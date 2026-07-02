@@ -162,3 +162,59 @@ def test_apply_inserts_knob_and_commits(tmp_path):
     assert CONFIG_FILE in _head_files(repo), (
         f"Expected HEAD to name {CONFIG_FILE}; got {_head_files(repo)!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-3: RED -- idempotency + single-key normalization
+# ---------------------------------------------------------------------------
+
+def test_apply_twice_is_idempotent_no_second_commit(tmp_path):
+    """Running apply twice on the same repo leaves exactly one knob
+    occurrence and creates no second commit."""
+    repo = _make_fake_reify_repo(tmp_path)
+
+    first = _run_script(repo)
+    assert first.returncode == 0, (
+        f"Expected exit 0 on first apply; got {first.returncode}\n"
+        f"stdout={first.stdout!r} stderr={first.stderr!r}"
+    )
+    commits_after_first = _commit_count(repo)
+
+    second = _run_script(repo)
+    assert second.returncode == 0, (
+        f"Expected exit 0 on second (already-flipped, no-op) apply; got "
+        f"{second.returncode}\nstdout={second.stdout!r} stderr={second.stderr!r}"
+    )
+
+    config_text = _read_config(repo)
+    assert config_text.count(KNOB) == 1, (
+        f"Expected exactly one occurrence of {KNOB}; got {config_text.count(KNOB)}\n"
+        f"config:\n{config_text}"
+    )
+    commits_after_second = _commit_count(repo)
+    assert commits_after_second == commits_after_first, (
+        f"Expected no new commit on the second (already-flipped) run; "
+        f"before={commits_after_first} after={commits_after_second}"
+    )
+
+
+def test_apply_normalizes_stray_zero_value_to_single_key(tmp_path):
+    """A pre-existing REIFY_GATE_EXCLUDE_HEAVY: "0" is normalized to "1"
+    with no duplicate key."""
+    repo = _make_fake_reify_repo(tmp_path, state="flipped_zero")
+
+    result = _run_script(repo)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    config_text = _read_config(repo)
+    assert config_text.count(KNOB) == 1, (
+        f"Expected exactly one occurrence of {KNOB} after normalization; "
+        f"got {config_text.count(KNOB)}\nconfig:\n{config_text}"
+    )
+    assert f'{KNOB}: "1"' in config_text, (
+        f"Expected the stray \"0\" value normalized to \"1\"; config:\n{config_text}"
+    )
+    assert f'{KNOB}: "0"' not in config_text
