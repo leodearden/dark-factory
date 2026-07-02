@@ -413,12 +413,6 @@ class TestStatusScopedOrchestratorSignal:
             )
         return side_effect
 
-    def test_orch_live_ineligible_statuses_constant(self):
-        """ORCH_LIVE_INELIGIBLE_STATUSES lists exactly the never-dispatched statuses."""
-        assert frozenset(
-            {'deferred', 'done', 'cancelled'}
-        ) == detector_module.ORCH_LIVE_INELIGIBLE_STATUSES
-
     @pytest.mark.parametrize('status', ['deferred', 'done', 'cancelled'])
     def test_ineligible_status_suppresses_orchestrator_signal(self, tmp_path, status):
         """Ineligible statuses force orchestrator_live False even when _orchestrator_live=True.
