@@ -10,6 +10,7 @@ import pytest
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import Scope
+from fused_memory.services import memory_service
 from fused_memory.services.memory_service import MemoryService, _serialize_temporal
 
 
@@ -257,6 +258,114 @@ class TestAddMemory:
         assert event.payload['memory_ids'] == ['mem0-1'], (
             f'Expected memory_ids=[\'mem0-1\'] in reconciliation event, '
             f'got {event.payload["memory_ids"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mem0_add_empty_result_logs_warning(self, service, caplog):
+        """task 1974: a mem0.add call that returns {'results': []} WITHOUT
+        raising is a silent dedup/no-op drop — the exact failure mode that
+        made Stage 2's cycle_summary write go fully absent with no trace.
+        It must be logged as a WARNING even though add_memory() itself does
+        not raise and behavior (response/stores_written/journal) is unchanged.
+        """
+        service.mem0.add = AsyncMock(return_value={'results': []})
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'task_knowledge_sync',
+                    'run_id': 'run-x',
+                },
+                causation_id='run-x',
+            )
+
+        # Behavior must be UNCHANGED — this is observability-only.
+        assert result.memory_ids == [], (
+            f'Expected memory_ids=[] for an empty mem0 result, got {result.memory_ids!r}'
+        )
+        assert SourceStore.mem0 in result.stores_written, (
+            'stores_written must still include mem0 — the write was attempted '
+            'and did not raise; only the returned ids are empty.'
+        )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for the silent empty-result drop, '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+        record = warning_records[0]
+        message = record.message.lower()
+        assert 'mem0' in message and ('empty' in message or 'zero' in message), (
+            f'Expected the WARNING to identify a silent mem0 empty-result drop, '
+            f'got: {record.message!r}'
+        )
+        assert record.kind == 'cycle_summary'
+        assert record.category == 'observations_and_summaries'
+        assert record.causation_id == 'run-x'
+        assert record.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_mem0_add_nonempty_result_no_empty_result_warning(self, service, caplog):
+        """The happy path (fixture default, non-empty mem0 result) must NOT
+        trigger the empty-result WARNING — no happy-path false positives."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.add_memory(
+                content='Always use type hints in Python code',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'task_knowledge_sync',
+                    'run_id': 'run-y',
+                },
+                causation_id='run-y',
+            )
+
+        assert result.memory_ids == ['mem0-1']
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING on the happy path, got: '
+            f'{[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mem0_add_empty_result_warning_gated_on_infer_pin(
+        self, service, caplog, monkeypatch
+    ):
+        """The empty-result WARNING is only meaningful while Mem0Backend.add()
+        pins infer=False (a successful write always returns exactly one
+        result). It is gated on `_MEM0_ADD_INFER_PINNED_FALSE` so that if the
+        pin is ever lifted or made configurable, flipping that one constant
+        silences the warning instead of it becoming a recurring,
+        non-actionable log line for a legitimate infer-driven no-op."""
+        monkeypatch.setattr(memory_service, '_MEM0_ADD_INFER_PINNED_FALSE', False)
+        service.mem0.add = AsyncMock(return_value={'results': []})
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'task_knowledge_sync',
+                    'run_id': 'run-x',
+                },
+                causation_id='run-x',
+            )
+
+        # Behavior (response/stores_written) is unaffected by the gate.
+        assert result.memory_ids == []
+        assert SourceStore.mem0 in result.stores_written
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING once the infer=False pin no longer holds, got: '
+            f'{[r.message for r in warning_records]}'
         )
 
 

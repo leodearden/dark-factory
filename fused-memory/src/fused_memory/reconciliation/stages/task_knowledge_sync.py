@@ -1622,6 +1622,7 @@ async def _reconstruct_stage2_summary(
             'reconciliation._reconstruct_stage2_summary: '
             'add_memory failed for run_id=%s; skipping reconstruction',
             run_id,
+            exc_info=True,
             extra={'project_id': project_id, 'run_id': run_id},
         )
         return 0

@@ -13190,6 +13190,39 @@ class TestReconstructStage2Summary:
         assert result == 0
         assert [r for r in caplog.records if r.levelno >= logging.WARNING]
 
+    @pytest.mark.asyncio
+    async def test_add_memory_exception_warning_carries_exc_info(self, caplog):
+        """task 1974 (Fix B): the exception-path WARNING must carry exc_info
+        so a raised nonce-retry (first attempt OR retry) is diagnosable in
+        the act, rather than swallowed to a generic 'add_memory failed'
+        message with no traceback. Distinct from the dedup-dropped-twice
+        WARNING covered by test_dedup_drop_twice_returns_zero_and_warns.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _reconstruct_stage2_summary,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.add_memory = AsyncMock(side_effect=RuntimeError('mem0 down'))
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            result = await _reconstruct_stage2_summary(
+                memory_service, project_id='dark_factory', run_id='run-recon-exc-detail',
+            )
+
+        assert result == 0
+
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        exc_records = [r for r in warning_records if 'add_memory failed' in r.message]
+        assert len(exc_records) == 1, (
+            f'Expected exactly 1 "add_memory failed" WARNING, got {len(exc_records)}: '
+            f'{[r.message for r in warning_records]}'
+        )
+        assert exc_records[0].exc_info is not None, (
+            'Expected the WARNING to carry exc_info so the raised exception '
+            '(first attempt or nonce-retry) is diagnosable, not swallowed'
+        )
+
 
 class TestRunStage2SummaryReconstructionWiring:
     """TaskKnowledgeSync.run() wires _reconstruct_stage2_summary (task 1964)
