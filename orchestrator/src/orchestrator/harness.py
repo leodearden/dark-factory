@@ -7201,9 +7201,26 @@ Output JSON matching the schema. Every task must appear in the output.
         """
         config_path = os.environ.get('ORCH_CONFIG_PATH')
         try:
+            # asyncio.wait_for cancels the *wrapping* task on timeout, but the
+            # thread-pool thread actually running load_config() cannot be
+            # force-cancelled — it is abandoned to finish in the background and
+            # its result (or exception) is discarded. Accepted per PRD Open Q3.
             fresh = await asyncio.wait_for(
                 asyncio.to_thread(load_config), timeout=_RELOAD_LOAD_TIMEOUT_SECS
             )
+        except TimeoutError:
+            report = {
+                'reloaded': False,
+                'config_path': config_path,
+                'applied': {},
+                'restart_required': {},
+                'unchanged': 0,
+                'error': f'load_config timed out after {_RELOAD_LOAD_TIMEOUT_SECS}s',
+            }
+            if self.event_store:
+                self.event_store.emit(EventType.config_reload, data=report)
+            logger.warning('config reload: %s', report['error'])
+            return report
         except Exception as exc:
             report = {
                 'reloaded': False,
