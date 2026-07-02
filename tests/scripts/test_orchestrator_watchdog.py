@@ -954,3 +954,113 @@ def test_enumerate_running_units_empty_stdout(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert wdog._enumerate_running_units() == []
 
+
+# ---------------------------------------------------------------------------
+# _unit_start_epoch tests
+# ---------------------------------------------------------------------------
+
+
+def _make_start_epoch_result(value: str, rc: int = 0) -> subprocess.CompletedProcess:
+    """Build a fake `systemctl show --timestamp=unix -p ExecMainStartTimestamp` result."""
+    stdout = f"ExecMainStartTimestamp={value}\n"
+    return subprocess.CompletedProcess(["systemctl"], rc, stdout=stdout, stderr="")
+
+
+def test_unit_start_epoch_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_epoch parses the '@<epoch>' realtime value to an int."""
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return _make_start_epoch_result("@1782996274")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog._unit_start_epoch("orchestrator-dark-factory.service")
+
+    assert result == 1782996274
+    assert isinstance(result, int)
+    assert len(calls) == 1, f"Expected exactly one systemctl call, got {calls}"
+    argv = calls[0]
+    assert "--timestamp=unix" in argv
+    assert "--property=ExecMainStartTimestamp" in argv or (
+        "-p" in argv and "ExecMainStartTimestamp" in argv
+    ), f"argv must request ExecMainStartTimestamp: {argv}"
+
+
+def test_unit_start_epoch_nonzero_rc_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_epoch returns None when systemctl exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_start_epoch_result("@1782996274", rc=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_epoch("some.service") is None
+
+
+def test_unit_start_epoch_empty_value_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_epoch returns None when the property value is empty."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_start_epoch_result("")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_epoch("some.service") is None
+
+
+def test_unit_start_epoch_zero_sentinel_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_epoch returns None for the '@0' sentinel (unit never started)."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_start_epoch_result("@0")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_epoch("some.service") is None
+
+
+def test_unit_start_epoch_unparseable_value_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_epoch returns None when the value is not an int."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return _make_start_epoch_result("@notanint")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_epoch("some.service") is None
+
+
+def test_unit_start_epoch_no_equals_line_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_epoch returns None when stdout has no '=' line."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_epoch("some.service") is None
+
+
+def test_unit_start_epoch_missing_binary_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_epoch returns None when systemctl binary is not found."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_epoch("some.service") is None
+
+
+def test_unit_start_epoch_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_unit_start_epoch returns None when the systemctl call times out."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._unit_start_epoch("some.service") is None
+
