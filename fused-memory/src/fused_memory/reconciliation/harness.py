@@ -2117,6 +2117,40 @@ class ReconciliationHarness:
             if not actionable:
                 return
 
+            # Task 1970: drop any actionable finding that cites nothing (no
+            # legacy affected_ids and no typed citation) — a synthetic/
+            # placeholder finding that cannot be investigated or remediated
+            # (e.g. Stage 3 filed add_finding but never followed up with a
+            # cite_* call).  This is the last line of defense before findings
+            # become a production remediation batch: _run_remediation_pass is
+            # reached only through this method, so this guard fully closes
+            # the leak.  Fail-open: _finding_has_reference only drops a
+            # finding when _derive_affected_ids is clearly empty; anything
+            # ambiguous (legacy affected_ids or any typed citation) passes.
+            referenceable: list[dict] = []
+            dropped_placeholders: list[dict] = []
+            for finding in actionable:
+                if _finding_has_reference(finding):
+                    referenceable.append(finding)
+                else:
+                    dropped_placeholders.append(finding)
+
+            for finding in dropped_placeholders:
+                logger.warning(
+                    'reconciliation.remediation_dropped_placeholder_finding',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'finding_category': finding.get('category', ''),
+                        'description': finding.get('description', ''),
+                    },
+                )
+
+            if not referenceable:
+                return
+
+            actionable = referenceable
+
             # Task 1570 / FIX A: suppress remediation for any actionable finding
             # that already has an OPEN pending recon_integrity_issue escalation.
             # Performance: call get_pending() ONCE and build a fingerprint set
