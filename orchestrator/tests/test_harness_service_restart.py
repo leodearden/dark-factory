@@ -636,7 +636,13 @@ class TestOrchestratorCoordinatorEndToEnd:
     """
 
     async def test_fires_systemd_run_once_pipeline_drained(self, harness: Harness):
-        """note_merge arms the coordinator; a drained pipeline lets it fire via systemd-run."""
+        """note_merge arms the coordinator; a drained pipeline lets it fire via systemd-run.
+
+        Also confirms the systemd-run argv actually threads config's
+        on_active_secs/project_root/script through (not just that SOME
+        non-None executor ran), and that a second fire's transient unit
+        name advances via the closure's itertools counter.
+        """
         harness.config.orchestrator_restart_on_merge_enabled = True
         harness.config.orchestrator_restart_debounce_secs = 0.0
 
@@ -653,6 +659,9 @@ class TestOrchestratorCoordinatorEndToEnd:
             return_value=(['orchestrator/src/orchestrator/git_ops.py'], None)
         )
         orch_coord = harness._service_restart_coordinators[2]
+        expected_script = str(
+            Path(harness.config.project_root) / 'scripts/restart-orchestrator.sh'
+        )
 
         await harness._note_merge_all('task-1', 'base', 'head')
         assert orch_coord.is_pending is True
@@ -671,7 +680,28 @@ class TestOrchestratorCoordinatorEndToEnd:
         mock_exec.assert_awaited_once()
         pos_args = mock_exec.call_args.args
         assert pos_args[0] == 'systemd-run'
+        assert '--on-active=10' in pos_args
+        assert '--unit=orch-selfrestart-on-merge-0.service' in pos_args
+        assert expected_script in pos_args
         assert orch_coord.is_pending is False
+
+        # Second merge + fire: the executor closure's itertools counter must
+        # advance the unit name — a fixed/hardcoded name would collide with
+        # the (already --collect'd) prior unit and is the exact regression
+        # the counter exists to prevent.
+        await harness._note_merge_all('task-2', 'base2', 'head2')
+        assert orch_coord.is_pending is True
+
+        with patch(
+            'orchestrator.service_restart.asyncio.create_subprocess_exec',
+            new_callable=AsyncMock,
+            return_value=fake_proc,
+        ) as mock_exec_2:
+            fired_2 = await harness._maybe_restart_stale_service(agents_idle=True)
+
+        assert fired_2 is True
+        pos_args_2 = mock_exec_2.call_args.args
+        assert '--unit=orch-selfrestart-on-merge-1.service' in pos_args_2
 
     async def test_precondition_blocks_fire_when_merge_in_flight(self, harness: Harness):
         """When the merge pipeline is NOT drained (depth>0), the fire is deferred."""
