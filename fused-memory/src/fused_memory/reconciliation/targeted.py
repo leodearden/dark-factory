@@ -63,6 +63,19 @@ _ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 # and the fast-path write can't drift out of sync (task 1984).
 _ECHO_SOURCE = 'targeted_reconciliation'
 
+# Cap on the authoritative-memory pre-check query in _on_task_done's hot
+# path (task 1984 review: hot_path_efficiency).  That query runs on EVERY
+# `done` transition; get_memories_by_metadata defaults to limit=1000, which
+# is a full Qdrant scroll + enumeration for a check that only needs "does at
+# least one authoritative memory exist for this task_id".  A handful of
+# per-task memories (completion echoes, guard markers) is the norm, so a
+# small cap keeps the common case cheap while still covering it; it trades
+# away detecting an authoritative marker that happens to land outside the
+# first N points for a task_id with a pathologically large memory count —
+# an accepted, documented trade-off rather than an unbounded scroll on the
+# hot path.
+_AUTHORITATIVE_PRECHECK_LIMIT = 25
+
 # Metadata key recognized as an authoritative resolution/superseding marker
 # by _is_authoritative_resolution, in addition to a truthy `supersedes`
 # marker.  This is Stage 2's real, task_id-scoped "Completion-Note
@@ -72,9 +85,13 @@ _ECHO_SOURCE = 'targeted_reconciliation'
 # metadata={'stage2_suppress': True, 'task_id': str(task_id)} on its
 # protective completion-note guard writes. Because it carries task_id, it
 # intersects _on_task_done's deterministic {'task_id': task_id} pre-check
-# filter below. test_stage2_suppress_key_matches_write_side_producer
-# (test_targeted.py) ties this constant to that write-side literal so the
-# read side and write side can't silently drift apart.
+# filter below. prompts/stage2.py's write side is the source of truth for
+# this key; there is no mechanical (code-level) test tying the two together
+# because the write side is a natural-language LLM prompt instruction (Stage
+# 2 is instructed to tag its output with
+# metadata={stage2_suppress: True, ...}), not deterministic code — so this
+# trigger is inherently best-effort, not compiler/test-enforced, and can
+# drift if the prompt wording changes without a matching update here.
 #
 # Replaces an earlier revision's `_AUTHORITATIVE_SOURCES =
 # frozenset({'stage2_task_knowledge_sync'})` source-allowlist: a task 1984
@@ -255,6 +272,7 @@ class TargetedReconciler:
             try:
                 memories = await self.memory.get_memories_by_metadata(
                     project_id=project_id, filters={'task_id': task_id},
+                    limit=_AUTHORITATIVE_PRECHECK_LIMIT,
                 )
             except Exception as e:
                 logger.warning(
