@@ -48,6 +48,7 @@ import asyncio
 import contextlib
 import logging
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -339,7 +340,7 @@ async def _assert_never_a_gate(
         'a landed advance during an in-flight run must arm a coalesced re-run'
     )
     assert harness.get_merge_halt_status() == {'wired': False}
-    assert worker.escalation_queue.get_pending() == []
+    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
 
     async def _raising_notifiee(task_id: str, base: str, head: str) -> None:
         await worker.on_post_merge(task_id, base, head)
@@ -360,7 +361,7 @@ async def _assert_never_a_gate(
         'task-3', base2, head2, prefetched_diff=[],
     )
     assert harness.get_merge_halt_status() == {'wired': False}
-    assert worker.escalation_queue.get_pending() == []
+    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
 
 
 def _inject_red(worker: OfflineLaneWorker, failing_ids: list[str]) -> None:
@@ -591,7 +592,7 @@ async def test_b4_confirmed_red_files_fix_task_and_info_escalation(harness, git_
 
     fp = compute_failing_test_set_fingerprint(failing_ids)
     task_id = worker.open_fix_tasks[fp]
-    escalations = _l0_info_escalations(worker.escalation_queue, task_id)
+    escalations = _l0_info_escalations(cast(EscalationQueue, worker.escalation_queue), task_id)
     assert len(escalations) == 1
     assert escalations[0].severity == 'info'
     assert escalations[0].agent_role == 'orchestrator-offline-lane'
@@ -618,12 +619,12 @@ async def test_b5_same_set_recurrence_updates_not_duplicates(harness, git_ops, r
 
     await _drive_reds(harness, repo, worker, failing_ids, 2)
 
-    worker.task_client.submit_fix_task.assert_awaited_once()
-    worker.task_client.append_suspect_range.assert_awaited_once()
+    cast(AsyncMock, worker.task_client).submit_fix_task.assert_awaited_once()
+    cast(AsyncMock, worker.task_client).append_suspect_range.assert_awaited_once()
 
     fp = compute_failing_test_set_fingerprint(failing_ids)
     task_id = worker.open_fix_tasks[fp]
-    escalations = _l0_info_escalations(worker.escalation_queue, task_id)
+    escalations = _l0_info_escalations(cast(EscalationQueue, worker.escalation_queue), task_id)
     assert len(escalations) == 1, (
         'a same-set recurrence must not raise a second L0 escalation'
     )
@@ -648,9 +649,9 @@ async def test_b6_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, t
         await _run_one_lane_pass(worker)
 
     assert 'intermittent nondeterminism' in caplog.text
-    worker.task_client.submit_fix_task.assert_not_awaited()
+    cast(AsyncMock, worker.task_client).submit_fix_task.assert_not_awaited()
     assert worker.open_fix_tasks == {}
-    assert worker.escalation_queue.get_pending() == []
+    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
 
 
 # ---------------------------------------------------------------------------
@@ -680,14 +681,14 @@ async def test_b7_stall_promotes_to_blocker(harness, git_ops, repo, tmp_path):
 
     fp_a = compute_failing_test_set_fingerprint(failing_a)
     task_a = worker_a.open_fix_tasks[fp_a]
-    blockers_a = _l2_blocker_escalations(worker_a.escalation_queue, task_a)
+    blockers_a = _l2_blocker_escalations(cast(EscalationQueue, worker_a.escalation_queue), task_a)
     assert len(blockers_a) == 1
     assert blockers_a[0].severity == 'critical'
     assert blockers_a[0].agent_role == 'orchestrator-offline-lane'
 
     # A further same-set red must not re-promote (idempotent per fingerprint).
     await _drive_reds(harness, repo, worker_a, failing_a, 1)
-    assert len(_l2_blocker_escalations(worker_a.escalation_queue, task_a)) == 1
+    assert len(_l2_blocker_escalations(cast(EscalationQueue, worker_a.escalation_queue), task_a)) == 1
     assert harness.get_merge_halt_status() == {'wired': False}
 
     # Arm 2 — terminal non-done status: promotes immediately regardless of
@@ -703,14 +704,14 @@ async def test_b7_stall_promotes_to_blocker(harness, git_ops, repo, tmp_path):
 
     fp_b = compute_failing_test_set_fingerprint(failing_b)
     task_b = worker_b.open_fix_tasks[fp_b]
-    blockers_b = _l2_blocker_escalations(worker_b.escalation_queue, task_b)
+    blockers_b = _l2_blocker_escalations(cast(EscalationQueue, worker_b.escalation_queue), task_b)
     assert len(blockers_b) == 1, (
         'a terminal non-done fix-task status must promote immediately, '
         'regardless of the configured advance-count threshold'
     )
 
     await _drive_reds(harness, repo, worker_b, failing_b, 1)
-    assert len(_l2_blocker_escalations(worker_b.escalation_queue, task_b)) == 1
+    assert len(_l2_blocker_escalations(cast(EscalationQueue, worker_b.escalation_queue), task_b)) == 1
     assert harness.get_merge_halt_status() == {'wired': False}
 
 
