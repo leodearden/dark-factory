@@ -268,6 +268,7 @@ def _make_coordinator_with_mutable_clock(
     debounce_secs: float = 120.0,
     enabled: bool = True,
     restart_executor: AsyncMock | None = None,
+    restart_precondition=None,
 ) -> tuple[StaleServiceRestartCoordinator, list[float], AsyncMock, MagicMock]:
     """Build a coordinator with a mutable-list clock and injectable executor."""
     git_ops = MagicMock()
@@ -285,6 +286,7 @@ def _make_coordinator_with_mutable_clock(
         enabled=enabled,
         restart_executor=executor,
         clock=lambda: current_time[0],
+        restart_precondition=restart_precondition,
     )
     return coord, current_time, executor, event_store
 
@@ -942,3 +944,84 @@ async def test_schedule_detached_systemd_restart_raises_on_nonzero_rc() -> None:
         )
 
     assert 'failed to register unit' in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# U2 (task 1973): restart_precondition gate on StaleServiceRestartCoordinator
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restart_precondition_false_defers_and_keeps_pending() -> None:
+    """(a) restart_precondition=False: no executor call, returns False, stays pending (retryable)."""
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=0.0,
+        restart_precondition=lambda: False,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord.is_pending is True
+
+    current_time[0] = 1.0
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
+
+
+@pytest.mark.asyncio
+async def test_restart_precondition_true_fires_normally() -> None:
+    """(b) restart_precondition=True: fires normally — executor awaited once, pending cleared."""
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=0.0,
+        restart_precondition=lambda: True,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 1.0
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+
+
+@pytest.mark.asyncio
+async def test_restart_precondition_raises_is_fail_safe() -> None:
+    """(c) restart_precondition raising: maybe_restart returns False, no propagation, stays pending."""
+
+    def _boom() -> bool:
+        raise RuntimeError('precondition boom')
+
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=0.0,
+        restart_precondition=_boom,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 1.0
+    result = await coord.maybe_restart(agents_idle=True)  # must not raise
+
+    assert result is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True
+
+
+@pytest.mark.asyncio
+async def test_restart_precondition_default_none_preserves_existing_behavior() -> None:
+    """Default restart_precondition=None fires exactly like the pre-U2 coordinator (regression guard)."""
+    coord, current_time, executor, _ = _make_coordinator_with_mutable_clock(
+        ['fused-memory/src/server/main.py'],
+        debounce_secs=0.0,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 1.0
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
