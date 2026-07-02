@@ -1536,3 +1536,81 @@ def test_report_unknown_verdict_does_not_force_exit_1(monkeypatch: pytest.Monkey
 
     assert wdog.report() == 0
 
+
+# ---------------------------------------------------------------------------
+# _cli tests
+# ---------------------------------------------------------------------------
+
+
+def test_cli_report_flag_routes_to_report_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_cli(["--report"]) calls report() exactly once and does not run main()/staleness_pass()."""
+    wdog = _load_watchdog()
+    calls: list[str] = []
+
+    monkeypatch.setattr(wdog, "report", lambda: calls.append("report") or 0)
+    monkeypatch.setattr(wdog, "main", lambda: calls.append("main"))
+    monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+
+    exit_code = wdog._cli(["--report"])
+
+    assert calls == ["report"], f"Expected only report() called, got {calls}"
+    assert exit_code == 0
+
+
+def test_cli_report_flag_returns_reports_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_cli(["--report"]) returns report()'s own return value, and skips the mutating paths."""
+    wdog = _load_watchdog()
+
+    monkeypatch.setattr(wdog, "report", lambda: 1)
+    monkeypatch.setattr(wdog, "main", lambda: pytest.fail("main() must not run under --report"))
+    monkeypatch.setattr(
+        wdog,
+        "staleness_pass",
+        lambda: pytest.fail("staleness_pass() must not run under --report"),
+    )
+
+    assert wdog._cli(["--report"]) == 1
+
+
+def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_cli([]) runs main() then staleness_pass(), in that order, and never report()."""
+    wdog = _load_watchdog()
+    calls: list[str] = []
+
+    monkeypatch.setattr(wdog, "report", lambda: calls.append("report") or 0)
+    monkeypatch.setattr(wdog, "main", lambda: calls.append("main"))
+    monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+
+    wdog._cli([])
+
+    assert calls == ["main", "staleness_pass"], f"Expected main then staleness_pass, got {calls}"
+
+
+def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_cli(["--bogus"]) must not raise; unknown flags fall through to the timer path."""
+    wdog = _load_watchdog()
+    calls: list[str] = []
+
+    monkeypatch.setattr(wdog, "report", lambda: calls.append("report") or 0)
+    monkeypatch.setattr(wdog, "main", lambda: calls.append("main"))
+    monkeypatch.setattr(wdog, "staleness_pass", lambda: calls.append("staleness_pass"))
+
+    # Must not raise
+    wdog._cli(["--bogus"])
+
+    assert calls == ["main", "staleness_pass"]
+
+
+def test_cli_defaults_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_cli() with no argv argument reads sys.argv[1:]."""
+    wdog = _load_watchdog()
+    calls: list[str] = []
+
+    monkeypatch.setattr(wdog, "report", lambda: calls.append("report") or 0)
+    monkeypatch.setattr(wdog.sys, "argv", ["orchestrator-watchdog.py", "--report"])
+
+    exit_code = wdog._cli()
+
+    assert calls == ["report"]
+    assert exit_code == 0
+
