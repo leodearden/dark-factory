@@ -493,3 +493,104 @@ class TestVerifyPremiseRefuted:
         entry = self._make_entry([])
 
         assert verify_premise_refuted(entry, tmp_path) is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-1972 step-09 RED: TestPremiseRefutedEntry
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestPremiseRefutedEntry:
+    """Tests for premise_refuted_entry() from
+    fused_memory.middleware.recon_code_fix_premise_guard.
+
+    premise_refuted_entry composes match_candidate + verify_premise_refuted:
+    a candidate is only ever dropped when BOTH the textual match hits AND the
+    live source still refutes the premise.
+    """
+
+    def _make_entry(self, source_assertions):
+        from fused_memory.middleware.recon_code_fix_premise_guard import PremiseEntry
+        return PremiseEntry(
+            name="test_entry",
+            reason="test reason",
+            title_substrings=["entity-summary rebuild", "invalid_at"],
+            description_substrings=["missing invalid_at filter"],
+            source_assertions=source_assertions,
+        )
+
+    def _make_candidate(self, title: str, description: str = "", details: str = ""):
+        return CandidateTask(title=title, description=description, details=details)
+
+    def _matching_candidate(self):
+        return self._make_candidate(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+    def test_returns_entry_when_match_and_refuted(self, tmp_path):
+        """(a) Returns the entry when match_candidate hits AND verify_premise_refuted is True."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            premise_refuted_entry,
+        )
+
+        target = tmp_path / "memory_service.py"
+        target.write_text("filter_by(invalid_at=None)\n", encoding="utf-8")
+
+        entry = self._make_entry([
+            SourceAssertion(file="memory_service.py", must_contain=["invalid_at"], must_not_contain=[])
+        ])
+
+        result = premise_refuted_entry(self._matching_candidate(), [entry], tmp_path)
+        assert result is entry
+
+    def test_returns_none_when_match_but_source_no_longer_refutes(self, tmp_path):
+        """(b) Self-correcting case: candidate matches textually, but the fixture no longer
+        refutes the premise (e.g. the must_contain token has since been removed) -> None.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            premise_refuted_entry,
+        )
+
+        target = tmp_path / "memory_service.py"
+        target.write_text("no marker in this version anymore\n", encoding="utf-8")
+
+        entry = self._make_entry([
+            SourceAssertion(file="memory_service.py", must_contain=["invalid_at"], must_not_contain=[])
+        ])
+
+        result = premise_refuted_entry(self._matching_candidate(), [entry], tmp_path)
+        assert result is None
+
+    def test_returns_none_when_no_textual_match_even_if_source_would_hold(self, tmp_path):
+        """(c) Returns None when there is no textual match, even though source_assertions
+        would hold if checked (match_candidate short-circuits first).
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            premise_refuted_entry,
+        )
+
+        target = tmp_path / "memory_service.py"
+        target.write_text("filter_by(invalid_at=None)\n", encoding="utf-8")
+
+        entry = self._make_entry([
+            SourceAssertion(file="memory_service.py", must_contain=["invalid_at"], must_not_contain=[])
+        ])
+
+        unrelated_candidate = self._make_candidate(
+            title="Completely unrelated task about something else entirely",
+            description="Nothing to do with entity summaries or invalid_at.",
+        )
+
+        result = premise_refuted_entry(unrelated_candidate, [entry], tmp_path)
+        assert result is None
+
+    def test_returns_none_for_empty_entries(self, tmp_path):
+        """(d) Returns None when entries is empty."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import premise_refuted_entry
+
+        result = premise_refuted_entry(self._matching_candidate(), [], tmp_path)
+        assert result is None
