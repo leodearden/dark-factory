@@ -430,3 +430,45 @@ class TestS5HybridRollbackLock:
         assert live.model_dump() == live_dump_before
         assert live.timeouts.steward == 1800.0
         assert live.steward_completion_timeout == 900.0
+
+
+# ---------------------------------------------------------------------------
+# Scenario 6: an unedited on-disk YAML reloads to a no-op. Complements
+# test_harness_config_reload.py::TestHarnessReloadConfigNoOp (which patches
+# load_config to return an independently-built, structurally-identical fresh
+# config) by proving the REAL load_config()-off-disk round-trip also diffs
+# to empty when nothing changed on disk.
+# ---------------------------------------------------------------------------
+
+
+class TestS6NoOpReload:
+    """PRD boundary scenario 6: reloading an unedited on-disk config is a no-op."""
+
+    @pytest.mark.asyncio
+    async def test_unedited_yaml_reloads_as_noop(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        harness, config_path = _make_reload_harness(tmp_path, monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            report = await harness.reload_config()
+
+        assert report['reloaded'] is True
+        assert report['applied'] == {}
+        assert report['restart_required'] == {}
+        assert report['unchanged'] > 0
+        assert report['error'] is None
+        assert report['config_path'] == str(config_path)
+
+        rows = _query_config_reload_events(harness.event_store)
+        assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
+        assert json.loads(rows[0]['data']) == report
+
+        harness_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        assert not harness_warnings, (
+            'Expected no WARNING on a no-op reload; got '
+            + repr([r.getMessage() for r in harness_warnings])
+        )
