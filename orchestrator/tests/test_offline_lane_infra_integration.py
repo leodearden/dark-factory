@@ -650,3 +650,57 @@ async def test_ib2_infra_run_in_flight_never_gates_merge(harness, git_ops, repo,
 
     runner.release()
     await lane_task
+
+
+# ---------------------------------------------------------------------------
+# IB3 — confirmed red files a normal fix task + L0 info escalation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ib3_confirmed_infra_red_files_normal_fix_task_and_info_escalation(
+    harness,
+    git_ops,
+    repo,
+    tmp_path,
+):
+    """IB3 — a confirmed-red INFRA run files a NORMAL pending fix task
+    (never the b3_gate red-main fix-forward path) plus a non-blocking L0
+    info escalation, leaving the merge queue itself completely untouched.
+
+    Proves the infra red routes through β3's ``_handle_red_run`` with
+    ``confirmation_runner=infra_confirmation_runner`` injected (task 1959,
+    IE1). Negative control: routing an infra red to the red-main
+    fix-forward path, or touching the merge queue from this call path,
+    makes this RED.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    failing_ids = ['infra::test_cgroup_burn.sh', 'infra::test_reflink.sh']
+    worker = _build_infra_worker(git_ops, tmp_path)
+    _inject_infra_red(worker, failing_ids)
+    _wire_lane(harness, worker)
+
+    _, head_sha = await _drive_advance(harness, repo)
+    await _run_one_lane_pass(worker)
+
+    arguments = _submitted_fix_task_arguments(worker.task_client)
+    assert arguments['status'] == 'pending'
+    assert arguments['metadata']['merge_lane'] == 'normal', (
+        'a confirmed-red infra fix task must route through the standard '
+        'TDD→PR→merge gate, never the b3_gate red-main fix-forward path'
+    )
+    assert arguments['metadata']['failing_tests'] == sorted(failing_ids)
+    assert arguments['metadata']['suspect_ranges'] == [head_sha], (
+        'no prior green run is recorded yet, so the suspect range is just the head'
+    )
+
+    fp = compute_failing_test_set_fingerprint(failing_ids)
+    task_id = worker.open_fix_tasks[fp]
+    escalations = _l0_info_escalations(cast(EscalationQueue, worker.escalation_queue), task_id)
+    assert len(escalations) == 1
+    assert escalations[0].severity == 'info'
+    assert escalations[0].agent_role == 'orchestrator-offline-lane'
+
+    # The merge queue itself is left completely untouched by the infra red path.
+    assert harness.get_merge_halt_status() == {'wired': False}
