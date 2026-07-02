@@ -396,6 +396,23 @@ def _l0_info_escalations(escalation_queue: EscalationQueue, task_id: str) -> lis
     return escalation_queue.get_by_task(task_id, status='pending', level=0)
 
 
+async def _drive_reds(
+    harness: Harness, repo: Path, worker: OfflineLaneWorker, failing_ids: list[str], n: int,
+) -> None:
+    """Drive *n* same-failing-set confirmed-red advances through the real chain.
+
+    Injects the SAME confirmed break once (:func:`_inject_red`) then, for
+    *n* iterations, drives a real advance + the real on_merge_landed fan-out
+    (:func:`_drive_advance`, mirroring B1-B4) followed by one full pass
+    (:func:`_run_one_lane_pass`) — the same-fingerprint repeat-red sequence
+    B5's dedup and B7's stall-promotion scenarios both need.
+    """
+    _inject_red(worker, failing_ids)
+    for _ in range(n):
+        await _drive_advance(harness, repo)
+        await _run_one_lane_pass(worker)
+
+
 # ---------------------------------------------------------------------------
 # B1 — advance triggers a from-head run
 # ---------------------------------------------------------------------------
