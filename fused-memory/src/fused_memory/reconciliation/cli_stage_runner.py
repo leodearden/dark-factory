@@ -334,6 +334,11 @@ async def run_stage_via_cli(
     MCP tools, with per-stage restrictions via ``--disallowedTools``.
     """
     effective_model = model or config.agent_llm_model
+    # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT switched to
+    # a neutral cwd. This is the GENERIC stage runner — disallowed_tools is a
+    # per-call param (not hardcoded ['*']) and stages get fused-memory/
+    # escalation MCP tools, so it is not a pure prompt-contained classifier;
+    # changing the default cwd here would affect tool-enabled stages.
     effective_cwd = cwd or Path(config.explore_codebase_root)
 
     start_ms = int(time.monotonic() * 1000)
