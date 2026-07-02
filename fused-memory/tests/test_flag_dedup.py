@@ -1569,6 +1569,152 @@ class TestFilterSuppressed:
             f'[{label}] Preserved flag differs from input: {result[0]}'
         )
 
+    # -----------------------------------------------------------------
+    # Scoped (task_id, flag_type) suppression — task-1966 step-3
+    #
+    # RED until step-4 rewrites filter_suppressed's matching to a
+    # task_id -> (wildcard | flag_types-set) map.
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_scoped_record_drops_only_matching_flag_type(self):
+        """(a) A SCOPED suppression record drops only its listed flag_type(s),
+        keeping other flag_types for the same task_id — the core fix."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        scoped_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+            'flag_types': ['human_review_required_deferred'],
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[scoped_record])
+
+        suppressed_flag = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
+        surviving_flag = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}
+        result = await filter_suppressed(memory_service, 'p', [suppressed_flag, surviving_flag])
+
+        assert result == [surviving_flag]
+
+    @pytest.mark.asyncio
+    async def test_legacy_record_still_blanket_drops_all_flag_types(self):
+        """(b) A LEGACY record (no flag_types key) still blanket-drops ALL
+        flag_types for that task_id — backward compat, mirrors
+        test_suppressed_flag_dropped_and_unrelated_kept."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        legacy_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[legacy_record])
+
+        flag_a = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
+        flag_b = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}
+        result = await filter_suppressed(memory_service, 'p', [flag_a, flag_b])
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_absent_flag_type_kept_against_scoped_but_dropped_against_legacy(self):
+        """(c) A flag whose flag_type is None/absent cannot match a specific
+        flag_type, so it is KEPT against a scoped record — but a legacy
+        blanket record still drops it (no flag_type to check against)."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        flag_no_type = {'task_id': 452}  # flag_type key intentionally absent
+
+        scoped_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+            'flag_types': ['human_review_required_deferred'],
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[scoped_record])
+        result = await filter_suppressed(memory_service, 'p', [flag_no_type])
+        assert result == [flag_no_type], 'flag_type=None cannot match a scoped allowlist'
+
+        legacy_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+        })
+        memory_service_legacy = AsyncMock()
+        memory_service_legacy.search = AsyncMock(return_value=[legacy_record])
+        result2 = await filter_suppressed(memory_service_legacy, 'p', [flag_no_type])
+        assert result2 == [], 'legacy blanket record must still drop a flag with no flag_type'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_task_id,record_task_id',
+        [
+            pytest.param(452, 452, id='int-int'),
+            pytest.param(452, '452', id='int-str'),
+            pytest.param('452', 452, id='str-int'),
+            pytest.param('452', '452', id='str-str'),
+        ],
+    )
+    async def test_scoped_record_task_id_coercion(self, flag_task_id, record_task_id):
+        """(d) task_id str/int coercion still applies with scoped records."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        scoped_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': record_task_id,
+            'flag_types': ['human_review_required_deferred'],
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[scoped_record])
+
+        suppressed_flag = {'task_id': flag_task_id, 'flag_type': 'human_review_required_deferred'}
+        result = await filter_suppressed(memory_service, 'p', [suppressed_flag])
+        assert result == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'record_order',
+        [
+            pytest.param('scoped_first', id='scoped-then-legacy'),
+            pytest.param('legacy_first', id='legacy-then-scoped'),
+        ],
+    )
+    async def test_scoped_and_legacy_records_for_same_task_id_union_to_blanket(
+        self, record_order
+    ):
+        """(e) One scoped + one legacy-blanket record for the same task_id
+        results in blanket suppression (union semantics: wildcard wins),
+        regardless of which order Mem0's search returns them in — result
+        ordering is nondeterministic in practice, so both orders occur.
+
+        'legacy-then-scoped' exercises the wildcard-already-present
+        short-circuit branch (``if tid_str in suppressed and
+        suppressed[tid_str] is None: continue``), which 'scoped-then-legacy'
+        never reaches (the scoped record's ``set`` is simply overwritten by
+        the legacy record's wildcard in that order)."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        scoped_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+            'flag_types': ['human_review_required_deferred'],
+        })
+        legacy_record = _make_memory_result({
+            'kind': 'stage1_flag_suppression',
+            'task_id': 452,
+        })
+        records = (
+            [scoped_record, legacy_record]
+            if record_order == 'scoped_first'
+            else [legacy_record, scoped_record]
+        )
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=records)
+
+        flag_a = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
+        flag_b = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}
+        result = await filter_suppressed(memory_service, 'p', [flag_a, flag_b])
+        assert result == []
+
 
 # ---------------------------------------------------------------------------
 # task-1186 step-3 — filter_suppressed: search exception → pass-through + WARNING
@@ -1906,6 +2052,57 @@ class TestBuildSuppressionPayload:
         assert isinstance(exc_info.value.__cause__, (ValueError, TypeError)), (
             f'Expected __cause__ to be ValueError or TypeError but got: {type(exc_info.value.__cause__)}'
         )
+
+
+# ---------------------------------------------------------------------------
+# build_suppression_payload — optional flag_types allowlist (task-1966 step-1)
+#
+# RED until step-2 adds the flag_types param.  All TestBuildSuppressionPayload
+# assertions above (legacy shape) must remain green throughout.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSuppressionPayloadFlagTypes:
+    """Tests for the OPTIONAL flag_types scoping allowlist (task-1966)."""
+
+    def test_legacy_call_has_no_flag_types_key(self):
+        """(a) build_suppression_payload(42) still equals the canonical dict —
+        NO 'flag_types' key in metadata (backward compat)."""
+        result = build_suppression_payload(42)
+        assert result == {
+            'content': 'STAGE 1 FLAG SUPPRESSION task_id=42',
+            'category': 'observations_and_summaries',
+            'metadata': {'kind': 'stage1_flag_suppression', 'task_id': 42},
+        }
+        assert 'flag_types' not in result['metadata']
+
+    def test_scoped_call_includes_flag_types_in_metadata(self):
+        """(b) Non-empty flag_types produces metadata.task_id (int-coerced) AND
+        metadata.flag_types (list[str]); content is still the canonical
+        non-empty 'STAGE 1 FLAG SUPPRESSION task_id=452...' string."""
+        result = build_suppression_payload(452, flag_types=['human_review_required_deferred'])
+        assert result['metadata']['task_id'] == 452
+        assert isinstance(result['metadata']['task_id'], int)
+        # .get() (not ['flag_types']) — the key is NotRequired in _SuppressionMetadata,
+        # so a direct subscript trips pyright's reportTypedDictNotRequiredAccess.
+        assert result['metadata'].get('flag_types') == ['human_review_required_deferred']
+        assert isinstance(result['content'], str) and result['content']
+        assert result['content'].startswith('STAGE 1 FLAG SUPPRESSION task_id=452')
+
+    def test_flag_types_normalized_sorted_unique_str_coerced(self):
+        """(c) Mixed/duplicate/unsorted flag_types normalize to sorted-unique,
+        every element str-coerced."""
+        result = build_suppression_payload(452, flag_types=['b', 'a', 'a'])
+        flag_types = result['metadata'].get('flag_types')
+        assert flag_types == ['a', 'b']
+        assert flag_types is not None  # narrows list[str] | None for the iteration below
+        assert all(isinstance(x, str) for x in flag_types)
+
+    @pytest.mark.parametrize('flag_types', [None, []], ids=['none', 'empty_list'])
+    def test_none_or_empty_flag_types_yields_legacy_shape(self, flag_types):
+        """(d) flag_types=[] or None yields the legacy no-flag_types shape."""
+        result = build_suppression_payload(452, flag_types=flag_types)
+        assert 'flag_types' not in result['metadata']
 
 
 # ---------------------------------------------------------------------------
@@ -2324,6 +2521,37 @@ class TestWriteSuppressionRecord:
         kwargs = mock_memory_service.add_memory.call_args.kwargs
         assert kwargs['metadata']['task_id'] == 42
         assert isinstance(kwargs['metadata']['task_id'], int)
+
+    @pytest.mark.asyncio
+    async def test_forwards_flag_types_to_metadata(self, mock_memory_service):
+        """flag_types is forwarded into metadata.flag_types (task-1966 step-5).
+
+        RED until step-6 adds the flag_types param and forwards it to
+        build_suppression_payload.
+        """
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            mock_memory_service,
+            project_id='p',
+            task_id=452,
+            flag_types=['human_review_required_deferred'],
+        )
+
+        kwargs = mock_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['flag_types'] == ['human_review_required_deferred']
+        assert kwargs['metadata']['kind'] == 'stage1_flag_suppression'
+        assert kwargs['metadata']['task_id'] == 452
+
+    @pytest.mark.asyncio
+    async def test_omitting_flag_types_produces_legacy_metadata(self, mock_memory_service):
+        """Omitting flag_types produces metadata with NO flag_types key (legacy)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(mock_memory_service, project_id='p', task_id=452)
+
+        kwargs = mock_memory_service.add_memory.call_args.kwargs
+        assert 'flag_types' not in kwargs['metadata']
 
 
 def test_write_suppression_record_importable_from_canonical_path():

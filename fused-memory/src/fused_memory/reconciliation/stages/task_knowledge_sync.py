@@ -12,7 +12,7 @@ import sys
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -961,6 +961,44 @@ async def _query_stage2_flags(
             },
         )
     return Stage2FlagPartition(current_flags, stale_missing_run_id_ids, stale_mismatched_run_id_ids, rescued_ids)
+
+
+def _query_recon_report_findings(
+    recon_report_state: Any,
+    run_id: str,
+    *,
+    categories: frozenset[str] = frozenset({'systemic_pattern'}),
+) -> list[dict]:
+    """Poll the recon_report channel for *run_id*, filtered to *categories*.
+
+    Independent second channel (task-1966 scope item 2): unlike the Mem0
+    flagged-items channel (``_query_stage2_flags`` / Stage 1's
+    ``items_flagged``), findings read via ``recon_report_state.get_findings_for_run``
+    do NOT pass through ``filter_suppressed`` — a ``stage1_flag_suppression``
+    record can never hide a ``systemic_pattern`` finding from Stage 2 through
+    this path.
+
+    Reached via duck-typed method call (no import of ``ReconReportState`` —
+    mirrors ``base.py``'s ``_active_rrs.get_assembled_report`` usage, avoiding
+    a server←reconciliation import).
+
+    Best-effort, mirrors :func:`_query_stage2_flags`: returns ``[]`` when
+    *recon_report_state* is ``None`` (recon_report channel not configured for
+    this stage instance — no call is made) or when
+    ``get_findings_for_run`` raises (logs a WARNING; never propagates).
+    """
+    if recon_report_state is None:
+        return []
+    try:
+        findings = recon_report_state.get_findings_for_run(run_id)
+    except Exception:
+        logger.warning(
+            'reconciliation._query_recon_report_findings: get_findings_for_run '
+            'failed; skipping recon_report channel this cycle',
+            extra={'run_id': run_id},
+        )
+        return []
+    return [f for f in findings if f.get('category') in categories]
 
 
 def _compute_stale_flags(
@@ -1925,6 +1963,16 @@ class TaskKnowledgeSync(BaseStage):
     # and injected via the same four-touchpoint pattern as _stale_fixc_markers_swept.
     _rescued_in_window_markers: int = 0
 
+    # Count of systemic_pattern findings polled from the recon_report channel
+    # (task-1966) that were newly APPENDED to combined_flags in the current
+    # assemble_payload() call — i.e. survived compute_flag_signature dedup
+    # against the Mem0/Stage-1 channel.  A finding whose signature already
+    # exists in combined_flags is deduped and does NOT increment this counter.
+    # Reset and injected via the same four-touchpoint pattern as
+    # _stale_fixc_markers_swept.  Written to
+    # report.stats['stage2_recon_report_systemic_polled'] after super().run().
+    _recon_report_systemic_polled: int = 0
+
     def get_system_prompt(self) -> str:
         return build_stage2_system_prompt(self.project_id)
 
@@ -1959,6 +2007,7 @@ class TaskKnowledgeSync(BaseStage):
         self._stale_fixc_markers_swept = 0
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
+        self._recon_report_systemic_polled = 0
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         # --- trim-then-write: pre-trim pool to cap-1 BEFORE agent writes (task 1831) ---
         # Runs unconditionally (full + remediation) so the pool is bounded every cycle.
@@ -1983,6 +2032,10 @@ class TaskKnowledgeSync(BaseStage):
         # swept), but the count is observable here for operator diagnostics.
         # Explicit zero so downstream consumers never need .get(..., 0) fallbacks.
         report.stats['rescued_in_window_markers'] = self._rescued_in_window_markers
+        # --- recon_report systemic_pattern channel poll stat (task-1966) ---
+        # Mirrors _stale_fixc_markers_swept; explicit zero so downstream
+        # consumers never need .get(..., 0) fallbacks.
+        report.stats['stage2_recon_report_systemic_polled'] = self._recon_report_systemic_polled
 
         # --- same-run Stage 1 human_operator_required dedup (task 1154) ---
         # Guard on stage identity so a future reorder of prior_reports doesn't
@@ -2629,9 +2682,53 @@ class TaskKnowledgeSync(BaseStage):
                     '_source': 'mem0_active_query',
                     'flag_id': f['id'],
                     'task_id': f['task_id'],
+                    # flag_type surfaced from the Mem0 marker's own metadata
+                    # (task-1966 amendment, reviewer finding dedup_gap):
+                    # compute_flag_signature() requires BOTH task_id and
+                    # flag_type to produce a signature, so without this a
+                    # surviving mem0_active_query flag never enters
+                    # existing_signatures below and the recon_report_systemic
+                    # poll could double-render a finding that also survived
+                    # this channel.  Stage 1 markers are documented (stage1.py
+                    # "## Stage 2 Flag Relay (FIX B)") to carry flag_type
+                    # alongside task_id; falls back to None (no signature,
+                    # same as before) when a legacy marker omits it.
+                    'flag_type': f.get('metadata', {}).get('flag_type'),
                     'content': f['content'],
                 }
             )
+
+        # recon_report systemic_pattern channel (task-1966 scope item 2): an
+        # independent poll that does NOT pass through filter_suppressed, so a
+        # stage1_flag_suppression record can never hide a systemic_pattern
+        # finding from Stage 2 through this path.  Deduped against
+        # combined_flags (Stage 1 + Mem0 channels) by compute_flag_signature so
+        # a finding that also survived the primary channel is not double-rendered.
+        existing_signatures = {
+            sig for flag in combined_flags
+            if (sig := compute_flag_signature(flag)) is not None
+        }
+        polled_systemic_findings = _query_recon_report_findings(
+            self._recon_report_state, self._current_run_id
+        )
+        appended = 0
+        for finding in polled_systemic_findings:
+            sig = compute_flag_signature(finding)
+            if sig is not None and sig in existing_signatures:
+                continue
+            combined_flags.append(
+                {
+                    '_source': 'recon_report_systemic',
+                    'task_id': finding.get('task_id'),
+                    'flag_type': finding.get('flag_type'),
+                    'finding_id': finding.get('finding_id'),
+                    'content': finding.get('description'),
+                }
+            )
+            if sig is not None:
+                existing_signatures.add(sig)
+            appended += 1
+        self._recon_report_systemic_polled = appended
 
         flagged_text = _format_flagged(combined_flags, run_stage='stage2')
 

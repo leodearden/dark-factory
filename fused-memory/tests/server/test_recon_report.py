@@ -1818,3 +1818,130 @@ class TestGetAssembledReportNonActionableEchoSuppression:
             f'flagged_items finding_ids: {finding_ids}'
         )
 
+
+# ---------------------------------------------------------------------------
+# task-1966 step-8: get_findings_for_run — RED until step-9 adds the method
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportGetFindingsForRun:
+    """Verify ReconReportState.get_findings_for_run(run_id) aggregates findings
+    across ALL stages of a run, raw (no Fix-1 read-time suppression), and is
+    isolated across run_ids.
+
+    This is the independent "recon_report channel" that Stage 2 polls
+    (task-1966 scope item 2) so systemic_pattern findings survive even when
+    the Mem0 flagged-items channel is suppressed by a task_id-scoped
+    stage1_flag_suppression record.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def test_returns_all_findings_across_stages_for_run(self):
+        state, _ = self._make_state()
+
+        # Stage 1 — memory_consolidator: two findings, different categories.
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='p')
+        f1 = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='systemic_pattern',
+            description='systemic d',
+            suggested_action='a1',
+            actionable=True,
+            task_id='452',
+            flag_type='live_workflow_recurrence_counter_needed',
+        )
+        assert 'finding_id' in f1, f'Stage 1 add_finding #1 failed: {f1}'
+        f2 = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='task_memory_mismatch',
+            description='mismatch d',
+            suggested_action='a2',
+            actionable=True,
+            task_id='99',
+            flag_type='memory_task_mismatch',
+        )
+        assert 'finding_id' in f2, f'Stage 1 add_finding #2 failed: {f2}'
+
+        # Stage 2 — task_knowledge_sync, same run_id, distinct signature (avoid
+        # cross-stage in-run dedup colliding with f1).
+        state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='p')
+        f3 = state.add_finding(
+            run_id='r1',
+            severity='high',
+            category='systemic_pattern',
+            description='systemic d2',
+            suggested_action='a3',
+            actionable=True,
+            task_id='452',
+            flag_type='another_flag_type',
+        )
+        assert 'finding_id' in f3, f'Stage 2 add_finding failed: {f3}'
+
+        results = state.get_findings_for_run('r1')
+        assert isinstance(results, list)
+        ids = {r['finding_id'] for r in results}
+        assert ids == {f1['finding_id'], f2['finding_id'], f3['finding_id']}
+
+        by_id = {r['finding_id']: r for r in results}
+        systemic = by_id[f1['finding_id']]
+        assert systemic['category'] == 'systemic_pattern'
+        assert systemic['description'] == 'systemic d'
+        assert systemic['severity'] == 'moderate'
+        assert systemic['suggested_action'] == 'a1'
+        assert systemic['actionable'] is True
+        assert systemic['task_id'] == '452'
+        assert systemic['flag_type'] == 'live_workflow_recurrence_counter_needed'
+        assert systemic['cited_entities'] == []
+        assert systemic['cited_edges'] == []
+        assert systemic['cited_tasks'] == []
+        assert systemic['cited_memories'] == []
+
+    def test_cross_run_isolation(self):
+        """A finding filed under run 'r2' must never appear in get_findings_for_run('r1')."""
+        state, _ = self._make_state()
+
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='p')
+        f1 = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='systemic_pattern',
+            description='r1 finding',
+            suggested_action='a',
+            actionable=True,
+            task_id='452',
+            flag_type='live_workflow_recurrence_counter_needed',
+        )
+        assert 'finding_id' in f1, f'run r1 add_finding failed: {f1}'
+
+        state.start_report(run_id='r2', stage='memory_consolidator', project_id='p')
+        f2 = state.add_finding(
+            run_id='r2',
+            severity='moderate',
+            category='systemic_pattern',
+            # Same (task_id, flag_type) signature as f1 — must be allowed since
+            # in-run dedup is scoped per run_id, and must not leak into r1's
+            # results.
+            description='r2 finding',
+            suggested_action='a',
+            actionable=True,
+            task_id='452',
+            flag_type='live_workflow_recurrence_counter_needed',
+        )
+        assert 'finding_id' in f2, f'run r2 add_finding failed: {f2}'
+
+        results_r1 = state.get_findings_for_run('r1')
+        ids_r1 = {r['finding_id'] for r in results_r1}
+        assert ids_r1 == {f1['finding_id']}
+        assert f2['finding_id'] not in ids_r1
+
+    def test_unknown_run_id_returns_empty_list(self):
+        state, _ = self._make_state()
+        assert state.get_findings_for_run('does-not-exist') == []
+

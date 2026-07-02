@@ -26,6 +26,17 @@ suppression record are dropped entirely; the remaining flags proceed through
 the signature-dedup loop unchanged.  This enforces the suppression contract
 in code, making it authoritative over the LLM-side prompt directive.
 
+Scoped (task_id, flag_type) suppression (task-1966)
+-----------------------------------------------------
+A suppression record MAY carry an optional ``metadata.flag_types`` allowlist
+(``build_suppression_payload(task_id, flag_types=[...])``).  When present and
+non-empty, the record suppresses ONLY those (task_id, flag_type) pairs,
+leaving other flag_types for the same task_id free to surface.  When absent
+(the legacy shape written by all pre-existing hand-authored records), the
+record blanket-suppresses ALL flag_types for that task_id, exactly as before.
+When both a scoped and a legacy/blanket record exist for the same task_id,
+the blanket record wins (union semantics) — see ``filter_suppressed``.
+
 Best-effort replacement contract (task-1146, hardened in task-1165)
 --------------------------------------------------------------------
 On every HIT the dedup flow is:
@@ -150,7 +161,7 @@ import asyncio
 import hashlib
 import logging
 import re
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.mem0_dedup import find_prior_memories
@@ -169,10 +180,17 @@ class _SuppressionMetadata(TypedDict):
     and ``str`` task_ids for backward compat with legacy hand-authored
     records — do NOT tighten the reader to int-only without a migration
     of any pre-existing str-task_id records in Mem0.
+
+    ``flag_types`` is an OPTIONAL scoping allowlist (task-1966).  When
+    present and non-empty, the record suppresses ONLY those flag_types for
+    this task_id.  When absent — the legacy shape carried by all
+    pre-existing hand-authored records — the record blanket-suppresses ALL
+    flag_types for this task_id.
     """
 
     kind: Literal['stage1_flag_suppression']
     task_id: int
+    flag_types: NotRequired[list[str]]
 
 
 class SuppressionPayload(TypedDict):
@@ -368,23 +386,38 @@ async def filter_suppressed(
     project_id: str,
     flags: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Drop flags whose ``task_id`` has an active ``stage1_flag_suppression`` record.
+    """Drop flags matched by an active ``stage1_flag_suppression`` record.
 
     Performs one project-scoped Mem0 search per call to retrieve all active
-    suppression records.  Suppressed task_ids are extracted into a set; flags
-    whose ``task_id`` is in that set are dropped.  The remaining flags are
-    returned unchanged so they can proceed through the signature-dedup loop.
+    suppression records, then builds a ``task_id -> (wildcard | flag_types)``
+    map:
+
+    - A record WITHOUT a non-empty ``metadata.flag_types`` (the legacy shape)
+      is a WILDCARD — it blanket-suppresses every flag_type for that task_id.
+    - A record WITH a non-empty ``metadata.flag_types`` is SCOPED — it
+      suppresses only those (task_id, flag_type) pairs.
+    - When both a scoped and a wildcard record exist for the same task_id
+      (in either search order), the wildcard wins — union semantics, since a
+      blanket suppression cannot be narrowed by a more specific record.
+
+    A flag is dropped iff its ``task_id`` has a wildcard entry, or has a
+    scoped entry whose set contains the flag's (str-coerced) ``flag_type``.
+    A flag with no ``flag_type`` (``None``/absent) can never match a scoped
+    entry — it is kept unless the task_id entry is a wildcard.  The remaining
+    flags are returned unchanged so they can proceed through the
+    signature-dedup loop.
 
     Canonical suppression record schema (owned by the producer task):
     - ``metadata.kind == "stage1_flag_suppression"``
     - ``metadata.task_id == <N>`` (int or str; coerced to str on both sides)
+    - ``metadata.flag_types == [<str>, ...]`` (optional scoping allowlist)
 
-    Both fields must be present and correct for a record to be treated as a
-    suppression — this rejects vector-search near-misses that only match on
-    semantic proximity.  ``task_id`` values that are ``None`` or ``''`` in a
-    suppression record are skipped (invalid; not added to the suppressed set),
-    preventing a malformed record from accidentally suppressing flags that have
-    no task_id.
+    Both ``kind`` and ``task_id`` must be present and correct for a record to
+    be treated as a suppression — this rejects vector-search near-misses that
+    only match on semantic proximity.  ``task_id`` values that are ``None``
+    or ``''`` in a suppression record are skipped (invalid; not added to the
+    map), preventing a malformed record from accidentally suppressing flags
+    that have no task_id.
 
     The search uses ``limit=501`` internally so that genuine overflow can be
     detected without false positives.  When exactly 500 results are returned
@@ -423,7 +456,9 @@ async def filter_suppressed(
         )
         results = results[:500]
 
-    suppressed_task_ids: set[str] = set()
+    # task_id (str) -> None (wildcard/blanket) | set[str] (scoped flag_types
+    # allowlist).  See docstring for wildcard-wins union semantics.
+    suppressed: dict[str, set[str] | None] = {}
     for r in results:
         meta = r.metadata or {}
         if meta.get('kind') != 'stage1_flag_suppression':
@@ -431,13 +466,38 @@ async def filter_suppressed(
         task_id = meta.get('task_id')
         if task_id is None or task_id == '':
             continue
-        suppressed_task_ids.add(str(task_id))  # required: legacy records may carry task_id as int or str; coerce both sides for compat
+        tid_str = str(task_id)  # required: legacy records may carry task_id as int or str; coerce both sides for compat
+
+        if tid_str in suppressed and suppressed[tid_str] is None:
+            continue  # already wildcard for this task_id; cannot be narrowed further
+
+        flag_types = meta.get('flag_types')
+        if not flag_types:
+            # Unscoped/legacy record -> wildcard; overrides any scoped entry
+            # accumulated so far for this task_id (union semantics: wildcard wins).
+            suppressed[tid_str] = None
+            continue
+
+        scoped = suppressed.get(tid_str)
+        if not isinstance(scoped, set):
+            scoped = set()
+            suppressed[tid_str] = scoped
+        scoped.update(str(ft) for ft in flag_types)
 
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
         if flag_tid is None or flag_tid == '':
             return True  # symmetric with producer-side suppression-record guard above
-        return str(flag_tid) not in suppressed_task_ids
+        tid_str = str(flag_tid)
+        if tid_str not in suppressed:
+            return True
+        allowlist = suppressed[tid_str]
+        if allowlist is None:
+            return False  # wildcard/blanket suppression
+        flag_type = f.get('flag_type')
+        if flag_type is None:
+            return True  # cannot match a scoped allowlist without a flag_type
+        return str(flag_type) not in allowlist
 
     return [f for f in flags if _keep(f)]
 
@@ -852,7 +912,9 @@ async def dedup_flags(
     return result
 
 
-def build_suppression_payload(task_id: int | str) -> SuppressionPayload:
+def build_suppression_payload(
+    task_id: int | str, flag_types: list[str] | None = None
+) -> SuppressionPayload:
     """Build the canonical ``stage1_flag_suppression`` Mem0 payload for *task_id*.
 
     Returns a :class:`SuppressionPayload` with ``content``, ``category``, and
@@ -865,9 +927,19 @@ def build_suppression_payload(task_id: int | str) -> SuppressionPayload:
     must be passed separately to ``memory_service.add_memory``, keeping this
     helper pure and reusable across projects.
 
+    ``flag_types`` is an OPTIONAL scoping allowlist (task-1966).  When a
+    non-empty list is given, each element is coerced to ``str`` and the list
+    is sorted+deduped before being stored under ``metadata.flag_types`` — the
+    record then suppresses ONLY those (task_id, flag_type) pairs.  When
+    ``None`` or empty (the default), ``metadata.flag_types`` is omitted
+    entirely and the record keeps the legacy blanket-suppression-for-task_id
+    shape, so ``build_suppression_payload(task_id)`` is unchanged for all
+    existing callers.
+
     Canonical schema (Mem0, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
       - ``metadata.task_id = <N>`` (int — coerced by this function)
+      - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
     """
     try:
@@ -877,13 +949,16 @@ def build_suppression_payload(task_id: int | str) -> SuppressionPayload:
             f'build_suppression_payload: task_id must be an int or numeric '
             f'string, got {task_id!r}'
         ) from e
+    metadata: _SuppressionMetadata = {
+        'kind': 'stage1_flag_suppression',
+        'task_id': tid,
+    }
+    if flag_types:
+        metadata['flag_types'] = sorted({str(ft) for ft in flag_types})
     return {
         'content': f'STAGE 1 FLAG SUPPRESSION task_id={tid}',
         'category': 'observations_and_summaries',
-        'metadata': {
-            'kind': 'stage1_flag_suppression',
-            'task_id': tid,
-        },
+        'metadata': metadata,
     }
 
 
@@ -892,6 +967,7 @@ async def write_suppression_record(
     *,
     project_id: str,
     task_id: int | str,
+    flag_types: list[str] | None = None,
     causation_id: str | None = None,
 ) -> AddMemoryResponse:
     """Write a ``stage1_flag_suppression`` record to Mem0 for *task_id*.
@@ -905,15 +981,22 @@ async def write_suppression_record(
     writes from ``'stage1_flag_dedup'`` and ``'targeted_recon'`` writes in the
     audit journal, enabling per-class retention and query filtering.
 
+    ``flag_types`` is an OPTIONAL scoping allowlist (task-1966), forwarded
+    verbatim to :func:`build_suppression_payload`.  When a non-empty list is
+    given, the record suppresses ONLY those (task_id, flag_type) pairs.  When
+    ``None`` or empty (the default), ``metadata.flag_types`` is omitted and
+    the record keeps the legacy blanket-suppression-for-task_id shape.
+
     Canonical schema (Mem0, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
       - ``metadata.task_id = <N>`` (int — coerced by build_suppression_payload)
+      - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
       - ``content = "STAGE 1 FLAG SUPPRESSION task_id=<N>"``
 
     Returns the :class:`AddMemoryResponse` from the memory service so callers
     can inspect ``memory_ids`` for empty-list deduplication / no-op detection.
     """
-    payload = build_suppression_payload(task_id)
+    payload = build_suppression_payload(task_id, flag_types=flag_types)
     return await memory_service.add_memory(
         **payload,
         project_id=project_id,

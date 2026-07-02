@@ -483,19 +483,37 @@ check yourself — suppressed flags are dropped automatically.
 
 As an optimisation you *may* skip emitting a flag for a task that you know is \
 suppressed, but the code gate is the authoritative enforcement point; any flag you \
-emit for a suppressed task_id will be dropped by the post-processor regardless.
+emit for a suppressed task_id (and, for a scoped record, matching flag_type — see \
+below) will be dropped by the post-processor regardless.
 
 Canonical suppression record schema (Mem0, observations_and_summaries category) — \
 this is the producer's contract source-of-truth read by the post-processor:
   - `metadata.kind = "stage1_flag_suppression"`
   - `metadata.task_id = <N>` (pinned to `int` by `build_suppression_payload`)
+  - `metadata.flag_types = [<str>, ...]` (OPTIONAL scoping allowlist — task-1966)
   - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`
+
+Scoped vs. legacy suppression (task-1966): a record WITH a non-empty \
+`metadata.flag_types` suppresses ONLY those (task_id, flag_type) pairs, leaving \
+other flag_types for the same task_id free to surface. A record WITHOUT \
+`flag_types` (absent, `None`, or empty — the legacy shape) blanket-suppresses ALL \
+flag_types for that task_id, exactly as before. When both a scoped and a \
+legacy/blanket record exist for the same task_id, the blanket record wins (union \
+semantics) — a blanket suppression cannot be narrowed by a more specific record.
 
 Producing a suppression record: operators and remediation hooks should call \
 `fused_memory.reconciliation.flag_dedup.write_suppression_record(memory_service, \
-project_id=..., task_id=N)` rather than constructing the canonical schema by hand. \
-The helper coerces `task_id` to int and pins the metadata.kind/content shape so \
-future schema changes touch one location.
+project_id=..., task_id=N, flag_types=[...])` rather than constructing the \
+canonical schema by hand. The helper coerces `task_id` to int, sorts/dedupes \
+`flag_types`, and pins the metadata.kind/content shape so future schema changes \
+touch one location. **Prefer a scoped record** (explicit `flag_types`) over the \
+legacy blanket form: scoping to the specific flag_type(s) you intend to suppress \
+means a newly-relevant flag_type for the same task is NOT silently blanket-blocked. \
+This is not hypothetical — an unscoped record once let an unrelated flag_type's \
+blanket suppression hide a genuinely recurring \
+`live_workflow_recurrence_counter_needed` flag for 6+ cycles with no tracking task. \
+Omit `flag_types` only when you deliberately want to silence every flag_type for \
+that task.
 
 If you do choose to check: call \
 `search(query="stage1_flag_suppression task_id=<N>", project_id=..., \
@@ -509,7 +527,11 @@ Historical/legacy suppression records were written with `task_id` as either \
 but readers MUST coerce both sides via `str(...)` to remain compatible with \
 legacy data: a result is a valid suppression record ONLY when BOTH \
 `metadata.kind == "stage1_flag_suppression"` AND \
-`str(result.metadata.get('task_id')) == str(target_task_id)`. Do NOT rely on \
+`str(result.metadata.get('task_id')) == str(target_task_id)`. When the matched \
+record also carries a non-empty `metadata.flag_types`, it is in effect for your \
+candidate flag ONLY if `str(candidate_flag_type)` also appears in that list \
+(str-coerced, same convention as task_id); an empty/absent `flag_types` means the \
+record is blanket and applies regardless of flag_type. Do NOT rely on \
 semantic/vector proximity alone — a result that fails either metadata field, or \
 an empty result set, means "no suppression in effect"; proceed normally.
 
@@ -521,7 +543,9 @@ code, keeping prompt-driven and code-driven outcomes aligned.
 
 Suppression is distinct from the post-processor dedup described in the next section. \
 Dedup collapses repeated emissions of the same (task_id, flag_type) pair across runs; \
-suppression authoritatively forbids ANY flag emission for a specific task. \
+suppression authoritatively forbids flag emission for a task_id — either for every \
+flag_type (legacy blanket record) or for a scoped subset of flag_types (a record \
+carrying a non-empty `flag_types`). \
 The contamination cycle motivating this gate: Stage 1 writes a violating flag → Stage 3 \
 detects it → remediation deletes it → next cycle Stage 1 writes it again. \
 `flag_dedup.filter_suppressed` breaks this cycle deterministically in code.
