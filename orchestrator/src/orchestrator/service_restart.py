@@ -87,11 +87,19 @@ async def schedule_detached_systemd_restart(
     """Schedule a detached, cgroup-escaping self-restart via ``systemd-run --user``.
 
     Mirrors ``DeterministicRunner._default_schedule_detached_restart``'s argv
-    pattern but WITHOUT the ``/bin/sh`` on-failure escalation wrapper: the
-    restart script (``scripts/restart-orchestrator.sh``) already self-verifies
-    and self-reports failures to journald, and the coordinator's
-    ``maybe_restart`` already clears its pending flag when the injected
-    executor raises — so no additional failure plumbing is needed here.
+    pattern but WITHOUT its ``/bin/sh`` on-failure escalation wrapper — an
+    accepted gap for this operator-gated rollout (see config.py's
+    ``orchestrator_restart_on_merge_enabled`` comment). Concretely: this
+    coroutine raises ONLY when the ``systemd-run`` *registration* itself
+    fails (rc != 0). Once registration succeeds it returns immediately (per
+    ``--on-active``, before the deferred payload has run), and the
+    coordinator's ``maybe_restart`` treats the fire as successful — it emits
+    the restart event and clears pending right away. A LATER fire-time
+    failure of ``scripts/restart-orchestrator.sh`` itself (e.g. a failed
+    MainPID/timestamp verify) is therefore NOT escalated anywhere
+    in-process; its only trace is the transient unit's journald output
+    (``journalctl --user -u <transient_unit>``). During the soak period,
+    operators should watch that log rather than relying on escalations.
 
     ``--on-active=<on_active_secs>`` defers execution so this call returns
     immediately after *registering* the transient unit; the restart payload
