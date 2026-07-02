@@ -1319,11 +1319,17 @@ def create_server(
         WarmLanePool, violating isolation invariant I1: interactive
         worktrees never touch the dispatch/speculation pools).
 
-        Returns ``{removed, path, branch}``. ``removed`` is False (not an
-        error) when the target was already gone — idempotent, safe to call
-        from a session-end hook after the δ reaper already cleaned up.  A
-        standalone server or a ``project_root`` mismatch returns ``{error}``
-        instead, and removes nothing.
+        Returns ``{removed, path, branch, branch_pruned}``. ``removed`` is
+        False (not an error) when the target was already gone — idempotent,
+        safe to call from a session-end hook after the δ reaper already
+        cleaned up.  A standalone server or a ``project_root`` mismatch
+        returns ``{error}`` instead, and removes nothing.
+
+        After removal, ``branch`` is deleted (``git branch -D``) — and
+        ``branch_pruned`` set True — only when its tip is an ancestor of
+        (already merged into) ``main``; an unmerged branch is left in place
+        so its commits are never lost.  ``branch_pruned`` is False whenever
+        the branch is unmerged, already gone, or removal itself did nothing.
         """
         if harness is None or getattr(harness, 'git_ops', None) is None:
             return {'error': 'escalation server running standalone — no harness wired'}
@@ -1359,7 +1365,20 @@ def create_server(
         await _run(['git', 'worktree', 'prune'], cwd=gops.project_root)
         removed = rc == 0
 
-        return {'removed': removed, 'path': str(path), 'branch': branch}
+        # Prune-if-merged: only delete branch once its tip is confirmed an
+        # ancestor of main — an unmerged branch's commits must never be lost.
+        branch_pruned = False
+        sha = await gops.resolve_branch_sha(branch)
+        if sha is not None and await gops.is_ancestor(sha, gops.config.main_branch):
+            rc_del, _, _ = await _run(['git', 'branch', '-D', branch], cwd=gops.project_root)
+            branch_pruned = rc_del == 0
+
+        return {
+            'removed': removed,
+            'path': str(path),
+            'branch': branch,
+            'branch_pruned': branch_pruned,
+        }
 
     # ── merge_status — read-only lifecycle probe (PRD α3 / task 1630) ──────────
 
