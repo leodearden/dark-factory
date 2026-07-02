@@ -31,7 +31,7 @@ import yaml
 from _workflow_helpers import FakeBriefing, FakeScheduler
 
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.agents.roles import IMPLEMENTER
+from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER
 from orchestrator.config import (
     OrchestratorConfig,
     TimeoutsConfig,
@@ -471,4 +471,45 @@ class TestS6NoOpReload:
         assert not harness_warnings, (
             'Expected no WARNING on a no-op reload; got '
             + repr([r.getMessage() for r in harness_warnings])
+        )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 8 (straddle, PRD decision 2): a task whose architect stage ran
+# under the OLD config and whose implementer stage runs AFTER a reload
+# spawns the implementer under the NEW value — no error, no special-casing.
+# This is the documented straddle behaviour: each _invoke call reads config
+# fresh, so a single task can straddle a reload with different stages
+# observing different config snapshots.
+# ---------------------------------------------------------------------------
+
+
+class TestS8Straddle:
+    """PRD boundary scenario 8: architect runs pre-reload, implementer runs post-reload."""
+
+    @pytest.mark.asyncio
+    async def test_architect_old_then_implementer_new(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        harness, config_path = _make_reload_harness(tmp_path, monkeypatch)
+        workflow, stub = _make_reload_workflow(harness, tmp_path, monkeypatch)
+
+        live_architect = harness.config.models.architect
+        architect_result = await workflow._invoke(ARCHITECT, 'plan it', tmp_path)
+        assert architect_result.success is True
+        assert stub.calls[-1]['model'] == live_architect, (
+            'the architect stage must run under the pre-reload model'
+        )
+
+        live_implementer = harness.config.models.implementer
+        new_implementer = _other_model(live_implementer)
+        _edit_yaml(config_path, 'models.implementer', new_implementer)
+        report = await harness.reload_config()
+        assert report['error'] is None
+
+        implementer_result = await workflow._invoke(IMPLEMENTER, 'implement it', tmp_path)
+        assert implementer_result.success is True
+        assert stub.calls[-1]['model'] == new_implementer, (
+            'the implementer stage spawned after the reload must use the NEW '
+            'model — the same workflow/task straddles the reload cleanly'
         )
