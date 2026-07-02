@@ -272,6 +272,7 @@ async def run_dry_run_unblock(
     head_sha, main_sha = await _capture_worktree_shas(worktree)
 
     config_dir: TaskConfigDir | None = None
+    preserve_config_dir = False
     try:
         # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
         # the main task's `claude-config-{task_id}` dir so this background
@@ -348,6 +349,8 @@ async def run_dry_run_unblock(
             entry = _cap_exhausted_entry(reason=reason, exc=cap_exc)
             result = None
 
+        preserve_config_dir = result is not None and is_zero_output_timeout(result)
+
     except Exception as exc:
         logger.warning('dry_run_unblock: unexpected error for task %s: %s', task_id, exc)
         entry = {
@@ -364,7 +367,20 @@ async def run_dry_run_unblock(
         result = None
     finally:
         if config_dir is not None:
-            config_dir.cleanup()
+            if preserve_config_dir:
+                logger.warning(
+                    'dry_run_unblock: config dir preserved for forensic analysis '
+                    '(doubly-wedged investigation) for task %s → %s',
+                    task_id, config_dir.path,
+                )
+            else:
+                try:
+                    config_dir.cleanup()
+                except Exception as exc:
+                    logger.warning(
+                        'dry_run_unblock: failed to clean up config dir for task %s: %s',
+                        task_id, exc,
+                    )
 
     # Stamp the git anchor onto the entry at a single point so all four
     # shapes (ok, investigation_failed, budget_exhausted, exception fallback)
