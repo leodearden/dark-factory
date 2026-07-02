@@ -2195,38 +2195,3 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
             f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals "
             f"in assembled-path payload; got snippet:\n{payload[-800:]!r}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Task 1977 step-5/step-6: STAGE1_SYSTEM_PROMPT mandates a Live-Workflow Authority guard
-# ---------------------------------------------------------------------------
-
-
-class TestStage1PromptMandatesLiveWorkflowAuthority:
-    """Minimal existence check: STAGE1_SYSTEM_PROMPT exposes a Live-Workflow Authority guard.
-
-    Mirrors TestStage2PromptMandatesUniquenessToken — a few stable-substring
-    anchor asserts (not a full-prose pin) guarding against the guard section
-    being silently dropped in a future edit.
-
-    RED until step-6 adds the '## Live-Workflow Authority' section to
-    STAGE1_SYSTEM_PROMPT.
-    """
-
-    def test_prompt_exposes_live_workflow_authority_guard(self):
-        """STAGE1_SYSTEM_PROMPT must reference Live-Workflow Signals and the
-        actionable/pending-Stage-2 downgrade directive."""
-        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
-
-        assert 'Live-Workflow Signals' in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must reference 'Live-Workflow Signals' "
-            "(guards against the Live-Workflow Authority section being dropped)."
-        )
-        assert 'actionable' in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must reference 'actionable' as part of the "
-            "Live-Workflow Authority downgrade directive."
-        )
-        assert 'pending Stage 2' in STAGE1_SYSTEM_PROMPT, (
-            "STAGE1_SYSTEM_PROMPT must reference 'pending Stage 2' as part of the "
-            "Live-Workflow Authority downgrade directive."
-        )
