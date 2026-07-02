@@ -702,28 +702,39 @@ class TestReconciliationConfigBacklogHardLimitOverrides:
 class TestPathScopeAdjudicatorConfigBudget:
     """Regression guard: max_budget_usd must clear the adjudicator's own call cost (task 1849).
 
-    The adjudicator's true cost is ~0.105 USD — dominated by FIXED overhead:
-    Sonnet + 3-turn json-schema flow + CLI base-context cache-creation (~13k tokens)
-    + the filing project's CLAUDE.md/memory auto-loaded from cwd.
+    The adjudicator's cost floor was measured at ~0.105 USD on 2026-06-19 against
+    Sonnet 4.6 — dominated by FIXED overhead: Sonnet + 3-turn json-schema flow +
+    CLI base-context cache-creation (~13k tokens) + the filing project's
+    CLAUDE.md/memory auto-loaded from cwd.
     The original 0.10 default was BELOW this cost, so every call returned
     error_max_budget_usd — a silent no-op that prevented any verdict=='allow'.
-    The 0.25 floor is ~2.4x above the true cost; the chosen default (0.30) gives ~2.85x margin.
+    That floor has since eroded as stack-wide cost-per-call rose (filing-project
+    CLAUDE.md growth + opus/sonnet alias-roll tokenizer inflation), tripping the
+    0.30 default the same way the sibling CuratorConfig tripped (task 1980) — so
+    task 1983 re-baselines the default to a flat $2.00, matching CuratorConfig's
+    durable ceiling. The 0.25 floor remains the minimum safe value below which the
+    adjudicator becomes a silent no-op.
     """
 
     def test_default_max_budget_usd_above_cost_floor(self):
         """PathScopeAdjudicatorConfig default must clear the 0.25 cost floor.
 
-        The adjudicator's true cost is ~0.105 USD (fixed CLI/base-context overhead +
-        3-turn json-schema flow + filing project CLAUDE.md/memory auto-loaded from cwd);
+        The adjudicator's cost floor was ~0.105 USD (fixed CLI/base-context overhead +
+        3-turn json-schema flow + filing project CLAUDE.md/memory auto-loaded from cwd),
+        since eroded by stack-wide cost-per-call growth (task 1983);
         a budget at or below cost means error_max_budget_usd before any verdict —
-        a silent no-op.  0.25 is the minimum safe floor (~2.4x above cost).
+        a silent no-op.  0.25 is the minimum safe floor.
         """
-        # 0.10 < 0.25 is False — RED before the fix; 0.30 >= 0.25 is True — GREEN after
+        # 0.10 < 0.25 is False — RED before the fix; 2.00 >= 0.25 is True — GREEN after
         assert PathScopeAdjudicatorConfig().max_budget_usd >= 0.25, (
             'PathScopeAdjudicatorConfig.max_budget_usd must be >= 0.25 '
-            '(the adjudicator true cost is ~0.105 USD; anything at or below cost '
-            'returns error_max_budget_usd before any verdict, making it a silent no-op). '
-            'Raise the default — see task 1849.'
+            '(the adjudicator cost floor was ~0.105 USD and has since risen; anything '
+            'at or below cost returns error_max_budget_usd before any verdict, making '
+            'it a silent no-op). Raise the default — see task 1849 / task 1983.'
+        )
+        assert PathScopeAdjudicatorConfig().max_budget_usd == pytest.approx(2.00), (
+            'PathScopeAdjudicatorConfig.max_budget_usd must be re-baselined to a flat '
+            '$2.00 (task 1983), matching CuratorConfig\'s durable ceiling (task 1980).'
         )
 
     def test_deployed_config_max_budget_usd_above_floor(self, monkeypatch):
@@ -738,15 +749,16 @@ class TestPathScopeAdjudicatorConfigBudget:
         assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
         monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
         # config.yaml currently has no path_scope_adjudicator section, so today
-        # this test exercises the default-fallback path (schema default = 0.30).
+        # this test exercises the default-fallback path (schema default = 2.00).
         # It will catch a future YAML edit that explicitly pins the budget below cost.
         cfg = FusedMemoryConfig()
         assert cfg.path_scope_adjudicator.max_budget_usd >= 0.25, (
             f'Effective path_scope_adjudicator.max_budget_usd (got '
             f'{cfg.path_scope_adjudicator.max_budget_usd!r}) must be >= 0.25 — '
-            f'the adjudicator true cost is ~0.105 USD; a budget at or below cost '
-            f'returns error_max_budget_usd before any verdict (silent no-op). '
-            f'Check config.yaml for an override that pins the budget below cost.'
+            f'the adjudicator cost floor was ~0.105 USD and has since risen; a budget '
+            f'at or below cost returns error_max_budget_usd before any verdict '
+            f'(silent no-op). Check config.yaml for an override that pins the budget '
+            f'below cost.'
         )
 
 
