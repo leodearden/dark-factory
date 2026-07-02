@@ -41,6 +41,9 @@ WATCHED = [
     (8102, "orchestrator-dark-factory.service"),
     (8100, "orchestrator-reify.service"),
     (8106, "orchestrator-my-solar-challenge.service"),
+    (8105, "orchestrator-know-live.service"),
+    (8101, "orchestrator-autopilot-video.service"),
+    (8107, "orchestrator-solar-challenge-platform.service"),
 ]
 
 # Skip the port probe for a unit that started within this many seconds.
