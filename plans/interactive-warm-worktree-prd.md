@@ -2,10 +2,9 @@
 
 **Status:** deferred · authored 2026-07-02 · greenfield feature
 
-> **⚠ Two design forks were DEFAULTED without confirmation (author was AFK at authoring time).**
-> Override either before decompose/queue:
-> 1. **Mechanism = "fresh CoW-seeded worktree, no pool"** (rejected: reserved-band pooled lane, shared-budget pooled lane). See *Resolved design decisions* §1.
-> 2. **Consumer = escalation verb + wire `/do`** (rejected: verb-only, dedicated `/warm` skill). See §2.
+> **⚠ Fork status (author was AFK at authoring time):**
+> 1. **Mechanism = "fresh CoW-seeded worktree, no pool"** — **DEFAULTED, still overridable** (rejected: reserved-band pooled lane, shared-budget pooled lane). See *Resolved design decisions* §1.
+> 2. **Consumer = escalation verb + wire `/do` + a dedicated explicit-only `/warm` skill** — **RESOLVED by user 2026-07-02** (verb-only rejected; `/do` wiring and the `/warm` skill both adopted). See §2.
 
 ---
 
@@ -41,7 +40,7 @@ Per-project by construction: each project's orchestrator serves the verb on its 
 ## Resolved design decisions
 
 1. **Isolated warm worktree, NOT a pool lane** *(defaulted — fork 1)*. The pooled options (reserved band / shared budget) buy only the saved `git worktree add` + one reflink, while dragging in dispatch-capacity coupling, force-steal exposure, and restart bookkeeping. Because CoW-seed + `worktree add` are both cheap, the isolated path delivers the same warmth at far lower blast radius. The `_iact-*` band is **invariantly disjoint** from `_lane-*`/`_spec-*` and never affects dispatch capacity.
-2. **Escalation verb + wire `/do`** *(defaulted — fork 2)*. `/do` is the concrete G1 consumer (avoids a producer-orphan verb). It **prefers** the warm claim and **cold-falls-back** to `EnterWorktree` when no orchestrator/base is reachable, preserving `/do`'s robustness. Trade-off accepted: a claimed `_iact-*` worktree is a raw worktree the Claude Code harness does not track (no `ExitWorktree`); cleanup is owned by the release verb + reaper, and `/merge-queue` is branch-based so it is unaffected.
+2. **Escalation verb + wire `/do` + a dedicated explicit-only `/warm` skill** *(fork 2 — resolved by user 2026-07-02)*. Two consumer surfaces over the same verbs: **(a)** `/do` **prefers** the warm claim and **cold-falls-back** to `EnterWorktree` when no orchestrator/base is reachable, so the autonomous hand-off path is warm without losing robustness; **(b)** a new **`/warm` skill** — **explicit-only** (triggers solely on a typed `/warm`, never auto-invoked, mirroring `/do`'s trigger discipline) — gives an interactive session a first-class "put me in a warm worktree now" command for ad-hoc work that does not go through `/do`. Both name `/merge-queue`-compatible `task/<slug>` branches. Trade-off accepted: a claimed `_iact-*` worktree is a raw worktree the Claude Code harness does not track (no `ExitWorktree`); cleanup is owned by the release verb + reaper, and `/merge-queue` is branch-based so it is unaffected.
 3. **Branch identity `task/<slug>`** (via `config.branch_prefix`), so `/merge-queue` lands it unchanged; `.task/interactive.json` stamp gives the reaper an owner + age without needing a DB task.
 4. **Reuse `_seed_warm_lane` verbatim** — do not fork the seed logic; the interactive worktree gets reify's symlink-gen-dir resolution and `flock` reader-refcount GC safety for free.
 5. **Fail-soft warmth** — absent/failed seed never blocks the claim; the verb returns `warm=False` and a usable cold worktree.
@@ -82,7 +81,7 @@ Corollary: claiming or releasing an interactive worktree leaves the pool's FREE 
 
 ## Decomposition plan
 
-Labels are placeholders; task IDs assigned at decompose. DAG: **α → {β, δ}; β → {ε, ζ}; δ → ζ.** Leaves: **ε, ζ**. Intermediates: **α, β, δ**.
+Labels are placeholders; task IDs assigned at decompose. DAG: **α → {β, δ}; β → {ε, η, ζ}; δ → ζ.** Leaves: **ε, η, ζ**. Intermediates: **α, β, δ**.
 
 - **α — `GitOps.create_interactive_worktree` primitive + config knobs** *(intermediate; unlocks β, δ)*
   - Modules: `orchestrator/src/orchestrator/git_ops.py`, `config.py`/`defaults.yaml`.
@@ -107,6 +106,12 @@ Labels are placeholders; task IDs assigned at decompose. DAG: **α → {β, δ};
   - Change: call `claim_warm_worktree` on the project's escalation MCP; on success `cd` into the returned path on the `task/<slug>` branch; add a release-on-session-end step; on unreachable/failure fall back to `EnterWorktree`.
   - Signal (user-observable): running `/do` with a live orchestrator + warm base lands the session in a warm `_iact-*` worktree whose first build recompiles near-zero; cleanly cold-falls-back to `EnterWorktree` when the orchestrator is down.
   - Capability bindings: β's verbs → `producer:task-β` (upstream) · `EnterWorktree` fallback → existing harness builtin.
+
+- **η — explicit-only `/warm` skill** *(LEAF — G1 consumer; depends β)*
+  - Modules: `skills/warm/SKILL.md` (new).
+  - New skill whose description is **explicit-only** — triggers ONLY on a typed `/warm`, never auto-invoked (mirror `/do`'s "ONLY runs when the user explicitly types /do — never auto-invoke it" language). On invocation: call `claim_warm_worktree` on the project's escalation MCP, `cd` into the returned `task/<slug>` worktree, surface `warm`/`base_ref` to the user, register release-on-session-end; on unreachable/failure print a clear cold-fallback note (never silent).
+  - Signal (user-observable): typing `/warm` lands the session in a warm `_iact-*` worktree whose first build recompiles near-zero; with the orchestrator down it reports the fallback rather than erroring.
+  - Capability bindings: β's verbs → `producer:task-β` (upstream) · skill-trigger discipline → mirror `skills/do/SKILL.md`.
 
 - **ζ — integration-gate boundary test** *(LEAF — the H integration gate; depends β, δ)*
   - Modules: `orchestrator/tests/` (new end-to-end test/example).
