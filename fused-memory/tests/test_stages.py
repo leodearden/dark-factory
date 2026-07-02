@@ -4468,6 +4468,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
             )
 
         ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
         call_kwargs = ack_mock.await_args.kwargs
         assert call_kwargs.get('mode') == 'delete'
         assert call_kwargs.get('run_id') == 'r-test'
@@ -4529,6 +4530,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
             )
 
         ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
         call_kwargs = ack_mock.await_args.kwargs
         assert call_kwargs.get('resolved_flags') == []
         assert report.stats.get('stage1_flag_markers_acknowledged') == 0
@@ -13804,6 +13806,7 @@ class TestAcknowledgeResolvedStage1Markers:
 
         assert result == 1
         ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
         call_args = ack_mock.await_args.args
         call_kwargs = ack_mock.await_args.kwargs
         assert call_kwargs.get('mode') == 'tag'
@@ -13915,6 +13918,7 @@ class TestTaskKnowledgeSyncStage2FlagMarkersAcknowledgedStat:
 
         assert report.stats.get('stage2_flag_markers_acknowledged') == 2
         ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
         call_args = ack_mock.await_args.args
         assert call_args[0] is mock_deps['memory_service']
         assert call_args[1] == 'reify'
