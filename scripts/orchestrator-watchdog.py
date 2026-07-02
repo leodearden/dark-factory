@@ -417,6 +417,10 @@ def staleness_pass() -> None:
             if not is_unit_enabled(unit):
                 # Disabled (or unknown) — respect operator intent, skip silently.
                 continue
+            elapsed = _unit_start_elapsed_secs(unit)
+            if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
+                # None => grace does not apply, proceed (mirrors main()).
+                continue
             start_epoch = _unit_start_epoch(unit)
             if start_epoch is None:
                 continue  # undeterminable for this unit — skip, don't guess
