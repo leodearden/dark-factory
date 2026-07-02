@@ -1266,6 +1266,75 @@ def test_newest_watched_commit_epoch_timeout_returns_none(
 
 
 # ---------------------------------------------------------------------------
+# _JournalLog.warning() fail-soft swallow tests (follow-up from esc-2032-2)
+#
+# _JournalLog.warning() routes through the module-level log() helper and is
+# itself wrapped in `try/except Exception: pass` so a journald-write failure
+# can never convert a probe's return-None contract into a raised exception.
+# These tests monkeypatch log() to raise, then force each probe into its
+# broad-except branch (where logger.warning(...) is actually invoked) and
+# assert the probe still returns None with nothing propagating.
+# ---------------------------------------------------------------------------
+
+
+def test_unit_start_epoch_warning_log_failure_is_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_unit_start_epoch returns None (no raise) when its except-block's
+    logger.warning(...) call hits a log() that itself raises.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise RuntimeError("boom: systemctl subprocess exploded")
+
+    def fake_log(msg):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemd-cat")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", fake_log)
+
+    assert wdog._unit_start_epoch("some.service") is None
+
+
+def test_newest_watched_commit_epoch_warning_log_failure_is_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_watched_commit_epoch returns None (no raise) when its
+    except-block's logger.warning(...) call hits a log() that itself raises.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise RuntimeError("boom: git subprocess exploded")
+
+    def fake_log(msg):  # noqa: ANN001
+        raise OSError("journald socket unavailable")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "log", fake_log)
+
+    assert wdog._newest_watched_commit_epoch() is None
+
+
+def test_journal_log_warning_swallows_log_failure_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_JournalLog().warning(...) itself returns None without raising when
+    the underlying log() helper raises — the fail-soft guarantee in isolation,
+    independent of any calling probe.
+    """
+    wdog = _load_watchdog()
+
+    def fake_log(msg):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemd-cat")
+
+    monkeypatch.setattr(wdog, "log", fake_log)
+
+    assert wdog._JournalLog().warning("x") is None
+
+
+# ---------------------------------------------------------------------------
 # STALENESS_GRACE_SECS tests
 # ---------------------------------------------------------------------------
 
