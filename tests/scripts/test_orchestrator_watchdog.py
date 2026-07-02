@@ -1064,3 +1064,116 @@ def test_unit_start_epoch_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert wdog._unit_start_epoch("some.service") is None
 
+
+# ---------------------------------------------------------------------------
+# _newest_watched_commit_epoch tests
+# ---------------------------------------------------------------------------
+
+_EXPECTED_REPO_DIR = "/home/leo/src/dark-factory"
+_EXPECTED_WATCHED_PATHS = [
+    "orchestrator/src/",
+    "escalation/src/",
+    "orchestrator/pyproject.toml",
+    "orchestrator/uv.lock",
+    "escalation/pyproject.toml",
+]
+
+
+def test_newest_watched_commit_epoch_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_newest_watched_commit_epoch parses git's %ct output to an int."""
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="1783013906\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog._newest_watched_commit_epoch()
+
+    assert result == 1783013906
+    assert isinstance(result, int)
+    assert len(calls) == 1, f"Expected exactly one git call, got {calls}"
+    argv = calls[0]
+    assert argv[0] == "git"
+    assert argv[1] == "-C"
+    assert argv[2] == _EXPECTED_REPO_DIR
+    assert argv[3:7] == ["log", "-1", "--format=%ct", "HEAD"]
+    assert "--" in argv, f"argv must separate revision from pathspec with '--': {argv}"
+    watched_args = argv[argv.index("--") + 1 :]
+    for path in _EXPECTED_WATCHED_PATHS:
+        assert path in watched_args, f"Expected watched path {path!r} in argv {argv}"
+
+
+def test_newest_watched_commit_epoch_empty_stdout_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_watched_commit_epoch returns None on empty stdout (rc 0).
+
+    Confirmed real behavior: `git log -1 --format=%ct HEAD -- <paths>` exits 0
+    with empty stdout when no commit touches the given paths. This must be
+    treated as undeterminable, not epoch 0 (which would make everything look
+    infinitely stale).
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_watched_commit_epoch() is None
+
+
+def test_newest_watched_commit_epoch_nonzero_rc_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_watched_commit_epoch returns None when git exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(
+            cmd, 128, stdout="", stderr="fatal: not a git repository"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_watched_commit_epoch() is None
+
+
+def test_newest_watched_commit_epoch_unparseable_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_watched_commit_epoch returns None when stdout is not an int."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="not-an-epoch\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_watched_commit_epoch() is None
+
+
+def test_newest_watched_commit_epoch_missing_binary_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_watched_commit_epoch returns None when git binary is not found."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "git")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_watched_commit_epoch() is None
+
+
+def test_newest_watched_commit_epoch_timeout_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_newest_watched_commit_epoch returns None when the git call times out."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._newest_watched_commit_epoch() is None
+
