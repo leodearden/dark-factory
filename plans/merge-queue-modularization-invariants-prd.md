@@ -304,7 +304,7 @@ Strictly linear chain: each task depends on its predecessor. All tasks
   integration test is green in CI. Consumer: ρ + operator confidence.
 - **ρ — Deterministic deploy: restart all running orchestrators.**
   `task_kind='deterministic'`, `before_done={script:
-  'scripts/restart-all-orchestrators.sh', args: [], timeout_secs: 600,
+  'scripts/restart-all-orchestrators.sh', args: [], timeout_secs: 900,
   target_unit: 'orchestrator-dark-factory.service'}`, `always_escalates=false`
   (auto-deploy preset: escalate only on failure; done='scheduled' via detached
   self-restart). Signal: runner stamps `done_provenance
