@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -69,6 +70,31 @@ def _get_merge_worker(harness: Any | None) -> Any | None:
     if harness is None:
         return None
     return getattr(harness, '_merge_worker', None)
+
+
+def _require_matching_project_root(harness: Any, project_root: str) -> str | None:
+    """Return an error message if *project_root* doesn't match this server's project.
+
+    The escalation server closes over exactly one project's ``harness``, so
+    *project_root* can never be used to route a call — it is a defensive
+    validation guard.  Resolved-path equality (not string equality) so
+    trailing slashes / relative segments / symlink differences don't produce
+    false-positive mismatches.  Returns None when they match.
+
+    Shared by claim_warm_worktree and release_warm_worktree (PRD β, task
+    2011) so a multi-project interactive caller (/do, /warm) that mis-targets
+    an escalation MCP endpoint gets a clean testable failure instead of
+    claiming/releasing a worktree against the wrong orchestrator.
+    """
+    gops_root = Path(harness.git_ops.project_root).resolve()
+    given_root = Path(project_root).resolve()
+    if given_root != gops_root:
+        return (
+            f'project_root mismatch: {project_root!r} does not match this '
+            f"server's wired project ({harness.git_ops.project_root!s}, "
+            f'resolved {gops_root!s}).'
+        )
+    return None
 
 
 # C1 action enum for resolve_issue — five valid values, two disposition buckets.
@@ -1208,6 +1234,181 @@ def create_server(
                 'error': 'escalation server running standalone — no harness wired',
             }
         return await harness.reload_config()
+
+    # --- Interactive warm-worktree tools (PRD β / task 2011) ---
+
+    @mcp.tool()
+    async def claim_warm_worktree(
+        slug: str, project_root: str, *, start_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Claim an isolated interactive warm-worktree (PRD β, task 2011).
+
+        Thin closure over :meth:`GitOps.create_interactive_worktree` (task α,
+        2010) for out-of-process interactive callers (/do, /warm, the
+        integration gate) that cannot reach ``harness.git_ops`` directly.
+        Mints a fresh worktree in the ``_iact-*`` band on branch
+        ``task/<slug>``, CoW-seeding its build cache when possible.
+
+        *project_root* is validated against this server's wired
+        ``harness.git_ops.project_root`` (resolved-path equality) — it is a
+        defensive guard, NOT a routing key: this server always serves exactly
+        one project, so a mismatch means the caller is talking to the wrong
+        escalation MCP endpoint.
+
+        Returns ``{path, branch, warm, base_ref}`` on success. ``path`` is an
+        absolute string (not a ``Path``). ``warm=False`` is a fail-soft
+        SUCCESS — the CoW seed faulted but the worktree is still usable; it
+        is never surfaced as an error.
+
+        On failure returns ``{error, reason}`` instead of raising — callers
+        should surface ``error`` and, for ``reason='interactive_worktree_limit'``,
+        fall back to a cold worktree/clone rather than retrying immediately.
+        ``reason`` is one of: ``'interactive_worktree_limit'`` (the _iact-*
+        cap is reached — free a slot and retry), ``'invalid_slug'`` (slug
+        fails the safe-charset validation), ``'git_failure'`` (start_ref/main
+        failed to resolve, or ``git worktree add`` failed).  A standalone
+        server (no harness wired) or a ``project_root`` mismatch returns
+        ``{error}`` with no ``reason`` key.
+        """
+        if harness is None or getattr(harness, 'git_ops', None) is None:
+            return {'error': 'escalation server running standalone — no harness wired'}
+        mismatch = _require_matching_project_root(harness, project_root)
+        if mismatch is not None:
+            return {'error': mismatch}
+
+        # Runtime-only reverse import: orchestrator depends on escalation, not
+        # vice versa (mirrors merge_request's lazy orchestrator.merge_queue
+        # import above) — unresolvable in escalation's standalone typecheck
+        # env, hence the suppression.
+        from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
+            InteractiveWorktreeLimitError,
+        )
+
+        try:
+            info = await harness.git_ops.create_interactive_worktree(
+                slug, start_ref=start_ref,
+            )
+        except InteractiveWorktreeLimitError as e:
+            return {'error': str(e), 'reason': 'interactive_worktree_limit'}
+        except ValueError as e:
+            return {'error': str(e), 'reason': 'invalid_slug'}
+        except RuntimeError as e:
+            return {'error': str(e), 'reason': 'git_failure'}
+
+        return {
+            'path': str(info.path),
+            'branch': info.branch,
+            'warm': info.warm,
+            'base_ref': info.base_ref,
+        }
+
+    @mcp.tool()
+    async def release_warm_worktree(path_or_branch: str, project_root: str) -> dict[str, Any]:
+        """Release an interactive warm-worktree claimed via claim_warm_worktree.
+
+        *path_or_branch* accepts either shape claim_warm_worktree returned: an
+        absolute worktree ``path``, or the ``task/<slug>`` ``branch`` name
+        (bare ``<slug>`` is also accepted). An existing directory, or any
+        absolute path (even one already removed — the idempotent second-call
+        case), is treated as path-mode; anything else is treated as
+        branch-mode. In path-mode, the branch is read from the worktree's
+        ``.task/interactive.json`` stamp when present and parseable, else
+        derived from the path's basename — a truncated/corrupt stamp never
+        raises, it just falls back to the basename derivation.
+
+        *project_root* is validated exactly like claim_warm_worktree's guard.
+
+        Runs ``git worktree remove --force`` + ``git worktree prune``
+        directly (task α added no removal primitive, and
+        ``GitOps.release_warm_lane`` is unusable here — it mutates
+        WarmLanePool, violating isolation invariant I1: interactive
+        worktrees never touch the dispatch/speculation pools).
+
+        Returns ``{removed, path, branch, branch_pruned}``, plus an optional
+        ``detail`` key holding the ``git worktree remove`` stderr whenever
+        ``removed`` is False and git reported something — lets a caller
+        distinguish an idempotent already-gone target from a genuine removal
+        failure (locked worktree, permission, ...).  ``removed`` is False
+        (not an error) when the target was already gone — idempotent, safe
+        to call from a session-end hook after the δ reaper already cleaned
+        up.  A standalone server or a ``project_root`` mismatch returns
+        ``{error}`` instead, and removes nothing.
+
+        After removal, ``branch`` is deleted (``git branch -D``) — and
+        ``branch_pruned`` set True — only when its tip is an ancestor of
+        (already merged into) ``main``; an unmerged branch is left in place
+        so its commits are never lost.  ``branch_pruned`` is False whenever
+        the branch is unmerged, already gone, or removal itself did nothing.
+        """
+        if harness is None or getattr(harness, 'git_ops', None) is None:
+            return {'error': 'escalation server running standalone — no harness wired'}
+        mismatch = _require_matching_project_root(harness, project_root)
+        if mismatch is not None:
+            return {'error': mismatch}
+
+        gops = harness.git_ops
+        candidate = Path(path_or_branch)
+        # Path-mode covers both a still-live worktree directory AND an
+        # already-removed one referenced by its (necessarily absolute)
+        # claimed path — the idempotent second-release case. Keying off
+        # shape (absolute / exists) rather than is_dir() alone keeps the
+        # returned path/branch meaningful instead of silently falling
+        # through to branch-mode and treating the whole path string as a
+        # branch slug.
+        if candidate.is_absolute() or candidate.exists():
+            path = candidate.resolve()
+            branch = None
+            stamp_path = path / '.task' / 'interactive.json'
+            if stamp_path.exists():
+                try:
+                    branch = json.loads(stamp_path.read_text())['branch']
+                except (json.JSONDecodeError, KeyError, OSError):
+                    # Truncated/corrupt stamp (e.g. a crash mid-write) — fall
+                    # back to the basename derivation below rather than
+                    # raising out of a documented never-raise verb.
+                    branch = None
+            if branch is None:
+                branch = (
+                    f'{gops.config.branch_prefix}'
+                    f'{path.name.removeprefix(gops.config.iact_prefix)}'
+                )
+        else:
+            branch = path_or_branch
+            if not branch.startswith(gops.config.branch_prefix):
+                branch = f'{gops.config.branch_prefix}{branch}'
+            slug = branch.removeprefix(gops.config.branch_prefix)
+            path = gops.worktree_base / f'{gops.config.iact_prefix}{slug}'
+
+        # Runtime-only reverse import — mirrors claim_warm_worktree above.
+        from orchestrator.git_ops import _run  # type: ignore[reportMissingImports]
+
+        rc, _, remove_stderr = await _run(
+            ['git', 'worktree', 'remove', '--force', str(path)], cwd=gops.project_root,
+        )
+        await _run(['git', 'worktree', 'prune'], cwd=gops.project_root)
+        removed = rc == 0
+
+        # Prune-if-merged: only delete branch once its tip is confirmed an
+        # ancestor of main — an unmerged branch's commits must never be lost.
+        branch_pruned = False
+        sha = await gops.resolve_branch_sha(branch)
+        if sha is not None and await gops.is_ancestor(sha, gops.config.main_branch):
+            rc_del, _, _ = await _run(['git', 'branch', '-D', branch], cwd=gops.project_root)
+            branch_pruned = rc_del == 0
+
+        result: dict[str, Any] = {
+            'removed': removed,
+            'path': str(path),
+            'branch': branch,
+            'branch_pruned': branch_pruned,
+        }
+        if not removed and remove_stderr.strip():
+            # Present only on removal failure — its text is what lets a
+            # caller tell an idempotent already-gone target apart from a
+            # genuine failure (locked worktree, permission, ...); the
+            # removed=False contract itself is unchanged.
+            result['detail'] = remove_stderr.strip()
+        return result
 
     # ── merge_status — read-only lifecycle probe (PRD α3 / task 1630) ──────────
 
