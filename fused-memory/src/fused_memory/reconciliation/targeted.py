@@ -220,22 +220,34 @@ class TargetedReconciler:
 
         # 0. Fast-path: write completion fact immediately (no search/verify needed)
         try:
+            memories = await self.memory.get_memories_by_metadata(
+                project_id=project_id, filters={'task_id': task_id},
+            )
+            has_authoritative = any(
+                _is_authoritative_resolution(m.get('metadata') or {}) for m in memories
+            )
+
             content = f"Task '{title}' completed."
-            if description:
-                content += f" {description}"
-            details = task.get('details', '')
-            if details:
-                content += f"\nDetails: {details[:500]}"
+            if not has_authoritative:
+                if description:
+                    content += f" {description}"
+                details = task.get('details', '')
+                if details:
+                    content += f"\nDetails: {details[:500]}"
+
+            write_metadata = {
+                'source': _ECHO_SOURCE,
+                'task_id': task_id,
+                'transition': 'done',
+            }
+            if has_authoritative:
+                write_metadata['echo_suppressed_stale_description'] = True
 
             written = await self._fenced_add_memory(
                 content=content,
                 category='observations_and_summaries',
                 project_id=project_id,
-                metadata={
-                    'source': _ECHO_SOURCE,
-                    'task_id': task_id,
-                    'transition': 'done',
-                },
+                metadata=write_metadata,
                 causation_id=run_id,
             )
             action_type = 'knowledge_captured_fast' if written else 'knowledge_deferred_fast'
