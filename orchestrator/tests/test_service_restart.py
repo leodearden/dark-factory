@@ -509,6 +509,60 @@ async def test_maybe_restart_transient_executor_failure_retains_pending_and_retr
     assert coord.is_pending is False
 
 
+@pytest.mark.asyncio
+async def test_maybe_restart_transient_failures_bounded_clears_and_logs_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Transient executor failures are bounded: after max_executor_failures
+    consecutive failures, pending + trigger metadata are cleared and a LOUD
+    ERROR is logged — a persistent transient failure must not retry forever
+    nor silently drop the restart.
+    """
+    import logging
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['fused-memory/src/server/main.py'], None)
+    )
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+    executor = AsyncMock(side_effect=RuntimeError('systemd hiccup'))
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+        max_executor_failures=2,
+    )
+
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord.is_pending is True
+
+    current_time[0] = 1.0
+
+    # First failure (1/2): transient — pending retained.
+    result1 = await coord.maybe_restart(agents_idle=True)
+    assert result1 is False
+    assert coord.is_pending is True
+
+    # Second failure (2/2): bound reached — cleared, loud ERROR logged.
+    with caplog.at_level(logging.ERROR, logger='orchestrator.service_restart'):
+        result2 = await coord.maybe_restart(agents_idle=True)
+
+    assert result2 is False
+    assert coord.is_pending is False
+    assert coord._trigger_task_ids == []
+    assert coord._trigger_merge_shas == []
+    assert any(
+        r.levelno == logging.ERROR and 'giving up' in r.message.lower()
+        for r in caplog.records
+    )
+
+
 # ---------------------------------------------------------------------------
 # Burst-coalescing (step-7) + default executor tests
 # ---------------------------------------------------------------------------
