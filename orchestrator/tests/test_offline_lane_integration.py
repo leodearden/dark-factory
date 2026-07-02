@@ -574,3 +574,27 @@ async def test_b5_same_set_recurrence_updates_not_duplicates(harness, git_ops, r
     assert len(escalations) == 1, (
         'a same-set recurrence must not raise a second L0 escalation'
     )
+
+
+# ---------------------------------------------------------------------------
+# B6 — flake filtered: fail-then-pass on confirmation is not a red
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b6_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, tmp_path, caplog):
+    """B6 (PRD §8) — a run that fails, then passes on the isolated
+    confirmation re-run, is intermittent nondeterminism, never a genuine
+    break: no fix task and no escalation are ever raised."""
+    worker = _build_worker(git_ops, tmp_path)
+    _wire_lane(harness, worker)
+    _inject_flake(worker)
+
+    with caplog.at_level(logging.INFO):
+        await _drive_advance(harness, repo)
+        await _run_one_lane_pass(worker)
+
+    assert 'intermittent nondeterminism' in caplog.text
+    worker.task_client.submit_fix_task.assert_not_awaited()
+    assert worker.open_fix_tasks == {}
+    assert worker.escalation_queue.get_pending() == []
