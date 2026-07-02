@@ -227,6 +227,14 @@ Public API
 - ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
   ``filter_suppressed`` first then does Mem0 search + write + confirm + delete
   per flag; best-effort (exceptions are logged, not raised).
+- ``acknowledge_flag_marker(memory_service, *, project_id, run_id, task_id, flag_type, mode, log)``
+  — async, best-effort delete or tag (write-replacement + delete-old) of the
+  prior ``stage1_flag_marker``(s) for one (task_id, flag_type) signature;
+  never raises; returns the count acknowledged.
+- ``acknowledge_resolved_flags(memory_service, project_id, run_id, resolved_flags, *, mode, log)``
+  — async, generic batch entry point; computes each flag's signature and
+  delegates to ``acknowledge_flag_marker`` per flag; best-effort (one flag
+  failing never aborts the batch); returns the summed count.
 """
 from __future__ import annotations
 
@@ -2090,6 +2098,69 @@ async def acknowledge_flag_marker(
         else:
             success_count += 1
     return success_count
+
+
+async def acknowledge_resolved_flags(
+    memory_service: Any,
+    project_id: str,
+    run_id: str,
+    resolved_flags: list[dict[str, Any]],
+    *,
+    mode: Literal['delete', 'tag'] = 'delete',
+    log: logging.Logger = logger,
+) -> int:
+    """Best-effort batch acknowledgment entry point for a list of resolved flags.
+
+    For each flag in *resolved_flags*, computes its signature exactly as
+    ``dedup_flags`` does — :func:`compute_flag_signature` first, falling back to
+    :func:`compute_content_fingerprint_signature` — and delegates to
+    :func:`acknowledge_flag_marker` for the ``(task_id, flag_type)`` pair.
+    Flags for which both signature helpers return ``None`` are skipped (no I/O).
+
+    Best-effort: a single flag's acknowledgment failing is logged at WARNING and
+    does NOT abort the batch — the remaining flags are still processed. (This
+    also guards against a caller-supplied replacement for
+    ``acknowledge_flag_marker`` that raises, even though the real implementation
+    never does.)
+
+    Args:
+        memory_service: Mem0 service forwarded to ``acknowledge_flag_marker``.
+        project_id: Project scope forwarded to ``acknowledge_flag_marker``.
+        run_id: Current reconciliation run identifier.
+        resolved_flags: Flags whose requested action is already fulfilled.
+        mode: ``'delete'`` (default) or ``'tag'``; forwarded verbatim to every
+            ``acknowledge_flag_marker`` call in this batch.
+        log: Logger for WARNING messages; defaults to this module's logger.
+
+    Returns:
+        Total count of markers acknowledged across all flags in the batch.
+    """
+    total = 0
+    for flag in resolved_flags:
+        sig = compute_flag_signature(flag)
+        if sig is None:
+            sig = compute_content_fingerprint_signature(flag)
+        if sig is None:
+            continue
+        tid, ftype = sig
+        try:
+            total += await acknowledge_flag_marker(
+                memory_service,
+                project_id=project_id,
+                run_id=run_id,
+                task_id=tid,
+                flag_type=ftype,
+                mode=mode,
+                log=log,
+            )
+        except Exception as e:
+            log.warning(
+                'acknowledge_resolved_flags: acknowledge_flag_marker failed for task %s'
+                ' flag_type %s: %s',
+                tid, ftype, e,
+            )
+            continue
+    return total
 
 
 def filter_blocked_snapshot_findings(
