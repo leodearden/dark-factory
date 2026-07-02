@@ -318,6 +318,13 @@ class TestAgentFailureFallback:
         # cost_usd must be present on all fallback entries for dashboard queries
         assert 'cost_usd' in entry
         assert entry['cost_usd'] == pytest.approx(0.1)
+        # task 2020 step-5: diagnostic keys also present on investigation_failed.
+        assert entry['timed_out'] is False
+        assert entry['subtype'] == 'error_max_turns'
+        assert 'transcript_turns' in entry
+        assert 'session_id' in entry
+        assert 'stderr_tail' in entry
+        assert 'duration_ms' in entry
 
 
 # ---------------------------------------------------------------------------
