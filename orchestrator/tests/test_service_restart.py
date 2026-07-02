@@ -455,6 +455,47 @@ async def test_maybe_restart_executor_raises_subsequent_tick_does_not_retry() ->
 
 
 @pytest.mark.asyncio
+async def test_maybe_restart_bare_oserror_is_treated_as_transient_and_retries() -> None:
+    """A bare OSError (e.g. ENOSPC/EMFILE) — distinct from FileNotFoundError and
+    PermissionError — is classified TRANSIENT: pending is retained and the next
+    idle tick retries. Locks the intended permanent/transient boundary: only the
+    two concrete subclasses are permanent; every other OSError is transient.
+    """
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['fused-memory/src/server/main.py'], None)
+    )
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+    executor = AsyncMock(side_effect=[OSError('ENOSPC: no space left on device'), None])
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+    )
+
+    await coord.note_merge('task-1', 'base', 'head')
+    current_time[0] = 1.0
+
+    # First tick: bare OSError — transient, pending retained.
+    result1 = await coord.maybe_restart(agents_idle=True)
+    assert result1 is False
+    assert coord.is_pending is True
+    executor.assert_awaited_once()
+
+    # Second tick: executor recovers — fires normally.
+    result2 = await coord.maybe_restart(agents_idle=True)
+    assert result2 is True
+    assert coord.is_pending is False
+    assert executor.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_maybe_restart_transient_executor_failure_retains_pending_and_retries(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

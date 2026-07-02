@@ -281,7 +281,8 @@ class StaleServiceRestartCoordinator:
         # Accumulated trigger metadata for the current pending burst
         self._trigger_task_ids: list[str] = []
         self._trigger_merge_shas: list[str] = []
-        # Consecutive TRANSIENT executor failures since the last success/arming.
+        # Consecutive TRANSIENT executor failures since the last successful
+        # fire (NOT reset by note_merge re-arming — see maybe_restart).
         self._consecutive_executor_failures: int = 0
 
     # ------------------------------------------------------------------
@@ -398,7 +399,10 @@ class StaleServiceRestartCoordinator:
         except (FileNotFoundError, PermissionError):
             # PERMANENT: a missing or non-executable script will fail identically
             # on every idle tick, so retrying would crash-loop. Clear pending
-            # (fail-open) — a new note_merge will re-arm.
+            # (fail-open) — a new note_merge will re-arm. NOTE: only these two
+            # concrete subclasses are treated as permanent — any other OSError
+            # (e.g. ENOSPC, EMFILE, a transient subprocess-spawn error) is NOT
+            # caught here and falls through to the TRANSIENT branch below.
             logger.warning(
                 f'{self._service_name} restart executor failed; clearing pending to avoid'
                 ' a crash-loop on a permanently-missing or non-executable script.'
@@ -468,7 +472,8 @@ class StaleServiceRestartCoordinator:
         self._trigger_task_ids = []
         self._trigger_merge_shas = []
         # A successful fire resets the bound: the counter tracks consecutive
-        # failures since the last success/arming, not a lifetime tally.
+        # failures since the last successful fire, not a lifetime tally.
+        # (note_merge re-arming does NOT reset it — only success/exhaustion do.)
         self._consecutive_executor_failures = 0
 
         return True
