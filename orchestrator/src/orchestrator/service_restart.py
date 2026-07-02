@@ -79,7 +79,7 @@ async def schedule_detached_systemd_restart(
     *,
     script: str,
     script_args: list[str],
-    project_root: str,
+    project_root: str | Path,
     transient_unit: str,
     on_active_secs: int,
     runner=None,
@@ -108,8 +108,9 @@ async def schedule_detached_systemd_restart(
     script_args:
         Extra positional args appended after the script path (e.g. ``['--drain']``).
     project_root:
-        Absolute root of the project repo; the script path is resolved as
-        ``Path(project_root) / script``.
+        Absolute root of the project repo (``str`` or ``Path`` — e.g.
+        ``Config.project_root`` is a ``Path``); the script path is resolved
+        as ``Path(project_root) / script``.
     transient_unit:
         Name of the transient systemd-run unit (e.g.
         ``orch-selfrestart-on-merge-3.service``).
