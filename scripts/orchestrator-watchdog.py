@@ -17,12 +17,21 @@ restart path covers BOTH failure modes:
 Disabled units are skipped — disabling is explicit operator intent. Runs as a
 oneshot systemd service on a 60-second timer.
 
+Each timer tick also runs a fleet-wide staleness pass (staleness_pass()):
+any running orchestrator-*.service unit whose realtime start time predates
+the newest commit touching a small set of watched paths is restarted, as a
+backstop for the event-driven restart coordinator
+(plans/orchestrator-fleet-staleness-prd.md). Pass ``--report`` for a
+read-only doctor mode that prints a per-unit staleness table and performs
+no mutating systemctl calls.
+
 Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
 """
 
 import os
 import subprocess
+import sys
 import time
 
 # (port, systemd unit name) pairs to watch.  Port values match each
@@ -481,5 +490,25 @@ def report() -> int:
     return 1 if any_stale else 0
 
 
-if __name__ == "__main__":
+def _cli(argv: list[str] | None = None) -> int:
+    """Dispatch the CLI: ``--report`` routes to the read-only doctor mode.
+
+    With no ``argv`` argument, reads ``sys.argv[1:]``. If ``--report`` is
+    present, runs ONLY the read-only report() and returns its exit code
+    (0 = all fresh, 1 = at least one stale unit) — main() and
+    staleness_pass() are not invoked, so this path never mutates systemd
+    state (I7 at the CLI boundary). Otherwise runs the existing liveness
+    main() followed by staleness_pass() (the timer path) and returns 0.
+    Unknown flags are not treated as an error — they fall through to the
+    timer path.
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    if "--report" in argv:
+        return report()
     main()
+    staleness_pass()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())
