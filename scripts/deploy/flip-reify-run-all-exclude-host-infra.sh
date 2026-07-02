@@ -28,6 +28,10 @@ for arg in "$@"; do
         --check|--dry-run)
             MODE="check"
             ;;
+        *)
+            echo "ERROR: unexpected argument: $arg" >&2
+            exit 1
+            ;;
     esac
 done
 
