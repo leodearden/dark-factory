@@ -1352,3 +1352,64 @@ def test_staleness_pass_skips_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert restarted == [], f"Disabled unit must not be restarted; got {restarted}"
 
+
+def test_staleness_pass_skips_startup_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """staleness_pass must not restart a stale, enabled unit within STARTUP_GRACE_SECS.
+
+    Mirrors main()'s existing grace-window gate: a unit that just (re)started
+    may not have converged on the new commit's effects yet, and restarting it
+    again would risk an indefinite restart loop (I5).
+    """
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    grace_unit = "orchestrator-grace.service"
+
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [grace_unit])
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)  # < 120s grace
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch - 100)  # stale
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert restarted == [], f"Unit within startup grace must not be restarted; got {restarted}"
+
+
+def test_staleness_pass_none_elapsed_does_not_block_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """staleness_pass must still restart a stale unit when elapsed is None (undeterminable).
+
+    None means "grace window does not apply" — fall-through, consistent with
+    main()'s existing treatment of an undeterminable elapsed time.
+    """
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
+
+    unit = "orchestrator-unknown-elapsed.service"
+
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [unit])
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch - 100)  # stale
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert restarted == [unit], (
+        f"A None elapsed must not block the staleness restart; got {restarted}"
+    )
+
