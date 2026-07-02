@@ -28,6 +28,7 @@ from orchestrator.git_ops import (
     InteractiveWorktreeLimitError,
     _run,
 )
+from orchestrator.warm_lane_pool import LaneState
 
 
 # ---------------------------------------------------------------------------
@@ -368,4 +369,77 @@ class TestCreateInteractiveWorktreeCap:
         info_d = await git_ops.create_interactive_worktree('d')
         assert info_d.path.exists(), (
             'expected create_interactive_worktree("d") to succeed once a slot freed'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-11: I1 isolation (the α headline signal)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreateInteractiveWorktreeIsolation:
+    """RED — I1: create_interactive_worktree must never touch WarmLanePool state."""
+
+    async def test_pool_untouched_by_create_and_remove(self, iw_git_repo: Path) -> None:
+        """FREE lane count / assignments_snapshot unchanged by create AND by removal."""
+        await _add_seed_script(iw_git_repo)
+        config = GitConfig(warm_lane_pool=True)
+        git_ops = GitOps(config, iw_git_repo, warm_lane_pool_size=3)
+        assert git_ops.warm_lane_pool is not None, 'setup: pool must be enabled'
+        pool = git_ops.warm_lane_pool
+
+        def _free_count() -> int:
+            return sum(1 for s in pool._lanes.values() if s == LaneState.FREE)
+
+        free_before = _free_count()
+        assert free_before == 3, f'setup: expected 3 FREE lanes, got {free_before}'
+        assert pool.assignments_snapshot() == {}, 'setup: expected no assignments yet'
+
+        info = await git_ops.create_interactive_worktree('iso')
+
+        assert info.warm is True, f'expected warm is True (seed ran), got {info.warm!r}'
+        assert (info.path / 'target' / 'seeded.bin').exists(), (
+            'expected target/seeded.bin to exist (CoW-populated)'
+        )
+
+        # I1: pool state is completely untouched by create.
+        assert _free_count() == 3, (
+            f'I1 VIOLATION: create_interactive_worktree changed the FREE lane '
+            f'count (before={free_before}, after={_free_count()})'
+        )
+        assert pool.assignments_snapshot() == {}, (
+            'I1 VIOLATION: create_interactive_worktree left an entry in '
+            'assignments_snapshot()'
+        )
+        assert pool.is_lane(info.path) is False, (
+            'I1 VIOLATION: the interactive worktree path is registered as a pool lane'
+        )
+        assert pool.state(info.path) is None, (
+            'I1 VIOLATION: the pool reports a LaneState for the interactive '
+            'worktree path'
+        )
+        lane_dirs_after_create = sorted(
+            p.name for p in git_ops.worktree_base.iterdir()
+            if p.name.startswith('_lane-')
+        )
+        assert lane_dirs_after_create == [], (
+            f'I1 VIOLATION: a _lane-* dir was created on disk: {lane_dirs_after_create}'
+        )
+
+        # Remove the interactive worktree directly (no pool-aware release verb
+        # exists yet — that is β) and re-assert the pool is still untouched.
+        rc_remove, _, remove_err = await _run(
+            ['git', 'worktree', 'remove', '--force', str(info.path)],
+            cwd=iw_git_repo,
+        )
+        assert rc_remove == 0, f'setup: failed to remove {info.path}: {remove_err}'
+
+        assert _free_count() == 3, (
+            f'I1 VIOLATION: removing the interactive worktree changed the FREE '
+            f'lane count (expected 3, got {_free_count()})'
+        )
+        assert pool.assignments_snapshot() == {}, (
+            'I1 VIOLATION: removing the interactive worktree left an '
+            'assignments entry behind'
         )
