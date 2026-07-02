@@ -1040,14 +1040,18 @@ def create_mcp_server(
         session_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Look up an entity in the knowledge graph by name (fuzzy matched).
+        """Look up an entity in the knowledge graph by name (exact match tried first, then fuzzy).
 
-        Returns entity nodes (with names, summaries, labels), their edges as
-        relationship facts, and connected entities. Use this for direct entity
-        lookup when you know the name; use search() for broader semantic queries.
+        Tries an exact, case-sensitive match on the canonical entity label first — so
+        canonical labels like "Task 115" resolve to the exact node instead of
+        scattering across fuzzy neighbours. Falls back to fuzzy/semantic search when
+        there is no exact match. Returns entity nodes (with names, summaries, labels),
+        their edges as relationship facts, and connected entities. Use this for direct
+        entity lookup when you know the name; use search() for broader semantic queries.
 
         Args:
-            name: Entity name (fuzzy matched — partial or approximate names work)
+            name: Entity name (exact match tried first; falls back to fuzzy/approximate
+                matching when no exact match exists)
             project_id: Project scope (required)
             agent_id: Which agent is reading (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
