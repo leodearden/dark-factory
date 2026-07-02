@@ -216,6 +216,30 @@ Reflect and write each as a separate `add_memory` call:
 
 Use `/memory` for detailed guidance on writing effective memories.
 
+## Orchestrator Config Reload
+
+`mcp__escalation__reload_config` hot-applies an `orchestrator.yaml` edit to
+a **running** orchestrator process without a restart. It takes no
+arguments — it always re-reads that process's own `ORCH_CONFIG_PATH`,
+never another project's.
+
+**Green tier** (hot-reloadable): per-role `models` / `budgets` /
+`max_turns` / `effort` / `timeouts` / `backends`, steward grace
+(`steward_completion_timeout`, `steward_lifetime_budget`), scheduler +
+watcher tuning, `review.*` checkpoint knobs, `unblock_auto.*`,
+`verify_env`, and the `git.offline_lane_*` leaf tunables.
+
+**Red tier** (restart-only — edit is accepted but has no effect until
+restart): `max_concurrent_tasks`, pool sizes / `verify_runners`,
+`escalation` bind host/port, `sandbox.backend`, `project_root`, and the
+merge-lane `git.*` structural fields.
+
+**Reloaded ≠ everything took effect** — always read the returned
+`applied` / `restart_required` dispositions, not just the top-level
+`reloaded` flag. See `plans/config-hot-reload-prd.md` for the full
+allowlist and `skills/orchestrate/SKILL.md`'s "Reload Config (vs Restart)"
+section for the operator workflow.
+
 ## Reference
 
 - **Design docs**: `DESIGN.md` (architecture), `fused-memory/docs/reconciliation/` (reconciliation system)
