@@ -467,6 +467,9 @@ class StaleServiceRestartCoordinator:
         self._pending = False
         self._trigger_task_ids = []
         self._trigger_merge_shas = []
+        # A successful fire resets the bound: the counter tracks consecutive
+        # failures since the last success/arming, not a lifetime tally.
+        self._consecutive_executor_failures = 0
 
         return True
 
