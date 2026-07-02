@@ -102,6 +102,34 @@ def log(msg: str) -> None:
     )
 
 
+class _JournalLog:
+    """Route ``.warning(...)`` through the systemd-cat ``log()`` helper (single
+    'orchestrator-watchdog' tag).
+
+    Itself fail-soft: a journald-write failure must never convert a probe's
+    return-None contract into a raised exception.
+
+    Intentionally exposes ONLY ``.warning()`` — the minimal attribute-call
+    surface required by the silent-fallthrough gate's WARN_METHODS check
+    (see shared/tests/silent_fallthrough_scan.py::_handler_has_warn_log).
+    This is not a general-purpose logging facade: other call sites in this
+    module (e.g. probe_port's diagnostics) intentionally keep calling the
+    bare ``log()`` helper directly, since those are not silent-fallthrough
+    sig-b handlers and do not need gate exoneration. Do not add ``.info()``/
+    ``.error()``/etc. here without re-checking whether they're actually
+    needed for a gated handler.
+    """
+
+    def warning(self, msg: str) -> None:
+        try:
+            log(f"WARNING: {msg}")
+        except Exception:  # noqa: BLE001 -- logging must never break a fail-soft probe
+            pass
+
+
+logger = _JournalLog()
+
+
 def probe_port(port: int) -> bool:
     """Return True iff a process is listening on *port* (TCP, local).
 
@@ -355,7 +383,11 @@ def _unit_start_epoch(unit: str) -> int | None:
                 return None  # unit has never started (or no PID recorded)
             return epoch
         return None
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_unit_start_epoch({unit!r}): swallowed {exc!r}; "
+            "returning None (staleness undeterminable this tick)"
+        )
         return None
 
 
@@ -401,7 +433,11 @@ def _newest_watched_commit_epoch() -> int | None:
             return int(stdout)
         except ValueError:
             return None
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_newest_watched_commit_epoch: swallowed {exc!r}; "
+            "returning None (staleness undeterminable this tick)"
+        )
         return None
 
 
