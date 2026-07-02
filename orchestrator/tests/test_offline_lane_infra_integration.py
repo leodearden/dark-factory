@@ -769,3 +769,80 @@ async def test_ib5_infra_flake_filtered_by_confirmation_rerun(harness, git_ops, 
     cast(AsyncMock, worker.task_client).submit_fix_task.assert_not_awaited()
     assert worker.open_fix_tasks == {}
     assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
+
+
+# ---------------------------------------------------------------------------
+# IB6 — real H9 wire-format over a committed classified-set stub
+# ---------------------------------------------------------------------------
+
+
+async def _add_infra_run_all_stub(repo: Path) -> None:
+    """Commit a stub ``tests/infra/run_all.sh`` into *repo* (IB6).
+
+    Mirrors ``test_warm_lane_integration_gate.py``'s committed-stub-script
+    pattern (``_add_all_warm_lane_scripts``): the script is chmod'd 0o755
+    and committed so any worktree checked out from main — including a real
+    ``_offline-deep`` reset — carries it at ``<wt>/tests/infra/run_all.sh``,
+    letting the REAL default ``_default_run_infra`` /
+    ``_default_infra_confirmation_run`` seams shell out to it (rather than
+    the injected-callable seam every other IB scenario uses). The stub
+    ignores its ``--scope host-infra`` argv beyond presence — it always
+    deterministically emits one PASS line and one FAIL line in reify H9's
+    ``RESULT: (PASS|FAIL) (<name>)`` wire format, then exits non-zero, so
+    both the initial run and the isolated confirmation re-run confirm the
+    SAME failing set (a genuine break, not a flake).
+    """
+    infra_dir = repo / 'tests' / 'infra'
+    infra_dir.mkdir(parents=True, exist_ok=True)
+    script = infra_dir / 'run_all.sh'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo "RESULT: PASS (infra_test_y.sh)"\n'
+        'echo "RESULT: FAIL (infra_test_x.sh)"\n'
+        'exit 1\n'
+    )
+    script.chmod(0o755)
+    await _run(['git', 'add', str(script)], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add stub tests/infra/run_all.sh'], cwd=repo)
+
+
+@pytest.mark.asyncio
+async def test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task(
+    harness,
+    git_ops,
+    repo,
+    tmp_path,
+):
+    """IB6 — the REAL default infra seams (``_default_run_infra`` /
+    ``_default_infra_confirmation_run``) shell out to a committed stub
+    ``tests/infra/run_all.sh`` emitting reify H9's wire format, and
+    ``_parse_infra_failures`` extracts the failing test-file-name into a
+    filed fix task end-to-end.
+
+    ``infra_runner``/``infra_confirmation_runner`` are deliberately left
+    uninjected (unlike IB1-IB5) so :class:`OfflineLaneWorker` falls back to
+    its own real default seams. Binds the manifest's "real H9 runner over
+    real H1-classified set" claim and exercises IE1's subprocess-invocation
+    + wire-format-parse glue that pure callable-injection bypasses.
+    Negative control: a broken H9-wire-format parse or subprocess
+    invocation makes this RED.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    await _add_infra_run_all_stub(repo)
+
+    worker = _build_infra_worker(git_ops, tmp_path)
+    _wire_lane(harness, worker)
+
+    _, head_sha = await _drive_advance(harness, repo)
+    await _run_one_lane_pass(worker)
+
+    arguments = _submitted_fix_task_arguments(worker.task_client)
+    assert arguments['status'] == 'pending'
+    assert arguments['metadata']['failing_tests'] == ['infra_test_x.sh']
+    assert arguments['metadata']['suspect_ranges'] == [head_sha]
+
+    fp = compute_failing_test_set_fingerprint(['infra_test_x.sh'])
+    task_id = worker.open_fix_tasks[fp]
+    escalations = _l0_info_escalations(cast(EscalationQueue, worker.escalation_queue), task_id)
+    assert len(escalations) == 1
