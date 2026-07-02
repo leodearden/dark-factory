@@ -67,20 +67,20 @@ class TestMcpRoleGates:
     """
 
     def test_simple_task_in_plan_tools_gate(self):
-        from orchestrator.workflow import _PLAN_TOOLS_ROLES # noqa: PLC0415
+        from orchestrator.workflow import _PLAN_TOOLS_ROLES  # noqa: PLC0415
 
         assert 'simple_task' in _PLAN_TOOLS_ROLES
 
     def test_simple_task_in_mcp_config_gate(self):
-        from orchestrator.workflow import _MCP_CONFIG_ROLES # noqa: PLC0415
+        from orchestrator.workflow import _MCP_CONFIG_ROLES  # noqa: PLC0415
 
         assert 'simple_task' in _MCP_CONFIG_ROLES
 
     def test_plan_tools_gate_covers_every_role_allowing_plan_tools(self):
         """Inverse invariant: every ROLES entry that allows any
         mcp__plan-tools__* tool must be in _PLAN_TOOLS_ROLES."""
-        from orchestrator.agents.roles import ROLES # noqa: PLC0415
-        from orchestrator.workflow import _PLAN_TOOLS_ROLES # noqa: PLC0415
+        from orchestrator.agents.roles import ROLES  # noqa: PLC0415
+        from orchestrator.workflow import _PLAN_TOOLS_ROLES  # noqa: PLC0415
 
         for name, role in ROLES.items():
             allows_plan_tools = any(
