@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
