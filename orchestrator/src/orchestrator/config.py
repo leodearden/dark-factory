@@ -1696,6 +1696,42 @@ class OrchestratorConfig(BaseSettings):
         default='scripts/restart-dashboard.sh'
     )
 
+    # Post-merge staleness hook — restarts orchestrator-dark-factory.service
+    # after a merge whose landed diff touches orchestrator/src/. Unlike the
+    # fused-memory/dashboard restarts (plain subprocess spawn), this restart
+    # MUST cgroup-escape via `systemd-run --user` (see
+    # service_restart.schedule_detached_systemd_restart): under
+    # orchestrator-dark-factory.service's KillMode=control-group, a
+    # `systemctl restart` SIGKILLs the whole cgroup — including a same-cgroup
+    # restart child spawned via asyncio.create_subprocess_exec(start_new_session
+    # =True) — before it can bring the service back up. systemd-run detaches
+    # the transient unit into its own cgroup so it survives the kill.
+    #
+    # enabled defaults to False: the orchestrator is the single most critical
+    # unit, so auto-fire-on-merge must not activate merely because this
+    # wiring lands. Enabling is an operator action (flip the flag after a
+    # soak period + sign-off) — see U2 design notes; the recommended enable
+    # mechanism is a task_kind='deterministic' pure-gate task.
+    #
+    # The restart is additionally merge-drain-gated (Harness._merge_pipeline_idle,
+    # injected as the coordinator's restart_precondition): even at the
+    # run-loop's idle quiet-window, the restart is deferred until the merge
+    # queue and merge-worker pipeline are both quiescent, so it never fires
+    # mid-merge. See orchestrator/src/orchestrator/service_restart.py for
+    # coordinator policy details.
+    orchestrator_restart_on_merge_enabled: bool = Field(default=False)
+    orchestrator_restart_debounce_secs: float = Field(default=300.0)
+    orchestrator_restart_watch_prefixes: list[str] = Field(
+        default_factory=lambda: ['orchestrator/src/']
+    )
+    orchestrator_restart_script: str = Field(
+        default='scripts/restart-orchestrator.sh'
+    )
+    # Small deferral so the current run-loop tick can log/settle before the
+    # detached transient unit fires; the cgroup escape makes the restart
+    # survive regardless of this value.
+    orchestrator_restart_on_active_secs: int = Field(default=10)
+
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no
     # active workflow/steward (e.g. escalations emitted by the deep reviewer
     # against a synthetic ``review-*`` task_id).  Without this, such
