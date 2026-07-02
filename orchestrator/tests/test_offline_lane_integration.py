@@ -699,3 +699,49 @@ async def test_b7_stall_promotes_to_blocker(harness, git_ops, repo, tmp_path):
     await _drive_reds(harness, repo, worker_b, failing_b, 1)
     assert len(_l2_blocker_escalations(worker_b.escalation_queue, task_b)) == 1
     assert harness.get_merge_halt_status() == {'wired': False}
+
+
+# ---------------------------------------------------------------------------
+# B8 — target/worktree ISOLATION (offline-deep path != merge-verify path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b8_offline_deep_worktree_isolated_from_merge_lane(git_ops, repo):
+    """B8 (PRD §8) — the offline-deep lane's persistent worktree is isolated
+    from the merge lane's: distinct fixed paths; a real reset materializes
+    and registers ONLY the offline-deep path (the merge lane's _merge-verify
+    path is never created or touched by the lane reset); and
+    cleanup_merge_worktree is prune-exempt (a no-op) on the offline-deep
+    path. Real reify compile timing is NOT asserted here — self-warming
+    timing is a reify-build capability (reify:4916/4913) validated at
+    production activation, out of ζ's executable scope."""
+    assert (
+        git_ops.persistent_offline_deep_worktree_path
+        != git_ops.persistent_merge_worktree_path
+    )
+
+    before = _materialized_worktree_names(git_ops.worktree_base)
+    head = await git_ops.get_main_sha()
+    offline_wt = await git_ops.reset_persistent_offline_deep_worktree(head)
+    after = _materialized_worktree_names(git_ops.worktree_base)
+
+    assert offline_wt == git_ops.persistent_offline_deep_worktree_path
+    assert after - before == {git_ops.persistent_offline_deep_worktree_path.name}, (
+        'a lane reset must materialize ONLY its own _offline-deep worktree, '
+        'never the merge lane _merge-verify path'
+    )
+    assert not git_ops.persistent_merge_worktree_path.exists(), (
+        'the merge lane worktree must never be created by an offline-deep reset'
+    )
+    assert await git_ops._is_registered_worktree(offline_wt)
+
+    await git_ops.cleanup_merge_worktree(offline_wt)
+    assert offline_wt.exists(), (
+        'cleanup_merge_worktree must be prune-exempt (a no-op) on the '
+        'persistent offline-deep worktree'
+    )
+    assert await git_ops._is_registered_worktree(offline_wt), (
+        'the offline-deep worktree must remain a registered git worktree '
+        'after a cleanup_merge_worktree no-op'
+    )
