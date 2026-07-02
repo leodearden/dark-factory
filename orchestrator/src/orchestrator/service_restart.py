@@ -198,6 +198,17 @@ class StaleServiceRestartCoordinator:
         services such as the dashboard), the gate becomes
         ``(agents_idle or not require_idle)`` so the restart fires even while
         agents are dispatching.
+    restart_precondition:
+        Optional injectable sync callable (no args) returning bool.  When
+        provided, ``maybe_restart`` evaluates it AFTER the
+        enabled/pending/idle/debounce gate and only fires when it returns
+        truthy.  A falsy return OR a raised exception is treated as "not
+        satisfied" (fail-safe — pending is left set so the next idle tick
+        retries).  Default None preserves byte-identical existing behaviour
+        for coordinators that don't need an extra gate (fused-memory,
+        dashboard).  Used by the orchestrator coordinator to defer restart
+        until the merge pipeline is drained (see
+        ``Harness._merge_pipeline_idle``).
     """
 
     def __init__(
@@ -215,6 +226,7 @@ class StaleServiceRestartCoordinator:
         service_name: str = 'fused-memory',
         require_idle: bool = True,
         script_args: list[str] | None = None,
+        restart_precondition: Callable[[], bool] | None = None,
     ) -> None:
         self._git_ops = git_ops
         self._event_store = event_store
@@ -236,6 +248,10 @@ class StaleServiceRestartCoordinator:
         # _default_restart_executor.  None → ['--drain'] to preserve the
         # existing fused-memory spawn signature exactly.
         self._script_args: list[str] = script_args if script_args is not None else ['--drain']
+        # Optional extra gate evaluated after enabled/pending/idle/debounce.
+        # Default None → the gate check below is skipped entirely, so
+        # existing coordinators (fused-memory, dashboard) are unaffected.
+        self._restart_precondition = restart_precondition
 
         # State
         self._pending: bool = False
@@ -317,7 +333,8 @@ class StaleServiceRestartCoordinator:
     async def maybe_restart(self, *, agents_idle: bool) -> bool:
         """Fire the restart if all gate conditions are met.
 
-        Conditions: enabled AND pending AND agents_idle AND debounce elapsed.
+        Conditions: enabled AND pending AND agents_idle AND debounce elapsed
+        AND (no restart_precondition OR restart_precondition() is truthy).
 
         Returns True when the restart was fired; False otherwise (no side
         effects — caller may call again on the next idle tick).
@@ -329,6 +346,23 @@ class StaleServiceRestartCoordinator:
             and (self._clock() - self._last_request_monotonic >= self._debounce_secs)
         ):
             return False
+
+        if self._restart_precondition is not None:
+            try:
+                satisfied = self._restart_precondition()
+            except Exception:
+                logger.warning(
+                    f'{self._service_name} restart_precondition raised; deferring'
+                    ' (fail-safe) — pending stays set for the next idle tick.',
+                    exc_info=True,
+                )
+                return False
+            if not satisfied:
+                logger.info(
+                    f'{self._service_name} restart deferred: restart_precondition'
+                    ' not satisfied (pending retained).',
+                )
+                return False
 
         # Snapshot trigger metadata before clearing
         trigger_task_ids = list(self._trigger_task_ids)
