@@ -300,6 +300,8 @@ async def _finalize_advanced_merge(
     """
     from orchestrator.merge_queue import (
         AUTO_CHAIN_GENERATIONS_ENABLED,
+        _check_post_merge_equivalence,
+        _check_post_merge_pyright,
         _elapsed_ms,
         _emit_merge_attempt,
         _maybe_auto_chain_generation,
@@ -1138,7 +1140,7 @@ async def _reverify_rebased_tree(
         verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
         legacy single-keep behaviour (only ``merge_wt`` is protected).
     """
-    from orchestrator.merge_queue import _run_post_merge_verify
+    from orchestrator.merge_queue import _rebase_delta_touched_overlap, _run_post_merge_verify
 
     overlap = await _rebase_delta_touched_overlap(
         req.worktree, rebased_from, rebased_onto, git_ops,
