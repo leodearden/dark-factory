@@ -1948,6 +1948,105 @@ def _is_task_count_snapshot_finding(flag: dict[str, Any]) -> bool:
     return is_count_snapshot(f'{description} {suggested_action}')
 
 
+async def acknowledge_flag_marker(
+    memory_service: Any,
+    *,
+    project_id: str,
+    run_id: str,
+    task_id: str,
+    flag_type: str,
+    mode: Literal['delete', 'tag'] = 'delete',
+    log: logging.Logger = logger,
+) -> int:
+    """Best-effort acknowledge (delete) prior ``stage1_flag_marker``(s).
+
+    Locates every prior ``stage1_flag_marker`` for the ``(task_id, flag_type)``
+    signature via the same ``find_prior_memories`` + :func:`_marker_query` search
+    ``dedup_flags`` uses, then deletes every located prior (best-effort parallel
+    delete via ``asyncio.gather(return_exceptions=True)``, mirroring
+    ``task_knowledge_sync._sweep_stale_fixc_markers``).  Returns the number of
+    deletes that completed without raising.
+
+    ``mode='tag'`` is reserved for a follow-up step; this step only implements
+    ``mode='delete'`` behavior.
+
+    Guards: an invalid *task_id* (per :func:`_is_valid_marker_task_id`) or no
+    located priors short-circuits to a no-op ``0`` with no Mem0 I/O beyond the
+    (skipped or empty) search.  Never raises — every I/O call is wrapped in its
+    own try/except so a transient Mem0 outage can never abort a caller's batch.
+
+    Args:
+        memory_service: Mem0 service with async ``search``/``delete_memory`` methods.
+        project_id: Project scope for search/delete.
+        run_id: Current reconciliation run identifier; used as ``causation_id``
+            on deletes.
+        task_id: The flag's task_id (or comma-joined/``fp:`` signature key).
+        flag_type: The flag's flag_type.
+        mode: ``'delete'`` (default); ``'tag'`` is not yet implemented.
+        log: Logger for WARNING/DEBUG messages; defaults to this module's logger.
+
+    Returns:
+        Count of priors successfully deleted (0 on any guard/no-op/failure).
+    """
+    tid = str(task_id)
+    ftype = str(flag_type)
+
+    if not _is_valid_marker_task_id(tid):
+        log.debug(
+            'acknowledge_flag_marker: skipping invalid task_id %r flag_type %s',
+            tid, ftype,
+        )
+        return 0
+
+    try:
+        priors = await find_prior_memories(
+            memory_service,
+            project_id=project_id,
+            task_id=tid,
+            kind={'source': 'stage1_flag_marker', 'flag_type': ftype},
+            query=_marker_query(tid, ftype),
+            categories=['observations_and_summaries'],
+            limit=50,
+            log=log,
+        )
+    except Exception as e:
+        log.warning(
+            'acknowledge_flag_marker: search failed for task %s flag_type %s: %s',
+            tid, ftype, e,
+        )
+        return 0
+
+    if not priors:
+        return 0
+
+    # mode == 'delete': delete all located priors best-effort (one bad delete
+    # does not abort the batch).
+    results = await asyncio.gather(
+        *(
+            memory_service.delete_memory(
+                memory_id=prior.id,
+                store='mem0',
+                project_id=project_id,
+                causation_id=run_id,
+                _source='flag_acknowledgment',
+            )
+            for prior in priors
+        ),
+        return_exceptions=True,
+    )
+    success_count = 0
+    for prior, result in zip(priors, results, strict=True):
+        if isinstance(result, BaseException):
+            log.warning(
+                'acknowledge_flag_marker: failed to delete prior marker %s for task %s'
+                ' flag_type %s: %s',
+                prior.id, tid, ftype, result,
+            )
+        else:
+            success_count += 1
+    return success_count
+
+
 def filter_blocked_snapshot_findings(
     flags: list[dict[str, Any]],
     project_id: str,
