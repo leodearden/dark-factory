@@ -106,6 +106,65 @@ def is_mixed_temporal_framing(text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Batch-plan framing detection (task 2022)
+# --------------------------------------------------------------------------- #
+#
+# A batch-queue / decompose-and-queue plan episode (e.g. "Merge-queue
+# modularization and invariant-enforcement batch were queued together as df
+# 1985-2002", incident episode 128442e1) describes multiple tasks as queued
+# together as a unit. When such an episode is ingested via add_episode
+# without temporal_context='planning', Graphiti extracts its many completion
+# edges as ordinary factual edges — polluting default search even though most
+# of the batch is still undone. This detector is the ingest-time signal used
+# to auto-upgrade temporal_context to 'planning' for exactly this shape.
+#
+# Detection is deterministic lexical matching (word-boundary alternation over
+# a fixed marker list plus a numeric range/enumeration check), mirroring
+# is_count_snapshot and is_mixed_temporal_framing above rather than
+# semantic/LLM classification: no fragile thresholds, fully unit-testable.
+# This may occasionally false-positive on prose that combines a batch/queue
+# marker with an unrelated multi-task enumeration; the impact is bounded — a
+# mis-tagged episode is merely hidden from default search (recoverable via
+# include_planned=True, and promoted to factual once a related task is marked
+# done), the same tolerance documented for the sibling detectors in this
+# module.
+#
+# Requiring BOTH marker classes to co-occur keeps ordinary single-task facts
+# (no enumeration) and prose that merely contains a number range (no batch/
+# queue marker) passing — i.e. the detector fails open on under-firing by
+# design, matching the sibling detectors' philosophy.
+BATCH_PLAN_ACTION_RE: re.Pattern[str] = re.compile(
+    r'\b(?:queued|queue|queueing|decomposed|decompose|batch|batched)\b',
+    re.IGNORECASE,
+)
+
+# Two-number range like '1985-2002' or '1985 to 2002'. Requires each side to
+# have >=2 digits so short incidental numbers (e.g. '1-2 days') don't count.
+TASK_ID_RANGE_RE: re.Pattern[str] = re.compile(
+    r'\b\d{2,}\s*(?:[-–—]|\bto\b)\s*\d{2,}\b',
+    re.IGNORECASE,
+)
+
+# Individual multi-digit id tokens, used to detect an enumeration of >=3
+# distinct task-id-shaped numbers (e.g. 'tasks 1985, 1986, 1987').
+TASK_ID_TOKEN_RE: re.Pattern[str] = re.compile(r'\b\d{2,}\b')
+
+
+def is_batch_plan_framing(text: str) -> bool:
+    """Return True when text co-mentions a batch-queue/decompose marker AND a
+    multi-task enumeration — a task-id range like '1985-2002' OR an
+    enumeration of >=3 task-id tokens — the batch-queue / decompose-and-queue
+    plan-episode shape that must be auto-tagged temporal_context='planning'
+    at ingest (see is_batch_plan_framing module docstring above).
+    """
+    if not BATCH_PLAN_ACTION_RE.search(text):
+        return False
+    if TASK_ID_RANGE_RE.search(text):
+        return True
+    return len(TASK_ID_TOKEN_RE.findall(text)) >= 3
+
+
+# --------------------------------------------------------------------------- #
 # Status constants
 # --------------------------------------------------------------------------- #
 
