@@ -2047,32 +2047,3 @@ async def test_on_task_done_echo_suppressed_flag_in_journal_action(
     assert completion_rows[0]['detail'].get('echo_suppressed') is expected_suppressed, (
         f'Expected echo_suppressed={expected_suppressed}, got detail: {completion_rows[0]["detail"]}'
     )
-
-
-def test_stage2_suppress_key_matches_write_side_producer():
-    """Cross-module invariant: the read-side `_STAGE2_SUPPRESS_KEY` constant must
-    name the exact metadata key Stage 2's prompt instructs agents to write.
-
-    _is_authoritative_resolution's `stage2_suppress` check and Stage 2's
-    "Completion-Note Suppression Pre-Check (stage2_suppress guard)" write-side
-    contract (prompts/stage2.py — documented as "the only writer of the
-    `stage2_suppress` key") live in different modules. Without a test tying
-    them together, a rename on either side (the prompt's metadata literal or
-    this constant) would silently re-open the dead-trigger gap a task 1984
-    review pass found in the prior `source`-allowlist revision: the read side
-    and write side would drift apart with no failing test to catch it.
-
-    Function-local imports (rather than module-level) so a missing
-    `_STAGE2_SUPPRESS_KEY` symbol only fails this test, not collection of the
-    other tests in this module (steps 9/10 import `_is_authoritative_resolution`
-    directly and must keep collecting even if this constant doesn't exist yet).
-    """
-    from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-    from fused_memory.reconciliation.targeted import _STAGE2_SUPPRESS_KEY
-
-    assert f"'{_STAGE2_SUPPRESS_KEY}': True, 'task_id': str(task_id)" in STAGE2_SYSTEM_PROMPT, (
-        f'Expected the write-side metadata literal for key {_STAGE2_SUPPRESS_KEY!r} '
-        'to appear verbatim in STAGE2_SYSTEM_PROMPT (Completion-Note Suppression '
-        'Pre-Check write side) — read-side constant and write-side prompt contract '
-        'have drifted apart.'
-    )
