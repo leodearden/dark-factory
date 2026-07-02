@@ -470,3 +470,32 @@ class TestBudgetMisconfigSignal:
 
         assert verdict.should_allow_creation is False
         assert verdict.failed is True
+
+
+# ===========================================================================
+# Task 1989: CLI cwd forwarded for the pure prompt-contained classifier call
+# is a neutral scratch dir, decoupled from the filing project's
+# CLAUDE.md/MEMORY.md.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAdjudicateNeutralCwd:
+    async def test_adjudicate_forwards_neutral_cwd(self, tmp_path):
+        from pathlib import Path
+
+        from shared.neutral_cwd import neutral_cli_cwd
+
+        adj = _make_adjudicator(tmp_path=tmp_path)
+        result = _agent_result(
+            success=True,
+            structured_output={'verdict': 'allow', 'reason': 'incidental example mention'},
+        )
+        with patch(_INVOKE_PATH, new=AsyncMock(return_value=result)) as mock_invoke:
+            await _do_adjudicate(adj, project_root='/some/project')
+
+        assert mock_invoke.await_args is not None
+        call_kwargs = mock_invoke.await_args.kwargs
+        assert call_kwargs['cwd'] == neutral_cli_cwd()
+        assert call_kwargs['cwd'] != tmp_path
+        assert call_kwargs['cwd'] != Path('/some/project')

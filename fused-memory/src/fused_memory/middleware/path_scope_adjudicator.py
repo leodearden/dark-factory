@@ -35,6 +35,7 @@ from shared.cli_invoke import (
     invoke_with_cap_retry,
     is_zero_output_timeout,
 )
+from shared.neutral_cwd import neutral_cli_cwd
 
 if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
@@ -295,7 +296,10 @@ class PathScopeAdjudicator:
                 llm_used=False,
             )
 
-        cwd = self._cwd or Path(project_root)
+        # Task 1989: neutral CLI cwd — this is a pure prompt-contained
+        # classifier (disallowed_tools=['*']), so the filing project's
+        # auto-loaded CLAUDE.md/MEMORY.md contribute no decision signal.
+        cwd = neutral_cli_cwd()
         user_prompt = self._build_user_prompt(
             title=title,
             description=description,

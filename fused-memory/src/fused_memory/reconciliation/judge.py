@@ -254,6 +254,11 @@ Review this run and provide your verdict as JSON.
             max_turns=1,
             permission_mode='bypassPermissions',
             timeout_seconds=float(self.config.judge_cli_timeout_seconds),
+            # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
+            # switched to a neutral cwd. JUDGE_SYSTEM_PROMPT rates factual
+            # grounding/proportionality ("were codebase verifications used
+            # when appropriate?"), which plausibly draws on the auto-loaded
+            # CLAUDE.md's project architecture context.
             cwd=Path(self.config.explore_codebase_root),
             cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
         )

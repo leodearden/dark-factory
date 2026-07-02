@@ -362,6 +362,12 @@ class AgentLoop:
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
+                # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
+                # switched to a neutral cwd. This is a multi-turn agent that
+                # actively adjudicates memory-vs-codebase discrepancies with
+                # CLI built-in tools disabled (disallowed_tools=['*']), so the
+                # auto-loaded CLAUDE.md is plausibly its main passive codebase
+                # signal.
                 cwd=Path(self.config.explore_codebase_root),
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
