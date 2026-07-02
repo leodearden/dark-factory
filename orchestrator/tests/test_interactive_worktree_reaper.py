@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -296,3 +297,122 @@ class TestReapInteractiveWorktreesDiskPressure:
         assert reaped == [], (
             f'expected nothing reaped under no pressure; got {reaped!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-07: fail-soft stamp handling + band isolation (I1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapInteractiveWorktreesFailSoftStamp:
+    """RED — a missing/corrupt ``.task/interactive.json`` stamp must never
+    become an indefinite leak (I2) NOR a cause of silently dropped unmerged
+    work."""
+
+    async def test_missing_stamp_reaped_corrupt_with_unmerged_preserved(
+        self, iw_git_repo: Path, caplog,
+    ) -> None:
+        """G: stamp deleted, no own-commits -> reaped ('stale_no_stamp') + WARN.
+
+        H: stamp corrupted (invalid JSON), WITH an unmerged own-commit ->
+        PRESERVED — a corrupt stamp must never cause unmerged work to be
+        silently dropped.
+        """
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info_g = await git_ops.create_interactive_worktree('no-stamp-g')
+        (info_g.path / '.task' / 'interactive.json').unlink()
+
+        info_h = await git_ops.create_interactive_worktree('corrupt-h')
+        (info_h.path / '.task' / 'interactive.json').write_text('{not valid json')
+        await _commit_file(info_h.path, 'work.txt', 'work\n', 'wip on h')
+
+        now = datetime.now(UTC)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        registered = await _registered_worktree_paths(iw_git_repo)
+        assert str(info_g.path.resolve()) not in registered, (
+            f'expected G ({info_g.path}) to be reaped despite its missing '
+            f'stamp; registered: {registered}'
+        )
+        assert str(info_h.path.resolve()) in registered, (
+            f'expected H ({info_h.path}) to be PRESERVED — a corrupt stamp '
+            f'must never cause unmerged work to be silently dropped; '
+            f'registered: {registered}'
+        )
+
+        g_record = next(
+            (r for r in reaped if r.path.resolve() == info_g.path.resolve()), None,
+        )
+        assert g_record is not None, f'expected a reaped record for G; got {reaped!r}'
+        assert g_record.reason == 'stale_no_stamp', (
+            f"expected G's reap reason to be 'stale_no_stamp', got {g_record.reason!r}"
+        )
+        h_paths = {r.path.resolve() for r in reaped}
+        assert info_h.path.resolve() not in h_paths, (
+            f'expected NO reaped record for H; got {reaped!r}'
+        )
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'no-stamp-g' in r.getMessage()
+        ]
+        assert warnings, (
+            f'expected a WARNING naming the missing-stamp worktree (G); '
+            f'all warnings: {[r.getMessage() for r in caplog.records]}'
+        )
+
+
+@pytest.mark.asyncio
+class TestReapInteractiveWorktreesBandIsolation:
+    """RED — the reaper must never enumerate, evaluate, or remove worktrees
+    outside the ``_iact-*`` band (isolation invariant I1)."""
+
+    async def test_non_iact_sibling_worktrees_never_touched(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """``_lane-*``, ``_merge-*``, and plain numeric task-id worktrees
+        registered alongside the ``_iact-*`` band must return no records and
+        must never be removed."""
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        worktree_base = git_ops.worktree_base
+        sibling_paths = {
+            worktree_base / '_lane-x': 'lane-branch-x',
+            worktree_base / '_merge-x': 'merge-branch-x',
+            worktree_base / '123': 'task-branch-123',
+        }
+        for path, branch in sibling_paths.items():
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '-b', branch, str(path), 'main'],
+                cwd=iw_git_repo,
+            )
+            assert rc == 0, f'setup: failed to register {path}: {err}'
+
+        # A genuine _iact-* candidate too, so the sweep does real work and
+        # isn't a no-op that would vacuously "preserve" the siblings.
+        info_i = await git_ops.create_interactive_worktree('real-i')
+
+        now = datetime.now(UTC)
+        reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        registered = await _registered_worktree_paths(iw_git_repo)
+        for path in sibling_paths:
+            assert str(path.resolve()) in registered, (
+                f'expected {path} to remain registered (outside the '
+                f'_iact-* band); registered: {registered}'
+            )
+        assert str(info_i.path.resolve()) in registered, (
+            f'expected I ({info_i.path}) to remain (fresh, within ttl); '
+            f'registered: {registered}'
+        )
+
+        reaped_paths = {r.path.resolve() for r in reaped}
+        for path in sibling_paths:
+            assert path.resolve() not in reaped_paths, (
+                f'expected NO reaped record for {path}; got {reaped!r}'
+            )
