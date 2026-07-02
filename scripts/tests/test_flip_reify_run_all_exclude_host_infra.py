@@ -298,3 +298,44 @@ def test_check_mode_on_already_flipped_reports_noop(tmp_path):
     assert _commit_count(repo) == before_commits, (
         "--check must never create a commit"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-07: RED -- config-reload seam fires only on a real flip
+# ---------------------------------------------------------------------------
+
+RELOAD_MARKER = "flip-reify-run-all: config-reload signal emitted"
+
+
+def test_reload_marker_emitted_only_on_real_apply(tmp_path):
+    """The reload signal fires on a genuine flip, not on --check, and not
+    on an already-flipped no-op apply."""
+    repo = _make_fake_reify_repo(tmp_path)
+
+    applied = _run_script(repo)
+    assert applied.returncode == 0, (
+        f"Expected exit 0 on real apply; got {applied.returncode}\n"
+        f"stdout={applied.stdout!r} stderr={applied.stderr!r}"
+    )
+    assert RELOAD_MARKER in applied.stdout, (
+        f"Expected the reload marker on a real apply; got: {applied.stdout!r}"
+    )
+
+    check_base = tmp_path / "check"
+    check_base.mkdir()
+    check_repo = _make_fake_reify_repo(check_base)
+    checked = _run_script(check_repo, "--check")
+    assert checked.returncode == 0
+    assert RELOAD_MARKER not in checked.stdout, (
+        f"--check must not emit the reload marker; got: {checked.stdout!r}"
+    )
+
+    noop = _run_script(repo)
+    assert noop.returncode == 0, (
+        f"Expected exit 0 on already-flipped no-op apply; got {noop.returncode}\n"
+        f"stdout={noop.stdout!r} stderr={noop.stderr!r}"
+    )
+    assert RELOAD_MARKER not in noop.stdout, (
+        f"An already-flipped no-op apply must not emit the reload marker; "
+        f"got: {noop.stdout!r}"
+    )
