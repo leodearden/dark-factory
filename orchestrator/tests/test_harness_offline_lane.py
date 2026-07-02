@@ -69,6 +69,38 @@ class TestOfflineLaneWiring:
         finally:
             await harness._stop_offline_lane()
 
+    async def test_start_offline_lane_wires_task_client_and_escalation_queue(
+        self, harness: Harness
+    ):
+        """_start_offline_lane wires a concrete task_client + the harness's
+        escalation_queue into the worker (task 2016, closing Bug #1).
+
+        Without this wiring, a confirmed red run's _file_new_fix_task /
+        _file_info_escalation / _file_blocker_escalation all degrade to
+        log-only no-ops (offline_lane.py task_client/escalation_queue None
+        checks) — a confirmed red run files NOTHING.
+
+        Step 5 (RED): _start_offline_lane currently builds the worker with
+        neither task_client= nor escalation_queue=, so both default to None
+        — must fail before impl (step-6).
+        """
+        from orchestrator.harness import _OfflineLaneTaskClient
+
+        harness.config.git.offline_lane_enabled = True
+        harness.config.git.persistent_offline_deep_worktree = True
+        harness._escalation_queue = MagicMock()
+
+        await harness._start_offline_lane()
+
+        try:
+            worker = harness._offline_lane_worker
+            assert isinstance(worker, OfflineLaneWorker)
+            assert worker.task_client is not None
+            assert isinstance(worker.task_client, _OfflineLaneTaskClient)
+            assert worker.escalation_queue is harness._escalation_queue
+        finally:
+            await harness._stop_offline_lane()
+
     async def test_start_offline_lane_noop_when_offline_lane_disabled(
         self, harness: Harness
     ):
