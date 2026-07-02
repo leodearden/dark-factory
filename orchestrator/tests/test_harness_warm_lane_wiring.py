@@ -558,11 +558,11 @@ class TestHardCancelLaneRelease:
 
         # ── Configure mocked scheduler ──────────────────────────────────────
         # carries_substrate_probe → False so the substrate gate is skipped
-        harness.scheduler.carries_substrate_probe.return_value = False
+        harness.scheduler.carries_substrate_probe.return_value = False  # type: ignore[attr-defined]
         # is_deterministic must return False to avoid the deterministic route
         # (MagicMock default is truthy → routes to _run_deterministic_slot
         #  which raises RuntimeError because _escalation_queue is None).
-        harness.scheduler.is_deterministic.return_value = False
+        harness.scheduler.is_deterministic.return_value = False  # type: ignore[attr-defined]
 
         # ── Patch TaskWorkflow to simulate a hard-cancel ────────────────────
         # workflow.run() raises CancelledError, exactly as hard_cancel_workflow()
@@ -648,8 +648,8 @@ class TestHardCancelLaneRelease:
         assert lane is not None, f'setup: lane must be ASSIGNED for task {tid}'
         assert pool.state(lane) == LaneState.ASSIGNED
 
-        harness.scheduler.carries_substrate_probe.return_value = False
-        harness.scheduler.is_deterministic.return_value = False
+        harness.scheduler.carries_substrate_probe.return_value = False  # type: ignore[attr-defined]
+        harness.scheduler.is_deterministic.return_value = False  # type: ignore[attr-defined]
 
         # Patch TaskWorkflow to return CANCELLED normally (not raise).
         # The harness builds the full report at harness.py:3842 with
