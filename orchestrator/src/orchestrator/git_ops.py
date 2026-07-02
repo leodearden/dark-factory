@@ -4714,8 +4714,7 @@ class GitOps:
         this does not depend on the ``.task/interactive.json`` stamp being
         intact.
 
-        Per-worktree reap predicate (disk-pressure eviction is layered in
-        separately):
+        Per-worktree reap predicate:
 
         * :meth:`_interactive_worktree_landed` finds a ``Merge <branch> into
           <main_branch>`` marker on main → reaped immediately as
@@ -4725,12 +4724,18 @@ class GitOps:
           commits beyond main) → age is measured from the
           ``.task/interactive.json`` stamp's ``created_at``.  Reaped
           (``'ttl_idle'``) when that age exceeds
-          ``config.interactive_worktree_ttl``.
+          ``config.interactive_worktree_ttl``; otherwise, when
+          ``_run_warm_lane_disk_guard()`` reports disk pressure (rc==75),
+          reaped anyway (``'disk_pressure'``) regardless of age — safe
+          because there is no unmerged work to lose.  The disk-guard check
+          runs at most once per sweep (not per-candidate).
         * Otherwise (the worktree carries unmerged commits) → age is
           measured from the newest commit's time (``git show -s
           --format=%ct HEAD``), NOT the stamp — an in-progress session that
           keeps committing must never be reaped merely because it is old.
-          Reaped (``'ttl_idle'``) when that age exceeds the same TTL.
+          Reaped (``'ttl_idle'``) when that age exceeds the same TTL. A
+          worktree with unmerged commits is NEVER reaped for disk pressure
+          alone — only the TTL (or landed) rule can reclaim it.
 
         Removal uses ``git worktree remove --force`` per reaped candidate,
         followed by a single ``git worktree prune`` if at least one was
