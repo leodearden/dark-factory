@@ -51,9 +51,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import pydantic_spec
 from escalation.queue import EscalationQueue
 
-from orchestrator.config import GitConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.offline_lane import OfflineLaneWorker
@@ -170,7 +171,7 @@ def _build_worker(
     convention in ``test_offline_lane.py``) with ``get_status`` pre-set to
     the steady in-flight ``'in-progress'`` state.
     """
-    config = MagicMock()
+    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = git_ops.project_root
     config.git = GitConfig(**(git_overrides or {}))
 
