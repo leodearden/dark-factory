@@ -82,6 +82,14 @@ project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
 # ACTIVATION NOTE: this flip is inert in the running daemon until the next
 # orchestrator restart — these knobs are not in the config hot-reload
 # allowlist. Activation is a separate deterministic capstone task.
+#
+# WATCH-PREFIX CONVENTION: every entry below must be a full, existing path
+# (directory or file) relative to the repo root — enforced by
+# tests/scripts/test_orchestrator_restart_config_drift.py. This is stricter
+# than the runtime matcher (service_restart.diff_touches_watched_paths does
+# plain boundary-safe string-prefix matching against changed file paths with
+# no filesystem check), chosen deliberately so a typo'd prefix fails CI
+# instead of silently never matching a changed file at fire time.
 orchestrator_restart_on_merge_enabled: true
 orchestrator_restart_script: "scripts/restart-all-orchestrators.sh"
 orchestrator_restart_watch_prefixes:
