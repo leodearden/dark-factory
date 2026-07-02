@@ -403,8 +403,8 @@ class ReconReportState:
             description=description,
             suggested_action=suggested_action,
             actionable=actionable,
-            task_id=task_id,
-            flag_type=flag_type,
+            task_id=c_task_id,
+            flag_type=c_flag_type,
         )
         entry.findings.append(finding)
         if sig != (None, None):
