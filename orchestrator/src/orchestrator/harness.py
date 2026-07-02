@@ -7200,6 +7200,22 @@ Output JSON matching the schema. Every task must appear in the output.
         error}`` verbatim from ``apply_reload`` plus the injected ``config_path``.
         """
         config_path = os.environ.get('ORCH_CONFIG_PATH')
+
+        def _load_failure_report(error: str) -> dict[str, Any]:
+            """Build+audit+warn the shared I1 fail-closed shape for a load failure."""
+            report = {
+                'reloaded': False,
+                'config_path': config_path,
+                'applied': {},
+                'restart_required': {},
+                'unchanged': 0,
+                'error': error,
+            }
+            if self.event_store:
+                self.event_store.emit(EventType.config_reload, data=report)
+            logger.warning('config reload: %s', report['error'])
+            return report
+
         try:
             # asyncio.wait_for cancels the *wrapping* task on timeout, but the
             # thread-pool thread actually running load_config() cannot be
@@ -7209,31 +7225,9 @@ Output JSON matching the schema. Every task must appear in the output.
                 asyncio.to_thread(load_config), timeout=_RELOAD_LOAD_TIMEOUT_SECS
             )
         except TimeoutError:
-            report = {
-                'reloaded': False,
-                'config_path': config_path,
-                'applied': {},
-                'restart_required': {},
-                'unchanged': 0,
-                'error': f'load_config timed out after {_RELOAD_LOAD_TIMEOUT_SECS}s',
-            }
-            if self.event_store:
-                self.event_store.emit(EventType.config_reload, data=report)
-            logger.warning('config reload: %s', report['error'])
-            return report
+            return _load_failure_report(f'load_config timed out after {_RELOAD_LOAD_TIMEOUT_SECS}s')
         except Exception as exc:
-            report = {
-                'reloaded': False,
-                'config_path': config_path,
-                'applied': {},
-                'restart_required': {},
-                'unchanged': 0,
-                'error': str(exc),
-            }
-            if self.event_store:
-                self.event_store.emit(EventType.config_reload, data=report)
-            logger.warning('config reload: %s', report['error'])
-            return report
+            return _load_failure_report(str(exc))
 
         report = apply_reload(self.config, fresh)
         report['config_path'] = config_path
