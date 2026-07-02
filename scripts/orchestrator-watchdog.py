@@ -50,6 +50,18 @@ WATCHED = [
 # Value = 2 × probe interval (60s) to cover worst-case startup latency.
 STARTUP_GRACE_SECS = 120
 
+# The watchdog's own systemd unit. It matches the `orchestrator-*.service`
+# glob that _enumerate_running_units filters on, but must never be treated as
+# a fleet member to probe or restart. Today it is excluded incidentally
+# because a Type=oneshot unit's SUB state while executing is 'start', not
+# 'running' (see orchestrator-watchdog.service), so --state=running filters
+# it out on its own. That is a fragile invariant to depend on implicitly --
+# if the unit were ever changed to RemainAfterExit=yes or a non-oneshot Type,
+# staleness_pass() could enumerate and blocking-restart itself mid-pass.
+# _enumerate_running_units excludes it explicitly so the exclusion does not
+# rely on systemd oneshot SUB-state semantics.
+WATCHDOG_UNIT_NAME = "orchestrator-watchdog.service"
+
 # Working directory shared by every orchestrator-*.service unit; the repo the
 # staleness pass diffs against.
 REPO_DIR = "/home/leo/src/dark-factory"
@@ -263,6 +275,11 @@ def _enumerate_running_units() -> list[str]:
     Returns [] on a non-zero exit, a subprocess error (missing binary /
     timeout), or empty output — a tooling failure yields no units to act on
     rather than a crash.
+
+    Explicitly excludes WATCHDOG_UNIT_NAME (the watchdog's own unit) even
+    though it should also match `orchestrator-*.service`, so callers never
+    have to rely on oneshot SUB-state timing to keep the watchdog from
+    probing or restarting itself.
     """
     try:
         result = subprocess.run(
@@ -283,7 +300,11 @@ def _enumerate_running_units() -> list[str]:
         return []
     if result.returncode != 0:
         return []
-    return [line.split()[0] for line in result.stdout.splitlines() if line.split()]
+    return [
+        fields[0]
+        for line in result.stdout.splitlines()
+        if (fields := line.split()) and fields[0] != WATCHDOG_UNIT_NAME
+    ]
 
 
 def _unit_start_epoch(unit: str) -> int | None:

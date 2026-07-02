@@ -955,6 +955,43 @@ def test_enumerate_running_units_empty_stdout(monkeypatch: pytest.MonkeyPatch) -
     assert wdog._enumerate_running_units() == []
 
 
+def test_enumerate_running_units_excludes_self(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_enumerate_running_units must never return the watchdog's own unit.
+
+    orchestrator-watchdog.service matches the `orchestrator-*.service` glob
+    just like every other unit. Today it happens to be absent from
+    --state=running output because it is a Type=oneshot unit whose SUB state
+    while executing is 'start', not 'running' — a fragile invariant this
+    test does not rely on: it injects a `list-units` line for the watchdog's
+    own unit directly (as if that invariant no longer held, e.g. after a
+    Type or RemainAfterExit change) and asserts the explicit exclusion still
+    filters it out.
+    """
+    wdog = _load_watchdog()
+    stdout = (
+        _LIST_UNITS_SIX
+        + "orchestrator-watchdog.service                  loaded active running Watchdog\n"
+    )
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog._enumerate_running_units()
+
+    assert wdog.WATCHDOG_UNIT_NAME not in result, (
+        f"_enumerate_running_units must exclude its own unit even if enumerated; got {result}"
+    )
+    assert result == [
+        "orchestrator-dark-factory.service",
+        "orchestrator-reify.service",
+        "orchestrator-my-solar-challenge.service",
+        "orchestrator-know-live.service",
+        "orchestrator-autopilot-video.service",
+        "orchestrator-solar-challenge-platform.service",
+    ], f"Non-self units must be preserved in order; got {result}"
+
+
 # ---------------------------------------------------------------------------
 # _unit_start_epoch tests
 # ---------------------------------------------------------------------------
@@ -1457,7 +1494,19 @@ def test_staleness_pass_commit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_report_mixed_fleet_returns_1_and_lists_all_units(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """report() lists every unit with a verdict, returns 1 if any is stale, mutates nothing (I7)."""
+    """report() lists every unit with a verdict, returns 1 if any is stale, mutates nothing (I7).
+
+    Drives report() through its REAL helpers (_enumerate_running_units,
+    _newest_watched_commit_epoch, _unit_start_epoch) against a single faked
+    subprocess.run, dispatching on argv shape the same way the probe_port
+    tests do. This way recorded_calls captures the actual systemctl/git argv
+    report() drives, so the "zero mutating calls" assertion below is
+    meaningful — a prior version of this test monkeypatched all three
+    helpers directly, so subprocess.run was never invoked inside report()
+    and that assertion passed vacuously (recorded_calls was always empty).
+    restart_unit is also monkeypatched to fail the test outright if called,
+    as a direct belt-and-suspenders check.
+    """
     wdog = _load_watchdog()
 
     commit_epoch = 1_800_000_000
@@ -1471,12 +1520,22 @@ def test_report_mixed_fleet_returns_1_and_lists_all_units(
 
     def fake_run(cmd, **kwargs):  # noqa: ANN001
         recorded_calls.append(list(cmd))
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:3] == ["systemctl", "--user", "list-units"]:
+            stdout = "".join(f"{u} loaded active running desc\n" for u in units)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:3] == ["systemctl", "--user", "show"]:
+            unit = cmd[3]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"ExecMainStartTimestamp=@{start_epochs[unit]}\n", stderr=""
+            )
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_epoch}\n", stderr="")
+        pytest.fail(f"unexpected subprocess.run call inside report(): {cmd}")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(units))
-    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
-    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda u: start_epochs[u])
+    monkeypatch.setattr(
+        wdog, "restart_unit", lambda u: pytest.fail(f"report() must never restart {u}")
+    )
 
     exit_code = wdog.report()
 
@@ -1488,6 +1547,10 @@ def test_report_mixed_fleet_returns_1_and_lists_all_units(
     assert "stale" in captured.out
     assert "fresh" in captured.out
 
+    assert recorded_calls, (
+        "report() must have driven subprocess.run through its real helpers "
+        "for this assertion to mean anything"
+    )
     mutating_verbs = {"stop", "start", "restart", "reset-failed"}
     for call in recorded_calls:
         for token in call:
