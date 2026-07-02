@@ -845,12 +845,28 @@ class MemoryService:
                     payload={'content': content[:200]},
                     coro=self.mem0.add(content=content, scope=scope, metadata=meta),
                 )
-                memory_ids.extend(
+                mem0_ids = [
                     r['id']
                     for r in (mem0_result or {}).get('results', [])
                     if isinstance(r, dict) and 'id' in r
-                )
+                ]
+                memory_ids.extend(mem0_ids)
                 stores_written.append(SourceStore.mem0)
+                if not mem0_ids:
+                    # mem0.add() did not raise but returned no results — a silent
+                    # dedup/infer no-op drop (task 1974). Under the pinned
+                    # infer=False, a successful write always returns exactly one
+                    # result with an id, so this is always anomalous.
+                    logger.warning(
+                        'MemoryService.add_memory: mem0 add returned zero memory_ids '
+                        '(silent empty-result drop; possible dedup/infer no-op)',
+                        extra={
+                            'project_id': project_id,
+                            'category': resolved_category.value,
+                            'causation_id': causation_id,
+                            'kind': meta.get('kind'),
+                        },
+                    )
             except Exception as e:
                 logger.error(f'Mem0 write failed: {e}')
                 _mem0_error = str(e)
