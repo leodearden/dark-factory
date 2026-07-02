@@ -237,3 +237,64 @@ def test_apply_normalizes_stray_zero_value_to_single_key(tmp_path):
         f"Expected the stray \"0\" value normalized to \"1\"; config:\n{config_text}"
     )
     assert f'{KNOB}: "0"' not in config_text
+
+
+# ---------------------------------------------------------------------------
+# step-05: RED -- --check / --dry-run mode
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", ["--check", "--dry-run"])
+def test_check_mode_prints_diff_without_mutating(tmp_path, flag):
+    """--check (and its --dry-run alias) on an unflipped config prints the
+    intended one-line diff, exits 0, and leaves the repo untouched."""
+    repo = _make_fake_reify_repo(tmp_path)
+    before_config = _read_config(repo)
+    before_commits = _commit_count(repo)
+
+    result = _run_script(repo, flag)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0 for {flag}; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "+" in result.stdout and KNOB in result.stdout and '"1"' in result.stdout, (
+        f"Expected a '+'-prefixed line naming {KNOB} with value \"1\" in stdout; "
+        f"got: {result.stdout!r}"
+    )
+    assert "verify_env" in result.stdout, (
+        f"Expected the intended diff to reference verify_env; got: {result.stdout!r}"
+    )
+
+    assert _read_config(repo) == before_config, f"{flag} must not mutate orchestrator.yaml"
+    assert _commit_count(repo) == before_commits, f"{flag} must not create a commit"
+
+
+def test_check_mode_on_already_flipped_reports_noop(tmp_path):
+    """--check on an ALREADY-flipped config reports the same no-op state
+    as apply (nothing would change) rather than printing the
+    intended-diff line as if a flip were still pending -- applying would
+    be a no-op, so that is what --check reports too."""
+    repo = _make_fake_reify_repo(tmp_path, state="flipped")
+    before_config = _read_config(repo)
+    before_commits = _commit_count(repo)
+
+    result = _run_script(repo, "--check")
+
+    assert result.returncode == 0, (
+        f"Expected exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "already flipped" in result.stdout, (
+        f"Expected --check on an already-flipped config to report the "
+        f"no-op state; got: {result.stdout!r}"
+    )
+    # The reload marker (defined at step-07) must not appear on any no-op
+    # path; asserted here as a literal string since RELOAD_MARKER isn't
+    # defined as a module constant until step-07.
+    assert "config-reload signal emitted" not in result.stdout
+    assert _read_config(repo) == before_config, (
+        "--check must never mutate orchestrator.yaml"
+    )
+    assert _commit_count(repo) == before_commits, (
+        "--check must never create a commit"
+    )
