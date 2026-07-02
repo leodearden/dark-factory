@@ -54,6 +54,7 @@ import asyncio
 import fcntl
 import logging
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -77,6 +78,34 @@ _OFFLINE_LANE_FAILURE_BACKOFF_SECS: float = 60.0
 # Default suite-run seam script (Part A, gated separately at ζ — see module
 # docstring's cross-project scope boundary).
 _RUN_OFFLINE_DEEP_SCRIPT: str = 'scripts/run-offline-deep.sh'
+
+# Default infra sub-run seam script + scope (task 1959, IE1): reify's H9
+# (reify:4929) host-exclusive runner.  IE-D2 — `--scope host-infra`
+# SELF-ACQUIRES the H8 Lane-X flock, so no DF-side flock is needed here.
+_RUN_ALL_INFRA_SCRIPT: str = 'tests/infra/run_all.sh'
+_INFRA_SCOPE: str = 'host-infra'
+
+# Matches reify H9's per-test result lines, e.g. '  RESULT: FAIL (test_x.sh)'
+# or '  RESULT: PASS (test_y.sh)'.  Only FAIL lines are of interest to the
+# infra confirmation runner; the captured group is the test-FILE-name.
+_INFRA_RESULT_FAIL_RE = re.compile(r'^\s*RESULT:\s*FAIL\s*\((?P<name>.+?)\)\s*$')
+
+
+def _parse_infra_failures(text: str) -> list[str]:
+    """Extract still-failing test-file-names from reify H9's stdout (IE1).
+
+    Matches per-line ``RESULT: FAIL (<name>)`` lines (PASS lines and any
+    other output are ignored) and returns the sorted, de-duplicated set of
+    captured names.  Used by
+    :meth:`OfflineLaneWorker._default_infra_confirmation_run` (kept
+    module-level so it is trivially unit-testable in isolation).
+    """
+    names = {
+        m.group('name')
+        for line in text.splitlines()
+        if (m := _INFRA_RESULT_FAIL_RE.match(line))
+    }
+    return sorted(names)
 
 #: Signature of the injectable heavy-suite seam: (worktree path, head SHA,
 #: test-thread count) -> (return code, output tail).
@@ -139,6 +168,18 @@ class OfflineLaneWorker:
             ``(wt_path, head) -> confirmed_still_failing_ids`` used by
             :meth:`_handle_red_run` to filter flakes before fingerprinting.
             Defaults to :meth:`_default_confirmation_run` when not supplied.
+        infra_runner: Optional injectable async seam (task 1959, IE1),
+            same ``SuiteRunner`` signature as ``suite_runner``, for the
+            second (infra) sub-run: reify's ``run_all --scope host-infra``
+            (H9 = reify:4929).  Defaults to :meth:`_default_run_infra` when
+            not supplied.  IE-D2: the infra scope self-acquires the H8
+            Lane-X flock — no DF-side flock is taken here.
+        infra_confirmation_runner: Optional injectable async seam (task
+            1959, IE1), same ``ConfirmationRunner`` signature as
+            ``confirmation_runner``, used by :meth:`_handle_red_run` (via
+            its optional ``confirmation_runner`` kwarg) to confirm an infra
+            sub-run red result.  Defaults to
+            :meth:`_default_infra_confirmation_run` when not supplied.
         task_client: Optional :class:`OfflineLaneTaskClient` (β3) used to
             file/update the dedup'd fix task for a confirmed red run.
             Defaults to ``None`` — the red path degrades to a log-only no-op
@@ -157,6 +198,8 @@ class OfflineLaneWorker:
         lock_path: str | Path,
         suite_runner: SuiteRunner | None = None,
         confirmation_runner: ConfirmationRunner | None = None,
+        infra_runner: SuiteRunner | None = None,
+        infra_confirmation_runner: ConfirmationRunner | None = None,
         task_client: OfflineLaneTaskClient | None = None,
         escalation_queue: EscalationQueue | None = None,
     ) -> None:
@@ -170,6 +213,14 @@ class OfflineLaneWorker:
             confirmation_runner
             if confirmation_runner is not None
             else self._default_confirmation_run
+        )
+        self.infra_runner: SuiteRunner = (
+            infra_runner if infra_runner is not None else self._default_run_infra
+        )
+        self.infra_confirmation_runner: ConfirmationRunner = (
+            infra_confirmation_runner
+            if infra_confirmation_runner is not None
+            else self._default_infra_confirmation_run
         )
         self.task_client = task_client
         self.escalation_queue = escalation_queue
@@ -284,7 +335,7 @@ class OfflineLaneWorker:
                 await asyncio.sleep(_OFFLINE_LANE_FAILURE_BACKOFF_SECS)
 
     async def _run_once(self) -> None:
-        """Snapshot head, reset the warm worktree, and invoke the suite seam.
+        """Snapshot head, reset the warm worktree, and invoke both sub-run seams.
 
         See module docstring — always-from-head, clear-before-snapshot.
 
@@ -293,6 +344,34 @@ class OfflineLaneWorker:
         landing after the clear either lands inside this run's snapshot
         (fine) or re-sets ``_dirty`` for a coalesced re-run (fine).
         Clearing AFTER the snapshot would open a lost-update window.
+
+        Two sub-runs per coalesced cadence, both at this ONE snapshot head
+        and in the SAME ``_offline-deep`` worktree (task 1959, IE1):
+
+        1. NUMERIC — the existing ``scripts/run-offline-deep.sh`` suite via
+           :attr:`suite_runner`. Unchanged: on red it calls
+           :meth:`_handle_red_run` BARE (``_handle_red_run(wt, head)``),
+           preserving back-compat with the numeric-only red path.
+        2. INFRA — reify's ``run_all --scope host-infra`` (H9 = reify:4929)
+           via :attr:`infra_runner`, gated on
+           ``config.git.offline_lane_infra_enabled`` (default False =
+           numeric-only, byte-identical to prior behavior). On red, it
+           reuses :meth:`_handle_red_run` with :attr:`infra_confirmation_runner`
+           injected via the optional ``confirmation_runner`` kwarg — the
+           entire confirm→fingerprint→file/update→escalate machinery is
+           shared, unchanged (IE-D1/§6: no new dedup mechanism). IE-D2: the
+           infra scope self-acquires the H8 Lane-X flock — no DF-side flock
+           is taken here. IE-D4: infra ``.sh``/cargo tests never touch
+           ``_offline-deep/target/``, so reusing δ's worktree does not
+           violate C5's single-consumer-of-target invariant.
+
+        Both sub-runs are logged (the run record). ``_last_green_head``
+        advances only when ALL EXECUTED sub-runs passed at this head — the
+        last-both-green head is a sound (if sometimes wider) lower bound for
+        either sub-run's suspect range (see :meth:`_suspect_range`). When
+        infra is disabled, the infra leg is vacuously green, so numeric-only
+        semantics are unchanged. Never a gate (C7): a red infra result files
+        a normal queued fix task — it never blocks the merge queue.
         """
         self._dirty = False
         head = await self.git_ops.get_main_sha()
@@ -301,31 +380,52 @@ class OfflineLaneWorker:
             return
         wt = await self.git_ops.reset_persistent_offline_deep_worktree(head)
         threads = self.config.git.offline_lane_test_threads
+
         start = time.monotonic()
         rc, _tail = await self.suite_runner(wt, head, threads)
         duration = time.monotonic() - start
         self._last_run_head = head
         logger.info(
-            'offline-lane: run head=%s status=%s duration=%.1fs',
+            'offline-lane: numeric sub-run head=%s status=%s duration=%.1fs',
             head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
         )
-        if rc == 0:
-            self._last_green_head = head
-        else:
+        numeric_green = rc == 0
+        if not numeric_green:
             await self._handle_red_run(wt, head)
+
+        infra_green = True
+        if self.config.git.offline_lane_infra_enabled:
+            start = time.monotonic()
+            rc, _tail = await self.infra_runner(wt, head, threads)
+            duration = time.monotonic() - start
+            logger.info(
+                'offline-lane: infra sub-run head=%s status=%s duration=%.1fs',
+                head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+            )
+            infra_green = rc == 0
+            if not infra_green:
+                await self._handle_red_run(
+                    wt, head, confirmation_runner=self.infra_confirmation_runner,
+                )
+
+        if numeric_green and infra_green:
+            self._last_green_head = head
 
     # ------------------------------------------------------------------
     # Red-path handling — confirmation, fingerprint, dedup'd fix-task spawn,
     # staged escalation (β3, task 1954, PRD §5 C3/C4)
     # ------------------------------------------------------------------
 
-    async def _handle_red_run(self, wt: Path, head: str) -> None:
+    async def _handle_red_run(
+        self, wt: Path, head: str, *, confirmation_runner: ConfirmationRunner | None = None,
+    ) -> None:
         """Handle a confirmed-red ``_run_once`` pass: confirm, fingerprint, file/update.
 
         (1) CONFIRMATION RE-RUN: re-runs only the originally-failing tests,
-        isolated/serial, ONCE, via :attr:`confirmation_runner`. An empty
-        result means the failure did not reproduce — intermittent
-        nondeterminism (B6): log only, no task, no escalation.
+        isolated/serial, ONCE, via *confirmation_runner* if supplied, else
+        :attr:`confirmation_runner` (the numeric seam). An empty result
+        means the failure did not reproduce — intermittent nondeterminism
+        (B6): log only, no task, no escalation.
 
         (2)+(3) UPDATE-OR-FILE: fingerprints the confirmed failing-test SET
         (never ``main_sha`` — DB3/C3) and dispatches on whether that
@@ -333,8 +433,19 @@ class OfflineLaneWorker:
         fingerprint is UPDATED (:meth:`_update_existing_fix_task` — append
         the suspect range, no new task/escalation, B5); a new fingerprint is
         FILED (:meth:`_file_new_fix_task` — new fix task + INFO escalation, B4).
+
+        The optional *confirmation_runner* kwarg (task 1959, IE1) lets the
+        infra sub-run's red path reuse this entire method with its OWN
+        confirmation seam (:attr:`infra_confirmation_runner`) while the
+        numeric call site stays bare (``_handle_red_run(wt, head)``,
+        unchanged) and keeps using :attr:`confirmation_runner`. Everything
+        downstream of the confirmation re-run — fingerprint, file/update,
+        escalation — is content-agnostic and unchanged, so infra
+        test-file-names dedup exactly like numeric test IDs (IE-D1/§6): no
+        new dedup mechanism.
         """
-        confirmed = await self.confirmation_runner(wt, head)
+        runner = confirmation_runner if confirmation_runner is not None else self.confirmation_runner
+        confirmed = await runner(wt, head)
         if not confirmed:
             logger.info(
                 'offline-lane: intermittent nondeterminism — confirmation '
@@ -680,3 +791,68 @@ class OfflineLaneWorker:
         stdout, _ = await proc.communicate()
         text = (stdout or b'').decode(errors='replace')
         return [line.strip() for line in text.splitlines() if line.strip()]
+
+    async def _default_run_infra(self, wt_path: Path, head: str, threads: int) -> tuple[int, str]:
+        """Default ``infra_runner`` seam — runs reify's H9 host-infra scope (IE1).
+
+        Cross-project scope boundary (same as :meth:`_default_run_suite`):
+        reify's ``tests/infra/run_all.sh`` (H9 = reify:4929) is not
+        necessarily present/confirmed on every checkout — real wiring is
+        gated separately via ``config.git.offline_lane_infra_enabled``
+        (task 1959, IE1), exactly like ``offline_lane_enabled`` gates
+        :meth:`_default_run_suite`'s ζ script. This default builds the
+        invocation unconditionally.
+
+        NO ``--test-threads``: IE-D2 — ``--scope host-infra`` SELF-ACQUIRES
+        the H8 Lane-X flock and runs the host-exclusive set serially, so a
+        thread count is meaningless and no DF-side flock is taken here.
+        ``env``/``cwd`` mirror :meth:`_default_run_suite` exactly (same
+        ``DF_VERIFY_ROLE=offline`` overlay onto a full ``os.environ``
+        copy). ``head``/``threads`` are accepted only for ``SuiteRunner``
+        seam-signature symmetry with the numeric runner; ``threads`` is
+        unused.
+        """
+        argv = [_RUN_ALL_INFRA_SCRIPT, '--scope', _INFRA_SCOPE]
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(wt_path),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        tail = (stdout or b'').decode(errors='replace')[-2000:]
+        return proc.returncode or 0, tail
+
+    async def _default_infra_confirmation_run(self, wt: Path, head: str) -> list[str]:
+        """Default ``infra_confirmation_runner`` seam — re-runs H9 host-infra (IE1).
+
+        Cross-project scope boundary (same as :meth:`_default_run_infra`).
+        Re-invokes reify's H9 with the SAME argv/env/cwd as
+        :meth:`_default_run_infra` — the whole host-exclusive set is small
+        and self-serializes under its own flock (IE-D2), so re-running the
+        full scope is an acceptable flake filter (mirrors
+        :meth:`_default_confirmation_run`'s serial re-run, without needing
+        a separate "confirm only these" flag since the set is already
+        tiny).
+
+        Parses stdout via the module-level :func:`_parse_infra_failures`
+        helper, which extracts H9's ``RESULT: FAIL (<name>)`` lines — a
+        different wire format from the numeric seam's newline-separated
+        test IDs (:meth:`_default_confirmation_run`), since reify H9 emits
+        one line per test with an explicit PASS/FAIL verdict rather than
+        listing only failures.
+        """
+        argv = [_RUN_ALL_INFRA_SCRIPT, '--scope', _INFRA_SCOPE]
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(wt),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        text = (stdout or b'').decode(errors='replace')
+        return _parse_infra_failures(text)

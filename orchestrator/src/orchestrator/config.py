@@ -841,6 +841,18 @@ class GitConfig(BaseModel):
             'dedicated _offline-deep worktree.'
         ),
     )
+    offline_lane_infra_enabled: bool = Field(
+        default=False,
+        description=(
+            "When True (and offline_lane_enabled is also True) the "
+            "offline-deep worker ALSO invokes reify's `run_all --scope "
+            "host-infra` (H9 = reify:4929) as a second sub-run at the same "
+            'run-start snapshot head (task 1959, IE1); default False = '
+            'numeric-only, byte-identical to prior behavior; gated '
+            'separately so infra can be enabled once reify:4929 is '
+            'confirmed on main.'
+        ),
+    )
     offline_lane_test_threads: int = Field(
         default=6,
         ge=1,

@@ -57,6 +57,8 @@ def _make_worker(
     config: MagicMock | None = None,
     suite_runner=None,
     confirmation_runner=None,
+    infra_runner=None,
+    infra_confirmation_runner=None,
     task_client=None,
     escalation_queue=None,
 ) -> OfflineLaneWorker:
@@ -67,6 +69,8 @@ def _make_worker(
         lock_path=tmp_path / 'offline_lane.lock',
         suite_runner=suite_runner,
         confirmation_runner=confirmation_runner,
+        infra_runner=infra_runner,
+        infra_confirmation_runner=infra_confirmation_runner,
         task_client=task_client,
         escalation_queue=escalation_queue,
     )
@@ -117,6 +121,18 @@ def test_git_config_offline_lane_knobs_validation():
         GitConfig(offline_lane_poll_interval_secs=0.0)
     with pytest.raises(ValidationError):
         GitConfig(offline_lane_red_advances_before_blocker=0)
+
+
+def test_git_config_offline_lane_infra_enabled_default_and_settable():
+    """GitConfig exposes offline_lane_infra_enabled, default off (task 1959, IE1).
+
+    Step 1 (RED): the field does not yet exist — must fail before impl.
+    """
+    assert GitConfig().offline_lane_infra_enabled is False, (
+        'offline_lane_infra_enabled must default to False (numeric-only, '
+        'byte-identical to prior behavior)'
+    )
+    assert GitConfig(offline_lane_infra_enabled=True).offline_lane_infra_enabled is True
 
 
 # ---------------------------------------------------------------------------
@@ -928,3 +944,356 @@ async def test_default_confirmation_run_empty_stdout_means_no_confirmed_failures
         confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
 
     assert confirmed == []
+
+
+# ---------------------------------------------------------------------------
+# infra seams — constructor wiring (task 1959, IE1, step-3/4)
+# ---------------------------------------------------------------------------
+
+
+def test_infra_seams_injected_or_default(tmp_path: Path):
+    """infra_runner/infra_confirmation_runner are stored when injected, else
+    fall back to their bound default methods (task 1959, IE1).
+
+    Mirrors the existing suite_runner/confirmation_runner wiring.
+
+    Step 3 (RED): the constructor params and the default methods do not
+    exist yet — must fail before impl.
+    """
+    sentinel_infra = AsyncMock(return_value=(0, ''))
+    sentinel_conf = AsyncMock(return_value=[])
+    worker = _make_worker(
+        tmp_path, infra_runner=sentinel_infra, infra_confirmation_runner=sentinel_conf,
+    )
+    assert worker.infra_runner is sentinel_infra
+    assert worker.infra_confirmation_runner is sentinel_conf
+
+    worker_default = _make_worker(tmp_path)
+    assert worker_default.infra_runner == worker_default._default_run_infra
+    assert (
+        worker_default.infra_confirmation_runner
+        == worker_default._default_infra_confirmation_run
+    )
+
+
+# ---------------------------------------------------------------------------
+# Default infra-runner seam (task 1959, IE1, step-5/6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: Path):
+    """The default (uninjected) infra_runner seam builds reify's H9 invocation.
+
+    No infra_runner is supplied, so the worker falls back to its
+    ``_default_run_infra`` seam. ``asyncio.create_subprocess_exec`` is
+    mocked, so this asserts ONLY that the argv/env/cwd invocation is built
+    correctly — real script existence/execution on reify main is
+    cross-project scope (see module docstring), mirroring
+    ``test_default_suite_runner_builds_run_offline_deep_command``.
+
+    NO ``--test-threads``: the host-exclusive set self-serializes under
+    H9's own flock (IE-D2).
+
+    Step 5 (RED): _default_run_infra is a NotImplementedError stub — must
+    fail before impl.
+    """
+    worker = _make_worker(tmp_path)  # no infra_runner injected -> default seam
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'infra output\n', b''))
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        rc, tail = await worker.infra_runner(wt_path, 'HEAD1', 6)
+
+    assert rc == 0
+    assert 'infra output' in tail
+
+    mock_exec.assert_awaited_once()
+    argv = mock_exec.call_args.args
+    kwargs = mock_exec.call_args.kwargs
+    assert list(argv) == ['tests/infra/run_all.sh', '--scope', 'host-infra'], (
+        'argv must invoke reify H9 with the host-infra scope and NO '
+        '--test-threads (the set self-serializes under its own flock)'
+    )
+    assert kwargs['cwd'] == str(wt_path), 'cwd must be the _offline-deep worktree'
+    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
+        'DF_VERIFY_ROLE=offline must be set, same as the numeric sub-run'
+    )
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
+            f'not replace it (missing/altered {key!r})'
+        )
+    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert kwargs['stderr'] == asyncio.subprocess.STDOUT
+
+
+# ---------------------------------------------------------------------------
+# Default infra-confirmation-runner seam (task 1959, IE1, step-7/8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_infra_confirmation_run_parses_result_fail_lines(tmp_path: Path):
+    """The default (uninjected) infra_confirmation_runner seam re-invokes H9
+    and parses ``RESULT: FAIL (<name>)`` lines into a sorted, de-duplicated
+    list of still-failing test-file-names (PASS lines excluded).
+
+    No infra_confirmation_runner is supplied, so the worker falls back to
+    its ``_default_infra_confirmation_run`` seam. ``create_subprocess_exec``
+    is mocked, so this asserts ONLY that the argv/env/cwd invocation is
+    built correctly and stdout is parsed — real script existence/execution
+    on reify main is cross-project scope (see module docstring).
+
+    Step 7 (RED): _default_infra_confirmation_run is a NotImplementedError
+    stub — must fail before impl.
+    """
+    worker = _make_worker(tmp_path)  # no infra_confirmation_runner injected
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(
+        return_value=(
+            b'--- Running: test_cgroup_burn.sh ---\n'
+            b'  RESULT: FAIL (test_cgroup_burn.sh)\n'
+            b'  RESULT: PASS (test_reflink_fs.sh)\n'
+            b'  RESULT: FAIL (test_cgroup_delegation.sh)\n',
+            b'',
+        )
+    )
+    mock_proc.returncode = 1
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        confirmed = await worker.infra_confirmation_runner(wt_path, 'HEAD1')
+
+    assert confirmed == ['test_cgroup_burn.sh', 'test_cgroup_delegation.sh'], (
+        'FAIL file-names must be sorted, de-duplicated, and exclude PASS lines'
+    )
+
+    mock_exec.assert_awaited_once()
+    argv = mock_exec.call_args.args
+    kwargs = mock_exec.call_args.kwargs
+    assert list(argv) == ['tests/infra/run_all.sh', '--scope', 'host-infra']
+    assert kwargs['cwd'] == str(wt_path), 'cwd must be the _offline-deep worktree'
+    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
+            f'not replace it (missing/altered {key!r})'
+        )
+
+
+@pytest.mark.asyncio
+async def test_default_infra_confirmation_run_no_fail_lines_means_no_confirmed_failures(
+    tmp_path: Path,
+):
+    """Output with only PASS / no RESULT lines confirms nothing.
+
+    Step 7 (RED): _default_infra_confirmation_run is a NotImplementedError
+    stub — must fail before impl.
+    """
+    worker = _make_worker(tmp_path)
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(
+        return_value=(b'  RESULT: PASS (test_reflink_fs.sh)\n', b'')
+    )
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ):
+        confirmed = await worker.infra_confirmation_runner(wt_path, 'HEAD1')
+
+    assert confirmed == []
+
+
+# ---------------------------------------------------------------------------
+# _handle_red_run — optional confirmation_runner kwarg for infra reuse
+# (task 1959, IE1, step-9/10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_red_run_uses_injected_confirmation_runner_for_infra(tmp_path: Path):
+    """_handle_red_run accepts an OPTIONAL confirmation_runner kwarg so the
+    infra sub-run's red path reuses the entire confirm→fingerprint→file/
+    update→escalate machinery (IE-D1/§6) with its OWN confirmation seam,
+    while the numeric call site (bare, no kwarg) keeps using
+    self.confirmation_runner unchanged (back-compat).
+
+    Step 9 (RED): _handle_red_run has no confirmation_runner param yet — the
+    kwarg call raises TypeError. Must fail before impl.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    numeric_confirmation_runner = AsyncMock(return_value=['numeric::should-not-be-used'])
+    infra_confirmed = ['test_cgroup_burn.sh', 'test_reflink_fs.sh']
+    infra_conf = AsyncMock(return_value=infra_confirmed)
+    task_client = AsyncMock()
+    task_client.submit_fix_task = AsyncMock(return_value='fix-infra-1')
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task.return_value = []
+    escalation_queue.make_id.return_value = 'esc-1'
+
+    worker = _make_worker(
+        tmp_path,
+        confirmation_runner=numeric_confirmation_runner,
+        task_client=task_client,
+        escalation_queue=escalation_queue,
+    )
+    worker._last_green_head = 'GREEN'
+
+    wt = Path('/tmp/_offline-deep')
+    await worker._handle_red_run(wt, 'HEAD1', confirmation_runner=infra_conf)
+
+    infra_conf.assert_awaited_once_with(wt, 'HEAD1')
+    numeric_confirmation_runner.assert_not_awaited()
+
+    task_client.submit_fix_task.assert_awaited_once()
+    arguments = task_client.submit_fix_task.await_args.args[0]
+    assert arguments['metadata']['failing_tests'] == sorted(infra_confirmed)
+    assert arguments['metadata']['merge_lane'] == 'normal'
+
+    fp = compute_failing_test_set_fingerprint(infra_confirmed)
+    assert worker.open_fix_tasks[fp] == 'fix-infra-1'
+
+    escalation_queue.submit.assert_called_once()
+    esc = escalation_queue.submit.call_args.args[0]
+    assert esc.severity == 'info'
+    assert esc.level == 0
+    assert esc.agent_role == 'orchestrator-offline-lane'
+
+    # Back-compat: the bare (no-kwarg) call site still uses the numeric
+    # self.confirmation_runner.
+    wt2 = Path('/tmp/_offline-deep-2')
+    await worker._handle_red_run(wt2, 'HEAD1')
+    numeric_confirmation_runner.assert_awaited_once_with(wt2, 'HEAD1')
+
+
+# ---------------------------------------------------------------------------
+# _run_once — dual sub-run when infra enabled (task 1959, IE1, step-11/12)
+# ---------------------------------------------------------------------------
+
+
+def _log_call_text(call) -> str:
+    """Join a mock logger call's args into one searchable string.
+
+    Format-agnostic: works whether the message uses %-style placeholders
+    or plain text, since it just concatenates the format string with all
+    of its interpolation args.
+    """
+    return ' '.join(str(a) for a in call.args)
+
+
+@pytest.mark.asyncio
+async def test_run_once_runs_both_sub_runs_when_infra_enabled(tmp_path: Path):
+    """_run_once runs the infra sub-run (at the SAME snapshot head, in the
+    SAME worktree) when offline_lane_infra_enabled is True, reusing β3's red
+    path via the infra confirmation runner; _last_green_head only advances
+    when ALL executed sub-runs pass at that head. When infra is disabled
+    (default), only the numeric sub-run runs — byte-identical to prior
+    behavior.
+
+    Mirrors test_run_once_wires_red_and_green_paths_by_returncode.
+
+    Step 11 (RED): _run_once does not run the infra sub-run yet —
+    infra_runner is never awaited and _handle_red_run is never called with
+    confirmation_runner=infra_confirmation_runner. Must fail before impl.
+    """
+    wt_path = tmp_path / '_offline-deep'
+
+    # -- Scenario A: infra enabled, numeric green + infra red.
+    git_ops_a = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    config_a = _make_config(tmp_path, offline_lane_infra_enabled=True)
+    suite_runner_a = AsyncMock(return_value=(0, ''))
+    infra_runner_a = AsyncMock(return_value=(1, ''))
+    infra_conf_a = AsyncMock(return_value=[])
+    worker_a = _make_worker(
+        tmp_path,
+        git_ops=git_ops_a,
+        config=config_a,
+        suite_runner=suite_runner_a,
+        infra_runner=infra_runner_a,
+        infra_confirmation_runner=infra_conf_a,
+    )
+    worker_a._handle_red_run = AsyncMock()
+    worker_a._dirty = True
+
+    with patch('orchestrator.offline_lane.logger') as mock_logger:
+        await worker_a._run_once()
+
+    threads_a = config_a.git.offline_lane_test_threads
+    suite_runner_a.assert_awaited_once_with(wt_path, 'HEAD1', threads_a)
+    infra_runner_a.assert_awaited_once_with(wt_path, 'HEAD1', threads_a)
+    worker_a._handle_red_run.assert_awaited_once_with(
+        wt_path, 'HEAD1', confirmation_runner=worker_a.infra_confirmation_runner,
+    )
+    assert worker_a._last_green_head is None, (
+        'infra red must block the both-green advance even though numeric was green'
+    )
+
+    info_texts = [_log_call_text(call) for call in mock_logger.info.call_args_list]
+    assert any('numeric' in t and 'HEAD1' in t and 'PASS' in t for t in info_texts), (
+        f'expected a numeric-labeled PASS log line, got {info_texts!r}'
+    )
+    assert any('infra' in t and 'HEAD1' in t and 'FAIL' in t for t in info_texts), (
+        f'expected an infra-labeled FAIL log line, got {info_texts!r}'
+    )
+
+    # -- Scenario B: infra enabled, both sub-runs green.
+    git_ops_b = _make_git_ops(head='HEAD2', worktree_path=wt_path)
+    config_b = _make_config(tmp_path, offline_lane_infra_enabled=True)
+    suite_runner_b = AsyncMock(return_value=(0, ''))
+    infra_runner_b = AsyncMock(return_value=(0, ''))
+    worker_b = _make_worker(
+        tmp_path,
+        git_ops=git_ops_b,
+        config=config_b,
+        suite_runner=suite_runner_b,
+        infra_runner=infra_runner_b,
+    )
+    worker_b._handle_red_run = AsyncMock()
+    worker_b._dirty = True
+
+    await worker_b._run_once()
+
+    infra_runner_b.assert_awaited_once_with(wt_path, 'HEAD2', config_b.git.offline_lane_test_threads)
+    worker_b._handle_red_run.assert_not_awaited()
+    assert worker_b._last_green_head == 'HEAD2'
+
+    # -- Scenario C: infra disabled (default) — numeric-only, unchanged.
+    git_ops_c = _make_git_ops(head='HEAD3', worktree_path=wt_path)
+    config_c = _make_config(tmp_path)  # offline_lane_infra_enabled defaults False
+    suite_runner_c = AsyncMock(return_value=(0, ''))
+    infra_runner_c = AsyncMock(return_value=(0, ''))
+    worker_c = _make_worker(
+        tmp_path,
+        git_ops=git_ops_c,
+        config=config_c,
+        suite_runner=suite_runner_c,
+        infra_runner=infra_runner_c,
+    )
+    worker_c._handle_red_run = AsyncMock()
+    worker_c._dirty = True
+
+    await worker_c._run_once()
+
+    infra_runner_c.assert_not_awaited()
+    worker_c._handle_red_run.assert_not_awaited()
+    assert worker_c._last_green_head == 'HEAD3'
