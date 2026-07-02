@@ -1,0 +1,188 @@
+"""Tests for claim_warm_worktree / release_warm_worktree escalation MCP verbs.
+
+PRD β (task 2011) — thin @mcp.tool() closures over the in-process ``harness``
+handle that expose task α's interactive-warm-worktree primitive
+(``GitOps.create_interactive_worktree``, task 2010) to out-of-process
+interactive callers (/do, /warm, the integration gate).
+
+Isolated from test_server.py because these are real-git integration tests
+(worktree creation/removal, branch pruning) incompatible with test_server.py's
+in-memory stubs — mirrors test_merge_status_git_authority.py's split.
+
+Shared patterns from the existing test suite:
+- Cross-package orchestrator import guard (mirrors test_server.py:31-55 /
+  test_merge_status_git_authority.py:31-43)
+- ``_call_tool`` helper — FastMCP async unit-test pattern
+  (``tool = await server.get_tool(name); await tool.fn(...)``), mirrors
+  test_server.py's ``_call_tool`` (line 3661).
+- Real-repo fixtures (``_init_repo``/``_add_seed_script``/``_run``,
+  ``GitConfig()``+``GitOps(config, repo)``) copied from
+  orchestrator/tests/test_interactive_worktree.py.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import types
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from escalation.queue import EscalationQueue
+from escalation.server import create_server
+
+# ---------------------------------------------------------------------------
+# Cross-package orchestrator imports.
+# Guarded so the rest of the file is still collected when the orchestrator
+# package is absent (e.g. in an escalation-only install).
+# Mirrors test_server.py lines 31-55 / test_merge_status_git_authority.py.
+# ---------------------------------------------------------------------------
+try:
+    from orchestrator.config import GitConfig  # type: ignore[reportMissingImports]
+    from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
+        GitOps,
+        InteractiveWorktreeLimitError,
+        _run,
+    )
+    _ORCHESTRATOR_AVAILABLE = True
+except ImportError:
+    _ORCHESTRATOR_AVAILABLE = False
+    # Satisfy pyright's definite-assignment check — see test_server.py:44-55.
+    GitConfig: Any = None
+    GitOps: Any = None
+    InteractiveWorktreeLimitError: Any = None
+    _run: Any = None
+
+# ---------------------------------------------------------------------------
+# Repo fixture + seed-stub helper — copied from
+# orchestrator/tests/test_interactive_worktree.py (_init_repo/_add_seed_script/
+# _commit_file), which this file's fixtures mirror exactly so a committed
+# seed-warm-lane.sh stub is available for warm=True assertions.
+# ---------------------------------------------------------------------------
+
+
+async def _init_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+async def _add_seed_script(repo: Path, *, exit_code: int = 0) -> None:
+    """Commit a seed-warm-lane.sh stub into repo/scripts/.
+
+    On exit_code == 0: creates <lane>/target/seeded.bin (orchestration-observable
+    seededness). On non-zero: exits with that code immediately (no target/
+    created) — unused here but kept for parity with the α fixture.
+    """
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    seed = scripts_dir / 'seed-warm-lane.sh'
+    if exit_code == 0:
+        seed.write_text(
+            '#!/usr/bin/env bash\n'
+            'mkdir -p "$2/target"\n'
+            'echo "seeded" > "$2/target/seeded.bin"\n'
+        )
+    else:
+        seed.write_text(
+            f'#!/usr/bin/env bash\necho "seed failure" >&2\nexit {exit_code}\n'
+        )
+    seed.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add seed-warm-lane.sh stub'], cwd=repo)
+
+
+async def _commit_file(repo: Path, name: str, content: str, message: str) -> str:
+    """Write+commit a file on the repo's current branch; return the new commit SHA."""
+    (repo / name).write_text(content)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', message], cwd=repo)
+    rc, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, f'rev-parse HEAD failed after committing {name!r}'
+    return sha.strip()
+
+
+@pytest.fixture
+def warm_repo(tmp_path: Path) -> Path:
+    """Temp git repo with an initial commit + committed seed-warm-lane.sh stub."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_repo(repo))
+    asyncio.run(_add_seed_script(repo))
+    return repo
+
+
+@pytest.fixture
+def git_ops(warm_repo: Path) -> GitOps:  # type: ignore[reportInvalidTypeForm]
+    return GitOps(GitConfig(), warm_repo)
+
+
+@pytest.fixture
+def harness(git_ops: GitOps) -> types.SimpleNamespace:  # type: ignore[reportInvalidTypeForm]
+    return types.SimpleNamespace(git_ops=git_ops)
+
+
+@pytest.fixture
+def server(tmp_path: Path, harness: types.SimpleNamespace) -> Any:
+    return create_server(EscalationQueue(tmp_path / 'esc'), harness=harness)
+
+
+async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
+    """Invoke an async MCP tool by name (mirrors test_server.py's _call_tool)."""
+    tool = await server.get_tool(name)
+    return await tool.fn(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# step-1 (RED) / step-2 (GREEN): claim_warm_worktree happy path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestClaimWarmWorktreeHappyPath:
+    """claim_warm_worktree happy path — maps InteractiveWorktreeInfo 1:1."""
+
+    async def test_claim_creates_warm_worktree(
+        self, warm_repo: Path, git_ops: GitOps, server: Any,
+    ) -> None:
+        """Fresh claim: {path, branch, warm, base_ref} match the α contract."""
+        rc, main_sha, _ = await _run(['git', 'rev-parse', 'main'], cwd=warm_repo)
+        assert rc == 0, 'setup: rev-parse main failed'
+        main_sha = main_sha.strip()
+
+        res = await _call_tool(
+            server, 'claim_warm_worktree', slug='demo', project_root=str(warm_repo),
+        )
+
+        expected_path = git_ops.worktree_base / '_iact-demo'
+        assert res == {
+            'path': str(expected_path),
+            'branch': 'task/demo',
+            'warm': True,
+            'base_ref': main_sha,
+        }, f'unexpected claim_warm_worktree result: {res}'
+        assert isinstance(res['path'], str), 'path must be a str, not a Path'
+
+        rc_list, wt_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=warm_repo,
+        )
+        assert rc_list == 0
+        assert '_iact-demo' in wt_list, f'expected _iact-demo registered, got: {wt_list}'
+
+    async def test_claim_forwards_start_ref(self, warm_repo: Path, server: Any) -> None:
+        """start_ref is forwarded verbatim — base_ref reflects the pinned commit."""
+        second_sha = await _commit_file(warm_repo, 'second.txt', 'x', 'second commit')
+
+        res = await _call_tool(
+            server, 'claim_warm_worktree',
+            slug='demo2', project_root=str(warm_repo), start_ref=second_sha,
+        )
+
+        assert res['base_ref'] == second_sha, (
+            f'expected base_ref == start_ref {second_sha!r}, got {res["base_ref"]!r}'
+        )
