@@ -1804,3 +1804,54 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     from fused_memory.reconciliation.targeted import _is_authoritative_resolution
 
     assert _is_authoritative_resolution(metadata) is expected
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_suppresses_stale_description_when_authoritative_memory_exists(
+    reconciler, mock_memory_service,
+):
+    """When an authoritative resolution/superseding memory already exists for the
+    task, the fast-path completion echo must NOT re-append the (possibly stale,
+    re-scoped) raw description/details — only the title-only completion fact —
+    and the write must be flagged so operators can query suppressed echoes."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {'id': '959b8497', 'metadata': {'task_id': '361', 'supersedes': 'cd09e261'}},
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE re-scoped description text',
+            'details': 'stale details',
+        },
+    )
+
+    # (a) the deterministic per-task metadata query was awaited correctly
+    mock_memory_service.get_memories_by_metadata.assert_awaited_once()
+    query_call = mock_memory_service.get_memories_by_metadata.await_args
+    assert query_call.kwargs.get('project_id') == 'test-project'
+    assert query_call.kwargs.get('filters') == {'task_id': '361'}
+
+    # (b) the fast-path add_memory content is title-only — no stale prose
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content')
+    assert content == "Task 'Autopilot task' completed.", (
+        f'Expected title-only completion fact, got: {content!r}'
+    )
+    assert 'STALE re-scoped description text' not in content
+    assert 'stale details' not in content
+
+    # (c) metadata carries the suppression flag alongside the existing fields
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_suppressed_stale_description') is True
+    assert metadata.get('source') == 'targeted_reconciliation'
+    assert metadata.get('task_id') == '361'
+    assert metadata.get('transition') == 'done'
+
+    # (d) completion-fact audit action is preserved
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
