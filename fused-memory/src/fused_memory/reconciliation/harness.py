@@ -178,6 +178,24 @@ def _derive_affected_ids(finding: dict) -> list[str]:
     return ids
 
 
+def _finding_has_reference(finding: dict) -> bool:
+    """Return True iff *finding* cites at least one task/entity/edge/memory ID.
+
+    A finding whose ``_derive_affected_ids`` is empty (no legacy ``affected_ids``
+    and no typed citation carries a usable identity) references nothing
+    concrete — it is a synthetic/placeholder finding (e.g. Stage 3 filed
+    ``add_finding`` but never followed up with a ``cite_*`` call) that cannot
+    be investigated or remediated.  Reusing ``_derive_affected_ids`` keeps
+    reference-derivation single-sourced with the escalation dedup/fingerprint
+    logic, so this predicate can never disagree about what counts as a
+    reference.
+
+    Task 1970: used by ``_maybe_remediate`` to drop referenceless actionable
+    findings before they reach the production remediation batch.
+    """
+    return bool(_derive_affected_ids(finding))
+
+
 # Module-local sleep binding — allows tests to patch sleep without touching
 # the global asyncio namespace.
 _sleep = asyncio.sleep
