@@ -2148,3 +2148,50 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' absent when filtered_task_tree is None; "
             f"got snippet:\n{payload[-800:]!r}"
         )
+
+    # ── assembled (token-budget) _format_assembled_payload path ─────────
+
+    @pytest.mark.asyncio
+    async def test_assembled_path_includes_section_for_live_task(self, monkeypatch):
+        """_format_assembled_payload lists the live task id under '### Live-Workflow Signals'.
+
+        Mirrors test_format_assembled_payload_includes_tree_when_set (tests/test_stages.py)
+        by calling _format_assembled_payload directly.
+
+        RED after step-2 alone: only assemble_payload's legacy branch is wired; the
+        assembled path is a separate method that must be wired independently (step-4).
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        live_task_id = '4321'
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            return WorkflowLiveness(
+                is_live=True,
+                worktree_registered=True,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{live_task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = _make_consolidator(project_root='/project')
+        stage.filtered_task_tree = self._make_tree(
+            [{'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}]
+        )
+        stage.assembled_payload = AssembledPayload(events=[], context_items={})
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage._format_assembled_payload(watermark)
+
+        assert '### Live-Workflow Signals' in payload, (
+            f"Expected '### Live-Workflow Signals' section in assembled-path payload; "
+            f"got snippet:\n{payload[-800:]!r}"
+        )
+        assert live_task_id in payload, (
+            f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals "
+            f"in assembled-path payload; got snippet:\n{payload[-800:]!r}"
+        )
