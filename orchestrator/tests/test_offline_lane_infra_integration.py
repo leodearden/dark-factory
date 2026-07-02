@@ -555,7 +555,6 @@ async def test_ib1_advance_triggers_from_head_infra_sub_run(
 async def _assert_infra_never_a_gate(
     harness: Harness,
     worker: OfflineLaneWorker,
-    runner: _ControllableInfraRunner,
     repo: Path,
     git_ops: GitOps,
 ) -> None:
@@ -646,7 +645,7 @@ async def test_ib2_infra_run_in_flight_never_gates_merge(harness, git_ops, repo,
     lane_task = asyncio.create_task(_run_lane(worker, expected_passes=1))
     await runner.wait_entered()
 
-    await _assert_infra_never_a_gate(harness, worker, runner, repo, git_ops)
+    await _assert_infra_never_a_gate(harness, worker, repo, git_ops)
 
     runner.release()
     await lane_task
@@ -741,6 +740,10 @@ async def test_ib4_same_infra_set_recurrence_updates_not_duplicates(
     task_id = worker.open_fix_tasks[fp]
     escalations = _l0_info_escalations(cast(EscalationQueue, worker.escalation_queue), task_id)
     assert len(escalations) == 1, 'a same-set recurrence must not raise a second L0 escalation'
+    assert _l2_blocker_escalations(cast(EscalationQueue, worker.escalation_queue), task_id) == [], (
+        'a same-set recurrence (still under the default promotion threshold) must never '
+        'double-escalate to an L2 born-at-L2 blocker'
+    )
 
 
 # ---------------------------------------------------------------------------
