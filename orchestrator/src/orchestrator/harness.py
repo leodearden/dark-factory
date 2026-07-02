@@ -7239,8 +7239,11 @@ Output JSON matching the schema. Every task must appear in the output.
         report['config_path'] = config_path
         if self.event_store:
             self.event_store.emit(EventType.config_reload, data=report)
-        if not report['reloaded']:
-            logger.warning('config reload: %s', report.get('error'))
+        if report['restart_required'] or not report['reloaded']:
+            logger.warning(
+                'config reload: restart_required=%s error=%s',
+                sorted(report['restart_required']), report['error'],
+            )
         return report
 
     # ------------------------------------------------------------------ #
