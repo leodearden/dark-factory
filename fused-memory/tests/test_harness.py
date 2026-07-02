@@ -6559,6 +6559,102 @@ async def test_maybe_remediate_fail_open_when_queue_raises(
     )
 
 
+# ── Task 1970: referenceless placeholder-finding guard ─────────────────────
+#
+# Stage 3 can file an actionable=True finding whose typed citations
+# (cited_tasks/cited_entities/cited_edges/cited_memories) are attached only
+# AFTER add_finding via separate cite_* calls (server/recon_report.py:317),
+# so a finding can reach the remediation batch citing nothing at all — a
+# synthetic/placeholder finding with no task/entity/edge/memory ID to
+# investigate ("Remediation finding #1" in remediation run 7b0e879d).
+# _finding_has_reference is the pure predicate; _maybe_remediate is the
+# funnel that drops referenceless actionable findings before they reach
+# _run_remediation_pass.
+
+
+def _make_placeholder_finding() -> dict:
+    """Return a synthetic actionable finding citing nothing (task 1970 repro).
+
+    Mirrors the real-world 'Remediation finding #1' from remediation run
+    7b0e879d: actionable=True, no legacy affected_ids, no typed citations —
+    nothing for Stage 1/2 to investigate or fix.
+    """
+    return {
+        'description': 'Remediation finding #1',
+        'severity': 'moderate',
+        'actionable': True,
+        'category': 'unknown',
+        'suggested_action': 'Investigate',
+    }
+
+
+class TestFindingHasReference:
+    """_finding_has_reference must distinguish investigable findings from
+    synthetic/placeholder findings that cite no task/entity/edge/memory.
+
+    step-1 (RED): _finding_has_reference does not exist yet.
+    step-2 (GREEN): add it to harness.py as bool(_derive_affected_ids(finding)).
+    """
+
+    def test_no_citation_keys_at_all_returns_false(self):
+        """A finding with none of the reference fields set is a placeholder."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        assert _finding_has_reference(_make_placeholder_finding()) is False
+
+    def test_all_empty_citation_lists_returns_false(self):
+        """Every typed citation list present but empty is still a placeholder."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {
+            'affected_ids': [],
+            'cited_tasks': [],
+            'cited_entities': [],
+            'cited_edges': [],
+            'cited_memories': [],
+        }
+        assert _finding_has_reference(finding) is False
+
+    def test_legacy_affected_ids_returns_true(self):
+        """A finding carrying the legacy affected_ids field has a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {'affected_ids': ['edge-abc123']}
+        assert _finding_has_reference(finding) is True
+
+    def test_single_cited_task_returns_true(self):
+        """A single cited_tasks entry with task_id is a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {
+            'cited_tasks': [{'project_id': 'p', 'task_id': '42', 'title': 'T'}],
+        }
+        assert _finding_has_reference(finding) is True
+
+    def test_single_cited_entity_with_canonical_name_returns_true(self):
+        """A single cited_entities entry with canonical_name is a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {
+            'cited_entities': [{'canonical_name': 'MyEntity', 'entity_uuid': 'uuid-1'}],
+        }
+        assert _finding_has_reference(finding) is True
+
+    def test_single_cited_edge_with_edge_uuid_returns_true(self):
+        """A single cited_edges entry with edge_uuid is a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {'cited_edges': [{'edge_uuid': 'edge-uuid-1'}]}
+        assert _finding_has_reference(finding) is True
+
+    def test_single_cited_memory_with_memory_id_returns_true(self):
+        """A single cited_memories entry with memory_id is a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {'cited_memories': [{'memory_id': 'mem-uuid-1', 'store': 'mem0'}]}
+        assert _finding_has_reference(finding) is True
+
+
 # ── Tests for Task 1655: live-workflow escalation gate ─────────────────────
 
 
