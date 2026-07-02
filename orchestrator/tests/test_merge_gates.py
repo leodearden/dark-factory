@@ -37,6 +37,7 @@ import pytest
 
 def test_merge_gates_exports_moved_public_symbols() -> None:
     from orchestrator.merge_gates import (
+        _OVERLAP_GIT_ERROR_SENTINEL,
         DROPPED_PLAN_TARGETS_REASON_PREFIX,
         PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
         POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
@@ -53,7 +54,6 @@ def test_merge_gates_exports_moved_public_symbols() -> None:
         _GenerationChainContext,
         _map_advance_failure,
         _normalize_plan_path,
-        _OVERLAP_GIT_ERROR_SENTINEL,
         _rebase_delta_touched_overlap,
         _resolve_second_parent,
         _reverify_rebased_tree,
