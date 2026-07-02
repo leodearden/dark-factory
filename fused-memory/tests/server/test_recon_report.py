@@ -1945,3 +1945,192 @@ class TestReconReportGetFindingsForRun:
         state, _ = self._make_state()
         assert state.get_findings_for_run('does-not-exist') == []
 
+
+# ---------------------------------------------------------------------------
+# task-1979: in-run dedup signature type canonicalization (run 9542fa10)
+# ---------------------------------------------------------------------------
+
+
+class TestReconReportSignatureTypeCanonicalization:
+    """Verify add_finding's in-run dedup signature canonicalizes task_id and
+    flag_type so an integer task_id and the equivalent string task_id collapse
+    to the same dedup key.
+
+    Root cause (run 9542fa10): ``sig = (task_id, flag_type)`` was built from
+    the RAW argument values with no type coercion, so ``(1976, ft) != ('1976',
+    ft)`` and the ``_run_sig_index`` lookup missed, allocating a second
+    finding row instead of returning ``duplicate_finding``.  This mirrors
+    flag_dedup.compute_flag_signature's str-coercion, which documents
+    "integer task_id is common in LLM output" as the reason for it.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(ttl_seconds=300, clock=lambda: t[0]), t
+
+    def _finding(
+        self,
+        state,
+        run_id: str = 'r1',
+        task_id: object = 1970,
+        flag_type: str | None = 'deterministic_task_stall',
+        **kwargs,
+    ):
+        defaults = dict(
+            run_id=run_id,
+            severity='moderate',
+            category='task_stall',
+            description='d',
+            suggested_action='a',
+            actionable=True,
+            task_id=task_id,
+            flag_type=flag_type,
+        )
+        defaults.update(kwargs)
+        return state.add_finding(**defaults)
+
+    def test_int_then_str_same_stage_dedups(self):
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        first = self._finding(state, task_id=1976, flag_type='deterministic_task_stall')
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        second = self._finding(
+            state,
+            task_id='1976',
+            flag_type='deterministic_task_stall',
+            description='different text, same logical task',
+        )
+        assert second == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': first['finding_id'],
+        }
+
+    def test_str_then_int_same_stage_dedups(self):
+        """Order-independent: str filed first, int filed second must also dedup."""
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        first = self._finding(state, task_id='1976', flag_type='deterministic_task_stall')
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        second = self._finding(
+            state,
+            task_id=1976,
+            flag_type='deterministic_task_stall',
+            description='different text, same logical task',
+        )
+        assert second == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': first['finding_id'],
+        }
+
+    def test_cross_stage_int_str_dedups(self):
+        """Matches run-9542fa10: Stage 1 files an int task_id, Stage 3 (same
+        run_id) files the equivalent str task_id — must dedup against Stage 1's
+        finding, not allocate a second row.
+        """
+        state, _ = self._make_state()
+
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        stage1 = self._finding(
+            state,
+            task_id=1970,
+            flag_type='flag_marker_duplicate_recurrence',
+        )
+        assert 'finding_id' in stage1, f'Stage 1 add_finding failed: {stage1}'
+
+        state.start_report(run_id='r1', stage='integrity_check', project_id='dark_factory')
+        stage3 = self._finding(
+            state,
+            task_id='1970',
+            flag_type='flag_marker_duplicate_recurrence',
+            description='integrity_check restates the same stall',
+        )
+        assert stage3 == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': stage1['finding_id'],
+        }
+
+    def test_falsy_but_valid_task_id_zero_dedups(self):
+        """task_id=0 is a real (falsy-but-valid) signature value, not the
+        (None, None) null-null desc-hash path — int 0 and str '0' must still
+        collapse to the same signature.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        first = self._finding(state, task_id=0, flag_type='x')
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        second = self._finding(state, task_id='0', flag_type='x', description='second text')
+        assert second == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': first['finding_id'],
+        }
+
+    def test_same_type_same_stage_still_dedups(self):
+        """Literal regression pin: two calls with an identical (run_id,
+        task_id='1970', flag_type) str signature from one stage must still
+        dedup — the documented same-type contract must not regress.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        first = self._finding(state, task_id='1970', flag_type='flag_marker_duplicate_recurrence')
+        assert 'finding_id' in first, f'first add_finding failed: {first}'
+
+        second = self._finding(
+            state,
+            task_id='1970',
+            flag_type='flag_marker_duplicate_recurrence',
+            description='restated',
+        )
+        assert second == {
+            'error': 'duplicate_finding',
+            'error_type': 'ReconReportDuplicateFinding',
+            'existing_finding_id': first['finding_id'],
+        }
+
+    def test_int_task_id_stored_as_canonical_str(self):
+        """A finding filed with an int task_id must read back as str — the
+        stored _Finding, not just the dedup signature, must be canonicalized
+        so get_assembled_report is type-stable for downstream consumers
+        (flag_dedup.compute_flag_signature, stats_verifier).
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        result = self._finding(state, task_id=1976, flag_type='deterministic_task_stall')
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        assert len(report['flagged_items']) == 1
+        item = report['flagged_items'][0]
+        assert item['task_id'] == '1976'
+        assert isinstance(item['task_id'], str)
+        assert item['flag_type'] == 'deterministic_task_stall'
+
+    def test_get_findings_for_run_task_id_is_str(self):
+        """get_findings_for_run must also read back a canonical str task_id,
+        not the raw int that was passed to add_finding.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        result = self._finding(state, task_id=1976, flag_type='deterministic_task_stall')
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+
+        results = state.get_findings_for_run('r1')
+        assert len(results) == 1
+        assert results[0]['task_id'] == '1976'
+        assert isinstance(results[0]['task_id'], str)
+
