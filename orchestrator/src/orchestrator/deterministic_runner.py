@@ -715,60 +715,82 @@ class DeterministicRunner:
                 # effectively immediately — re-introducing the self-kill window
                 # this detached-deferral design exists to prevent.
                 on_active_secs = max(int(before_done.get('on_active_delay_secs', 60)), 5)
-                restart_fn = self._restart_scheduler or self._default_schedule_detached_restart
-                rc, tail = await restart_fn(
-                    before_done,
-                    transient_unit=transient_unit,
-                    on_active_secs=on_active_secs,
-                    task_id=task_id,
-                    summary=f'Self-restart scheduling failed: {target_unit}',
-                )
-                if rc != 0:
-                    detail = '\n'.join([
+                try:
+                    restart_fn = self._restart_scheduler or self._default_schedule_detached_restart
+                    rc, tail = await restart_fn(
+                        before_done,
+                        transient_unit=transient_unit,
+                        on_active_secs=on_active_secs,
+                        task_id=task_id,
+                        summary=f'Self-restart scheduling failed: {target_unit}',
+                    )
+                    if rc != 0:
+                        detail = '\n'.join([
+                            description,
+                            f'Target unit: {target_unit}',
+                            f'Transient unit: {transient_unit}',
+                            f'systemd-run exit code: rc={rc}',
+                            f'Output:\n{tail}',
+                        ])
+                        return await self._file_infra_issue_and_block(
+                            task_id,
+                            summary=f'Self-restart scheduling failed: {target_unit}',
+                            detail=detail,
+                        )
+
+                    # Stamp before_done_scheduled_at — positive proof the transient unit
+                    # was successfully registered.  If the orchestrator crashes between
+                    # this stamp and the done write, the resume path (sub-case b-self
+                    # above) drives to done with scheduled provenance instead of
+                    # re-escalating as a generic crash-window.
+                    await self.scheduler.update_task(
+                        task_id,
+                        {'before_done_scheduled_at': {
+                            'at': datetime.now(UTC).isoformat(),
+                            'transient_unit': transient_unit,
+                            'fire_delay_secs': on_active_secs,
+                        }},
+                        metadata_mode='merge',
+                    )
+
+                    if not always_escalates:
+                        logger.info(
+                            'DeterministicRunner: task %s self-restart scheduled — '
+                            'transient_unit=%s on_active_secs=%d — setting done',
+                            task_id, transient_unit, on_active_secs,
+                        )
+                        await self.scheduler.set_task_status(
+                            task_id,
+                            'done',
+                            done_provenance={
+                                'kind': 'deterministic-deploy-scheduled',
+                                'unit': target_unit,
+                                'transient_unit': transient_unit,
+                                'fire_delay_secs': on_active_secs,
+                            },
+                        )
+                        return WorkflowOutcome.DONE
+                except Exception as exc:
+                    # Defense-in-depth (task 2004): ANY exception in the scheduling ->
+                    # stamp -> scheduled-done-write window (including a terminal write
+                    # rejected by the provenance validator) must surface LOUDLY instead
+                    # of bubbling past Harness._run_slot's generic `except Exception`
+                    # handler, which returns a silent BLOCKED TaskReport with no
+                    # escalation and no way to self-heal — the exact signature observed
+                    # on tasks 1976/1982.  before_done_ran_at is already stamped (I1
+                    # once-only), so it is always safe to resolve via a born-at-L2
+                    # infra_issue rather than re-running the restart.
+                    completion_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
                         f'Transient unit: {transient_unit}',
-                        f'systemd-run exit code: rc={rc}',
-                        f'Output:\n{tail}',
+                        f'Self-restart completion failed: {exc!r}',
                     ])
                     return await self._file_infra_issue_and_block(
                         task_id,
-                        summary=f'Self-restart scheduling failed: {target_unit}',
-                        detail=detail,
+                        summary=f'Self-restart completion failed: {target_unit}',
+                        detail=completion_detail,
                     )
-
-                # Stamp before_done_scheduled_at — positive proof the transient unit
-                # was successfully registered.  If the orchestrator crashes between
-                # this stamp and the done write, the resume path (sub-case b-self
-                # above) drives to done with scheduled provenance instead of
-                # re-escalating as a generic crash-window.
-                await self.scheduler.update_task(
-                    task_id,
-                    {'before_done_scheduled_at': {
-                        'at': datetime.now(UTC).isoformat(),
-                        'transient_unit': transient_unit,
-                        'fire_delay_secs': on_active_secs,
-                    }},
-                    metadata_mode='merge',
-                )
-
-                if not always_escalates:
-                    logger.info(
-                        'DeterministicRunner: task %s self-restart scheduled — '
-                        'transient_unit=%s on_active_secs=%d — setting done',
-                        task_id, transient_unit, on_active_secs,
-                    )
-                    await self.scheduler.set_task_status(
-                        task_id,
-                        'done',
-                        done_provenance={
-                            'kind': 'deterministic-deploy-scheduled',
-                            'unit': target_unit,
-                            'transient_unit': transient_unit,
-                            'fire_delay_secs': on_active_secs,
-                        },
-                    )
-                    return WorkflowOutcome.DONE
                 # always_escalates=True (act-then-ask, non-exemplar): fall through
                 # to the gate (section 3) WITHOUT running the blocking cross-unit
                 # deploy.  The `if not self_target:` guard below ensures the
