@@ -368,6 +368,12 @@ async def run_dry_run_unblock(
     finally:
         if config_dir is not None:
             if preserve_config_dir:
+                # Not independently reaped here: this dir lives under
+                # <worktree>/.task/, which GitOps.cleanup_worktree() removes
+                # wholesale (`git worktree remove --force`) when the worktree
+                # is torn down — see the .task/ contamination-prevention
+                # notes atop git_ops.py. The forensic window is bounded by
+                # the worktree's lifetime, not unbounded.
                 logger.warning(
                     'dry_run_unblock: config dir preserved for forensic analysis '
                     '(doubly-wedged investigation) for task %s → %s',
