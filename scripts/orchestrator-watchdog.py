@@ -108,6 +108,16 @@ class _JournalLog:
 
     Itself fail-soft: a journald-write failure must never convert a probe's
     return-None contract into a raised exception.
+
+    Intentionally exposes ONLY ``.warning()`` — the minimal attribute-call
+    surface required by the silent-fallthrough gate's WARN_METHODS check
+    (see shared/tests/silent_fallthrough_scan.py::_handler_has_warn_log).
+    This is not a general-purpose logging facade: other call sites in this
+    module (e.g. probe_port's diagnostics) intentionally keep calling the
+    bare ``log()`` helper directly, since those are not silent-fallthrough
+    sig-b handlers and do not need gate exoneration. Do not add ``.info()``/
+    ``.error()``/etc. here without re-checking whether they're actually
+    needed for a gated handler.
     """
 
     def warning(self, msg: str) -> None:
