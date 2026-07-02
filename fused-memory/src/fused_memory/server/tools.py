@@ -689,8 +689,9 @@ def create_mcp_server(
         # task 2022: auto-upgrade the batch-queue / decompose-and-queue plan-episode
         # shape to temporal_context='planning' so its Graphiti-extracted completion
         # edges are registered as planned (excluded from default search) instead of
-        # polluting factual search while the batch is still undone.
-        if is_batch_plan_framing(content):
+        # polluting factual search while the batch is still undone. Only the unset
+        # default is upgraded — an explicit temporal_context is always respected.
+        if temporal_context is None and is_batch_plan_framing(content):
             temporal_context = 'planning'
             logger.info('add_episode: auto-tagged batch-plan content as planning (task 2022)')
         parsed_reference_time = None
