@@ -495,6 +495,9 @@ Review the above data and perform memory consolidation:
         # Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
+        # Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
+        live_workflow_section = self._build_live_workflow_section()
+
         # Per-cycle summary nonce (task 1574)
         summary_nonce_section = self._build_summary_nonce_section()
 
@@ -515,7 +518,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{summary_nonce_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
