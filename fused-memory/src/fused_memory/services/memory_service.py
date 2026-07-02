@@ -103,6 +103,40 @@ def _serialize_temporal(
     }
 
 
+def _node_to_dict(n: Any) -> dict:
+    """Normalize a Graphiti node into get_entity's node dict shape.
+
+    Accepts either a dict (exact-match path, from graphiti.get_nodes_by_exact_name)
+    or an object with attributes (fuzzy-match path, from graphiti.search_nodes).
+    Missing/None 'labels' default to [] in both cases.
+    """
+    if isinstance(n, dict):
+        uuid, name, summary, labels = n.get('uuid'), n.get('name'), n.get('summary'), n.get('labels')
+    else:
+        uuid = getattr(n, 'uuid', None)
+        name = getattr(n, 'name', None)
+        summary = getattr(n, 'summary', None)
+        labels = getattr(n, 'labels', None)
+    return {'uuid': uuid, 'name': name, 'summary': summary, 'labels': labels or []}
+
+
+def _edge_to_dict(e: Any) -> dict:
+    """Normalize a Graphiti fact-search result into get_entity's edge dict shape.
+
+    Shared by both the exact-match and fuzzy branches of get_entity — edges
+    always come from the fuzzy graphiti.search() fact search regardless of
+    how the node was resolved.
+    """
+    return {
+        'uuid': getattr(e, 'uuid', None),
+        'fact': getattr(e, 'fact', str(e)),
+        'temporal': _serialize_temporal(
+            getattr(e, 'valid_at', None),
+            getattr(e, 'invalid_at', None),
+        ),
+    }
+
+
 class SearchResults(list):
     """list subclass returned by MemoryService.search carrying in-band degrade metadata.
 
@@ -1244,12 +1278,42 @@ class MemoryService:
     ) -> dict:
         """Entity lookup in Graphiti — returns nodes + edges.
 
-        Both Graphiti calls run concurrently via asyncio.gather(return_exceptions=True).
-        This ensures neither call becomes an orphaned background task in the error path:
-        gather() awaits both coroutines to settlement before returning, even when one
-        (or both) raise an exception.  If any call fails, all exceptions are logged
-        (warning) then the first exception is re-raised.
+        Tries an exact, case-sensitive name match first (via
+        graphiti.get_nodes_by_exact_name): canonical labels like "Task 115" resolve to
+        the exact node instead of scattering across fuzzy neighbours. On an exact hit,
+        fuzzy node search (search_nodes) is skipped entirely; edges still come from the
+        fuzzy fact search below. On no exact match, falls back to the fuzzy gather path.
+
+        Both Graphiti calls in the fuzzy fallback run concurrently via
+        asyncio.gather(return_exceptions=True). This ensures neither call becomes an
+        orphaned background task in the error path: gather() awaits both coroutines to
+        settlement before returning, even when one (or both) raise an exception.  If
+        any call fails, all exceptions are logged (warning) then the first exception
+        is re-raised.
+
+        Performance trade-off: the exact-match lookup below is a serial round-trip
+        that runs in front of the fuzzy gather on every call — its result (hit vs.
+        miss) gates which branch runs, so it cannot be folded into the concurrent
+        gather(). This adds one extra round-trip of latency even to calls that end
+        up on the fuzzy path. Accepted because canonical-label lookups (e.g.
+        "Task 115") are this fast path's primary target; gating it behind a
+        name-pattern regex was considered and rejected (see plan design_decisions)
+        as added complexity that would leave non-numeric exact lookups (e.g.
+        "Auth Service") still exposed to fuzzy neighbours for no benefit.
         """
+        # See "Performance trade-off" above: this call is intentionally serial —
+        # its 0/1/many result decides whether the fuzzy gather runs at all.
+        exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
+        if exact:
+            edges = await self.graphiti.search(
+                query=name,
+                group_ids=[project_id],
+                num_results=10,
+            )
+            node_data = [_node_to_dict(n) for n in exact]
+            edge_data = [_edge_to_dict(e) for e in edges]
+            return {'nodes': node_data, 'edges': edge_data}
+
         results = await asyncio.gather(
             self.graphiti.search_nodes(
                 query=name,
@@ -1291,25 +1355,8 @@ class MemoryService:
         nodes = cast(list, results[0])
         edges = cast(list, results[1])
 
-        node_data = []
-        for n in nodes:
-            node_data.append({
-                'uuid': getattr(n, 'uuid', None),
-                'name': getattr(n, 'name', None),
-                'summary': getattr(n, 'summary', None),
-                'labels': getattr(n, 'labels', None) or [],
-            })
-
-        edge_data = []
-        for e in edges:
-            edge_data.append({
-                'uuid': getattr(e, 'uuid', None),
-                'fact': getattr(e, 'fact', str(e)),
-                'temporal': _serialize_temporal(
-                    getattr(e, 'valid_at', None),
-                    getattr(e, 'invalid_at', None),
-                ),
-            })
+        node_data = [_node_to_dict(n) for n in nodes]
+        edge_data = [_edge_to_dict(e) for e in edges]
 
         return {'nodes': node_data, 'edges': edge_data}
 

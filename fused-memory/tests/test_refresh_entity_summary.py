@@ -95,6 +95,122 @@ class TestResolveEntityByName:
 
 
 # ---------------------------------------------------------------------------
+# step-1 (task-1975): GraphitiBackend.get_nodes_by_exact_name
+# ---------------------------------------------------------------------------
+
+class TestGetNodesByExactName:
+    """GraphitiBackend.get_nodes_by_exact_name(name, group_id) resolves name to full node data.
+
+    Sibling to resolve_entity_by_name: same exact Cypher match on the canonical Entity
+    label, but returns full node data (uuid, name, summary, labels) as a list[dict] and
+    never raises on zero/multiple matches — callers (get_entity) choose fuzzy fallback
+    on an empty result and pick nodes[0] on a hit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_single_exact_match(self, mock_config, make_backend, make_graph_mock):
+        """Single exact match returns a one-element list with full node data."""
+        backend = make_backend(mock_config)
+        rows = [['u-115', 'Task 115', 'summary text', ['Entity']]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_nodes_by_exact_name('Task 115', group_id='test')
+        assert result == [
+            {'uuid': 'u-115', 'name': 'Task 115', 'summary': 'summary text', 'labels': ['Entity']}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_when_no_match(self, mock_config, make_backend, make_graph_mock):
+        """No matching entity returns an empty list (does NOT raise)."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_nodes_by_exact_name('NonExistent', group_id='test')
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_multiple_exact_matches_returns_all_without_raising(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """Multiple entities sharing the same name all come back — no AmbiguousEntityError."""
+        backend = make_backend(mock_config)
+        rows = [
+            ['uuid-1', 'Alice', 'summary 1', ['Entity']],
+            ['uuid-2', 'Alice', 'summary 2', ['Entity']],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_nodes_by_exact_name('Alice', group_id='test')
+        assert len(result) == 2
+        assert result[0] == {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'summary 1', 'labels': ['Entity']}
+        assert result[1] == {'uuid': 'uuid-2', 'name': 'Alice', 'summary': 'summary 2', 'labels': ['Entity']}
+
+    @pytest.mark.asyncio
+    async def test_null_summary_returns_none(self, mock_config, make_backend, make_graph_mock):
+        """NULL summary column yields summary=None (not '') — matches get_entity's node shape."""
+        backend = make_backend(mock_config)
+        rows = [['u-1', 'Alice', None, ['Entity']]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_nodes_by_exact_name('Alice', group_id='test')
+        assert result[0]['summary'] is None
+
+    @pytest.mark.asyncio
+    async def test_null_labels_defaults_to_empty_list(self, mock_config, make_backend, make_graph_mock):
+        """NULL labels(n) column defaults to []."""
+        backend = make_backend(mock_config)
+        rows = [['u-1', 'Alice', 'summary', None]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_nodes_by_exact_name('Alice', group_id='test')
+        assert result[0]['labels'] == []
+
+    @pytest.mark.asyncio
+    async def test_empty_labels_stays_empty_list(self, mock_config, make_backend, make_graph_mock):
+        """Empty-list labels(n) column stays []."""
+        backend = make_backend(mock_config)
+        rows = [['u-1', 'Alice', 'summary', []]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_nodes_by_exact_name('Alice', group_id='test')
+        assert result[0]['labels'] == []
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self, mock_config, make_backend, make_graph_mock):
+        """Uses ro_query (read-only path) — graph.query must never be called."""
+        backend = make_backend(mock_config)
+        graph = await assert_ro_query_only(
+            backend, make_graph_mock,
+            [['u-115', 'Task 115', 'summary', ['Entity']]],
+            'get_nodes_by_exact_name', 'Task 115', group_id='test',
+        )
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert 'MATCH (n:Entity {name: $name})' in cypher
+
+    @pytest.mark.asyncio
+    async def test_passes_name_as_cypher_parameter(self, mock_config, make_backend, make_graph_mock):
+        """Passes the name as a Cypher parameter (not interpolated into the query string)."""
+        backend = make_backend(mock_config)
+        rows = [['u-115', 'Task 115', 'summary', ['Entity']]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        entity_name = 'Task 115'
+        await backend.get_nodes_by_exact_name(entity_name, group_id='test')
+        call_args = graph.ro_query.call_args
+        assert call_args is not None
+        cypher_params = extract_params(call_args)
+        assert cypher_params.get('name') == entity_name
+        graph.query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when backend client is not initialized."""
+        backend = GraphitiBackend(mock_config)  # _driver is None
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.get_nodes_by_exact_name('Alice', group_id='test')
+
+
+# ---------------------------------------------------------------------------
 # step-1 (original): GraphitiBackend.get_valid_edges_for_node
 # ---------------------------------------------------------------------------
 

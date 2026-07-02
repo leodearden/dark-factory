@@ -993,6 +993,40 @@ class GraphitiBackend:
             )
         return rows[0][0]
 
+    async def get_nodes_by_exact_name(self, name: str, *, group_id: str) -> list[dict]:
+        """Resolve an entity name to full node data via an exact, case-sensitive Cypher match.
+
+        Sibling to resolve_entity_by_name: same `MATCH (n:Entity {name: $name})` shape,
+        but returns full node data (uuid, name, summary, labels) as a list[dict] and
+        never raises on zero or multiple matches — callers (e.g. MemoryService.get_entity)
+        treat an empty result as "fall back to fuzzy search" and pick nodes[0] on a hit.
+
+        Uses ro_query since no writes are performed.
+
+        Args:
+            name: Exact name of the Entity node(s) to resolve.
+            group_id: Project graph to query.
+
+        Returns:
+            List of dicts with keys: uuid, name, summary (None when NULL), labels
+            (defaults to [] when NULL/absent). Empty list when no entity matches.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self._graph_for(group_id)
+        cypher = 'MATCH (n:Entity {name: $name}) RETURN n.uuid, n.name, n.summary, labels(n)'
+        result = await graph.ro_query(cypher, {'name': name})
+        return [
+            {
+                'uuid': row[0],
+                'name': row[1],
+                'summary': row[2],
+                'labels': row[3] or [],
+            }
+            for row in (result.result_set or [])
+        ]
+
     @staticmethod
     def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
         """Build a normalised edge dict, coercing NULL fact/name to empty string.
