@@ -7,6 +7,8 @@ live source/test re-verification (verify_premise_refuted).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fused_memory.middleware.task_curator import CandidateTask
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -594,3 +596,156 @@ class TestPremiseRefutedEntry:
 
         result = premise_refuted_entry(self._matching_candidate(), [], tmp_path)
         assert result is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-1972 step-15 RED: TestSeedRegistryRealSource
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestSeedRegistryRealSource:
+    """Loads the SHIPPED fused-memory/config/recon_code_fix_premise_registry.yaml
+    and re-verifies its three seed entries against the REAL fused-memory source
+    root — not a tmp_path fixture.
+
+    Confirmed base-branch facts (see task-1972 analysis):
+    - src/fused_memory/services/memory_service.py contains "invalid_at".
+    - tests/test_stages.py contains
+      "test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2".
+    - src/fused_memory/server/recon_report.py does NOT contain "max_length".
+    """
+
+    # tests/test_recon_code_fix_premise_guard.py -> tests/ -> fused-memory/
+    SOURCE_ROOT = Path(__file__).resolve().parent.parent
+    REGISTRY_PATH = SOURCE_ROOT / "config" / "recon_code_fix_premise_registry.yaml"
+
+    def _load_entries(self):
+        from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
+        return load_premise_registry(self.REGISTRY_PATH)
+
+    def test_shipped_registry_has_three_entries(self):
+        """The seed registry ships exactly the three confirmed incidents."""
+        entries = self._load_entries()
+        names = {e.name for e in entries}
+        assert len(entries) == 3
+        assert names == {
+            "entity_summary_rebuild_invalid_at_filter_already_present",
+            "stage2_flag_query_stage1_flag_marker_forbidden_regression",
+            "add_finding_suggested_action_no_max_length_field",
+        }
+
+    def test_esc_1946_15_entity_summary_rebuild_matches_and_is_refuted(self):
+        """esc-1946-15: entity-summary rebuild missing invalid_at filter — refuted
+        because memory_service.py already applies the filter.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            verify_premise_refuted,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        entry = match_candidate(candidate, entries)
+        assert entry is not None
+        assert entry.name == "entity_summary_rebuild_invalid_at_filter_already_present"
+        assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
+
+    def test_esc_1947_17_stage2_flag_query_matches_and_is_refuted(self):
+        """esc-1947-17: Stage2 flag-query should also consume stage1_flag_marker —
+        refuted because the two marker families are deliberately kept separate
+        and pinned by test_stage1_flag_marker_fp_key_is_never_consumed_by_stage2.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            verify_premise_refuted,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Fix Stage2 flag-query missing stage1_flag_marker (schema drift)",
+            description=(
+                "Stage 2's flag-query does not also match stage1_flag_marker; "
+                "treating this as a schema drift bug."
+            ),
+        )
+
+        entry = match_candidate(candidate, entries)
+        assert entry is not None
+        assert entry.name == "stage2_flag_query_stage1_flag_marker_forbidden_regression"
+        assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
+
+    def test_esc_1971_34_add_finding_suggested_action_matches_and_is_refuted(self):
+        """esc-1971-34: add_finding drops long suggested_action / length
+        field-required bug — refuted because there is no Field(max_length=...)
+        constraint on those fields in recon_report.py.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            verify_premise_refuted,
+        )
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Fix add_finding drops long suggested_action values (length field-required bug)",
+            description=(
+                "add_finding truncates or rejects long suggested_action text due to an "
+                "assumed length field-required constraint."
+            ),
+        )
+
+        entry = match_candidate(candidate, entries)
+        assert entry is not None
+        assert entry.name == "add_finding_suggested_action_no_max_length_field"
+        assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
+
+    def test_all_three_incidents_via_premise_refuted_entry(self):
+        """premise_refuted_entry composes match + verify for all three incidents
+        at once against the real source root — the end-to-end shape the curator
+        actually calls.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import premise_refuted_entry
+
+        entries = self._load_entries()
+        cases = [
+            (
+                CandidateTask(
+                    title="Fix entity-summary rebuild missing invalid_at filter",
+                    description=(
+                        "Rebuild does not check missing invalid_at filter before writing."
+                    ),
+                ),
+                "entity_summary_rebuild_invalid_at_filter_already_present",
+            ),
+            (
+                CandidateTask(
+                    title="Fix Stage2 flag-query missing stage1_flag_marker (schema drift)",
+                    description=(
+                        "Stage 2's flag-query does not also match stage1_flag_marker; "
+                        "treating this as a schema drift bug."
+                    ),
+                ),
+                "stage2_flag_query_stage1_flag_marker_forbidden_regression",
+            ),
+            (
+                CandidateTask(
+                    title=(
+                        "Fix add_finding drops long suggested_action values "
+                        "(length field-required bug)"
+                    ),
+                    description=(
+                        "add_finding truncates or rejects long suggested_action text due to "
+                        "an assumed length field-required constraint."
+                    ),
+                ),
+                "add_finding_suggested_action_no_max_length_field",
+            ),
+        ]
+
+        for candidate, expected_name in cases:
+            result = premise_refuted_entry(candidate, entries, self.SOURCE_ROOT)
+            assert result is not None, f"expected a premise-refuted drop for {expected_name!r}"
+            assert result.name == expected_name
