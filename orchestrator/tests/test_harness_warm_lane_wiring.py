@@ -1419,6 +1419,38 @@ class TestHarnessReclaimCandidateProvider:
             f'got {result!r}'
         )
 
+    async def test_merge_deferred_and_deferred_excluded_from_candidates(
+        self, tmp_path: Path
+    ):
+        """Protected parked statuses must never be reclaim victims (task 2018).
+
+        Mirrors the merge-deferred early-return guard in
+        _reconcile_one_stranded (harness.py:2437): a merge-deferred branch is
+        train-parked (PRD § 9.8) and a deferred branch is human-parked —
+        both have worktrees owned by a non-scheduler party and must survive
+        intact. Neither is terminal, so without this exclusion they would
+        pass the TERMINAL_STATUSES filter and become eligible reclaim
+        victims. A genuinely-active in-progress branch must still be
+        returned, guarding against over-exclusion.
+        """
+        statuses = {'A': 'merge-deferred', 'B': 'in-progress', 'C': 'deferred'}
+        harness = self._make_harness_with_stub_scheduler(tmp_path, (statuses, None))
+
+        result = await harness._warm_lane_reclaim_candidates(['A', 'B', 'C'])
+
+        assert 'A' not in result, (
+            f'merge-deferred (train-parked) branch must never be a reclaim '
+            f'victim; result={result!r}'
+        )
+        assert 'C' not in result, (
+            f'deferred (human-parked) branch must never be a reclaim victim; '
+            f'result={result!r}'
+        )
+        assert result == {'B'}, (
+            f'in-progress branch must still be reclaimable (no '
+            f'over-exclusion); got {result!r}'
+        )
+
     async def test_unknown_status_dropped(self, tmp_path: Path):
         """(b) Branch not in the statuses dict is silently dropped (unknown = skip)."""
         # 'X' not in returned statuses → dropped
