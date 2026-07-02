@@ -6559,6 +6559,396 @@ async def test_maybe_remediate_fail_open_when_queue_raises(
     )
 
 
+# ── Task 1970: referenceless placeholder-finding guard ─────────────────────
+#
+# Stage 3 can file an actionable=True finding whose typed citations
+# (cited_tasks/cited_entities/cited_edges/cited_memories) are attached only
+# AFTER add_finding via separate cite_* calls (server/recon_report.py:317),
+# so a finding can reach the remediation batch citing nothing at all — a
+# synthetic/placeholder finding with no task/entity/edge/memory ID to
+# investigate ("Remediation finding #1" in remediation run 7b0e879d).
+# _finding_has_reference is the pure predicate; _maybe_remediate is the
+# funnel that drops referenceless actionable findings before they reach
+# _run_remediation_pass.
+
+
+def _make_placeholder_finding() -> dict:
+    """Return a synthetic actionable finding citing nothing (task 1970 repro).
+
+    Mirrors the real-world 'Remediation finding #1' from remediation run
+    7b0e879d: actionable=True, no legacy affected_ids, no typed citations —
+    nothing for Stage 1/2 to investigate or fix.
+    """
+    return {
+        'description': 'Remediation finding #1',
+        'severity': 'moderate',
+        'actionable': True,
+        'category': 'unknown',
+        'suggested_action': 'Investigate',
+    }
+
+
+class TestFindingHasReference:
+    """_finding_has_reference must distinguish investigable findings from
+    synthetic/placeholder findings that cite no task/entity/edge/memory.
+
+    step-1 (RED): _finding_has_reference does not exist yet.
+    step-2 (GREEN): add it to harness.py as bool(_derive_affected_ids(finding)).
+    """
+
+    def test_no_citation_keys_at_all_returns_false(self):
+        """A finding with none of the reference fields set is a placeholder."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        assert _finding_has_reference(_make_placeholder_finding()) is False
+
+    def test_all_empty_citation_lists_returns_false(self):
+        """Every typed citation list present but empty is still a placeholder."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {
+            'affected_ids': [],
+            'cited_tasks': [],
+            'cited_entities': [],
+            'cited_edges': [],
+            'cited_memories': [],
+        }
+        assert _finding_has_reference(finding) is False
+
+    def test_legacy_affected_ids_returns_true(self):
+        """A finding carrying the legacy affected_ids field has a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {'affected_ids': ['edge-abc123']}
+        assert _finding_has_reference(finding) is True
+
+    def test_single_cited_task_returns_true(self):
+        """A single cited_tasks entry with task_id is a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {
+            'cited_tasks': [{'project_id': 'p', 'task_id': '42', 'title': 'T'}],
+        }
+        assert _finding_has_reference(finding) is True
+
+    def test_single_cited_entity_with_canonical_name_returns_true(self):
+        """A single cited_entities entry with canonical_name is a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {
+            'cited_entities': [{'canonical_name': 'MyEntity', 'entity_uuid': 'uuid-1'}],
+        }
+        assert _finding_has_reference(finding) is True
+
+    def test_single_cited_edge_with_edge_uuid_returns_true(self):
+        """A single cited_edges entry with edge_uuid is a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {'cited_edges': [{'edge_uuid': 'edge-uuid-1'}]}
+        assert _finding_has_reference(finding) is True
+
+    def test_single_cited_memory_with_memory_id_returns_true(self):
+        """A single cited_memories entry with memory_id is a reference."""
+        from fused_memory.reconciliation.harness import _finding_has_reference
+
+        finding = {'cited_memories': [{'memory_id': 'mem-uuid-1', 'store': 'mem0'}]}
+        assert _finding_has_reference(finding) is True
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_drops_referenceless_actionable_finding(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    caplog,
+):
+    """ALL-DROPPED: a single actionable finding citing nothing must NOT trigger remediation.
+
+    Task 1970: Stage 3 can file an actionable=True finding that never receives
+    any citation (add_finding's typed citations are optional; cite_* calls
+    happen afterward).  _maybe_remediate must drop such referenceless findings
+    before they reach _run_remediation_pass — there is nothing to investigate.
+
+    RED on base branch: _maybe_remediate currently passes any actionable
+    finding straight through regardless of references, so the journal
+    contains a remediation run and no drop-log record is emitted.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    await event_buffer.push(_make_event('test-project'))
+
+    placeholder_finding = _make_placeholder_finding()
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[placeholder_finding])
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+        run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    # (a) Journal must contain ONLY the parent run — no remediation run.
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_runs = [r for r in recent_runs if r.run_type == 'remediation']
+    assert remediation_runs == [], (
+        f'Expected no remediation run (finding cites nothing to investigate), '
+        f'got {len(remediation_runs)}: {[r.id for r in remediation_runs]}'
+    )
+
+    # (b) A structured drop-log record must have been emitted.
+    drop_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.remediation_dropped_placeholder_finding'
+    ]
+    assert len(drop_records) >= 1, (
+        f'Expected at least one "reconciliation.remediation_dropped_placeholder_finding" '
+        f'log record; got records: {[r.getMessage() for r in caplog.records]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_mixed_batch_excludes_placeholder_keeps_reference_bearing(
+    journal,
+    event_buffer,
+    mock_memory_service,
+):
+    """MIXED: a referenceless placeholder alongside a reference-bearing finding.
+
+    Remediation must still run (the reference-bearing finding is genuinely
+    actionable), but only the reference-bearing finding may reach Stage 1's
+    remediation_findings — the placeholder is dropped at the _maybe_remediate
+    funnel.
+
+    RED on base branch: _maybe_remediate passes both findings through
+    unfiltered, so stage.remediation_findings contains the placeholder too.
+    """
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    stage1 = stages[0]
+    assert isinstance(stage1, MemoryConsolidator)
+
+    captured: dict = {}
+
+    async def capture_attrs(stage):
+        captured['remediation_findings'] = stage.remediation_findings
+
+    placeholder_finding = _make_placeholder_finding()
+    reference_bearing_finding = _make_s3_findings()[0]  # carries affected_ids
+
+    _mock_stage_run(stage1, before_return=capture_attrs)
+    _mock_stage_run(stages[1])
+    _mock_stage_run(
+        stages[2], items_flagged=[placeholder_finding, reference_bearing_finding],
+    )
+
+    await event_buffer.push(_make_event('test-project'))
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    # Remediation DID run — the reference-bearing finding is genuinely actionable.
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_runs = [r for r in recent_runs if r.run_type == 'remediation']
+    assert len(remediation_runs) == 1, (
+        f'Expected exactly one remediation run (mixed batch has a real finding), '
+        f'got {len(remediation_runs)}'
+    )
+
+    # Only the reference-bearing finding reached Stage 1 — the placeholder was dropped.
+    assert captured.get('remediation_findings') == [reference_bearing_finding], (
+        f'Expected remediation_findings to contain only the reference-bearing finding, '
+        f'got {captured.get("remediation_findings")!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_placeholder_drop_storm_escalates_at_threshold(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 1970 amendment: dropping _PLACEHOLDER_DROP_STORM_THRESHOLD referenceless
+    actionable findings in a single batch must wire to exactly ONE
+    'recon_remediation_placeholder_storm' escalation carrying
+    _PLACEHOLDER_DROP_STORM_FINDING.
+
+    RED on the current tree: the dropped_placeholders loop in _maybe_remediate
+    only logs 'reconciliation.remediation_dropped_placeholder_finding' and never
+    calls _record_placeholder_finding_drop, so no storm escalation is ever
+    emitted even though the recorder/deque/constants apparatus already exists.
+    """
+    from fused_memory.reconciliation.harness import (
+        _PLACEHOLDER_DROP_STORM_FINDING,
+        _PLACEHOLDER_DROP_STORM_THRESHOLD,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    await event_buffer.push(_make_event('test-project'))
+
+    placeholder_findings = [
+        _make_placeholder_finding() for _ in range(_PLACEHOLDER_DROP_STORM_THRESHOLD)
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=placeholder_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if (c.args[0] if c.args else c.kwargs.get('category')) == 'recon_remediation_placeholder_storm'
+    ]
+    assert len(storm_calls) == 1, (
+        f'Expected exactly one recon_remediation_placeholder_storm call; '
+        f'got {harness._escalate.call_args_list}'
+    )
+    assert storm_calls[0].kwargs.get('finding') is _PLACEHOLDER_DROP_STORM_FINDING, (
+        f"Expected the storm call's finding= kwarg to be _PLACEHOLDER_DROP_STORM_FINDING; "
+        f'got {storm_calls[0].kwargs.get("finding")!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_placeholder_drop_storm_does_not_escalate_below_threshold(
+    journal, event_buffer, mock_memory_service,
+):
+    """Below the storm threshold, dropped placeholders must NOT trip the storm alarm.
+
+    RED on the current tree for the same reason as the at-threshold test above
+    (no wiring exists yet), but this case guards against an off-by-one that
+    fires the storm too early once the wiring lands in step-6.
+    """
+    from fused_memory.reconciliation.harness import _PLACEHOLDER_DROP_STORM_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    await event_buffer.push(_make_event('test-project'))
+
+    placeholder_findings = [
+        _make_placeholder_finding() for _ in range(_PLACEHOLDER_DROP_STORM_THRESHOLD - 1)
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=placeholder_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if (c.args[0] if c.args else c.kwargs.get('category')) == 'recon_remediation_placeholder_storm'
+    ]
+    assert storm_calls == [], (
+        f'Expected zero recon_remediation_placeholder_storm calls below threshold; '
+        f'got {storm_calls}'
+    )
+
+
+def test_record_placeholder_finding_drop_rolling_window(
+    journal, event_buffer, mock_memory_service,
+):
+    """Unit tests for ReconciliationHarness._record_placeholder_finding_drop().
+
+    Mirrors test_record_dead_owner_suppression_rolling_window's three phases
+    (task 1755 / PRD β), applied to the placeholder-finding-drop storm counter
+    (task 1970 amendment). The recorder itself was already correct when this
+    test was written — this is coverage-hardening for a counter that step-6
+    now wires into a live escalation path, not a RED->GREEN gate.
+
+    Phase 1 — threshold crossing + per-project labels:
+        _PLACEHOLDER_DROP_STORM_THRESHOLD calls in the window (alternating
+        'reify' / 'autopilot_video') → all but the last return None, the
+        threshold-crossing call returns a storm dict with
+        count>=_PLACEHOLDER_DROP_STORM_THRESHOLD,
+        window_seconds==_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS, and
+        projects==sorted distinct project labels seen in the window.
+
+    Phase 2 — no re-fire in the same window:
+        Two more calls immediately after return None (rate limit: <=1 fire
+        per window).
+
+    Phase 3 — re-fire after a full window during a sustained storm:
+        A fresh burst of THRESHOLD calls at now=base + 2*WINDOW_SECONDS
+        re-fires.
+    """
+    from fused_memory.reconciliation.harness import (
+        _PLACEHOLDER_DROP_STORM_THRESHOLD,
+        _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
+
+    # ── Phase 1: threshold crossing ──────────────────────────────────────────
+
+    projects = [
+        'reify' if i % 2 == 0 else 'autopilot_video'
+        for i in range(_PLACEHOLDER_DROP_STORM_THRESHOLD)
+    ]
+    results = [
+        harness._record_placeholder_finding_drop(proj, now=base + timedelta(seconds=i))
+        for i, proj in enumerate(projects)
+    ]
+
+    for i, r in enumerate(results[:-1]):
+        assert r is None, f'Call {i+1} should return None (below threshold), got {r!r}'
+
+    storm = results[-1]
+    assert storm is not None, 'Threshold-crossing call should return a storm dict'
+    assert storm['count'] >= _PLACEHOLDER_DROP_STORM_THRESHOLD, (
+        f'Expected count>=_PLACEHOLDER_DROP_STORM_THRESHOLD, got {storm["count"]}'
+    )
+    assert storm['window_seconds'] == _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS, (
+        f'Expected window_seconds=={_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS}, '
+        f'got {storm["window_seconds"]}'
+    )
+    assert storm['projects'] == sorted(set(projects)), (
+        f'Expected sorted distinct project labels, got {storm["projects"]}'
+    )
+
+    # ── Phase 2: no re-fire in the same window ───────────────────────────────
+
+    n = _PLACEHOLDER_DROP_STORM_THRESHOLD
+    r_next = harness._record_placeholder_finding_drop('reify', now=base + timedelta(seconds=n))
+    r_next2 = harness._record_placeholder_finding_drop(
+        'reify', now=base + timedelta(seconds=n + 1),
+    )
+    assert r_next is None, f'Same-window call should return None (already fired), got {r_next!r}'
+    assert r_next2 is None, (
+        f'Same-window call should return None (already fired), got {r_next2!r}'
+    )
+
+    # ── Phase 3: re-fire after a full window (sustained storm) ───────────────
+
+    future_base = base + timedelta(seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS * 2)
+    results3 = [
+        harness._record_placeholder_finding_drop(proj, now=future_base + timedelta(seconds=i))
+        for i, proj in enumerate(projects)
+    ]
+
+    for i, r in enumerate(results3[:-1]):
+        assert r is None, (
+            f'Phase-3 call {i+1} should return None (new window builds up), got {r!r}'
+        )
+
+    storm3 = results3[-1]
+    assert storm3 is not None, (
+        'Phase-3 threshold-crossing call should return a storm dict (new window re-fires)'
+    )
+    assert storm3['count'] >= _PLACEHOLDER_DROP_STORM_THRESHOLD
+
+
 # ── Tests for Task 1655: live-workflow escalation gate ─────────────────────
 
 

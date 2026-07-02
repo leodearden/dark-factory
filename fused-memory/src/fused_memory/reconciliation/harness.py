@@ -97,6 +97,11 @@ _RECON_DEDUP_CONFIG = (
             # repeated storm alarms (stable _DEAD_OWNER_STORM_FINDING fingerprint)
             # into a single pending escalation for the 8103 watcher.
             'recon_watchdog_kill_storm',
+            # Task 1970 amendment: aggregate storm alarm for referenceless
+            # placeholder-finding drops (see _PLACEHOLDER_DROP_STORM_FINDING /
+            # _record_placeholder_finding_drop).  Same fold rationale as
+            # recon_watchdog_kill_storm above.
+            'recon_remediation_placeholder_storm',
         ),
     )
     if HAS_ESCALATION else None
@@ -137,6 +142,36 @@ _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
 # robustly inside/outside any reasonable 24h window).
 _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 
+# Task 1970 amendment (reviewer_comprehensive): coarse safety net for a
+# runaway Stage 3 that stops citing anything.  Each individual referenceless-
+# finding drop in _maybe_remediate is only logged
+# (reconciliation.remediation_dropped_placeholder_finding) and, being noise
+# rather than a human-actionable integrity issue, is deliberately never
+# escalated on its own — see _maybe_remediate.  That means a systemic Stage 3
+# regression (e.g. it stops calling cite_* entirely) would otherwise be
+# invisible outside logs, and can no longer accumulate toward
+# _INTEGRITY_FINDING_RECURRENCE_THRESHOLD above, since a dropped placeholder
+# never enters a remediation run.  This rolling-window counter closes that
+# gap by firing ONE coarse escalation once drops recur this often for the
+# same project within the window.  Mirrors the dead_owner_shielded
+# suppression-storm counter (_record_dead_owner_suppression /
+# dead_owner_suppression_storm_threshold+window_seconds below) but as plain
+# module constants rather than ReconciliationConfig fields, since this
+# predicate and its guard are private to this module.
+_PLACEHOLDER_DROP_STORM_THRESHOLD = 5
+_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS = 3600.0  # 1h
+
+# Stable finding identity for the placeholder-drop storm alarm — same
+# fingerprint-stability rationale as _DEAD_OWNER_STORM_FINDING above.
+_PLACEHOLDER_DROP_STORM_FINDING: dict[str, Any] = {
+    'category': 'recon_remediation_placeholder_storm',
+    'affected_ids': ['remediation_placeholder_drop_storm'],
+    'description': (
+        'Stage 3 is repeatedly filing actionable findings with no '
+        'task/entity/edge/memory citation'
+    ),
+}
+
 
 def _derive_affected_ids(finding: dict) -> list[str]:
     """Derive an affected-ids-equivalent list from a finding's typed citations.
@@ -176,6 +211,24 @@ def _derive_affected_ids(finding: dict) -> list[str]:
         if mid:
             ids.append(str(mid))
     return ids
+
+
+def _finding_has_reference(finding: dict) -> bool:
+    """Return True iff *finding* cites at least one task/entity/edge/memory ID.
+
+    A finding whose ``_derive_affected_ids`` is empty (no legacy ``affected_ids``
+    and no typed citation carries a usable identity) references nothing
+    concrete — it is a synthetic/placeholder finding (e.g. Stage 3 filed
+    ``add_finding`` but never followed up with a ``cite_*`` call) that cannot
+    be investigated or remediated.  Reusing ``_derive_affected_ids`` keeps
+    reference-derivation single-sourced with the escalation dedup/fingerprint
+    logic, so this predicate can never disagree about what counts as a
+    reference.
+
+    Task 1970: used by ``_maybe_remediate`` to drop referenceless actionable
+    findings before they reach the production remediation batch.
+    """
+    return bool(_derive_affected_ids(finding))
 
 
 # Module-local sleep binding — allows tests to patch sleep without touching
@@ -332,6 +385,14 @@ class ReconciliationHarness:
         self._dead_owner_suppressions: deque[tuple[datetime, str]] = deque()
         # Timestamp of the last storm escalation — None means never fired.
         self._last_suppression_storm_escalation_at: datetime | None = None
+
+        # Task 1970 amendment: rolling-window counter for dropped
+        # referenceless actionable findings (see
+        # _record_placeholder_finding_drop / _maybe_remediate).  Same
+        # (timestamp, project_id) shape, in-process-lifetime caveat, and
+        # rate-limited single-fire semantics as _dead_owner_suppressions above.
+        self._placeholder_finding_drops: deque[tuple[datetime, str]] = deque()
+        self._last_placeholder_drop_storm_escalation_at: datetime | None = None
 
         # Usage gate (multi-account cap failover)
         self.usage_gate: UsageGate | None = None
@@ -1128,6 +1189,66 @@ class ReconciliationHarness:
         return {
             'count': count,
             'window_seconds': self.config.dead_owner_suppression_storm_window_seconds,
+            'projects': projects,
+        }
+
+    # ── Placeholder-finding drop storm counter (task 1970 amendment) ───
+
+    def _record_placeholder_finding_drop(
+        self, project_id: str, *, now: datetime | None = None
+    ) -> dict | None:
+        """Record one dropped referenceless-finding event and check for a storm.
+
+        Same rolling-window-counter + rate-limited-single-fire shape as
+        _record_dead_owner_suppression above, applied to
+        reconciliation.remediation_dropped_placeholder_finding events instead
+        of dead_owner_shielded suppressions.  Thresholds are the plain module
+        constants _PLACEHOLDER_DROP_STORM_THRESHOLD /
+        _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS rather than ReconciliationConfig
+        fields, since this counter is private to this module.
+
+        Appends (effective_now, project_id) to the rolling deque, prunes
+        entries older than the configured window, then:
+        - Returns None if the count is below the threshold.
+        - Returns None if the alarm already fired within this window
+          (rate limit: <=1 per window).
+        - Otherwise sets _last_placeholder_drop_storm_escalation_at =
+          effective_now and returns a storm summary dict with 'count',
+          'window_seconds', and 'projects' (sorted distinct project labels
+          seen in the window).
+
+        The now= parameter follows the same time-injection convention as
+        _record_dead_owner_suppression, for deterministic unit tests.
+        """
+        effective_now = now if now is not None else datetime.now(UTC)
+
+        # Append and prune the rolling window.
+        self._placeholder_finding_drops.append((effective_now, project_id))
+        window = timedelta(seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS)
+        cutoff_ts = effective_now - window
+        while (
+            self._placeholder_finding_drops
+            and self._placeholder_finding_drops[0][0] < cutoff_ts
+        ):
+            self._placeholder_finding_drops.popleft()
+
+        count = len(self._placeholder_finding_drops)
+        if count < _PLACEHOLDER_DROP_STORM_THRESHOLD:
+            return None
+
+        # Threshold crossed — apply the per-window rate limit.
+        if (
+            self._last_placeholder_drop_storm_escalation_at is not None
+            and (effective_now - self._last_placeholder_drop_storm_escalation_at) < window
+        ):
+            return None
+
+        # Fire: set rate-limit timestamp and build the storm summary dict.
+        self._last_placeholder_drop_storm_escalation_at = effective_now
+        projects = sorted({pid for _, pid in self._placeholder_finding_drops})
+        return {
+            'count': count,
+            'window_seconds': _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
             'projects': projects,
         }
 
@@ -2098,6 +2219,66 @@ class ReconciliationHarness:
 
             if not actionable:
                 return
+
+            # Task 1970: drop any actionable finding that cites nothing (no
+            # legacy affected_ids and no typed citation) — a synthetic/
+            # placeholder finding that cannot be investigated or remediated
+            # (e.g. Stage 3 filed add_finding but never followed up with a
+            # cite_* call).  This is the last line of defense before findings
+            # become a production remediation batch: _run_remediation_pass is
+            # reached only through this method, so this guard fully closes
+            # the leak.  Fail-open: _finding_has_reference only drops a
+            # finding when _derive_affected_ids is clearly empty; anything
+            # ambiguous (legacy affected_ids or any typed citation) passes.
+            referenceable: list[dict] = []
+            dropped_placeholders: list[dict] = []
+            for finding in actionable:
+                if _finding_has_reference(finding):
+                    referenceable.append(finding)
+                else:
+                    dropped_placeholders.append(finding)
+
+            for finding in dropped_placeholders:
+                logger.warning(
+                    'reconciliation.remediation_dropped_placeholder_finding',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'finding_category': finding.get('category', ''),
+                        'description': finding.get('description', ''),
+                    },
+                )
+                # Task 1970 amendment: coarse aggregate alarm for a runaway
+                # Stage 3 that stops citing anything.  Each individual drop
+                # stays logged-only (never escalated on its own — see the
+                # module comment above _PLACEHOLDER_DROP_STORM_THRESHOLD);
+                # this counter fires ONE 'recon_remediation_placeholder_storm'
+                # escalation when drops recur often enough within the
+                # rolling window.  Mirrors the dead_owner_shielded storm
+                # wiring in _recover_stale_runs (~line 1122).
+                storm = self._record_placeholder_finding_drop(project_id)
+                if storm is not None:
+                    window_min = storm['window_seconds'] / 60
+                    proj_label = ', '.join(storm['projects']) or project_id
+                    storm_summary = (
+                        f"referenceless placeholder-finding drop storm: {storm['count']} in "
+                        f"{window_min:.0f} min (projects: {proj_label}) — "
+                        f'Stage 3 may have stopped citing findings (add_finding '
+                        f'without a follow-up cite_* call)'
+                    )
+                    storm_detail = f'project={project_id} parent_run={parent_run_id}'
+                    self._escalate(
+                        'recon_remediation_placeholder_storm',
+                        parent_run_id,
+                        storm_summary,
+                        storm_detail,
+                        finding=_PLACEHOLDER_DROP_STORM_FINDING,
+                    )
+
+            if not referenceable:
+                return
+
+            actionable = referenceable
 
             # Task 1570 / FIX A: suppress remediation for any actionable finding
             # that already has an OPEN pending recon_integrity_issue escalation.
