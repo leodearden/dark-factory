@@ -2415,7 +2415,7 @@ class ReconciliationHarness:
         # (deferred/done/cancelled) drop the project-wide orchestrator_live signal
         # instead of being suppressed by it. remediation_tree is always a valid
         # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
-        status_by_id: dict[str, str] = {
+        status_by_id: dict[str, str | None] = {
             str(t.get('id')): t.get('status')
             for t in (
                 list(remediation_tree.active_tasks)

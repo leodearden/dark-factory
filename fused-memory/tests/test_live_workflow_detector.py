@@ -415,9 +415,9 @@ class TestStatusScopedOrchestratorSignal:
 
     def test_orch_live_ineligible_statuses_constant(self):
         """ORCH_LIVE_INELIGIBLE_STATUSES lists exactly the never-dispatched statuses."""
-        assert detector_module.ORCH_LIVE_INELIGIBLE_STATUSES == frozenset(
+        assert frozenset(
             {'deferred', 'done', 'cancelled'}
-        )
+        ) == detector_module.ORCH_LIVE_INELIGIBLE_STATUSES
 
     @pytest.mark.parametrize('status', ['deferred', 'done', 'cancelled'])
     def test_ineligible_status_suppresses_orchestrator_signal(self, tmp_path, status):
