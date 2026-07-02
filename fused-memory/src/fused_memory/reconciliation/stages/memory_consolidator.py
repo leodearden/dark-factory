@@ -32,6 +32,9 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     track_human_operator_stalls,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _render_live_workflow_section,
+)
 from fused_memory.reconciliation.summary_pool import pretrim_summary_pool
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
@@ -394,6 +397,9 @@ class MemoryConsolidator(BaseStage):
         # 7b. Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
+        # 7c. Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
+        live_workflow_section = self._build_live_workflow_section()
+
         # 8. Format
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
@@ -419,7 +425,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{summary_nonce_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -489,6 +495,9 @@ Review the above data and perform memory consolidation:
         # Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
+        # Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
+        live_workflow_section = self._build_live_workflow_section()
+
         # Per-cycle summary nonce (task 1574)
         summary_nonce_section = self._build_summary_nonce_section()
 
@@ -509,7 +518,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{summary_nonce_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}{summary_nonce_section}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -542,6 +551,33 @@ Review the above data and perform memory consolidation:
         if self.filtered_task_tree is None:
             return ''
         return '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
+
+    def _build_live_workflow_section(self) -> str:
+        """Return the Live-Workflow Signals prompt section, or empty string if inapplicable.
+
+        Mirrors Stage 2's guard/source exactly (task 1655): renders over
+        ``self.filtered_task_tree.active_tasks`` when ``self.project_root`` and
+        ``self.filtered_task_tree`` are set and ``active_tasks`` is non-empty.
+        Reuses Stage 2's ``_render_live_workflow_section`` renderer (imported from
+        task_knowledge_sync.py) so both stages emit byte-identical section
+        formatting for the same underlying live-workflow signals (task 1977).
+
+        Returns '' when the guard fails or no active task is currently live —
+        keeps the payload tight, matching _build_task_tree_section's pattern.
+        """
+        if not (
+            self.project_root
+            and self.filtered_task_tree
+            and self.filtered_task_tree.active_tasks
+        ):
+            return ''
+        section = _render_live_workflow_section(
+            self.filtered_task_tree.active_tasks,
+            self.project_root,
+        )
+        if not section:
+            return ''
+        return '\n' + section
 
     def _build_task_count_census_section(self) -> str:
         """Return the Task Count Census payload section, or empty string if unavailable.

@@ -595,4 +595,37 @@ directive is intentionally STRICTER: the LLM is asked to additionally surface th
 from its own re-search into the `flagged_items` entry, since the structured-output channel \
 carries the durable delivery guarantee. The asymmetry is deliberate; do not re-align by \
 reverting the Python helper to return `str | None`.
+
+## Live-Workflow Authority
+The payload may include a `### Live-Workflow Signals` section. When present, it lists \
+tasks whose branch `task/<id>` has at least one live-workflow signal: a registered \
+git worktree, a recent branch commit (within the last 6 hours), or an active \
+orchestrator process holding the project lock. These signals indicate that a live \
+pipeline — typically the reify-build orchestrator — is actively driving that task's \
+lifecycle.
+
+**For any task listed in `### Live-Workflow Signals`, do NOT emit a stranded-work or \
+blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
+`severity='moderate'` with `actionable=true`.** A task under an active live pipeline is \
+mid-flight, not stranded — asserting a moderate/actionable disposition for it contradicts \
+Stage 2's own Live-Workflow Authority policy (task 1655) and produces two contradictory \
+disposition markers for the same `task_id`+`flag_type` in a single reconciliation cycle.
+
+Instead, for a task listed under `### Live-Workflow Signals`, do one of:
+1. **Downgrade** the flag to `severity='info'` and `actionable=false`, or
+2. **Annotate** the flag's description with "pending Stage 2 live-workflow confirmation" \
+   and leave the final disposition to Stage 2, which has direct access to live scheduler \
+   state.
+
+Either remediation is acceptable; what is NOT acceptable is emitting the flag at \
+`severity='moderate'` with `actionable=true` as though the task were genuinely stranded.
+
+**Only treat a stranded / blocked-escalation flag as fully actionable when NO live signal \
+is present** — i.e., the task is absent from `### Live-Workflow Signals` (all three \
+signals are False: no worktree, no recent commits, no active orchestrator). That is the \
+genuinely stranded case that legitimately needs operator attention.
+
+If `### Live-Workflow Signals` is absent from the payload, all three signals are False \
+for every task; no live-workflow suppression applies, and stranded/blocked-escalation \
+flags may be emitted normally.
 """
