@@ -82,6 +82,42 @@ def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG00
     return subtype in _BUDGET_SUBTYPES
 
 
+def _failure_diagnostics(result: Any) -> dict[str, Any]:
+    """Build the discrete, queryable diagnostic fields stamped on failure entries.
+
+    None-safe: when *result* is None (the orchestrator-side exception fallback
+    in ``run_dry_run_unblock``, where no ``AgentResult`` was ever produced),
+    every key is present with a ``None`` value — preserving shape parity
+    across all four entry shapes (ok, investigation_failed, budget_exhausted,
+    exception fallback).
+
+    ``stderr_tail`` mirrors ``classify_agent_failure``'s 500-char tail
+    convention (``shared/src/shared/cli_invoke.py``).
+
+    These keys are orchestrator-stamped OUTSIDE ``DRY_RUN_PROPOSAL_SCHEMA``
+    (``additionalProperties: False``) — the same pattern as head_sha/main_sha
+    (task 1613) — so the agent cannot forge them.
+    """
+    if result is None:
+        return {
+            'timed_out': None,
+            'duration_ms': None,
+            'subtype': None,
+            'transcript_turns': None,
+            'session_id': None,
+            'stderr_tail': None,
+        }
+    stderr = getattr(result, 'stderr', '') or ''
+    return {
+        'timed_out': bool(getattr(result, 'timed_out', False)),
+        'duration_ms': getattr(result, 'duration_ms', None),
+        'subtype': getattr(result, 'subtype', '') or '',
+        'transcript_turns': getattr(result, 'transcript_turns', None),
+        'session_id': getattr(result, 'session_id', '') or '',
+        'stderr_tail': stderr[-500:],
+    }
+
+
 # Read-only tools the dry-run agent is allowed to use.
 # Bash(pytest:*) and Bash(cargo:*) are intentionally omitted: both can
 # write .pyc/__pycache__/target/ files or fetch from the network, which
@@ -354,6 +390,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
                 'cost_usd': getattr(result, 'cost_usd', 0.0),
                 'investigated_at': now,
                 'timestamp': now,
+                **_failure_diagnostics(result),
             }
         return {
             'status': 'investigation_failed',
