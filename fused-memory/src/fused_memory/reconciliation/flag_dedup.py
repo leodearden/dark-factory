@@ -1958,17 +1958,23 @@ async def acknowledge_flag_marker(
     mode: Literal['delete', 'tag'] = 'delete',
     log: logging.Logger = logger,
 ) -> int:
-    """Best-effort acknowledge (delete) prior ``stage1_flag_marker``(s).
+    """Best-effort acknowledge (delete or tag) prior ``stage1_flag_marker``(s).
 
     Locates every prior ``stage1_flag_marker`` for the ``(task_id, flag_type)``
     signature via the same ``find_prior_memories`` + :func:`_marker_query` search
-    ``dedup_flags`` uses, then deletes every located prior (best-effort parallel
-    delete via ``asyncio.gather(return_exceptions=True)``, mirroring
-    ``task_knowledge_sync._sweep_stale_fixc_markers``).  Returns the number of
-    deletes that completed without raising.
+    ``dedup_flags`` uses, then:
 
-    ``mode='tag'`` is reserved for a follow-up step; this step only implements
-    ``mode='delete'`` behavior.
+    - ``mode='delete'``: deletes every located prior (best-effort parallel
+      delete via ``asyncio.gather(return_exceptions=True)``, mirroring
+      ``task_knowledge_sync._sweep_stale_fixc_markers``). Returns the number of
+      deletes that completed without raising.
+    - ``mode='tag'``: writes ONE replacement marker carrying the canonical
+      ``stage1_flag_marker`` payload plus ``addressed_by``/``addressed_at_run``
+      set to *run_id*, then — only if the write is confirmed (non-empty
+      ``memory_ids``) — deletes the located priors the same way as
+      ``mode='delete'``.  An unconfirmed/failed write leaves all priors intact
+      and returns 0 (mirrors ``_write_and_confirm_marker``'s best-effort
+      at-least-one-marker contract).
 
     Guards: an invalid *task_id* (per :func:`_is_valid_marker_task_id`) or no
     located priors short-circuits to a no-op ``0`` with no Mem0 I/O beyond the
@@ -1976,17 +1982,19 @@ async def acknowledge_flag_marker(
     own try/except so a transient Mem0 outage can never abort a caller's batch.
 
     Args:
-        memory_service: Mem0 service with async ``search``/``delete_memory`` methods.
-        project_id: Project scope for search/delete.
+        memory_service: Mem0 service with async ``search``/``add_memory``/
+            ``delete_memory`` methods.
+        project_id: Project scope for search/write/delete.
         run_id: Current reconciliation run identifier; used as ``causation_id``
-            on deletes.
+            on writes/deletes and, in ``mode='tag'``, as the ``addressed_by``/
+            ``addressed_at_run`` provenance value.
         task_id: The flag's task_id (or comma-joined/``fp:`` signature key).
         flag_type: The flag's flag_type.
-        mode: ``'delete'`` (default); ``'tag'`` is not yet implemented.
+        mode: ``'delete'`` (default) or ``'tag'``.
         log: Logger for WARNING/DEBUG messages; defaults to this module's logger.
 
     Returns:
-        Count of priors successfully deleted (0 on any guard/no-op/failure).
+        Count of priors successfully acknowledged (0 on any guard/no-op/failure).
     """
     tid = str(task_id)
     ftype = str(flag_type)
@@ -2019,8 +2027,45 @@ async def acknowledge_flag_marker(
     if not priors:
         return 0
 
-    # mode == 'delete': delete all located priors best-effort (one bad delete
-    # does not abort the batch).
+    if mode == 'tag':
+        try:
+            response = await memory_service.add_memory(
+                content=(
+                    f'Stage 1 flag marker addressed: task={tid} type={ftype}'
+                    f' addressed_by run={run_id}'
+                ),
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata={
+                    'source': 'stage1_flag_marker',
+                    'kind': 'stage1_flag_marker',
+                    'task_id': tid,
+                    'flag_type': ftype,
+                    'run_id': run_id,
+                    'last_seen_run_id': run_id,
+                    'addressed_by': run_id,
+                    'addressed_at_run': run_id,
+                },
+                causation_id=run_id,
+                _source='flag_acknowledgment',
+            )
+        except Exception as e:
+            log.warning(
+                'acknowledge_flag_marker: failed to write tag replacement for task %s'
+                ' flag_type %s: %s',
+                tid, ftype, e,
+            )
+            return 0
+        if not response.memory_ids:
+            log.warning(
+                'acknowledge_flag_marker: tag replacement for task %s flag_type %s not'
+                ' confirmed (empty memory_ids) — leaving priors intact',
+                tid, ftype,
+            )
+            return 0
+
+    # mode == 'delete', or mode == 'tag' with a confirmed replacement write:
+    # delete all located priors best-effort (one bad delete does not abort the batch).
     results = await asyncio.gather(
         *(
             memory_service.delete_memory(
