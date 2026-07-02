@@ -250,6 +250,55 @@ def _enumerate_running_units() -> list[str]:
     return [line.split()[0] for line in result.stdout.splitlines() if line.split()]
 
 
+def _unit_start_epoch(unit: str) -> int | None:
+    """Return *unit*'s realtime start epoch (Unix seconds since epoch), or None.
+
+    Queries ``ExecMainStartTimestamp`` via ``systemctl --user show
+    --timestamp=unix``, which yields a clean, timezone-independent ``@<epoch>``
+    value directly comparable to git's ``%ct`` committer epoch. Deliberately
+    does NOT parse systemd's human-readable timestamp string (locale/TZ
+    fragile) and does NOT derive from the monotonic twin
+    _unit_start_elapsed_secs (a different clock domain, unusable here).
+
+    Returns None if the unit has no recorded start time (the ``@0`` sentinel),
+    the value cannot be parsed, or any subprocess/OS error occurs — callers
+    must treat None as "staleness cannot be determined for this unit".
+    """
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--timestamp=unix",
+                "-p",
+                "ExecMainStartTimestamp",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if "=" not in line:
+                continue
+            val = line.split("=", 1)[1].strip()
+            if val.startswith("@"):
+                val = val[1:]
+            try:
+                epoch = int(val)
+            except ValueError:
+                return None
+            if epoch == 0:
+                return None  # unit has never started (or no PID recorded)
+            return epoch
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def main() -> None:
     """Probe each watched port; restart the unit if the port is not listening."""
     for port, unit in WATCHED:
