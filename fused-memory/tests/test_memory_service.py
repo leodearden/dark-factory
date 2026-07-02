@@ -1891,6 +1891,94 @@ class TestGetEntity:
         assert edge['temporal']['valid_at'] == '2024-03-01T10:00:00+00:00'
         assert edge['temporal']['invalid_at'] is None
 
+    # ------------------------------------------------------------------
+    # exact-first lookup (task-1975): get_nodes_by_exact_name precedes fuzzy search_nodes
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_exact_match_preferred_over_fuzzy(self, service):
+        """An exact-name hit is returned as-is; fuzzy search_nodes is skipped entirely."""
+        from _fm_helpers import MockNode
+
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.search_nodes = AsyncMock(
+            return_value=[MockNode(name='Task 95', uuid='u-95')]
+        )
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        result = await service.get_entity('Task 115', project_id='test')
+
+        assert len(result['nodes']) == 1
+        assert result['nodes'][0]['name'] == 'Task 115'
+        assert result['nodes'][0]['uuid'] == 'u-115'
+        service.graphiti.search_nodes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_exact_match_falls_back_to_fuzzy(self, service):
+        """An empty exact-name result falls through to the existing fuzzy search_nodes path."""
+        from _fm_helpers import MockNode
+
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(
+            return_value=[MockNode(name='Approx', uuid='u-1')]
+        )
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        result = await service.get_entity('Approx', project_id='test')
+
+        assert result['nodes'][0]['name'] == 'Approx'
+        service.graphiti.search_nodes.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_exact_match_multiple_returns_all(self, service):
+        """Multiple exact-name matches are all returned (no ambiguity error)."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[
+            {'uuid': 'u-1', 'name': 'Alice', 'summary': 's1', 'labels': []},
+            {'uuid': 'u-2', 'name': 'Alice', 'summary': 's2', 'labels': []},
+        ])
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        result = await service.get_entity('Alice', project_id='test')
+
+        assert len(result['nodes']) == 2
+        assert result['nodes'][0]['name'] == 'Alice'
+        assert result['nodes'][1]['name'] == 'Alice'
+        assert result['nodes'][0]['uuid'] == 'u-1'
+        assert result['nodes'][1]['uuid'] == 'u-2'
+
+    @pytest.mark.asyncio
+    async def test_exact_match_edges_come_from_fuzzy_search(self, service):
+        """Edges are still sourced from the fuzzy fact search even on an exact node hit."""
+        from _fm_helpers import MockEdge
+
+        dt = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.search = AsyncMock(
+            return_value=[MockEdge(fact='F', uuid='e-1', valid_at=dt, invalid_at=None)]
+        )
+
+        result = await service.get_entity('Task 115', project_id='test')
+
+        assert result['edges'][0]['fact'] == 'F'
+        assert result['edges'][0]['temporal']['valid_at'] == dt.isoformat()
+        assert result['edges'][0]['temporal']['invalid_at'] is None
+
+    @pytest.mark.asyncio
+    async def test_exact_match_labels_default_empty(self, service):
+        """An exact node dict with no/None labels yields labels == [] in the result."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': None}]
+        )
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        result = await service.get_entity('Task 115', project_id='test')
+
+        assert result['nodes'][0]['labels'] == []
+
 
 class TestSerializeTemporal:
     """Unit tests for the _serialize_temporal module-level helper."""
