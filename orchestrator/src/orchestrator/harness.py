@@ -27,7 +27,7 @@ from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, apply_reload, load_config
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
@@ -110,6 +110,13 @@ _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 # tight-spin on a pass that fails immediately, even if the configured interval
 # is non-numeric (task 1907).
 _BG_LOOP_FAILURE_BACKOFF_SECS: float = 60.0
+
+# Bound on the thread-off load_config() call inside reload_config() (PRD
+# plans/config-hot-reload-prd.md Open Q3). load_config() runs
+# _discover_module_configs, a filesystem walk that can wedge; this keeps a
+# hot-reload request from hanging indefinitely. The abandoned worker thread
+# cannot be force-cancelled and is left to finish; its result is discarded.
+_RELOAD_LOAD_TIMEOUT_SECS: float = 30.0
 
 # Idle-while-paused tuning (task 1322 follow-up).  When the scheduler is paused
 # and no tasks are active, the main run loop idles in-process instead of exiting
@@ -7162,6 +7169,45 @@ Output JSON matching the schema. Every task must appear in the output.
             'prior_reason': prior_reason,
             'reason': reason,
         }
+
+    # ------------------------------------------------------------------ #
+    # Config hot-reload (plans/config-hot-reload-prd.md, task beta)       #
+    # ------------------------------------------------------------------ #
+
+    async def reload_config(self) -> dict[str, Any]:
+        """Hot-apply the allowlisted subset of orchestrator config (task beta).
+
+        Backs the ``reload_config`` escalation MCP tool (task gamma). Orchestrates
+        task alpha's pure config.py engine:
+
+        * I1 fail-closed thread-off load — ``load_config()`` is invoked with ZERO
+          arguments (off the event loop, via ``asyncio.to_thread``) so a reload can
+          only ever re-read this process's own ``ORCH_CONFIG_PATH`` — never retarget
+          the orchestrator at a different project. This method's own exception/
+          timeout handling for that load lands in later steps.
+        * I4 same-turn atomic apply — ``apply_reload(self.config, fresh)`` runs
+          synchronously with no interleaved await, so coroutine readers of
+          ``self.config`` never observe a torn multi-field state. Its internal I5
+          hybrid re-validation + rollback is relied upon as-is (not re-wrapped here).
+        * config_path injection — ``apply_reload``'s return dict intentionally omits
+          ``config_path``; this method supplies it from ``ORCH_CONFIG_PATH``.
+        * I7 audit — every call (success or failure) is recorded as a
+          ``config_reload`` event carrying the full report.
+
+        Returns ``{reloaded, config_path, applied, restart_required, unchanged,
+        error}`` verbatim from ``apply_reload`` plus the injected ``config_path``.
+        """
+        config_path = os.environ.get('ORCH_CONFIG_PATH')
+        fresh = await asyncio.wait_for(
+            asyncio.to_thread(load_config), timeout=_RELOAD_LOAD_TIMEOUT_SECS
+        )
+        report = apply_reload(self.config, fresh)
+        report['config_path'] = config_path
+        if self.event_store:
+            self.event_store.emit(EventType.config_reload, data=report)
+        if not report['reloaded']:
+            logger.warning('config reload: %s', report.get('error'))
+        return report
 
     # ------------------------------------------------------------------ #
     # Scheduler park-and-stop pause (task 1322)                           #
