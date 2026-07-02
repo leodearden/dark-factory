@@ -1124,3 +1124,96 @@ class TestDryRunResilienceScaffolding:
         assert call_kwargs.get('invoke_fn') is real_invoke_agent
         session_id_arg = call_kwargs.get('session_id')
         assert isinstance(session_id_arg, str) and session_id_arg
+
+
+# ---------------------------------------------------------------------------
+# task 2021 step-3: exactly one fresh retry on a zero-output timeout wedge
+# ---------------------------------------------------------------------------
+
+class TestDryRunFreshRetry:
+    """A pre-turn-1 host wedge (timed_out=True, transcript_turns==0) is
+    retried exactly ONCE with a freshly-allocated session_id — never reusing
+    a possibly-committed UUID (reify-3604 / _reset_for_fresh_retry semantics).
+    usage_gate is omitted throughout so invoke_with_cap_retry takes its fast,
+    no-gate path and forwards straight to the patched invoke_agent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wedge_then_success_retries_once_with_fresh_session(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        wedge = _make_agent_result(
+            success=False, timed_out=True, transcript_turns=0,
+            subtype='error_empty_output', session_id='w1',
+        )
+        success = _make_agent_result(
+            success=True,
+            structured_output={
+                'proposal_text': 'x', 'risk_label': 'low', 'files_referenced': [],
+            },
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        mock_invoke = AsyncMock(side_effect=[wedge, success])
+        with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+            await run_dry_run_unblock(
+                task_id='2200',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        assert mock_invoke.await_count == 2, (
+            f'Expected the wedge to trigger exactly one retry, got '
+            f'{mock_invoke.await_count} invoke_agent calls'
+        )
+        first_session = mock_invoke.call_args_list[0].kwargs.get('session_id')
+        second_session = mock_invoke.call_args_list[1].kwargs.get('session_id')
+        assert first_session != second_session, (
+            'retry must allocate a FRESH session_id, never reuse the wedged one'
+        )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry.get('risk_label') == 'low'
+        assert entry.get('status') is None, (
+            f"successful retry must persist the plain success shape (no 'status' "
+            f"key), got status={entry.get('status')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_wedge_then_wedge_bounded_to_one_retry(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        wedge = _make_agent_result(
+            success=False, timed_out=True, transcript_turns=0,
+            subtype='error_empty_output', session_id='w1',
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        mock_invoke = AsyncMock(side_effect=[wedge, wedge])
+        with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+            await run_dry_run_unblock(
+                task_id='2201',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        assert mock_invoke.await_count == 2, (
+            f'Expected exactly one retry (2 total attempts, bounded — not a '
+            f'loop), got {mock_invoke.await_count}'
+        )
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure'
