@@ -905,3 +905,47 @@ class TestInfraFailureClassification:
         scheduler.update_task.assert_awaited_once()
         entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
         assert entry['status'] == 'investigation_failed'
+
+
+# ---------------------------------------------------------------------------
+# task 2020 step-7: exception fallback carries None-safe diagnostic keys
+# ---------------------------------------------------------------------------
+
+class TestExceptionFallbackDiagnostics:
+    """The exception-fallback entry (an orchestrator-side error, not a
+    detected host wedge) stays 'investigation_failed' and carries all six
+    diagnostic keys with None values — shape parity, since no AgentResult
+    ever existed on this path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_exception_fallback_carries_none_diagnostics(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(side_effect=RuntimeError('boom')),
+        ):
+            await run_dry_run_unblock(
+                task_id='703',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'investigation_failed'
+        assert entry['risk_label'] == 'human-review-required'
+        for key in (
+            'timed_out', 'duration_ms', 'subtype',
+            'transcript_turns', 'session_id', 'stderr_tail',
+        ):
+            assert key in entry, f'{key} must be present on the exception fallback entry'
+            assert entry[key] is None, f'{key} must be None on the exception fallback entry'
