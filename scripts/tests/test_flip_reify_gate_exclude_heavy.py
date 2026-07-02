@@ -291,3 +291,26 @@ def test_reload_marker_emitted_only_on_real_apply(tmp_path):
         f"An already-flipped no-op apply must not emit the reload marker; "
         f"got: {noop.stdout!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED -- commit must bypass a failing reify pre-commit hook
+# ---------------------------------------------------------------------------
+
+def test_apply_commits_despite_failing_precommit_hook(tmp_path):
+    """The flip commit must bypass reify's pre-commit hook (--no-verify),
+    mirroring the real repo's main-branch commit gate."""
+    repo = _make_fake_reify_repo(tmp_path, failing_precommit=True)
+    before_commits = _commit_count(repo)
+
+    result = _run_script(repo)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0 despite a failing pre-commit hook; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    after_commits = _commit_count(repo)
+    assert after_commits == before_commits + 1, (
+        f"Expected the flip commit to succeed despite a failing pre-commit "
+        f"hook; before={before_commits} after={after_commits}"
+    )
