@@ -1244,12 +1244,48 @@ class MemoryService:
     ) -> dict:
         """Entity lookup in Graphiti — returns nodes + edges.
 
-        Both Graphiti calls run concurrently via asyncio.gather(return_exceptions=True).
-        This ensures neither call becomes an orphaned background task in the error path:
-        gather() awaits both coroutines to settlement before returning, even when one
-        (or both) raise an exception.  If any call fails, all exceptions are logged
-        (warning) then the first exception is re-raised.
+        Tries an exact, case-sensitive name match first (via
+        graphiti.get_nodes_by_exact_name): canonical labels like "Task 115" resolve to
+        the exact node instead of scattering across fuzzy neighbours. On an exact hit,
+        fuzzy node search (search_nodes) is skipped entirely; edges still come from the
+        fuzzy fact search below. On no exact match, falls back to the fuzzy gather path.
+
+        Both Graphiti calls in the fuzzy fallback run concurrently via
+        asyncio.gather(return_exceptions=True). This ensures neither call becomes an
+        orphaned background task in the error path: gather() awaits both coroutines to
+        settlement before returning, even when one (or both) raise an exception.  If
+        any call fails, all exceptions are logged (warning) then the first exception
+        is re-raised.
         """
+        exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
+        if exact:
+            edges = await self.graphiti.search(
+                query=name,
+                group_ids=[project_id],
+                num_results=10,
+            )
+            node_data = [
+                {
+                    'uuid': n.get('uuid'),
+                    'name': n.get('name'),
+                    'summary': n.get('summary'),
+                    'labels': n.get('labels') or [],
+                }
+                for n in exact
+            ]
+            edge_data = [
+                {
+                    'uuid': getattr(e, 'uuid', None),
+                    'fact': getattr(e, 'fact', str(e)),
+                    'temporal': _serialize_temporal(
+                        getattr(e, 'valid_at', None),
+                        getattr(e, 'invalid_at', None),
+                    ),
+                }
+                for e in edges
+            ]
+            return {'nodes': node_data, 'edges': edge_data}
+
         results = await asyncio.gather(
             self.graphiti.search_nodes(
                 query=name,
