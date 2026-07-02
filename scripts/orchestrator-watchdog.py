@@ -21,6 +21,7 @@ Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
 """
 
+import os
 import subprocess
 import time
 
@@ -54,6 +55,17 @@ WATCHED_PATHS = [
     "orchestrator/uv.lock",
     "escalation/pyproject.toml",
 ]
+
+# Fleet-wide head start for the polite event-driven restart coordinator
+# (PRD: orchestrator-fleet-staleness) before the backstop staleness pass acts
+# on the same commit. Env-overridable, mirroring restart-all-orchestrators.sh's
+# RESTART_VERIFY_TIMEOUT env-with-default pattern (PRD Open Question 1). A
+# missing or malformed value falls back to the default — a typo'd env var
+# must not crash the oneshot watchdog.
+try:
+    STALENESS_GRACE_SECS = int(os.environ["STALENESS_GRACE_SECS"])
+except (KeyError, ValueError):
+    STALENESS_GRACE_SECS = 1800
 
 
 def log(msg: str) -> None:
