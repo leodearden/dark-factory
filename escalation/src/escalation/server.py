@@ -71,6 +71,31 @@ def _get_merge_worker(harness: Any | None) -> Any | None:
     return getattr(harness, '_merge_worker', None)
 
 
+def _require_matching_project_root(harness: Any, project_root: str) -> str | None:
+    """Return an error message if *project_root* doesn't match this server's project.
+
+    The escalation server closes over exactly one project's ``harness``, so
+    *project_root* can never be used to route a call — it is a defensive
+    validation guard.  Resolved-path equality (not string equality) so
+    trailing slashes / relative segments / symlink differences don't produce
+    false-positive mismatches.  Returns None when they match.
+
+    Shared by claim_warm_worktree and release_warm_worktree (PRD β, task
+    2011) so a multi-project interactive caller (/do, /warm) that mis-targets
+    an escalation MCP endpoint gets a clean testable failure instead of
+    claiming/releasing a worktree against the wrong orchestrator.
+    """
+    gops_root = Path(harness.git_ops.project_root).resolve()
+    given_root = Path(project_root).resolve()
+    if given_root != gops_root:
+        return (
+            f'project_root mismatch: {project_root!r} does not match this '
+            f"server's wired project ({harness.git_ops.project_root!s}, "
+            f'resolved {gops_root!s}).'
+        )
+    return None
+
+
 # C1 action enum for resolve_issue — five valid values, two disposition buckets.
 RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'close_only')
 # park is no longer dismissed — it keeps the record open at L2 (version-a).
@@ -1223,15 +1248,52 @@ def create_server(
         Mints a fresh worktree in the ``_iact-*`` band on branch
         ``task/<slug>``, CoW-seeding its build cache when possible.
 
+        *project_root* is validated against this server's wired
+        ``harness.git_ops.project_root`` (resolved-path equality) — it is a
+        defensive guard, NOT a routing key: this server always serves exactly
+        one project, so a mismatch means the caller is talking to the wrong
+        escalation MCP endpoint.
+
         Returns ``{path, branch, warm, base_ref}`` on success. ``path`` is an
         absolute string (not a ``Path``). ``warm=False`` is a fail-soft
         SUCCESS — the CoW seed faulted but the worktree is still usable; it
         is never surfaced as an error.
+
+        On failure returns ``{error, reason}`` instead of raising — callers
+        should surface ``error`` and, for ``reason='interactive_worktree_limit'``,
+        fall back to a cold worktree/clone rather than retrying immediately.
+        ``reason`` is one of: ``'interactive_worktree_limit'`` (the _iact-*
+        cap is reached — free a slot and retry), ``'invalid_slug'`` (slug
+        fails the safe-charset validation), ``'git_failure'`` (start_ref/main
+        failed to resolve, or ``git worktree add`` failed).  A standalone
+        server (no harness wired) or a ``project_root`` mismatch returns
+        ``{error}`` with no ``reason`` key.
         """
         if harness is None or getattr(harness, 'git_ops', None) is None:
             return {'error': 'escalation server running standalone — no harness wired'}
+        mismatch = _require_matching_project_root(harness, project_root)
+        if mismatch is not None:
+            return {'error': mismatch}
 
-        info = await harness.git_ops.create_interactive_worktree(slug, start_ref=start_ref)
+        # Runtime-only reverse import: orchestrator depends on escalation, not
+        # vice versa (mirrors merge_request's lazy orchestrator.merge_queue
+        # import above) — unresolvable in escalation's standalone typecheck
+        # env, hence the suppression.
+        from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
+            InteractiveWorktreeLimitError,
+        )
+
+        try:
+            info = await harness.git_ops.create_interactive_worktree(
+                slug, start_ref=start_ref,
+            )
+        except InteractiveWorktreeLimitError as e:
+            return {'error': str(e), 'reason': 'interactive_worktree_limit'}
+        except ValueError as e:
+            return {'error': str(e), 'reason': 'invalid_slug'}
+        except RuntimeError as e:
+            return {'error': str(e), 'reason': 'git_failure'}
+
         return {
             'path': str(info.path),
             'branch': info.branch,
