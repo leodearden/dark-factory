@@ -22,7 +22,6 @@ Shared patterns from the existing test suite:
 from __future__ import annotations
 
 import asyncio
-import json
 import types
 from pathlib import Path
 from typing import Any
@@ -148,7 +147,7 @@ class TestClaimWarmWorktreeHappyPath:
     """claim_warm_worktree happy path — maps InteractiveWorktreeInfo 1:1."""
 
     async def test_claim_creates_warm_worktree(
-        self, warm_repo: Path, git_ops: GitOps, server: Any,
+        self, warm_repo: Path, git_ops: GitOps, server: Any,  # type: ignore[reportInvalidTypeForm]
     ) -> None:
         """Fresh claim: {path, branch, warm, base_ref} match the α contract."""
         rc, main_sha, _ = await _run(['git', 'rev-parse', 'main'], cwd=warm_repo)
