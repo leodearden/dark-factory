@@ -428,8 +428,8 @@ async def test_maybe_restart_executor_raises_does_not_propagate(caplog: pytest.L
 
 @pytest.mark.asyncio
 async def test_maybe_restart_executor_raises_subsequent_tick_does_not_retry() -> None:
-    """After an executor failure, is_pending is False — subsequent idle ticks are no-ops."""
-    raising_executor = AsyncMock(side_effect=OSError('permission denied'))
+    """After a PERMANENT executor failure, is_pending is False — subsequent idle ticks are no-ops."""
+    raising_executor = AsyncMock(side_effect=PermissionError('permission denied'))
     coord, current_time, _, _ = _make_coordinator_with_mutable_clock(
         ['fused-memory/src/server/main.py'],
         debounce_secs=0.0,
@@ -447,6 +447,211 @@ async def test_maybe_restart_executor_raises_subsequent_tick_does_not_retry() ->
     result2 = await coord.maybe_restart(agents_idle=True)
     assert result2 is False
     raising_executor.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Transient vs permanent executor failures (asymmetry fix — task 2017)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_bare_oserror_is_treated_as_transient_and_retries() -> None:
+    """A bare OSError (e.g. ENOSPC/EMFILE) — distinct from FileNotFoundError and
+    PermissionError — is classified TRANSIENT: pending is retained and the next
+    idle tick retries. Locks the intended permanent/transient boundary: only the
+    two concrete subclasses are permanent; every other OSError is transient.
+    """
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['fused-memory/src/server/main.py'], None)
+    )
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+    executor = AsyncMock(side_effect=[OSError('ENOSPC: no space left on device'), None])
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+    )
+
+    await coord.note_merge('task-1', 'base', 'head')
+    current_time[0] = 1.0
+
+    # First tick: bare OSError — transient, pending retained.
+    result1 = await coord.maybe_restart(agents_idle=True)
+    assert result1 is False
+    assert coord.is_pending is True
+    executor.assert_awaited_once()
+
+    # Second tick: executor recovers — fires normally.
+    result2 = await coord.maybe_restart(agents_idle=True)
+    assert result2 is True
+    assert coord.is_pending is False
+    assert executor.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_transient_executor_failure_retains_pending_and_retries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A TRANSIENT executor failure (e.g. a RuntimeError from a systemd-run
+    registration hiccup) retains pending — symmetric with the restart_precondition
+    fail-safe path — so the next idle tick retries. Once the executor recovers, the
+    retry fires normally (event emitted, pending cleared).
+    """
+    import logging
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['fused-memory/src/server/main.py'], None)
+    )
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+    executor = AsyncMock(side_effect=[RuntimeError('systemd-run rc=1'), None])
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+    )
+
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord.is_pending is True
+
+    current_time[0] = 1.0  # past debounce (0)
+
+    # First tick: executor raises RuntimeError (transient) — pending is retained.
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        result1 = await coord.maybe_restart(agents_idle=True)
+
+    assert result1 is False
+    assert coord.is_pending is True
+    executor.assert_awaited_once()
+    assert any(
+        'transient' in r.message.lower() or 'retry' in r.message.lower()
+        for r in caplog.records
+    )
+
+    # Second tick: executor recovers — fires, emits event, clears pending.
+    result2 = await coord.maybe_restart(agents_idle=True)
+
+    assert result2 is True
+    assert executor.await_count == 2
+    event_store.emit.assert_called_once()
+    assert coord.is_pending is False
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_transient_failures_bounded_clears_and_logs_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Transient executor failures are bounded: after max_executor_failures
+    consecutive failures, pending + trigger metadata are cleared and a LOUD
+    ERROR is logged — a persistent transient failure must not retry forever
+    nor silently drop the restart.
+    """
+    import logging
+
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['fused-memory/src/server/main.py'], None)
+    )
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+    executor = AsyncMock(side_effect=RuntimeError('systemd hiccup'))
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+        max_executor_failures=2,
+    )
+
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord.is_pending is True
+
+    current_time[0] = 1.0
+
+    # First failure (1/2): transient — pending retained.
+    result1 = await coord.maybe_restart(agents_idle=True)
+    assert result1 is False
+    assert coord.is_pending is True
+
+    # Second failure (2/2): bound reached — cleared, loud ERROR logged.
+    with caplog.at_level(logging.ERROR, logger='orchestrator.service_restart'):
+        result2 = await coord.maybe_restart(agents_idle=True)
+
+    assert result2 is False
+    assert coord.is_pending is False
+    assert coord._trigger_task_ids == []
+    assert coord._trigger_merge_shas == []
+    assert any(
+        r.levelno == logging.ERROR and 'giving up' in r.message.lower()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_restart_failure_counter_resets_after_successful_fire() -> None:
+    """The consecutive-failure counter resets to 0 on a successful fire, so a later,
+    unrelated transient-failure burst starts counting from zero again — the bound
+    must not trip prematurely off a stale tally from an already-recovered burst.
+    """
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['fused-memory/src/server/main.py'], None)
+    )
+    event_store = MagicMock()
+    current_time: list[float] = [0.0]
+    executor = AsyncMock(side_effect=[RuntimeError('boom1'), None, RuntimeError('boom2')])
+
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['fused-memory/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: current_time[0],
+        max_executor_failures=2,
+    )
+
+    await coord.note_merge('task-1', 'base', 'head')
+    current_time[0] = 1.0
+
+    # #1: transient failure — count now 1/2, retained.
+    result1 = await coord.maybe_restart(agents_idle=True)
+    assert result1 is False
+    assert coord.is_pending is True
+
+    # #2: success — fires, clears pending, resets the counter.
+    result2 = await coord.maybe_restart(agents_idle=True)
+    assert result2 is True
+    assert coord.is_pending is False
+
+    # Re-arm for a new, unrelated burst.
+    current_time[0] = 2.0
+    await coord.note_merge('task-2', 'base2', 'head2')
+    current_time[0] = 3.0
+
+    # #3: transient failure again — must be attempt 1/2 (counter reset by the
+    # success above), NOT the 2nd strike that would trip the bound.
+    result3 = await coord.maybe_restart(agents_idle=True)
+    assert result3 is False
+    assert coord.is_pending is True
 
 
 # ---------------------------------------------------------------------------
