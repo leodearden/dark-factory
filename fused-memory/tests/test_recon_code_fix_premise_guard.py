@@ -337,3 +337,159 @@ class TestMatchCandidate:
         )
         result = match_candidate(candidate, [entry])
         assert result is entry
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-1972 step-07 RED: TestVerifyPremiseRefuted
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestVerifyPremiseRefuted:
+    """Tests for verify_premise_refuted() from
+    fused_memory.middleware.recon_code_fix_premise_guard.
+
+    source_root is a tmp_path standing in for the fused-memory server cwd;
+    each SourceAssertion.file is relative to it.
+    """
+
+    def _make_entry(self, source_assertions):
+        from fused_memory.middleware.recon_code_fix_premise_guard import PremiseEntry
+        return PremiseEntry(
+            name="test_entry",
+            reason="test reason",
+            title_substrings=["irrelevant"],
+            description_substrings=["irrelevant"],
+            source_assertions=source_assertions,
+        )
+
+    def test_true_when_single_assertion_holds(self, tmp_path):
+        """(a) True when the only assertion's must_contain/must_not_contain both hold."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            verify_premise_refuted,
+        )
+
+        target = tmp_path / "memory_service.py"
+        target.write_text("def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8")
+
+        entry = self._make_entry([
+            SourceAssertion(
+                file="memory_service.py",
+                must_contain=["invalid_at"],
+                must_not_contain=["deprecated_marker"],
+            )
+        ])
+
+        assert verify_premise_refuted(entry, tmp_path) is True
+
+    def test_false_when_must_contain_token_absent(self, tmp_path):
+        """(b) False when a must_contain token is absent from the cited file."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            verify_premise_refuted,
+        )
+
+        target = tmp_path / "memory_service.py"
+        target.write_text("def rebuild():\n    pass\n", encoding="utf-8")
+
+        entry = self._make_entry([
+            SourceAssertion(file="memory_service.py", must_contain=["invalid_at"], must_not_contain=[])
+        ])
+
+        assert verify_premise_refuted(entry, tmp_path) is False
+
+    def test_false_when_must_not_contain_token_present(self, tmp_path):
+        """(c) False when a must_not_contain token IS present in the cited file."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            verify_premise_refuted,
+        )
+
+        target = tmp_path / "recon_report.py"
+        target.write_text("description: str = Field(max_length=500)\n", encoding="utf-8")
+
+        entry = self._make_entry([
+            SourceAssertion(file="recon_report.py", must_contain=[], must_not_contain=["max_length"])
+        ])
+
+        assert verify_premise_refuted(entry, tmp_path) is False
+
+    def test_false_when_cited_file_missing(self, tmp_path):
+        """(d) Fail-open: False when the cited file does not exist under source_root."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            verify_premise_refuted,
+        )
+
+        entry = self._make_entry([
+            SourceAssertion(file="does_not_exist.py", must_contain=["token"], must_not_contain=[])
+        ])
+
+        assert verify_premise_refuted(entry, tmp_path) is False
+
+    def test_false_when_any_one_of_multiple_assertions_fails(self, tmp_path):
+        """(e) AND semantics: one failing assertion among several makes the whole entry False."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            verify_premise_refuted,
+        )
+
+        good = tmp_path / "good.py"
+        good.write_text("has_token = True\n", encoding="utf-8")
+        bad = tmp_path / "bad.py"
+        bad.write_text("nothing relevant here\n", encoding="utf-8")
+
+        entry = self._make_entry([
+            SourceAssertion(file="good.py", must_contain=["has_token"], must_not_contain=[]),
+            SourceAssertion(file="bad.py", must_contain=["missing_token"], must_not_contain=[]),
+        ])
+
+        assert verify_premise_refuted(entry, tmp_path) is False
+
+    def test_true_when_all_of_multiple_assertions_hold(self, tmp_path):
+        """(f) True only when ALL assertions across multiple files hold."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            verify_premise_refuted,
+        )
+
+        a = tmp_path / "a.py"
+        a.write_text("alpha_token\n", encoding="utf-8")
+        b = tmp_path / "b.py"
+        b.write_text("beta_token\n", encoding="utf-8")
+
+        entry = self._make_entry([
+            SourceAssertion(file="a.py", must_contain=["alpha_token"], must_not_contain=["forbidden"]),
+            SourceAssertion(file="b.py", must_contain=["beta_token"], must_not_contain=["forbidden"]),
+        ])
+
+        assert verify_premise_refuted(entry, tmp_path) is True
+
+    def test_reads_file_fresh_not_cached(self, tmp_path):
+        """(g) Self-correcting: re-reads the file fresh each call, no caching across calls."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            SourceAssertion,
+            verify_premise_refuted,
+        )
+
+        target = tmp_path / "memory_service.py"
+        target.write_text("no marker here\n", encoding="utf-8")
+
+        entry = self._make_entry([
+            SourceAssertion(file="memory_service.py", must_contain=["invalid_at"], must_not_contain=[])
+        ])
+
+        assert verify_premise_refuted(entry, tmp_path) is False
+
+        # Premise becomes refuted once the source is edited to add the marker —
+        # proves there is no stale caching between calls.
+        target.write_text("invalid_at filter added\n", encoding="utf-8")
+        assert verify_premise_refuted(entry, tmp_path) is True
+
+    def test_true_when_no_assertions_at_all(self, tmp_path):
+        """(bonus) Vacuously True when source_assertions is an empty list (ALL of none holds)."""
+        from fused_memory.middleware.recon_code_fix_premise_guard import verify_premise_refuted
+
+        entry = self._make_entry([])
+
+        assert verify_premise_refuted(entry, tmp_path) is True
