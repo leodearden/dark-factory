@@ -293,32 +293,47 @@ async def run_dry_run_unblock(
 
         mcp_config = mcp.mcp_config_json() if mcp is not None else None
 
-        result = await invoke_with_cap_retry(
-            usage_gate=usage_gate,
-            label=f'Task {task_id} [unblock_auto]',
-            config_dir=config_dir,
-            cost_store=cost_store,
-            run_id=run_id,
-            task_id=task_id,
-            project_id=project_id,
-            role='unblock_auto',
-            cap_wait_sanity_secs=_DRY_RUN_CAP_WAIT_SANITY_SECS,
-            invoke_fn=invoke_agent,
-            backend=ua_cfg.backend,
-            session_id=str(uuid.uuid4()),
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            cwd=Path(worktree),
-            model=ua_cfg.model,
-            max_turns=ua_cfg.max_turns,
-            max_budget_usd=ua_cfg.budget_usd,
-            allowed_tools=_ALLOWED_TOOLS,
-            disallowed_tools=_DISALLOWED_TOOLS,
-            mcp_config=mcp_config,
-            output_schema=DRY_RUN_PROPOSAL_SCHEMA,
-            effort=ua_cfg.effort,
-            timeout_seconds=ua_cfg.timeout_seconds,
-        )
+        async def _one_attempt(session_id: str) -> Any:
+            return await invoke_with_cap_retry(
+                usage_gate=usage_gate,
+                label=f'Task {task_id} [unblock_auto]',
+                config_dir=config_dir,
+                cost_store=cost_store,
+                run_id=run_id,
+                task_id=task_id,
+                project_id=project_id,
+                role='unblock_auto',
+                cap_wait_sanity_secs=_DRY_RUN_CAP_WAIT_SANITY_SECS,
+                invoke_fn=invoke_agent,
+                backend=ua_cfg.backend,
+                session_id=session_id,
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                cwd=Path(worktree),
+                model=ua_cfg.model,
+                max_turns=ua_cfg.max_turns,
+                max_budget_usd=ua_cfg.budget_usd,
+                allowed_tools=_ALLOWED_TOOLS,
+                disallowed_tools=_DISALLOWED_TOOLS,
+                mcp_config=mcp_config,
+                output_schema=DRY_RUN_PROPOSAL_SCHEMA,
+                effort=ua_cfg.effort,
+                timeout_seconds=ua_cfg.timeout_seconds,
+            )
+
+        result = await _one_attempt(str(uuid.uuid4()))
+        if is_zero_output_timeout(result):
+            # Transcript-authoritative pre-turn-1 wedge: retry EXACTLY once
+            # with a freshly-allocated session_id. Never reuse the wedged
+            # UUID — a possibly-committed session id makes the CLI's
+            # --session-id exit instantly with 'already in use' (reify-3604 /
+            # _reset_for_fresh_retry semantics, shared/cli_invoke.py:562).
+            logger.warning(
+                'dry_run_unblock: zero-output timeout wedge for task %s — '
+                'retrying once with a fresh session',
+                task_id,
+            )
+            result = await _one_attempt(str(uuid.uuid4()))
 
         entry = _build_entry(result, reason=reason, budget_usd=ua_cfg.budget_usd)
 
