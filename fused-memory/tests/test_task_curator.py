@@ -20,6 +20,7 @@ from fused_memory.middleware.task_curator import (
     _parse_decision,
     _parse_decision_dict,
     _PoolEntry,
+    _scale_budget,
     _task_dependencies,
     _task_files,
     _to_pool_entry,
@@ -1885,17 +1886,63 @@ class TestCallLlmBatchFailure:
 
 
 # ----------------------------------------------------------------------
+# _scale_budget — shared pure formula, tested independent of CuratorConfig
+# ----------------------------------------------------------------------
+
+
+class TestScaleBudget:
+    """Direct coverage of ``_scale_budget``'s ``min(base + per_entry*size, cap)``.
+
+    As of task 1980, ``CuratorConfig``'s real defaults set ``base == cap ==
+    $2.00`` for both the single-call and batch budget paths, so
+    ``TestCallLlmBatchBudgetScaling`` / ``TestCallLlmSingleBudgetScaling``
+    below now exercise only the clamp branch — every size, no matter how
+    large or small, returns the same flat $2.00 through those call sites.
+    That collapsed the previously-distinct scaling coverage (reviewer
+    finding on task 1980's amendment pass), so these tests pin the additive
+    formula directly with ``base < cap``, independent of whatever the
+    current config defaults happen to be. A regression in the additive term
+    (``+`` flipped to ``-``, wrong ``per_entry``, an off-by-one on ``size``)
+    is caught here even though no *current* config exercises that branch.
+    """
+
+    def test_scales_additively_below_cap(self):
+        assert _scale_budget(base=0.30, per_entry=0.30, size=0, cap=2.00) == pytest.approx(0.30)
+        assert _scale_budget(base=0.30, per_entry=0.30, size=1, cap=2.00) == pytest.approx(0.60)
+        assert _scale_budget(base=0.30, per_entry=0.30, size=4, cap=2.00) == pytest.approx(1.50)
+
+    def test_clamps_at_cap_once_scaled_value_would_exceed_it(self):
+        assert _scale_budget(base=0.30, per_entry=0.30, size=19, cap=2.00) == pytest.approx(2.00)
+        assert _scale_budget(base=0.30, per_entry=0.30, size=100, cap=2.00) == pytest.approx(2.00)
+
+    def test_flat_when_base_equals_cap_regardless_of_size(self):
+        """Pins the CURRENT production shape (task 1980): with base == cap
+        == $2.00, every size — including 0 — clamps to the same flat
+        budget. This is exactly why the call-site classes below can no
+        longer exercise the additive term on their own."""
+        for size in (0, 1, 5, 20, 50):
+            assert _scale_budget(base=2.00, per_entry=0.30, size=size, cap=2.00) == pytest.approx(
+                2.00
+            )
+
+
+# ----------------------------------------------------------------------
 # TaskCurator._call_llm_batch — R1: scaled max_budget_usd
 # ----------------------------------------------------------------------
 
 
 class TestCallLlmBatchBudgetScaling:
-    """Fix R1 — the per-call ``max_budget_usd`` cap scales with batch size.
+    """Fix R1 — the per-call ``max_budget_usd`` is now a durable flat $2.00 (task 1980).
 
     Whole-batch failures in the 24h trace had 5 ``error_max_budget_usd``
     misses because the flat $0.30 single-call budget was burned in 1–2
-    turns by a much-larger batch prompt.  The scaling formula mirrors the
-    existing timeout/turns scaling and clamps at ``batch_budget_cap_usd``.
+    turns by a much-larger batch prompt.  A prior scale-by-batch-size fix
+    (reify task 2254) was cancelled and the cap recurred as batches grew, so
+    ``max_budget_usd`` was raised to $2.00 — matching the pre-existing
+    ``batch_budget_cap_usd`` — making the batch ceiling flat and
+    size-independent (esc-task-curator-194). ``_scale_budget`` still runs
+    but its per-item scaling term is now inert: ``min(2.00 + 0.30*(n-1),
+    2.00) == 2.00`` for every N.
     """
 
     def _ar(self, n: int) -> AgentResult:
@@ -1911,7 +1958,7 @@ class TestCallLlmBatchBudgetScaling:
     @pytest.mark.asyncio
     async def test_n1_uses_baseline_budget(self):
         """Batch size 1 (defensive — _call_llm_batch is normally never called
-        for n<2): budget == max_budget_usd (0.30 default), no scaling."""
+        for n<2): budget == max_budget_usd, now a flat $2.00 (task 1980)."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._ar(1))
@@ -1925,11 +1972,14 @@ class TestCallLlmBatchBudgetScaling:
                 start=0.0, project_id='p', project_root='/x',
             )
         _, kwargs = mock.call_args
-        assert kwargs['max_budget_usd'] == pytest.approx(0.30)
+        assert kwargs['max_budget_usd'] == pytest.approx(2.00)
 
     @pytest.mark.asyncio
-    async def test_n2_scales_by_one_per_item(self):
-        """N=2 → budget = 0.30 + 0.30*(2-1) = 0.60."""
+    async def test_n2_clamped_to_flat_budget(self):
+        """N=2 → flat $2.00 (base and batch_budget_cap_usd are both $2.00,
+        so the per-item scaling term no longer moves the result — task 1980).
+        See TestScaleBudget for direct coverage of the additive term this
+        clamp now hides."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._ar(2))
@@ -1943,11 +1993,14 @@ class TestCallLlmBatchBudgetScaling:
                 start=0.0, project_id='p', project_root='/x',
             )
         _, kwargs = mock.call_args
-        assert kwargs['max_budget_usd'] == pytest.approx(0.60)
+        assert kwargs['max_budget_usd'] == pytest.approx(2.00)
 
     @pytest.mark.asyncio
-    async def test_n5_scales_linearly(self):
-        """N=5 → budget = 0.30 + 0.30*4 = 1.50, well below the $2.00 cap."""
+    async def test_n5_clamped_to_flat_budget(self):
+        """N=5 → still flat $2.00; base == batch_budget_cap_usd == $2.00 so
+        the linear term is clamped away regardless of N (task 1980). See
+        TestScaleBudget for direct coverage of the additive term this
+        clamp now hides."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._ar(5))
@@ -1961,11 +2014,12 @@ class TestCallLlmBatchBudgetScaling:
                 start=0.0, project_id='p', project_root='/x',
             )
         _, kwargs = mock.call_args
-        assert kwargs['max_budget_usd'] == pytest.approx(1.50)
+        assert kwargs['max_budget_usd'] == pytest.approx(2.00)
 
     @pytest.mark.asyncio
     async def test_clamps_at_batch_budget_cap_usd(self):
-        """N=20 → budget would be 0.30 + 0.30*19 = 6.00; clamped at $2.00."""
+        """N=20 → clamped at the $2.00 batch_budget_cap_usd, same ceiling as
+        every other N now that the base floor equals the cap (task 1980)."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._ar(20))
@@ -3988,14 +4042,17 @@ def _make_pool(n: int) -> list[_PoolEntry]:
 
 
 class TestCallLlmSingleBudgetScaling:
-    """Fix R-single — pool-size-scaled max_budget_usd for single-candidate calls.
+    """Fix R-single — max_budget_usd for single-candidate calls is now a durable flat $2.00 (task 1980).
 
     A full (~30-entry) corpus pool generates a ~41K-token prompt that costs
     ~$0.30574 — just over the flat $0.30 cap, triggering error_max_budget_usd.
     The scaling formula mirrors the R1 batch approach but scales by pool size:
         budget = min(max_budget_usd + per_pool_entry_budget_usd * len(pool),
                      single_call_budget_cap_usd)
-    Empty pool stays at $0.30 baseline; full 30-entry pool → $0.675.
+    max_budget_usd and single_call_budget_cap_usd were both raised to $2.00
+    (esc-task-curator-194; a prior scale-by-size fix left the linear term
+    maxing out at only $0.675 for a full pool), so every pool size now
+    clamps to a flat $2.00 — the empty pool and the full 30-entry pool alike.
     """
 
     def _success_ar(self) -> AgentResult:
@@ -4006,7 +4063,7 @@ class TestCallLlmSingleBudgetScaling:
 
     @pytest.mark.asyncio
     async def test_empty_pool_uses_baseline_budget(self):
-        """N=0 (empty pool) → budget == max_budget_usd (0.30 default)."""
+        """N=0 (empty pool) → budget == max_budget_usd, now a flat $2.00 (task 1980)."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._success_ar())
@@ -4021,11 +4078,14 @@ class TestCallLlmSingleBudgetScaling:
                 start=0.0, project_id='p', project_root='/x',
             )
         _, kwargs = mock.call_args
-        assert kwargs['max_budget_usd'] == pytest.approx(0.30)
+        assert kwargs['max_budget_usd'] == pytest.approx(2.00)
 
     @pytest.mark.asyncio
-    async def test_partial_pool_scales_linearly(self):
-        """N=10 → budget = 0.30 + 0.0125*10 = 0.425."""
+    async def test_partial_pool_clamped_to_flat_budget(self):
+        """N=10 → flat $2.00; base == single_call_budget_cap_usd == $2.00 so
+        the per-pool-entry scaling term is clamped away (task 1980). See
+        TestScaleBudget for direct coverage of the additive term this
+        clamp now hides."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._success_ar())
@@ -4040,11 +4100,12 @@ class TestCallLlmSingleBudgetScaling:
                 start=0.0, project_id='p', project_root='/x',
             )
         _, kwargs = mock.call_args
-        assert kwargs['max_budget_usd'] == pytest.approx(0.425)
+        assert kwargs['max_budget_usd'] == pytest.approx(2.00)
 
     @pytest.mark.asyncio
     async def test_full_30_entry_pool_gives_sufficient_headroom(self):
-        """N=30 → budget = 0.30 + 0.0125*30 = 0.675, inside $0.60-0.75 PRD target."""
+        """N=30 → flat $2.00, well above the ~$0.30574 full-pool cost floor
+        (task 1980 / esc-task-curator-194)."""
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
         mock = AsyncMock(return_value=self._success_ar())
@@ -4059,18 +4120,19 @@ class TestCallLlmSingleBudgetScaling:
                 start=0.0, project_id='p', project_root='/x',
             )
         _, kwargs = mock.call_args
-        assert kwargs['max_budget_usd'] == pytest.approx(0.675)
+        assert kwargs['max_budget_usd'] == pytest.approx(2.00)
 
     @pytest.mark.asyncio
     async def test_oversized_pool_clamped_at_cap(self):
-        """N=50 → unclamped would be 0.30 + 0.0125*50 = 0.925; clamped at $0.75.
+        """N=50 → unclamped would be 2.00 + 0.0125*50 = 2.625; clamped at $2.00.
 
         NOTE: In production _trim_pool caps the pool at pool_total_cap (default 30)
         before _call_llm is invoked via curate(), so len(pool) can never exceed 30
-        on the normal code path.  The cap (0.75) is a pure safety net against
-        pathological pool sizes >36 entries.  This test verifies the clamping
-        arithmetic but does NOT represent a reachable runtime scenario — it bypasses
-        _trim_pool by calling _call_llm directly with an oversized pool.
+        on the normal code path.  The cap (2.00) now equals the base floor, so
+        every pool size — including pathologically large ones — clamps to the
+        same flat $2.00.  This test verifies the clamping arithmetic but does
+        NOT represent a reachable runtime scenario — it bypasses _trim_pool by
+        calling _call_llm directly with an oversized pool.
         """
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
@@ -4086,7 +4148,7 @@ class TestCallLlmSingleBudgetScaling:
                 start=0.0, project_id='p', project_root='/x',
             )
         _, kwargs = mock.call_args
-        assert kwargs['max_budget_usd'] == pytest.approx(0.75)
+        assert kwargs['max_budget_usd'] == pytest.approx(2.00)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

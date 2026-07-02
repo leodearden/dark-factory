@@ -1815,14 +1815,16 @@ class TaskCurator:
         cwd = self._cwd or Path(project_root)
         user_prompt = self._build_user_prompt(candidate, pool)
 
-        # Scale max_budget_usd by pool size — pool size is the prompt-token
-        # cost driver for single-candidate calls (a full 30-entry corpus
-        # yields a ~41K-token prompt costing ~$0.30574, tripping the flat
-        # $0.30 cap; esc-task-curator-191).  Mirror the R1 batch formula
-        # but scale by len(pool) rather than (n-1):
+        # max_budget_usd is now a durable flat $2.00 (task 1980 /
+        # esc-task-curator-194): max_budget_usd and single_call_budget_cap_usd
+        # were both raised to $2.00, comfortably above the ~$0.30574 cost of a
+        # full 30-entry corpus prompt (esc-task-curator-191). _scale_budget
+        # still runs — mirroring the R1 batch formula but scaling by
+        # len(pool) rather than (n-1):
         #   budget = min(max_budget_usd + per_pool_entry_budget_usd*len(pool),
         #                single_call_budget_cap_usd)
-        # Empty pool stays at the $0.30 baseline; full 30-entry pool → $0.675.
+        # — but with base == cap == $2.00 the scaling term is inert: every
+        # pool size clamps to the same flat $2.00.
         budget = _scale_budget(
             self._config.curator.max_budget_usd,
             self._config.curator.per_pool_entry_budget_usd,
@@ -1913,9 +1915,11 @@ class TaskCurator:
             + self._config.curator.per_item_turns * (n - 1),
             self._config.curator.batch_turns_cap,
         )
-        # R1: scale max_budget_usd. Batch prompts are several × bigger than
-        # single-call prompts and burn the flat per-call budget in 1–2 turns,
-        # tripping error_max_budget_usd before the model can answer.
+        # R1: max_budget_usd is now a durable flat $2.00 (task 1980 /
+        # esc-task-curator-194) — base (max_budget_usd) and
+        # batch_budget_cap_usd are both $2.00, so this clamps to a flat
+        # $2.00 regardless of batch size. _scale_budget still runs but its
+        # per-item scaling term is now inert (min(2.00 + scale, 2.00) == 2.00).
         budget = _scale_budget(
             self._config.curator.max_budget_usd,
             self._config.curator.per_item_budget_usd,
