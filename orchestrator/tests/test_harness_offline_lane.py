@@ -144,3 +144,54 @@ class TestOfflineLaneWiring:
         assert harness._offline_lane_task is None
         assert harness._offline_lane_worker is None
         assert harness._offline_lane_notifiee is None
+
+
+# ---------------------------------------------------------------------------
+# _OfflineLaneTaskClient — concrete MCP adapter wrapping the scheduler
+# (task 2016, step-3/4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_offline_lane_task_client_dispatches_via_scheduler():
+    """_OfflineLaneTaskClient's three methods delegate to the scheduler.
+
+    Covers the concrete implementation of the ``offline_lane.OfflineLaneTaskClient``
+    Protocol that the harness wires into ``OfflineLaneWorker`` — submit via
+    ``dispatch_tool('submit_task', ...)``, suspect-range append via
+    ``update_task(..., metadata_mode='additive')`` (atomic list-union, no
+    read-modify-write), and status via ``get_statuses([id])``.
+
+    Step 3 (RED): ``_OfflineLaneTaskClient`` does not exist on
+    ``orchestrator.harness`` yet — the import must fail before impl (step-4).
+    """
+    from orchestrator.harness import _OfflineLaneTaskClient
+
+    scheduler = MagicMock()
+    scheduler.dispatch_tool = AsyncMock(return_value={'task_id': 'fix-7'})
+    scheduler.update_task = AsyncMock(return_value=True)
+    scheduler.get_statuses = AsyncMock(return_value=({'fix-7': 'in-progress'}, None))
+
+    client = _OfflineLaneTaskClient(scheduler)
+
+    # (a) submit_fix_task dispatches 'submit_task' with the arguments dict and
+    # extracts the new task's id from the MCP response envelope.
+    arguments = {'title': 't'}
+    task_id = await client.submit_fix_task(arguments)
+    assert task_id == 'fix-7'
+    scheduler.dispatch_tool.assert_awaited_once()
+    await_args = scheduler.dispatch_tool.await_args
+    assert await_args.args[0] == 'submit_task'
+    assert await_args.args[1] == arguments
+
+    # (b) append_suspect_range additive-updates metadata.suspect_ranges —
+    # a recursive list-union append, not a read-modify-write.
+    await client.append_suspect_range('fix-7', 'A..B')
+    scheduler.update_task.assert_awaited_once_with(
+        'fix-7', {'suspect_ranges': ['A..B']}, metadata_mode='additive',
+    )
+
+    # (c) get_status resolves via get_statuses([task_id]).
+    status = await client.get_status('fix-7')
+    assert status == 'in-progress'
+    scheduler.get_statuses.assert_awaited_once_with(['fix-7'])
