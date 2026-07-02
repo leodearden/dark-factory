@@ -6767,6 +6767,93 @@ async def test_maybe_remediate_mixed_batch_excludes_placeholder_keeps_reference_
     )
 
 
+@pytest.mark.asyncio
+async def test_maybe_remediate_placeholder_drop_storm_escalates_at_threshold(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 1970 amendment: dropping _PLACEHOLDER_DROP_STORM_THRESHOLD referenceless
+    actionable findings in a single batch must wire to exactly ONE
+    'recon_remediation_placeholder_storm' escalation carrying
+    _PLACEHOLDER_DROP_STORM_FINDING.
+
+    RED on the current tree: the dropped_placeholders loop in _maybe_remediate
+    only logs 'reconciliation.remediation_dropped_placeholder_finding' and never
+    calls _record_placeholder_finding_drop, so no storm escalation is ever
+    emitted even though the recorder/deque/constants apparatus already exists.
+    """
+    from fused_memory.reconciliation.harness import (
+        _PLACEHOLDER_DROP_STORM_FINDING,
+        _PLACEHOLDER_DROP_STORM_THRESHOLD,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    await event_buffer.push(_make_event('test-project'))
+
+    placeholder_findings = [
+        _make_placeholder_finding() for _ in range(_PLACEHOLDER_DROP_STORM_THRESHOLD)
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=placeholder_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if (c.args[0] if c.args else c.kwargs.get('category')) == 'recon_remediation_placeholder_storm'
+    ]
+    assert len(storm_calls) == 1, (
+        f'Expected exactly one recon_remediation_placeholder_storm call; '
+        f'got {harness._escalate.call_args_list}'
+    )
+    assert storm_calls[0].kwargs.get('finding') is _PLACEHOLDER_DROP_STORM_FINDING, (
+        f"Expected the storm call's finding= kwarg to be _PLACEHOLDER_DROP_STORM_FINDING; "
+        f'got {storm_calls[0].kwargs.get("finding")!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_placeholder_drop_storm_does_not_escalate_below_threshold(
+    journal, event_buffer, mock_memory_service,
+):
+    """Below the storm threshold, dropped placeholders must NOT trip the storm alarm.
+
+    RED on the current tree for the same reason as the at-threshold test above
+    (no wiring exists yet), but this case guards against an off-by-one that
+    fires the storm too early once the wiring lands in step-6.
+    """
+    from fused_memory.reconciliation.harness import _PLACEHOLDER_DROP_STORM_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+
+    await event_buffer.push(_make_event('test-project'))
+
+    placeholder_findings = [
+        _make_placeholder_finding() for _ in range(_PLACEHOLDER_DROP_STORM_THRESHOLD - 1)
+    ]
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=placeholder_findings)
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    storm_calls = [
+        c for c in harness._escalate.call_args_list
+        if (c.args[0] if c.args else c.kwargs.get('category')) == 'recon_remediation_placeholder_storm'
+    ]
+    assert storm_calls == [], (
+        f'Expected zero recon_remediation_placeholder_storm calls below threshold; '
+        f'got {storm_calls}'
+    )
+
+
 # ── Tests for Task 1655: live-workflow escalation gate ─────────────────────
 
 
