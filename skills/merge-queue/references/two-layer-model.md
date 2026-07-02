@@ -122,6 +122,34 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `_bounce_conflicting_suffix_items()` | merge_queue.py | Graph-time disk-free bounce of the younger conflicting item |
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
 
+### 7.1 merge_types.py — request/outcome/item/entry types + registries (MQ-refactor task α)
+
+The merge-queue data types and the registries that own them were extracted verbatim into
+`orchestrator/merge_types.py` (task α of `plans/merge-queue-modularization-invariants-prd.md`).
+`merge_queue.py` re-exports every one of these names through a single top-level shim import
+(`from orchestrator.merge_types import (...)  # noqa: F401  re-export shim`), so existing call
+sites — `from orchestrator.merge_queue import MergeRequest`, etc. — keep working unchanged.
+
+| Symbol | Location | Description |
+|--------|----------|-------------|
+| `MergeRequest` | merge_types.py | A request to merge a task branch into main |
+| `GroupMergeRequest` | merge_types.py | `MergeRequest` subclass for an atomic linear-stacked train merge |
+| `MergeOutcome` | merge_types.py | Result delivered to the caller via the request's Future |
+| `SpeculativeItem` | merge_types.py | Internal message from the Merger coroutine to the Verifier coroutine |
+| `InflightEntry` | merge_types.py | An in-flight verify entry held in `SpeculativeMergeWorker._inflight` |
+| `InflightVerifyResult` | merge_types.py | Result returned by `SpeculativeMergeWorker._run_inflight_verify` |
+| `SoloVerifyResult` | merge_types.py | Result of verifying a single train member's delta in isolation |
+| `WaiterRecord` | merge_types.py | Server-side durable-intent waiter record keyed by `request_id` |
+| `MergeDispatchResult` | merge_types.py | Structured return value from `coalesce_or_enqueue_merge_request` |
+| `InFlightMergeRegistry` (+ `_InFlightEntry`) | merge_types.py | Per-branch in-flight de-dup registry and its slot record |
+| `TerminalOutcomeRetention` (+ `TerminalOutcomeRecord`) | merge_types.py | Bounded ring of recent terminal merge outcomes and its record type |
+| `MergeBounceRegistry` | merge_types.py | Monotonic per-branch bounce counter (η=1892 needs-rebase bounce cap) |
+| `MainHealthAutoHealRegistry` | merge_types.py | Monotonic per-signature attempt counter for main-health auto-heal |
+| `TrainCallbacks` / `TrainCallbackFactory` | merge_types.py | Scheduler-backed per-train callbacks and their factory type alias |
+| `MergeReadyPredicate` | merge_types.py | Type alias for the injectable merge-ready confidence-gate predicate (δ/1720) |
+| `_HostUnavailability` | merge_types.py | Per-host `RunnerUnavailable` streak tracker entry (task 1795) |
+| `_INFLIGHT_MERGE_ETA_ESTIMATE_SECS` | merge_types.py | Coarse ETA estimate (seconds) used by `InFlightMergeRegistry.eta_seconds` |
+
 ---
 
 ## 8. Greek→task-ID provenance table
