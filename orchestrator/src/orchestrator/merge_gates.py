@@ -181,6 +181,13 @@ async def _resolve_second_parent(git_ops: GitOps, sha: str) -> str | None:
     equivalence gate compares the right tree (drift-proof vs a lane whose
     worktree HEAD has been hijacked or rebased after snapshotting).
 
+    Discoverability note: ``_finalize_advanced_merge`` never calls this
+    definition directly — it reaches back through
+    ``orchestrator.merge_queue._resolve_second_parent`` (see the module
+    docstring's reach-back convention) so the existing suite's string-path
+    monkeypatches stay effective.  This function body is nonetheless the
+    canonical implementation that ``merge_queue`` re-exports.
+
     Fail-open: any exception returns ``None`` so the caller falls back to the
     next tier (``merged_branch_tip`` or ``req.snapshot_tip``).
     """
@@ -235,6 +242,12 @@ async def _commit_is_linear(git_ops: GitOps, sha: str) -> bool:
     redundant gate — the tree was already re-verified by ``_reverify_rebased_tree``)
     from a transient ``^2`` git error on a real merge commit (must keep the
     legacy HEAD check to avoid masking a real drop).
+
+    Discoverability note: like :func:`_resolve_second_parent`,
+    ``_finalize_advanced_merge`` calls this via the
+    ``orchestrator.merge_queue._commit_is_linear`` reach-back rather than
+    this local definition, so the existing suite's monkeypatches on that
+    string path stay effective.
     """
     # Reach-back (deferred import): see _resolve_second_parent — same
     # `orchestrator.merge_queue._run` string-path patch convention applies.
@@ -1013,6 +1026,11 @@ async def _rebase_delta_touched_overlap(
         Provides ``project_root`` for cross-worktree git operations.
     task_id:
         Optional task identifier for log messages.
+
+    Discoverability note: :func:`_reverify_rebased_tree` calls this via the
+    ``orchestrator.merge_queue._rebase_delta_touched_overlap`` reach-back
+    rather than this local definition, so the existing suite's monkeypatches
+    on that string path stay effective.
     """
     label = task_id or '<unknown>'
 
