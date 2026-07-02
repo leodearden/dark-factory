@@ -36,6 +36,24 @@ def _description_hash(description: str) -> str:
     return hashlib.sha256(_normalize_description(description).encode('utf-8')).hexdigest()
 
 
+def _canonical_sig_field(value: Any) -> str | None:
+    """Coerce an in-run dedup signature field (task_id or flag_type) to ``str``.
+
+    Mirrors ``reconciliation.flag_dedup.compute_flag_signature``'s str-coercion,
+    which exists because "integer task_id is common in LLM output" — without
+    it, ``(1976, ft) != ('1976', ft)`` and two calls describing the same
+    logical (task_id, flag_type) produce distinct dedup keys (task-1979 /
+    run 9542fa10).  Re-implemented locally rather than imported because
+    server/ must not import from the reconciliation package — see
+    ``_normalize_description`` above for the same local-copy convention.
+
+    ``None`` is preserved as ``None`` (never coerced to the string ``'None'``)
+    so the ``(None, None)`` null-null desc-hash sentinel and partial-None
+    signature routing in :meth:`ReconReportState.add_finding` are unaffected.
+    """
+    return None if value is None else str(value)
+
+
 # ---------------------------------------------------------------------------
 # Fix 1 helpers — citation identity + same-run echo suppression (task-1654)
 # ---------------------------------------------------------------------------
@@ -351,12 +369,16 @@ class ReconReportState:
 
         # In-run dedup: two separate namespaces.
         # (1) Signature path: (task_id, flag_type) != (None, None) — O(1) lookup in
-        #     _run_sig_index, scoped to this run_id across ALL stages.
+        #     _run_sig_index, scoped to this run_id across ALL stages.  Each field
+        #     is canonicalized via _canonical_sig_field so an int task_id (common
+        #     in LLM output) and the equivalent str task_id collapse to one key.
         # (2) Null-null path: both are None — dedup by normalized description hash
         #     in _run_desc_index so identical informational observations collapse.
         # The two namespaces are kept separate so a null-null finding with description
         # 'd' never collides with a real-signature finding that shares description 'd'.
-        sig = (task_id, flag_type)
+        c_task_id = _canonical_sig_field(task_id)
+        c_flag_type = _canonical_sig_field(flag_type)
+        sig = (c_task_id, c_flag_type)
         desc_hash = ""
         if sig != (None, None):
             existing_id = self._run_sig_index.get(run_id, {}).get(sig)
