@@ -153,6 +153,122 @@ class TestReapInteractiveWorktreesTtlRule:
 
 
 # ---------------------------------------------------------------------------
+# Amendment: a `git rev-parse HEAD` failure must defer the reap decision,
+# never be conflated with "no commits beyond main" (I2 data-loss guard).
+# worktree_head_beyond_main returns None for both cases; the reaper must
+# independently re-confirm HEAD is readable before treating None as safe.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapInteractiveWorktreesHeadUnreadable:
+    """A HEAD-unreadable candidate is retained this sweep, not force-removed."""
+
+    async def test_head_unreadable_defers_reap_despite_expired_ttl(
+        self, iw_git_repo: Path, caplog,
+    ) -> None:
+        """X: no own-commits, stamp older than ttl (would normally reap as
+        'ttl_idle') but HEAD is unreadable this sweep -> PRESERVED + WARN.
+        """
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info_x = await git_ops.create_interactive_worktree('unreadable-x')
+        now = datetime.now(UTC)
+        _backdate_stamp(
+            info_x.path,
+            now - timedelta(seconds=config.interactive_worktree_ttl + 3600),
+        )
+
+        git_ops._worktree_head_readable = AsyncMock(return_value=False)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        registered = await _registered_worktree_paths(iw_git_repo)
+        assert str(info_x.path.resolve()) in registered, (
+            f'expected X ({info_x.path}) to be PRESERVED when HEAD could '
+            f'not be read this sweep, despite an expired stamp; '
+            f'registered: {registered}'
+        )
+        x_paths = {r.path.resolve() for r in reaped}
+        assert info_x.path.resolve() not in x_paths, (
+            f'expected NO reaped record for X; got {reaped!r}'
+        )
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'unreadable-x' in r.getMessage()
+        ]
+        assert warnings, (
+            f'expected a WARNING naming the HEAD-unreadable worktree (X); '
+            f'all warnings: {[r.getMessage() for r in caplog.records]}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Amendment: the disk-guard subprocess is deferred until a candidate
+# actually reaches the idle-and-within-TTL branch, not invoked unconditionally
+# at the top of every sweep.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapInteractiveWorktreesDiskGuardLaziness:
+    """The disk-guard check is skipped when no candidate needs it, and
+    invoked at most once per sweep when one does."""
+
+    async def test_disk_guard_not_invoked_when_no_iact_worktrees(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """No _iact-* worktrees registered -> the disk-guard is never called."""
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+        git_ops._run_warm_lane_disk_guard = AsyncMock(return_value=0)
+
+        reaped = await git_ops.reap_interactive_worktrees(now=datetime.now(UTC))
+
+        assert reaped == []
+        git_ops._run_warm_lane_disk_guard.assert_not_awaited()
+
+    async def test_disk_guard_not_invoked_when_only_live_candidate(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """Only a live (unmerged-commit), within-ttl worktree is present ->
+        the idle/disk-pressure branch is never reached, so the guard is
+        never called."""
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+        git_ops._run_warm_lane_disk_guard = AsyncMock(return_value=0)
+
+        info_live = await git_ops.create_interactive_worktree('live-only')
+        await _commit_file(info_live.path, 'work.txt', 'work\n', 'wip')
+
+        reaped = await git_ops.reap_interactive_worktrees(now=datetime.now(UTC))
+
+        assert reaped == []
+        git_ops._run_warm_lane_disk_guard.assert_not_awaited()
+
+    async def test_disk_guard_invoked_once_for_multiple_idle_candidates(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """Two idle, within-ttl candidates both reach the disk-pressure
+        branch -> the guard is invoked exactly once (result reused), not
+        once per candidate."""
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+        git_ops._run_warm_lane_disk_guard = AsyncMock(return_value=0)
+
+        await git_ops.create_interactive_worktree('idle-one')
+        await git_ops.create_interactive_worktree('idle-two')
+
+        reaped = await git_ops.reap_interactive_worktrees(now=datetime.now(UTC))
+
+        assert reaped == []
+        git_ops._run_warm_lane_disk_guard.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Step-03: landed-on-main detection + fresh-worktree preservation
 # ---------------------------------------------------------------------------
 

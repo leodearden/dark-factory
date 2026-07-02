@@ -4718,6 +4718,21 @@ class GitOps:
             return True
         return bool(out.strip())
 
+    async def _worktree_head_readable(self, worktree: Path) -> bool:
+        """True if ``git rev-parse HEAD`` succeeds in *worktree*.
+
+        :meth:`worktree_head_beyond_main` returns ``None`` both when a
+        worktree genuinely has no commits beyond main AND when its internal
+        ``git rev-parse HEAD`` call fails (rc != 0) — a transient git error
+        collapses to the exact same signal as "safe, no unmerged work".
+        :meth:`reap_interactive_worktrees` uses this helper to tell those two
+        cases apart *before* trusting a ``None`` result: a worktree that
+        actually carries unmerged commits must never be force-removed just
+        because HEAD happened to be unreadable for one sweep.
+        """
+        rc, _, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        return rc == 0
+
     async def reap_interactive_worktrees(
         self, *, now: datetime | None = None,
     ) -> list[ReapedInteractiveWorktree]:
@@ -4736,6 +4751,15 @@ class GitOps:
 
         Per-worktree reap predicate:
 
+        * :meth:`worktree_head_beyond_main` returns ``None`` both when a
+          worktree genuinely has no commits beyond main AND when its
+          internal ``git rev-parse HEAD`` call fails (transient git error) —
+          the two cases are indistinguishable from that return value alone.
+          Before trusting a ``None`` result as "no unmerged work",
+          :meth:`_worktree_head_readable` independently re-confirms HEAD is
+          actually readable; if it is not, this candidate is skipped for the
+          sweep (retention) instead of risking a false "safe to reap"
+          classification that could force-remove genuinely unmerged commits.
         * :meth:`worktree_head_beyond_main` is ``None`` (no commits beyond
           main) AND :meth:`_interactive_worktree_landed` finds a ``Merge
           <branch> into <main_branch>`` marker on main AND the working tree
@@ -4755,7 +4779,10 @@ class GitOps:
           ``_run_warm_lane_disk_guard()`` reports disk pressure (rc==75),
           reaped anyway (``'disk_pressure'``) regardless of age — safe
           because there is no unmerged work to lose.  The disk-guard check
-          runs at most once per sweep (not per-candidate).
+          is deferred until the first candidate that actually reaches this
+          branch (idle, within TTL, not landed) and its result is reused for
+          the rest of the sweep — so it still runs at most once per sweep,
+          but a sweep with no such candidate never invokes it at all.
         * Otherwise (the worktree carries unmerged commits) → a dirty
           working tree (:meth:`_worktree_dirty`) is treated as recent
           activity and preserves the worktree outright, since an in-progress
@@ -4788,18 +4815,35 @@ class GitOps:
         ttl = self.config.interactive_worktree_ttl
 
         reaped: list[ReapedInteractiveWorktree] = []
+        # `None` = not checked yet this sweep. Computed lazily on first
+        # actual need (see the disk-pressure branch below) and reused for
+        # every remaining candidate, so it still runs at most once per
+        # sweep — but a sweep with zero _iact-* worktrees, or none that are
+        # idle-and-within-TTL, never pays for the subprocess call at all.
+        disk_pressure: bool | None = None
         try:
-            # Disk-guard check runs at most once per sweep (not per-candidate)
-            # — mirrors _run_warm_lane_disk_guard's other call sites, which
-            # never poll per-item either.
-            disk_pressure = (await self._run_warm_lane_disk_guard()) == 75
-
             async for wt_path, wt_resolved in self._iter_interactive_worktrees():
                 slug = wt_resolved.name[len(self.config.iact_prefix):]
                 full_branch = f'{self.config.branch_prefix}{slug}'
 
                 reason: str | None = None
                 beyond = await self.worktree_head_beyond_main(wt_path)
+                # worktree_head_beyond_main returns None both when there are
+                # genuinely no commits beyond main AND when its internal
+                # `git rev-parse HEAD` failed (transient git error) — those
+                # two cases are indistinguishable from the return value
+                # alone. Independently confirm HEAD is actually readable
+                # before trusting None as "no unmerged work"; a rev-parse
+                # failure defers this candidate (retention) rather than
+                # risking a false "safe to reap" classification that could
+                # force-remove genuinely unmerged commits.
+                if beyond is None and not await self._worktree_head_readable(wt_path):
+                    logger.warning(
+                        'reap_interactive_worktrees: could not read HEAD '
+                        'for %s this sweep — deferring reap decision',
+                        wt_path,
+                    )
+                    continue
                 # Only a worktree with no commits beyond main can possibly be
                 # "landed" (a real merge marker); short-circuiting here also
                 # skips the merge-marker grep entirely once beyond is known
@@ -4839,11 +4883,16 @@ class GitOps:
                     else:
                         if (now - created_at).total_seconds() > ttl:
                             reason = 'ttl_idle'
-                        elif disk_pressure:
-                            # No unmerged work to lose — safe to evict
-                            # under pressure even though still within
-                            # TTL.
-                            reason = 'disk_pressure'
+                        else:
+                            if disk_pressure is None:
+                                disk_pressure = (
+                                    await self._run_warm_lane_disk_guard()
+                                ) == 75
+                            if disk_pressure:
+                                # No unmerged work to lose — safe to evict
+                                # under pressure even though still within
+                                # TTL.
+                                reason = 'disk_pressure'
                 elif not await self._worktree_dirty(wt_path):
                     # Unmerged commits and a clean tree — age on the
                     # newest commit. A dirty tree here (the `if` this
