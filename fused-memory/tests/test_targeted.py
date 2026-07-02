@@ -1892,3 +1892,61 @@ async def test_on_task_done_fails_open_when_metadata_query_raises(
 
     # (d) completion-fact audit action is preserved
     assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'memories, expected_suppressed',
+    [
+        pytest.param([], False, id='no_memories'),
+        pytest.param(
+            [{'metadata': {'source': 'targeted_reconciliation', 'task_id': '5'}}],
+            False,
+            id='plain_prior_echo_only',
+        ),
+        pytest.param(
+            [{'id': '959b8497', 'metadata': {'task_id': '5', 'supersedes': 'cd09e261'}}],
+            True,
+            id='authoritative_memory',
+        ),
+    ],
+)
+async def test_on_task_done_echo_suppressed_flag_in_journal_action(
+    reconciler, mock_memory_service, journal, memories, expected_suppressed,
+):
+    """The journal audit row for the fast-path completion write must carry a
+    queryable echo_suppressed flag reflecting whether the raw description was
+    suppressed — mirroring the hints_skipped audit convention. Non-authoritative
+    memories (including a task's own plain prior echoes) must NOT suppress the
+    description (regression guard against oscillation)."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=memories)
+
+    await reconciler.reconcile_task(
+        task_id='5', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '5', 'title': 'Task Five', 'status': 'in-progress',
+            'description': 'Five description',
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    content = calls[0].kwargs.get('content') or ''
+    if not expected_suppressed:
+        assert 'Five description' in content, (
+            f'Expected description preserved when not suppressed, got: {content!r}'
+        )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    completion_rows = [
+        a for a in actions
+        if a['operation'] == 'add_memory' and a['detail'].get('type') == 'completion_fast'
+    ]
+    assert len(completion_rows) == 1, (
+        f'Expected exactly one completion_fast journal row, got: {completion_rows}'
+    )
+    assert completion_rows[0]['detail'].get('echo_suppressed') is expected_suppressed, (
+        f'Expected echo_suppressed={expected_suppressed}, got detail: {completion_rows[0]["detail"]}'
+    )
