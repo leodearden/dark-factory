@@ -60,6 +60,11 @@ apply_flip() {
     # pre-existing knob line (any indentation/value), then insert the
     # canonical line as the first child immediately after the unique
     # top-level `verify_env:` anchor. Single awk pass, atomic mktemp+mv.
+    if ! grep -qE "^verify_env:" "$CONFIG_PATH"; then
+        echo "ERROR: ${CONFIG_PATH} has no top-level verify_env: anchor; refusing to apply a blind edit" >&2
+        exit 1
+    fi
+
     local tmp
     tmp="$(mktemp "${CONFIG_PATH}.XXXXXX")"
     awk -v knob="$KNOB" '
@@ -70,6 +75,17 @@ apply_flip() {
             inserted = 1
         }
     ' "$CONFIG_PATH" > "$tmp"
+
+    if ! is_flipped_in "$tmp"; then
+        rm -f "$tmp"
+        echo "ERROR: failed to insert ${KNOB} into ${CONFIG_PATH}; aborting without committing" >&2
+        exit 1
+    fi
+
+    # Preserve the original file's mode -- mktemp defaults to 0600, which
+    # would otherwise silently reset orchestrator.yaml's permissions on
+    # every flip.
+    chmod --reference="$CONFIG_PATH" "$tmp"
 
     mv "$tmp" "$CONFIG_PATH"
 }
