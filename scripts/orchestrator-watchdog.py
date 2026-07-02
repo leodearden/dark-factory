@@ -215,6 +215,41 @@ def is_unit_enabled(unit: str) -> bool:
         return False
 
 
+def _enumerate_running_units() -> list[str]:
+    """Return the names of all running ``orchestrator-*.service`` units.
+
+    Runs the same enumeration as scripts/restart-all-orchestrators.sh
+    (``systemctl --user list-units 'orchestrator-*.service' --state=running
+    --no-legend --plain``) so the staleness pass and ``--report`` cover
+    exactly the units restart-all touches — new projects are covered
+    automatically with no watchdog code change.
+
+    Returns [] on a non-zero exit, a subprocess error (missing binary /
+    timeout), or empty output — a tooling failure yields no units to act on
+    rather than a crash.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "list-units",
+                "orchestrator-*.service",
+                "--state=running",
+                "--no-legend",
+                "--plain",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    return [line.split()[0] for line in result.stdout.splitlines() if line.split()]
+
+
 def main() -> None:
     """Probe each watched port; restart the unit if the port is not listening."""
     for port, unit in WATCHED:
