@@ -298,6 +298,68 @@ class _ControllableSuiteRunner:
         await asyncio.wait_for(self._entered.wait(), timeout=timeout)
 
 
+async def _assert_never_a_gate(
+    harness: Harness,
+    worker: OfflineLaneWorker,
+    runner: _ControllableSuiteRunner,
+    repo: Path,
+    git_ops: GitOps,
+    caplog,
+) -> None:
+    """Assert the never-a-gate invariant (C7) while a lane run is held in-flight.
+
+    Called with the FIRST pass already confirmed in-flight (the caller
+    awaited ``runner.wait_entered()``) and released only after this
+    returns, so the bounded ``wait_for`` below proves the synchronous
+    on_merge_landed fan-out never blocks on it.
+
+    (1)+(2) ``harness._note_merge_all`` — the exact ``on_merge_landed``
+    callback ``SpeculativeMergeWorker`` invokes (``harness.py:4979``) —
+    must return promptly and must set ``worker._dirty`` (arming a
+    coalesced re-run).
+    (3) A raising notifiee is fail-open: ``_note_offline_lane``'s own
+    try/except (``harness.py:5072-5079``) swallows it — the SAME shape
+    ``SpeculativeMergeWorker`` independently wraps this exact call in
+    (``merge_queue.py:10578-10596``, belt-and-suspenders) — so the merge
+    still lands (the service-restart coordinator fan-out still runs).
+    (4) Neither case ever halts the merge queue or files an escalation —
+    the only halt/gate-adjacent side effects reachable from this call path.
+    """
+    assert harness.get_merge_halt_status() == {'wired': False}
+
+    base_sha = await git_ops.get_main_sha()
+    head_sha = await _advance_main(repo)
+    await asyncio.wait_for(
+        harness._note_merge_all('task-2', base_sha, head_sha), timeout=0.5,
+    )
+    assert worker._dirty is True, (
+        'a landed advance during an in-flight run must arm a coalesced re-run'
+    )
+    assert harness.get_merge_halt_status() == {'wired': False}
+    assert worker.escalation_queue.get_pending() == []
+
+    async def _raising_notifiee(task_id: str, base: str, head: str) -> None:
+        await worker.on_post_merge(task_id, base, head)
+        raise RuntimeError('lane boom')
+
+    harness._offline_lane_notifiee = _raising_notifiee
+    coord = MagicMock()
+    coord.note_merge = AsyncMock()
+    harness._service_restart_coordinators = [coord]
+
+    base2 = head_sha
+    head2 = await _advance_main(repo)
+    with caplog.at_level(logging.WARNING):
+        await harness._note_merge_all('task-3', base2, head2)  # must not raise
+
+    assert 'fail-open' in caplog.text
+    coord.note_merge.assert_awaited_once_with(
+        'task-3', base2, head2, prefetched_diff=[],
+    )
+    assert harness.get_merge_halt_status() == {'wired': False}
+    assert worker.escalation_queue.get_pending() == []
+
+
 # ---------------------------------------------------------------------------
 # B1 — advance triggers a from-head run
 # ---------------------------------------------------------------------------
