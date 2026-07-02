@@ -1,0 +1,314 @@
+"""Premise-verification guard for Stage 2 self-referential recon code-fix task-filing.
+
+Provides a pure, deterministic curator pre-check that drops a self-referential
+recon code-fix candidate ONLY WHILE the live source/tests still refute its
+premise. Mirrors cancelled_premise_blocklist.py in shape, but where that
+module drops matching candidates unconditionally forever, this module
+re-verifies against the live source tree on every call — the drop is
+self-correcting: if a refactor later makes the premise valid, the candidate
+stops matching and proceeds to the architect.
+
+Usage::
+
+    from fused_memory.middleware.recon_code_fix_premise_guard import (
+        PremiseEntry,
+        load_premise_registry,
+    )
+
+    entries = load_premise_registry(Path("config/recon_code_fix_premise_registry.yaml"))
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import yaml
+
+if TYPE_CHECKING:
+    from fused_memory.middleware.task_curator import CandidateTask
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "PremiseEntry",
+    "SourceAssertion",
+    "load_premise_registry",
+    "match_candidate",
+    "premise_refuted_entry",
+    "verify_premise_refuted",
+]
+
+
+@dataclass(frozen=True)
+class SourceAssertion:
+    """One live source/test assertion backing a PremiseEntry.
+
+    Holds iff every ``must_contain`` substring is present in the cited file's
+    text AND every ``must_not_contain`` substring is absent from it.
+    """
+
+    file: str
+    must_contain: list[str] = field(default_factory=list)
+    must_not_contain: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PremiseEntry:
+    """One entry in the recon code-fix premise-verification registry.
+
+    Matching logic mirrors cancelled_premise_blocklist.BlocklistEntry
+    (evaluated case-insensitively):
+    - ALL strings in ``title_substrings`` must appear in the candidate title.
+    - AT LEAST ONE string in ``description_substrings`` must appear in the
+      combined candidate description + details text.
+
+    Unlike BlocklistEntry, a textual match alone does not drop the candidate:
+    ``source_assertions`` must ALSO currently hold against the live source
+    tree (see ``verify_premise_refuted``) — the drop is self-correcting.
+    """
+
+    name: str
+    reason: str
+    title_substrings: list[str]
+    description_substrings: list[str]
+    source_assertions: list[SourceAssertion]
+
+
+def _coerce_source_assertion(item: object) -> SourceAssertion | None:
+    """Coerce one raw YAML mapping into a SourceAssertion, or None if malformed."""
+    if not isinstance(item, dict) or "file" not in item:
+        return None
+    must_contain = item.get("must_contain", [])
+    must_not_contain = item.get("must_not_contain", [])
+    if not isinstance(must_contain, list) or not isinstance(must_not_contain, list):
+        return None
+    return SourceAssertion(
+        file=str(item["file"]),
+        must_contain=[str(s) for s in must_contain],
+        must_not_contain=[str(s) for s in must_not_contain],
+    )
+
+
+def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
+    """Load the recon code-fix premise-verification registry from a YAML file.
+
+    Returns an empty list (without warning) when *path* is ``None``.
+    Returns an empty list and emits one WARNING when the file is missing,
+    unreadable, or not valid YAML.
+    Skips malformed individual entries with one WARNING each while returning
+    the well-formed entries from the same file.
+
+    The function never raises — all failures degrade gracefully to [].
+    """
+    if path is None:
+        return []
+
+    # Missing-file / unreadable
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.warning(
+            "recon_code_fix_premise_guard: file not found: %s — guard disabled", path
+        )
+        return []
+    except OSError as exc:
+        logger.warning(
+            "recon_code_fix_premise_guard: cannot read %s: %s — guard disabled",
+            path, exc,
+        )
+        return []
+
+    # Parse
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        logger.warning(
+            "recon_code_fix_premise_guard: YAML parse error in %s: %s — guard disabled",
+            path, exc,
+        )
+        return []
+
+    if not isinstance(data, list):
+        logger.warning(
+            "recon_code_fix_premise_guard: expected a YAML list in %s, got %s — guard disabled",
+            path, type(data).__name__,
+        )
+        return []
+
+    entries: list[PremiseEntry] = []
+    for item in data:
+        if not isinstance(item, dict):
+            logger.warning(
+                "recon_code_fix_premise_guard: skipping non-dict entry in %s: %r", path, item
+            )
+            continue
+
+        # Validate required fields
+        missing = [
+            f for f in (
+                "name", "reason", "title_substrings", "description_substrings",
+                "source_assertions",
+            )
+            if f not in item
+        ]
+        if missing:
+            logger.warning(
+                "recon_code_fix_premise_guard: skipping entry missing fields %s in %s: %r",
+                missing, path, item.get("name", "<unnamed>"),
+            )
+            continue
+
+        title_subs = item["title_substrings"]
+        desc_subs = item["description_substrings"]
+        raw_assertions = item["source_assertions"]
+        if not isinstance(title_subs, list) or not isinstance(desc_subs, list):
+            logger.warning(
+                "recon_code_fix_premise_guard: skipping entry %r — title_substrings and "
+                "description_substrings must be lists",
+                item.get("name", "<unnamed>"),
+            )
+            continue
+        if not isinstance(raw_assertions, list):
+            logger.warning(
+                "recon_code_fix_premise_guard: skipping entry %r — source_assertions must "
+                "be a list",
+                item.get("name", "<unnamed>"),
+            )
+            continue
+
+        assertions: list[SourceAssertion] = []
+        malformed_assertion = False
+        for raw in raw_assertions:
+            sa = _coerce_source_assertion(raw)
+            if sa is None:
+                malformed_assertion = True
+                break
+            assertions.append(sa)
+        if malformed_assertion:
+            logger.warning(
+                "recon_code_fix_premise_guard: skipping entry %r — malformed "
+                "source_assertions entry (each requires a 'file' key)",
+                item.get("name", "<unnamed>"),
+            )
+            continue
+
+        entries.append(
+            PremiseEntry(
+                name=str(item["name"]),
+                reason=str(item["reason"]),
+                title_substrings=[str(s) for s in title_subs],
+                description_substrings=[str(s) for s in desc_subs],
+                source_assertions=assertions,
+            )
+        )
+
+    return entries
+
+
+def match_candidate(
+    candidate: CandidateTask,
+    entries: list[PremiseEntry],
+) -> PremiseEntry | None:
+    """Return the first matching premise entry for *candidate*, or ``None``.
+
+    Matching is case-insensitive string search — identical in shape to
+    cancelled_premise_blocklist.match_candidate:
+    - ALL strings in ``entry.title_substrings`` must appear in
+      ``candidate.title``.
+    - AT LEAST ONE string in ``entry.description_substrings`` must appear in
+      the combined ``candidate.description + " " + candidate.details``.
+
+    A textual match alone does not mean the premise is refuted — callers
+    should additionally check ``verify_premise_refuted`` (see
+    ``premise_refuted_entry``).
+
+    Returns the first match in list order (deterministic). Returns ``None``
+    when *entries* is empty or no entry matches.
+
+    Pure string operations — no regex, no async, no I/O.
+    """
+    title_lower = (candidate.title or "").lower()
+    desc_lower = (
+        (candidate.description or "") + " " + (candidate.details or "")
+    ).lower()
+
+    for entry in entries:
+        # All title substrings must match
+        if not all(sub.lower() in title_lower for sub in entry.title_substrings):
+            continue
+        # At least one description substring must match
+        if not any(sub.lower() in desc_lower for sub in entry.description_substrings):
+            continue
+        return entry
+
+    return None
+
+
+def _assertion_holds(assertion: SourceAssertion, source_root: Path) -> bool:
+    """Return True iff *assertion* currently holds against the live source tree.
+
+    Reads ``source_root / assertion.file`` fresh (no caching) on every call —
+    this is what makes the guard self-correcting. A missing or unreadable
+    file, or any unexpected error, fails open (returns False, i.e. the
+    assertion does NOT hold, so the candidate is NOT dropped).
+    """
+    target = source_root / assertion.file
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        # FileNotFoundError is a subclass of OSError and is covered here — the
+        # common "cited file missing" case, but any unreadable-file OSError
+        # fails open the same way.
+        logger.warning(
+            "recon_code_fix_premise_guard: cannot read %s: %s — assertion fails open", target, exc,
+        )
+        return False
+    except Exception:  # noqa: BLE001 - never raise out of the guard
+        logger.warning(
+            "recon_code_fix_premise_guard: unexpected error reading %s — assertion fails open",
+            target,
+            exc_info=True,
+        )
+        return False
+
+    if not all(token in text for token in assertion.must_contain):
+        return False
+    return not any(token in text for token in assertion.must_not_contain)
+
+
+def verify_premise_refuted(entry: PremiseEntry, source_root: Path) -> bool:
+    """Return True iff EVERY source assertion in *entry* currently holds.
+
+    Re-reads each cited file fresh against *source_root* on every call — the
+    result is never cached, so a later change to the source tree (e.g. a
+    genuine fix that removes the invalid_at filter) changes the outcome on
+    the very next call. Short-circuits to False on the first assertion that
+    does not hold; vacuously True when ``entry.source_assertions`` is empty.
+    Never raises.
+    """
+    return all(
+        _assertion_holds(assertion, source_root) for assertion in entry.source_assertions
+    )
+
+
+def premise_refuted_entry(
+    candidate: CandidateTask,
+    entries: list[PremiseEntry],
+    source_root: Path,
+) -> PremiseEntry | None:
+    """Return the matched entry iff the candidate's premise is refuted, else ``None``.
+
+    Composes ``match_candidate`` (textual match) and ``verify_premise_refuted``
+    (live source/test re-verification). Both must hold — a textual match on a
+    premise the source no longer refutes returns ``None`` (the self-correcting
+    case), as does live source verification on a candidate that never matched.
+    """
+    entry = match_candidate(candidate, entries)
+    if entry is None:
+        return None
+    if not verify_premise_refuted(entry, source_root):
+        return None
+    return entry

@@ -146,6 +146,15 @@ curator:
   # fused-memory/config/cancelled_premise_blocklist.yaml for the schema.
   cancelled_premise_blocklist_path: "config/cancelled_premise_blocklist.yaml"
 
+  # Recon code-fix premise-verification registry: YAML file listing
+  # self-referential recon/fused-memory-internal code-fix premises an
+  # architect has empirically refuted. Matching candidates are dropped
+  # before any LLM call ONLY WHILE the live source/tests still refute the
+  # premise (self-correcting — unlike cancelled_premise_blocklist_path's
+  # unconditional forever-drop). See
+  # fused-memory/config/recon_code_fix_premise_registry.yaml for the schema.
+  recon_code_fix_premise_registry_path: "config/recon_code_fix_premise_registry.yaml"
+
   # Background ticket janitor — see middleware/ticket_janitor.py.
   # Replaces per-call resolve_ticket waits with a server-side sweep that
   # batches failed tickets into one info-severity ticket_failure escalation
