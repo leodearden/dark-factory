@@ -385,6 +385,25 @@ def _inject_red(worker: OfflineLaneWorker, failing_ids: list[str]) -> None:
     worker.confirmation_runner = _confirmation_runner
 
 
+def _inject_flake(worker: OfflineLaneWorker) -> None:
+    """Wire *worker* to simulate a flake: fails once, but confirms clean (B6).
+
+    ``suite_runner`` reports a normal FAILED pass (``rc=1``); the isolated
+    confirmation re-run finds NOTHING still failing (empty list) —
+    intermittent nondeterminism, never the genuine break :func:`_inject_red`
+    simulates.
+    """
+
+    async def _suite_runner(wt: Path, head: str, threads: int) -> tuple[int, str]:
+        return (1, 'FAILED (injected, flake)')
+
+    async def _confirmation_runner(wt: Path, head: str) -> list[str]:
+        return []
+
+    worker.suite_runner = _suite_runner
+    worker.confirmation_runner = _confirmation_runner
+
+
 def _submitted_fix_task_arguments(task_client) -> dict:
     """Assert ``submit_fix_task`` was awaited exactly once; return its sole argument block."""
     task_client.submit_fix_task.assert_awaited_once()
