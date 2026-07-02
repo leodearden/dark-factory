@@ -1088,6 +1088,13 @@ class Harness:
             # traffic.  Defaults on (warm_lane_gc_enabled=True).
             self._start_warm_lane_gc()
 
+            # 1c1g. Unconditional interactive-worktree (_iact-*) crash-safety
+            # sweep (task δ/2012). Runs once at every boot regardless of
+            # warm_lane_gc_enabled — crash recovery must not wait for (or
+            # depend on) the periodic cadence kill-switch. The pass is itself
+            # fail-soft, so a reaper fault can never break startup.
+            await self._run_interactive_worktree_reaper_pass()
+
             # 1c2. Delay before task execution (escalation server already running)
             if delay_secs > 0:
                 hours, rem = divmod(delay_secs, 3600)
