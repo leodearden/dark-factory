@@ -411,6 +411,9 @@ def staleness_pass() -> None:
     commit_epoch = _newest_watched_commit_epoch()
     if commit_epoch is None:
         return  # undeterminable — fall safe, no restarts this tick
+    if time.time() - commit_epoch < STALENESS_GRACE_SECS:
+        # Give the polite event-driven restart coordinator its head start.
+        return
 
     for unit in _enumerate_running_units():
         try:
