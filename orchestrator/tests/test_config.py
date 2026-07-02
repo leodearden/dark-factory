@@ -10,6 +10,7 @@ import yaml
 from pydantic import ValidationError
 
 from orchestrator.config import (
+    RELOADABLE_FIELDS,
     ConfigRequiredError,
     CpuPriorityConfig,
     JobserverConfig,
@@ -1779,4 +1780,86 @@ class TestWarmLaneGcConfig:
         assert config.warm_lane_gc_interval_secs == 600.0, (
             f'warm_lane_gc_interval_secs must default to 600.0s (10 min); '
             f'got {config.warm_lane_gc_interval_secs}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task/2005 (config-hot-reload PRD, task alpha): RELOADABLE_FIELDS + diff_config
+# + apply_reload
+# ---------------------------------------------------------------------------
+
+
+class TestConfigReload:
+    """RELOADABLE_FIELDS: code-owned allowlist of dotted leaf paths safe to
+    apply via hot-reload without a process restart.
+    """
+
+    def test_reloadable_fields_is_nonempty_frozenset_of_str(self):
+        """PRD Open Q1 audit property: a non-empty frozenset[str]."""
+        assert isinstance(RELOADABLE_FIELDS, frozenset)
+        assert len(RELOADABLE_FIELDS) > 0
+        assert all(isinstance(path, str) for path in RELOADABLE_FIELDS), (
+            f'RELOADABLE_FIELDS must contain only str paths; got types '
+            f'{sorted({type(p).__name__ for p in RELOADABLE_FIELDS})}'
+        )
+
+    def test_every_path_resolves_on_default_config(self, monkeypatch, tmp_path):
+        """Every dotted path in RELOADABLE_FIELDS must resolve via getattr-walk
+        on a default OrchestratorConfig — catches typos in the allowlist that
+        would otherwise silently no-op inside diff_config/apply_reload.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        cfg = OrchestratorConfig()
+        for path in RELOADABLE_FIELDS:
+            obj = cfg
+            for part in path.split('.'):
+                try:
+                    obj = getattr(obj, part)
+                except AttributeError:
+                    pytest.fail(
+                        f'RELOADABLE_FIELDS path {path!r} does not resolve on a '
+                        f'default OrchestratorConfig (failed at component {part!r})'
+                    )
+
+    @pytest.mark.parametrize('path', [
+        'models.architect',
+        'budgets.implementer',
+        'max_turns.implementer',  # NOTE: field name is max_turns, not turns
+        'effort.reviewer',
+        'timeouts.steward',
+        'timeouts.startup_grace_secs',
+        'backends.merger',
+        'unblock_auto.enabled',
+        'steward_completion_timeout',
+        'steward_lifetime_budget',
+        'fairness.skip_threshold',
+        'starvation_watchdog.idle_secs',
+        'idle_poll_secs',
+        'orphan_l0_timeout_secs',
+        'watcher_rotation_escalations',
+        'watcher_crashloop_window_secs',
+        'review.full_review_min_tasks',
+        'verify_env',
+        'git.offline_lane_test_threads',
+        'git.offline_lane_red_advances_before_blocker',
+    ])
+    def test_representative_reloadable_members_present(self, path):
+        assert path in RELOADABLE_FIELDS, (
+            f'{path!r} is expected to be reloadable but is missing from '
+            f'RELOADABLE_FIELDS'
+        )
+
+    @pytest.mark.parametrize('path', [
+        'max_concurrent_tasks',
+        'verify_runners',
+        'sandbox.backend',
+        'escalation.port',
+        'project_root',
+        'git.main_branch',
+    ])
+    def test_restart_only_members_absent(self, path):
+        assert path not in RELOADABLE_FIELDS, (
+            f'{path!r} requires a process restart to take effect and must NOT '
+            f'be in RELOADABLE_FIELDS'
         )
