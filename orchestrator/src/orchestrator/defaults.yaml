@@ -311,6 +311,18 @@ git:
   offline_lane_test_threads: 6
   # Poll-backstop cadence (seconds) catching a missed on_post_merge trigger.
   offline_lane_poll_interval_secs: 120.0
+  # Interactive warm-worktree isolated primitive (task α / 2010).  Disjoint
+  # _iact-* band; GitOps.create_interactive_worktree never draws from
+  # warm_lane_pool or merge_spec_warm_lane_pool (isolation invariant I1).
+  # Cap policy = REJECT (raises InteractiveWorktreeLimitError) once the
+  # on-disk _iact-* count reaches max_interactive_worktrees.
+  max_interactive_worktrees: 2
+  # Max age in seconds (24h) an idle interactive worktree may live before the
+  # δ reaper reclaims it (consumed by δ; not enforced by the α primitive).
+  interactive_worktree_ttl: 86400.0
+  # Directory-name prefix for interactive worktrees; MUST NOT collide with
+  # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
+  iact_prefix: "_iact-"
 
 # Autonomous dry-run unblock hook
 unblock_auto:

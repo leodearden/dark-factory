@@ -1084,6 +1084,42 @@ class GitConfig(BaseModel):
             'covers headroom until then).'
         ),
     )
+    max_interactive_worktrees: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            'Cap on concurrently live interactive worktrees (the _iact-* band '
+            'created by GitOps.create_interactive_worktree).  Enforced by '
+            'REJECT: once the on-disk count of _iact-* worktrees under '
+            'worktree_base reaches this cap, create_interactive_worktree raises '
+            'InteractiveWorktreeLimitError before any git operation.  Strictly '
+            'disjoint from warm_lane_pool / merge_spec_warm_lane_pool sizing — '
+            'interactive worktrees never draw from either pool (isolation '
+            'invariant I1).'
+        ),
+    )
+    interactive_worktree_ttl: float = Field(
+        default=86400.0,
+        gt=0,
+        description=(
+            'Max age in SECONDS (default 86400.0 = 24h) an interactive '
+            'worktree may live with no activity before the reaper sweep '
+            '(task δ) reclaims it.  Consumed by the δ reaper against the '
+            'created_at stamp written to .task/interactive.json; not enforced '
+            'by create_interactive_worktree itself.'
+        ),
+    )
+    iact_prefix: str = Field(
+        default='_iact-',
+        description=(
+            'Directory-name prefix for interactive worktrees created by '
+            'GitOps.create_interactive_worktree, e.g. worktree_base/'
+            '"_iact-<slug>".  MUST NOT collide with the warm-lane pool prefix '
+            '(_lane-) or the merge-speculation pool prefix (_spec-) — the '
+            '_iact-* band is invariantly disjoint from both (isolation '
+            'invariant I1).'
+        ),
+    )
 
 
 class VerifyRunnerConfig(BaseModel):
