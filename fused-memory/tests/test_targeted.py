@@ -30,6 +30,10 @@ def mock_memory_service():
     svc = AsyncMock()
     svc.search = AsyncMock(return_value=[])
     svc.add_memory = AsyncMock(return_value=AsyncMock(model_dump=lambda: {}))
+    # Deterministic per-task metadata lookup used by _on_task_done's pre-echo
+    # authoritative-resolution check (task 1984). Default: no memories found,
+    # so existing fast-path tests are unaffected (has_authoritative=False).
+    svc.get_memories_by_metadata = AsyncMock(return_value=[])
     return svc
 
 
