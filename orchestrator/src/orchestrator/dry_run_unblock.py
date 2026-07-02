@@ -362,6 +362,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
     now = _now_iso()
 
     if not result.success:
+        diagnostics = _failure_diagnostics(result)
         if _is_budget_exhausted(result, budget_usd):
             return {
                 'status': 'budget_exhausted',
@@ -375,6 +376,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
                 'cost_usd': result.cost_usd,
                 'investigated_at': now,
                 'timestamp': now,
+                **diagnostics,
             }
         failure_cls = classify_agent_failure(result)
         if failure_cls.kind in _INFRA_FAILURE_KINDS:
@@ -390,7 +392,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
                 'cost_usd': getattr(result, 'cost_usd', 0.0),
                 'investigated_at': now,
                 'timestamp': now,
-                **_failure_diagnostics(result),
+                **diagnostics,
             }
         return {
             'status': 'investigation_failed',
@@ -404,6 +406,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
             'cost_usd': getattr(result, 'cost_usd', 0.0),
             'investigated_at': now,
             'timestamp': now,
+            **diagnostics,
         }
 
     # Success path — parse structured_output
