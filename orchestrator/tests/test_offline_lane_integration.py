@@ -171,7 +171,9 @@ def _build_worker(
     ``submit_fix_task`` / ``append_suspect_range`` / ``get_status``
     children auto-vivify as awaitable ``AsyncMock``s, per the β3 unit-test
     convention in ``test_offline_lane.py``) with ``get_status`` pre-set to
-    the steady in-flight ``'in-progress'`` state.
+    the steady in-flight ``'in-progress'`` state and ``submit_fix_task``
+    pre-set to return a stable ``'fix-task-1'`` id (B4/B5/B7 only ever have
+    one fingerprint open at a time, so one stable id suffices).
     """
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = git_ops.project_root
@@ -180,6 +182,7 @@ def _build_worker(
     if task_client is None:
         task_client = AsyncMock()
         task_client.get_status = AsyncMock(return_value='in-progress')
+        task_client.submit_fix_task = AsyncMock(return_value='fix-task-1')
 
     if escalation_queue is None:
         escalation_queue = EscalationQueue(tmp_path / 'escalations')
