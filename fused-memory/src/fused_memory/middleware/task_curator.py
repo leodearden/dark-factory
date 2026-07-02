@@ -502,6 +502,13 @@ class TaskCurator:
         # None means "not yet attempted"; [] means "loaded but empty or failed".
         self._blocklist: list | None = None
         self._blocklist_load_attempted: bool = False
+        # Recon code-fix premise-verification registry — lazy-loaded on first
+        # curate() call, same shape as _blocklist above. Unlike the blocklist,
+        # a match here is re-verified against the live source tree on every
+        # call (see recon_code_fix_premise_guard.verify_premise_refuted) —
+        # only the YAML load itself is cached for the instance lifetime.
+        self._premise_registry: list | None = None
+        self._premise_registry_load_attempted: bool = False
         # Consecutive-ZOT circuit breaker (task 1743).
         # Counts CONSECUTIVE zero-output/full-timeout curator LLM failures;
         # reset to 0 on any real LLM success or non-ZOT failure.
@@ -799,6 +806,81 @@ class TaskCurator:
         )
         return decision
 
+    async def _maybe_premise_refuted_drop(
+        self, candidate: CandidateTask, payload_hash: str,
+    ) -> CuratorDecision | None:
+        """Return a drop decision if the candidate's premise is refuted by live source.
+
+        Lazy-loads the registry from
+        ``self._config.curator.recon_code_fix_premise_registry_path`` on the first
+        call and caches the parsed entries for the lifetime of this
+        :class:`TaskCurator` instance (no hot-reload; a server restart is required
+        to pick up YAML changes). The live source/test re-verification itself is
+        NOT cached — it re-reads the cited files on every call, so the guard is
+        self-correcting.
+
+        Returns ``None`` (fail-open) when:
+        - The registry path is not configured (``None``).
+        - The registry file is missing, unreadable, or unparseable (one WARNING logged).
+        - The registry is empty.
+        - No entry textually matches the candidate.
+        - ``self._cwd`` is ``None`` — the source root cannot be resolved, so the
+          premise cannot be verified.
+        - The candidate matches an entry, but the live source no longer refutes
+          its premise.
+
+        Never raises.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry,
+            premise_refuted_entry,
+        )
+
+        cfg_path = self._config.curator.recon_code_fix_premise_registry_path
+        if cfg_path is None:
+            return None
+
+        if self._cwd is None:
+            logger.warning(
+                'task_curator: recon_code_fix_premise_registry_path %r is configured but '
+                'TaskCurator was constructed without cwd — cannot resolve a source root to '
+                'verify premises against; guard disabled for this call',
+                cfg_path,
+            )
+            return None
+
+        # Lazy load — run at most once per TaskCurator instance.
+        if not self._premise_registry_load_attempted:
+            self._premise_registry_load_attempted = True
+            raw_path = Path(cfg_path)
+            if not raw_path.is_absolute():
+                raw_path = self._cwd / raw_path
+            self._premise_registry = load_premise_registry(raw_path)
+
+        entries = self._premise_registry
+        if not entries:
+            return None
+
+        entry = premise_refuted_entry(candidate, entries, self._cwd)
+        if entry is None:
+            return None
+
+        decision = CuratorDecision(
+            action='drop',
+            target_id=None,
+            target_fingerprint=None,
+            rewritten_task=None,
+            justification=f'recon-premise-refuted: {entry.name}: {entry.reason}',
+            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            latency_ms=0,
+        )
+        self._store_cache(payload_hash, decision)
+        logger.info(
+            'task_curator: recon-premise-refuted drop entry=%s candidate=%r',
+            entry.name, candidate.title,
+        )
+        return decision
+
     async def curate(
         self,
         candidate: CandidateTask,
@@ -819,6 +901,13 @@ class TaskCurator:
         blocklist_decision = await self._maybe_blocklist_drop(candidate, payload_hash)
         if blocklist_decision is not None:
             return blocklist_decision
+
+        # Recon code-fix premise-verification short-circuit — runs immediately after
+        # the blocklist so a self-referential candidate whose premise the live
+        # source/tests still refute also skips embedding + corpus assembly cost.
+        premise_decision = await self._maybe_premise_refuted_drop(candidate, payload_hash)
+        if premise_decision is not None:
+            return premise_decision
 
         # Pre-LLM exact-match short-circuit comes FIRST. The payload_hash
         # idempotency cache below can only return drop/combine safely — a
