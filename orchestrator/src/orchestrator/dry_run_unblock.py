@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from shared.cli_invoke import AgentFailureKind, classify_agent_failure
+
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 
@@ -56,6 +58,16 @@ _HUMAN_REVIEW_REQUIRED: str = 'human-review-required'
 # emits ``error_max_budget_usd`` (with the ``_usd`` suffix) on cost-cap
 # exhaustion, not ``error_max_budget``.
 _BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
+
+# Transient HOST infra wedges (e.g. a pre-turn-1 kill at the
+# UnblockAutoConfig.timeout ceiling -> empty stdout + timed_out) are
+# retryable and operationally distinct from a substantive
+# 'investigation_failed' agent conclusion. api_error is deliberately NOT
+# included: it is handled at another layer, not treated as infra here.
+_INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
+    AgentFailureKind.TIMED_OUT,
+    AgentFailureKind.EMPTY_OUTPUT,
+})
 
 
 def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
@@ -325,6 +337,21 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
                 'files_referenced': [],
                 'block_reason': reason,
                 'cost_usd': result.cost_usd,
+                'investigated_at': now,
+                'timestamp': now,
+            }
+        failure_cls = classify_agent_failure(result)
+        if failure_cls.kind in _INFRA_FAILURE_KINDS:
+            return {
+                'status': 'infra_failure',
+                'proposal_text': (
+                    f'Infra wedge (retryable, not a human-review conclusion): '
+                    f'{failure_cls.summary}; subtype={result.subtype}'
+                ),
+                'risk_label': _HUMAN_REVIEW_REQUIRED,
+                'files_referenced': [],
+                'block_reason': reason,
+                'cost_usd': getattr(result, 'cost_usd', 0.0),
                 'investigated_at': now,
                 'timestamp': now,
             }
