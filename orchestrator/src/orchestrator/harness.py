@@ -7183,8 +7183,10 @@ Output JSON matching the schema. Every task must appear in the output.
         * I1 fail-closed thread-off load — ``load_config()`` is invoked with ZERO
           arguments (off the event loop, via ``asyncio.to_thread``) so a reload can
           only ever re-read this process's own ``ORCH_CONFIG_PATH`` — never retarget
-          the orchestrator at a different project. This method's own exception/
-          timeout handling for that load lands in later steps.
+          the orchestrator at a different project. Any exception raised while
+          loading (bad YAML, a failing validator, a missing file) is treated as a
+          failed reload: ``self.config`` is left completely untouched and the
+          failure is reported rather than propagated.
         * I4 same-turn atomic apply — ``apply_reload(self.config, fresh)`` runs
           synchronously with no interleaved await, so coroutine readers of
           ``self.config`` never observe a torn multi-field state. Its internal I5
@@ -7198,9 +7200,24 @@ Output JSON matching the schema. Every task must appear in the output.
         error}`` verbatim from ``apply_reload`` plus the injected ``config_path``.
         """
         config_path = os.environ.get('ORCH_CONFIG_PATH')
-        fresh = await asyncio.wait_for(
-            asyncio.to_thread(load_config), timeout=_RELOAD_LOAD_TIMEOUT_SECS
-        )
+        try:
+            fresh = await asyncio.wait_for(
+                asyncio.to_thread(load_config), timeout=_RELOAD_LOAD_TIMEOUT_SECS
+            )
+        except Exception as exc:
+            report = {
+                'reloaded': False,
+                'config_path': config_path,
+                'applied': {},
+                'restart_required': {},
+                'unchanged': 0,
+                'error': str(exc),
+            }
+            if self.event_store:
+                self.event_store.emit(EventType.config_reload, data=report)
+            logger.warning('config reload: %s', report['error'])
+            return report
+
         report = apply_reload(self.config, fresh)
         report['config_path'] = config_path
         if self.event_store:
