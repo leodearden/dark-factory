@@ -254,3 +254,66 @@ class TestHarnessReloadConfigTimeout:
             if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
         ]
         assert harness_warnings, 'Expected at least one WARNING on a timed-out reload'
+
+
+class TestHarnessReloadConfigRestartRequired:
+    """restart_required disposition + WARNING-on-restart_required (task 2006 step 7)."""
+
+    @pytest.mark.asyncio
+    async def test_reload_config_warns_when_restart_required_nonempty(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """A mixed diff (one allowlisted + one non-allowlisted leaf): partial apply, warns.
+
+        The non-allowlisted leaf is reported in restart_required but left
+        untouched on the live object (I2); the allowlisted leaf is still
+        applied; reloaded is True but a WARNING still fires because an
+        operator needs to know a restart is needed.
+        """
+        harness, _, event_store = _make_harness_with_mocks(tmp_path)
+
+        live_implementer = harness.config.models.implementer
+        new_implementer = _other_model(live_implementer)
+        live_mct = harness.config.max_concurrent_tasks
+
+        # Built before ORCH_CONFIG_PATH is repointed below, so it resolves
+        # config.yaml the same way harness.config did (see _other_model's note).
+        fresh = OrchestratorConfig(project_root=tmp_path)
+        fresh.models.implementer = new_implementer
+        fresh.max_concurrent_tasks = live_mct + 1
+
+        config_path = tmp_path / 'orchestrator.yaml'
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+
+        with (
+            patch('orchestrator.harness.load_config', return_value=fresh),
+            caplog.at_level(logging.WARNING, logger='orchestrator.harness'),
+        ):
+            report = await harness.reload_config()
+
+        assert report['reloaded'] is True
+        assert report['applied'] == {
+            'models.implementer': {'old': live_implementer, 'new': new_implementer}
+        }
+        assert report['restart_required'] == {
+            'max_concurrent_tasks': {'old': live_mct, 'new': live_mct + 1}
+        }
+
+        assert harness.config.max_concurrent_tasks == live_mct, (
+            'non-allowlisted field must NOT be mutated on the live object (I2)'
+        )
+        assert harness.config.models.implementer == new_implementer, (
+            'allowlisted field must still be applied'
+        )
+
+        rows = _query_events(event_store, 'config_reload')
+        assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
+        assert json.loads(rows[0]['data']) == report
+
+        harness_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        assert harness_warnings, (
+            'Expected a WARNING even though reloaded=True, because restart_required != {}'
+        )
