@@ -10,11 +10,13 @@ from __future__ import annotations
 import json as _json
 import subprocess
 from importlib import resources as pkg_resources
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 from _orch_helpers import pydantic_spec
+from shared.config_dir import TaskConfigDir
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler
@@ -1012,3 +1014,113 @@ class TestExceptionFallbackDiagnostics:
         ):
             assert key in entry, f'{key} must be present on the exception fallback entry'
             assert entry[key] is None, f'{key} must be None on the exception fallback entry'
+
+
+# ---------------------------------------------------------------------------
+# task 2021 step-1: resilience scaffolding — config_dir + session_id revive
+# the startup watchdog; cap-retry/failover wiring through invoke_with_cap_retry
+# ---------------------------------------------------------------------------
+
+class TestDryRunResilienceScaffolding:
+    """run_dry_run_unblock must route through invoke_with_cap_retry with a
+    per-investigation TaskConfigDir + pre-allocated session_id, so that the
+    startup watchdog in shared/cli_invoke.py._run_subprocess is no longer
+    structurally dead for this call site (config_dir and session_id were
+    previously never passed, forcing `_grace_spent=True`).
+    """
+
+    @pytest.mark.asyncio
+    async def test_watchdog_revival_and_cleanup_on_success(self, tmp_path):
+        """invoke_agent (the real fast path, usage_gate omitted) receives a
+        Path config_dir and a non-empty session_id; the per-investigation
+        config dir is cleaned up after a successful run.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        structured = {
+            'proposal_text': 'Rebase on main and rerun verify',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(return_value=agent_result),
+        ) as mock_invoke:
+            await run_dry_run_unblock(
+                task_id='2100',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        invoke_kwargs = mock_invoke.call_args.kwargs
+        config_dir_arg = invoke_kwargs.get('config_dir')
+        assert isinstance(config_dir_arg, Path), (
+            f'Expected invoke_agent to receive a Path config_dir, got {config_dir_arg!r}'
+        )
+        session_id_arg = invoke_kwargs.get('session_id')
+        assert isinstance(session_id_arg, str) and session_id_arg, (
+            f'Expected a non-empty session_id string, got {session_id_arg!r}'
+        )
+
+        # Cleanup: no claude-config-*-unblock dir remains under tmp_path/.task
+        task_dir = tmp_path / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], f'Expected config dir to be cleaned up, found: {leftover}'
+
+    @pytest.mark.asyncio
+    async def test_cap_policy_wiring_forwards_usage_gate_and_cost_store(self, tmp_path):
+        """invoke_with_cap_retry receives usage_gate/cost_store, a
+        TaskConfigDir, the 1800s cap-wait sanity override, role='unblock_auto',
+        invoke_fn=invoke_agent, and a session_id kwarg.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+        from orchestrator.dry_run_unblock import invoke_agent as real_invoke_agent
+
+        structured = {
+            'proposal_text': 'Rebase on main and rerun verify',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        usage_gate_sentinel = object()
+        cost_store_sentinel = object()
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_with_cap_retry',
+            new=AsyncMock(return_value=agent_result),
+        ) as mock_cap_retry:
+            await run_dry_run_unblock(
+                task_id='2101',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                usage_gate=usage_gate_sentinel,
+                cost_store=cost_store_sentinel,
+            )
+
+        mock_cap_retry.assert_awaited_once()
+        call_kwargs = mock_cap_retry.call_args.kwargs
+        assert call_kwargs.get('usage_gate') is usage_gate_sentinel
+        assert call_kwargs.get('cost_store') is cost_store_sentinel
+        assert isinstance(call_kwargs.get('config_dir'), TaskConfigDir)
+        assert call_kwargs.get('cap_wait_sanity_secs') == 1800
+        assert call_kwargs.get('role') == 'unblock_auto'
+        assert call_kwargs.get('invoke_fn') is real_invoke_agent
+        session_id_arg = call_kwargs.get('session_id')
+        assert isinstance(session_id_arg, str) and session_id_arg
