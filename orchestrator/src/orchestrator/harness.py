@@ -5154,7 +5154,13 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         lock_path = self.config.project_root / 'data' / 'orchestrator' / 'offline_lane.lock'
-        worker = OfflineLaneWorker(self.git_ops, self.config, lock_path=lock_path)
+        worker = OfflineLaneWorker(
+            self.git_ops,
+            self.config,
+            lock_path=lock_path,
+            task_client=_OfflineLaneTaskClient(self.scheduler),
+            escalation_queue=self._escalation_queue,
+        )
         if not worker.acquire_lock():
             logger.warning(
                 'Offline-deep lane: lock acquire refused (another instance holds '
