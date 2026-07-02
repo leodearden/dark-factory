@@ -222,15 +222,20 @@ async def _drive_advance(
     return base_sha, head_sha
 
 
-async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 5.0) -> None:
-    """Drive worker.run() as a real background task for exactly one pass.
+async def _run_lane(
+    worker: OfflineLaneWorker, expected_passes: int, *, timeout: float = 5.0,
+) -> None:
+    """Drive worker.run() as a real background task until *expected_passes*
+    suite_runner calls have COMPLETED, then cancel the loop task.
 
     Wraps whatever ``suite_runner`` is currently on *worker* with a call
-    counter and cancels the loop task as soon as the FIRST pass completes —
-    modeled on ``test_offline_lane.py``'s
-    ``test_loop_coalesces_to_exactly_one_rerun`` cancel-after-N pattern.
-    Requires ``worker._dirty`` (or the wake event) to already be set by a
-    prior trigger, exactly as production wiring would leave it.
+    counter — modeled on ``test_offline_lane.py``'s
+    ``test_loop_coalesces_to_exactly_one_rerun`` cancel-after-N pattern,
+    generalized from a fixed N=1 to an arbitrary pass count (B1's single
+    pass via :func:`_run_one_lane_pass`; B2's held-pass-plus-one-coalesced-
+    rerun burst uses N=2). Requires ``worker._dirty`` (or the wake event) to
+    already be set by a prior trigger, exactly as production wiring would
+    leave it.
     """
     inner_runner = worker.suite_runner
     done = asyncio.Event()
@@ -239,7 +244,7 @@ async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 5.0)
     async def _counting_runner(wt, head, threads):
         result = await inner_runner(wt, head, threads)
         count['n'] += 1
-        if count['n'] == 1:
+        if count['n'] >= expected_passes:
             done.set()
         return result
 
@@ -251,6 +256,43 @@ async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 5.0)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 5.0) -> None:
+    """Drive worker.run() as a real background task for exactly one pass (B1)."""
+    await _run_lane(worker, 1, timeout=timeout)
+
+
+class _ControllableSuiteRunner:
+    """A suite_runner whose FIRST call blocks in-flight until released (B2/B3).
+
+    Records every head it is invoked with, in call order. Only the first
+    call blocks (on an internal ``asyncio.Event`` gate) — later calls
+    return immediately — so a single instance can drive both the held
+    initial pass and the subsequent coalesced re-run(s) in one scenario.
+    """
+
+    def __init__(self) -> None:
+        self.heads: list[str] = []
+        self._hold = asyncio.Event()
+        self._entered = asyncio.Event()
+        self._held_once = False
+
+    async def __call__(self, wt: Path, head: str, threads: int) -> tuple[int, str]:
+        self.heads.append(head)
+        if not self._held_once:
+            self._held_once = True
+            self._entered.set()
+            await self._hold.wait()
+        return (0, '')
+
+    def release(self) -> None:
+        """Release the held first call."""
+        self._hold.set()
+
+    async def wait_entered(self, timeout: float = 5.0) -> None:
+        """Block until the held first call has actually started (is in-flight)."""
+        await asyncio.wait_for(self._entered.wait(), timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
