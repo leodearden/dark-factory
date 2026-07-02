@@ -413,6 +413,31 @@ class InteractiveWorktreeInfo:
     base_ref: str
 
 
+@dataclass(frozen=True)
+class ReapedInteractiveWorktree:
+    """Record of one ``_iact-*`` worktree removed by ``reap_interactive_worktrees``.
+
+    Returned by :meth:`GitOps.reap_interactive_worktrees` (task δ/2012) — one
+    entry per worktree the reaper force-removed during a sweep.
+
+    path: the on-disk location that was removed (``worktree_base/_iact-<slug>``).
+    branch: the full branch name that was checked out there (``task/<slug>``).
+    slug: the interactive session's claim identity (the ``_iact-`` /
+        ``branch_prefix`` suffix).
+    reason: why it was reaped — one of ``'landed'`` (a merge marker for this
+        branch exists on main), ``'ttl_idle'`` (no activity for longer than
+        ``config.interactive_worktree_ttl``), ``'disk_pressure'`` (evicted
+        under disk pressure despite being within TTL — idle-only, never a
+        worktree carrying unmerged work), or ``'stale_no_stamp'`` (the
+        ``.task/interactive.json`` stamp was missing/corrupt and the
+        worktree carried no unmerged work).
+    """
+    path: Path
+    branch: str
+    slug: str
+    reason: str
+
+
 class ConflictProbe(NamedTuple):
     """Result of merge_tree_conflicts — a lightweight, tuple-destructurable probe.
 
@@ -4597,6 +4622,322 @@ class GitOps:
                 return wt_path
 
         return None
+
+    # ── δ: interactive-worktree (_iact-*) crash-safety reaper — task 2012 ──
+    #
+    # WarmLanePool._recover_crashed_tasks covers _lane-* only; the _iact-*
+    # band task α (2010) mints via create_interactive_worktree is
+    # structurally disjoint from that pool (isolation invariant I1) and had
+    # no crash-cleanup path.  reap_interactive_worktrees supplies it: a
+    # crashed/idle/landed interactive worktree is force-removed the same way
+    # prune_stale_merge_worktrees reclaims _merge-* worktrees.
+
+    async def _iter_interactive_worktrees(self):
+        """Yield ``(wt_path, wt_resolved)`` pairs for registered ``_iact-*`` worktrees.
+
+        Mirrors :meth:`_iter_merge_worktrees` (same porcelain-enumeration and
+        direct-child-of-``worktree_base`` filter) but matches
+        ``config.iact_prefix`` instead of the hardcoded ``'_merge-'`` prefix,
+        and has no persistent-worktree exemption — there is no ``_iact-*``
+        equivalent of the always-on ``_merge-verify`` worktree.  Yields
+        nothing on git error (fail-closed, matching ``_iter_merge_worktrees``).
+        """
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return
+
+        for line in out.splitlines():
+            if not line.startswith('worktree '):
+                continue
+            wt_path = Path(line[len('worktree '):].strip())
+            try:
+                wt_resolved = wt_path.resolve()
+            except OSError:
+                wt_resolved = wt_path
+            if wt_resolved.parent != self.worktree_base:
+                continue
+            if not wt_resolved.name.startswith(self.config.iact_prefix):
+                continue
+            yield wt_path, wt_resolved
+
+    async def _interactive_worktree_landed(self, full_branch: str) -> bool:
+        """True if a ``Merge {full_branch} into {main_branch}`` marker exists on main.
+
+        Reproduces :func:`find_merge_marker`'s grep core (``git log
+        <main_branch> --fixed-strings --grep=<subject> --max-count=1
+        --format=%H``) but deliberately WITHOUT its branch-existence gate:
+        :meth:`find_merge_marker` returns ``None`` immediately whenever the
+        branch ref still resolves, on the assumption that a live branch means
+        ``is_ancestor`` is the right check — but an ``_iact-*`` branch is
+        *always* still checked out in its own worktree at reap time, so that
+        gate would short-circuit to ``False`` here every single time.
+
+        Deliberately NOT ``is_ancestor(HEAD, main)``: a freshly-created
+        ``_iact-*`` worktree has zero commits of its own, so its HEAD trivially
+        *is* an ancestor of (equal to) main at creation time — using
+        ``is_ancestor`` here would misclassify every brand-new interactive
+        session as "landed" and reap it immediately. The merge-marker grep
+        only matches a REAL merge commit, so it cannot false-positive on that
+        shape (see :meth:`worktree_head_beyond_main`'s docstring and
+        ``find_task_citation_commit`` for the same is_ancestor pitfall
+        elsewhere in this module).
+        """
+        grep_pattern = _merge_subject(full_branch, self.config.main_branch)
+        rc, out, _ = await _run(
+            [
+                'git', 'log', self.config.main_branch,
+                '--fixed-strings',
+                f'--grep={grep_pattern}',
+                '--max-count=1',
+                '--format=%H',
+            ],
+            cwd=self.project_root,
+        )
+        return rc == 0 and bool(out.strip())
+
+    async def _worktree_dirty(self, worktree: Path) -> bool:
+        """True if *worktree* has uncommitted changes (``git status --porcelain``).
+
+        Used by :meth:`reap_interactive_worktrees` to avoid reaping a worktree
+        out from under an actively-editing user in two situations: a landed
+        (merged-to-main) worktree the user resumed working in without
+        committing yet, and a live (unmerged-commits) worktree whose newest
+        commit is old but whose working tree shows fresh, uncommitted edits.
+
+        **Fail-safe True** on any git error (unreadable worktree, etc.) —
+        callers treat "dirty" as "leave it alone this sweep", so an I/O
+        hiccup defers a reap decision rather than risking one on a false
+        "clean" reading. This mirrors :meth:`_branch_has_commits_beyond_main`'s
+        fail-safe-toward-retention convention.
+        """
+        rc, out, _ = await _run(['git', 'status', '--porcelain'], cwd=worktree)
+        if rc != 0:
+            return True
+        return bool(out.strip())
+
+    async def _worktree_head_readable(self, worktree: Path) -> bool:
+        """True if ``git rev-parse HEAD`` succeeds in *worktree*.
+
+        :meth:`worktree_head_beyond_main` returns ``None`` both when a
+        worktree genuinely has no commits beyond main AND when its internal
+        ``git rev-parse HEAD`` call fails (rc != 0) — a transient git error
+        collapses to the exact same signal as "safe, no unmerged work".
+        :meth:`reap_interactive_worktrees` uses this helper to tell those two
+        cases apart *before* trusting a ``None`` result: a worktree that
+        actually carries unmerged commits must never be force-removed just
+        because HEAD happened to be unreadable for one sweep.
+        """
+        rc, _, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        return rc == 0
+
+    async def reap_interactive_worktrees(
+        self, *, now: datetime | None = None,
+    ) -> list[ReapedInteractiveWorktree]:
+        """Crash-safety sweep over the ``_iact-*`` interactive-worktree band (task δ/2012).
+
+        Enumerates registered ``_iact-*`` worktrees exactly like
+        :meth:`_iter_interactive_worktrees` (direct children of
+        ``worktree_base`` matching ``config.iact_prefix``, per ``git worktree
+        list --porcelain``).  For each candidate, ``slug``/``branch`` are
+        derived from the directory name by the same convention
+        :meth:`create_interactive_worktree` used to create it
+        (``worktree_base/{iact_prefix}{slug}`` on branch
+        ``{branch_prefix}{slug}``) — both are always derivable this way, so
+        this does not depend on the ``.task/interactive.json`` stamp being
+        intact.
+
+        Per-worktree reap predicate:
+
+        * :meth:`worktree_head_beyond_main` returns ``None`` both when a
+          worktree genuinely has no commits beyond main AND when its
+          internal ``git rev-parse HEAD`` call fails (transient git error) —
+          the two cases are indistinguishable from that return value alone.
+          Before trusting a ``None`` result as "no unmerged work",
+          :meth:`_worktree_head_readable` independently re-confirms HEAD is
+          actually readable; if it is not, this candidate is skipped for the
+          sweep (retention) instead of risking a false "safe to reap"
+          classification that could force-remove genuinely unmerged commits.
+        * :meth:`worktree_head_beyond_main` is ``None`` (no commits beyond
+          main) AND :meth:`_interactive_worktree_landed` finds a ``Merge
+          <branch> into <main_branch>`` marker on main AND the working tree
+          is clean (:meth:`_worktree_dirty` is ``False``) → reaped
+          immediately as ``'landed'``, regardless of age (the work is
+          already safe on main and nothing remains uncommitted). A landed
+          worktree that still carries commits beyond main, or uncommitted
+          edits, is NOT reaped immediately — it falls through to the
+          idle/TTL handling below instead, so a session the user resumed
+          *after* the merge (committed or not) isn't reclaimed out from
+          under them.
+        * Otherwise, when :meth:`worktree_head_beyond_main` is ``None`` (no
+          commits beyond main) → age is measured from the
+          ``.task/interactive.json`` stamp's ``created_at``.  Reaped
+          (``'ttl_idle'``) when that age exceeds
+          ``config.interactive_worktree_ttl``; otherwise, when
+          ``_run_warm_lane_disk_guard()`` reports disk pressure (rc==75),
+          reaped anyway (``'disk_pressure'``) regardless of age — safe
+          because there is no unmerged work to lose.  The disk-guard check
+          is deferred until the first candidate that actually reaches this
+          branch (idle, within TTL, not landed) and its result is reused for
+          the rest of the sweep — so it still runs at most once per sweep,
+          but a sweep with no such candidate never invokes it at all.
+        * Otherwise (the worktree carries unmerged commits) → a dirty
+          working tree (:meth:`_worktree_dirty`) is treated as recent
+          activity and preserves the worktree outright, since an in-progress
+          session can be actively editing for hours between commits.
+          Otherwise, age is measured from the newest commit's time (``git
+          show -s --format=%ct HEAD``), NOT the stamp — an in-progress
+          session that keeps committing must never be reaped merely because
+          it is old.  Reaped (``'ttl_idle'``) when that age exceeds the same
+          TTL. Note this means uncommitted edits made *after* the TTL window
+          has already lapsed on a stale worktree are not specially
+          protected — only edits present at sweep time are. A worktree with
+          unmerged commits is NEVER reaped for disk pressure alone — only
+          the TTL (or landed) rule can reclaim it.
+
+        Removal uses ``git worktree remove --force`` per reaped candidate,
+        followed by a single ``git worktree prune`` if at least one was
+        removed — mirrors :meth:`prune_stale_merge_worktrees`.
+
+        Args:
+            now: reference time for TTL comparisons; defaults to
+                ``datetime.now(UTC)``. Injectable so callers/tests get
+                deterministic TTL boundaries.
+
+        Returns:
+            One :class:`ReapedInteractiveWorktree` per worktree actually
+            removed. Never raises.
+        """
+        if now is None:
+            now = datetime.now(UTC)
+        ttl = self.config.interactive_worktree_ttl
+
+        reaped: list[ReapedInteractiveWorktree] = []
+        # `None` = not checked yet this sweep. Computed lazily on first
+        # actual need (see the disk-pressure branch below) and reused for
+        # every remaining candidate, so it still runs at most once per
+        # sweep — but a sweep with zero _iact-* worktrees, or none that are
+        # idle-and-within-TTL, never pays for the subprocess call at all.
+        disk_pressure: bool | None = None
+        try:
+            async for wt_path, wt_resolved in self._iter_interactive_worktrees():
+                slug = wt_resolved.name[len(self.config.iact_prefix):]
+                full_branch = f'{self.config.branch_prefix}{slug}'
+
+                reason: str | None = None
+                beyond = await self.worktree_head_beyond_main(wt_path)
+                # worktree_head_beyond_main returns None both when there are
+                # genuinely no commits beyond main AND when its internal
+                # `git rev-parse HEAD` failed (transient git error) — those
+                # two cases are indistinguishable from the return value
+                # alone. Independently confirm HEAD is actually readable
+                # before trusting None as "no unmerged work"; a rev-parse
+                # failure defers this candidate (retention) rather than
+                # risking a false "safe to reap" classification that could
+                # force-remove genuinely unmerged commits.
+                if beyond is None and not await self._worktree_head_readable(wt_path):
+                    logger.warning(
+                        'reap_interactive_worktrees: could not read HEAD '
+                        'for %s this sweep — deferring reap decision',
+                        wt_path,
+                    )
+                    continue
+                # Only a worktree with no commits beyond main can possibly be
+                # "landed" (a real merge marker); short-circuiting here also
+                # skips the merge-marker grep entirely once beyond is known
+                # not-None, since that case always falls to the live-commit
+                # branch below regardless of landed status.
+                landed = beyond is None and await self._interactive_worktree_landed(
+                    full_branch,
+                )
+                if landed and not await self._worktree_dirty(wt_path):
+                    # Landed on main and the working tree is clean — safe to
+                    # reap regardless of age (the PROMPT-safe case: the work
+                    # already lives on main and nothing remains uncommitted).
+                    reason = 'landed'
+                elif beyond is None:
+                    # Either not landed, or landed-but-dirty (resumed
+                    # post-merge editing with no new commit yet) — either way
+                    # there are no commits beyond main, so age on the stamp
+                    # exactly like any other idle candidate.
+                    stamp_path = wt_path / '.task' / 'interactive.json'
+                    try:
+                        stamp = json.loads(stamp_path.read_text())
+                        created_at = datetime.fromisoformat(stamp['created_at'])
+                    except (OSError, ValueError, KeyError, TypeError) as exc:
+                        # Missing/corrupt stamp and no unmerged work to
+                        # lose — fail-soft towards reaping (I2: never an
+                        # indefinite leak) rather than preserving forever.
+                        # A worktree WITH unmerged commits never reaches
+                        # this branch at all (beyond is not None below),
+                        # so a corrupt stamp can never silently drop work.
+                        logger.warning(
+                            'reap_interactive_worktrees: unreadable stamp '
+                            'for %s (%s: %s) — reaping as stale (no '
+                            'unmerged work to lose)',
+                            wt_path, type(exc).__name__, exc,
+                        )
+                        reason = 'stale_no_stamp'
+                    else:
+                        if (now - created_at).total_seconds() > ttl:
+                            reason = 'ttl_idle'
+                        else:
+                            if disk_pressure is None:
+                                disk_pressure = (
+                                    await self._run_warm_lane_disk_guard()
+                                ) == 75
+                            if disk_pressure:
+                                # No unmerged work to lose — safe to evict
+                                # under pressure even though still within
+                                # TTL.
+                                reason = 'disk_pressure'
+                elif not await self._worktree_dirty(wt_path):
+                    # Unmerged commits and a clean tree — age on the
+                    # newest commit. A dirty tree here (the `if` this
+                    # `elif` pairs with) is treated as recent activity
+                    # and preserves the worktree outright, since a
+                    # session can be actively editing for hours between
+                    # commits.
+                    rc_ct, ct_out, _ = await _run(
+                        ['git', 'show', '-s', '--format=%ct', 'HEAD'],
+                        cwd=wt_path,
+                    )
+                    if rc_ct == 0 and ct_out.strip():
+                        commit_time = datetime.fromtimestamp(
+                            int(ct_out.strip()), tz=UTC,
+                        )
+                        if (now - commit_time).total_seconds() > ttl:
+                            reason = 'ttl_idle'
+
+                if reason is None:
+                    continue
+
+                rc_rm, _, err = await _run(
+                    ['git', 'worktree', 'remove', '--force', str(wt_path)],
+                    cwd=self.project_root,
+                )
+                if rc_rm == 0:
+                    reaped.append(ReapedInteractiveWorktree(
+                        path=wt_path, branch=full_branch, slug=slug, reason=reason,
+                    ))
+                else:
+                    logger.warning(
+                        'reap_interactive_worktrees: failed to remove %s: %s',
+                        wt_path, err.strip(),
+                    )
+
+            if reaped:
+                await _run(['git', 'worktree', 'prune'], cwd=self.project_root)
+        except Exception:
+            logger.warning(
+                'reap_interactive_worktrees: unexpected error during sweep '
+                '(returning %d worktree(s) reaped before the fault)',
+                len(reaped), exc_info=True,
+            )
+
+        return reaped
 
     # ── PHASE 4: Speculative merge-verify pipeline ────────────────────
     #
