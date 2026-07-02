@@ -3782,3 +3782,55 @@ class TestOperatorHaltTools:
         assert result['halted'] is False
         assert 'reason' in result['error']
         assert called == [], 'harness must NOT be invoked on an empty reason'
+
+
+@pytest.mark.asyncio
+class TestReloadConfigTool:
+    """reload_config — operator-only config hot-reload trigger (task 2007, PRD gamma).
+
+    Unlike halt_scheduler / halt_merge_queue, this tool takes NO parameters: it
+    always re-reads the process's own ORCH_CONFIG_PATH, so a reload can never
+    retarget the orchestrator at another project.  It is a thin standalone-guard
+    + verbatim delegate to ``harness.reload_config()`` (task 2006), which does
+    the actual load/apply/audit work.  Restriction from autonomous agents is by
+    allow-list omission (see test_roles_operator_tools.py), not a server gate.
+    """
+
+    async def test_tool_registered(self, tmp_path: Path) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        server: Any = create_server(queue)
+        assert await server.get_tool('reload_config') is not None
+
+    async def test_standalone_returns_wired_error(self, tmp_path: Path) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)  # no harness wired
+
+        result = await _call_tool(server, 'reload_config')
+
+        assert result['reloaded'] is False
+        assert 'standalone' in result['error']
+        assert 'no harness wired' in result['error']
+
+    async def test_wired_path_returns_report_verbatim(self, tmp_path: Path) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        canned_report = {
+            'reloaded': True,
+            'config_path': '/x/orchestrator.yaml',
+            'applied': {'some_field': 'new_value'},
+            'restart_required': {},
+            'unchanged': 3,
+            'error': None,
+        }
+
+        async def _reload_config(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append((args, kwargs))
+            return canned_report
+
+        stub_harness = types.SimpleNamespace(reload_config=_reload_config)
+        server = create_server(queue, harness=stub_harness)
+
+        result = await _call_tool(server, 'reload_config')
+
+        assert result == canned_report, 'must return the harness report verbatim'
+        assert calls == [((), {})], 'harness.reload_config must be awaited exactly once with no arguments'
