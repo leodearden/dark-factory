@@ -471,3 +471,59 @@ class TestMaybeRestartStaleServiceBusyPath:
 
         executor.assert_not_awaited()
         assert fused_coord.is_pending is True  # still pending — waiting for the idle branch
+
+
+# ---------------------------------------------------------------------------
+# U2 (task 1973): Harness._merge_pipeline_idle
+# ---------------------------------------------------------------------------
+
+
+class TestMergePipelineIdle:
+    """_merge_pipeline_idle() reports whether the merge queue + worker pipeline is drained.
+
+    Used as the orchestrator restart coordinator's restart_precondition — a
+    genuine quiet window requires BOTH the merge queue empty AND the merge
+    worker's in-flight pipeline (snapshot()['depth']) at zero.
+    """
+
+    def test_true_when_merge_worker_is_none(self, harness: Harness):
+        """(a) _merge_worker=None → True (bare/unit-test harness)."""
+        harness._merge_worker = None
+
+        assert harness._merge_pipeline_idle() is True
+
+    def test_true_when_depth_zero_and_queue_empty(self, harness: Harness):
+        """(b) snapshot depth==0 and _merge_queue empty → True."""
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 0}
+        harness._merge_worker = worker
+        assert harness._merge_queue.empty()
+
+        assert harness._merge_pipeline_idle() is True
+
+    def test_false_when_depth_nonzero(self, harness: Harness):
+        """(c) snapshot depth==2 → False."""
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 2}
+        harness._merge_worker = worker
+
+        assert harness._merge_pipeline_idle() is False
+
+    def test_false_when_queue_has_item_even_if_depth_zero(self, harness: Harness):
+        """(d) snapshot depth==0 but _merge_queue non-empty → False."""
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 0}
+        harness._merge_worker = worker
+        harness._merge_queue.put_nowait({'task_id': 'queued-task'})
+
+        assert harness._merge_pipeline_idle() is False
+
+    def test_false_when_snapshot_raises(self, harness: Harness):
+        """(e) snapshot() raising → False (fail-safe), no exception propagates."""
+        worker = MagicMock()
+        worker.snapshot.side_effect = RuntimeError('snapshot boom')
+        harness._merge_worker = worker
+
+        result = harness._merge_pipeline_idle()  # must not raise
+
+        assert result is False
