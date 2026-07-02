@@ -18,6 +18,7 @@ running the full owning-package suite instead of a scoped subset.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -273,3 +274,54 @@ class TestS2AllowlistedNextSpawn:
             'the next spawn must read models.implementer fresh at call time, '
             'observing the reloaded value rather than one captured earlier'
         )
+
+
+# ---------------------------------------------------------------------------
+# Scenario 3 (I2, I7): a non-allowlisted max_concurrent_tasks edit lands in
+# restart_required and never resizes any dispatch semaphore built from the
+# live config. There is no stored dispatch-sem attribute to assert against
+# directly — the real one is a run()-local at harness.py:1193
+# (``sem = asyncio.Semaphore(self.config.max_concurrent_tasks)``) — so this
+# observes the startup-baked SIZING VALUE instead.
+# ---------------------------------------------------------------------------
+
+
+class TestS3NonAllowlistedSemaphoreWarning:
+    """PRD boundary scenario 3: a restart-only max_concurrent_tasks edit warns and does not resize."""
+
+    @pytest.mark.asyncio
+    async def test_nonallowlisted_edit_warns_and_leaves_semaphore_sized(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        harness, config_path = _make_reload_harness(tmp_path, monkeypatch)
+
+        live_max_concurrent = harness.config.max_concurrent_tasks
+        new_max_concurrent = live_max_concurrent + 1
+        sem_before = asyncio.Semaphore(live_max_concurrent)
+
+        _edit_yaml(config_path, 'max_concurrent_tasks', new_max_concurrent)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            report = await harness.reload_config()
+
+        assert report['reloaded'] is True
+        assert report['applied'] == {}
+        assert report['restart_required'] == {
+            'max_concurrent_tasks': {'old': live_max_concurrent, 'new': new_max_concurrent},
+        }
+
+        assert harness.config.max_concurrent_tasks == live_max_concurrent, (
+            'a restart-only leaf must NOT be mutated on the live config (I2)'
+        )
+        sem_after = asyncio.Semaphore(harness.config.max_concurrent_tasks)
+        assert sem_after._value == sem_before._value, (
+            'any dispatch semaphore built from the live config is unchanged in '
+            'size — the non-allowlisted edit never reaches the running '
+            'structure without a restart'
+        )
+
+        harness_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        assert harness_warnings, 'Expected at least one WARNING when restart_required is nonempty'
