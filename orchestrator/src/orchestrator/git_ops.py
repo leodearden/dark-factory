@@ -4756,6 +4756,11 @@ class GitOps:
 
         reaped: list[ReapedInteractiveWorktree] = []
         try:
+            # Disk-guard check runs at most once per sweep (not per-candidate)
+            # — mirrors _run_warm_lane_disk_guard's other call sites, which
+            # never poll per-item either.
+            disk_pressure = (await self._run_warm_lane_disk_guard()) == 75
+
             async for wt_path, wt_resolved in self._iter_interactive_worktrees():
                 slug = wt_resolved.name[len(self.config.iact_prefix):]
                 full_branch = f'{self.config.branch_prefix}{slug}'
@@ -4773,6 +4778,10 @@ class GitOps:
                         created_at = datetime.fromisoformat(stamp['created_at'])
                         if (now - created_at).total_seconds() > ttl:
                             reason = 'ttl_idle'
+                        elif disk_pressure:
+                            # No unmerged work to lose — safe to evict under
+                            # pressure even though still within TTL.
+                            reason = 'disk_pressure'
                     else:
                         rc_ct, ct_out, _ = await _run(
                             ['git', 'show', '-s', '--format=%ct', 'HEAD'],
