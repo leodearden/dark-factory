@@ -63,6 +63,18 @@ _ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 # and the fast-path write can't drift out of sync (task 1984).
 _ECHO_SOURCE = 'targeted_reconciliation'
 
+# Metadata `source` values recognized as authoritative resolution/superseding
+# writers by _is_authoritative_resolution, in addition to a truthy
+# `supersedes` marker.  Deliberately an allowlist rather than "any source
+# other than _ECHO_SOURCE": several real task_id-tagged writers are lifecycle
+# / flag markers, not resolutions, and must NOT suppress the completion
+# echo's description — e.g. flag_dedup.py's `stage1_flag_marker` and
+# stage1_stall_detector.py's `stage1_human_operator_stall_marker` both stamp
+# {'source': ..., 'task_id': tid} with no `supersedes`. Extend this set only
+# for writers that represent a genuine resolution of the task, not a
+# transient marker (task 1984 amendment).
+_AUTHORITATIVE_SOURCES = frozenset({'stage2_task_knowledge_sync'})
+
 
 class TargetedReconciler:
     """Lightweight reconciliation triggered by task state transitions."""
@@ -223,6 +235,15 @@ class TargetedReconciler:
             # Narrowly scoped: a Mem0/Qdrant hiccup here must fail open (treat the
             # task as having no authoritative memory) rather than propagate into
             # the broad try/except below and skip the completion write entirely.
+            #
+            # Mem0-only scope (task 1984 amendment): get_memories_by_metadata
+            # enumerates Mem0/Qdrant only — it does not query Graphiti. A
+            # superseding/resolution memory routed to Graphiti (e.g. written to
+            # decisions_and_rationale, entities_and_relations, or temporal_facts)
+            # is invisible to this pre-check. The primary intended trigger
+            # (Stage-2 knowledge-sync echoes) writes observations_and_summaries
+            # to Mem0, so this is acceptable today, but a Graphiti-resident
+            # resolution will not suppress a stale description here.
             try:
                 memories = await self.memory.get_memories_by_metadata(
                     project_id=project_id, filters={'task_id': task_id},
@@ -936,7 +957,15 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
 
     A memory is authoritative when its metadata carries a truthy ``supersedes``
     marker (the established superseding-memory convention, harness.py:849) OR a
-    ``source`` other than the targeted-reconciliation echo source (_ECHO_SOURCE).
+    ``source`` in the ``_AUTHORITATIVE_SOURCES`` allowlist.
+
+    The source check is an allowlist — NOT "any source other than
+    _ECHO_SOURCE" — because several real task_id-tagged writers are lifecycle
+    / flag markers rather than resolutions (e.g. flag_dedup.py's
+    ``stage1_flag_marker``, stage1_stall_detector.py's
+    ``stage1_human_operator_stall_marker``); treating any non-echo source as
+    authoritative would wrongly suppress the completion description for any
+    task that ever picked up one of those markers (task 1984 amendment).
 
     Plain prior targeted echoes (``source=_ECHO_SOURCE``, no ``supersedes``) are
     deliberately NOT authoritative, so a task's own earlier echoes never trigger
@@ -946,5 +975,4 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
         return False
     if metadata.get('supersedes'):
         return True
-    source = metadata.get('source')
-    return bool(source) and source != _ECHO_SOURCE
+    return metadata.get('source') in _AUTHORITATIVE_SOURCES

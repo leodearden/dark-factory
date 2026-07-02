@@ -1784,7 +1784,7 @@ async def test_on_task_done_writes_own_title_in_multicompletion_window(
     'metadata, expected',
     [
         pytest.param({'supersedes': '959b8497'}, True, id='truthy_supersedes'),
-        pytest.param({'source': 'stage2_task_knowledge_sync'}, True, id='non_echo_source'),
+        pytest.param({'source': 'stage2_task_knowledge_sync'}, True, id='allowlisted_source'),
         pytest.param(
             {'source': 'targeted_reconciliation', 'task_id': '361', 'transition': 'done'},
             False,
@@ -1792,10 +1792,27 @@ async def test_on_task_done_writes_own_title_in_multicompletion_window(
         ),
         pytest.param({}, False, id='empty_metadata'),
         pytest.param({'supersedes': ''}, False, id='falsy_supersedes_no_other_marker'),
+        pytest.param(
+            {'source': 'stage1_flag_marker', 'task_id': '7', 'flag_type': 'x'},
+            False,
+            id='non_authoritative_flag_marker_source',
+        ),
+        pytest.param(
+            {'source': 'stage1_human_operator_stall_marker', 'task_id': '7'},
+            False,
+            id='non_authoritative_stall_marker_source',
+        ),
     ],
 )
 def test_is_authoritative_resolution_truth_table(metadata, expected):
-    """Pure classifier: truthy `supersedes` OR non-echo `source` => authoritative.
+    """Pure classifier: truthy `supersedes` OR allowlisted `source` => authoritative.
+
+    The source check is an allowlist (`_AUTHORITATIVE_SOURCES`), not "any source
+    other than the echo source" — real task_id-tagged writers like flag_dedup.py's
+    `stage1_flag_marker` and stage1_stall_detector.py's
+    `stage1_human_operator_stall_marker` are lifecycle/flag markers, not
+    resolutions, and must NOT suppress the completion echo's description
+    (task 1984 amendment: over-suppression-risk fix).
 
     Plain prior targeted echoes (source='targeted_reconciliation', no supersedes)
     are deliberately NOT authoritative, so a task's own earlier echoes never
