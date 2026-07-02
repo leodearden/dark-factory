@@ -397,5 +397,36 @@ def main() -> None:
             log(f"watchdog error for {unit} (port {port}): {exc}")
 
 
+def staleness_pass() -> None:
+    """Restart any running orchestrator unit stale w.r.t. the newest watched commit.
+
+    Fleet-wide backstop for the event-driven restart-all coordinator
+    (plans/orchestrator-fleet-staleness-prd.md): a unit is stale when its
+    realtime start epoch predates the newest commit touching WATCHED_PATHS.
+    Stateless — staleness is recomputed from live systemd + git state on
+    every call, so a successful restart (from this pass, the coordinator, a
+    deploy capstone, or manual operator action) makes the unit read fresh on
+    the very next call. No stored state, no flap loop (I6).
+    """
+    commit_epoch = _newest_watched_commit_epoch()
+    if commit_epoch is None:
+        return  # undeterminable — fall safe, no restarts this tick
+
+    for unit in _enumerate_running_units():
+        try:
+            start_epoch = _unit_start_epoch(unit)
+            if start_epoch is None:
+                continue  # undeterminable for this unit — skip, don't guess
+            if start_epoch < commit_epoch:
+                log(
+                    f"WARNING: {unit} started at {start_epoch} before the newest "
+                    f"watched commit ({commit_epoch}); restarting for staleness"
+                )
+                restart_unit(unit)
+                log(f"{unit} staleness restart issued")
+        except Exception as exc:  # noqa: BLE001
+            log(f"staleness probe error for {unit}: {exc}")
+
+
 if __name__ == "__main__":
     main()
