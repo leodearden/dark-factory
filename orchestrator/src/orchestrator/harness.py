@@ -4967,6 +4967,7 @@ Output JSON matching the schema. Every task must appear in the output.
         self._service_restart_coordinators = [
             self._build_service_restart_coordinator(),
             self._build_dashboard_restart_coordinator(),
+            self._build_orchestrator_restart_coordinator(),
         ]
 
         # Build the callback factory here (where self.scheduler is live) and
