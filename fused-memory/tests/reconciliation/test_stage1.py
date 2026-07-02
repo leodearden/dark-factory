@@ -1974,3 +1974,177 @@ class TestConsolidatorRunFetchDegradedStat:
             f"got: {report.stats.get('stage1_fetch_degraded')!r}. "
             "RED: _format_assembled_payload does not append 'status' to _fetch_degraded_sources."
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 1977 step-1/step-3: Stage 1 payload renders '### Live-Workflow Signals'
+# ---------------------------------------------------------------------------
+
+
+class TestStage1PayloadLiveWorkflowSignalsSection:
+    """assemble_payload() / _format_assembled_payload() render a
+    '### Live-Workflow Signals' section when an active task has a live workflow
+    (mirrors Stage 2's TestAssemblePayloadLiveWorkflowSignalsSection, task 1655).
+
+    The renderer (_render_live_workflow_section) is imported into
+    memory_consolidator.py from task_knowledge_sync.py, so tests monkeypatch
+    the detector at its home namespace (tks_module.detect_live_workflow) —
+    the same namespace the renderer's module-level call resolves against.
+
+    RED until step-2 wires _build_live_workflow_section() into assemble_payload
+    (legacy path); the assembled-path cases (test_assembled_path_*) stay RED
+    until step-4 additionally wires it into _format_assembled_payload.
+    """
+
+    def _make_tree(self, tasks: list[dict]) -> FilteredTaskTree:
+        """Build a FilteredTaskTree with the given tasks as active_tasks."""
+        return FilteredTaskTree(
+            active_tasks=tasks,
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=len(tasks),
+            max_task_id=max((t.get('id', 0) for t in tasks), default=0),
+        )
+
+    # ── legacy (time-windowed) assemble_payload path ────────────────────
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_includes_section_for_live_task(self, monkeypatch):
+        """Legacy assemble_payload lists the live task id under '### Live-Workflow Signals'."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        live_task_id = '4321'
+        not_live_task_id = '100'
+        live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
+        other_task = {'id': int(not_live_task_id), 'title': 'Other task', 'status': 'blocked'}
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            if str(task_id) == live_task_id:
+                return WorkflowLiveness(
+                    is_live=True,
+                    worktree_registered=True,
+                    recent_commit=False,
+                    orchestrator_live=False,
+                    branch=f'task/{live_task_id}',
+                    last_commit_at=None,
+                )
+            return WorkflowLiveness(
+                is_live=False,
+                worktree_registered=False,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = _make_consolidator(project_root='/project')
+        stage.filtered_task_tree = self._make_tree([live_task, other_task])
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### Live-Workflow Signals' in payload, (
+            f"Expected '### Live-Workflow Signals' section in payload; "
+            f"got snippet:\n{payload[-800:]!r}"
+        )
+        assert live_task_id in payload, (
+            f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals; "
+            f"got snippet:\n{payload[-800:]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_omits_section_when_no_task_live(self, monkeypatch):
+        """Section absent when no active task is live (keeps the payload tight)."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            return WorkflowLiveness(
+                is_live=False,
+                worktree_registered=False,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = _make_consolidator(project_root='/project')
+        stage.filtered_task_tree = self._make_tree(
+            [{'id': 100, 'title': 'Other', 'status': 'blocked'}]
+        )
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### Live-Workflow Signals' not in payload, (
+            f"Expected '### Live-Workflow Signals' absent when no task is live; "
+            f"got snippet:\n{payload[-800:]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_omits_section_when_project_root_empty(self, monkeypatch):
+        """Section absent when project_root is '' even if an active task would be live."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            return WorkflowLiveness(
+                is_live=True,
+                worktree_registered=True,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = _make_consolidator(project_root='')
+        stage.filtered_task_tree = self._make_tree(
+            [{'id': 4321, 'title': 'Live', 'status': 'in-progress'}]
+        )
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### Live-Workflow Signals' not in payload, (
+            f"Expected '### Live-Workflow Signals' absent when project_root is empty; "
+            f"got snippet:\n{payload[-800:]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_path_omits_section_when_no_filtered_task_tree(self, monkeypatch):
+        """Section absent when filtered_task_tree is None (the _make_consolidator default)."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        def _fake_detect(task_id, project_root, **kwargs):
+            return WorkflowLiveness(
+                is_live=True,
+                worktree_registered=True,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+
+        stage = _make_consolidator(project_root='/project')
+        assert stage.filtered_task_tree is None
+        watermark = Watermark(project_id='test_project')
+
+        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### Live-Workflow Signals' not in payload, (
+            f"Expected '### Live-Workflow Signals' absent when filtered_task_tree is None; "
+            f"got snippet:\n{payload[-800:]!r}"
+        )
