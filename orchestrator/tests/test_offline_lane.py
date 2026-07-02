@@ -57,6 +57,8 @@ def _make_worker(
     config: MagicMock | None = None,
     suite_runner=None,
     confirmation_runner=None,
+    infra_runner=None,
+    infra_confirmation_runner=None,
     task_client=None,
     escalation_queue=None,
 ) -> OfflineLaneWorker:
@@ -67,6 +69,8 @@ def _make_worker(
         lock_path=tmp_path / 'offline_lane.lock',
         suite_runner=suite_runner,
         confirmation_runner=confirmation_runner,
+        infra_runner=infra_runner,
+        infra_confirmation_runner=infra_confirmation_runner,
         task_client=task_client,
         escalation_queue=escalation_queue,
     )
@@ -940,3 +944,33 @@ async def test_default_confirmation_run_empty_stdout_means_no_confirmed_failures
         confirmed = await worker.confirmation_runner(wt_path, 'HEAD1')
 
     assert confirmed == []
+
+
+# ---------------------------------------------------------------------------
+# infra seams — constructor wiring (task 1959, IE1, step-3/4)
+# ---------------------------------------------------------------------------
+
+
+def test_infra_seams_injected_or_default(tmp_path: Path):
+    """infra_runner/infra_confirmation_runner are stored when injected, else
+    fall back to their bound default methods (task 1959, IE1).
+
+    Mirrors the existing suite_runner/confirmation_runner wiring.
+
+    Step 3 (RED): the constructor params and the default methods do not
+    exist yet — must fail before impl.
+    """
+    sentinel_infra = AsyncMock(return_value=(0, ''))
+    sentinel_conf = AsyncMock(return_value=[])
+    worker = _make_worker(
+        tmp_path, infra_runner=sentinel_infra, infra_confirmation_runner=sentinel_conf,
+    )
+    assert worker.infra_runner is sentinel_infra
+    assert worker.infra_confirmation_runner is sentinel_conf
+
+    worker_default = _make_worker(tmp_path)
+    assert worker_default.infra_runner == worker_default._default_run_infra
+    assert (
+        worker_default.infra_confirmation_runner
+        == worker_default._default_infra_confirmation_run
+    )
