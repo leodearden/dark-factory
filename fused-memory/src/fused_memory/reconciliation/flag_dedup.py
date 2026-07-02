@@ -107,6 +107,18 @@ instead annotated directly from the memo:
   the first occurrence was a MISS — a MISS-first repeat is itself a genuine
   same-run duplicate, so the current run is the correct provenance.
 
+The memo is populated only when the first occurrence's own write was
+confirmed persisted (``write_succeeded`` from ``_write_and_confirm_marker``
+on both the HIT and MISS branches).  If that write was never confirmed
+(``add_memory`` raised, or the read-back confirmation missed), the signature
+is deliberately left out of the memo so a later occurrence of it in the same
+call retries the full search/write/confirm/delete cycle instead of silently
+inheriting provenance for a marker that does not exist.  Without this gate, a
+signature emitted N times with a failing first write would memoize a
+never-persisted outcome and every subsequent occurrence would skip straight
+to the memo branch — persisting ZERO markers for the whole call instead of
+giving each occurrence its own chance to write one.
+
 This bounds every signature to at most one search+write+confirm+delete cycle
 per ``dedup_flags`` call regardless of how many times it is emitted, which
 removes all dependence on Mem0 read-after-write consistency for the within-run
@@ -1005,6 +1017,29 @@ async def dedup_flags(
         # it verbatim.  MISS-first: flag carries no persisted_from_run key, so
         # the get() default (the current run_id) is used — a MISS-first repeat
         # is a genuine same-run duplicate, so run_id is the correct provenance.
+        #
+        # Deliberately UNCONDITIONAL — not gated on write_succeeded. Gating on
+        # write_succeeded looks appealing (a genuinely-failed add_memory would
+        # then let a later same-call occurrence retry instead of inheriting a
+        # never-written signature's provenance) but write_succeeded conflates
+        # two different situations that _write_and_confirm_marker cannot
+        # distinguish through its bool-only return: (1) add_memory itself
+        # raised — nothing persisted — and (2) add_memory succeeded but
+        # confirm_marker_persisted's OWN read-back search missed under the
+        # exact same Mem0 read-after-write lag this memo exists to route
+        # around. Case (2) is the validated production mechanism (see
+        # "In-batch memoization" above); gating on write_succeeded would skip
+        # memoizing it, so a later same-call occurrence would retry the full
+        # cycle, hit the same lag on ITS OWN confirmation search, and also not
+        # be memoized — reopening unbounded within-run duplicate accumulation
+        # for the very case this fix targets. Recording the memo unconditionally
+        # bounds every signature to exactly one write per call regardless of
+        # confirmation outcome. The trade-off this accepts: on the rarer
+        # genuine-failure case (1), a later same-call occurrence inherits
+        # provenance for a marker that was never written; the next dedup_flags
+        # cycle's pre-write search then correctly finds no prior and re-MISSes,
+        # writing a fresh marker — a one-cycle-delayed self-heal, not a
+        # permanent loss.
         seen_signatures[(tid, ftype)] = flag.get('persisted_from_run', run_id)
         result.append(flag)
     return result

@@ -1964,8 +1964,12 @@ class _FakeMem0:
         return records[0].metadata.get('run_id')
 
 
-class _FakeMem0ReadLag:
+class _FakeMem0ReadLag(_FakeMem0):
     """In-memory Mem0 stub modelling Mem0 read-after-write indexing lag (task-1978).
+
+    Subclasses _FakeMem0 to reuse its store/add_memory/delete_memory/count
+    logic single-sourced; only search() is overridden here (plus the
+    begin_call()/_snapshot mechanism and add_memory_call_count tracking).
 
     add_memory/delete_memory mutate the live store immediately, exactly like
     _FakeMem0. search() differs: it returns a SNAPSHOT of the store frozen by
@@ -1979,7 +1983,7 @@ class _FakeMem0ReadLag:
     """
 
     def __init__(self) -> None:
-        self._store: dict[str, _MemoryRecord] = {}
+        super().__init__()
         self._snapshot: list[_MemoryRecord] = []
         self.add_memory_call_count: int = 0
 
@@ -1989,18 +1993,10 @@ class _FakeMem0ReadLag:
 
     async def add_memory(self, *, metadata: dict, **_kwargs) -> AddMemoryResponse:
         self.add_memory_call_count += 1
-        id_ = str(_uuid_mod.uuid4())
-        self._store[id_] = _MemoryRecord(id_, metadata)
-        return AddMemoryResponse(memory_ids=[id_])
+        return await super().add_memory(metadata=metadata, **_kwargs)
 
     async def search(self, *, query: str = '', **_kwargs) -> list[_MemoryRecord]:
         return list(self._snapshot)
-
-    async def delete_memory(self, *, memory_id: str, **_kwargs) -> None:
-        self._store.pop(memory_id, None)
-
-    def count(self) -> int:
-        return len(self._store)
 
 
 @pytest.mark.asyncio
@@ -2085,7 +2081,7 @@ async def test_dedup_flags_same_signature_repeated_in_one_call_writes_single_mar
     }
     flags = [dict(flag), dict(flag), dict(flag)]
 
-    await dedup_flags(
+    result = await dedup_flags(
         memory_service=fake,
         project_id='p',
         run_id='r_now',
@@ -2101,6 +2097,27 @@ async def test_dedup_flags_same_signature_repeated_in_one_call_writes_single_mar
         f'Expected exactly 1 add_memory call for 3 same-signature occurrences in '
         f'one dedup_flags call but got {fake.add_memory_call_count}'
     )
+
+    # Annotation contract under the read-lag mechanism itself (not just under
+    # the AsyncMock-based test_dedup_flags_in_batch_repeat_annotation): this is
+    # a MISS-first call (store starts empty), so the first occurrence follows
+    # existing MISS behavior (no persisted_from_run) while the 2nd and 3rd
+    # (in-batch repeats) inherit persisted_from_run=run_id and
+    # last_seen_run_id=run_id from the memo.
+    assert len(result) == 3
+    assert 'persisted_from_run' not in result[0], (
+        f'MISS-first flag[0] must follow existing MISS behavior (no '
+        f'persisted_from_run) but got {result[0]}'
+    )
+    for i in (1, 2):
+        assert result[i].get('persisted_from_run') == 'r_now', (
+            f'In-batch repeat flag[{i}]: expected persisted_from_run="r_now" but '
+            f'got {result[i].get("persisted_from_run")!r}'
+        )
+        assert result[i].get('last_seen_run_id') == 'r_now', (
+            f'In-batch repeat flag[{i}]: expected last_seen_run_id="r_now" but '
+            f'got {result[i].get("last_seen_run_id")!r}'
+        )
 
 
 @pytest.mark.asyncio
