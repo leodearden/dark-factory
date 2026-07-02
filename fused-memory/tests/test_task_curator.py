@@ -4160,8 +4160,13 @@ class TestCuratorPremiseRefutedDrop:
         mock_llm.assert_not_called()
         mock_exact.assert_not_called()
 
-    async def test_decision_stored_in_cache(self, tmp_path):
-        """The decision is stored in _decision_cache under payload_hash."""
+    async def test_premise_refuted_drop_not_stored_in_cache(self, tmp_path):
+        """The recon-premise-refuted drop is deliberately NOT stored in
+        _decision_cache — unlike the blocklist's unconditional forever-drop,
+        this guard must re-verify live source on every call so it self-corrects
+        the moment the source stops refuting the premise. Caching the drop would
+        let a stale decision suppress a genuinely-fixed premise for up to
+        idempotency_ttl_seconds after the source changes."""
         source_root = tmp_path / "source_root"
         source_root.mkdir()
         (source_root / "memory_service.py").write_text("invalid_at\n", encoding="utf-8")
@@ -4184,11 +4189,59 @@ class TestCuratorPremiseRefutedDrop:
 
         decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
-        payload_hash = candidate.payload_hash()
-        assert payload_hash in curator._decision_cache
-        cached_dec, _ = curator._decision_cache[payload_hash]
-        assert cached_dec.action == "drop"
-        assert cached_dec.justification == decision.justification
+        assert decision.action == "drop"
+        assert decision.justification.startswith("recon-premise-refuted:")
+        assert candidate.payload_hash() not in curator._decision_cache
+
+    async def test_premise_drop_self_corrects_after_source_change(self, tmp_path):
+        """The guard is self-correcting across calls: once the fixture source is
+        rewritten so it no longer refutes the premise, the SAME candidate must
+        stop being dropped on the very next curate() call — proving no stale
+        drop decision was cached from the first call."""
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        source_file = source_root / "memory_service.py"
+        # Premise refuted: the file DOES contain the must_contain token.
+        source_file.write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        fake_exact_match, fake_corpus, create_result = _make_create_mocks()
+
+        with patch.object(curator, "_pre_llm_exact_match", side_effect=fake_exact_match), \
+             patch.object(curator, "_build_corpus", side_effect=fake_corpus), \
+             patch("fused_memory.middleware.task_curator.invoke_with_cap_retry",
+                   new=AsyncMock(return_value=create_result)):
+            decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
+
+            assert decision1.action == "drop"
+            assert decision1.justification.startswith("recon-premise-refuted:")
+            assert candidate.payload_hash() not in curator._decision_cache
+
+            # Premise now VALID: rewrite the fixture, removing the must_contain
+            # token — a genuine bug now exists (the filter really is missing).
+            source_file.write_text("def rebuild():\n    pass\n", encoding="utf-8")
+
+            decision2 = await curator.curate(candidate, project_id="p", project_root="/x")
+
+        assert decision2.action == "create"
+        assert not decision2.justification.startswith("recon-premise-refuted:")
 
     async def test_registry_unset_falls_through(self, tmp_path):
         """(c1) recon_code_fix_premise_registry_path=None -> curate() proceeds past the guard."""
@@ -4413,4 +4466,77 @@ class TestCuratorBatchPremiseRefutedDrop:
         assert len(llm_candidates_received) == 2
         assert decisions[0].action == "create"
         assert decisions[1].action == "create"
+
+    async def test_batch_premise_drop_self_corrects_after_source_change(self, tmp_path):
+        """Same self-correction scenario as
+        TestCuratorPremiseRefutedDrop.test_premise_drop_self_corrects_after_source_change,
+        driven through curate_batch_prepared() twice: the first call drops the
+        candidate pre-LLM; after the fixture source is rewritten to no longer
+        refute the premise, the identical candidate must reach the (mocked) LLM
+        on the second call instead of being suppressed by a stale cached drop.
+        """
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        source_file = source_root / "memory_service.py"
+        source_file.write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        c0 = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        llm_decisions_returned = [
+            CuratorDecision(action="create", justification="genuinely new",
+                            pool_sizes=empty_sizes, latency_ms=0),
+        ]
+        llm_candidates_received: list[CandidateTask] = []
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            llm_candidates_received.extend(cands)
+            return llm_decisions_returned
+
+        with patch.object(
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
+        ):
+            decisions1 = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+            assert decisions1[0].action == "drop"
+            assert decisions1[0].justification.startswith("recon-premise-refuted:")
+            assert len(llm_candidates_received) == 0
+            assert c0.payload_hash() not in curator._decision_cache
+
+            # Premise now VALID: rewrite the fixture, removing the must_contain
+            # token — a genuine bug now exists (the filter really is missing).
+            source_file.write_text("def rebuild():\n    pass\n", encoding="utf-8")
+
+            decisions2 = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        assert len(llm_candidates_received) == 1
+        assert llm_candidates_received[0] is c0
+        assert decisions2[0].action == "create"
+        assert not decisions2[0].justification.startswith("recon-premise-refuted:")
 
