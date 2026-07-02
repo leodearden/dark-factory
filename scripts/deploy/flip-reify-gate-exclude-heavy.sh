@@ -13,7 +13,10 @@ set -euo pipefail
 # deterministic runner around signal_config_reload() (PRD §11.6 open-Q).
 #
 # Usage:
-#   flip-reify-gate-exclude-heavy.sh
+#   flip-reify-gate-exclude-heavy.sh [--check|--dry-run]
+#
+# --check / --dry-run: print the one-line diff that WOULD be applied and
+# exit 0 without touching the repo.
 #
 # Env overrides (mirrors restart-orchestrator.sh's RESTART_VERIFY_TIMEOUT):
 #   REIFY_REPO - path to the reify checkout (default: /home/leo/src/reify)
@@ -25,8 +28,20 @@ KNOB="REIFY_GATE_EXCLUDE_HEAVY"
 
 MODE="apply"
 
+for arg in "$@"; do
+    case "$arg" in
+        --check|--dry-run)
+            MODE="check"
+            ;;
+    esac
+done
+
 is_flipped() {
     grep -qE "^[[:space:]]*${KNOB}:[[:space:]]*\"?1\"?[[:space:]]*\$" "$CONFIG_PATH"
+}
+
+print_intended_diff() {
+    echo "+  ${KNOB}: \"1\"   (under verify_env: in ${CONFIG_PATH})"
 }
 
 apply_flip() {
@@ -50,6 +65,11 @@ apply_flip() {
 main() {
     if is_flipped; then
         echo "flip-reify-gate: already flipped (no-op)"
+        exit 0
+    fi
+
+    if [[ "$MODE" == "check" ]]; then
+        print_intended_diff
         exit 0
     fi
 
