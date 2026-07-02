@@ -22,7 +22,12 @@ import pytest
 
 from orchestrator import config as orchestrator_config
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, InteractiveWorktreeInfo, _run
+from orchestrator.git_ops import (
+    GitOps,
+    InteractiveWorktreeInfo,
+    InteractiveWorktreeLimitError,
+    _run,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -313,4 +318,54 @@ class TestCreateInteractiveWorktreeFailSoftWarmth:
             f'expected {info.path} to remain a REGISTERED git worktree after a '
             f'seed failure (fail-soft retention, not the acquire_warm_lane '
             f'remove-on-failure behaviour); worktree list: {wt_list!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-09: max_interactive_worktrees cap (REJECT)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreateInteractiveWorktreeCap:
+    """RED — max_interactive_worktrees enforces a REJECT cap before any git op."""
+
+    async def test_cap_rejects_third_worktree_then_frees_on_removal(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """Cap of 2: 'a'/'b' succeed, 'c' is rejected, 'd' succeeds once freed."""
+        await _add_seed_script(iw_git_repo)
+        config = GitConfig(max_interactive_worktrees=2)
+        git_ops = GitOps(config, iw_git_repo)
+
+        info_a = await git_ops.create_interactive_worktree('a')
+        info_b = await git_ops.create_interactive_worktree('b')
+        assert info_a.path.exists() and info_b.path.exists(), (
+            'setup: both a and b should be created within the cap'
+        )
+
+        with pytest.raises(InteractiveWorktreeLimitError):
+            await git_ops.create_interactive_worktree('c')
+
+        c_path = git_ops.worktree_base / '_iact-c'
+        assert not c_path.exists(), (
+            f'expected {c_path} to NOT exist after a cap-rejected create'
+        )
+        rc_branch, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/c'], cwd=iw_git_repo,
+        )
+        assert rc_branch != 0, (
+            'expected no task/c branch to have been created by the rejected call'
+        )
+
+        # Free a slot by removing one of the existing interactive worktrees.
+        rc_remove, _, remove_err = await _run(
+            ['git', 'worktree', 'remove', '--force', str(info_a.path)],
+            cwd=iw_git_repo,
+        )
+        assert rc_remove == 0, f'setup: failed to remove {info_a.path}: {remove_err}'
+
+        info_d = await git_ops.create_interactive_worktree('d')
+        assert info_d.path.exists(), (
+            'expected create_interactive_worktree("d") to succeed once a slot freed'
         )
