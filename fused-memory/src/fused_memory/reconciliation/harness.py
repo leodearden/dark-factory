@@ -2415,6 +2415,13 @@ class ReconciliationHarness:
         # (deferred/done/cancelled) drop the project-wide orchestrator_live signal
         # instead of being suppressed by it. remediation_tree is always a valid
         # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+        # Coverage caveat: active_tasks is uncapped (deferred — the cited case —
+        # always resolves), but done_tasks/cancelled_tasks are capped at
+        # MAX_DONE_TASKS_RETAINED=30 / MAX_CANCELLED_TASKS_RETAINED=15
+        # (task_filter.py). A cited done/cancelled task outside those caps, or one
+        # with an untracked status, is simply absent here and status_by_id.get(tid)
+        # falls back to None below — the pre-2031 status-blind behavior for that
+        # one id, not a new failure mode.
         status_by_id: dict[str, str | None] = {
             str(t.get('id')): t.get('status')
             for t in (
