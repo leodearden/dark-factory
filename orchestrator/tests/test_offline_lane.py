@@ -1184,3 +1184,116 @@ async def test_handle_red_run_uses_injected_confirmation_runner_for_infra(tmp_pa
     wt2 = Path('/tmp/_offline-deep-2')
     await worker._handle_red_run(wt2, 'HEAD1')
     numeric_confirmation_runner.assert_awaited_once_with(wt2, 'HEAD1')
+
+
+# ---------------------------------------------------------------------------
+# _run_once — dual sub-run when infra enabled (task 1959, IE1, step-11/12)
+# ---------------------------------------------------------------------------
+
+
+def _log_call_text(call) -> str:
+    """Join a mock logger call's args into one searchable string.
+
+    Format-agnostic: works whether the message uses %-style placeholders
+    or plain text, since it just concatenates the format string with all
+    of its interpolation args.
+    """
+    return ' '.join(str(a) for a in call.args)
+
+
+@pytest.mark.asyncio
+async def test_run_once_runs_both_sub_runs_when_infra_enabled(tmp_path: Path):
+    """_run_once runs the infra sub-run (at the SAME snapshot head, in the
+    SAME worktree) when offline_lane_infra_enabled is True, reusing β3's red
+    path via the infra confirmation runner; _last_green_head only advances
+    when ALL executed sub-runs pass at that head. When infra is disabled
+    (default), only the numeric sub-run runs — byte-identical to prior
+    behavior.
+
+    Mirrors test_run_once_wires_red_and_green_paths_by_returncode.
+
+    Step 11 (RED): _run_once does not run the infra sub-run yet —
+    infra_runner is never awaited and _handle_red_run is never called with
+    confirmation_runner=infra_confirmation_runner. Must fail before impl.
+    """
+    wt_path = tmp_path / '_offline-deep'
+
+    # -- Scenario A: infra enabled, numeric green + infra red.
+    git_ops_a = _make_git_ops(head='HEAD1', worktree_path=wt_path)
+    config_a = _make_config(tmp_path, offline_lane_infra_enabled=True)
+    suite_runner_a = AsyncMock(return_value=(0, ''))
+    infra_runner_a = AsyncMock(return_value=(1, ''))
+    infra_conf_a = AsyncMock(return_value=[])
+    worker_a = _make_worker(
+        tmp_path,
+        git_ops=git_ops_a,
+        config=config_a,
+        suite_runner=suite_runner_a,
+        infra_runner=infra_runner_a,
+        infra_confirmation_runner=infra_conf_a,
+    )
+    worker_a._handle_red_run = AsyncMock()
+    worker_a._dirty = True
+
+    with patch('orchestrator.offline_lane.logger') as mock_logger:
+        await worker_a._run_once()
+
+    threads_a = config_a.git.offline_lane_test_threads
+    suite_runner_a.assert_awaited_once_with(wt_path, 'HEAD1', threads_a)
+    infra_runner_a.assert_awaited_once_with(wt_path, 'HEAD1', threads_a)
+    worker_a._handle_red_run.assert_awaited_once_with(
+        wt_path, 'HEAD1', confirmation_runner=worker_a.infra_confirmation_runner,
+    )
+    assert worker_a._last_green_head is None, (
+        'infra red must block the both-green advance even though numeric was green'
+    )
+
+    info_texts = [_log_call_text(call) for call in mock_logger.info.call_args_list]
+    assert any('numeric' in t and 'HEAD1' in t and 'PASS' in t for t in info_texts), (
+        f'expected a numeric-labeled PASS log line, got {info_texts!r}'
+    )
+    assert any('infra' in t and 'HEAD1' in t and 'FAIL' in t for t in info_texts), (
+        f'expected an infra-labeled FAIL log line, got {info_texts!r}'
+    )
+
+    # -- Scenario B: infra enabled, both sub-runs green.
+    git_ops_b = _make_git_ops(head='HEAD2', worktree_path=wt_path)
+    config_b = _make_config(tmp_path, offline_lane_infra_enabled=True)
+    suite_runner_b = AsyncMock(return_value=(0, ''))
+    infra_runner_b = AsyncMock(return_value=(0, ''))
+    worker_b = _make_worker(
+        tmp_path,
+        git_ops=git_ops_b,
+        config=config_b,
+        suite_runner=suite_runner_b,
+        infra_runner=infra_runner_b,
+    )
+    worker_b._handle_red_run = AsyncMock()
+    worker_b._dirty = True
+
+    await worker_b._run_once()
+
+    infra_runner_b.assert_awaited_once_with(wt_path, 'HEAD2', config_b.git.offline_lane_test_threads)
+    worker_b._handle_red_run.assert_not_awaited()
+    assert worker_b._last_green_head == 'HEAD2'
+
+    # -- Scenario C: infra disabled (default) — numeric-only, unchanged.
+    git_ops_c = _make_git_ops(head='HEAD3', worktree_path=wt_path)
+    config_c = _make_config(tmp_path)  # offline_lane_infra_enabled defaults False
+    suite_runner_c = AsyncMock(return_value=(0, ''))
+    infra_runner_c = AsyncMock(return_value=(0, ''))
+    worker_c = _make_worker(
+        tmp_path,
+        git_ops=git_ops_c,
+        config=config_c,
+        suite_runner=suite_runner_c,
+        infra_runner=infra_runner_c,
+    )
+    worker_c._handle_red_run = AsyncMock()
+    worker_c._dirty = True
+
+    await worker_c._run_once()
+
+    infra_runner_c.assert_not_awaited()
+    worker_c._handle_red_run.assert_not_awaited()
+    assert worker_c._last_green_head == 'HEAD3'
