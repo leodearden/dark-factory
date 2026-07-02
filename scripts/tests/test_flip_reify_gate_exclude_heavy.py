@@ -14,6 +14,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).parent.parent / "deploy" / "flip-reify-gate-exclude-heavy.sh"
 CONFIG_FILE = "orchestrator.yaml"
 KNOB = "REIFY_GATE_EXCLUDE_HEAVY"
@@ -218,3 +220,33 @@ def test_apply_normalizes_stray_zero_value_to_single_key(tmp_path):
         f"Expected the stray \"0\" value normalized to \"1\"; config:\n{config_text}"
     )
     assert f'{KNOB}: "0"' not in config_text
+
+
+# ---------------------------------------------------------------------------
+# step-5: RED -- --check / --dry-run mode
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", ["--check", "--dry-run"])
+def test_check_mode_prints_diff_without_mutating(tmp_path, flag):
+    """--check (and its --dry-run alias) on an unflipped config prints the
+    intended one-line diff, exits 0, and leaves the repo untouched."""
+    repo = _make_fake_reify_repo(tmp_path)
+    before_config = _read_config(repo)
+    before_commits = _commit_count(repo)
+
+    result = _run_script(repo, flag)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0 for {flag}; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "+" in result.stdout and KNOB in result.stdout and '"1"' in result.stdout, (
+        f"Expected a '+'-prefixed line naming {KNOB} with value \"1\" in stdout; "
+        f"got: {result.stdout!r}"
+    )
+    assert "verify_env" in result.stdout, (
+        f"Expected the intended diff to reference verify_env; got: {result.stdout!r}"
+    )
+
+    assert _read_config(repo) == before_config, f"{flag} must not mutate orchestrator.yaml"
+    assert _commit_count(repo) == before_commits, f"{flag} must not create a commit"
