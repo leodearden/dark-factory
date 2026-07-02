@@ -83,7 +83,74 @@ class TestCarriesRemediationHistory:
         content = 'CYCLE SUMMARY: QUIESCENT CYCLE. 0 MUTATIONS.'
         assert self._call(content) is False
 
+    def test_zero_count_action_fields_are_boilerplate_not_remediation(self):
+        """Real Stage 1 quiescent format: zero-valued action FIELDS
+        ("memories_deleted: 0") must not trip the 'deleted' keyword."""
+        content = (
+            'FLAGS EMITTED THIS CYCLE: none\n'
+            'flag_ids_this_cycle: []\n'
+            'MUTATIONS THIS CYCLE:\n'
+            '- memories_added: 0 (excluding this summary)\n'
+            '- memories_deleted: 0\n'
+            '- edges_updated: 0\n'
+            '- graphiti_writes_queued: 0\n'
+            '- entity_refresh_failed_uuids: []'
+        )
+        assert self._call(content) is False
+
+    def test_clean_cycle_stage2_boilerplate(self):
+        """Real Stage 2 quiescent format: 'Clean cycle' with zero-valued
+        processed-counts is deletable boilerplate."""
+        content = (
+            'flag_ids_processed: none\n'
+            'tasks_created: none\n'
+            'stage1_mem0_flags_processed: 0\n'
+            'Clean cycle -- Stage 1 emitted 0 flagged items, 0 mem0 '
+            'active-query flags, 0 stale escalation flags.'
+        )
+        assert self._call(content) is False
+
+    def test_no_new_episodes_prose_marker(self):
+        content = 'Cycle summary: No new episodes. Nothing else to report.'
+        assert self._call(content) is False
+
     # --- Real remediation -> True ---
+
+    def test_nonzero_action_field_preserved(self):
+        """A non-zero action field ("edges_updated: 3") is remediation
+        evidence even alongside quiescent zero-fields."""
+        content = (
+            'MUTATIONS THIS CYCLE:\n'
+            '- memories_added: 0\n'
+            '- memories_deleted: 0\n'
+            '- edges_updated: 3'
+        )
+        assert self._call(content) is True
+
+    def test_nonzero_paren_count_preserved(self):
+        """Parenthesised action counts ("memories_deleted (3):") are
+        remediation evidence."""
+        content = (
+            'flag_ids_emitted: none. No new episodes.\n'
+            'MUTATIONS THIS CYCLE:\n'
+            '- memories_deleted (3):\n'
+            '  - b59149f3 (stale dispatch-readiness claim)'
+        )
+        assert self._call(content) is True
+
+    def test_remediation_mode_summary_preserved(self):
+        content = (
+            'stage: memory_consolidator (remediation run). No new episodes.\n'
+            'REMEDIATION FINDINGS ADDRESSED (4): ...'
+        )
+        assert self._call(content) is True
+
+    def test_nonzero_flags_processed_field_preserved(self):
+        content = (
+            'Clean cycle otherwise. stage1_flags_processed: 2\n'
+            'memories_written: 1'
+        )
+        assert self._call(content) is True
 
     def test_deleted_entity_mentioned(self):
         content = 'Cycle summary: deleted entity e47ac10b-58cc-4372-a567-0e02b2c3d479 (duplicate).'

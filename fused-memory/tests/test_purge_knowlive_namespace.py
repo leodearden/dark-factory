@@ -212,35 +212,42 @@ class TestEnumerateGraphitiNamespace:
 class TestEnumerateMem0Namespace:
     """Tests for async enumerate_mem0_namespace(memory_service, namespace, *, limit)."""
 
-    @pytest.mark.asyncio
-    async def test_calls_count_and_scroll_with_project_id_and_empty_filters(self):
-        """Both count_memories_by_metadata and get_memories_by_metadata are
-        called with project_id=namespace and filters={} (deterministic, not
-        semantic search)."""
+    @staticmethod
+    def _make_memory_service(members: list[dict], count: int) -> AsyncMock:
+        """AsyncMock memory_service with mem0.count/get_all wired (the live
+        backend's no-filter collection APIs; the metadata-filter APIs reject
+        an empty filters dict, so the script must never use them here)."""
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
-        memory_service.get_memories_by_metadata = AsyncMock(
-            return_value=[_mem0_member('m1'), _mem0_member('m2')]
+        memory_service.mem0 = MagicMock()
+        memory_service.mem0.count = AsyncMock(return_value=count)
+        memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_calls_count_and_get_all_scoped_to_namespace(self):
+        """Both mem0.count and mem0.get_all are called with a Scope for the
+        namespace (deterministic collection enumeration, not semantic search
+        and not the empty-filter metadata APIs the live backend rejects)."""
+        memory_service = self._make_memory_service(
+            [_mem0_member('m1'), _mem0_member('m2')], count=2,
         )
         memory_service.search = AsyncMock()
 
         await _mod.enumerate_mem0_namespace(memory_service, 'knowlive', limit=1000)
 
-        memory_service.count_memories_by_metadata.assert_called_once_with(
-            project_id='knowlive', filters={},
-        )
-        scroll_kwargs = memory_service.get_memories_by_metadata.call_args.kwargs
-        assert scroll_kwargs.get('project_id') == 'knowlive'
-        assert scroll_kwargs.get('filters') == {}
+        memory_service.mem0.count.assert_called_once()
+        assert memory_service.mem0.count.call_args.args[0].project_id == 'knowlive'
+        memory_service.mem0.get_all.assert_called_once()
+        get_all_call = memory_service.mem0.get_all.call_args
+        assert get_all_call.args[0].project_id == 'knowlive'
+        assert get_all_call.kwargs.get('limit') == 1000
         memory_service.search.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_returns_members_and_count_tuple(self):
         """Returns (members, count) -- the full list plus the authoritative count."""
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
         members = [_mem0_member('m1'), _mem0_member('m2')]
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service = self._make_memory_service(members, count=2)
 
         result = await _mod.enumerate_mem0_namespace(memory_service, 'knowlive', limit=1000)
 
@@ -250,10 +257,8 @@ class TestEnumerateMem0Namespace:
     async def test_warns_when_scroll_undercounts(self, caplog):
         """No-silent-caps: fewer enumerated members than the authoritative count
         logs a WARNING (scroll cap reached)."""
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=5)
-        memory_service.get_memories_by_metadata = AsyncMock(
-            return_value=[_mem0_member('m1'), _mem0_member('m2')]
+        memory_service = self._make_memory_service(
+            [_mem0_member('m1'), _mem0_member('m2')], count=5,
         )
 
         with caplog.at_level('WARNING'):
@@ -267,16 +272,32 @@ class TestEnumerateMem0Namespace:
     @pytest.mark.asyncio
     async def test_no_warning_when_fully_enumerated(self, caplog):
         """member count == authoritative count -> no WARNING."""
-        memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
-        memory_service.get_memories_by_metadata = AsyncMock(
-            return_value=[_mem0_member('m1'), _mem0_member('m2')]
+        memory_service = self._make_memory_service(
+            [_mem0_member('m1'), _mem0_member('m2')], count=2,
         )
 
         with caplog.at_level('WARNING'):
             await _mod.enumerate_mem0_namespace(memory_service, 'knowlive', limit=1000)
 
         assert caplog.records == []
+
+    @pytest.mark.asyncio
+    async def test_malformed_get_all_treated_as_empty_with_warning(self, caplog):
+        """A malformed/absent 'results' key from mem0.get_all is treated as an
+        empty enumeration and logged, never raised."""
+        memory_service = AsyncMock()
+        memory_service.mem0 = MagicMock()
+        memory_service.mem0.count = AsyncMock(return_value=3)
+        memory_service.mem0.get_all = AsyncMock(return_value=None)
+
+        with caplog.at_level('WARNING'):
+            members, count = await _mod.enumerate_mem0_namespace(
+                memory_service, 'knowlive', limit=1000,
+            )
+
+        assert members == []
+        assert count == 3
+        assert any('malformed' in rec.message.lower() for rec in caplog.records)
 
 
 # ===========================================================================
@@ -504,10 +525,11 @@ class TestRunDryRun:
         graphiti._graph_for = MagicMock(return_value=graph)
         memory_service.graphiti = graphiti
         members = mem0_members or []
-        memory_service.count_memories_by_metadata = AsyncMock(
+        memory_service.mem0 = MagicMock()
+        memory_service.mem0.count = AsyncMock(
             return_value=mem0_count if mem0_count is not None else len(members)
         )
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
         memory_service.delete_memory = AsyncMock(return_value=None)
         memory_service.update_edge = AsyncMock(return_value=None)
         return memory_service, graph
@@ -568,8 +590,10 @@ class TestRunDryRun:
         )
 
         memory_service.graphiti._graph_for.assert_called_once_with(_mod.LEGACY_NAMESPACE)
-        memory_service.count_memories_by_metadata.assert_called_once_with(
-            project_id=_mod.LEGACY_NAMESPACE, filters={},
+        memory_service.mem0.count.assert_called_once()
+        assert (
+            memory_service.mem0.count.call_args.args[0].project_id
+            == _mod.LEGACY_NAMESPACE
         )
 
     @pytest.mark.asyncio
@@ -652,10 +676,11 @@ class TestRunApply:
         graphiti._graph_for = MagicMock(return_value=graph)
         memory_service.graphiti = graphiti
         members = mem0_members or []
-        memory_service.count_memories_by_metadata = AsyncMock(
+        memory_service.mem0 = MagicMock()
+        memory_service.mem0.count = AsyncMock(
             return_value=mem0_count if mem0_count is not None else len(members)
         )
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
         if delete_side_effect is not None:
             memory_service.delete_memory = AsyncMock(side_effect=delete_side_effect)
         else:
@@ -789,8 +814,9 @@ class TestRunApply:
         memory_service = AsyncMock()
         memory_service.graphiti = graphiti
         members = [_mem0_member('m1')]
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=len(members))
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.mem0 = MagicMock()
+        memory_service.mem0.count = AsyncMock(return_value=len(members))
+        memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
         memory_service.delete_memory = AsyncMock(return_value=None)
         memory_service.update_edge = AsyncMock(return_value=None)
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
