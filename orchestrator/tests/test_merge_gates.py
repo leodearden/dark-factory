@@ -247,3 +247,65 @@ class TestReachBackRouting:
             f'result to be returned unchanged, got {result!r}'
         )
         git_ops.cleanup_merge_worktree.assert_awaited_once()
+
+
+def test_merge_queue_reexports_identical_objects() -> None:
+    """merge_queue re-exports the SAME objects from merge_gates (shim identity).
+
+    Covers every one of the 20 moved names.
+
+    RED (pre-shim): merge_queue.py still defines its own independent copies
+    of these names (the duplicate definitions left in place by the EXPAND
+    step), so ``getattr(merge_queue, name) is getattr(merge_gates, name)``
+    fails for every name — two distinct objects that merely share a name.
+    """
+    import orchestrator.merge_gates as merge_gates
+    import orchestrator.merge_queue as merge_queue
+
+    moved_names = [
+        'DROPPED_PLAN_TARGETS_REASON_PREFIX',
+        'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX',
+        'POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX',
+        'POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX',
+        'DropGuardResult',
+        'PlanFilesTouchedResult',
+        'PostMergePyrightResult',
+        '_GenerationChainContext',
+        '_OVERLAP_GIT_ERROR_SENTINEL',
+        '_check_plan_targets_in_tree',
+        '_normalize_plan_path',
+        '_check_plan_files_touched_in_branch',
+        '_check_post_merge_equivalence',
+        '_rebase_delta_touched_overlap',
+        '_reverify_rebased_tree',
+        '_check_post_merge_pyright',
+        '_resolve_second_parent',
+        '_commit_is_linear',
+        '_finalize_advanced_merge',
+        '_map_advance_failure',
+    ]
+
+    for name in moved_names:
+        mq_obj = getattr(merge_queue, name)
+        mg_obj = getattr(merge_gates, name)
+        assert mq_obj is mg_obj, (
+            f'{name}: orchestrator.merge_queue.{name} and '
+            f'orchestrator.merge_gates.{name} must be the identical object'
+        )
+
+
+def test_reason_prefix_byte_identical_literals() -> None:
+    """Reason-prefix string VALUES are byte-identical to their pre-extraction
+    literals, so existing ``reason.startswith(PREFIX)`` assertions and any
+    ``grep`` for the human-facing text keep matching unchanged."""
+    from orchestrator.merge_gates import (
+        DROPPED_PLAN_TARGETS_REASON_PREFIX,
+        PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+        POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+        POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+    )
+
+    assert DROPPED_PLAN_TARGETS_REASON_PREFIX == 'Merge commit is missing plan target files'
+    assert PLAN_FILES_NOT_TOUCHED_REASON_PREFIX == 'Plan files not touched by branch'
+    assert POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX == 'Post-merge content equivalence failed'
+    assert POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX == 'Post-merge unscoped type-check failed'
