@@ -12,6 +12,7 @@ script against it via `REIFY_REPO=<repo>`.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -385,3 +386,59 @@ def test_rejects_unknown_argument(tmp_path):
     assert result.stderr.strip(), f"Expected an error message on stderr; got stderr={result.stderr!r}"
     assert _read_config(repo) == before_config, "unknown arg must not mutate orchestrator.yaml"
     assert _commit_count(repo) == before_commits, "unknown arg must not create a commit"
+
+
+# ---------------------------------------------------------------------------
+# step-13: RED -- fail loudly on a missing verify_env: anchor; preserve the
+# config file's permissions across the mktemp+mv rewrite.
+# ---------------------------------------------------------------------------
+
+def test_apply_fails_loudly_when_verify_env_anchor_missing(tmp_path):
+    """If the config has no top-level verify_env: anchor, apply must fail
+    loudly (non-zero exit, stderr error, no mutation, no commit, no reload
+    signal) instead of silently reporting success without flipping the
+    knob -- otherwise a deterministic deploy task driven by this script
+    would be marked 'deployed-and-verified' despite the knob never having
+    been set."""
+    repo = _make_fake_reify_repo(tmp_path, state="no_verify_env")
+    before_config = _read_config(repo)
+    before_commits = _commit_count(repo)
+
+    result = _run_script(repo)
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit when verify_env: anchor is missing; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected an error message on stderr; got stderr={result.stderr!r}"
+    )
+    assert _read_config(repo) == before_config, (
+        "must not mutate orchestrator.yaml when the anchor is missing"
+    )
+    assert _commit_count(repo) == before_commits, (
+        "must not create a commit when the anchor is missing"
+    )
+    assert RELOAD_MARKER not in result.stdout, (
+        "must not emit the reload marker when the flip could not be applied"
+    )
+
+
+def test_apply_preserves_config_file_permissions(tmp_path):
+    """apply must not silently reset orchestrator.yaml's file mode to
+    mktemp's default 0600 via the mktemp+mv rewrite in apply_flip."""
+    repo = _make_fake_reify_repo(tmp_path)
+    config_path = repo / CONFIG_FILE
+    config_path.chmod(0o644)
+
+    result = _run_script(repo)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    mode = stat.S_IMODE(config_path.stat().st_mode)
+    assert mode == 0o644, (
+        f"Expected orchestrator.yaml to keep mode 0644 after the flip; "
+        f"got {oct(mode)}"
+    )
