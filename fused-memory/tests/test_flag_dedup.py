@@ -6876,3 +6876,126 @@ class TestFilterBlockedSnapshotFindings:
             f"got {result!r}"
         )
 
+
+# ---------------------------------------------------------------------------
+# Generic flag-acknowledgment mechanism (task-2029)
+#
+# acknowledge_flag_marker(mode='delete') — step-1 RED tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcknowledgeFlagMarkerDelete:
+    """RED tests for acknowledge_flag_marker(..., mode='delete') (step-1).
+
+    RED until step-2 adds acknowledge_flag_marker to flag_dedup.py.
+    """
+
+    async def test_deletes_single_matching_prior_and_returns_one(self):
+        """One matching prior -> delete_memory called once with the ack sentinel; returns 1."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior.id = 'm1'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[prior])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await acknowledge_flag_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            task_id='42',
+            flag_type='missing_deliverable',
+            mode='delete',
+        )
+
+        assert result == 1
+        memory_service.delete_memory.assert_called_once_with(
+            memory_id='m1',
+            store='mem0',
+            project_id='p',
+            causation_id='r1',
+            _source='flag_acknowledgment',
+        )
+
+    async def test_invalid_task_id_performs_no_search_and_no_delete(self):
+        """Invalid task_id ('abc') short-circuits before any Mem0 I/O; returns 0."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        memory_service = AsyncMock()
+
+        result = await acknowledge_flag_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            task_id='abc',
+            flag_type='missing_deliverable',
+            mode='delete',
+        )
+
+        assert result == 0
+        memory_service.search.assert_not_called()
+        memory_service.delete_memory.assert_not_called()
+
+    async def test_no_matching_prior_returns_zero_no_delete(self):
+        """No prior marker found -> no delete, returns 0."""
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[])
+
+        result = await acknowledge_flag_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            task_id='42',
+            flag_type='missing_deliverable',
+            mode='delete',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_called()
+
+    async def test_delete_exception_is_caught_and_excluded_from_count(self, caplog):
+        """delete_memory raising is caught (WARNING), does not propagate, excluded from count."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior.id = 'm1'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[prior])
+        memory_service.delete_memory = AsyncMock(side_effect=RuntimeError('delete blew up'))
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await acknowledge_flag_marker(
+                memory_service,
+                project_id='p',
+                run_id='r1',
+                task_id='42',
+                flag_type='missing_deliverable',
+                mode='delete',
+            )
+
+        assert result == 0
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('m1' in m for m in warning_messages), (
+            f'expected a WARNING mentioning the failed marker id; got {warning_messages!r}'
+        )
+
