@@ -413,6 +413,31 @@ class InteractiveWorktreeInfo:
     base_ref: str
 
 
+@dataclass(frozen=True)
+class ReapedInteractiveWorktree:
+    """Record of one ``_iact-*`` worktree removed by ``reap_interactive_worktrees``.
+
+    Returned by :meth:`GitOps.reap_interactive_worktrees` (task δ/2012) — one
+    entry per worktree the reaper force-removed during a sweep.
+
+    path: the on-disk location that was removed (``worktree_base/_iact-<slug>``).
+    branch: the full branch name that was checked out there (``task/<slug>``).
+    slug: the interactive session's claim identity (the ``_iact-`` /
+        ``branch_prefix`` suffix).
+    reason: why it was reaped — one of ``'landed'`` (a merge marker for this
+        branch exists on main), ``'ttl_idle'`` (no activity for longer than
+        ``config.interactive_worktree_ttl``), ``'disk_pressure'`` (evicted
+        under disk pressure despite being within TTL — idle-only, never a
+        worktree carrying unmerged work), or ``'stale_no_stamp'`` (the
+        ``.task/interactive.json`` stamp was missing/corrupt and the
+        worktree carried no unmerged work).
+    """
+    path: Path
+    branch: str
+    slug: str
+    reason: str
+
+
 class ConflictProbe(NamedTuple):
     """Result of merge_tree_conflicts — a lightweight, tuple-destructurable probe.
 
@@ -4597,6 +4622,146 @@ class GitOps:
                 return wt_path
 
         return None
+
+    # ── δ: interactive-worktree (_iact-*) crash-safety reaper — task 2012 ──
+    #
+    # WarmLanePool._recover_crashed_tasks covers _lane-* only; the _iact-*
+    # band task α (2010) mints via create_interactive_worktree is
+    # structurally disjoint from that pool (isolation invariant I1) and had
+    # no crash-cleanup path.  reap_interactive_worktrees supplies it: a
+    # crashed/idle/landed interactive worktree is force-removed the same way
+    # prune_stale_merge_worktrees reclaims _merge-* worktrees.
+
+    async def _iter_interactive_worktrees(self):
+        """Yield ``(wt_path, wt_resolved)`` pairs for registered ``_iact-*`` worktrees.
+
+        Mirrors :meth:`_iter_merge_worktrees` (same porcelain-enumeration and
+        direct-child-of-``worktree_base`` filter) but matches
+        ``config.iact_prefix`` instead of the hardcoded ``'_merge-'`` prefix,
+        and has no persistent-worktree exemption — there is no ``_iact-*``
+        equivalent of the always-on ``_merge-verify`` worktree.  Yields
+        nothing on git error (fail-closed, matching ``_iter_merge_worktrees``).
+        """
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return
+
+        for line in out.splitlines():
+            if not line.startswith('worktree '):
+                continue
+            wt_path = Path(line[len('worktree '):].strip())
+            try:
+                wt_resolved = wt_path.resolve()
+            except OSError:
+                wt_resolved = wt_path
+            if wt_resolved.parent != self.worktree_base:
+                continue
+            if not wt_resolved.name.startswith(self.config.iact_prefix):
+                continue
+            yield wt_path, wt_resolved
+
+    async def reap_interactive_worktrees(
+        self, *, now: datetime | None = None,
+    ) -> list[ReapedInteractiveWorktree]:
+        """Crash-safety sweep over the ``_iact-*`` interactive-worktree band (task δ/2012).
+
+        Enumerates registered ``_iact-*`` worktrees exactly like
+        :meth:`_iter_interactive_worktrees` (direct children of
+        ``worktree_base`` matching ``config.iact_prefix``, per ``git worktree
+        list --porcelain``).  For each candidate, ``slug``/``branch`` are
+        derived from the directory name by the same convention
+        :meth:`create_interactive_worktree` used to create it
+        (``worktree_base/{iact_prefix}{slug}`` on branch
+        ``{branch_prefix}{slug}``) — both are always derivable this way, so
+        this does not depend on the ``.task/interactive.json`` stamp being
+        intact.
+
+        Per-worktree TTL rule (the only reap rule at this stage — landed-on-
+        main detection and disk-pressure eviction are layered in separately):
+
+        * :meth:`worktree_head_beyond_main` is ``None`` (no commits beyond
+          main) → age is measured from the ``.task/interactive.json``
+          stamp's ``created_at``.  Reaped when that age exceeds
+          ``config.interactive_worktree_ttl``.
+        * Otherwise (the worktree carries unmerged commits) → age is
+          measured from the newest commit's time (``git show -s
+          --format=%ct HEAD``), NOT the stamp — an in-progress session that
+          keeps committing must never be reaped merely because it is old.
+          Reaped when that age exceeds the same TTL.
+
+        Removal uses ``git worktree remove --force`` per reaped candidate,
+        followed by a single ``git worktree prune`` if at least one was
+        removed — mirrors :meth:`prune_stale_merge_worktrees`.
+
+        Args:
+            now: reference time for TTL comparisons; defaults to
+                ``datetime.now(UTC)``. Injectable so callers/tests get
+                deterministic TTL boundaries.
+
+        Returns:
+            One :class:`ReapedInteractiveWorktree` per worktree actually
+            removed. Never raises.
+        """
+        if now is None:
+            now = datetime.now(UTC)
+        ttl = self.config.interactive_worktree_ttl
+
+        reaped: list[ReapedInteractiveWorktree] = []
+        try:
+            async for wt_path, wt_resolved in self._iter_interactive_worktrees():
+                slug = wt_resolved.name[len(self.config.iact_prefix):]
+                full_branch = f'{self.config.branch_prefix}{slug}'
+
+                reason: str | None = None
+                beyond = await self.worktree_head_beyond_main(wt_path)
+                if beyond is None:
+                    stamp_path = wt_path / '.task' / 'interactive.json'
+                    stamp = json.loads(stamp_path.read_text())
+                    created_at = datetime.fromisoformat(stamp['created_at'])
+                    if (now - created_at).total_seconds() > ttl:
+                        reason = 'ttl_idle'
+                else:
+                    rc_ct, ct_out, _ = await _run(
+                        ['git', 'show', '-s', '--format=%ct', 'HEAD'],
+                        cwd=wt_path,
+                    )
+                    if rc_ct == 0 and ct_out.strip():
+                        commit_time = datetime.fromtimestamp(
+                            int(ct_out.strip()), tz=UTC,
+                        )
+                        if (now - commit_time).total_seconds() > ttl:
+                            reason = 'ttl_idle'
+
+                if reason is None:
+                    continue
+
+                rc_rm, _, err = await _run(
+                    ['git', 'worktree', 'remove', '--force', str(wt_path)],
+                    cwd=self.project_root,
+                )
+                if rc_rm == 0:
+                    reaped.append(ReapedInteractiveWorktree(
+                        path=wt_path, branch=full_branch, slug=slug, reason=reason,
+                    ))
+                else:
+                    logger.warning(
+                        'reap_interactive_worktrees: failed to remove %s: %s',
+                        wt_path, err.strip(),
+                    )
+
+            if reaped:
+                await _run(['git', 'worktree', 'prune'], cwd=self.project_root)
+        except Exception:
+            logger.warning(
+                'reap_interactive_worktrees: unexpected error during sweep '
+                '(returning %d worktree(s) reaped before the fault)',
+                len(reaped), exc_info=True,
+            )
+
+        return reaped
 
     # ── PHASE 4: Speculative merge-verify pipeline ────────────────────
     #
