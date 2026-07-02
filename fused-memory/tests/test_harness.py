@@ -6655,6 +6655,118 @@ class TestFindingHasReference:
         assert _finding_has_reference(finding) is True
 
 
+@pytest.mark.asyncio
+async def test_maybe_remediate_drops_referenceless_actionable_finding(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    caplog,
+):
+    """ALL-DROPPED: a single actionable finding citing nothing must NOT trigger remediation.
+
+    Task 1970: Stage 3 can file an actionable=True finding that never receives
+    any citation (add_finding's typed citations are optional; cite_* calls
+    happen afterward).  _maybe_remediate must drop such referenceless findings
+    before they reach _run_remediation_pass — there is nothing to investigate.
+
+    RED on base branch: _maybe_remediate currently passes any actionable
+    finding straight through regardless of references, so the journal
+    contains a remediation run and no drop-log record is emitted.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    await event_buffer.push(_make_event('test-project'))
+
+    placeholder_finding = _make_placeholder_finding()
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[placeholder_finding])
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+        run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    # (a) Journal must contain ONLY the parent run — no remediation run.
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_runs = [r for r in recent_runs if r.run_type == 'remediation']
+    assert remediation_runs == [], (
+        f'Expected no remediation run (finding cites nothing to investigate), '
+        f'got {len(remediation_runs)}: {[r.id for r in remediation_runs]}'
+    )
+
+    # (b) A structured drop-log record must have been emitted.
+    drop_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.remediation_dropped_placeholder_finding'
+    ]
+    assert len(drop_records) >= 1, (
+        f'Expected at least one "reconciliation.remediation_dropped_placeholder_finding" '
+        f'log record; got records: {[r.getMessage() for r in caplog.records]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_mixed_batch_excludes_placeholder_keeps_reference_bearing(
+    journal,
+    event_buffer,
+    mock_memory_service,
+):
+    """MIXED: a referenceless placeholder alongside a reference-bearing finding.
+
+    Remediation must still run (the reference-bearing finding is genuinely
+    actionable), but only the reference-bearing finding may reach Stage 1's
+    remediation_findings — the placeholder is dropped at the _maybe_remediate
+    funnel.
+
+    RED on base branch: _maybe_remediate passes both findings through
+    unfiltered, so stage.remediation_findings contains the placeholder too.
+    """
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages = harness._make_stages()
+    harness._make_stages = lambda: stages
+
+    stage1 = stages[0]
+    assert isinstance(stage1, MemoryConsolidator)
+
+    captured: dict = {}
+
+    async def capture_attrs(stage):
+        captured['remediation_findings'] = stage.remediation_findings
+
+    placeholder_finding = _make_placeholder_finding()
+    reference_bearing_finding = _make_s3_findings()[0]  # carries affected_ids
+
+    _mock_stage_run(stage1, before_return=capture_attrs)
+    _mock_stage_run(stages[1])
+    _mock_stage_run(
+        stages[2], items_flagged=[placeholder_finding, reference_bearing_finding],
+    )
+
+    await event_buffer.push(_make_event('test-project'))
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    # Remediation DID run — the reference-bearing finding is genuinely actionable.
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_runs = [r for r in recent_runs if r.run_type == 'remediation']
+    assert len(remediation_runs) == 1, (
+        f'Expected exactly one remediation run (mixed batch has a real finding), '
+        f'got {len(remediation_runs)}'
+    )
+
+    # Only the reference-bearing finding reached Stage 1 — the placeholder was dropped.
+    assert captured.get('remediation_findings') == [reference_bearing_finding], (
+        f'Expected remediation_findings to contain only the reference-bearing finding, '
+        f'got {captured.get("remediation_findings")!r}'
+    )
+
+
 # ── Tests for Task 1655: live-workflow escalation gate ─────────────────────
 
 
