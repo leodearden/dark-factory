@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.neutral_cwd import neutral_cli_cwd
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import (
@@ -736,6 +738,42 @@ class TestCurateFallbacks:
         assert kwargs['subtype'] == 'error_max_budget_usd'
         assert kwargs['cost_usd'] == pytest.approx(0.30574)
         assert kwargs['pool_sizes'] == known_pool_sizes
+
+
+class TestCallLlmNeutralCwd:
+    """Task 1989: the CLI cwd forwarded for the pure prompt-contained classifier
+    call is a neutral scratch dir, decoupled from the filing project's
+    CLAUDE.md/MEMORY.md — while ``self._cwd`` (used Python-side for blocklist
+    and premise-refuted resolution) keeps pointing at the project root."""
+
+    @pytest.mark.asyncio
+    async def test_call_llm_forwards_neutral_cwd_and_preserves_self_cwd(self, tmp_path):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        result = AgentResult(
+            success=True, output='',
+            structured_output={'action': 'create', 'justification': 'x'},
+        )
+        mock = AsyncMock(return_value=result)
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm(
+                CandidateTask(title='T'),
+                pool=[],
+                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                start=0.0,
+                project_id='p',
+                project_root=str(tmp_path),
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['cwd'] == neutral_cli_cwd()
+        assert kwargs['cwd'] != tmp_path
+        assert kwargs['cwd'] != Path(str(tmp_path))
+        # Regression guard: self._cwd (Python-side blocklist/premise anchor) untouched.
+        assert curator._cwd == tmp_path
 
 
 class TestZeroOutputTimeoutSignal:
