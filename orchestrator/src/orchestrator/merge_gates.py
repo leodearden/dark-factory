@@ -184,6 +184,13 @@ async def _resolve_second_parent(git_ops: GitOps, sha: str) -> str | None:
     Fail-open: any exception returns ``None`` so the caller falls back to the
     next tier (``merged_branch_tip`` or ``req.snapshot_tip``).
     """
+    # Reach-back (deferred import): the existing test suite patches the git
+    # subprocess runner by string path at `orchestrator.merge_queue._run`
+    # (this function used to live in merge_queue.py).  Resolving `_run`
+    # dynamically from merge_queue's namespace at call time keeps those
+    # patches effective post-extraction.
+    from orchestrator.merge_queue import _run
+
     try:
         rc, out, _err = await _run(
             ['git', 'rev-parse', f'{sha}^2'],
@@ -229,6 +236,10 @@ async def _commit_is_linear(git_ops: GitOps, sha: str) -> bool:
     from a transient ``^2`` git error on a real merge commit (must keep the
     legacy HEAD check to avoid masking a real drop).
     """
+    # Reach-back (deferred import): see _resolve_second_parent — same
+    # `orchestrator.merge_queue._run` string-path patch convention applies.
+    from orchestrator.merge_queue import _run
+
     try:
         rc, out, _err = await _run(
             ['git', 'rev-list', '--parents', '-n', '1', sha],
@@ -302,9 +313,11 @@ async def _finalize_advanced_merge(
         AUTO_CHAIN_GENERATIONS_ENABLED,
         _check_post_merge_equivalence,
         _check_post_merge_pyright,
+        _commit_is_linear,
         _elapsed_ms,
         _emit_merge_attempt,
         _maybe_auto_chain_generation,
+        _resolve_second_parent,
     )
 
     cas_retries.pop(req.task_id, None)
