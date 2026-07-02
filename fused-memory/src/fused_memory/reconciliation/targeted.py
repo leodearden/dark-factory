@@ -245,7 +245,7 @@ class TargetedReconciler:
                 if details:
                     content += f"\nDetails: {details[:500]}"
 
-            write_metadata = {
+            write_metadata: dict[str, Any] = {
                 'source': _ECHO_SOURCE,
                 'task_id': task_id,
                 'transition': 'done',

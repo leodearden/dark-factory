@@ -1832,6 +1832,7 @@ async def test_on_task_done_suppresses_stale_description_when_authoritative_memo
     # (a) the deterministic per-task metadata query was awaited correctly
     mock_memory_service.get_memories_by_metadata.assert_awaited_once()
     query_call = mock_memory_service.get_memories_by_metadata.await_args
+    assert query_call is not None
     assert query_call.kwargs.get('project_id') == 'test-project'
     assert query_call.kwargs.get('filters') == {'task_id': '361'}
 
