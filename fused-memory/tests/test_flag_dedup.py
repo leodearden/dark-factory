@@ -1916,60 +1916,103 @@ async def test_dedup_flags_calls_filter_suppressed_before_signature_dedup():
     )
 
 
+class _MemoryRecord:
+    """Minimal stand-in for a Mem0 MemoryResult."""
+
+    def __init__(self, id_: str, metadata: dict) -> None:
+        self.id = id_
+        self.metadata = metadata
+        self.content = (
+            f"Stage 1 flag marker: task={metadata.get('task_id')} "
+            f"type={metadata.get('flag_type')} from run={metadata.get('run_id')}"
+        )
+
+
+class _FakeMem0:
+    """In-memory Mem0 stub with add_memory, search, and delete_memory.
+
+    Immediate-consistency variant: search() always returns the live store
+    contents (a write/delete is visible to the very next search). Compare
+    _FakeMem0ReadLag below, which freezes a pre-call snapshot to model Mem0
+    read-after-write indexing lag (task-1978).
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, _MemoryRecord] = {}
+
+    async def add_memory(self, *, metadata: dict, **_kwargs) -> AddMemoryResponse:
+        id_ = str(_uuid_mod.uuid4())
+        self._store[id_] = _MemoryRecord(id_, metadata)
+        return AddMemoryResponse(memory_ids=[id_])
+
+    async def search(self, *, query: str = '', **_kwargs) -> list[_MemoryRecord]:
+        # Return all stored records (deterministic; query not used for filtering —
+        # find_prior_memories applies the real task_id/kind equality filtering).
+        return list(self._store.values())
+
+    async def delete_memory(self, *, memory_id: str, **_kwargs) -> None:
+        self._store.pop(memory_id, None)
+
+    def count(self) -> int:
+        return len(self._store)
+
+    def latest_run_id(self) -> str | None:
+        """Return the run_id of the single stored marker (for assertion)."""
+        records = list(self._store.values())
+        if not records:
+            return None
+        return records[0].metadata.get('run_id')
+
+
+class _FakeMem0ReadLag(_FakeMem0):
+    """In-memory Mem0 stub modelling Mem0 read-after-write indexing lag (task-1978).
+
+    Subclasses _FakeMem0 to reuse its store/add_memory/delete_memory/count
+    logic single-sourced; only search() is overridden here (plus the
+    begin_call()/_snapshot mechanism and add_memory_call_count tracking).
+
+    add_memory/delete_memory mutate the live store immediately, exactly like
+    _FakeMem0. search() differs: it returns a SNAPSHOT of the store frozen by
+    the most recent call to begin_call(), not the live store. Call begin_call()
+    once before each dedup_flags() invocation to advance the snapshot to that
+    call's pre-call state. Any write or delete performed during the call is
+    therefore invisible to every search issued later in THAT SAME call — this
+    reproduces the production mechanism behind finding bfa0b9db (run 9542fa10):
+    a later same-signature occurrence's pre-write search does not see an
+    earlier occurrence's write from earlier in the same dedup_flags call.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._snapshot: list[_MemoryRecord] = []
+        self.add_memory_call_count: int = 0
+
+    def begin_call(self) -> None:
+        """Freeze the snapshot that searches will see until the next begin_call()."""
+        self._snapshot = list(self._store.values())
+
+    async def add_memory(self, *, metadata: dict, **_kwargs) -> AddMemoryResponse:
+        self.add_memory_call_count += 1
+        return await super().add_memory(metadata=metadata, **_kwargs)
+
+    async def search(self, *, query: str = '', **_kwargs) -> list[_MemoryRecord]:
+        return list(self._snapshot)
+
+
 @pytest.mark.asyncio
 async def test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation():
     """Regression: two successive dedup_flags calls for the same flag leave exactly 1 marker.
 
-    Uses a FakeMem0 in-memory store (self-contained, no external mocks) to
-    exercise the full add/search/delete cycle deterministically.
+    Uses the module-level _FakeMem0 in-memory store (self-contained, no
+    external mocks) to exercise the full add/search/delete cycle deterministically.
 
     Run 1 (run_id='r1'): no prior exists → MISS branch → 1 marker stored.
     Run 2 (run_id='r2'): prior found → HIT branch → write replacement, delete prior
                          → still exactly 1 marker stored, with run_id='r2'.
     """
-    import uuid as _uuid
-
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
-    class _MemoryRecord:
-        """Minimal stand-in for a Mem0 MemoryResult."""
-        def __init__(self, id_: str, metadata: dict) -> None:
-            self.id = id_
-            self.metadata = metadata
-            self.content = (
-                f"Stage 1 flag marker: task={metadata.get('task_id')} "
-                f"type={metadata.get('flag_type')} from run={metadata.get('run_id')}"
-            )
-
-    class FakeMem0:
-        """In-memory Mem0 stub with add_memory, search, and delete_memory."""
-
-        def __init__(self) -> None:
-            self._store: dict[str, _MemoryRecord] = {}
-
-        async def add_memory(self, *, metadata: dict, **_kwargs) -> AddMemoryResponse:
-            id_ = str(_uuid.uuid4())
-            self._store[id_] = _MemoryRecord(id_, metadata)
-            return AddMemoryResponse(memory_ids=[id_])
-
-        async def search(self, *, query: str = '', **_kwargs) -> list[_MemoryRecord]:
-            # Return all stored records (deterministic; query not used for filtering)
-            return list(self._store.values())
-
-        async def delete_memory(self, *, memory_id: str, **_kwargs) -> None:
-            self._store.pop(memory_id, None)
-
-        def count(self) -> int:
-            return len(self._store)
-
-        def latest_run_id(self) -> str | None:
-            """Return the run_id of the single stored marker (for assertion)."""
-            records = list(self._store.values())
-            if not records:
-                return None
-            return records[0].metadata.get('run_id')
-
-    fake = FakeMem0()
+    fake = _FakeMem0()
     flag = {'task_id': '42', 'flag_type': 'missing_deliverable', 'description': 'foo'}
 
     # Run 1 — MISS branch: no prior, writes one marker
@@ -1995,6 +2038,312 @@ async def test_dedup_flags_two_consecutive_runs_no_predecessor_accumulation():
     )
     assert fake.latest_run_id() == 'r2', (
         f"Surviving marker must have run_id='r2' but got {fake.latest_run_id()!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# In-batch signature memoization (task-1978)
+#
+# Root cause: the SAME (task_id, flag_type) signature can be emitted multiple
+# times in ONE items_flagged list within a single dedup_flags call (e.g. task
+# 1970 genuinely re-evaluated multiple times per Stage 1 run). Each
+# occurrence's pre-write find_prior_memories search is a SEPARATE Mem0 read;
+# under Mem0 read-after-write indexing lag it may not yet see a marker written
+# by an EARLIER occurrence in the SAME call, so every occurrence independently
+# MISSes/HITs and writes its own replacement — duplicate markers accumulate
+# WITHIN a single run (finding bfa0b9db, run 9542fa10). The fix memoizes each
+# signature's outcome the first time it is processed within a dedup_flags
+# call; repeats skip all Mem0 I/O and inherit the memoized annotation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_same_signature_repeated_in_one_call_writes_single_marker():
+    """RED (task-1978): the same signature emitted 3x in ONE call must persist
+    exactly ONE marker — not one per occurrence.
+
+    _FakeMem0ReadLag models Mem0 read-after-write indexing lag: search() always
+    returns the snapshot frozen at begin_call() time (the store's state before
+    this dedup_flags call started), so a write made mid-call is invisible to
+    every later same-call search — regardless of how many occurrences of the
+    signature are processed. Without in-batch memoization, all 3 occurrences
+    independently MISS and each writes its own marker.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    fake = _FakeMem0ReadLag()
+    fake.begin_call()  # store starts empty -> snapshot models "no prior marker exists"
+
+    flag = {
+        'task_id': '1970',
+        'flag_type': 'task_blocked_stale_escalations',
+        'description': 'task 1970 has recurring stale escalations esc-1970-40/41',
+    }
+    flags = [dict(flag), dict(flag), dict(flag)]
+
+    result = await dedup_flags(
+        memory_service=fake,
+        project_id='p',
+        run_id='r_now',
+        flags=flags,
+    )
+
+    assert fake.count() == 1, (
+        f'Expected exactly 1 marker to persist for 3 same-signature occurrences '
+        f'processed in one dedup_flags call (no within-run accumulation) but got '
+        f'{fake.count()}'
+    )
+    assert fake.add_memory_call_count == 1, (
+        f'Expected exactly 1 add_memory call for 3 same-signature occurrences in '
+        f'one dedup_flags call but got {fake.add_memory_call_count}'
+    )
+
+    # Annotation contract under the read-lag mechanism itself (not just under
+    # the AsyncMock-based test_dedup_flags_in_batch_repeat_annotation): this is
+    # a MISS-first call (store starts empty), so the first occurrence follows
+    # existing MISS behavior (no persisted_from_run) while the 2nd and 3rd
+    # (in-batch repeats) inherit persisted_from_run=run_id and
+    # last_seen_run_id=run_id from the memo.
+    assert len(result) == 3
+    assert 'persisted_from_run' not in result[0], (
+        f'MISS-first flag[0] must follow existing MISS behavior (no '
+        f'persisted_from_run) but got {result[0]}'
+    )
+    for i in (1, 2):
+        assert result[i].get('persisted_from_run') == 'r_now', (
+            f'In-batch repeat flag[{i}]: expected persisted_from_run="r_now" but '
+            f'got {result[i].get("persisted_from_run")!r}'
+        )
+        assert result[i].get('last_seen_run_id') == 'r_now', (
+            f'In-batch repeat flag[{i}]: expected last_seen_run_id="r_now" but '
+            f'got {result[i].get("last_seen_run_id")!r}'
+        )
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_distinct_flag_types_same_task_each_write():
+    """Guard: two DISTINCT flag_types for the same task_id are independent
+    signatures — the in-batch memo (keyed on the FULL (task_id, flag_type)
+    tuple) must not collapse them. Each independently runs its own write cycle.
+
+    Green both before and after the task-1978 fix — pins the memo's keying so
+    the fix cannot over-suppress distinct signatures that merely share a
+    task_id.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[])
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+    flags = [
+        {'task_id': 1970, 'flag_type': 'task_blocked_stale_escalations', 'description': 'a'},
+        {'task_id': 1970, 'flag_type': 'other_flag_type', 'description': 'b'},
+    ]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r_now',
+        flags=flags,
+    )
+
+    assert len(result) == 2
+    assert memory_service.add_memory.call_count == 2, (
+        f'Distinct flag_types for the same task_id must each trigger an '
+        f'independent write cycle; expected 2 add_memory calls but got '
+        f'{memory_service.add_memory.call_count}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_none_signature_flags_not_collapsed_when_repeated():
+    """Guard: two flags with no computable signature (task_id=None, no
+    cited_tasks, blank description) must both pass through unchanged — the
+    in-batch memo must never trigger for None-signature flags.
+
+    Green both before and after the task-1978 fix — pins that the memo is
+    consulted only AFTER the None-signature pass-through, so repeated
+    unsignable flags are never collapsed together.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[])
+
+    flag = {'task_id': None, 'flag_type': 'x', 'description': '   '}
+    flags = [dict(flag), dict(flag)]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r_now',
+        flags=flags,
+    )
+
+    assert len(result) == 2, (
+        f'None-signature flags must never be collapsed by the in-batch memo; '
+        f'expected 2 flags but got {len(result)}'
+    )
+    assert result == flags
+    memory_service.add_memory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_invalid_tid_flags_not_collapsed_when_repeated():
+    """Guard: two flags sharing the same invalid task_id (fails
+    _is_valid_marker_task_id) must both pass through unchanged — the in-batch
+    memo must sit AFTER the invalid-tid guard so invalid-tid flags are never
+    collapsed together.
+
+    Green both before and after the task-1978 fix.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[])
+
+    flag = {'task_id': 'abc', 'flag_type': 'x', 'description': 'd'}
+    flags = [dict(flag), dict(flag)]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r_now',
+        flags=flags,
+    )
+
+    assert len(result) == 2, (
+        f'Invalid-tid flags must never be collapsed by the in-batch memo; '
+        f'expected 2 flags but got {len(result)}'
+    )
+    assert result == flags
+    memory_service.add_memory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_in_batch_repeat_annotation():
+    """RED (task-1978): the in-batch memo's repeat annotation must match the
+    FIRST occurrence's resolved outcome, not the step-2 placeholder (which
+    always stores the current run_id regardless of HIT/MISS).
+
+    HIT-first: a prior marker (run_id='r0') exists before the call. Two copies
+    of the signature are processed in one call with run_id='r_now'. Both
+    output flags must carry persisted_from_run='r0' (inherited from the first
+    occurrence's HIT) and last_seen_run_id='r_now'.
+
+    MISS-first: no prior marker exists. Two copies of a (different) signature
+    are processed in one call with run_id='r_now'. The first output flag
+    follows the existing MISS behavior (no persisted_from_run). The second
+    (repeat) output flag is a genuine same-run duplicate, so its
+    persisted_from_run is the CURRENT run_id ('r_now').
+
+    Both sub-cases also assert the caller's original flag dicts are never
+    mutated in place (copy-before-annotate).
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    # --- HIT-first ---
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '1970',
+        'flag_type': 'task_blocked_stale_escalations',
+        'run_id': 'r0',
+    })
+    prior_marker.id = 'prior-1970'
+    new_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '1970',
+        'flag_type': 'task_blocked_stale_escalations',
+        'run_id': 'r_now',
+    })
+    new_marker.id = 'new-1970-r_now'
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('1970', 'task_blocked_stale_escalations'): [[prior_marker], [new_marker]]},
+    ))
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    hit_flag = {'task_id': 1970, 'flag_type': 'task_blocked_stale_escalations', 'description': 'x'}
+    hit_flags = [dict(hit_flag), dict(hit_flag)]
+    original_hit_flags = [dict(f) for f in hit_flags]
+
+    hit_result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r_now',
+        flags=hit_flags,
+    )
+
+    assert len(hit_result) == 2
+    for i, flag in enumerate(hit_result):
+        assert flag.get('persisted_from_run') == 'r0', (
+            f'HIT-first flag[{i}]: expected persisted_from_run="r0" (inherited '
+            f'from the first occurrence) but got {flag.get("persisted_from_run")!r}'
+        )
+        assert flag.get('last_seen_run_id') == 'r_now', (
+            f'HIT-first flag[{i}]: expected last_seen_run_id="r_now" but got '
+            f'{flag.get("last_seen_run_id")!r}'
+        )
+    # Only ONE search+write+delete cycle ran — the repeat skipped it entirely.
+    memory_service.add_memory.assert_called_once()
+    memory_service.delete_memory.assert_called_once()
+    # Caller's original dicts must not be mutated (copy-before-annotate).
+    assert hit_flags == original_hit_flags, (
+        'dedup_flags must not mutate the caller-supplied flag dicts in place'
+    )
+
+    # --- MISS-first ---
+    new_marker_1971 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '1971',
+        'flag_type': 'task_blocked_stale_escalations',
+        'run_id': 'r_now',
+    })
+    new_marker_1971.id = 'new-1971-r_now'
+
+    memory_service2 = AsyncMock()
+    memory_service2.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('1971', 'task_blocked_stale_escalations'): [[], [new_marker_1971]]},
+    ))
+    memory_service2.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+    miss_flag = {'task_id': 1971, 'flag_type': 'task_blocked_stale_escalations', 'description': 'y'}
+    miss_flags = [dict(miss_flag), dict(miss_flag)]
+    original_miss_flags = [dict(f) for f in miss_flags]
+
+    miss_result = await dedup_flags(
+        memory_service=memory_service2,
+        project_id='p',
+        run_id='r_now',
+        flags=miss_flags,
+    )
+
+    assert len(miss_result) == 2
+    # First occurrence: existing MISS behavior — no persisted_from_run annotation.
+    assert 'persisted_from_run' not in miss_result[0], (
+        f'MISS-first flag[0] must follow existing MISS behavior (no '
+        f'persisted_from_run) but got {miss_result[0]}'
+    )
+    # Second occurrence (in-batch repeat): a genuine same-run duplicate, so
+    # persisted_from_run is the CURRENT run_id.
+    assert miss_result[1].get('persisted_from_run') == 'r_now', (
+        f'MISS-first flag[1] (repeat): expected persisted_from_run="r_now" but '
+        f'got {miss_result[1].get("persisted_from_run")!r}'
+    )
+    assert miss_result[1].get('last_seen_run_id') == 'r_now', (
+        f'MISS-first flag[1] (repeat): expected last_seen_run_id="r_now" but got '
+        f'{miss_result[1].get("last_seen_run_id")!r}'
+    )
+    # Only ONE write happened — the repeat skipped the write cycle entirely.
+    memory_service2.add_memory.assert_called_once()
+    # Caller's original dicts must not be mutated.
+    assert miss_flags == original_miss_flags, (
+        'dedup_flags must not mutate the caller-supplied flag dicts in place'
     )
 
 

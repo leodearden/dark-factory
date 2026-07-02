@@ -66,6 +66,79 @@ the number of outage cycles (transient Mem0 failures) and is expected to
 remain far below 50; the self-healing property still holds over multiple
 cycles.
 
+Within a single ``dedup_flags`` call, this HIT/MISS flow runs **at most once**
+per (task_id, flag_type) signature — see "In-batch memoization (task-1978)"
+below for how a signature emitted more than once in the same call's ``flags``
+list is handled without repeating this flow.
+
+In-batch memoization (task-1978)
+---------------------------------
+Root cause: a single ``items_flagged`` list passed to one ``dedup_flags`` call
+can contain MULTIPLE entries for the same (task_id, flag_type) signature — for
+example a task genuinely re-evaluated more than once within one Stage 1 run.
+The per-flag loop is strictly sequential (no ``asyncio.gather`` over flags), so
+concurrent/racing writes are NOT the mechanism; instead, each occurrence's
+pre-write ``find_prior_memories`` search is a SEPARATE, run_id-agnostic Mem0
+read.  Under Mem0 read-after-write (indexing/embedding) lag, a later
+occurrence's search can fail to see the marker written by an EARLIER
+occurrence in the SAME call — even though the earlier occurrence's own
+deletes of its priors ARE visible — making the signature appear to have zero
+markers.  That false MISS writes yet another marker, so duplicate markers
+accumulate WITHIN a single run faster than the next cycle's HIT-branch
+self-healing can collapse them (self-healing only reclaims duplicates on a
+*future* cycle, not within the run that created them).
+
+Fix: ``dedup_flags`` keeps a function-local ``seen_signatures`` memo (fresh on
+every invocation, mirroring the circuit-breaker counters), keyed on the full
+``(task_id, flag_type)`` tuple returned by the signature computation — checked
+only AFTER the None-signature pass-through and the ``_is_valid_marker_task_id``
+guard, so un-signable and invalid-tid flags are never collapsed together.  The
+FIRST occurrence of a signature in a call runs the full HIT/MISS flow above
+unchanged and records its resolved outcome in the memo.  Any LATER occurrence
+of that same signature in the same call skips ``find_prior_memories``,
+``_write_and_confirm_marker``, and prior deletion entirely (zero additional
+Mem0 I/O, and the confirmation circuit-breaker counter is untouched) and is
+instead annotated directly from the memo:
+
+- ``last_seen_run_id`` is always set to the current ``run_id``.
+- ``persisted_from_run`` is inherited from the first occurrence's resolved
+  value: the prior marker's run_id if the first occurrence was a HIT (the same
+  ``'unknown'`` fallback already applied there), or the current ``run_id`` if
+  the first occurrence was a MISS — a MISS-first repeat is itself a genuine
+  same-run duplicate, so the current run is the correct provenance.
+
+The memo is recorded UNCONDITIONALLY at the first occurrence — it is **not**
+gated on ``write_succeeded`` (the bool ``_write_and_confirm_marker`` returns
+on both the HIT and MISS branches).  Gating on ``write_succeeded`` looks
+appealing at first glance (a genuinely-failed ``add_memory`` would then let a
+later same-call occurrence retry instead of inheriting a never-written
+signature's provenance), but ``write_succeeded`` conflates two situations
+``_write_and_confirm_marker`` cannot distinguish through its bool-only
+return: (1) ``add_memory`` itself raised — nothing persisted — and (2)
+``add_memory`` succeeded but ``confirm_marker_persisted``'s own read-back
+search missed under the exact same Mem0 read-after-write lag this memo
+exists to route around.  Case (2) is the validated production mechanism (see
+"In-batch memoization" above); gating on ``write_succeeded`` would skip
+memoizing it, so a later same-call occurrence would retry the full cycle, hit
+the same lag on its own confirmation search, and also fail to be memoized —
+reopening the unbounded within-run duplicate accumulation this fix targets.
+Recording the memo unconditionally bounds every signature to exactly one
+write per call regardless of confirmation outcome. The trade-off this
+accepts: on the rarer genuine-failure case (1), a later same-call occurrence
+inherits provenance for a marker that was never written; the next
+``dedup_flags`` cycle's pre-write search then correctly finds no prior and
+re-MISSes, writing a fresh marker — a one-cycle-delayed self-heal, not a
+permanent loss.
+
+This bounds every signature to at most one search+write+confirm+delete cycle
+per ``dedup_flags`` call regardless of how many times it is emitted, which
+removes all dependence on Mem0 read-after-write consistency for the within-run
+case.  The memo is scoped to a single call (cross-call/cross-cycle dedup is
+still the existing HIT-path self-healing's job — see "Best-effort replacement
+contract" above); it does not change behavior for flags whose signature
+appears only once, so all pre-existing single-occurrence-per-call behavior is
+unchanged.
+
 Post-write confirmation (task-1400, corrected in task-1400 step-15)
 --------------------------------------------------------------------
 ``add_memory`` returns an id in ``memory_ids``, but Mem0 may store the content
@@ -663,6 +736,17 @@ async def dedup_flags(
     consecutive_confirmation_misses: int = 0
     confirmation_disabled: bool = False
 
+    # In-batch signature memoization (task-1978): records, for each
+    # (task_id, flag_type) signature already processed in THIS call, the
+    # resolved persisted_from_run to use for any later occurrence of that same
+    # signature.  Function-local so each dedup_flags invocation starts with a
+    # fresh, empty memo (mirrors the circuit-breaker locals above).  This
+    # bounds each signature to at most ONE search+write+confirm+delete cycle
+    # per call, which is what prevents duplicate markers from accumulating
+    # when Mem0 read-after-write indexing lag causes a later occurrence's
+    # pre-write search to miss a marker written earlier in the SAME call.
+    seen_signatures: dict[tuple[str, str], str] = {}
+
     async def _confirm_and_track(
         response_memory_ids: list[str],
         active_miss_warning_msg: str,
@@ -768,6 +852,23 @@ async def dedup_flags(
             )
             result.append(flag)
             continue
+        # In-batch signature memoization (task-1978): the SAME (task_id, flag_type)
+        # signature can be emitted multiple times in ONE items_flagged list within a
+        # single dedup_flags call (e.g. a task genuinely re-evaluated multiple times
+        # in one Stage 1 run).  A later occurrence's pre-write search below is a
+        # SEPARATE Mem0 read that may not yet see a marker written by an EARLIER
+        # occurrence in this SAME call (Mem0 read-after-write indexing lag) — so
+        # without memoization, every occurrence independently MISSes/HITs and writes
+        # its own replacement, accumulating duplicate markers WITHIN a single run.
+        # On the 2nd+ occurrence of a signature in this call, skip the entire
+        # search/write/confirm/delete cycle and annotate deterministically from the
+        # first occurrence's resolved outcome instead.
+        if (tid, ftype) in seen_signatures:
+            flag = dict(flag)
+            flag['persisted_from_run'] = seen_signatures[(tid, ftype)]
+            flag['last_seen_run_id'] = run_id
+            result.append(flag)
+            continue
         # Delegate search+filter to the shared helper.  find_prior_memories logs a
         # WARNING under logger on search failure and returns [] so the else
         # branch below writes a fresh marker (best-effort on transient Mem0 outage).
@@ -783,6 +884,10 @@ async def dedup_flags(
         )
         if priors:
             # --- HIT: best-effort replacement ---
+            # (Reached only on the FIRST occurrence of (tid, ftype) in this
+            # call — see the in-batch memoization check above, task-1978.
+            # Later occurrences are annotated from seen_signatures instead of
+            # re-running this search+write+delete cycle.)
             # (1) Sort priors by id lex so annotation source and deletion order
             #     are deterministic across concurrent cycles.  MemoryResult.id
             #     is always present (str); temporal fields are optional and may
@@ -856,6 +961,13 @@ async def dedup_flags(
             # dedup cycles.  _source='stage1_flag_dedup' distinguishes these
             # from 'targeted_recon' writes in the audit journal.
             #
+            # (Like the HIT branch above, reached only on the FIRST occurrence
+            # of (tid, ftype) in this call — see the in-batch memoization check
+            # above, task-1978.  A later occurrence of this same signature in
+            # this call is a genuine same-run duplicate; it is annotated from
+            # seen_signatures with persisted_from_run=run_id instead of writing
+            # another marker here.)
+            #
             # Marker-growth caveat: when find_prior_memories returns [] due to
             # a search failure (transient Mem0 outage) rather than a genuine
             # miss, this branch still writes a new marker.  During a sustained
@@ -908,6 +1020,38 @@ async def dedup_flags(
                     ' recurring flag will not be detected next cycle'
                 ),
             )
+        # Record this signature's resolved outcome (task-1978) so any later
+        # same-signature occurrence in this call hits the in-batch memo branch
+        # above instead of repeating the search/write/confirm/delete cycle.
+        # HIT-first: flag['persisted_from_run'] was just set above (the prior
+        # marker's run_id, with the 'unknown' fallback already applied) — reuse
+        # it verbatim.  MISS-first: flag carries no persisted_from_run key, so
+        # the get() default (the current run_id) is used — a MISS-first repeat
+        # is a genuine same-run duplicate, so run_id is the correct provenance.
+        #
+        # Deliberately UNCONDITIONAL — not gated on write_succeeded. Gating on
+        # write_succeeded looks appealing (a genuinely-failed add_memory would
+        # then let a later same-call occurrence retry instead of inheriting a
+        # never-written signature's provenance) but write_succeeded conflates
+        # two different situations that _write_and_confirm_marker cannot
+        # distinguish through its bool-only return: (1) add_memory itself
+        # raised — nothing persisted — and (2) add_memory succeeded but
+        # confirm_marker_persisted's OWN read-back search missed under the
+        # exact same Mem0 read-after-write lag this memo exists to route
+        # around. Case (2) is the validated production mechanism (see
+        # "In-batch memoization" above); gating on write_succeeded would skip
+        # memoizing it, so a later same-call occurrence would retry the full
+        # cycle, hit the same lag on ITS OWN confirmation search, and also not
+        # be memoized — reopening unbounded within-run duplicate accumulation
+        # for the very case this fix targets. Recording the memo unconditionally
+        # bounds every signature to exactly one write per call regardless of
+        # confirmation outcome. The trade-off this accepts: on the rarer
+        # genuine-failure case (1), a later same-call occurrence inherits
+        # provenance for a marker that was never written; the next dedup_flags
+        # cycle's pre-write search then correctly finds no prior and re-MISSes,
+        # writing a fresh marker — a one-cycle-delayed self-heal, not a
+        # permanent loss.
+        seen_signatures[(tid, ftype)] = flag.get('persisted_from_run', run_id)
         result.append(flag)
     return result
 
