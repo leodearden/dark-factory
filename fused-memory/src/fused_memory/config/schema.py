@@ -803,14 +803,15 @@ class PathScopeAdjudicatorConfig(BaseModel):
     model: str = Field(default='sonnet')
     # 60s bounds a silent Anthropic-API hang; independent of prompt/cost size.
     timeout_seconds: float = Field(default=60.0)
-    # True cost floor is ~0.105 USD (fixed CLI/base-context overhead dominates).
-    # 0.30 gives ~2.85x margin, which is all this fixed-cost call shape needs.
-    # CuratorConfig.max_budget_usd was separately raised to a flat $2.00 (task
-    # 1980 / esc-task-curator-194) to cover its much larger, size-varying
-    # prompt cost — the two configs no longer share a value, and this one
-    # does not need to move. Do NOT lower below 0.25 — the adjudicator
-    # becomes a silent no-op.
-    max_budget_usd: float = Field(default=0.30)
+    # True cost floor was measured at ~0.105 USD against Sonnet 4.6 on
+    # 2026-06-19 (task 1849); the 0.30 default sized against that floor has
+    # since eroded as stack-wide cost-per-call rose (~2-2.5x token-volume
+    # growth from filing-project CLAUDE.md bloat + opus/sonnet alias-roll
+    # tokenizer inflation) — the sibling CuratorConfig already tripped this
+    # same failure mode (task 1980 / esc-task-curator-194). Re-baselined to a
+    # flat $2.00 (task 1983) to match CuratorConfig's durable ceiling. Do NOT
+    # lower below 0.25 — the adjudicator becomes a silent no-op.
+    max_budget_usd: float = Field(default=2.00)
     # Per-call turn cap. Must be ≥ 3: schema burns one tool-use turn,
     # an optional reasoning turn may precede it, and the final assistant
     # response is the third. Matches the json-schema turn floor noted in
