@@ -4772,14 +4772,7 @@ class GitOps:
 
         Removal uses ``git worktree remove --force`` per reaped candidate,
         followed by a single ``git worktree prune`` if at least one was
-        removed — mirrors :meth:`prune_stale_merge_worktrees`. After each
-        successful removal, :meth:`_delete_branch_if_on_main` is called to
-        reclaim the now-unused ``task/<slug>`` branch ref — it independently
-        re-derives "no commits beyond main" and silently retains (never
-        deletes) a branch that still carries unmerged work, so this is safe
-        even for the unmerged ``'ttl_idle'`` path above, and prevents the
-        branch namespace from slowly accumulating dangling refs across many
-        sweeps.
+        removed — mirrors :meth:`prune_stale_merge_worktrees`.
 
         Args:
             now: reference time for TTL comparisons; defaults to
@@ -4826,48 +4819,48 @@ class GitOps:
                     # there are no commits beyond main, so age on the stamp
                     # exactly like any other idle candidate.
                     stamp_path = wt_path / '.task' / 'interactive.json'
-                        try:
-                            stamp = json.loads(stamp_path.read_text())
-                            created_at = datetime.fromisoformat(stamp['created_at'])
-                        except (OSError, ValueError, KeyError, TypeError) as exc:
-                            # Missing/corrupt stamp and no unmerged work to
-                            # lose — fail-soft towards reaping (I2: never an
-                            # indefinite leak) rather than preserving forever.
-                            # A worktree WITH unmerged commits never reaches
-                            # this branch at all (beyond is not None below),
-                            # so a corrupt stamp can never silently drop work.
-                            logger.warning(
-                                'reap_interactive_worktrees: unreadable stamp '
-                                'for %s (%s: %s) — reaping as stale (no '
-                                'unmerged work to lose)',
-                                wt_path, type(exc).__name__, exc,
-                            )
-                            reason = 'stale_no_stamp'
-                        else:
-                            if (now - created_at).total_seconds() > ttl:
-                                reason = 'ttl_idle'
-                            elif disk_pressure:
-                                # No unmerged work to lose — safe to evict
-                                # under pressure even though still within
-                                # TTL.
-                                reason = 'disk_pressure'
-                    elif not await self._worktree_dirty(wt_path):
-                        # Unmerged commits and a clean tree — age on the
-                        # newest commit. A dirty tree here (the `if` this
-                        # `elif` pairs with) is treated as recent activity
-                        # and preserves the worktree outright, since a
-                        # session can be actively editing for hours between
-                        # commits.
-                        rc_ct, ct_out, _ = await _run(
-                            ['git', 'show', '-s', '--format=%ct', 'HEAD'],
-                            cwd=wt_path,
+                    try:
+                        stamp = json.loads(stamp_path.read_text())
+                        created_at = datetime.fromisoformat(stamp['created_at'])
+                    except (OSError, ValueError, KeyError, TypeError) as exc:
+                        # Missing/corrupt stamp and no unmerged work to
+                        # lose — fail-soft towards reaping (I2: never an
+                        # indefinite leak) rather than preserving forever.
+                        # A worktree WITH unmerged commits never reaches
+                        # this branch at all (beyond is not None below),
+                        # so a corrupt stamp can never silently drop work.
+                        logger.warning(
+                            'reap_interactive_worktrees: unreadable stamp '
+                            'for %s (%s: %s) — reaping as stale (no '
+                            'unmerged work to lose)',
+                            wt_path, type(exc).__name__, exc,
                         )
-                        if rc_ct == 0 and ct_out.strip():
-                            commit_time = datetime.fromtimestamp(
-                                int(ct_out.strip()), tz=UTC,
-                            )
-                            if (now - commit_time).total_seconds() > ttl:
-                                reason = 'ttl_idle'
+                        reason = 'stale_no_stamp'
+                    else:
+                        if (now - created_at).total_seconds() > ttl:
+                            reason = 'ttl_idle'
+                        elif disk_pressure:
+                            # No unmerged work to lose — safe to evict
+                            # under pressure even though still within
+                            # TTL.
+                            reason = 'disk_pressure'
+                elif not await self._worktree_dirty(wt_path):
+                    # Unmerged commits and a clean tree — age on the
+                    # newest commit. A dirty tree here (the `if` this
+                    # `elif` pairs with) is treated as recent activity
+                    # and preserves the worktree outright, since a
+                    # session can be actively editing for hours between
+                    # commits.
+                    rc_ct, ct_out, _ = await _run(
+                        ['git', 'show', '-s', '--format=%ct', 'HEAD'],
+                        cwd=wt_path,
+                    )
+                    if rc_ct == 0 and ct_out.strip():
+                        commit_time = datetime.fromtimestamp(
+                            int(ct_out.strip()), tz=UTC,
+                        )
+                        if (now - commit_time).total_seconds() > ttl:
+                            reason = 'ttl_idle'
 
                 if reason is None:
                     continue
