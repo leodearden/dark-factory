@@ -220,3 +220,79 @@ class TestReapInteractiveWorktreesLanded:
         assert info_d.path.resolve() not in d_paths, (
             f'expected NO reaped record for D; got {reaped!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-05: disk-pressure eviction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapInteractiveWorktreesDiskPressure:
+    """RED — disk pressure evicts idle _iact-* worktrees but never live ones."""
+
+    async def test_disk_pressure_evicts_idle_preserves_live(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """E: idle, no own-commits, within ttl -> evicted under pressure.
+
+        F: recent own-commit (unmerged), within ttl -> PRESERVED even under
+        pressure (unmerged work is never dropped on pressure alone).
+        """
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info_e = await git_ops.create_interactive_worktree('idle-e')
+        info_f = await git_ops.create_interactive_worktree('live-f')
+        await _commit_file(info_f.path, 'work.txt', 'work\n', 'wip on f')
+
+        now = datetime.now(UTC)
+        git_ops._run_warm_lane_disk_guard = AsyncMock(return_value=75)
+        reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        registered = await _registered_worktree_paths(iw_git_repo)
+        assert str(info_e.path.resolve()) not in registered, (
+            f'expected E ({info_e.path}) to be evicted under disk pressure; '
+            f'registered: {registered}'
+        )
+        assert str(info_f.path.resolve()) in registered, (
+            f'expected F ({info_f.path}) to be PRESERVED under disk pressure '
+            f'(unmerged work is never dropped on pressure alone); '
+            f'registered: {registered}'
+        )
+
+        e_record = next(
+            (r for r in reaped if r.path.resolve() == info_e.path.resolve()), None,
+        )
+        assert e_record is not None, f'expected a reaped record for E; got {reaped!r}'
+        assert e_record.reason == 'disk_pressure', (
+            f"expected E's reap reason to be 'disk_pressure', got {e_record.reason!r}"
+        )
+        f_paths = {r.path.resolve() for r in reaped}
+        assert info_f.path.resolve() not in f_paths, (
+            f'expected NO reaped record for F; got {reaped!r}'
+        )
+
+    async def test_control_no_pressure_preserves_idle_worktree(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """Control: with the guard mocked to 0 (no pressure), an idle
+        within-ttl worktree is preserved — proves the eviction above is
+        pressure-driven, not an unrelated TTL/landed rule."""
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info_e = await git_ops.create_interactive_worktree('idle-e2')
+
+        now = datetime.now(UTC)
+        git_ops._run_warm_lane_disk_guard = AsyncMock(return_value=0)
+        reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        registered = await _registered_worktree_paths(iw_git_repo)
+        assert str(info_e.path.resolve()) in registered, (
+            f'expected E ({info_e.path}) to be preserved with no disk '
+            f'pressure; registered: {registered}'
+        )
+        assert reaped == [], (
+            f'expected nothing reaped under no pressure; got {reaped!r}'
+        )
