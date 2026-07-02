@@ -1448,3 +1448,91 @@ def test_staleness_pass_commit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
         f"A commit younger than STALENESS_GRACE_SECS must suppress all restarts; got {restarted}"
     )
 
+
+# ---------------------------------------------------------------------------
+# report() tests
+# ---------------------------------------------------------------------------
+
+
+def test_report_mixed_fleet_returns_1_and_lists_all_units(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """report() lists every unit with a verdict, returns 1 if any is stale, mutates nothing (I7)."""
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    units = [f"orchestrator-unit{i}.service" for i in range(6)]
+    # unit0 is stale; the rest are fresh.
+    start_epochs = {units[0]: commit_epoch - 100}
+    for u in units[1:]:
+        start_epochs[u] = commit_epoch + 100
+
+    recorded_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        recorded_calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(units))
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda u: start_epochs[u])
+
+    exit_code = wdog.report()
+
+    assert exit_code == 1, "report() must return 1 when any unit is stale"
+
+    captured = capsys.readouterr()
+    for u in units:
+        assert u in captured.out, f"report() output must list {u}: {captured.out}"
+    assert "stale" in captured.out
+    assert "fresh" in captured.out
+
+    mutating_verbs = {"stop", "start", "restart", "reset-failed"}
+    for call in recorded_calls:
+        for token in call:
+            assert token not in mutating_verbs, (
+                f"report() must perform zero mutating systemctl calls; saw {call}"
+            )
+
+
+def test_report_all_fresh_returns_0(monkeypatch: pytest.MonkeyPatch) -> None:
+    """report() returns 0 when every unit is fresh."""
+    wdog = _load_watchdog()
+
+    commit_epoch = 1_800_000_000
+    units = [f"orchestrator-unit{i}.service" for i in range(6)]
+    start_epochs = {u: commit_epoch + 100 for u in units}
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(units))
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda u: start_epochs[u])
+
+    assert wdog.report() == 0
+
+
+def test_report_unknown_verdict_does_not_force_exit_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """report() returns 0 when verdicts are 'unknown' (undeterminable), not forced to 1.
+
+    An 'unknown' verdict (either epoch undeterminable) must not be treated as
+    a failure signal — only a confirmed-stale unit should force exit 1.
+    """
+    wdog = _load_watchdog()
+    units = ["orchestrator-x.service"]
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(units))
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: None)  # undeterminable
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda u: 12345)
+
+    assert wdog.report() == 0
+
