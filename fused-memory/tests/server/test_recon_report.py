@@ -2099,3 +2099,38 @@ class TestReconReportSignatureTypeCanonicalization:
             'existing_finding_id': first['finding_id'],
         }
 
+    def test_int_task_id_stored_as_canonical_str(self):
+        """A finding filed with an int task_id must read back as str — the
+        stored _Finding, not just the dedup signature, must be canonicalized
+        so get_assembled_report is type-stable for downstream consumers
+        (flag_dedup.compute_flag_signature, stats_verifier).
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        result = self._finding(state, task_id=1976, flag_type='deterministic_task_stall')
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+
+        report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
+        assert len(report['flagged_items']) == 1
+        item = report['flagged_items'][0]
+        assert item['task_id'] == '1976'
+        assert isinstance(item['task_id'], str)
+        assert item['flag_type'] == 'deterministic_task_stall'
+
+    def test_get_findings_for_run_task_id_is_str(self):
+        """get_findings_for_run must also read back a canonical str task_id,
+        not the raw int that was passed to add_finding.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+        result = self._finding(state, task_id=1976, flag_type='deterministic_task_stall')
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+
+        results = state.get_findings_for_run('r1')
+        assert len(results) == 1
+        assert results[0]['task_id'] == '1976'
+        assert isinstance(results[0]['task_id'], str)
+
