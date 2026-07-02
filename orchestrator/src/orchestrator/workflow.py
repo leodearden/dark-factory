@@ -91,6 +91,26 @@ from orchestrator.verify import (
 # the plan-tools stdio MCP server.
 _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 
+# Role gates for per-invocation MCP wiring in _invoke().  A role listed in an
+# AgentRole.allowed_tools / briefing MUST also appear here for the matching
+# server family, or the session is told to call tools that do not exist.
+#
+# _MCP_CONFIG_ROLES: sessions that receive the orchestrator-assembled MCP
+# config (fused-memory + escalation).  simple_task is included (reify
+# esc-4943-54): its prompt embeds the escalation/memory instructions, and
+# without this entry the session only sees whatever static .mcp.json the
+# watched project happens to commit — nothing at all in projects without one.
+_MCP_CONFIG_ROLES = (
+    'architect', 'implementer', 'debugger', 'merger', 'judge', 'simple_task',
+)
+
+# _PLAN_TOOLS_ROLES: sessions that get the per-worktree plan-tools stdio
+# server injected.  simple_task is included (reify esc-4943-54): its success
+# contract (_run_simple_task requires a plan-tools-registered plan with >=1
+# step done) was unsatisfiable without the server, so the Lever-C fast-path
+# always fell through to the architect and its cost saving never materialized.
+_PLAN_TOOLS_ROLES = ('architect', 'implementer', 'debugger', 'simple_task')
+
 
 def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
@@ -6809,7 +6829,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # work; it does not use escalation tools but mcp_config_json handles
         # escalation_url=None fine.
         mcp_config = None
-        if role.name in ('architect', 'implementer', 'debugger', 'merger', 'judge'):
+        if role.name in _MCP_CONFIG_ROLES:
             escalation_url = None
             if self.escalation_queue:
                 esc = self.config.escalation
@@ -6818,11 +6838,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
 
         # Plan-tools stdio MCP server — architect builds plans, implementer/
-        # debugger marks steps done.  Per-invocation isolation: each agent
-        # gets its own server bound to the worktree path.  Fast-start flags
+        # debugger/simple_task mark steps done.  Per-invocation isolation: each
+        # agent gets its own server bound to the worktree path.  Fast-start flags
         # (--no-sync, --frozen) reuse the already-synced orchestrator venv to
         # avoid cold-resolve stalls under load (reify esc-4415-240/esc-4437-123).
-        if role.name in ('architect', 'implementer', 'debugger') and cwd:
+        if role.name in _PLAN_TOOLS_ROLES and cwd:
             mcp_config = _inject_plan_tools_mcp(mcp_config, cwd)
 
         # Session-resume lifecycle: if the harness recovered a sidecar that

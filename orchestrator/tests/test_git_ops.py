@@ -7731,6 +7731,87 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
             f'used), got {seed_count} — indicates _reuse_warm_lane ran on wrong branch'
         )
 
+    async def test_reset_in_place_reattach_clears_previous_occupant_task_dir(
+        self, git_repo: Path, tmp_path: Path,
+    ):
+        """Successful reset-in-place reattach must clear the previous
+        occupant's .task/ scratch (reify esc-4920-163).
+
+        Reaching the reattach guard means the lane's .task/ belongs to the
+        lane's PREVIOUS occupant — the same-task case already returned via
+        the disk-backstop reuse (plan.json task_id match).  ``checkout -f``
+        replaces tracked files but leaves untracked .task/ intact, and
+        _reuse_warm_lane preserves .task/ by design (same-task contract), so
+        without an explicit clear the incoming task inherits a foreign
+        plan.json/iterations.jsonl/reviews/ (incident: _lane-26 re-acquired
+        for reify task 4920 surfaced task 4949's plan and iteration entries
+        as its own).
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        # (a) Create task/A with a commit beyond main, then REMOVE its
+        #     worktree so the branch is orphaned-with-commits (reattachable)
+        #     and free to be checked out inside the lane.
+        tmp_wt_a = tmp_path / 'tmp_wt_A_taskscrub'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/A', str(tmp_wt_a), start_ref],
+            cwd=git_repo,
+        )
+        (tmp_wt_a / 'wip.txt').write_text('work\n')
+        await _run(['git', 'add', '-A'], cwd=tmp_wt_a)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=tmp_wt_a)
+        await _run(
+            ['git', 'worktree', 'remove', '--force', str(tmp_wt_a)], cwd=git_repo,
+        )
+
+        # (b) Register+free _lane-0 as 'seed' (previous occupant), leaving
+        #     its .task/ scratch behind exactly as a released lane does.
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+        info_seed = await git_ops.acquire_warm_lane('seed', start_ref)
+        assert isinstance(info_seed, WorktreeInfo), (
+            f'Seed acquire failed (setup): {info_seed!r}'
+        )
+        lane_path = info_seed.path
+        task_dir = lane_path / '.task'
+        (task_dir / 'reviews').mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(
+            '{"task_id": "seed", "title": "seed plan"}'
+        )
+        (task_dir / 'iterations.jsonl').write_text(
+            '{"iteration": 1, "agent": "implementer", "task": "seed"}\n'
+        )
+        (task_dir / 'reviews' / 'merge.json').write_text('{"task": "seed"}')
+        await git_ops.warm_lane_pool.release(lane_path)
+
+        # (c) Acquire for 'A' — registered lane + orphan task/A with commits
+        #     + foreign plan.json ⇒ reset-in-place reattach path, checkout
+        #     succeeds this time.
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+        assert isinstance(result, WorktreeInfo), (
+            f'Reattach acquire must succeed, got {result!r}'
+        )
+
+        # (d) Previous occupant's scratch must be GONE — none of seed's
+        #     artifacts may survive into task/A's session.
+        assert not (task_dir / 'iterations.jsonl').exists(), (
+            "previous occupant's iterations.jsonl survived the reattach — "
+            'provenance contamination (esc-4920-163 class)'
+        )
+        assert not (task_dir / 'reviews' / 'merge.json').exists(), (
+            "previous occupant's reviews/ survived the reattach — "
+            'provenance contamination (esc-4920-163 class)'
+        )
+        if (task_dir / 'plan.json').exists():
+            import json as _json
+            leftover = _json.loads((task_dir / 'plan.json').read_text())
+            assert leftover.get('task_id') != 'seed', (
+                "previous occupant's plan.json survived the reattach — the "
+                'incoming task would surface it as its own prior plan'
+            )
+
 
 # ===========================================================================
 # Task-1923 step-1: RED — rebind_branch_to_head contract
