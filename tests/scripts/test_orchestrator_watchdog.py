@@ -864,3 +864,93 @@ def test_main_skips_disabled_unit_entirely(monkeypatch: pytest.MonkeyPatch) -> N
     assert probed == [8100]
     assert restarted == ["orchestrator-reify.service"]
 
+
+# ---------------------------------------------------------------------------
+# _enumerate_running_units tests
+# ---------------------------------------------------------------------------
+
+_LIST_UNITS_SIX = (
+    "orchestrator-dark-factory.service             loaded active running Dark Factory Orchestrator\n"
+    "orchestrator-reify.service                    loaded active running Reify Orchestrator\n"
+    "orchestrator-my-solar-challenge.service        loaded active running My Solar Challenge Orchestrator\n"
+    "orchestrator-know-live.service                 loaded active running Know Live Orchestrator\n"
+    "orchestrator-autopilot-video.service           loaded active running Autopilot Video Orchestrator\n"
+    "orchestrator-solar-challenge-platform.service  loaded active running Solar Challenge Platform Orchestrator\n"
+)
+
+
+def test_enumerate_running_units_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_enumerate_running_units returns the first field of each list-units line, in order."""
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout=_LIST_UNITS_SIX, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = wdog._enumerate_running_units()
+
+    assert result == [
+        "orchestrator-dark-factory.service",
+        "orchestrator-reify.service",
+        "orchestrator-my-solar-challenge.service",
+        "orchestrator-know-live.service",
+        "orchestrator-autopilot-video.service",
+        "orchestrator-solar-challenge-platform.service",
+    ]
+    assert len(calls) == 1, f"Expected exactly one systemctl call, got {calls}"
+    assert calls[0] == [
+        "systemctl",
+        "--user",
+        "list-units",
+        "orchestrator-*.service",
+        "--state=running",
+        "--no-legend",
+        "--plain",
+    ]
+
+
+def test_enumerate_running_units_empty_on_nonzero_rc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_enumerate_running_units returns [] when systemctl exits non-zero."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 1, stdout=_LIST_UNITS_SIX, stderr="error")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._enumerate_running_units() == []
+
+
+def test_enumerate_running_units_empty_on_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_enumerate_running_units returns [] when systemctl binary is not found."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._enumerate_running_units() == []
+
+
+def test_enumerate_running_units_empty_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_enumerate_running_units returns [] when the systemctl call times out."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._enumerate_running_units() == []
+
+
+def test_enumerate_running_units_empty_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_enumerate_running_units returns [] when no orchestrator units are running."""
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog._enumerate_running_units() == []
+
