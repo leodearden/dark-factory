@@ -54,6 +54,7 @@ import asyncio
 import fcntl
 import logging
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -83,6 +84,28 @@ _RUN_OFFLINE_DEEP_SCRIPT: str = 'scripts/run-offline-deep.sh'
 # SELF-ACQUIRES the H8 Lane-X flock, so no DF-side flock is needed here.
 _RUN_ALL_INFRA_SCRIPT: str = 'tests/infra/run_all.sh'
 _INFRA_SCOPE: str = 'host-infra'
+
+# Matches reify H9's per-test result lines, e.g. '  RESULT: FAIL (test_x.sh)'
+# or '  RESULT: PASS (test_y.sh)'.  Only FAIL lines are of interest to the
+# infra confirmation runner; the captured group is the test-FILE-name.
+_INFRA_RESULT_FAIL_RE = re.compile(r'^\s*RESULT:\s*FAIL\s*\((?P<name>.+?)\)\s*$')
+
+
+def _parse_infra_failures(text: str) -> list[str]:
+    """Extract still-failing test-file-names from reify H9's stdout (IE1).
+
+    Matches per-line ``RESULT: FAIL (<name>)`` lines (PASS lines and any
+    other output are ignored) and returns the sorted, de-duplicated set of
+    captured names.  Used by
+    :meth:`OfflineLaneWorker._default_infra_confirmation_run` (kept
+    module-level so it is trivially unit-testable in isolation).
+    """
+    names = {
+        m.group('name')
+        for line in text.splitlines()
+        if (m := _INFRA_RESULT_FAIL_RE.match(line))
+    }
+    return sorted(names)
 
 #: Signature of the injectable heavy-suite seam: (worktree path, head SHA,
 #: test-thread count) -> (return code, output tail).
@@ -745,8 +768,31 @@ class OfflineLaneWorker:
     async def _default_infra_confirmation_run(self, wt: Path, head: str) -> list[str]:
         """Default ``infra_confirmation_runner`` seam — re-runs H9 host-infra (IE1).
 
-        Body lands in a later step (task 1959 step-8); this stub exists so
-        the constructor wiring (step-4) has a real bound method to fall
-        back to.
+        Cross-project scope boundary (same as :meth:`_default_run_infra`).
+        Re-invokes reify's H9 with the SAME argv/env/cwd as
+        :meth:`_default_run_infra` — the whole host-exclusive set is small
+        and self-serializes under its own flock (IE-D2), so re-running the
+        full scope is an acceptable flake filter (mirrors
+        :meth:`_default_confirmation_run`'s serial re-run, without needing
+        a separate "confirm only these" flag since the set is already
+        tiny).
+
+        Parses stdout via the module-level :func:`_parse_infra_failures`
+        helper, which extracts H9's ``RESULT: FAIL (<name>)`` lines — a
+        different wire format from the numeric seam's newline-separated
+        test IDs (:meth:`_default_confirmation_run`), since reify H9 emits
+        one line per test with an explicit PASS/FAIL verdict rather than
+        listing only failures.
         """
-        raise NotImplementedError
+        argv = [_RUN_ALL_INFRA_SCRIPT, '--scope', _INFRA_SCOPE]
+        env = {**os.environ, 'DF_VERIFY_ROLE': 'offline'}
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(wt),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        text = (stdout or b'').decode(errors='replace')
+        return _parse_infra_failures(text)
