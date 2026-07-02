@@ -7139,3 +7139,126 @@ class TestAcknowledgeFlagMarkerTag:
         assert result == 0
         memory_service.delete_memory.assert_not_called()
 
+
+# ---------------------------------------------------------------------------
+# acknowledge_resolved_flags(...) — step-5 RED tests.
+#
+# RED until step-6 adds acknowledge_resolved_flags to flag_dedup.py.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcknowledgeResolvedFlags:
+    """RED tests for acknowledge_resolved_flags(...) (step-5).
+
+    RED until step-6 adds acknowledge_resolved_flags to flag_dedup.py.
+    """
+
+    async def test_dispatches_per_signable_flag_and_sums_count(self, monkeypatch):
+        """One acknowledge_flag_marker call per signable flag; correct signature
+        forwarded per flag (task_id, cited_tasks-fallback, content-fingerprint);
+        no-signature flag skipped; total is the summed count.
+        """
+        import fused_memory.reconciliation.flag_dedup as flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import (
+            acknowledge_resolved_flags,
+            compute_content_fingerprint_signature,
+        )
+
+        calls: list[tuple[str, str, str]] = []
+
+        async def _fake_ack(memory_service, *, project_id, run_id, task_id, flag_type, mode, log=None):
+            calls.append((task_id, flag_type, mode))
+            return 1
+
+        monkeypatch.setattr(
+            flag_dedup_mod, 'acknowledge_flag_marker', AsyncMock(side_effect=_fake_ack)
+        )
+
+        memory_service = AsyncMock()
+        task_id_flag = {'task_id': 42, 'flag_type': 'x'}
+        cited_tasks_flag = {'task_id': None, 'flag_type': 'y', 'cited_tasks': [{'task_id': 7}]}
+        content_fp_flag = {'task_id': None, 'flag_type': None, 'description': 'orphan finding text'}
+        no_sig_flag: dict = {}
+
+        resolved_flags = [task_id_flag, cited_tasks_flag, content_fp_flag, no_sig_flag]
+
+        result = await acknowledge_resolved_flags(
+            memory_service, 'p', 'r1', resolved_flags, mode='delete',
+        )
+
+        assert result == 3
+        assert len(calls) == 3, f'no-signature flag must be skipped (no call); got {calls!r}'
+        assert ('42', 'x', 'delete') in calls
+        assert ('7', 'y', 'delete') in calls
+        fp_sig = compute_content_fingerprint_signature(content_fp_flag)
+        assert fp_sig is not None
+        assert (fp_sig[0], fp_sig[1], 'delete') in calls
+
+    async def test_mode_forwarded_verbatim_tag(self, monkeypatch):
+        """mode='tag' is forwarded verbatim to every acknowledge_flag_marker call."""
+        import fused_memory.reconciliation.flag_dedup as flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import acknowledge_resolved_flags
+
+        calls: list[tuple[str, str, str]] = []
+
+        async def _fake_ack(memory_service, *, project_id, run_id, task_id, flag_type, mode, log=None):
+            calls.append((task_id, flag_type, mode))
+            return 1
+
+        monkeypatch.setattr(
+            flag_dedup_mod, 'acknowledge_flag_marker', AsyncMock(side_effect=_fake_ack)
+        )
+
+        memory_service = AsyncMock()
+        resolved_flags = [{'task_id': 1, 'flag_type': 'a'}, {'task_id': 2, 'flag_type': 'b'}]
+
+        result = await acknowledge_resolved_flags(
+            memory_service, 'p', 'r1', resolved_flags, mode='tag',
+        )
+
+        assert result == 2
+        assert calls == [('1', 'a', 'tag'), ('2', 'b', 'tag')]
+
+    async def test_one_flag_failure_does_not_abort_batch(self, monkeypatch, caplog):
+        """One flag's acknowledge_flag_marker raising is logged and does not abort
+        the batch — the remaining flags are still processed.
+        """
+        import logging
+
+        import fused_memory.reconciliation.flag_dedup as flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import acknowledge_resolved_flags
+
+        calls: list[str] = []
+
+        async def _fake_ack(memory_service, *, project_id, run_id, task_id, flag_type, mode, log=None):
+            calls.append(task_id)
+            if task_id == '2':
+                raise RuntimeError('boom')
+            return 1
+
+        monkeypatch.setattr(
+            flag_dedup_mod, 'acknowledge_flag_marker', AsyncMock(side_effect=_fake_ack)
+        )
+
+        memory_service = AsyncMock()
+        resolved_flags = [
+            {'task_id': 1, 'flag_type': 'a'},
+            {'task_id': 2, 'flag_type': 'b'},
+            {'task_id': 3, 'flag_type': 'c'},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await acknowledge_resolved_flags(
+                memory_service, 'p', 'r1', resolved_flags, mode='delete',
+            )
+
+        # All three flags were attempted despite the middle one raising.
+        assert calls == ['1', '2', '3']
+        # flag 2's exception is excluded from the count; 1 and 3 succeeded.
+        assert result == 2
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('2' in m for m in warning_messages), (
+            f'expected a WARNING mentioning the failed flag; got {warning_messages!r}'
+        )
+
