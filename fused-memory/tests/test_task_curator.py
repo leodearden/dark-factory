@@ -775,6 +775,38 @@ class TestCallLlmNeutralCwd:
         # Regression guard: self._cwd (Python-side blocklist/premise anchor) untouched.
         assert curator._cwd == tmp_path
 
+    @pytest.mark.asyncio
+    async def test_call_llm_batch_forwards_neutral_cwd_and_preserves_self_cwd(self, tmp_path):
+        config = _make_config()
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        batch_result = AgentResult(
+            success=True, output='',
+            structured_output={'decisions': [
+                {'candidate_index': 0, 'action': 'create', 'justification': 'new0'},
+                {'candidate_index': 1, 'action': 'create', 'justification': 'new1'},
+            ]},
+        )
+        mock = AsyncMock(return_value=batch_result)
+        with patch(
+            'fused_memory.middleware.task_curator.invoke_with_cap_retry',
+            new=mock,
+        ):
+            await curator._call_llm_batch(
+                [CandidateTask(title='T0'), CandidateTask(title='T1')],
+                pools=[[], []],
+                pool_sizes_list=[{}, {}],
+                start=0.0,
+                project_id='p',
+                project_root=str(tmp_path),
+            )
+        _, kwargs = mock.call_args
+        assert kwargs['cwd'] == neutral_cli_cwd()
+        assert kwargs['cwd'] != tmp_path
+        assert kwargs['cwd'] != Path(str(tmp_path))
+        # Regression guard: self._cwd (Python-side blocklist/premise anchor) untouched.
+        assert curator._cwd == tmp_path
+
 
 class TestZeroOutputTimeoutSignal:
     """Step-1 RED: CuratorFailureError carries zero_output_timeout + forensic evidence."""
