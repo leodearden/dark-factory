@@ -384,7 +384,6 @@ class OfflineLaneWorker:
         start = time.monotonic()
         rc, _tail = await self.suite_runner(wt, head, threads)
         duration = time.monotonic() - start
-        self._last_run_head = head
         logger.info(
             'offline-lane: numeric sub-run head=%s status=%s duration=%.1fs',
             head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
@@ -408,6 +407,13 @@ class OfflineLaneWorker:
                     wt, head, confirmation_runner=self.infra_confirmation_runner,
                 )
 
+        # Advance ONLY after both red-handling legs and the infra sub-run have
+        # completed without raising (task 2016, Bug #2 fix). A raise from any
+        # leg propagates out of _run_once BEFORE this line runs, so
+        # _last_run_head stays at its prior value and run()'s poll backstop
+        # (head != self._last_run_head) re-flags this head for retry on the
+        # next poll tick — see run()'s docstring "Fail-open" section.
+        self._last_run_head = head
         if numeric_green and infra_green:
             self._last_green_head = head
 
