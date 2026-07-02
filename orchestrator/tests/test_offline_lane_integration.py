@@ -415,6 +415,11 @@ def _l0_info_escalations(escalation_queue: EscalationQueue, task_id: str) -> lis
     return escalation_queue.get_by_task(task_id, status='pending', level=0)
 
 
+def _l2_blocker_escalations(escalation_queue: EscalationQueue, task_id: str) -> list:
+    """Pending L2 (born-at-L2) blocker escalations filed for *task_id*."""
+    return escalation_queue.get_by_task(task_id, status='pending', level=2)
+
+
 async def _drive_reds(
     harness: Harness, repo: Path, worker: OfflineLaneWorker, failing_ids: list[str], n: int,
 ) -> None:
@@ -430,6 +435,22 @@ async def _drive_reds(
     for _ in range(n):
         await _drive_advance(harness, repo)
         await _run_one_lane_pass(worker)
+
+
+def _terminal_status_task_client(status: str) -> AsyncMock:
+    """A fake ``OfflineLaneTaskClient`` whose open fix task already reports a
+    terminal non-done *status* (B7 arm 2 — ``'cancelled'`` / ``'deferred'``).
+
+    :meth:`OfflineLaneWorker._maybe_promote_blocker` promotes on this arm
+    immediately, regardless of the configured advance-count threshold.
+    ``submit_fix_task`` / ``append_suspect_range`` behave as the
+    ``_build_worker`` default (see its docstring) — only ``get_status``
+    diverges.
+    """
+    task_client = AsyncMock()
+    task_client.get_status = AsyncMock(return_value=status)
+    task_client.submit_fix_task = AsyncMock(return_value='fix-task-1')
+    return task_client
 
 
 # ---------------------------------------------------------------------------
