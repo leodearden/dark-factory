@@ -43,6 +43,14 @@ print_intended_diff() {
     echo "+  ${KNOB}: \"1\"   (under verify_env: in ${CONFIG_PATH})"
 }
 
+# IE4 seam: this only EMITS the observable reload signal. The actual
+# reload MECHANIC (in-place config reload vs a target_unit self-kill
+# restart via the deterministic runner) is selected by IE4 -- it
+# wraps/replaces this function's body, not IE3's call site.
+signal_config_reload() {
+    echo "flip-reify-run-all: config-reload signal emitted"
+}
+
 apply_flip() {
     # Comment-preserving targeted edit (NOT a YAML round-trip): strip any
     # pre-existing knob line (any indentation/value), then insert the
@@ -78,6 +86,7 @@ main() {
     git -C "$REIFY_REPO" add -- "$CONFIG_FILE"
     if ! git -C "$REIFY_REPO" diff --cached --quiet -- "$CONFIG_FILE"; then
         git -C "$REIFY_REPO" commit -m "deploy: flip ${KNOB}=1 (exclude host-exclusive infra set from reify run_all)"
+        signal_config_reload
     fi
 }
 
