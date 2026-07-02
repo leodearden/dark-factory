@@ -148,3 +148,74 @@ class TestReapInteractiveWorktreesTtlRule:
         )
         assert a_record.slug == 'a', f"expected reaped record slug 'a', got {a_record.slug!r}"
         assert a_record.reason, 'expected a non-empty reason on the reaped record'
+
+
+# ---------------------------------------------------------------------------
+# Step-03: landed-on-main detection + fresh-worktree preservation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapInteractiveWorktreesLanded:
+    """RED — a merge marker on main reaps regardless of TTL; a fresh
+    zero-commit worktree at the main tip must NOT be mistaken for 'landed'
+    (guards against an is_ancestor false-positive)."""
+
+    async def test_landed_branch_reaped_fresh_worktree_preserved(
+        self, iw_git_repo: Path,
+    ) -> None:
+        """C: own-commit + merged into main (canonical subject) -> reaped as
+        'landed' despite being within ttl. D: fresh zero-commit worktree at
+        the (now-advanced) main tip, within ttl -> preserved."""
+        config = GitConfig()
+        git_ops = GitOps(config, iw_git_repo)
+
+        info_c = await git_ops.create_interactive_worktree('landed-c')
+        await _commit_file(info_c.path, 'work.txt', 'work\n', 'wip on c')
+
+        # Merge task/landed-c into main using the canonical subject, run from
+        # the main checkout (project_root). The branch stays checked out in
+        # info_c.path throughout, exactly as a live interactive session would
+        # leave it — merging FROM a branch checked out elsewhere is legal.
+        merge_rc, _, merge_err = await _run(
+            [
+                'git', 'merge', '--no-ff',
+                '-m', f'Merge {info_c.branch} into {config.main_branch}',
+                info_c.branch,
+            ],
+            cwd=iw_git_repo,
+        )
+        assert merge_rc == 0, (
+            f'setup: merge of {info_c.branch} into main failed: {merge_err}'
+        )
+
+        # D is created AFTER the merge, so its "main tip" already includes
+        # C's merge commit -- zero own-commits, HEAD == main tip exactly like
+        # the is_ancestor false-positive shape documented on
+        # worktree_head_beyond_main / find_task_citation_commit.
+        info_d = await git_ops.create_interactive_worktree('fresh-d')
+
+        now = datetime.now(UTC)
+        reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        registered = await _registered_worktree_paths(iw_git_repo)
+        assert str(info_c.path.resolve()) not in registered, (
+            f'expected C ({info_c.path}) to be removed as landed; '
+            f'registered: {registered}'
+        )
+        assert str(info_d.path.resolve()) in registered, (
+            f'expected D ({info_d.path}) to remain (fresh, zero commits, '
+            f'within ttl); registered: {registered}'
+        )
+
+        c_record = next(
+            (r for r in reaped if r.path.resolve() == info_c.path.resolve()), None,
+        )
+        assert c_record is not None, f'expected a reaped record for C; got {reaped!r}'
+        assert c_record.reason == 'landed', (
+            f"expected C's reap reason to be 'landed', got {c_record.reason!r}"
+        )
+        d_paths = {r.path.resolve() for r in reaped}
+        assert info_d.path.resolve() not in d_paths, (
+            f'expected NO reaped record for D; got {reaped!r}'
+        )
