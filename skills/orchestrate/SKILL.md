@@ -312,6 +312,59 @@ If children (agent subprocesses) are orphaned, kill them by PID. Do **not** use 
 
 ---
 
+## Reload Config (vs Restart)
+
+Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
+
+### Why this exists
+
+A full restart is expensive: graceful stop (SIGTERM, up to 90s before SIGKILL) cancels in-flight agent tasks and cargo verify suites, then cold start pays a warm-lane reseed, a module-tagger pass, and up to 280s waiting on fused-memory. For a pure tuning-knob change (bump a model, loosen a timeout), that cost buys nothing.
+
+### How to invoke
+
+`reload_config` is **operator-only** — it is in no agent role's MCP allow-list (same convention as `halt_scheduler`/`halt_merge_queue`), so agents can never reload config on themselves mid-task. Call it from an interactive session or a dedicated `/escalation-watcher` session, against the target orchestrator's own escalation MCP server (reify 8100, dark-factory 8102):
+
+```
+mcp__escalation__reload_config()
+```
+
+It takes **no path argument** — it always re-reads the process's own `ORCH_CONFIG_PATH`, the same cross-project guard that governs `--config`/`ORCH_CONFIG_PATH` at startup (a reload can never retarget a running orchestrator at a different project).
+
+### Reload vs restart — which one do I need?
+
+| Edit | Action |
+|---|---|
+| Per-role `models` / `budgets` / `max_turns` / `effort` / `timeouts` / `backends` | Reload |
+| Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`) | Reload |
+| Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
+| `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
+| `git.offline_lane_*` leaf tunables (test threads, poll interval, red-advance count) | Reload |
+| `max_concurrent_tasks`, pool sizes / `verify_runners`, `escalation` bind host/port, `sandbox.backend`, `project_root`, merge-lane `git.*` structural fields (`branch_prefix`, `main_branch`, `persistent_merge_worktree`, …) | **Restart** — these are startup-baked (semaphores, pool sizes, bound sockets, module globals); reload reports them in `restart_required` without touching the running process |
+| Any code change (not just YAML) | **Restart** — reload only re-reads config, never code |
+
+When unsure, reload first — it's cheap and non-destructive (fail-closed on bad YAML, never half-applies), then check the response for anything in `restart_required` and restart only if something you actually need is on that list.
+
+### Reading the response
+
+```
+{
+  reloaded: bool,              # true iff validation passed and apply committed
+  config_path: str,            # the ORCH_CONFIG_PATH re-read
+  applied: {path: {old, new}},          # allowlisted, changed, now live
+  restart_required: {path: {old, new}}, # changed but not allowlisted — still stale
+  unchanged: int,               # count of equal fields (audit convenience)
+  error: str | null,            # set iff reloaded=false; nothing was mutated
+}
+```
+
+**`reloaded: true` ≠ "everything took effect."** Always read `applied` and `restart_required` — a mixed edit can partially apply (allowlisted fields go live immediately) while non-allowlisted fields in the same edit sit untouched and stale until a restart. `error` is only set when the reload itself failed (bad YAML/validator failure); in that case the live config is untouched (fail-closed) and nothing was applied.
+
+Every call — success or failure — appends a `config_reload` event row to `runs.db` and fires a WARNING journal line whenever `restart_required` is non-empty or `reloaded=false`, so an AFK operator can audit what happened after the fact.
+
+See `CLAUDE.md`'s "Orchestrator Config Reload" section for the quick-reference tier summary, and `plans/config-hot-reload-prd.md` for the full allowlist and invariants.
+
+---
+
 ## Check Status
 
 Identify the target project first (see [Critical: identify the target project FIRST](#critical-identify-the-target-project-first)), then query its status. The `status` subcommand also requires `--config` (or `ORCH_CONFIG_PATH`):
