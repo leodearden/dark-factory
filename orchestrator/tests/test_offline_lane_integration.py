@@ -450,3 +450,45 @@ async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path, caplog):
 
     runner.release()
     await lane_task
+
+
+# ---------------------------------------------------------------------------
+# B4 — confirmed red files a normal fix task + L0 info escalation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b4_confirmed_red_files_fix_task_and_info_escalation(harness, git_ops, repo, tmp_path):
+    """B4 (PRD §8) — a confirmed-red run files a NORMAL pending fix task
+    (never the b3_gate red-main fix-forward path) plus a non-blocking L0
+    info escalation, leaving the merge queue itself completely untouched."""
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    failing_ids = ['t::b', 't::a']
+    worker = _build_worker(git_ops, tmp_path)
+    _inject_red(worker, failing_ids)
+    _wire_lane(harness, worker)
+
+    _, head_sha = await _drive_advance(harness, repo)
+    await _run_one_lane_pass(worker)
+
+    arguments = _submitted_fix_task_arguments(worker.task_client)
+    assert arguments['status'] == 'pending'
+    assert arguments['metadata']['merge_lane'] == 'normal', (
+        'a confirmed-red fix task must route through the standard '
+        'TDD→PR→merge gate, never the b3_gate red-main fix-forward path'
+    )
+    assert arguments['metadata']['failing_tests'] == sorted(failing_ids)
+    assert arguments['metadata']['suspect_ranges'] == [head_sha], (
+        'no prior green run is recorded yet, so the suspect range is just the head'
+    )
+
+    fp = compute_failing_test_set_fingerprint(failing_ids)
+    task_id = worker.open_fix_tasks[fp]
+    escalations = _l0_info_escalations(worker.escalation_queue, task_id)
+    assert len(escalations) == 1
+    assert escalations[0].severity == 'info'
+    assert escalations[0].agent_role == 'orchestrator-offline-lane'
+
+    # The merge queue itself is left completely untouched by the red path.
+    assert harness.get_merge_halt_status() == {'wired': False}
