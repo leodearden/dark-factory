@@ -18,6 +18,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     build_summary_nonce_section,
 )
 from fused_memory.reconciliation.flag_dedup import (
+    acknowledge_resolved_flags,
+    compute_content_fingerprint_signature,
+    compute_flag_signature,
     dedup_flags,
     filter_false_absence_flags,
     filter_stale_count_snapshot_corrections,
@@ -144,6 +147,12 @@ class MemoryConsolidator(BaseStage):
             return report
 
         if report.items_flagged:
+            # Snapshot before the filter chain (task-2029): used below to compute
+            # which flags the chain dropped, so any persisted stage1_flag_marker for
+            # a now-moot flag (terminal task, false-absence, stale-snapshot) can be
+            # reclaimed instead of waiting for the 14-day age-GC or a recurrence.
+            _pre_filter_flags = list(report.items_flagged)
+
             # ── Stale count-snapshot correction filter (task-1786): drop false ────
             # 'off-by-N correction' findings on stale-by-design task-count snapshot
             # edges BEFORE dedup_flags so no stage1_flag_marker churn occurs.
@@ -178,6 +187,30 @@ class MemoryConsolidator(BaseStage):
                 taskmaster=self.taskmaster,
                 project_root=self.project_root,
                 flags=report.items_flagged,
+            )
+
+            # ── Flag-marker acknowledgment (task-2029 scenario a) ──────────────────
+            # Flags DROPPED anywhere in the chain above (terminal task, false-absence,
+            # or stale-snapshot correction) have a moot requested action; reclaim any
+            # persisted stage1_flag_marker for them best-effort.  Computed as a
+            # signature diff against the survivors rather than threading a "dropped"
+            # list through each filter, so none of the filters' contracts change.
+            surviving_signatures = {
+                sig for f in report.items_flagged
+                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                is not None
+            }
+            dropped_flags = [
+                f for f in _pre_filter_flags
+                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                is not None and sig not in surviving_signatures
+            ]
+            report.stats['stage1_flag_markers_acknowledged'] = await acknowledge_resolved_flags(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                run_id=run_id,
+                resolved_flags=dropped_flags,
+                mode='delete',
             )
 
         # ── Census inconsistency detection ────────────────────────────────────
