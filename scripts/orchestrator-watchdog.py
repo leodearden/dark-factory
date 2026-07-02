@@ -437,12 +437,24 @@ def staleness_pass() -> None:
     every call, so a successful restart (from this pass, the coordinator, a
     deploy capstone, or manual operator action) makes the unit read fresh on
     the very next call. No stored state, no flap loop (I6).
+
+    Known limitation: the commit-grace gate below keys on the age of the
+    *newest* watched commit only, not on how far behind any individual unit
+    is. During a burst of continuous landings where a watched-path commit
+    lands more often than every STALENESS_GRACE_SECS, the newest commit is
+    perpetually inside the grace window, so this backstop is inhibited for
+    the whole burst even if some running unit is far behind an older commit.
+    This is an accepted trade-off (never race the event-driven coordinator)
+    rather than a bug; use `--report` to inspect actual per-unit staleness
+    while a burst is in progress.
     """
     commit_epoch = _newest_watched_commit_epoch()
     if commit_epoch is None:
         return  # undeterminable — fall safe, no restarts this tick
     if time.time() - commit_epoch < STALENESS_GRACE_SECS:
         # Give the polite event-driven restart coordinator its head start.
+        # NOTE: gates on the newest commit's age alone — see the "Known
+        # limitation" paragraph above for the rapid-landing suppression case.
         return
 
     for unit in _enumerate_running_units():
@@ -450,6 +462,13 @@ def staleness_pass() -> None:
             if not is_unit_enabled(unit):
                 # Disabled (or unknown) — respect operator intent, skip silently.
                 continue
+            # Two separate `systemctl show` calls per unit (elapsed here,
+            # start_epoch below) — could be merged into one
+            # `show -p ExecMainStartTimestampMonotonic -p ExecMainStartTimestamp`
+            # call to halve the subprocess count. Left as-is: low priority
+            # given the 60s timer cadence, and keeps this function reusing
+            # _unit_start_elapsed_secs verbatim rather than parsing both
+            # properties out of a combined call.
             elapsed = _unit_start_elapsed_secs(unit)
             if elapsed is not None and elapsed < STARTUP_GRACE_SECS:
                 # None => grace does not apply, proceed (mirrors main()).
@@ -488,11 +507,27 @@ def report() -> int:
     A unit's verdict is 'unknown' (not 'stale') when either epoch is
     undeterminable; an 'unknown' verdict does not force a non-zero exit —
     only a confirmed-stale unit does.
+
+    IMPORTANT: the verdict reflects raw start_epoch-vs-commit_epoch staleness
+    only. It does NOT evaluate the is_unit_enabled, STARTUP_GRACE_SECS, or
+    STALENESS_GRACE_SECS restraint gates that staleness_pass() applies before
+    actually restarting a unit — a unit reported 'stale' here may be one that
+    staleness_pass() will (correctly) leave alone this tick because it is
+    disabled, within its startup grace window, or the newest watched commit
+    is still within the fleet-wide commit-grace window. Treat 'stale' as
+    "not running code from the newest watched commit", not as a prediction
+    that a restart is imminent.
     """
     commit_epoch = _newest_watched_commit_epoch()
     units = _enumerate_running_units()
 
     commit_str = _format_epoch(commit_epoch)
+    print(
+        "NOTE: verdict reflects raw start-time-vs-commit staleness only; it "
+        "does not account for the enabled / startup-grace / commit-grace "
+        "restraint gates staleness_pass() applies before actually restarting "
+        "a unit."
+    )
     print(f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} VERDICT")
 
     any_stale = False
