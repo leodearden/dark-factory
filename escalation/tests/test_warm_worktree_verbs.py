@@ -275,3 +275,92 @@ class TestClaimWarmWorktreeGuards:
         assert result.get('reason') == 'invalid_slug', (
             f'expected reason=invalid_slug, got: {result}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-5 (RED) / step-6 (GREEN): release_warm_worktree by path — removal,
+# idempotency, standalone + project_root guards.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
+class TestReleaseWarmWorktreeRemoval:
+    """release_warm_worktree by path: removes, is idempotent, guards standalone/mismatch."""
+
+    async def test_release_by_path_removes_worktree(
+        self, warm_repo: Path, server: Any,
+    ) -> None:
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='rel1', project_root=str(warm_repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+
+        res = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(warm_repo),
+        )
+
+        assert res['removed'] is True, f'expected removed=True, got: {res}'
+        rc_list, wt_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=warm_repo,
+        )
+        assert rc_list == 0
+        assert '_iact-rel1' not in wt_list, (
+            f'expected _iact-rel1 gone from worktree list, got: {wt_list}'
+        )
+
+    async def test_release_by_path_is_idempotent(
+        self, warm_repo: Path, server: Any,
+    ) -> None:
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='rel1b', project_root=str(warm_repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+        first = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(warm_repo),
+        )
+        assert first['removed'] is True, f'setup: first release failed: {first}'
+
+        second = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(warm_repo),
+        )
+
+        assert second['removed'] is False, (
+            f'expected removed=False on already-gone path, got: {second}'
+        )
+
+    async def test_release_standalone_returns_error(self, tmp_path: Path) -> None:
+        """(i) No harness wired → {'error'}."""
+        server = create_server(EscalationQueue(tmp_path / 'esc'))  # no harness
+        result = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=str(tmp_path / 'nonexistent'), project_root=str(tmp_path),
+        )
+        assert 'error' in result, f'expected an error key, got: {result}'
+
+    async def test_release_project_root_mismatch_removes_nothing(
+        self, warm_repo: Path, server: Any,
+    ) -> None:
+        """(ii) project_root mismatch → {'error'} and nothing removed."""
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='rel2', project_root=str(warm_repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+        other = warm_repo.parent / 'not-the-repo'
+        other.mkdir()
+
+        result = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(other),
+        )
+
+        assert 'error' in result, f'expected an error key, got: {result}'
+        rc_list, wt_list, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=warm_repo,
+        )
+        assert '_iact-rel2' in wt_list, (
+            f'expected _iact-rel2 still registered after mismatch, got: {wt_list}'
+        )
