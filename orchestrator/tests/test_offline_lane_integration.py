@@ -363,6 +363,39 @@ async def _assert_never_a_gate(
     assert worker.escalation_queue.get_pending() == []
 
 
+def _inject_red(worker: OfflineLaneWorker, failing_ids: list[str]) -> None:
+    """Wire *worker* to simulate one confirmed-red suite pass (B4/B5/B7).
+
+    ``suite_runner`` reports a normal FAILED pass (``rc=1``);
+    ``confirmation_runner`` confirms the SAME *failing_ids* still fail in
+    isolation — a genuine break, never the B6 flake case (see
+    :func:`_inject_flake`). This is the ONLY point this integration harness
+    fakes the reify-subprocess boundary for a red pass; everything
+    downstream (fingerprinting, dedup, fix-task file/update, escalation
+    staging) is the real ``OfflineLaneWorker._handle_red_run`` chain.
+    """
+
+    async def _suite_runner(wt: Path, head: str, threads: int) -> tuple[int, str]:
+        return (1, 'FAILED (injected)')
+
+    async def _confirmation_runner(wt: Path, head: str) -> list[str]:
+        return list(failing_ids)
+
+    worker.suite_runner = _suite_runner
+    worker.confirmation_runner = _confirmation_runner
+
+
+def _submitted_fix_task_arguments(task_client) -> dict:
+    """Assert ``submit_fix_task`` was awaited exactly once; return its sole argument block."""
+    task_client.submit_fix_task.assert_awaited_once()
+    return task_client.submit_fix_task.await_args.args[0]
+
+
+def _l0_info_escalations(escalation_queue: EscalationQueue, task_id: str) -> list:
+    """Pending L0 (agent→steward) info escalations filed for *task_id*."""
+    return escalation_queue.get_by_task(task_id, status='pending', level=0)
+
+
 # ---------------------------------------------------------------------------
 # B1 — advance triggers a from-head run
 # ---------------------------------------------------------------------------
