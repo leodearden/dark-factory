@@ -4277,3 +4277,140 @@ class TestCuratorPremiseRefutedDrop:
 
         assert decision.action == "create"
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-1972 step-13 RED: TestCuratorBatchPremiseRefutedDrop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCuratorBatchPremiseRefutedDrop:
+    """Batch path: recon-premise-refuted matches are removed from LLM dispatch set.
+
+    Mirrors TestCuratorBatchBlocklistShortCircuit.
+    """
+
+    async def test_batch_premise_refuted_match_excluded_from_llm(self, tmp_path):
+        """candidates[0] is premise-refuted → excluded from LLM; decisions[0].action=='drop'."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        # candidates[0] is premise-refuted by the registry entry above
+        c0 = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+        # candidates[1] is an ordinary, non-matching candidate
+        c1 = CandidateTask(title="Improve worker logging", description="Normal task")
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        llm_decisions_returned = [
+            CuratorDecision(action="create", justification="new-1",
+                            pool_sizes=empty_sizes, latency_ms=0),
+        ]
+        llm_candidates_received: list[CandidateTask] = []
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            llm_candidates_received.extend(cands)
+            return llm_decisions_returned
+
+        with patch.object(
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        # (a) Two decisions returned, one per prepared candidate
+        assert len(decisions) == 2
+
+        # (b) decisions[0] is a recon-premise-refuted drop — NOT a batch_target_index drop
+        assert decisions[0].action == "drop"
+        assert decisions[0].justification.startswith("recon-premise-refuted:")
+        assert decisions[0].batch_target_index is None, (
+            "premise-refuted drops are real drops, not sibling-substitution drops"
+        )
+
+        # (c) LLM was called with only candidates[1], not [0]
+        assert len(llm_candidates_received) == 1
+        assert llm_candidates_received[0] is c1
+
+        # (d) decisions[1] reflects the mocked LLM result
+        assert decisions[1].action == "create"
+        assert decisions[1].justification == "new-1"
+
+    async def test_batch_ordinary_candidate_flows_through_normally(self, tmp_path):
+        """A batch with no premise-refuted candidates is unaffected by the guard."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        c0 = CandidateTask(title="Improve worker logging", description="Normal task")
+        c1 = CandidateTask(title="Add telemetry to recon pipeline", description="Normal task 2")
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        llm_decisions_returned = [
+            CuratorDecision(action="create", justification="new-0",
+                            pool_sizes=empty_sizes, latency_ms=0),
+            CuratorDecision(action="create", justification="new-1",
+                            pool_sizes=empty_sizes, latency_ms=0),
+        ]
+        llm_candidates_received: list[CandidateTask] = []
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            llm_candidates_received.extend(cands)
+            return llm_decisions_returned
+
+        with patch.object(
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        assert len(decisions) == 2
+        assert len(llm_candidates_received) == 2
+        assert decisions[0].action == "create"
+        assert decisions[1].action == "create"
+
