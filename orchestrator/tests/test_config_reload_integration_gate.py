@@ -18,11 +18,14 @@ running the full owning-package suite instead of a scoped subset.
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 import yaml
 from _workflow_helpers import FakeBriefing, FakeScheduler
 
@@ -181,3 +184,50 @@ def _make_reload_workflow(
         mcp=None,
     )
     return workflow, stub
+
+
+# ---------------------------------------------------------------------------
+# Scenario 1 (I1, I7): a real load_config() failure off a corrupted on-disk
+# YAML — the surface test_harness_config_reload.py's mocked-load-raises test
+# never exercises (it patches orchestrator.harness.load_config directly).
+# ---------------------------------------------------------------------------
+
+
+class TestS1BadYamlFailClosed:
+    """PRD boundary scenario 1: a genuinely corrupt on-disk config fails closed."""
+
+    @pytest.mark.asyncio
+    async def test_corrupt_yaml_fails_closed(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        harness, config_path = _make_reload_harness(tmp_path, monkeypatch)
+        before = harness.config.model_dump_json()
+
+        # Genuinely invalid YAML syntax (unterminated flow sequence) — a real
+        # yaml.safe_load() parse error surfacing through load_config(), not a
+        # mocked exception.
+        config_path.write_text('models: [unterminated')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            report = await harness.reload_config()
+
+        assert report['reloaded'] is False
+        assert report['config_path'] == str(config_path)
+        assert report['applied'] == {}
+        assert report['restart_required'] == {}
+        assert report['unchanged'] == 0
+        assert report['error']
+
+        assert harness.config.model_dump_json() == before, (
+            'live config must be byte-identical after a failed real-disk load (I1)'
+        )
+
+        rows = _query_config_reload_events(harness.event_store)
+        assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
+        assert json.loads(rows[0]['data']) == report
+
+        harness_warnings = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.harness' and r.levelno >= logging.WARNING
+        ]
+        assert harness_warnings, 'Expected at least one WARNING on a failed reload'
