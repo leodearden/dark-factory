@@ -12,7 +12,7 @@ import re
 import subprocess
 import types
 
-import pytest
+import pytest  # pyright: ignore[reportMissingImports]
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
