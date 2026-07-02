@@ -526,8 +526,21 @@ class _OfflineLaneTaskClient:
         )
 
     async def get_status(self, task_id: str) -> str:
-        """Return a previously filed fix task's current status."""
-        statuses, _err = await self._scheduler.get_statuses([task_id])
+        """Return a previously filed fix task's current status.
+
+        Logs (rather than silently swallows) a non-``None`` error half from
+        ``get_statuses`` — e.g. a transient MCP outage — so it stays
+        observable; the caller (``_maybe_promote_blocker``) still degrades
+        to treating the empty status as "not done, not terminal" either way
+        (task 2016 amendment).
+        """
+        statuses, err = await self._scheduler.get_statuses([task_id])
+        if err is not None:
+            logger.warning(
+                'offline-lane: get_statuses failed for task %s: %s — '
+                'treating status as unknown this check',
+                task_id, err,
+            )
         return statuses.get(task_id, '')
 
 

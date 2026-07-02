@@ -97,6 +97,10 @@ class TestOfflineLaneWiring:
             assert isinstance(worker, OfflineLaneWorker)
             assert worker.task_client is not None
             assert isinstance(worker.task_client, _OfflineLaneTaskClient)
+            assert worker.task_client._scheduler is harness.scheduler, (
+                'the adapter must wrap the harness\'s own scheduler, not a '
+                'stub or a different instance'
+            )
             assert worker.escalation_queue is harness._escalation_queue
         finally:
             await harness._stop_offline_lane()

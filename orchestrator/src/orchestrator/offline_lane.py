@@ -75,6 +75,15 @@ logger = logging.getLogger(__name__)
 # since harness.py imports OfflineLaneWorker from this module.
 _OFFLINE_LANE_FAILURE_BACKOFF_SECS: float = 60.0
 
+# Ceiling on the exponential backoff applied to CONSECUTIVE run() failures
+# (task 2016 amendment). Since the Bug #2 fix means a persistently-raising
+# red-handling/MCP leg now retries the head every pass instead of silently
+# advancing past it, a stuck outage would otherwise re-run the entire heavy
+# offline-deep suite every fixed 60s backoff forever. Doubling the backoff
+# per consecutive failure (capped here) bounds that cost while preserving
+# fail-open retry — never a permanent give-up.
+_OFFLINE_LANE_MAX_FAILURE_BACKOFF_SECS: float = 900.0
+
 # Default suite-run seam script (Part A, gated separately at ζ — see module
 # docstring's cross-project scope boundary).
 _RUN_OFFLINE_DEEP_SCRIPT: str = 'scripts/run-offline-deep.sh'
@@ -236,6 +245,11 @@ class OfflineLaneWorker:
         self._last_run_head: str | None = None
         # Held open for the lifetime of a successful acquire_lock() call.
         self._lock_file: IO | None = None
+        # Count of consecutive run() pass failures (reset to 0 on any
+        # successful _run_once) — drives the capped exponential backoff
+        # below so a persistent outage never hammers the heavy suite at a
+        # fixed 60s cadence forever (task 2016 amendment).
+        self._consecutive_failures: int = 0
 
         # Red-path state (β3) — keyed by compute_failing_test_set_fingerprint.
         # Maps a confirmed failing-test-set fingerprint to its open fix task
@@ -309,11 +323,18 @@ class OfflineLaneWorker:
         backstop (above) naturally re-flags the still-outstanding advance
         once the backoff elapses — a broken pass costs a retry, never a
         wedge (worker leg of C7, never-a-gate).
+
+        Bounded-cost retry (task 2016 amendment): the backoff doubles per
+        CONSECUTIVE failure (reset on any successful pass), capped at
+        :data:`_OFFLINE_LANE_MAX_FAILURE_BACKOFF_SECS` — so a persistent
+        red-handling/MCP outage doesn't re-run the entire heavy suite at the
+        fixed base cadence forever, while still never giving up permanently.
         """
         while True:
             try:
                 if self._dirty:
                     await self._run_once()
+                    self._consecutive_failures = 0
                     continue
                 self._wake.clear()
                 try:
@@ -328,11 +349,16 @@ class OfflineLaneWorker:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error(
-                    'offline-lane: run() pass failed: %s: %s',
-                    type(exc).__name__, exc,
+                self._consecutive_failures += 1
+                backoff = min(
+                    _OFFLINE_LANE_FAILURE_BACKOFF_SECS * (2 ** (self._consecutive_failures - 1)),
+                    _OFFLINE_LANE_MAX_FAILURE_BACKOFF_SECS,
                 )
-                await asyncio.sleep(_OFFLINE_LANE_FAILURE_BACKOFF_SECS)
+                logger.error(
+                    'offline-lane: run() pass failed (consecutive=%d): %s: %s',
+                    self._consecutive_failures, type(exc).__name__, exc,
+                )
+                await asyncio.sleep(backoff)
 
     async def _run_once(self) -> None:
         """Snapshot head, reset the warm worktree, and invoke both sub-run seams.
@@ -490,6 +516,16 @@ class OfflineLaneWorker:
         when :attr:`task_client` is unwired (never a crash; worker leg of
         C7) — no fingerprint is recorded in that case, since there is no
         fix task to dedup against.
+
+        Empty-id guard (task 2016 amendment): ``submit_fix_task`` returns
+        ``''`` when the MCP response envelope couldn't be parsed into a task
+        id (see ``harness._OfflineLaneTaskClient.submit_fix_task``). Treating
+        that as a normal id would record *fp* as "already open" under a
+        bogus empty key — a later genuine recurrence would then silently
+        dedup against it (no fix task actually exists) — and would file a
+        meaningless INFO escalation with ``task_id=''``. So an empty id is
+        logged and treated the same as the unwired-client degrade: no state
+        recorded, no escalation, safe to retry on the next red advance.
         """
         from orchestrator.workflow import build_offline_lane_fix_task_arguments
 
@@ -505,6 +541,14 @@ class OfflineLaneWorker:
             )
             return
         task_id = await self.task_client.submit_fix_task(arguments)
+        if not task_id:
+            logger.error(
+                'offline-lane: submit_fix_task returned no task id for '
+                'fingerprint=%s (tests=%s) — not recording as open; will '
+                'retry filing on the next confirmed-red advance',
+                fp, ', '.join(sorted(confirmed)),
+            )
+            return
         self.open_fix_tasks[fp] = task_id
         self._red_advance_counts[fp] = 1
         await self._file_info_escalation(task_id, confirmed, suspect)
