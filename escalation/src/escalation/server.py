@@ -1209,6 +1209,36 @@ def create_server(
             }
         return await harness.reload_config()
 
+    # --- Interactive warm-worktree tools (PRD β / task 2011) ---
+
+    @mcp.tool()
+    async def claim_warm_worktree(
+        slug: str, project_root: str, *, start_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Claim an isolated interactive warm-worktree (PRD β, task 2011).
+
+        Thin closure over :meth:`GitOps.create_interactive_worktree` (task α,
+        2010) for out-of-process interactive callers (/do, /warm, the
+        integration gate) that cannot reach ``harness.git_ops`` directly.
+        Mints a fresh worktree in the ``_iact-*`` band on branch
+        ``task/<slug>``, CoW-seeding its build cache when possible.
+
+        Returns ``{path, branch, warm, base_ref}`` on success. ``path`` is an
+        absolute string (not a ``Path``). ``warm=False`` is a fail-soft
+        SUCCESS — the CoW seed faulted but the worktree is still usable; it
+        is never surfaced as an error.
+        """
+        if harness is None or getattr(harness, 'git_ops', None) is None:
+            return {'error': 'escalation server running standalone — no harness wired'}
+
+        info = await harness.git_ops.create_interactive_worktree(slug, start_ref=start_ref)
+        return {
+            'path': str(info.path),
+            'branch': info.branch,
+            'warm': info.warm,
+            'base_ref': info.base_ref,
+        }
+
     # ── merge_status — read-only lifecycle probe (PRD α3 / task 1630) ──────────
 
     _MERGE_STATUS_UNKNOWN_HINT = 'check git log main'
