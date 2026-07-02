@@ -1177,3 +1177,37 @@ def test_newest_watched_commit_epoch_timeout_returns_none(
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert wdog._newest_watched_commit_epoch() is None
 
+
+# ---------------------------------------------------------------------------
+# STALENESS_GRACE_SECS tests
+# ---------------------------------------------------------------------------
+
+
+def test_staleness_grace_secs_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """STALENESS_GRACE_SECS defaults to 1800 (30 min) with no env override."""
+    monkeypatch.delenv("STALENESS_GRACE_SECS", raising=False)
+    wdog = _load_watchdog()
+    assert wdog.STALENESS_GRACE_SECS == 1800
+
+
+def test_staleness_grace_secs_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """STALENESS_GRACE_SECS honors a valid STALENESS_GRACE_SECS env override.
+
+    _load_watchdog() re-execs the module, so an env var set before the call
+    is picked up at (re)import time — mirrors restart-all-orchestrators.sh's
+    RESTART_VERIFY_TIMEOUT env-with-default pattern.
+    """
+    monkeypatch.setenv("STALENESS_GRACE_SECS", "60")
+    wdog = _load_watchdog()
+    assert wdog.STALENESS_GRACE_SECS == 60
+
+
+def test_staleness_grace_secs_malformed_env_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A malformed STALENESS_GRACE_SECS env value falls back to 1800, not a crash.
+
+    A typo'd env var must not crash the oneshot watchdog — fall-safe ethos.
+    """
+    monkeypatch.setenv("STALENESS_GRACE_SECS", "not-an-int")
+    wdog = _load_watchdog()
+    assert wdog.STALENESS_GRACE_SECS == 1800
+
