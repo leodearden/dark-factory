@@ -273,9 +273,7 @@ def _assertion_holds(assertion: SourceAssertion, source_root: Path) -> bool:
 
     if not all(token in text for token in assertion.must_contain):
         return False
-    if any(token in text for token in assertion.must_not_contain):
-        return False
-    return True
+    return not any(token in text for token in assertion.must_not_contain)
 
 
 def verify_premise_refuted(entry: PremiseEntry, source_root: Path) -> bool:
@@ -288,10 +286,9 @@ def verify_premise_refuted(entry: PremiseEntry, source_root: Path) -> bool:
     does not hold; vacuously True when ``entry.source_assertions`` is empty.
     Never raises.
     """
-    for assertion in entry.source_assertions:
-        if not _assertion_holds(assertion, source_root):
-            return False
-    return True
+    return all(
+        _assertion_holds(assertion, source_root) for assertion in entry.source_assertions
+    )
 
 
 def premise_refuted_entry(
