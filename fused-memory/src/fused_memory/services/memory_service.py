@@ -53,6 +53,16 @@ logger = logging.getLogger(__name__)
 # never be superseded by LLM edge-resolution.
 _DEPENDENCY_FACT_RE = re.compile(r'\bdepends on\b', re.I)
 
+# Mem0Backend.add() (backends/mem0_client.py) currently pins infer=False
+# unconditionally for every write, which guarantees a successful mem0.add()
+# always returns exactly one result with an id — so an empty result is
+# always anomalous (task 1974; see the empty-result WARNING below). Flip
+# this to False in lockstep if that pin is ever lifted or made
+# configurable, so the WARNING doesn't degenerate into a recurring,
+# non-actionable per-write log line under a legitimate infer-driven
+# dedup/no-op.
+_MEM0_ADD_INFER_PINNED_FALSE = True
+
 
 def _is_dependency_fact(fact: str | None) -> bool:
     """Return True when *fact* expresses a dependency relationship.
@@ -852,7 +862,7 @@ class MemoryService:
                 ]
                 memory_ids.extend(mem0_ids)
                 stores_written.append(SourceStore.mem0)
-                if not mem0_ids:
+                if not mem0_ids and _MEM0_ADD_INFER_PINNED_FALSE:
                     # mem0.add() did not raise but returned no results — a silent
                     # dedup/infer no-op drop (task 1974). Under the pinned
                     # infer=False, a successful write always returns exactly one
