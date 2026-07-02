@@ -936,11 +936,15 @@ async def dedup_flags(
                     ' recurring flag will not be detected next cycle'
                 ),
             )
-        # Record this signature's outcome so any later same-signature occurrence
-        # in this call hits the in-batch memo branch above instead of repeating
-        # the search/write/confirm/delete cycle.  Placeholder value (task-1978
-        # step-2): refined in step-4 to distinguish HIT-first from MISS-first.
-        seen_signatures[(tid, ftype)] = run_id
+        # Record this signature's resolved outcome (task-1978) so any later
+        # same-signature occurrence in this call hits the in-batch memo branch
+        # above instead of repeating the search/write/confirm/delete cycle.
+        # HIT-first: flag['persisted_from_run'] was just set above (the prior
+        # marker's run_id, with the 'unknown' fallback already applied) — reuse
+        # it verbatim.  MISS-first: flag carries no persisted_from_run key, so
+        # the get() default (the current run_id) is used — a MISS-first repeat
+        # is a genuine same-run duplicate, so run_id is the correct provenance.
+        seen_signatures[(tid, ftype)] = flag.get('persisted_from_run', run_id)
         result.append(flag)
     return result
 
