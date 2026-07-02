@@ -337,3 +337,17 @@ def test_rejects_unknown_argument(tmp_path):
     assert result.stderr.strip(), f"Expected an error message on stderr; got stderr={result.stderr!r}"
     assert _read_config(repo) == before_config, "unknown arg must not mutate orchestrator.yaml"
     assert _commit_count(repo) == before_commits, "unknown arg must not create a commit"
+
+
+# ---------------------------------------------------------------------------
+# step-13: RED -- the script file itself must be executable
+# ---------------------------------------------------------------------------
+
+def test_script_is_executable():
+    """The working-tree script must carry the executable bit (mode 100755)
+    -- pins the os.X_OK requirement enforced by ε2's fused-memory
+    deterministic_task_guard at submit_task time for before_done.script."""
+    assert os.access(SCRIPT, os.X_OK), (
+        f"Expected {SCRIPT} to be executable (os.X_OK); it is not. "
+        f"Run: chmod +x {SCRIPT}"
+    )
