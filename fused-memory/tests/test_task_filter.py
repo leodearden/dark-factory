@@ -2639,6 +2639,106 @@ class TestMixedTemporalFraming:
 
 
 # ---------------------------------------------------------------------------
+# is_batch_plan_framing (task 2022)
+# ---------------------------------------------------------------------------
+
+
+class TestIsBatchPlanFraming:
+    """Tests for is_batch_plan_framing() in task_filter.py.
+
+    Detects batch-queue / decompose-and-queue plan-episode content — a batch-
+    queue/decompose marker (queued/queue/decomposed/decompose/batch) co-
+    occurring with a multi-task enumeration (a task-id range like '1985-2002'
+    or >=3 enumerated task-id tokens). This is the ingest-time signal for
+    episodes like the incident shape (episode 128442e1: 'Merge-queue
+    modularization and invariant-enforcement batch were queued together as df
+    1985-2002'), whose Graphiti-extracted completion edges must not pollute
+    default factual search while most of the batch is still undone.
+    """
+
+    # ------------------------------------------------------------------ #
+    # is_batch_plan_framing — positive fixtures (batch-plan framing → True)
+    # ------------------------------------------------------------------ #
+
+    def test_positive_incident_shape_batch_queued_range(self):
+        """The task-2022 incident shape (batch ... queued ... range) must fire."""
+        from fused_memory.reconciliation.task_filter import is_batch_plan_framing
+
+        text = (
+            'Merge-queue modularization and invariant-enforcement batch were '
+            'queued together as df 1985-2002'
+        )
+        assert is_batch_plan_framing(text) is True, (
+            f'Expected is_batch_plan_framing to return True for the incident '
+            f'batch+queued+range shape, got False.\ntext={text!r}'
+        )
+
+    def test_positive_decompose_and_queue_with_range(self):
+        """A 'decomposed into tasks <range> and queued' phrasing must fire."""
+        from fused_memory.reconciliation.task_filter import is_batch_plan_framing
+
+        text = 'PRD decomposed into tasks 1985-2002 and queued'
+        assert is_batch_plan_framing(text) is True, (
+            f'Expected is_batch_plan_framing to return True for a decompose-and-queue '
+            f'range shape, got False.\ntext={text!r}'
+        )
+
+    def test_positive_queued_batch_with_enumerated_ids(self):
+        """A 'queued ... as a batch' phrasing with >=3 enumerated task ids must fire."""
+        from fused_memory.reconciliation.task_filter import is_batch_plan_framing
+
+        text = 'Queued tasks 1985, 1986, 1987 as a batch'
+        assert is_batch_plan_framing(text) is True, (
+            f'Expected is_batch_plan_framing to return True for a queued+batch '
+            f'enumeration shape, got False.\ntext={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # is_batch_plan_framing — negative fixtures (must return False)
+    # ------------------------------------------------------------------ #
+
+    def test_negative_ordinary_single_task_fact(self):
+        """An ordinary single-task fact (no range/enumeration) must NOT fire."""
+        from fused_memory.reconciliation.task_filter import is_batch_plan_framing
+
+        text = 'Task 1985 implemented merge_gates.py'
+        assert is_batch_plan_framing(text) is False, (
+            f'Expected is_batch_plan_framing to return False for an ordinary '
+            f'single-task fact, got True.\ntext={text!r}'
+        )
+
+    def test_negative_single_id_with_queue_word(self):
+        """A single id with a queue word (no range, no >=3 enumeration) must NOT fire."""
+        from fused_memory.reconciliation.task_filter import is_batch_plan_framing
+
+        text = 'Queued task 1985'
+        assert is_batch_plan_framing(text) is False, (
+            f'Expected is_batch_plan_framing to return False for a single queued '
+            f'task id, got True.\ntext={text!r}'
+        )
+
+    def test_negative_count_snapshot_no_batch_marker(self):
+        """A count-snapshot line with no batch/queue marker must NOT fire."""
+        from fused_memory.reconciliation.task_filter import is_batch_plan_framing
+
+        text = 'project has 3 blocked, 18 done'
+        assert is_batch_plan_framing(text) is False, (
+            f'Expected is_batch_plan_framing to return False for a count-snapshot '
+            f'line without a batch/queue marker, got True.\ntext={text!r}'
+        )
+
+    def test_negative_bare_number_range_no_batch_marker(self):
+        """A bare number range with no batch/queue marker must NOT fire."""
+        from fused_memory.reconciliation.task_filter import is_batch_plan_framing
+
+        text = 'covers years 2020-2026'
+        assert is_batch_plan_framing(text) is False, (
+            f'Expected is_batch_plan_framing to return False for a bare number '
+            f'range without a batch/queue marker, got True.\ntext={text!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # detect_task_dump_contamination (task 1661)
 # ---------------------------------------------------------------------------
 
