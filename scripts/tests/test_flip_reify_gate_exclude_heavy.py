@@ -11,6 +11,7 @@ script against it via `REIFY_REPO=<repo>`.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -32,6 +33,16 @@ def _fixture_config(state):
     couple of pre-existing children plus a hand-written operational
     comment, which the script must preserve untouched.
     """
+    if state == "no_verify_env":
+        # Malformed/unexpected config: no top-level verify_env: anchor at
+        # all. The script must refuse to guess and fail loudly rather than
+        # silently reporting success without flipping anything.
+        return (
+            "concurrent_verify: false\n"
+            "\n"
+            "other_top_level_key: true\n"
+        )
+
     knob_line = {
         "unflipped": "",
         "flipped": f'  {KNOB}: "1"\n',
@@ -58,10 +69,13 @@ def _make_fake_reify_repo(tmp_path, *, state="unflipped", failing_precommit=Fals
     fixture orchestrator.yaml committed as the initial commit.
 
     state:
-      "unflipped"    - no REIFY_GATE_EXCLUDE_HEAVY key present (default).
-      "flipped"      - REIFY_GATE_EXCLUDE_HEAVY: "1" already present.
-      "flipped_zero" - REIFY_GATE_EXCLUDE_HEAVY: "0" already present (a
-                        stray/stale value apply must normalize to "1").
+      "unflipped"     - no REIFY_GATE_EXCLUDE_HEAVY key present (default).
+      "flipped"       - REIFY_GATE_EXCLUDE_HEAVY: "1" already present.
+      "flipped_zero"  - REIFY_GATE_EXCLUDE_HEAVY: "0" already present (a
+                         stray/stale value apply must normalize to "1").
+      "no_verify_env" - no top-level verify_env: anchor at all (malformed
+                         config); apply must fail loudly rather than
+                         silently no-op.
 
     failing_precommit=True installs an executable .git/hooks/pre-commit
     that always exits 1 -- AFTER the initial commit, so only the script's
@@ -350,4 +364,101 @@ def test_script_is_executable():
     assert os.access(SCRIPT, os.X_OK), (
         f"Expected {SCRIPT} to be executable (os.X_OK); it is not. "
         f"Run: chmod +x {SCRIPT}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# amend: robustness -- a missing verify_env: anchor (or any other insert
+# failure) must fail loudly, not silently report success without flipping
+# anything (reviewer findings #1 and #4).
+# ---------------------------------------------------------------------------
+
+def test_apply_fails_loudly_when_verify_env_anchor_missing(tmp_path):
+    """If the config has no top-level verify_env: anchor, apply must fail
+    loudly (non-zero exit, stderr error, no mutation, no commit, no reload
+    signal) instead of silently reporting success without flipping the
+    knob -- otherwise a deterministic deploy task driven by this script
+    would be marked 'deployed-and-verified' despite the knob never having
+    been set."""
+    repo = _make_fake_reify_repo(tmp_path, state="no_verify_env")
+    before_config = _read_config(repo)
+    before_commits = _commit_count(repo)
+
+    result = _run_script(repo)
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit when verify_env: anchor is missing; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected an error message on stderr; got stderr={result.stderr!r}"
+    )
+    assert _read_config(repo) == before_config, (
+        "must not mutate orchestrator.yaml when the anchor is missing"
+    )
+    assert _commit_count(repo) == before_commits, (
+        "must not create a commit when the anchor is missing"
+    )
+    assert RELOAD_MARKER not in result.stdout, (
+        "must not emit the reload marker when the flip could not be applied"
+    )
+
+
+# ---------------------------------------------------------------------------
+# amend: robustness -- the mktemp+mv rewrite must preserve the config
+# file's mode instead of silently resetting it to mktemp's default 0600
+# (reviewer finding #2).
+# ---------------------------------------------------------------------------
+
+def test_apply_preserves_config_file_permissions(tmp_path):
+    """apply must not silently reset orchestrator.yaml's file mode to
+    mktemp's default 0600 via the mktemp+mv rewrite in apply_flip."""
+    repo = _make_fake_reify_repo(tmp_path)
+    config_path = repo / CONFIG_FILE
+    config_path.chmod(0o644)
+
+    result = _run_script(repo)
+
+    assert result.returncode == 0, (
+        f"Expected exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    mode = stat.S_IMODE(config_path.stat().st_mode)
+    assert mode == 0o644, (
+        f"Expected orchestrator.yaml to keep mode 0644 after the flip; "
+        f"got {oct(mode)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# amend: design_coherence -- pin --check's behavior on an already-flipped
+# config as an intentional, tested contract rather than an untested
+# accident of is_flipped-first precedence (reviewer finding #3).
+# ---------------------------------------------------------------------------
+
+def test_check_mode_on_already_flipped_reports_noop(tmp_path):
+    """--check on an ALREADY-flipped config reports the same no-op state
+    as apply (nothing would change) rather than printing the
+    intended-diff line as if a flip were still pending -- applying would
+    be a no-op, so that is what --check reports too."""
+    repo = _make_fake_reify_repo(tmp_path, state="flipped")
+    before_config = _read_config(repo)
+    before_commits = _commit_count(repo)
+
+    result = _run_script(repo, "--check")
+
+    assert result.returncode == 0, (
+        f"Expected exit 0; got {result.returncode}\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "already flipped" in result.stdout, (
+        f"Expected --check on an already-flipped config to report the "
+        f"no-op state; got: {result.stdout!r}"
+    )
+    assert RELOAD_MARKER not in result.stdout
+    assert _read_config(repo) == before_config, (
+        "--check must never mutate orchestrator.yaml"
+    )
+    assert _commit_count(repo) == before_commits, (
+        "--check must never create a commit"
     )
