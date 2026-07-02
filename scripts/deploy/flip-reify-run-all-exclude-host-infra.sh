@@ -21,12 +21,26 @@ CONFIG_FILE="orchestrator.yaml"
 CONFIG_PATH="$REIFY_REPO/$CONFIG_FILE"
 KNOB="REIFY_RUN_ALL_EXCLUDE_HOST_INFRA"
 
+MODE="apply"
+
+for arg in "$@"; do
+    case "$arg" in
+        --check|--dry-run)
+            MODE="check"
+            ;;
+    esac
+done
+
 is_flipped_in() {
     grep -qE "^[[:space:]]*${KNOB}:[[:space:]]*\"?1\"?[[:space:]]*\$" "$1"
 }
 
 is_flipped() {
     is_flipped_in "$CONFIG_PATH"
+}
+
+print_intended_diff() {
+    echo "+  ${KNOB}: \"1\"   (under verify_env: in ${CONFIG_PATH})"
 }
 
 apply_flip() {
@@ -51,6 +65,11 @@ apply_flip() {
 main() {
     if is_flipped; then
         echo "flip-reify-run-all: already flipped (no-op)"
+        exit 0
+    fi
+
+    if [[ "$MODE" == "check" ]]; then
+        print_intended_diff
         exit 0
     fi
 
