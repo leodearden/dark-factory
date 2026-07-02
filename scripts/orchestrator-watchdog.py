@@ -414,6 +414,9 @@ def staleness_pass() -> None:
 
     for unit in _enumerate_running_units():
         try:
+            if not is_unit_enabled(unit):
+                # Disabled (or unknown) — respect operator intent, skip silently.
+                continue
             start_epoch = _unit_start_epoch(unit)
             if start_epoch is None:
                 continue  # undeterminable for this unit — skip, don't guess
