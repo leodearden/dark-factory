@@ -1356,3 +1356,101 @@ class TestDryRunConfigDirPreserve:
         task_dir = tmp_path / '.task'
         leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
         assert leftover == [], f'Expected config dir cleanup on success, found: {leftover}'
+
+
+# ---------------------------------------------------------------------------
+# task 2021 amendment: pin the 1800s cap-wait bound to REAL loop behavior
+# ---------------------------------------------------------------------------
+
+class _ForcedCapSlot:
+    """Fake ``invoke_slot()`` context manager that reports a cap hit every time."""
+
+    account_name = 'forced-cap-account'
+    token = 'tok'
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def detect_cap_hit(self, stderr, output, backend=None):
+        return True
+
+    def settle(self):
+        pass
+
+    def confirm(self, cost_usd):
+        pass
+
+
+class _ForcedCapUsageGate:
+    """Minimal fake usage_gate whose every ``invoke_slot()`` reports a cap hit.
+
+    Drives the REAL ``invoke_with_cap_retry`` loop (unlike
+    TestDryRunCapExhaustion, which patches ``invoke_with_cap_retry`` itself
+    and only pins the entry-conversion shape). Real accounting means the
+    sanity-bound guard in ``invoke_with_cap_retry`` is what raises
+    ``AllAccountsCappedException`` here, not a mocked side_effect.
+    """
+
+    account_count = 1
+    active_account_name = 'forced-cap-account'
+    soonest_resets_at = None
+
+    def invoke_slot(self):
+        return _ForcedCapSlot()
+
+
+class TestDryRunCapExhaustionRealLoop:
+    """End-to-end: a fake usage_gate that always reports a cap hit drives the
+    real invoke_with_cap_retry cap-wait loop, which raises
+    AllAccountsCappedException once elapsed time exceeds the sanity bound.
+    Pins _DRY_RUN_CAP_WAIT_SANITY_SECS to actual loop behavior rather than a
+    patched sentinel (TestDryRunCapExhaustion covers the entry-shape
+    conversion in isolation).
+    """
+
+    @pytest.mark.asyncio
+    async def test_forced_cap_hit_raises_and_converts_to_infra_failure(
+        self, tmp_path, monkeypatch,
+    ):
+        from orchestrator import dry_run_unblock
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        # A negative sanity bound guarantees `elapsed > cap_wait_sanity_secs`
+        # trips on the very first cap hit regardless of actual wall-clock
+        # jitter, so the test doesn't need to wait out the real 1800s (or
+        # even the 5s base cooldown — the sanity check raises before the
+        # loop ever reaches `await asyncio.sleep(cooldown)`).
+        monkeypatch.setattr(dry_run_unblock, '_DRY_RUN_CAP_WAIT_SANITY_SECS', -1.0)
+
+        agent_result = _make_agent_result(success=False, subtype='error_rate_limit')
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(return_value=agent_result),
+        ):
+            await run_dry_run_unblock(
+                task_id='2400',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                usage_gate=_ForcedCapUsageGate(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure', (
+            f"expected the real cap-wait loop to raise AllAccountsCappedException "
+            f"and convert to 'infra_failure', got status={entry.get('status')!r}"
+        )
+        assert entry['risk_label'] == 'human-review-required'
+        assert entry['files_referenced'] == []
+        assert 'capped' in entry['proposal_text'].lower()
