@@ -2248,6 +2248,32 @@ class ReconciliationHarness:
                         'description': finding.get('description', ''),
                     },
                 )
+                # Task 1970 amendment: coarse aggregate alarm for a runaway
+                # Stage 3 that stops citing anything.  Each individual drop
+                # stays logged-only (never escalated on its own — see the
+                # module comment above _PLACEHOLDER_DROP_STORM_THRESHOLD);
+                # this counter fires ONE 'recon_remediation_placeholder_storm'
+                # escalation when drops recur often enough within the
+                # rolling window.  Mirrors the dead_owner_shielded storm
+                # wiring in _recover_stale_runs (~line 1122).
+                storm = self._record_placeholder_finding_drop(project_id)
+                if storm is not None:
+                    window_min = storm['window_seconds'] / 60
+                    proj_label = ', '.join(storm['projects']) or project_id
+                    storm_summary = (
+                        f"referenceless placeholder-finding drop storm: {storm['count']} in "
+                        f"{window_min:.0f} min (projects: {proj_label}) — "
+                        f'Stage 3 may have stopped citing findings (add_finding '
+                        f'without a follow-up cite_* call)'
+                    )
+                    storm_detail = f'project={project_id} parent_run={parent_run_id}'
+                    self._escalate(
+                        'recon_remediation_placeholder_storm',
+                        parent_run_id,
+                        storm_summary,
+                        storm_detail,
+                        finding=_PLACEHOLDER_DROP_STORM_FINDING,
+                    )
 
             if not referenceable:
                 return
