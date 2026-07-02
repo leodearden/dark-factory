@@ -32,7 +32,12 @@ from _workflow_helpers import FakeBriefing, FakeScheduler
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
-from orchestrator.config import load_config
+from orchestrator.config import (
+    OrchestratorConfig,
+    TimeoutsConfig,
+    apply_reload,
+    load_config,
+)
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
@@ -377,3 +382,51 @@ class TestS4MixedDispositionCompleteness:
             f'a path must not appear in both dispositions: {applied_keys & restart_keys!r}'
         )
         assert applied_keys | restart_keys == {'models.implementer', 'max_concurrent_tasks'}
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5 (I5), gate regression lock: re-runs alpha's synthetic-allowlist
+# hybrid-rollback (test_config.py:2084) at the gate. Stays a direct
+# apply_reload call rather than an end-to-end harness.reload_config() call
+# because it is UNREACHABLE end-to-end under the real v1 RELOADABLE_FIELDS
+# allowlist — both sides of _validate_steward_timeout_invariant
+# (timeouts.steward and steward_completion_timeout) travel together in the
+# real allowlist, so the harness path can never produce this hybrid state.
+# ---------------------------------------------------------------------------
+
+
+class TestS5HybridRollbackLock:
+    """PRD boundary scenario 5: a synthetic-allowlist hybrid invariant break rolls back (I5)."""
+
+    def test_hybrid_invariant_violation_rolls_back_synchronously(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        # live is valid on its own: 1800 >= 900.
+        live = OrchestratorConfig(
+            timeouts=TimeoutsConfig(steward=1800.0),
+            steward_completion_timeout=900.0,
+        )
+        # fresh is valid on its own: 800 >= 700.
+        fresh = OrchestratorConfig(
+            timeouts=TimeoutsConfig(steward=800.0),
+            steward_completion_timeout=700.0,
+        )
+        live_dump_before = live.model_dump()
+
+        # Applying ONLY timeouts.steward (1800 -> 800) while
+        # steward_completion_timeout stays at live's 900 produces an invalid
+        # hybrid (800 < 900) that OrchestratorConfig.model_validate rejects.
+        report = apply_reload(live, fresh, allowlist=frozenset({'timeouts.steward'}))
+
+        assert report['reloaded'] is False
+        assert report['error'].startswith('hybrid-invariant')
+        assert report['applied'] == {}
+
+        # Rolled back byte-for-byte: timeouts.steward restored to 1800.0;
+        # steward_completion_timeout was never touched (it was categorized
+        # restart_required under the synthetic allowlist).
+        assert live.model_dump() == live_dump_before
+        assert live.timeouts.steward == 1800.0
+        assert live.steward_completion_timeout == 900.0
