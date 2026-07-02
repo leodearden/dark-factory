@@ -17,14 +17,17 @@ from __future__ import annotations
 
 from orchestrator.agents.roles import ROLES
 
-# The full operator-only escalation control set: both halt directions and both
-# un-pause siblings.  Reversing a halt is just as much an operator action as
-# applying one, so the un-pause tools are restricted identically.
+# The full operator-only escalation control set: both halt directions, both
+# un-pause siblings, and the config hot-reload trigger.  Reversing a halt is
+# just as much an operator action as applying one, so the un-pause tools are
+# restricted identically; reload_config is restricted because an autonomous
+# agent could otherwise self-serve a config change mid-task (task 2007).
 OPERATOR_ONLY_ESCALATION_TOOLS = frozenset({
     'mcp__escalation__halt_merge_queue',
     'mcp__escalation__halt_scheduler',
     'mcp__escalation__unhalt_merge_queue',
     'mcp__escalation__resume_scheduler',
+    'mcp__escalation__reload_config',
 })
 
 
