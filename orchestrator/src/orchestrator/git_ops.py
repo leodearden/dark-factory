@@ -125,6 +125,15 @@ PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
 # _spec-*/_lane-*/_solo-* worktrees — with no explicit skip required.
 PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
 
+# The _iact-* band (worktree_base/<iact_prefix><slug>, config.iact_prefix
+# default '_iact-') minted by GitOps.create_interactive_worktree is
+# invariantly disjoint from the _lane-* warm_lane_pool band and the _spec-*
+# spec_warm_lane_pool band: create_interactive_worktree and its cap
+# enumeration never read or mutate either pool, and the pools never
+# enumerate, acquire, or release an _iact-* directory (isolation invariant
+# I1). See InteractiveWorktreeInfo / InteractiveWorktreeLimitError /
+# GitOps.create_interactive_worktree below for the full contract.
+
 
 class ScrubOutcome(Enum):
     """Outcome discriminant for :class:`ScrubResult`.
