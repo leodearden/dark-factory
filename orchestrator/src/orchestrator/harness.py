@@ -5144,6 +5144,33 @@ Output JSON matching the schema. Every task must appear in the output.
         self._offline_lane_notifiee = None
         logger.info('Offline-deep lane worker stopped')
 
+    def _merge_pipeline_idle(self) -> bool:
+        """True when the merge queue and merge-worker pipeline are both quiescent.
+
+        Used as the orchestrator restart coordinator's ``restart_precondition``
+        (U2): even at the run-loop's idle quiet-window (``agents_idle=True``),
+        a merge can still be queued or in-flight/verifying — restarting the
+        orchestrator mid-merge would be disruptive. True only when there is
+        nothing queued (``self._merge_queue.empty()``) AND nothing in-flight
+        or verifying (``worker.snapshot()['depth'] == 0``). True when
+        ``_merge_worker`` is None (bare / unit-test harness — no pipeline to
+        drain). Fail-safe: any exception reading the snapshot returns False
+        (never restart when drain state is unknown).
+        """
+        if self._merge_worker is None:
+            return True
+        try:
+            worker = cast('SpeculativeMergeWorker', self._merge_worker)
+            depth = worker.snapshot().get('depth', 1)
+        except Exception:
+            logger.warning(
+                '_merge_pipeline_idle: snapshot() failed; treating pipeline as'
+                ' NOT idle (fail-safe)',
+                exc_info=True,
+            )
+            return False
+        return self._merge_queue.empty() and depth == 0
+
     def _build_service_restart_coordinator(self) -> StaleServiceRestartCoordinator:
         """Construct a StaleServiceRestartCoordinator from the current config.
 
