@@ -71,6 +71,86 @@ def diff_touches_watched_paths(
 
 
 # ---------------------------------------------------------------------------
+# Cgroup-escaping detached restart (U2 — task 1973)
+# ---------------------------------------------------------------------------
+
+
+async def schedule_detached_systemd_restart(
+    *,
+    script: str,
+    script_args: list[str],
+    project_root: str,
+    transient_unit: str,
+    on_active_secs: int,
+    runner=None,
+):
+    """Schedule a detached, cgroup-escaping self-restart via ``systemd-run --user``.
+
+    Mirrors ``DeterministicRunner._default_schedule_detached_restart``'s argv
+    pattern but WITHOUT the ``/bin/sh`` on-failure escalation wrapper: the
+    restart script (``scripts/restart-orchestrator.sh``) already self-verifies
+    and self-reports failures to journald, and the coordinator's
+    ``maybe_restart`` already clears its pending flag when the injected
+    executor raises — so no additional failure plumbing is needed here.
+
+    ``--on-active=<on_active_secs>`` defers execution so this call returns
+    immediately after *registering* the transient unit; the restart payload
+    fires later, under the user systemd manager's own cgroup — which is what
+    lets it survive a same-cgroup ``systemctl restart`` SIGKILL under
+    ``KillMode=control-group``. ``--collect`` removes the transient unit once
+    it exits (success or failure) so repeated fires never collide on a
+    lingering unit name.
+
+    Parameters
+    ----------
+    script:
+        Path to the restart script, relative to *project_root*.
+    script_args:
+        Extra positional args appended after the script path (e.g. ``['--drain']``).
+    project_root:
+        Absolute root of the project repo; the script path is resolved as
+        ``Path(project_root) / script``.
+    transient_unit:
+        Name of the transient systemd-run unit (e.g.
+        ``orch-selfrestart-on-merge-3.service``).
+    on_active_secs:
+        Seconds to defer before the transient unit fires.
+    runner:
+        Optional injectable async callable with the same signature as
+        ``asyncio.create_subprocess_exec`` (for testing). Defaults to
+        ``asyncio.create_subprocess_exec``.
+
+    Raises
+    ------
+    RuntimeError:
+        When the ``systemd-run`` registration itself exits non-zero. The
+        error carries the last 2000 characters of combined stdout/stderr.
+    """
+    target = Path(project_root) / script
+    argv = [
+        'systemd-run', '--user',
+        f'--on-active={on_active_secs}',
+        f'--unit={transient_unit}',
+        '--collect',
+        str(target),
+        *script_args,
+    ]
+    spawn = runner or asyncio.create_subprocess_exec
+    proc = await spawn(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    rc = proc.returncode or 0
+    tail = (stdout or b'').decode(errors='replace')[-2000:]
+    if rc != 0:
+        raise RuntimeError(
+            f'systemd-run registration of {transient_unit} failed (rc={rc}): {tail}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Coordinator
 # ---------------------------------------------------------------------------
 
