@@ -6854,6 +6854,101 @@ async def test_maybe_remediate_placeholder_drop_storm_does_not_escalate_below_th
     )
 
 
+def test_record_placeholder_finding_drop_rolling_window(
+    journal, event_buffer, mock_memory_service,
+):
+    """Unit tests for ReconciliationHarness._record_placeholder_finding_drop().
+
+    Mirrors test_record_dead_owner_suppression_rolling_window's three phases
+    (task 1755 / PRD β), applied to the placeholder-finding-drop storm counter
+    (task 1970 amendment). The recorder itself was already correct when this
+    test was written — this is coverage-hardening for a counter that step-6
+    now wires into a live escalation path, not a RED->GREEN gate.
+
+    Phase 1 — threshold crossing + per-project labels:
+        _PLACEHOLDER_DROP_STORM_THRESHOLD calls in the window (alternating
+        'reify' / 'autopilot_video') → all but the last return None, the
+        threshold-crossing call returns a storm dict with
+        count>=_PLACEHOLDER_DROP_STORM_THRESHOLD,
+        window_seconds==_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS, and
+        projects==sorted distinct project labels seen in the window.
+
+    Phase 2 — no re-fire in the same window:
+        Two more calls immediately after return None (rate limit: <=1 fire
+        per window).
+
+    Phase 3 — re-fire after a full window during a sustained storm:
+        A fresh burst of THRESHOLD calls at now=base + 2*WINDOW_SECONDS
+        re-fires.
+    """
+    from fused_memory.reconciliation.harness import (
+        _PLACEHOLDER_DROP_STORM_THRESHOLD,
+        _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
+
+    # ── Phase 1: threshold crossing ──────────────────────────────────────────
+
+    projects = [
+        'reify' if i % 2 == 0 else 'autopilot_video'
+        for i in range(_PLACEHOLDER_DROP_STORM_THRESHOLD)
+    ]
+    results = [
+        harness._record_placeholder_finding_drop(proj, now=base + timedelta(seconds=i))
+        for i, proj in enumerate(projects)
+    ]
+
+    for i, r in enumerate(results[:-1]):
+        assert r is None, f'Call {i+1} should return None (below threshold), got {r!r}'
+
+    storm = results[-1]
+    assert storm is not None, 'Threshold-crossing call should return a storm dict'
+    assert storm['count'] >= _PLACEHOLDER_DROP_STORM_THRESHOLD, (
+        f'Expected count>=_PLACEHOLDER_DROP_STORM_THRESHOLD, got {storm["count"]}'
+    )
+    assert storm['window_seconds'] == _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS, (
+        f'Expected window_seconds=={_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS}, '
+        f'got {storm["window_seconds"]}'
+    )
+    assert storm['projects'] == sorted(set(projects)), (
+        f'Expected sorted distinct project labels, got {storm["projects"]}'
+    )
+
+    # ── Phase 2: no re-fire in the same window ───────────────────────────────
+
+    n = _PLACEHOLDER_DROP_STORM_THRESHOLD
+    r_next = harness._record_placeholder_finding_drop('reify', now=base + timedelta(seconds=n))
+    r_next2 = harness._record_placeholder_finding_drop(
+        'reify', now=base + timedelta(seconds=n + 1),
+    )
+    assert r_next is None, f'Same-window call should return None (already fired), got {r_next!r}'
+    assert r_next2 is None, (
+        f'Same-window call should return None (already fired), got {r_next2!r}'
+    )
+
+    # ── Phase 3: re-fire after a full window (sustained storm) ───────────────
+
+    future_base = base + timedelta(seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS * 2)
+    results3 = [
+        harness._record_placeholder_finding_drop(proj, now=future_base + timedelta(seconds=i))
+        for i, proj in enumerate(projects)
+    ]
+
+    for i, r in enumerate(results3[:-1]):
+        assert r is None, (
+            f'Phase-3 call {i+1} should return None (new window builds up), got {r!r}'
+        )
+
+    storm3 = results3[-1]
+    assert storm3 is not None, (
+        'Phase-3 threshold-crossing call should return a storm dict (new window re-fires)'
+    )
+    assert storm3['count'] >= _PLACEHOLDER_DROP_STORM_THRESHOLD
+
+
 # ── Tests for Task 1655: live-workflow escalation gate ─────────────────────
 
 
