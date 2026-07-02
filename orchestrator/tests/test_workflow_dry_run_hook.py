@@ -435,6 +435,45 @@ class TestMarkBlockedSpawnDryRunOrderingInvariant:
 
 
 # ---------------------------------------------------------------------------
+# task 2021 step-9: usage_gate/cost_store forwarded into run_dry_run_unblock
+# ---------------------------------------------------------------------------
+
+class TestMarkBlockedForwardsResilienceContext:
+    """_spawn_dry_run_unblock must forward self.usage_gate/self.cost_store
+    into run_dry_run_unblock so the background investigation's
+    invoke_with_cap_retry call can do account failover/cap detection like
+    every other orchestrator agent invocation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mark_blocked_forwards_usage_gate_and_cost_store(self, tmp_path):
+        wf, _ = _make_workflow(tmp_path=tmp_path, task_id='50', enabled=True)
+
+        usage_gate_sentinel = object()
+        cost_store_sentinel = object()
+        wf.usage_gate = usage_gate_sentinel  # type: ignore[assignment]
+        wf.cost_store = cost_store_sentinel  # type: ignore[assignment]
+
+        calls = []
+
+        async def _spy_dry_run(**kwargs):
+            calls.append(kwargs)
+
+        with patch('orchestrator.workflow.run_dry_run_unblock', new=_spy_dry_run):
+            await wf._mark_blocked('verify exhausted')
+
+        await asyncio.sleep(0)  # let the background task register its call
+        pending = list(wf._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
+        kwargs = calls[0]
+        assert kwargs.get('usage_gate') is usage_gate_sentinel
+        assert kwargs.get('cost_store') is cost_store_sentinel
+
+
+# ---------------------------------------------------------------------------
 # Protocol-conformance assertion (static-only; never executes at runtime).
 # Mirrors the if TYPE_CHECKING / _SchedulerLike conformance block near the
 # bottom of test_workflow_e2e.py.

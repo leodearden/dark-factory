@@ -13,11 +13,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from shared.cli_invoke import AgentFailureKind, classify_agent_failure
+from shared.cli_invoke import (
+    AgentFailureKind,
+    AllAccountsCappedException,
+    classify_agent_failure,
+    invoke_with_cap_retry,
+    is_zero_output_timeout,
+)
+from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -82,6 +90,14 @@ _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
     AgentFailureKind.TIMED_OUT,
     AgentFailureKind.EMPTY_OUTPUT,
 })
+
+# Outer wall-clock sanity bound for invoke_with_cap_retry's cap-hit patience
+# (shared/src/shared/cli_invoke.py cap-wait policy table). This is a
+# fire-and-forget, best-effort block-time investigation — it must NOT inherit
+# the 14-day default, which would leave a background task pending for weeks
+# under a sustained cap storm. Mirrors the 1800s reconciliation-stage
+# precedent (short-lived stage runners; see cli_invoke.py:82-94).
+_DRY_RUN_CAP_WAIT_SANITY_SECS: float = 1800.0
 
 
 def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
@@ -235,6 +251,8 @@ async def run_dry_run_unblock(
     mcp: Any,
     config: Any,
     event_store: Any = None,
+    usage_gate: Any = None,
+    cost_store: Any = None,
 ) -> None:
     """Investigate a blocked task and write a proposal to metadata.
 
@@ -246,12 +264,25 @@ async def run_dry_run_unblock(
 
     ua_cfg = config.unblock_auto
     start_time = time.monotonic()
+    project_id = getattr(getattr(config, 'fused_memory', None), 'project_id', '') or ''
+    run_id = getattr(event_store, 'run_id', '') or ''
 
     # Capture worktree SHAs before invoke_agent so both the success and
     # exception paths can stamp the same anchor values.
     head_sha, main_sha = await _capture_worktree_shas(worktree)
 
+    config_dir: TaskConfigDir | None = None
+    preserve_config_dir = False
     try:
+        # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
+        # the main task's `claude-config-{task_id}` dir so this background
+        # investigation cannot collide with the blocked task's own session/
+        # credentials. Passing config_dir + session_id to invoke_with_cap_retry
+        # (below) revives the startup-wedge fast-kill in
+        # shared/cli_invoke.py._run_subprocess — without both, `_grace_spent`
+        # is forced True and a pre-turn-1 wedge burns the full timeout ceiling.
+        config_dir = TaskConfigDir(f'{task_id}-unblock', base_dir=Path(worktree) / '.task')
+
         system_prompt = _load_skill_system_prompt()
         user_prompt = (
             f'Task ID: {task_id}\n'
@@ -263,23 +294,62 @@ async def run_dry_run_unblock(
 
         mcp_config = mcp.mcp_config_json() if mcp is not None else None
 
-        result = await invoke_agent(
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            cwd=Path(worktree),
-            model=ua_cfg.model,
-            max_turns=ua_cfg.max_turns,
-            max_budget_usd=ua_cfg.budget_usd,
-            allowed_tools=_ALLOWED_TOOLS,
-            disallowed_tools=_DISALLOWED_TOOLS,
-            mcp_config=mcp_config,
-            output_schema=DRY_RUN_PROPOSAL_SCHEMA,
-            effort=ua_cfg.effort,
-            backend=ua_cfg.backend,
-            timeout_seconds=ua_cfg.timeout_seconds,
-        )
+        async def _one_attempt(session_id: str) -> Any:
+            return await invoke_with_cap_retry(
+                usage_gate=usage_gate,
+                label=f'Task {task_id} [unblock_auto]',
+                config_dir=config_dir,
+                cost_store=cost_store,
+                run_id=run_id,
+                task_id=task_id,
+                project_id=project_id,
+                role='unblock_auto',
+                cap_wait_sanity_secs=_DRY_RUN_CAP_WAIT_SANITY_SECS,
+                invoke_fn=invoke_agent,
+                backend=ua_cfg.backend,
+                session_id=session_id,
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                cwd=Path(worktree),
+                model=ua_cfg.model,
+                max_turns=ua_cfg.max_turns,
+                max_budget_usd=ua_cfg.budget_usd,
+                allowed_tools=_ALLOWED_TOOLS,
+                disallowed_tools=_DISALLOWED_TOOLS,
+                mcp_config=mcp_config,
+                output_schema=DRY_RUN_PROPOSAL_SCHEMA,
+                effort=ua_cfg.effort,
+                timeout_seconds=ua_cfg.timeout_seconds,
+            )
 
-        entry = _build_entry(result, reason=reason, budget_usd=ua_cfg.budget_usd)
+        try:
+            result = await _one_attempt(str(uuid.uuid4()))
+            if is_zero_output_timeout(result):
+                # Transcript-authoritative pre-turn-1 wedge: retry EXACTLY once
+                # with a freshly-allocated session_id. Never reuse the wedged
+                # UUID — a possibly-committed session id makes the CLI's
+                # --session-id exit instantly with 'already in use' (reify-3604 /
+                # _reset_for_fresh_retry semantics, shared/cli_invoke.py:562).
+                logger.warning(
+                    'dry_run_unblock: zero-output timeout wedge for task %s — '
+                    'retrying once with a fresh session',
+                    task_id,
+                )
+                result = await _one_attempt(str(uuid.uuid4()))
+
+            entry = _build_entry(result, reason=reason, budget_usd=ua_cfg.budget_usd)
+        except AllAccountsCappedException as cap_exc:
+            # A retryable infra wedge, not a substantive investigation
+            # conclusion — must NOT surface as 'investigation_failed' (that
+            # shape is terminal for the B3 low-risk auto-unblock path).
+            logger.warning(
+                'dry_run_unblock: all accounts capped for task %s: %s',
+                task_id, cap_exc,
+            )
+            entry = _cap_exhausted_entry(reason=reason, exc=cap_exc)
+            result = None
+
+        preserve_config_dir = result is not None and is_zero_output_timeout(result)
 
     except Exception as exc:
         logger.warning('dry_run_unblock: unexpected error for task %s: %s', task_id, exc)
@@ -295,6 +365,28 @@ async def run_dry_run_unblock(
             **_failure_diagnostics(None),
         }
         result = None
+    finally:
+        if config_dir is not None:
+            if preserve_config_dir:
+                # Not independently reaped here: this dir lives under
+                # <worktree>/.task/, which GitOps.cleanup_worktree() removes
+                # wholesale (`git worktree remove --force`) when the worktree
+                # is torn down — see the .task/ contamination-prevention
+                # notes atop git_ops.py. The forensic window is bounded by
+                # the worktree's lifetime, not unbounded.
+                logger.warning(
+                    'dry_run_unblock: config dir preserved for forensic analysis '
+                    '(doubly-wedged investigation) for task %s → %s',
+                    task_id, config_dir.path,
+                )
+            else:
+                try:
+                    config_dir.cleanup()
+                except Exception as exc:
+                    logger.warning(
+                        'dry_run_unblock: failed to clean up config dir for task %s: %s',
+                        task_id, exc,
+                    )
 
     # Stamp the git anchor onto the entry at a single point so all four
     # shapes (ok, investigation_failed, budget_exhausted, exception fallback)
@@ -437,4 +529,31 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
         'block_reason': reason,
         'investigated_at': now,
         'timestamp': now,
+    }
+
+
+def _cap_exhausted_entry(*, reason: str, exc: AllAccountsCappedException) -> dict[str, Any]:
+    """Build the retryable infra_failure entry for a cap-exhausted investigation.
+
+    AllAccountsCappedException means invoke_with_cap_retry exceeded the
+    ``_DRY_RUN_CAP_WAIT_SANITY_SECS`` bound (all accounts capped) — no
+    AgentResult was ever produced, so this reuses the None-safe
+    ``_failure_diagnostics(None)`` shape rather than the AgentResult-derived
+    one, matching the task-2020 infra_failure entry shape.
+    """
+    now = _now_iso()
+    return {
+        'status': 'infra_failure',
+        'proposal_text': (
+            f'Infra wedge (retryable, not a human-review conclusion): '
+            f'all accounts capped after {exc.retries} retries '
+            f'({exc.elapsed_secs:.1f}s elapsed)'
+        ),
+        'risk_label': _HUMAN_REVIEW_REQUIRED,
+        'files_referenced': [],
+        'block_reason': reason,
+        'cost_usd': 0.0,
+        'investigated_at': now,
+        'timestamp': now,
+        **_failure_diagnostics(None),
     }

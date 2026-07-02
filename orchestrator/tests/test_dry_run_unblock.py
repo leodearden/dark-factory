@@ -10,11 +10,14 @@ from __future__ import annotations
 import json as _json
 import subprocess
 from importlib import resources as pkg_resources
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 from _orch_helpers import pydantic_spec
+from shared.cli_invoke import AllAccountsCappedException
+from shared.config_dir import TaskConfigDir
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler
@@ -1012,3 +1015,442 @@ class TestExceptionFallbackDiagnostics:
         ):
             assert key in entry, f'{key} must be present on the exception fallback entry'
             assert entry[key] is None, f'{key} must be None on the exception fallback entry'
+
+
+# ---------------------------------------------------------------------------
+# task 2021 step-1: resilience scaffolding — config_dir + session_id revive
+# the startup watchdog; cap-retry/failover wiring through invoke_with_cap_retry
+# ---------------------------------------------------------------------------
+
+class TestDryRunResilienceScaffolding:
+    """run_dry_run_unblock must route through invoke_with_cap_retry with a
+    per-investigation TaskConfigDir + pre-allocated session_id, so that the
+    startup watchdog in shared/cli_invoke.py._run_subprocess is no longer
+    structurally dead for this call site (config_dir and session_id were
+    previously never passed, forcing `_grace_spent=True`).
+    """
+
+    @pytest.mark.asyncio
+    async def test_watchdog_revival_and_cleanup_on_success(self, tmp_path):
+        """invoke_agent (the real fast path, usage_gate omitted) receives a
+        Path config_dir and a non-empty session_id; the per-investigation
+        config dir is cleaned up after a successful run.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        structured = {
+            'proposal_text': 'Rebase on main and rerun verify',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(return_value=agent_result),
+        ) as mock_invoke:
+            await run_dry_run_unblock(
+                task_id='2100',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        invoke_kwargs = mock_invoke.call_args.kwargs
+        config_dir_arg = invoke_kwargs.get('config_dir')
+        assert isinstance(config_dir_arg, Path), (
+            f'Expected invoke_agent to receive a Path config_dir, got {config_dir_arg!r}'
+        )
+        session_id_arg = invoke_kwargs.get('session_id')
+        assert isinstance(session_id_arg, str) and session_id_arg, (
+            f'Expected a non-empty session_id string, got {session_id_arg!r}'
+        )
+
+        # Cleanup: no claude-config-*-unblock dir remains under tmp_path/.task
+        task_dir = tmp_path / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], f'Expected config dir to be cleaned up, found: {leftover}'
+
+    @pytest.mark.asyncio
+    async def test_cap_policy_wiring_forwards_usage_gate_and_cost_store(self, tmp_path):
+        """invoke_with_cap_retry receives usage_gate/cost_store, a
+        TaskConfigDir, the 1800s cap-wait sanity override, role='unblock_auto',
+        invoke_fn=invoke_agent, and a session_id kwarg.
+        """
+        from orchestrator.dry_run_unblock import invoke_agent as real_invoke_agent
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        structured = {
+            'proposal_text': 'Rebase on main and rerun verify',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        usage_gate_sentinel = object()
+        cost_store_sentinel = object()
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_with_cap_retry',
+            new=AsyncMock(return_value=agent_result),
+        ) as mock_cap_retry:
+            await run_dry_run_unblock(
+                task_id='2101',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                usage_gate=usage_gate_sentinel,
+                cost_store=cost_store_sentinel,
+            )
+
+        mock_cap_retry.assert_awaited_once()
+        call_kwargs = mock_cap_retry.call_args.kwargs
+        assert call_kwargs.get('usage_gate') is usage_gate_sentinel
+        assert call_kwargs.get('cost_store') is cost_store_sentinel
+        assert isinstance(call_kwargs.get('config_dir'), TaskConfigDir)
+        assert call_kwargs.get('cap_wait_sanity_secs') == 1800
+        assert call_kwargs.get('role') == 'unblock_auto'
+        assert call_kwargs.get('invoke_fn') is real_invoke_agent
+        session_id_arg = call_kwargs.get('session_id')
+        assert isinstance(session_id_arg, str) and session_id_arg
+
+
+# ---------------------------------------------------------------------------
+# task 2021 step-3: exactly one fresh retry on a zero-output timeout wedge
+# ---------------------------------------------------------------------------
+
+class TestDryRunFreshRetry:
+    """A pre-turn-1 host wedge (timed_out=True, transcript_turns==0) is
+    retried exactly ONCE with a freshly-allocated session_id — never reusing
+    a possibly-committed UUID (reify-3604 / _reset_for_fresh_retry semantics).
+    usage_gate is omitted throughout so invoke_with_cap_retry takes its fast,
+    no-gate path and forwards straight to the patched invoke_agent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wedge_then_success_retries_once_with_fresh_session(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        wedge = _make_agent_result(
+            success=False, timed_out=True, transcript_turns=0,
+            subtype='error_empty_output', session_id='w1',
+        )
+        success = _make_agent_result(
+            success=True,
+            structured_output={
+                'proposal_text': 'x', 'risk_label': 'low', 'files_referenced': [],
+            },
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        mock_invoke = AsyncMock(side_effect=[wedge, success])
+        with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+            await run_dry_run_unblock(
+                task_id='2200',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        assert mock_invoke.await_count == 2, (
+            f'Expected the wedge to trigger exactly one retry, got '
+            f'{mock_invoke.await_count} invoke_agent calls'
+        )
+        first_session = mock_invoke.call_args_list[0].kwargs.get('session_id')
+        second_session = mock_invoke.call_args_list[1].kwargs.get('session_id')
+        assert first_session != second_session, (
+            'retry must allocate a FRESH session_id, never reuse the wedged one'
+        )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry.get('risk_label') == 'low'
+        assert entry.get('status') is None, (
+            f"successful retry must persist the plain success shape (no 'status' "
+            f"key), got status={entry.get('status')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_wedge_then_wedge_bounded_to_one_retry(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        wedge = _make_agent_result(
+            success=False, timed_out=True, transcript_turns=0,
+            subtype='error_empty_output', session_id='w1',
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        mock_invoke = AsyncMock(side_effect=[wedge, wedge])
+        with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
+            await run_dry_run_unblock(
+                task_id='2201',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        assert mock_invoke.await_count == 2, (
+            f'Expected exactly one retry (2 total attempts, bounded — not a '
+            f'loop), got {mock_invoke.await_count}'
+        )
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure'
+
+
+# ---------------------------------------------------------------------------
+# task 2021 step-5: cap exhaustion converts to a retryable infra_failure entry
+# ---------------------------------------------------------------------------
+
+class TestDryRunCapExhaustion:
+    """AllAccountsCappedException (raised by invoke_with_cap_retry when the
+    1800s cap-wait sanity bound is exceeded) is caught and converted into a
+    retryable 'infra_failure' proposal entry — it must NOT propagate out of
+    run_dry_run_unblock, and must NOT be written as the terminal
+    'investigation_failed' shape (which would disable B3 auto-retry).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cap_exhaustion_writes_infra_failure_entry(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        cap_exc = AllAccountsCappedException(
+            retries=3, elapsed_secs=1800.0, label='Task 42 [unblock_auto]',
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_with_cap_retry',
+            new=AsyncMock(side_effect=cap_exc),
+        ):
+            # Must not raise.
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure', (
+            f"cap exhaustion must land on 'infra_failure', not "
+            f"{entry.get('status')!r} — a terminal 'investigation_failed' "
+            f"would disable the B3 low-risk auto-unblock retry path"
+        )
+        assert entry['risk_label'] == 'human-review-required'
+        assert entry['files_referenced'] == []
+        assert 'capped' in entry['proposal_text'].lower()
+        assert '3' in entry['proposal_text']
+        for key in (
+            'timed_out', 'duration_ms', 'subtype',
+            'transcript_turns', 'session_id', 'stderr_tail',
+        ):
+            assert key in entry, f'{key} must be present on the cap-exhaustion entry'
+            assert entry[key] is None, f'{key} must be None on the cap-exhaustion entry'
+
+
+# ---------------------------------------------------------------------------
+# task 2021 step-7: preserve the config dir on a doubly-wedged (forensic) run
+# ---------------------------------------------------------------------------
+
+class TestDryRunConfigDirPreserve:
+    """The per-investigation TaskConfigDir is preserved (cleanup skipped)
+    when the FINAL result — after the single retry — is still a zero-output
+    timeout wedge, mirroring task-1739's _preserve_config_dir forensics
+    pattern. A healthy run still cleans up normally (pinned both ways here
+    so the preserve branch cannot regress into always-preserve).
+    """
+
+    @pytest.mark.asyncio
+    async def test_doubly_wedged_run_preserves_config_dir(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        wedge = _make_agent_result(
+            success=False, timed_out=True, transcript_turns=0,
+            subtype='error_empty_output', session_id='w1',
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(side_effect=[wedge, wedge]),
+        ):
+            await run_dry_run_unblock(
+                task_id='2300',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        task_dir = tmp_path / '.task'
+        preserved = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert len(preserved) == 1, (
+            f'Expected the config dir to be PRESERVED after a doubly-wedged '
+            f'run (forensics), found: {preserved}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_run_still_cleans_up_config_dir(self, tmp_path):
+        """Counterpart pin: a clean success still cleans up — guards against
+        a naive fix that preserves the config dir unconditionally.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(return_value=agent_result),
+        ):
+            await run_dry_run_unblock(
+                task_id='2301',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        task_dir = tmp_path / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], f'Expected config dir cleanup on success, found: {leftover}'
+
+
+# ---------------------------------------------------------------------------
+# task 2021 amendment: pin the 1800s cap-wait bound to REAL loop behavior
+# ---------------------------------------------------------------------------
+
+class _ForcedCapSlot:
+    """Fake ``invoke_slot()`` context manager that reports a cap hit every time."""
+
+    account_name = 'forced-cap-account'
+    token = 'tok'
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def detect_cap_hit(self, stderr, output, backend=None):
+        return True
+
+    def settle(self):
+        pass
+
+    def confirm(self, cost_usd):
+        pass
+
+
+class _ForcedCapUsageGate:
+    """Minimal fake usage_gate whose every ``invoke_slot()`` reports a cap hit.
+
+    Drives the REAL ``invoke_with_cap_retry`` loop (unlike
+    TestDryRunCapExhaustion, which patches ``invoke_with_cap_retry`` itself
+    and only pins the entry-conversion shape). Real accounting means the
+    sanity-bound guard in ``invoke_with_cap_retry`` is what raises
+    ``AllAccountsCappedException`` here, not a mocked side_effect.
+    """
+
+    account_count = 1
+    active_account_name = 'forced-cap-account'
+    soonest_resets_at = None
+
+    def invoke_slot(self):
+        return _ForcedCapSlot()
+
+
+class TestDryRunCapExhaustionRealLoop:
+    """End-to-end: a fake usage_gate that always reports a cap hit drives the
+    real invoke_with_cap_retry cap-wait loop, which raises
+    AllAccountsCappedException once elapsed time exceeds the sanity bound.
+    Pins _DRY_RUN_CAP_WAIT_SANITY_SECS to actual loop behavior rather than a
+    patched sentinel (TestDryRunCapExhaustion covers the entry-shape
+    conversion in isolation).
+    """
+
+    @pytest.mark.asyncio
+    async def test_forced_cap_hit_raises_and_converts_to_infra_failure(
+        self, tmp_path, monkeypatch,
+    ):
+        from orchestrator import dry_run_unblock
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        # A negative sanity bound guarantees `elapsed > cap_wait_sanity_secs`
+        # trips on the very first cap hit regardless of actual wall-clock
+        # jitter, so the test doesn't need to wait out the real 1800s (or
+        # even the 5s base cooldown — the sanity check raises before the
+        # loop ever reaches `await asyncio.sleep(cooldown)`).
+        monkeypatch.setattr(dry_run_unblock, '_DRY_RUN_CAP_WAIT_SANITY_SECS', -1.0)
+
+        agent_result = _make_agent_result(success=False, subtype='error_rate_limit')
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(return_value=agent_result),
+        ):
+            await run_dry_run_unblock(
+                task_id='2400',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+                usage_gate=_ForcedCapUsageGate(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure', (
+            f"expected the real cap-wait loop to raise AllAccountsCappedException "
+            f"and convert to 'infra_failure', got status={entry.get('status')!r}"
+        )
+        assert entry['risk_label'] == 'human-review-required'
+        assert entry['files_referenced'] == []
+        assert 'capped' in entry['proposal_text'].lower()
