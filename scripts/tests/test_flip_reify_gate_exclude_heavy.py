@@ -314,3 +314,26 @@ def test_apply_commits_despite_failing_precommit_hook(tmp_path):
         f"Expected the flip commit to succeed despite a failing pre-commit "
         f"hook; before={before_commits} after={after_commits}"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-11: RED -- unknown-argument rejection
+# ---------------------------------------------------------------------------
+
+def test_rejects_unknown_argument(tmp_path):
+    """An unrecognized argument exits non-zero, errors to stderr, and
+    performs no edit/commit -- guards against silently widening the
+    accepted-argument set."""
+    repo = _make_fake_reify_repo(tmp_path)
+    before_config = _read_config(repo)
+    before_commits = _commit_count(repo)
+
+    result = _run_script(repo, "--bogus")
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit on an unrecognized argument; got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), f"Expected an error message on stderr; got stderr={result.stderr!r}"
+    assert _read_config(repo) == before_config, "unknown arg must not mutate orchestrator.yaml"
+    assert _commit_count(repo) == before_commits, "unknown arg must not create a commit"
