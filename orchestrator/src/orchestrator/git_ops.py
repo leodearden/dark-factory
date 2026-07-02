@@ -25,6 +25,7 @@ and .task/.gitignore are NOT sufficient — agents bypass them routinely.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -1319,6 +1320,20 @@ class GitOps:
                 f'{path} (branch {full_branch!r}, base {base_ref!r}): '
                 f'{add_err.strip()!r}'
             )
+
+        # .task/interactive.json stamp for the δ reaper (owner/created_at let
+        # the reaper age out worktrees with no activity past the TTL).
+        # _ensure_task_gitignore writes .task/.gitignore('*') first (and
+        # creates the .task/ dir) so the stamp is never staged/committed —
+        # keeps /merge-queue from ever landing it on task/<slug>.
+        _ensure_task_gitignore(path)
+        stamp = {
+            'owner': slug,
+            'created_at': datetime.now(UTC).isoformat(),
+            'branch': full_branch,
+            'slug': slug,
+        }
+        (path / '.task' / 'interactive.json').write_text(json.dumps(stamp))
 
         seed_rc = await self._seed_warm_lane(path, '--fresh-checkout')
         warm = seed_rc == 0
