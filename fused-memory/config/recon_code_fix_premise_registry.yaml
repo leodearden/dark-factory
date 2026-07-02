@@ -40,10 +40,16 @@
 - name: entity_summary_rebuild_invalid_at_filter_already_present
   reason: >
     esc-1946-15 claimed the entity-summary rebuild is missing an invalid_at
-    filter. Empirically refuted by the architect: memory_service.py already
-    applies the invalid_at filter throughout (40 occurrences on the
-    inspected branch). Any recurrence of this claim should be dropped
-    without an LLM call while the filter remains present.
+    filter. Empirically refuted by the architect: the rebuild's bulk valid-edge
+    fetch (GraphitiBackend.get_all_valid_edges — the single query both the
+    force=True and force=False MemoryService.rebuild_entity_summaries code
+    paths route through, the latter via detect_stale_with_edges) already
+    filters with `WHERE e.invalid_at IS NULL`. Any recurrence of this claim
+    should be dropped without an LLM call while that function and its
+    invalid_at filter clause remain in place. Anchored to this specific
+    function + clause (not just any occurrence of "invalid_at" in the
+    codebase) so the gate self-corrects the moment this particular filter is
+    actually removed, per the registry's own operator guidance below.
   title_substrings:
     - "entity-summary rebuild"
     - "invalid_at"
@@ -51,9 +57,10 @@
     - "missing invalid_at filter"
     - "invalid_at filter"
   source_assertions:
-    - file: src/fused_memory/services/memory_service.py
+    - file: src/fused_memory/backends/graphiti_client.py
       must_contain:
-        - "invalid_at"
+        - "def get_all_valid_edges"
+        - "e.invalid_at IS NULL"
 
 - name: stage2_flag_query_stage1_flag_marker_forbidden_regression
   reason: >
