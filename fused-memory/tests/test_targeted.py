@@ -1767,3 +1767,40 @@ async def test_on_task_done_writes_own_title_in_multicompletion_window(
                     f"Task {task['id']}: content contains neighbor title {other_title!r}.\n"
                     f"  content: {content!r}"
                 )
+
+
+# ── Pre-echo authoritative-resolution check (task 1984) ─────────────────────
+#
+# _on_task_done's completion echo must not re-append a stale raw description
+# when an authoritative resolution/superseding memory already exists for the
+# task (e.g. a re-scoped/reopened-then-redone task whose earlier echo was
+# superseded).  _is_authoritative_resolution(metadata) is the pure classifier;
+# the fast-path guard in _on_task_done queries get_memories_by_metadata and
+# suppresses the description/details append when any returned memory is
+# authoritative, while always still writing a title-only completion fact.
+
+
+@pytest.mark.parametrize(
+    'metadata, expected',
+    [
+        pytest.param({'supersedes': '959b8497'}, True, id='truthy_supersedes'),
+        pytest.param({'source': 'stage2_task_knowledge_sync'}, True, id='non_echo_source'),
+        pytest.param(
+            {'source': 'targeted_reconciliation', 'task_id': '361', 'transition': 'done'},
+            False,
+            id='plain_prior_echo',
+        ),
+        pytest.param({}, False, id='empty_metadata'),
+        pytest.param({'supersedes': ''}, False, id='falsy_supersedes_no_other_marker'),
+    ],
+)
+def test_is_authoritative_resolution_truth_table(metadata, expected):
+    """Pure classifier: truthy `supersedes` OR non-echo `source` => authoritative.
+
+    Plain prior targeted echoes (source='targeted_reconciliation', no supersedes)
+    are deliberately NOT authoritative, so a task's own earlier echoes never
+    trigger suppression or oscillation.
+    """
+    from fused_memory.reconciliation.targeted import _is_authoritative_resolution
+
+    assert _is_authoritative_resolution(metadata) is expected
