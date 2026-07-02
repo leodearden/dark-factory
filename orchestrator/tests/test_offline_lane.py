@@ -119,6 +119,18 @@ def test_git_config_offline_lane_knobs_validation():
         GitConfig(offline_lane_red_advances_before_blocker=0)
 
 
+def test_git_config_offline_lane_infra_enabled_default_and_settable():
+    """GitConfig exposes offline_lane_infra_enabled, default off (task 1959, IE1).
+
+    Step 1 (RED): the field does not yet exist — must fail before impl.
+    """
+    assert GitConfig().offline_lane_infra_enabled is False, (
+        'offline_lane_infra_enabled must default to False (numeric-only, '
+        'byte-identical to prior behavior)'
+    )
+    assert GitConfig(offline_lane_infra_enabled=True).offline_lane_infra_enabled is True
+
+
 # ---------------------------------------------------------------------------
 # on_post_merge — enqueue-and-return trigger seam (step-3/4)
 # ---------------------------------------------------------------------------
