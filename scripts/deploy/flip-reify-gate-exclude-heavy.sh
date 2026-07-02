@@ -44,6 +44,14 @@ print_intended_diff() {
     echo "+  ${KNOB}: \"1\"   (under verify_env: in ${CONFIG_PATH})"
 }
 
+# ε2 seam (PRD §11.6 open-Q): this only EMITS the observable reload signal.
+# The actual reload MECHANIC (in-place config reload vs a target_unit
+# self-kill restart via the deterministic runner) is selected by ε2 --
+# it wraps/replaces this function's body, not ε1's call site.
+signal_config_reload() {
+    echo "flip-reify-gate: config-reload signal emitted"
+}
+
 apply_flip() {
     # Comment-preserving targeted edit (NOT a YAML round-trip): strip any
     # pre-existing knob line (any indentation/value), then insert the
@@ -78,6 +86,7 @@ main() {
     git -C "$REIFY_REPO" add -- "$CONFIG_FILE"
     if ! git -C "$REIFY_REPO" diff --cached --quiet -- "$CONFIG_FILE"; then
         git -C "$REIFY_REPO" commit -m "deploy: flip ${KNOB}=1 (exclude heavy from reify verify gate)"
+        signal_config_reload
     fi
 }
 
