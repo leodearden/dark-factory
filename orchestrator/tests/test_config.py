@@ -179,6 +179,24 @@ class TestDefaults:
         assert config.dashboard_restart_watch_prefixes == ['dashboard/src/']
         assert config.dashboard_restart_script == 'scripts/restart-dashboard.sh'
 
+    def test_orchestrator_restart_defaults(self, monkeypatch, tmp_path):
+        """Bare OrchestratorConfig() exposes orchestrator_restart_* defaults.
+
+        CRITICAL: orchestrator_restart_on_merge_enabled defaults to False — the
+        disabled-by-default operator gate (U2). The orchestrator is the single
+        most critical unit, so auto-fire-on-merge must not activate merely
+        because this wiring lands; an operator must flip the flag after a soak
+        period + sign-off.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        config = OrchestratorConfig()
+        assert config.orchestrator_restart_on_merge_enabled is False
+        assert config.orchestrator_restart_debounce_secs == 300.0
+        assert config.orchestrator_restart_watch_prefixes == ['orchestrator/src/']
+        assert config.orchestrator_restart_script == 'scripts/restart-orchestrator.sh'
+        assert config.orchestrator_restart_on_active_secs == 10
+
     def test_project_root_resolved_to_absolute(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
