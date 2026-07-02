@@ -1179,6 +1179,36 @@ def create_server(
             return {'halted': False, 'error': 'reason is required for audit'}
         return await harness.force_halt_scheduler(reason.strip())
 
+    @mcp.tool()
+    async def reload_config() -> dict[str, Any]:
+        """Operator-initiated hot-reload of the orchestrator's config file.
+
+        Operator-only: this tool appears in no agent role's allow-list, so
+        autonomous orchestrator agents cannot call it (I8).
+
+        Takes NO arguments — always re-reads the orchestrator process's own
+        ORCH_CONFIG_PATH, so a reload can never retarget the orchestrator at a
+        different project (extends the cross-project-execution safeguard).
+
+        What actually hot-applies is limited to the green-tier config allowlist
+        (plans/config-hot-reload-prd.md §Allowlist); fields outside it are
+        reported under ``restart_required`` — the edit was accepted but takes no
+        effect until the orchestrator restarts.  A truthy ``reloaded`` does NOT
+        mean every change took effect: always inspect the returned ``applied``
+        and ``restart_required`` dispositions rather than just the top-level
+        flag (I6).
+
+        Returns the harness's report verbatim: ``{reloaded, config_path,
+        applied, restart_required, unchanged, error}`` (or a standalone ``error``
+        when the server is running with no harness wired).
+        """
+        if harness is None:
+            return {
+                'reloaded': False,
+                'error': 'escalation server running standalone — no harness wired',
+            }
+        return await harness.reload_config()
+
     # ── merge_status — read-only lifecycle probe (PRD α3 / task 1630) ──────────
 
     _MERGE_STATUS_UNKNOWN_HINT = 'check git log main'
