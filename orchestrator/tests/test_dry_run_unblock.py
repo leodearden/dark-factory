@@ -1083,8 +1083,8 @@ class TestDryRunResilienceScaffolding:
         TaskConfigDir, the 1800s cap-wait sanity override, role='unblock_auto',
         invoke_fn=invoke_agent, and a session_id kwarg.
         """
-        from orchestrator.dry_run_unblock import run_dry_run_unblock
         from orchestrator.dry_run_unblock import invoke_agent as real_invoke_agent
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
 
         structured = {
             'proposal_text': 'Rebase on main and rerun verify',
