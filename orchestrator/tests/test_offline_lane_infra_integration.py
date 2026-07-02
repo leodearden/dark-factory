@@ -483,3 +483,65 @@ async def _drive_infra_reds(
     for _ in range(n):
         await _drive_advance(harness, repo)
         await _run_one_lane_pass(worker)
+
+
+# ---------------------------------------------------------------------------
+# IB1 — advance triggers a from-head infra sub-run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ib1_advance_triggers_from_head_infra_sub_run(
+    harness,
+    git_ops,
+    repo,
+    tmp_path,
+    caplog,
+):
+    """IB1 — a landed advance triggers an infra sub-run snapshotted from the
+    CURRENT main head, never the advisory trigger SHA passed to
+    on_post_merge; the numeric sub-run runs too, at that SAME head.
+
+    Negative control: reverting IE1's infra leg in ``_run_once`` (the infra
+    sub-run block that awaits ``self.infra_runner`` when
+    ``offline_lane_infra_enabled`` is True) would leave ``infra_calls``
+    empty and fail this test.
+    """
+    infra_calls: list[tuple] = []
+    suite_calls: list[tuple] = []
+
+    async def _infra_runner(wt, head, threads):
+        infra_calls.append((wt, head, threads))
+        return (0, '')
+
+    async def _suite_runner(wt, head, threads):
+        suite_calls.append((wt, head, threads))
+        return (0, '')
+
+    worker = _build_infra_worker(
+        git_ops,
+        tmp_path,
+        suite_runner=_suite_runner,
+        infra_runner=_infra_runner,
+    )
+    _wire_lane(harness, worker)
+
+    with caplog.at_level(logging.INFO):
+        base_sha, head_sha = await _drive_advance(harness, repo)
+        await _run_one_lane_pass(worker)
+
+    real_head = await git_ops.get_main_sha()
+    assert real_head == head_sha
+    assert len(infra_calls) == 1
+    assert infra_calls[0][1] == real_head, (
+        'infra_runner must be invoked with the real from-head snapshot, '
+        'never the advisory trigger SHA'
+    )
+    assert len(suite_calls) == 1
+    assert suite_calls[0][1] == real_head, (
+        'the numeric sub-run must also run, at the SAME snapshot head as the infra sub-run'
+    )
+
+    assert 'offline-lane: on_post_merge' in caplog.text
+    assert base_sha[:12] in caplog.text
+    assert head_sha[:12] in caplog.text
