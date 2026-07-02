@@ -1729,7 +1729,11 @@ class OrchestratorConfig(BaseSettings):
     )
     # Small deferral so the current run-loop tick can log/settle before the
     # detached transient unit fires; the cgroup escape makes the restart
-    # survive regardless of this value.
+    # survive regardless of this value. Clamped to a minimum of 5 at the
+    # executor call site (Harness._build_orchestrator_restart_coordinator),
+    # mirroring DeterministicRunner's analogous clamp, so a misconfigured
+    # 0/negative value can't drop the settle window or produce an invalid
+    # ``--on-active=`` argument.
     orchestrator_restart_on_active_secs: int = Field(default=10)
 
     # Orphan L0 reaper — re-escalates level-0 escalations whose task has no

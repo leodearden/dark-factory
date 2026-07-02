@@ -5246,6 +5246,13 @@ Output JSON matching the schema. Every task must appear in the output.
         coordinator (idle-only; restart-orchestrator.sh takes no positional
         args). Called once from _start_merge_worker alongside the other two
         builders.
+
+        ``on_active_secs`` is clamped to a minimum of 5 (mirroring
+        ``DeterministicRunner``'s ``max(int(...), 5)`` clamp on the
+        analogous field) so an operator misconfiguring
+        ``orchestrator_restart_on_active_secs`` to 0 or a negative value
+        can't remove the settle window entirely or produce an invalid
+        ``--on-active=`` argument at registration.
         """
         counter = itertools.count()
 
@@ -5255,7 +5262,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 script_args=[],
                 project_root=self.config.project_root,
                 transient_unit=f'orch-selfrestart-on-merge-{next(counter)}.service',
-                on_active_secs=self.config.orchestrator_restart_on_active_secs,
+                on_active_secs=max(self.config.orchestrator_restart_on_active_secs, 5),
             )
 
         return StaleServiceRestartCoordinator(
