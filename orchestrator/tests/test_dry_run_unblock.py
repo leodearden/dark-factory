@@ -124,7 +124,17 @@ def _init_git_repo(path) -> str:
 
 
 def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
-                       subtype='', output='', duration_ms=1000):
+                       subtype='', output='', duration_ms=1000,
+                       timed_out=False, transcript_turns=None, session_id='',
+                       stderr='', turns=0, api_error_status=None,
+                       schema_salvaged=False, output_tokens=None):
+    # NOTE: duplicated verbatim in test_b3_gate.py (task 2020 review:
+    # code_duplication). Both copies must be extended together whenever
+    # shared.cli_invoke.AgentResult gains/renames a field consumed by
+    # classify_agent_failure(). Out of this task's locked scope: hoisting
+    # both into the existing orchestrator/tests/_orch_helpers.py shared-helper
+    # module (the established convention for cross-suite test helpers in this
+    # package) is a follow-up.
     r = MagicMock()
     r.success = success
     r.cost_usd = cost_usd
@@ -132,6 +142,23 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
     r.subtype = subtype
     r.output = output
     r.duration_ms = duration_ms
+    # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
+    # A bare MagicMock auto-vivifies every unset attribute as a truthy
+    # MagicMock, which would silently corrupt classify_agent_failure()'s
+    # decision rules: .timed_out truthy -> misclassifies every failure as
+    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
+    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
+    # every field classify_agent_failure() consults (including
+    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
+    # these mocks faithful stand-ins for its decision rules.
+    r.timed_out = timed_out
+    r.transcript_turns = transcript_turns
+    r.session_id = session_id
+    r.stderr = stderr
+    r.turns = turns
+    r.api_error_status = api_error_status
+    r.schema_salvaged = schema_salvaged
+    r.output_tokens = output_tokens
     return r
 
 
@@ -305,6 +332,13 @@ class TestAgentFailureFallback:
         # cost_usd must be present on all fallback entries for dashboard queries
         assert 'cost_usd' in entry
         assert entry['cost_usd'] == pytest.approx(0.1)
+        # task 2020 step-5: diagnostic keys also present on investigation_failed.
+        assert entry['timed_out'] is False
+        assert entry['subtype'] == 'error_max_turns'
+        assert 'transcript_turns' in entry
+        assert 'session_id' in entry
+        assert 'stderr_tail' in entry
+        assert 'duration_ms' in entry
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +380,13 @@ class TestBudgetExhaustedFallback:
         assert 'proposal incomplete' in entry['proposal_text'].lower()
         assert entry['risk_label'] == 'human-review-required'
         assert entry['cost_usd'] == pytest.approx(5.0)
+        # task 2020 step-5: diagnostic keys also present on budget_exhausted.
+        assert entry['subtype'] == 'error_max_budget_usd'
+        assert 'timed_out' in entry
+        assert 'transcript_turns' in entry
+        assert 'session_id' in entry
+        assert 'stderr_tail' in entry
+        assert 'duration_ms' in entry
 
 
 # ---------------------------------------------------------------------------
@@ -785,3 +826,189 @@ class TestDryRunWireMode:
         assert 'append' not in trim_args, (
             f"'append' must not appear on the wire for trim write; got: {trim_args}"
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2020 step-1: infra vs. substantive failure classification
+# ---------------------------------------------------------------------------
+
+class TestInfraFailureClassification:
+    """Transient HOST infra wedges (600s ceiling kill -> empty stdout +
+    timed_out) are classified as a distinct 'infra_failure' status, separate
+    from a substantive 'investigation_failed' agent conclusion.
+    """
+
+    @pytest.mark.asyncio
+    async def test_host_wedge_classified_as_infra_failure(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        # Simulated HOST wedge: pre-turn-1 kill at the 600s UnblockAutoConfig
+        # timeout ceiling -> empty stdout + timed_out=True.
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_empty_output',
+            output='Agent produced no output',
+            timed_out=True,
+            duration_ms=600000,
+            transcript_turns=0,
+            session_id='sess-x',
+            stderr='...Absolute ceiling reached after 600.0s...',
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='701',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure'
+        assert entry['risk_label'] == 'human-review-required'
+        assert entry['files_referenced'] == []
+
+        # task 2020 step-3: discrete diagnostic keys carried on the entry.
+        assert entry['timed_out'] is True
+        assert entry['duration_ms'] == 600000
+        assert entry['subtype'] == 'error_empty_output'
+        assert entry['transcript_turns'] == 0
+        assert entry['session_id'] == 'sess-x'
+        assert 'Absolute ceiling reached after 600.0s' in entry['stderr_tail']
+        assert len(entry['stderr_tail']) <= 500
+
+    @pytest.mark.asyncio
+    async def test_substantive_failure_stays_investigation_failed(self, tmp_path):
+        """Guard against over-broad infra classification: a non-timed-out,
+        non-empty-output substantive failure must keep 'investigation_failed'.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_max_turns',
+            output='Exceeded max turns',
+            timed_out=False,
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='702',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'investigation_failed'
+
+    @pytest.mark.asyncio
+    async def test_high_turn_timeout_still_classified_infra_failure(self, tmp_path):
+        """Pin current behavior (review note, task 2020): classification is
+        by AgentFailureKind alone (timed_out=True -> TIMED_OUT), NOT gated on
+        transcript_turns. A genuine investigation that ran many turns before
+        hitting the timeout ceiling is classified identically to a
+        pre-turn-1 wedge — both land as 'infra_failure'. This is intentional:
+        risk_label stays 'human-review-required' either way, so no
+        auto-retry/auto-unblock path opens because of it (both statuses
+        still ABORT at the B3 gate; see
+        TestTwoWayBoundary.test_infra_failure_and_investigation_failed_both_aborted
+        in test_b3_gate.py). A future consumer that auto-retries specifically
+        on infra_failure should itself gate on transcript_turns rather than
+        assume this status implies near-zero turns.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_empty_output',
+            output='',
+            timed_out=True,
+            duration_ms=600000,
+            transcript_turns=47,
+            session_id='sess-y',
+            stderr='...Absolute ceiling reached after 600.0s...',
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='704',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure'
+        assert entry['transcript_turns'] == 47
+
+
+# ---------------------------------------------------------------------------
+# task 2020 step-7: exception fallback carries None-safe diagnostic keys
+# ---------------------------------------------------------------------------
+
+class TestExceptionFallbackDiagnostics:
+    """The exception-fallback entry (an orchestrator-side error, not a
+    detected host wedge) stays 'investigation_failed' and carries all six
+    diagnostic keys with None values — shape parity, since no AgentResult
+    ever existed on this path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_exception_fallback_carries_none_diagnostics(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(side_effect=RuntimeError('boom')),
+        ):
+            await run_dry_run_unblock(
+                task_id='703',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'investigation_failed'
+        assert entry['risk_label'] == 'human-review-required'
+        for key in (
+            'timed_out', 'duration_ms', 'subtype',
+            'transcript_turns', 'session_id', 'stderr_tail',
+        ):
+            assert key in entry, f'{key} must be present on the exception fallback entry'
+            assert entry[key] is None, f'{key} must be None on the exception fallback entry'

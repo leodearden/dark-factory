@@ -56,8 +56,20 @@ def _diverge_feature_branch(path: Path) -> str:
 
 
 def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
-                       subtype='', output='', duration_ms=1000):
-    """Create a minimal MagicMock AgentResult stand-in for _build_entry tests."""
+                       subtype='', output='', duration_ms=1000,
+                       timed_out=False, transcript_turns=None, session_id='',
+                       stderr='', turns=0, api_error_status=None,
+                       schema_salvaged=False, output_tokens=None):
+    """Create a minimal MagicMock AgentResult stand-in for _build_entry tests.
+
+    NOTE: duplicated verbatim in test_dry_run_unblock.py (task 2020 review:
+    code_duplication). Both copies must be extended together whenever
+    shared.cli_invoke.AgentResult gains/renames a field consumed by
+    classify_agent_failure(). Out of this task's locked scope: hoisting both
+    into the existing orchestrator/tests/_orch_helpers.py shared-helper
+    module (the established convention for cross-suite test helpers in this
+    package) is a follow-up.
+    """
     r = MagicMock()
     r.success = success
     r.cost_usd = cost_usd
@@ -65,6 +77,23 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
     r.subtype = subtype
     r.output = output
     r.duration_ms = duration_ms
+    # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
+    # A bare MagicMock auto-vivifies every unset attribute as a truthy
+    # MagicMock, which would silently corrupt classify_agent_failure()'s
+    # decision rules: .timed_out truthy -> misclassifies every failure as
+    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
+    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
+    # every field classify_agent_failure() consults (including
+    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
+    # these mocks faithful stand-ins for its decision rules.
+    r.timed_out = timed_out
+    r.transcript_turns = transcript_turns
+    r.session_id = session_id
+    r.stderr = stderr
+    r.turns = turns
+    r.api_error_status = api_error_status
+    r.schema_salvaged = schema_salvaged
+    r.output_tokens = output_tokens
     return r
 
 
@@ -1118,6 +1147,51 @@ class TestTwoWayBoundary:
         verdict = check_proposal(fail_entry, worktree=str(repo), category='task_failure',
                                  run_git=_run_git, now=self._NOW)
         assert verdict['verdict'] == ABORT, f'expected abort for failure entry: {verdict}'
+
+    def test_infra_failure_and_investigation_failed_both_aborted(self, tmp_path):
+        """task 2020 step-9: the new infra_failure status (a retryable HOST
+        wedge) and the existing investigation_failed status both carry a
+        'status' key, and both must be aborted by check_proposal — proving
+        the infra reclassification cannot open the B3 low-risk auto-unblock
+        path. b3_gate.py is intentionally NOT modified for this task.
+        """
+        from orchestrator.b3_gate import ABORT, _run_git, check_proposal
+        from orchestrator.dry_run_unblock import _build_entry
+        repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
+
+        # Wedge: pre-turn-1 kill at the 600s UnblockAutoConfig timeout
+        # ceiling -> empty stdout + timed_out=True.
+        wedge_agent = _make_agent_result(
+            success=False,
+            subtype='error_empty_output',
+            output='Agent produced no output',
+            timed_out=True,
+            duration_ms=600000,
+            transcript_turns=0,
+            session_id='sess-x',
+            stderr='...Absolute ceiling reached after 600.0s...',
+        )
+        wedge_entry = _build_entry(wedge_agent, reason='blocked', budget_usd=5.0)
+        wedge_entry['head_sha'] = head_sha
+        wedge_entry['main_sha'] = main_sha
+        assert wedge_entry['status'] == 'infra_failure'
+
+        # Substantive: agent ran and concluded a human must look — not timed
+        # out, not empty output.
+        substantive_agent = _make_agent_result(
+            success=False, subtype='error_max_turns', output='Exceeded max turns',
+        )
+        substantive_entry = _build_entry(substantive_agent, reason='blocked', budget_usd=5.0)
+        substantive_entry['head_sha'] = head_sha
+        substantive_entry['main_sha'] = main_sha
+        assert substantive_entry['status'] == 'investigation_failed'
+
+        for entry in (wedge_entry, substantive_entry):
+            verdict = check_proposal(entry, worktree=str(repo), category='task_failure',
+                                     run_git=_run_git, now=self._NOW)
+            assert verdict['verdict'] == ABORT, (
+                f"expected abort for status={entry['status']!r}: {verdict}"
+            )
 
     def test_success_entry_has_no_status_key(self, tmp_path):
         """Success _build_entry must NOT have a 'status' key (contract invariant)."""

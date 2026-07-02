@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from shared.cli_invoke import AgentFailureKind, classify_agent_failure
+
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 
@@ -57,6 +59,30 @@ _HUMAN_REVIEW_REQUIRED: str = 'human-review-required'
 # exhaustion, not ``error_max_budget``.
 _BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
 
+# Transient HOST infra wedges (e.g. a pre-turn-1 kill at the
+# UnblockAutoConfig.timeout ceiling -> empty stdout + timed_out) are
+# retryable and operationally distinct from a substantive
+# 'investigation_failed' agent conclusion. api_error is deliberately NOT
+# included: it is handled at another layer, not treated as infra here.
+#
+# NOTE: classification is by AgentFailureKind alone (timed_out=True ->
+# TIMED_OUT) and is intentionally NOT gated on transcript_turns — a genuine
+# investigation that ran many turns before hitting the timeout ceiling is
+# classified identically to a pre-turn-1 wedge (both land here as
+# 'infra_failure'). This is safe today because risk_label stays
+# 'human-review-required' either way, so no auto-retry/auto-unblock path is
+# opened by this status alone (see TestTwoWayBoundary.
+# test_infra_failure_and_investigation_failed_both_aborted in
+# test_b3_gate.py). A future consumer that auto-retries specifically on
+# infra_failure should itself gate on transcript_turns rather than assume
+# near-zero turns. Current behavior is pinned by TestInfraFailureClassification.
+# test_high_turn_timeout_still_classified_infra_failure in
+# test_dry_run_unblock.py.
+_INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
+    AgentFailureKind.TIMED_OUT,
+    AgentFailureKind.EMPTY_OUTPUT,
+})
+
 
 def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
     """Return True only when the agent's subtype explicitly signals budget exhaustion.
@@ -68,6 +94,42 @@ def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG00
     """
     subtype = getattr(result, 'subtype', '') or ''
     return subtype in _BUDGET_SUBTYPES
+
+
+def _failure_diagnostics(result: Any) -> dict[str, Any]:
+    """Build the discrete, queryable diagnostic fields stamped on failure entries.
+
+    None-safe: when *result* is None (the orchestrator-side exception fallback
+    in ``run_dry_run_unblock``, where no ``AgentResult`` was ever produced),
+    every key is present with a ``None`` value — preserving shape parity
+    across all four entry shapes (ok, investigation_failed, budget_exhausted,
+    exception fallback).
+
+    ``stderr_tail`` mirrors ``classify_agent_failure``'s 500-char tail
+    convention (``shared/src/shared/cli_invoke.py``).
+
+    These keys are orchestrator-stamped OUTSIDE ``DRY_RUN_PROPOSAL_SCHEMA``
+    (``additionalProperties: False``) — the same pattern as head_sha/main_sha
+    (task 1613) — so the agent cannot forge them.
+    """
+    if result is None:
+        return {
+            'timed_out': None,
+            'duration_ms': None,
+            'subtype': None,
+            'transcript_turns': None,
+            'session_id': None,
+            'stderr_tail': None,
+        }
+    stderr = getattr(result, 'stderr', '') or ''
+    return {
+        'timed_out': bool(getattr(result, 'timed_out', False)),
+        'duration_ms': getattr(result, 'duration_ms', None),
+        'subtype': getattr(result, 'subtype', '') or '',
+        'transcript_turns': getattr(result, 'transcript_turns', None),
+        'session_id': getattr(result, 'session_id', '') or '',
+        'stderr_tail': stderr[-500:],
+    }
 
 
 # Read-only tools the dry-run agent is allowed to use.
@@ -230,6 +292,7 @@ async def run_dry_run_unblock(
             'cost_usd': 0.0,
             'investigated_at': _now_iso(),
             'timestamp': _now_iso(),
+            **_failure_diagnostics(None),
         }
         result = None
 
@@ -314,6 +377,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
     now = _now_iso()
 
     if not result.success:
+        diagnostics = _failure_diagnostics(result)
         if _is_budget_exhausted(result, budget_usd):
             return {
                 'status': 'budget_exhausted',
@@ -327,6 +391,23 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
                 'cost_usd': result.cost_usd,
                 'investigated_at': now,
                 'timestamp': now,
+                **diagnostics,
+            }
+        failure_cls = classify_agent_failure(result)
+        if failure_cls.kind in _INFRA_FAILURE_KINDS:
+            return {
+                'status': 'infra_failure',
+                'proposal_text': (
+                    f'Infra wedge (retryable, not a human-review conclusion): '
+                    f'{failure_cls.summary}; subtype={result.subtype}'
+                ),
+                'risk_label': _HUMAN_REVIEW_REQUIRED,
+                'files_referenced': [],
+                'block_reason': reason,
+                'cost_usd': getattr(result, 'cost_usd', 0.0),
+                'investigated_at': now,
+                'timestamp': now,
+                **diagnostics,
             }
         return {
             'status': 'investigation_failed',
@@ -340,6 +421,7 @@ def _build_entry(result: Any, *, reason: str, budget_usd: float) -> dict[str, An
             'cost_usd': getattr(result, 'cost_usd', 0.0),
             'investigated_at': now,
             'timestamp': now,
+            **diagnostics,
         }
 
     # Success path — parse structured_output
