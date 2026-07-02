@@ -3704,6 +3704,43 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
                 await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
+    # ------------------------------------------------------------------
+    # Interactive-worktree (_iact-*) crash-safety reaper — task δ/2012
+    # ------------------------------------------------------------------
+
+    async def _run_interactive_worktree_reaper_pass(self) -> None:
+        """Sweep the ``_iact-*`` interactive-worktree band once (single tick).
+
+        Delegates unconditionally to ``git_ops.reap_interactive_worktrees()``,
+        which is itself fail-soft and never raises. This method wraps the
+        call in a belt-and-suspenders try/except anyway (mirrors
+        ``_run_warm_lane_gc_pass``'s contract) so a fault here can never kill
+        the shared warm-lane GC cadence loop or the startup sequence that
+        calls this directly.
+
+        Logs one INFO line per reaped record naming slug/branch/reason — the
+        per-worktree half of the I2 user-observable signal. Failure logging
+        is a bounded one-line ``logger.error`` summary — NOT
+        ``logger.exception`` — matching ``_warm_lane_gc_loop``'s rationale
+        (unbounded traceback formatting can exceed per-test timeouts).
+
+        Called by ``_run_warm_lane_gc_pass()`` on every cadence tick, and
+        once unconditionally at ``run()`` startup for crash recovery.
+        """
+        try:
+            reaped = await self.git_ops.reap_interactive_worktrees()
+            for record in reaped:
+                logger.info(
+                    'Reaped interactive worktree %s (branch=%s, reason=%s)',
+                    record.slug, record.branch, record.reason,
+                )
+        except Exception as exc:
+            logger.error(
+                'Interactive-worktree reaper pass failed: %s: %s',
+                type(exc).__name__,
+                exc,
+            )
+
     async def _block_and_escalate_substrate_flip(
         self,
         task_id: str,
