@@ -4698,6 +4698,26 @@ class GitOps:
         )
         return rc == 0 and bool(out.strip())
 
+    async def _worktree_dirty(self, worktree: Path) -> bool:
+        """True if *worktree* has uncommitted changes (``git status --porcelain``).
+
+        Used by :meth:`reap_interactive_worktrees` to avoid reaping a worktree
+        out from under an actively-editing user in two situations: a landed
+        (merged-to-main) worktree the user resumed working in without
+        committing yet, and a live (unmerged-commits) worktree whose newest
+        commit is old but whose working tree shows fresh, uncommitted edits.
+
+        **Fail-safe True** on any git error (unreadable worktree, etc.) —
+        callers treat "dirty" as "leave it alone this sweep", so an I/O
+        hiccup defers a reap decision rather than risking one on a false
+        "clean" reading. This mirrors :meth:`_branch_has_commits_beyond_main`'s
+        fail-safe-toward-retention convention.
+        """
+        rc, out, _ = await _run(['git', 'status', '--porcelain'], cwd=worktree)
+        if rc != 0:
+            return True
+        return bool(out.strip())
+
     async def reap_interactive_worktrees(
         self, *, now: datetime | None = None,
     ) -> list[ReapedInteractiveWorktree]:
@@ -4716,11 +4736,18 @@ class GitOps:
 
         Per-worktree reap predicate:
 
-        * :meth:`_interactive_worktree_landed` finds a ``Merge <branch> into
-          <main_branch>`` marker on main → reaped immediately as
-          ``'landed'``, regardless of age (the work is already safe on
-          main).
-        * Otherwise, :meth:`worktree_head_beyond_main` is ``None`` (no
+        * :meth:`worktree_head_beyond_main` is ``None`` (no commits beyond
+          main) AND :meth:`_interactive_worktree_landed` finds a ``Merge
+          <branch> into <main_branch>`` marker on main AND the working tree
+          is clean (:meth:`_worktree_dirty` is ``False``) → reaped
+          immediately as ``'landed'``, regardless of age (the work is
+          already safe on main and nothing remains uncommitted). A landed
+          worktree that still carries commits beyond main, or uncommitted
+          edits, is NOT reaped immediately — it falls through to the
+          idle/TTL handling below instead, so a session the user resumed
+          *after* the merge (committed or not) isn't reclaimed out from
+          under them.
+        * Otherwise, when :meth:`worktree_head_beyond_main` is ``None`` (no
           commits beyond main) → age is measured from the
           ``.task/interactive.json`` stamp's ``created_at``.  Reaped
           (``'ttl_idle'``) when that age exceeds
@@ -4729,17 +4756,30 @@ class GitOps:
           reaped anyway (``'disk_pressure'``) regardless of age — safe
           because there is no unmerged work to lose.  The disk-guard check
           runs at most once per sweep (not per-candidate).
-        * Otherwise (the worktree carries unmerged commits) → age is
-          measured from the newest commit's time (``git show -s
-          --format=%ct HEAD``), NOT the stamp — an in-progress session that
-          keeps committing must never be reaped merely because it is old.
-          Reaped (``'ttl_idle'``) when that age exceeds the same TTL. A
-          worktree with unmerged commits is NEVER reaped for disk pressure
-          alone — only the TTL (or landed) rule can reclaim it.
+        * Otherwise (the worktree carries unmerged commits) → a dirty
+          working tree (:meth:`_worktree_dirty`) is treated as recent
+          activity and preserves the worktree outright, since an in-progress
+          session can be actively editing for hours between commits.
+          Otherwise, age is measured from the newest commit's time (``git
+          show -s --format=%ct HEAD``), NOT the stamp — an in-progress
+          session that keeps committing must never be reaped merely because
+          it is old.  Reaped (``'ttl_idle'``) when that age exceeds the same
+          TTL. Note this means uncommitted edits made *after* the TTL window
+          has already lapsed on a stale worktree are not specially
+          protected — only edits present at sweep time are. A worktree with
+          unmerged commits is NEVER reaped for disk pressure alone — only
+          the TTL (or landed) rule can reclaim it.
 
         Removal uses ``git worktree remove --force`` per reaped candidate,
         followed by a single ``git worktree prune`` if at least one was
-        removed — mirrors :meth:`prune_stale_merge_worktrees`.
+        removed — mirrors :meth:`prune_stale_merge_worktrees`. After each
+        successful removal, :meth:`_delete_branch_if_on_main` is called to
+        reclaim the now-unused ``task/<slug>`` branch ref — it independently
+        re-derives "no commits beyond main" and silently retains (never
+        deletes) a branch that still carries unmerged work, so this is safe
+        even for the unmerged ``'ttl_idle'`` path above, and prevents the
+        branch namespace from slowly accumulating dangling refs across many
+        sweeps.
 
         Args:
             now: reference time for TTL comparisons; defaults to
@@ -4766,14 +4806,26 @@ class GitOps:
                 full_branch = f'{self.config.branch_prefix}{slug}'
 
                 reason: str | None = None
-                if await self._interactive_worktree_landed(full_branch):
-                    # Landed on main — safe to reap regardless of age (the
-                    # PROMPT-safe case: the work already lives on main).
+                beyond = await self.worktree_head_beyond_main(wt_path)
+                # Only a worktree with no commits beyond main can possibly be
+                # "landed" (a real merge marker); short-circuiting here also
+                # skips the merge-marker grep entirely once beyond is known
+                # not-None, since that case always falls to the live-commit
+                # branch below regardless of landed status.
+                landed = beyond is None and await self._interactive_worktree_landed(
+                    full_branch,
+                )
+                if landed and not await self._worktree_dirty(wt_path):
+                    # Landed on main and the working tree is clean — safe to
+                    # reap regardless of age (the PROMPT-safe case: the work
+                    # already lives on main and nothing remains uncommitted).
                     reason = 'landed'
-                else:
-                    beyond = await self.worktree_head_beyond_main(wt_path)
-                    if beyond is None:
-                        stamp_path = wt_path / '.task' / 'interactive.json'
+                elif beyond is None:
+                    # Either not landed, or landed-but-dirty (resumed
+                    # post-merge editing with no new commit yet) — either way
+                    # there are no commits beyond main, so age on the stamp
+                    # exactly like any other idle candidate.
+                    stamp_path = wt_path / '.task' / 'interactive.json'
                         try:
                             stamp = json.loads(stamp_path.read_text())
                             created_at = datetime.fromisoformat(stamp['created_at'])
@@ -4799,7 +4851,13 @@ class GitOps:
                                 # under pressure even though still within
                                 # TTL.
                                 reason = 'disk_pressure'
-                    else:
+                    elif not await self._worktree_dirty(wt_path):
+                        # Unmerged commits and a clean tree — age on the
+                        # newest commit. A dirty tree here (the `if` this
+                        # `elif` pairs with) is treated as recent activity
+                        # and preserves the worktree outright, since a
+                        # session can be actively editing for hours between
+                        # commits.
                         rc_ct, ct_out, _ = await _run(
                             ['git', 'show', '-s', '--format=%ct', 'HEAD'],
                             cwd=wt_path,
