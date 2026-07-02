@@ -13,6 +13,7 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings
 
 from fused_memory.config.schema import (
+    CuratorConfig,
     EmbedderConfig,
     FusedMemoryConfig,
     GraphitiBackendConfig,
@@ -746,6 +747,70 @@ class TestPathScopeAdjudicatorConfigBudget:
             f'the adjudicator true cost is ~0.105 USD; a budget at or below cost '
             f'returns error_max_budget_usd before any verdict (silent no-op). '
             f'Check config.yaml for an override that pins the budget below cost.'
+        )
+
+
+class TestCuratorConfigBudgetRaise:
+    """Regression guard: TaskCurator per-call budget is a durable flat $2.00 (task 1980).
+
+    Directive: reify L2 esc-task-curator-194 (Leo: raise budget to $2). The prior
+    scale-by-batch-size attempt (reify task 2254) was CANCELLED and the cap
+    recurred, so the fix here is a DURABLE flat raise rather than more per-size
+    scaling. ``_scale_budget`` computes ``min(base + per_entry*size, cap)`` — for
+    the ceiling to be a flat $2.00 regardless of pool/batch size, BOTH the base
+    (``max_budget_usd``) and the single-call cap (``single_call_budget_cap_usd``)
+    must be raised together; raising only one leaves the other clamping the
+    result below $2.00.
+    """
+
+    def test_default_max_budget_usd_is_two_dollars(self):
+        """CuratorConfig.max_budget_usd base floor must be raised to $2.00.
+
+        0.30 == 2.00 is False — RED before the fix; 2.00 == 2.00 is True — GREEN after.
+        """
+        assert CuratorConfig().max_budget_usd == pytest.approx(2.00), (
+            'CuratorConfig.max_budget_usd must be a flat $2.00 (task 1980 / '
+            'esc-task-curator-194) so large-candidate curations stop tripping '
+            'error_max_budget_usd. Raise the default.'
+        )
+
+    def test_single_call_cap_cannot_clamp_base_below_two_dollars(self):
+        """single_call_budget_cap_usd must be >= max_budget_usd.
+
+        The single-call effective budget is
+        ``min(max_budget_usd + per_pool_entry_budget_usd*len(pool), single_call_budget_cap_usd)``.
+        If the cap is left below the raised base, every single-call invocation
+        clamps back down below $2.00 — silently undoing the raise. Both the base
+        AND the cap must move together; that is the whole point of this task.
+        """
+        cfg = CuratorConfig()
+        assert cfg.single_call_budget_cap_usd >= cfg.max_budget_usd, (
+            f'CuratorConfig.single_call_budget_cap_usd (got '
+            f'{cfg.single_call_budget_cap_usd!r}) must be >= max_budget_usd (got '
+            f'{cfg.max_budget_usd!r}) — otherwise the single-call cap silently '
+            f'clamps the raised base back down, defeating the durable $2.00 raise.'
+        )
+
+    def test_deployed_config_max_budget_usd_at_least_two_dollars(self, monkeypatch):
+        """Effective deployed value (schema default layered with config.yaml) must also be >= $2.00.
+
+        Mirrors TestPathScopeAdjudicatorConfigBudget.test_deployed_config_max_budget_usd_above_floor:
+        loads the real config.yaml via CONFIG_PATH, constructs FusedMemoryConfig(),
+        and asserts the effective value. This catches a future YAML edit that
+        re-pins max_budget_usd below the durable $2.00 ceiling.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        # config.yaml currently has no curator.max_budget_usd override, so today
+        # this test exercises the default-fallback path (schema default = 2.00).
+        # It will catch a future YAML edit that explicitly pins the budget lower.
+        cfg = FusedMemoryConfig()
+        assert cfg.curator.max_budget_usd >= 2.00, (
+            f'Effective curator.max_budget_usd (got {cfg.curator.max_budget_usd!r}) '
+            f'must be >= 2.00 — task 1980 / esc-task-curator-194 raises the '
+            f'TaskCurator per-call budget to a durable flat $2.00. Check '
+            f'config.yaml for an override that pins the budget lower.'
         )
 
 
