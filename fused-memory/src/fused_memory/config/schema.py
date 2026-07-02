@@ -651,7 +651,13 @@ class CuratorConfig(BaseModel):
     # contract while still giving ~20% headroom over the slowest legitimate
     # single-item decision observed in production (~150s); see esc-task-curator-20.
     timeout_seconds: float = Field(default=180.0)
-    max_budget_usd: float = Field(default=0.30)
+    # Durable flat $2.00 per-call ceiling (task 1980 / esc-task-curator-194).
+    # A prior scale-by-batch-size attempt (reify task 2254) was cancelled and
+    # the cap recurred as pools/batches grew; a flat, size-independent ceiling
+    # does not recur. Raising this base ALONE is not sufficient — see the
+    # single-call comment block below on why single_call_budget_cap_usd must
+    # move together with this value.
+    max_budget_usd: float = Field(default=2.00)
     # Per-call turn cap. Must be ≥ 3: schema burns one tool-use turn, an
     # optional reasoning turn may precede it, and the final assistant
     # response is the third. 8 leaves headroom for harder combine-vs-create
@@ -707,14 +713,18 @@ class CuratorConfig(BaseModel):
     # pool size (the prompt-token cost driver for single-candidate calls):
     #   budget = min(max_budget_usd + per_pool_entry_budget_usd * len(pool),
     #                single_call_budget_cap_usd)
-    # Numeric basis: full 30-entry pool (pool_total_cap=30) →
-    #   0.30 + 0.0125*30 = $0.675 ≈ 2.2× the measured legitimate full-pool
-    #   cost of $0.30574 (esc-task-curator-191), inside the $0.60–$0.75 PRD
-    #   target.  Empty pool stays at the $0.30 max_budget_usd baseline.
-    #   The cap (0.75) sits above the realistic max for pool_total_cap=30
-    #   so it is a pure safety net against pathological pool sizes (>36).
+    # Durable flat $2.00 ceiling (task 1980 / esc-task-curator-194): a full
+    # 30-entry pool (pool_total_cap=30) costs ~$0.30574 (esc-task-curator-191)
+    # — comfortably under $2.00 with no per-size tuning required. The prior
+    # scaled cap (0.75, derived from 0.30 + 0.0125*30 = $0.675) was raised
+    # alongside max_budget_usd to the SAME $2.00 value: single_call_budget_cap_usd
+    # must be >= max_budget_usd or it silently clamps the raised base back
+    # down, defeating the durable raise (see TestCuratorConfigBudgetRaise in
+    # test_config_schema.py). With base == cap == $2.00, this formula now
+    # clamps to a flat $2.00 for every pool size, including pathologically
+    # large ones — the scaling knob below is retained but inert.
     per_pool_entry_budget_usd: float = Field(default=0.0125)
-    single_call_budget_cap_usd: float = Field(default=0.75)
+    single_call_budget_cap_usd: float = Field(default=2.00)
 
     # Background janitor that surfaces failed tickets to the orchestrator.
     janitor: TicketJanitorConfig = Field(default_factory=TicketJanitorConfig)
@@ -784,8 +794,12 @@ class PathScopeAdjudicatorConfig(BaseModel):
     # 60s bounds a silent Anthropic-API hang; independent of prompt/cost size.
     timeout_seconds: float = Field(default=60.0)
     # True cost floor is ~0.105 USD (fixed CLI/base-context overhead dominates).
-    # 0.30 gives ~2.85x margin and matches CuratorConfig.max_budget_usd.
-    # Do NOT lower below 0.25 — the adjudicator becomes a silent no-op.
+    # 0.30 gives ~2.85x margin, which is all this fixed-cost call shape needs.
+    # CuratorConfig.max_budget_usd was separately raised to a flat $2.00 (task
+    # 1980 / esc-task-curator-194) to cover its much larger, size-varying
+    # prompt cost — the two configs no longer share a value, and this one
+    # does not need to move. Do NOT lower below 0.25 — the adjudicator
+    # becomes a silent no-op.
     max_budget_usd: float = Field(default=0.30)
     # Per-call turn cap. Must be ≥ 3: schema burns one tool-use turn,
     # an optional reasoning turn may precede it, and the final assistant
