@@ -438,5 +438,48 @@ def staleness_pass() -> None:
             log(f"staleness probe error for {unit}: {exc}")
 
 
+def _format_epoch(epoch: int | None) -> str:
+    """Render a Unix epoch as a UTC timestamp string, or 'unknown' for None."""
+    if epoch is None:
+        return "unknown"
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(epoch))
+
+
+def report() -> int:
+    """Print a per-unit staleness table for the running fleet; return 1 iff any unit is stale.
+
+    Read-only doctor mode (I7): performs zero mutating systemctl calls, only
+    the same reads staleness_pass uses (list-units / show / git log) via
+    _enumerate_running_units, _newest_watched_commit_epoch, and
+    _unit_start_epoch. The row set is the dynamically-enumerated running
+    fleet — decoupled from the static WATCHED liveness port list (PRD Open
+    Question 3).
+
+    A unit's verdict is 'unknown' (not 'stale') when either epoch is
+    undeterminable; an 'unknown' verdict does not force a non-zero exit —
+    only a confirmed-stale unit does.
+    """
+    commit_epoch = _newest_watched_commit_epoch()
+    units = _enumerate_running_units()
+
+    commit_str = _format_epoch(commit_epoch)
+    print(f"{'UNIT':<50} {'START':<24} {'NEWEST WATCHED COMMIT':<24} VERDICT")
+
+    any_stale = False
+    for unit in units:
+        start_epoch = _unit_start_epoch(unit)
+        start_str = _format_epoch(start_epoch)
+        if start_epoch is None or commit_epoch is None:
+            verdict = "unknown"
+        elif start_epoch < commit_epoch:
+            verdict = "stale"
+            any_stale = True
+        else:
+            verdict = "fresh"
+        print(f"{unit:<50} {start_str:<24} {commit_str:<24} {verdict}")
+
+    return 1 if any_stale else 0
+
+
 if __name__ == "__main__":
     main()
