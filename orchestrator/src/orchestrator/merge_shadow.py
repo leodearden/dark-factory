@@ -36,8 +36,17 @@ from typing import TYPE_CHECKING, Any
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_types import MergeRequest
-from orchestrator.verify import run_scoped_verification
-from orchestrator.verify_runner import LocalRunner, VerifyRunnerPool, build_merge_verify_spec
+
+# These four are not referenced directly in this module — _run_cold_shadow_verify
+# always reaches back to the orchestrator.merge_queue-resident binding (see its
+# body).  They are imported here only so TestReachBackRouting has a "naive"
+# orchestrator.merge_shadow.<name> patch target to assert is NOT what governs.
+from orchestrator.verify import run_scoped_verification  # noqa: F401
+from orchestrator.verify_runner import (  # noqa: F401
+    LocalRunner,
+    VerifyRunnerPool,
+    build_merge_verify_spec,
+)
 
 if TYPE_CHECKING:
     from orchestrator.merge_queue import SpeculativeMergeWorker
@@ -723,22 +732,37 @@ async def _run_cold_shadow_verify(
         Per-test verdict map as returned by :func:`parse_per_test_results`.
         Empty dict if the cold verify produced no parseable test output.
     """
+    # Reach-back (deferred import): the existing test suite patches these
+    # dependencies by string path at orchestrator.merge_queue.<name> (this
+    # function used to live in merge_queue.py).  Resolving them dynamically
+    # from merge_queue's namespace at call time keeps those patches
+    # effective post-extraction — see the module docstring's reach-back
+    # convention.  Attribute access (rather than `from ... import <name>`)
+    # is used here because build_merge_verify_spec / VerifyRunnerPool /
+    # LocalRunner / run_scoped_verification also have a module-level "naive"
+    # import above (kept solely as a TestReachBackRouting patch target); a
+    # `from ... import` reach-back would shadow-and-thus-dead-code that
+    # naive import, which ruff flags (F811).  _run_unscoped_typechecks has
+    # no merge_shadow-local copy at all (it stays permanently in
+    # merge_queue.py) but is accessed the same way for consistency.
+    import orchestrator.merge_queue as _mq
+
     wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
     try:
         task_files_tuple = (
             tuple(req.task_files) if req.task_files is not None else None
         )
-        spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+        spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
         # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor detective
         # control (PRD §10 invariant 6(b)).  Adding remotes here would (a) defeat the
         # from-scratch-cold guarantee (a remote may have a warm sccache/target) and
         # (b) reintroduce remote scope-derivation concerns into the very control whose
         # purpose is to BE the local ground truth.  See design decision in plan.json.
-        pool = VerifyRunnerPool(
-            [LocalRunner(
+        pool = _mq.VerifyRunnerPool(
+            [_mq.LocalRunner(
                 wt, req.config, req.module_configs, task_files_tuple,
-                run_scoped=run_scoped_verification,
-                run_unscoped=_run_unscoped_typechecks,
+                run_scoped=_mq.run_scoped_verification,
+                run_unscoped=_mq._run_unscoped_typechecks,
                 task_id=req.task_id,
             )],
             event_store=event_store,
@@ -819,6 +843,14 @@ async def _run_shadow_compare(
         escalation_queue: Live escalation queue, or ``None`` (None-safe).
         event_store: Optional event store for parity-ok event emission.
     """
+    # Reach-back (deferred import): the existing test suite patches the cold
+    # leg by string path at orchestrator.merge_queue._run_cold_shadow_verify
+    # (this function used to live in merge_queue.py, alongside its sibling).
+    # Resolving it dynamically from merge_queue's namespace at call time
+    # keeps those patches effective post-extraction for BOTH cold-leg calls
+    # below (initial + Option-B re-confirmation).
+    from orchestrator.merge_queue import _run_cold_shadow_verify
+
     try:
         cold_results = await _run_cold_shadow_verify(
             git_ops, req, merge_commit, event_store
@@ -971,6 +1003,14 @@ async def _maybe_schedule_shadow_compare(
         escalation_queue: Live escalation queue, or ``None`` (None-safe).
         event_store: Optional event store for parity-ok event emission.
     """
+    # Reach-back (deferred import): the existing test suite patches the
+    # spawned coroutine by string path at
+    # orchestrator.merge_queue._run_shadow_compare (this function used to
+    # live in merge_queue.py, alongside its sibling).  Resolving it
+    # dynamically from merge_queue's namespace at call time keeps those
+    # patches effective post-extraction.
+    from orchestrator.merge_queue import _run_shadow_compare
+
     # Early exits: knob off or no warm results to compare against
     if not req.config.git.warm_verify_shadow_compare:
         return

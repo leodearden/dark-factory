@@ -171,6 +171,19 @@ def check_merge_liveness_margin(
         :class:`MergeLivenessAssessment` with all computed values and the
         ``safe`` verdict.
     """
+    # Reach-back (deferred import): _HEARTBEAT_POLL_S, TOUCH_MISS_TOLERANCE,
+    # and INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS stay in merge_queue.py (engine
+    # constants) and the existing test suite monkeypatches them by string path
+    # at orchestrator.merge_queue.<name>.  Resolving them dynamically from
+    # merge_queue's namespace at call time keeps those patches effective post-
+    # extraction — see the module docstring's reach-back convention and its
+    # note on the engine-constant default-argument hazard.
+    from orchestrator.merge_queue import (
+        _HEARTBEAT_POLL_S,
+        INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+        TOUCH_MISS_TOLERANCE,
+    )
+
     if liveness_secs is None:
         liveness_secs = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
 
@@ -256,6 +269,19 @@ def enforce_merge_liveness_margin(
         :exc:`MergeLivenessConfigError`: When ``worst_case_secs >= threshold_secs``
             (i.e. heartbeat floor ≥ threshold).
     """
+    # Reach-back (deferred import): check_merge_liveness_margin is a co-moved
+    # sibling that the existing test suite monkeypatches by string path at
+    # orchestrator.merge_queue.check_merge_liveness_margin (this function
+    # used to live in merge_queue.py, alongside its sibling).
+    # INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS is the same engine-constant
+    # default-argument hazard as in check_merge_liveness_margin above.
+    # Resolving both dynamically from merge_queue's namespace at call time
+    # keeps those patches effective post-extraction.
+    from orchestrator.merge_queue import (
+        INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+        check_merge_liveness_margin,
+    )
+
     if liveness_secs is None:
         liveness_secs = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
 
@@ -668,6 +694,13 @@ def enforce_persistent_worktree_serial_lane(
             ``config.git.persistent_merge_worktree is True`` and the per-host
             in-flight count ``ceil(merge_ahead_bound / num_hosts) > 1``.
     """
+    # Reach-back (deferred import): _MERGE_AHEAD_BOUND stays in merge_queue.py
+    # (engine constant) and the existing test suite monkeypatches it by
+    # string path at orchestrator.merge_queue._MERGE_AHEAD_BOUND — the same
+    # engine-constant default-argument hazard as liveness_secs above (see the
+    # module docstring's reach-back convention).
+    from orchestrator.merge_queue import _MERGE_AHEAD_BOUND
+
     if merge_ahead_bound is None:
         merge_ahead_bound = _MERGE_AHEAD_BOUND
 

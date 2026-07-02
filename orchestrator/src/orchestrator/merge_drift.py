@@ -36,13 +36,23 @@ from typing import TYPE_CHECKING, Any
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_types import MergeRequest
-from orchestrator.verify import _derive_task_files_from_git, run_scoped_verification
+
+# run_scoped_verification is not referenced directly in this module —
+# _run_drift_check always reaches back to the orchestrator.merge_queue-
+# resident binding (see its body).  Imported here only so TestReachBackRouting
+# has a "naive" orchestrator.merge_drift.run_scoped_verification patch target
+# to assert is NOT what governs.
+from orchestrator.verify import _derive_task_files_from_git, run_scoped_verification  # noqa: F401
+
+# LocalRunner / VerifyRunnerPool / build_merge_verify_spec: same reasoning —
+# _run_drift_check always reaches back to orchestrator.merge_queue for these;
+# DriftDetector / HostAllocator are used directly (not reached back).
 from orchestrator.verify_runner import (
     DriftDetector,
     HostAllocator,
-    LocalRunner,
-    VerifyRunnerPool,
-    build_merge_verify_spec,
+    LocalRunner,  # noqa: F401
+    VerifyRunnerPool,  # noqa: F401
+    build_merge_verify_spec,  # noqa: F401
 )
 
 if TYPE_CHECKING:
@@ -87,6 +97,22 @@ async def _run_drift_check(
             allocator and released in the finally block.  Fallback to the legacy
             ``_build_remote_runners`` pool when ``None`` (backward-compatible).
     """
+    # Reach-back (deferred import): the existing test suite patches these
+    # dependencies by string path at orchestrator.merge_queue.<name> (this
+    # function used to live in merge_queue.py).  Resolving them dynamically
+    # from merge_queue's namespace at call time keeps those patches
+    # effective post-extraction — see the module docstring's reach-back
+    # convention.  Attribute access (rather than `from ... import <name>`)
+    # is used here because build_merge_verify_spec / VerifyRunnerPool /
+    # LocalRunner / run_scoped_verification also have a module-level "naive"
+    # import above (kept solely as a TestReachBackRouting patch target); a
+    # `from ... import` reach-back would shadow-and-thus-dead-code that
+    # naive import, which ruff flags (F811).  _run_unscoped_typechecks and
+    # _build_remote_runners have no merge_drift-local copy at all (both stay
+    # permanently in merge_queue.py) but are accessed the same way for
+    # consistency.
+    import orchestrator.merge_queue as _mq
+
     # wt is initialised before the try so the finally guard (`if wt is not None`)
     # is safe even when create_throwaway_verify_worktree itself raises.  Moving the
     # creation inside the try ensures the docstring contract ("Exceptions are caught
@@ -103,7 +129,7 @@ async def _run_drift_check(
             derived = await _derive_task_files_from_git(wt, req.config)
             if derived:
                 task_files_tuple = tuple(derived)
-        spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+        spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
         if allocator is not None:
             # β decision 5: acquire both hosts through the allocator so slot
@@ -113,11 +139,11 @@ async def _run_drift_check(
             # constructed if the local slot is unavailable.
             _ttf = task_files_tuple  # capture for closure
 
-            def _local_factory() -> LocalRunner:
-                return LocalRunner(
+            def _local_factory() -> _mq.LocalRunner:
+                return _mq.LocalRunner(
                     wt, req.config, req.module_configs, _ttf,
-                    run_scoped=run_scoped_verification,
-                    run_unscoped=_run_unscoped_typechecks,
+                    run_scoped=_mq.run_scoped_verification,
+                    run_unscoped=_mq._run_unscoped_typechecks,
                     task_id=req.task_id,
                 )
 
@@ -132,7 +158,7 @@ async def _run_drift_check(
                     remote_lease is not None,
                 )
                 return
-            pool = VerifyRunnerPool(
+            pool = _mq.VerifyRunnerPool(
                 [local_lease.runner, remote_lease.runner],
                 event_store=event_store,
                 task_id=req.task_id,
@@ -140,13 +166,13 @@ async def _run_drift_check(
         else:
             # Legacy fallback: build fresh pool via _build_remote_runners (no
             # slot accounting — used when allocator is not threaded in yet).
-            pool = VerifyRunnerPool(
-                [LocalRunner(
+            pool = _mq.VerifyRunnerPool(
+                [_mq.LocalRunner(
                     wt, req.config, req.module_configs, task_files_tuple,
-                    run_scoped=run_scoped_verification,
-                    run_unscoped=_run_unscoped_typechecks,
+                    run_scoped=_mq.run_scoped_verification,
+                    run_unscoped=_mq._run_unscoped_typechecks,
                     task_id=req.task_id,
-                ), *_build_remote_runners(req.config, wt, quarantine=quarantine_set)],
+                ), *_mq._build_remote_runners(req.config, wt, quarantine=quarantine_set)],
                 event_store=event_store,
                 task_id=req.task_id,
             )
@@ -209,6 +235,14 @@ async def _maybe_run_drift_check(
         req: The :class:`MergeRequest` that just landed.
         merge_commit: The just-landed merge commit SHA.
     """
+    # Reach-back (deferred import): the existing test suite patches the
+    # spawned coroutine by string path at
+    # orchestrator.merge_queue._run_drift_check (this function used to live
+    # in merge_queue.py, alongside its sibling).  Resolving it dynamically
+    # from merge_queue's namespace at call time keeps those patches
+    # effective post-extraction.
+    from orchestrator.merge_queue import _run_drift_check
+
     if not req.config.enabled_verify_runners:
         return
     every_n = req.config.verify_drift_check_every_n_lands
