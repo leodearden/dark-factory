@@ -43,6 +43,13 @@ def harness(tmp_path: Path, mock_orch_config):
     mock_orch_config.dashboard_restart_debounce_secs = 20.0
     mock_orch_config.dashboard_restart_watch_prefixes = ['dashboard/src/']
     mock_orch_config.dashboard_restart_script = 'scripts/restart-dashboard.sh'
+    # orchestrator restart config (U2 — task 1973); mirrors the real Config
+    # defaults (disabled-by-default operator gate — see config.py).
+    mock_orch_config.orchestrator_restart_on_merge_enabled = False
+    mock_orch_config.orchestrator_restart_debounce_secs = 300.0
+    mock_orch_config.orchestrator_restart_watch_prefixes = ['orchestrator/src/']
+    mock_orch_config.orchestrator_restart_script = 'scripts/restart-orchestrator.sh'
+    mock_orch_config.orchestrator_restart_on_active_secs = 10
 
     with patch('orchestrator.harness.McpLifecycle'), \
          patch('orchestrator.harness.Scheduler'), \
@@ -527,3 +534,83 @@ class TestMergePipelineIdle:
         result = harness._merge_pipeline_idle()  # must not raise
 
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# U2 (task 1973): Harness._build_orchestrator_restart_coordinator
+# ---------------------------------------------------------------------------
+
+
+class TestBuildOrchestratorRestartCoordinator:
+    """_build_orchestrator_restart_coordinator() reads orchestrator_restart_* config.
+
+    Unlike the fused-memory/dashboard builders, this coordinator is wired
+    with a CUSTOM restart_executor (cgroup-escaping systemd-run, not the
+    coordinator's default create_subprocess_exec path) and a
+    restart_precondition (the merge-drain gate, Harness._merge_pipeline_idle).
+    """
+
+    def test_builds_coordinator_with_correct_config_values(self, harness: Harness):
+        """Coordinator fields match the orchestrator_restart_* config values."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert isinstance(coord, StaleServiceRestartCoordinator)
+        assert coord._debounce_secs == 300.0
+        assert coord._watch_prefixes == ['orchestrator/src/']
+        assert coord._script_path == 'scripts/restart-orchestrator.sh'
+
+    def test_service_name_is_orchestrator(self, harness: Harness):
+        """Coordinator has service_name='orchestrator'."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._service_name == 'orchestrator'
+
+    def test_requires_idle(self, harness: Harness):
+        """Coordinator has require_idle=True — never fires while agents dispatch."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._require_idle is True
+
+    def test_disabled_by_default(self, harness: Harness):
+        """Disabled under the default config (operator gate — soak + sign-off required)."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord.enabled is False
+
+    def test_enabled_when_config_flag_flipped(self, harness: Harness):
+        """Enabled once the operator flips orchestrator_restart_on_merge_enabled."""
+        harness.config.orchestrator_restart_on_merge_enabled = True
+
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord.enabled is True
+
+    def test_restart_precondition_is_merge_pipeline_idle(self, harness: Harness):
+        """restart_precondition is harness._merge_pipeline_idle (the drain gate)."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        # Bound-method equality: __self__ identity + __func__ identity.
+        assert coord._restart_precondition == harness._merge_pipeline_idle
+
+    def test_restart_executor_is_custom_injected(self, harness: Harness):
+        """restart_executor is a custom closure — NOT the coordinator's default path.
+
+        The default path (create_subprocess_exec + start_new_session=True) does
+        NOT cgroup-escape, so it must never be used for the orchestrator's own
+        self-restart (see module design note in service_restart.py).
+        """
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._restart_executor is not None
+
+    def test_git_ops_is_harness_git_ops(self, harness: Harness):
+        """Coordinator receives the harness's git_ops instance."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._git_ops is harness.git_ops
+
+    def test_project_root_matches_config(self, harness: Harness):
+        """Coordinator project_root matches config.project_root."""
+        coord = harness._build_orchestrator_restart_coordinator()
+
+        assert coord._project_root == Path(harness.config.project_root)
