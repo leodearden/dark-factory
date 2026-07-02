@@ -78,6 +78,12 @@ _OFFLINE_LANE_FAILURE_BACKOFF_SECS: float = 60.0
 # docstring's cross-project scope boundary).
 _RUN_OFFLINE_DEEP_SCRIPT: str = 'scripts/run-offline-deep.sh'
 
+# Default infra sub-run seam script + scope (task 1959, IE1): reify's H9
+# (reify:4929) host-exclusive runner.  IE-D2 — `--scope host-infra`
+# SELF-ACQUIRES the H8 Lane-X flock, so no DF-side flock is needed here.
+_RUN_ALL_INFRA_SCRIPT: str = 'tests/infra/run_all.sh'
+_INFRA_SCOPE: str = 'host-infra'
+
 #: Signature of the injectable heavy-suite seam: (worktree path, head SHA,
 #: test-thread count) -> (return code, output tail).
 SuiteRunner = Callable[[Path, str, int], Awaitable[tuple[int, str]]]
@@ -139,6 +145,18 @@ class OfflineLaneWorker:
             ``(wt_path, head) -> confirmed_still_failing_ids`` used by
             :meth:`_handle_red_run` to filter flakes before fingerprinting.
             Defaults to :meth:`_default_confirmation_run` when not supplied.
+        infra_runner: Optional injectable async seam (task 1959, IE1),
+            same ``SuiteRunner`` signature as ``suite_runner``, for the
+            second (infra) sub-run: reify's ``run_all --scope host-infra``
+            (H9 = reify:4929).  Defaults to :meth:`_default_run_infra` when
+            not supplied.  IE-D2: the infra scope self-acquires the H8
+            Lane-X flock — no DF-side flock is taken here.
+        infra_confirmation_runner: Optional injectable async seam (task
+            1959, IE1), same ``ConfirmationRunner`` signature as
+            ``confirmation_runner``, used by :meth:`_handle_red_run` (via
+            its optional ``confirmation_runner`` kwarg) to confirm an infra
+            sub-run red result.  Defaults to
+            :meth:`_default_infra_confirmation_run` when not supplied.
         task_client: Optional :class:`OfflineLaneTaskClient` (β3) used to
             file/update the dedup'd fix task for a confirmed red run.
             Defaults to ``None`` — the red path degrades to a log-only no-op
@@ -157,6 +175,8 @@ class OfflineLaneWorker:
         lock_path: str | Path,
         suite_runner: SuiteRunner | None = None,
         confirmation_runner: ConfirmationRunner | None = None,
+        infra_runner: SuiteRunner | None = None,
+        infra_confirmation_runner: ConfirmationRunner | None = None,
         task_client: OfflineLaneTaskClient | None = None,
         escalation_queue: EscalationQueue | None = None,
     ) -> None:
@@ -170,6 +190,14 @@ class OfflineLaneWorker:
             confirmation_runner
             if confirmation_runner is not None
             else self._default_confirmation_run
+        )
+        self.infra_runner: SuiteRunner = (
+            infra_runner if infra_runner is not None else self._default_run_infra
+        )
+        self.infra_confirmation_runner: ConfirmationRunner = (
+            infra_confirmation_runner
+            if infra_confirmation_runner is not None
+            else self._default_infra_confirmation_run
         )
         self.task_client = task_client
         self.escalation_queue = escalation_queue
@@ -680,3 +708,21 @@ class OfflineLaneWorker:
         stdout, _ = await proc.communicate()
         text = (stdout or b'').decode(errors='replace')
         return [line.strip() for line in text.splitlines() if line.strip()]
+
+    async def _default_run_infra(self, wt_path: Path, head: str, threads: int) -> tuple[int, str]:
+        """Default ``infra_runner`` seam — runs reify's H9 host-infra scope (IE1).
+
+        Body lands in a later step (task 1959 step-6); this stub exists so
+        the constructor wiring (step-4) has a real bound method to fall
+        back to.
+        """
+        raise NotImplementedError
+
+    async def _default_infra_confirmation_run(self, wt: Path, head: str) -> list[str]:
+        """Default ``infra_confirmation_runner`` seam — re-runs H9 host-infra (IE1).
+
+        Body lands in a later step (task 1959 step-8); this stub exists so
+        the constructor wiring (step-4) has a real bound method to fall
+        back to.
+        """
+        raise NotImplementedError
