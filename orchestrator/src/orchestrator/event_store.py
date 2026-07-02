@@ -156,6 +156,12 @@ class EventType(StrEnum):
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
 
+    # Config hot-reload (plans/config-hot-reload-prd.md, task beta) — emitted
+    # by Harness.reload_config() on every call, success or failure. Data
+    # payload = the full reload report: {reloaded, config_path, applied,
+    # restart_required, unchanged, error}.
+    config_reload = 'config_reload'
+
     # Plan salvaged — the architect CLI run reported failure (e.g. budget/turn
     # cap) but had already written a finalized, valid plan to disk; the
     # workflow uses that plan instead of discarding it and re-planning.
