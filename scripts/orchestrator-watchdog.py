@@ -40,6 +40,21 @@ WATCHED = [
 # Value = 2 × probe interval (60s) to cover worst-case startup latency.
 STARTUP_GRACE_SECS = 120
 
+# Working directory shared by every orchestrator-*.service unit; the repo the
+# staleness pass diffs against.
+REPO_DIR = "/home/leo/src/dark-factory"
+
+# Paths whose newest commit defines "fresh" for the staleness pass (mirrors
+# orchestrator/config.yaml's orchestrator_restart_watch_prefixes — see
+# plans/orchestrator-fleet-staleness-prd.md §Resolved 1/4).
+WATCHED_PATHS = [
+    "orchestrator/src/",
+    "escalation/src/",
+    "orchestrator/pyproject.toml",
+    "orchestrator/uv.lock",
+    "escalation/pyproject.toml",
+]
+
 
 def log(msg: str) -> None:
     """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``."""
@@ -295,6 +310,52 @@ def _unit_start_epoch(unit: str) -> int | None:
                 return None  # unit has never started (or no PID recorded)
             return epoch
         return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _newest_watched_commit_epoch() -> int | None:
+    """Return the newest committer epoch touching WATCHED_PATHS on HEAD, or None.
+
+    Runs ``git -C REPO_DIR log -1 --format=%ct HEAD -- <WATCHED_PATHS>``.
+    Committer time approximates landing time (the merge queue rebases
+    immediately before merging; direct-to-main commits are committed at
+    landing) — file mtimes are rejected as a source since they drift under
+    editor/checkout perturbation with no provenance.
+
+    Returns None if no commit touches the watched paths (confirmed real
+    behavior: git exits 0 with EMPTY stdout in this case — this must be
+    treated as undeterminable, not epoch 0, or every unit would look
+    infinitely stale), on a non-zero exit, on unparseable stdout, or on any
+    subprocess/OS error. Callers must treat None as "staleness cannot be
+    determined this tick".
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                REPO_DIR,
+                "log",
+                "-1",
+                "--format=%ct",
+                "HEAD",
+                "--",
+                *WATCHED_PATHS,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        stdout = result.stdout.strip()
+        if not stdout:
+            return None
+        try:
+            return int(stdout)
+        except ValueError:
+            return None
     except Exception:  # noqa: BLE001
         return None
 
