@@ -2579,3 +2579,58 @@ def diff_config(
         restart_required=restart_required,
         unchanged=unchanged,
     )
+
+
+def _get_leaf(model: 'OrchestratorConfig', path: str) -> Any:
+    """Return the value at dotted *path* by walking getattr across its components."""
+    obj: Any = model
+    for part in path.split('.'):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _set_leaf(model: 'OrchestratorConfig', path: str, value: Any) -> None:
+    """Write *value* to dotted *path* on *model*, bypassing per-write validation.
+
+    A one-component path (top-level scalar, e.g. 'verify_env') is written via
+    object.__setattr__, bypassing OrchestratorConfig's validate_assignment so
+    no per-write cross-field validator fires mid-apply — the single
+    authoritative check is the post-apply re-validation in apply_reload. A
+    two-component path (submodel leaf, e.g. 'models.architect') is written
+    via plain setattr on the submodel object — submodels have no
+    validate_assignment of their own, and this preserves submodel identity
+    (I3) so held references (e.g. GitOps, UsageGate) observe the update in
+    place.
+    """
+    parts = path.split('.')
+    if len(parts) == 1:
+        object.__setattr__(model, parts[0], value)
+    else:
+        sub_name, leaf = parts
+        setattr(getattr(model, sub_name), leaf, value)
+
+
+def apply_reload(
+    live: 'OrchestratorConfig',
+    fresh: 'OrchestratorConfig',
+    allowlist: frozenset[str] = RELOADABLE_FIELDS,
+) -> dict[str, Any]:
+    """Diff *live* against *fresh* and apply every allowlisted differing leaf
+    to *live* in place.
+
+    Returns {reloaded, applied, restart_required, unchanged, error} — see
+    plans/config-hot-reload-prd.md §Contract. config_path is intentionally
+    absent; the harness-level reload_config (task beta) supplies it.
+    """
+    d = diff_config(live, fresh, allowlist)
+    applied: dict[str, dict[str, Any]] = {}
+    for path, old_new in d.applied_candidates.items():
+        _set_leaf(live, path, old_new['new'])
+        applied[path] = old_new
+    return {
+        'reloaded': True,
+        'applied': applied,
+        'restart_required': d.restart_required,
+        'unchanged': d.unchanged,
+        'error': None,
+    }

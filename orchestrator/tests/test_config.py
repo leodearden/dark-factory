@@ -1964,7 +1964,16 @@ class TestApplyReload:
 
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        live = OrchestratorConfig()
+        # Both sides pin `models`/`git` explicitly (not just `fresh`): a bare
+        # OrchestratorConfig() sources unset submodel leaves from the packaged
+        # defaults.yaml via YamlSettingsSource, which diverges from the
+        # ModelsConfig Field(default=...) values on several roles (e.g.
+        # implementer/debugger/reviewer) — leaving `live` unpinned would leak
+        # those extra diffs into report['applied'] below.
+        live = OrchestratorConfig(
+            models=ModelsConfig(architect='opus'),
+            git=GitConfig(offline_lane_test_threads=6),
+        )
         fresh = OrchestratorConfig(
             models=ModelsConfig(architect='sonnet'),
             git=GitConfig(offline_lane_test_threads=8),
