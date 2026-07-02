@@ -798,3 +798,87 @@ class TestDryRunWireMode:
         assert 'append' not in trim_args, (
             f"'append' must not appear on the wire for trim write; got: {trim_args}"
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2020 step-1: infra vs. substantive failure classification
+# ---------------------------------------------------------------------------
+
+class TestInfraFailureClassification:
+    """Transient HOST infra wedges (600s ceiling kill -> empty stdout +
+    timed_out) are classified as a distinct 'infra_failure' status, separate
+    from a substantive 'investigation_failed' agent conclusion.
+    """
+
+    @pytest.mark.asyncio
+    async def test_host_wedge_classified_as_infra_failure(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        # Simulated HOST wedge: pre-turn-1 kill at the 600s UnblockAutoConfig
+        # timeout ceiling -> empty stdout + timed_out=True.
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_empty_output',
+            output='Agent produced no output',
+            timed_out=True,
+            duration_ms=600000,
+            transcript_turns=0,
+            session_id='sess-x',
+            stderr='...Absolute ceiling reached after 600.0s...',
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='701',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'infra_failure'
+        assert entry['risk_label'] == 'human-review-required'
+        assert entry['files_referenced'] == []
+
+    @pytest.mark.asyncio
+    async def test_substantive_failure_stays_investigation_failed(self, tmp_path):
+        """Guard against over-broad infra classification: a non-timed-out,
+        non-empty-output substantive failure must keep 'investigation_failed'.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        agent_result = _make_agent_result(
+            success=False,
+            subtype='error_max_turns',
+            output='Exceeded max turns',
+            timed_out=False,
+            structured_output=None,
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch('orchestrator.dry_run_unblock.invoke_agent',
+                   new=AsyncMock(return_value=agent_result)):
+            await run_dry_run_unblock(
+                task_id='702',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        scheduler.update_task.assert_awaited_once()
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        assert entry['status'] == 'investigation_failed'
