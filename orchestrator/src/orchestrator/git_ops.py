@@ -1335,8 +1335,30 @@ class GitOps:
         }
         (path / '.task' / 'interactive.json').write_text(json.dumps(stamp))
 
+        # FAIL-SOFT (the key deviation from acquire_warm_lane): a seed fault
+        # never removes the worktree and never raises — the worktree + stamp
+        # above are retained either way, so the caller always gets a usable
+        # worktree (warm or cold).  This is deliberately the opposite of
+        # acquire_warm_lane, which removes the lane and returns FAULT/
+        # DISK_PRESSURE on seed failure — that policy fits a pooled dispatch
+        # lane (release the slot, let a future acquire retry); an interactive
+        # session has no such retry path, so the worktree must survive.
         seed_rc = await self._seed_warm_lane(path, '--fresh-checkout')
         warm = seed_rc == 0
+        if not warm:
+            if seed_rc == 127:
+                logger.warning(
+                    'create_interactive_worktree: seed script absent for %s '
+                    '(rc=127) — worktree retained but cold (warm=False)',
+                    path,
+                )
+            else:
+                logger.warning(
+                    'create_interactive_worktree: seed failed (rc=%d) for %s '
+                    '— worktree retained but cold (warm=False); fail-soft, '
+                    'never removed on seed fault',
+                    seed_rc, path,
+                )
 
         return InteractiveWorktreeInfo(
             path=path, branch=full_branch, warm=warm, base_ref=base_ref,
