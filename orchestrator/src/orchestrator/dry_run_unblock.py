@@ -278,6 +278,7 @@ async def run_dry_run_unblock(
             'cost_usd': 0.0,
             'investigated_at': _now_iso(),
             'timestamp': _now_iso(),
+            **_failure_diagnostics(None),
         }
         result = None
 
