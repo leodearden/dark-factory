@@ -367,6 +367,31 @@ class WorktreeInfo:
     reify_debug_port: int | None = None
 
 
+@dataclass(frozen=True)
+class InteractiveWorktreeInfo:
+    """Return value from create_interactive_worktree — an isolated interactive worktree.
+
+    Deliberately NOT WorktreeInfo: an interactive worktree is not a
+    WarmLanePool/dispatch artifact (isolation invariant I1 — see
+    GitOps.create_interactive_worktree).  The shape mirrors the documented
+    escalation claim/release contract ``{path, branch, warm, base_ref}``
+    (task 2010) consumed by the β claim/release verbs.
+
+    path: the interactive worktree's location,
+        ``worktree_base / f'{iact_prefix}{slug}'``.
+    branch: the full branch name, ``f'{branch_prefix}{slug}'``.
+    warm: True iff the CoW seed (_seed_warm_lane) ran and exited 0; False on
+        any seed fault (fail-soft — the worktree is still usable, just cold).
+    base_ref: the resolved SHA the worktree was created from (``start_ref``
+        or the local ``main_branch`` tip, rev-parsed at creation time —
+        deterministic, no remote fetch).
+    """
+    path: Path
+    branch: str
+    warm: bool
+    base_ref: str
+
+
 class ConflictProbe(NamedTuple):
     """Result of merge_tree_conflicts — a lightweight, tuple-destructurable probe.
 
@@ -1222,6 +1247,84 @@ class GitOps:
             base_commit=post_create_base,
             stale_commits=stale_commits,
             reify_debug_port=port,
+        )
+
+    async def create_interactive_worktree(
+        self, slug: str, *, start_ref: str | None = None,
+    ) -> 'InteractiveWorktreeInfo':
+        """Mint an isolated interactive warm-worktree in the ``_iact-*`` band.
+
+        Creates a fresh worktree at ``worktree_base/<iact_prefix><slug>`` on
+        branch ``<branch_prefix><slug>``, based on *start_ref* (or the local
+        ``main_branch`` tip, rev-parsed deterministically — no remote fetch),
+        then CoW-seeds its ``target/`` by reusing :meth:`_seed_warm_lane`.
+
+        **Isolation invariant I1**: this method NEVER references
+        ``self.warm_lane_pool`` / ``self.spec_warm_lane_pool`` — the
+        ``_iact-*`` band this method creates is structurally disjoint from
+        the ``_lane-*`` dispatch pool and the ``_spec-*`` merge-speculation
+        pool.
+
+        Unlike :meth:`acquire_warm_lane`, a seed failure is FAIL-SOFT: the
+        worktree is retained (never removed) and ``warm=False`` is returned
+        rather than raising — an interactive session should get a usable
+        cold worktree rather than no worktree at all.
+
+        Args:
+            slug: caller-chosen claim identity; becomes both the branch
+                suffix and the ``.task/interactive.json`` owner.
+            start_ref: optional ref/SHA to pin as the base; defaults to the
+                current local ``main_branch`` tip.
+
+        Returns:
+            InteractiveWorktreeInfo(path, branch, warm, base_ref).
+
+        Raises:
+            RuntimeError: start_ref/main_branch fails to resolve, or
+                ``git worktree add`` fails (e.g. a path/branch collision
+                that self-heal could not clear).
+        """
+        path = self.worktree_base / f'{self.config.iact_prefix}{slug}'
+        full_branch = f'{self.config.branch_prefix}{slug}'
+
+        ref_rc, ref_out, ref_err = await _run(
+            ['git', 'rev-parse', start_ref or self.config.main_branch],
+            cwd=self.project_root,
+        )
+        if ref_rc != 0:
+            raise RuntimeError(
+                f'create_interactive_worktree: failed to resolve start ref '
+                f'{start_ref or self.config.main_branch!r}: {ref_err.strip()!r}'
+            )
+        base_ref = ref_out.strip()
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Self-heal a stale unregistered directory (mirrors acquire_warm_lane's
+        # create-once branch) so `git worktree add` doesn't refuse a non-empty dir.
+        if path.exists() and not await self._is_registered_worktree(path):
+            logger.warning(
+                'create_interactive_worktree: %s exists but is not registered; '
+                'removing stale directory (self-heal)', path,
+            )
+            shutil.rmtree(path)
+
+        add_rc, _, add_err = await _run(
+            ['git', 'worktree', 'add', '-b', full_branch, str(path), base_ref],
+            cwd=self.project_root,
+        )
+        if add_rc != 0:
+            raise RuntimeError(
+                f'create_interactive_worktree: git worktree add failed for '
+                f'{path} (branch {full_branch!r}, base {base_ref!r}): '
+                f'{add_err.strip()!r}'
+            )
+
+        seed_rc = await self._seed_warm_lane(path, '--fresh-checkout')
+        warm = seed_rc == 0
+
+        return InteractiveWorktreeInfo(
+            path=path, branch=full_branch, warm=warm, base_ref=base_ref,
         )
 
     async def _seed_warm_lane(self, lane_dir: Path, mode: str) -> int:
