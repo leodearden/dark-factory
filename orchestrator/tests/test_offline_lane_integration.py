@@ -49,8 +49,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from escalation.queue import EscalationQueue
+
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
