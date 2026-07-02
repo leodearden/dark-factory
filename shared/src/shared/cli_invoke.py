@@ -91,6 +91,16 @@ _WATCHDOG_MIN_POLL_SECS = 0.01
 #                                         would stall the queue indefinitely
 #                                         under sustained cap.  1800 s lets a
 #                                         brief cap window resolve in-band.
+#
+# orchestrator/dry_run_unblock.py         _DRY_RUN_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
+#   (block-time investigation invocation) Fire-and-forget background
+#                                         investigation spawned from
+#                                         _mark_blocked; 14-day default would
+#                                         leave it pending for weeks under a
+#                                         cap storm. AllAccountsCappedException
+#                                         is caught and converted to a
+#                                         retryable 'infra_failure' proposal
+#                                         entry instead of raising.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0        # emit at most one cap_wait log per ~10 min

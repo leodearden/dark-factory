@@ -13,11 +13,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from shared.cli_invoke import AgentFailureKind, classify_agent_failure
+from shared.cli_invoke import (
+    AgentFailureKind,
+    AllAccountsCappedException,
+    classify_agent_failure,
+    invoke_with_cap_retry,
+    is_zero_output_timeout,
+)
+from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
@@ -82,6 +90,14 @@ _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
     AgentFailureKind.TIMED_OUT,
     AgentFailureKind.EMPTY_OUTPUT,
 })
+
+# Outer wall-clock sanity bound for invoke_with_cap_retry's cap-hit patience
+# (shared/src/shared/cli_invoke.py cap-wait policy table). This is a
+# fire-and-forget, best-effort block-time investigation — it must NOT inherit
+# the 14-day default, which would leave a background task pending for weeks
+# under a sustained cap storm. Mirrors the 1800s reconciliation-stage
+# precedent (short-lived stage runners; see cli_invoke.py:82-94).
+_DRY_RUN_CAP_WAIT_SANITY_SECS: float = 1800.0
 
 
 def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
@@ -235,6 +251,8 @@ async def run_dry_run_unblock(
     mcp: Any,
     config: Any,
     event_store: Any = None,
+    usage_gate: Any = None,
+    cost_store: Any = None,
 ) -> None:
     """Investigate a blocked task and write a proposal to metadata.
 
@@ -246,12 +264,24 @@ async def run_dry_run_unblock(
 
     ua_cfg = config.unblock_auto
     start_time = time.monotonic()
+    project_id = getattr(getattr(config, 'fused_memory', None), 'project_id', '') or ''
+    run_id = getattr(event_store, 'run_id', '') or ''
 
     # Capture worktree SHAs before invoke_agent so both the success and
     # exception paths can stamp the same anchor values.
     head_sha, main_sha = await _capture_worktree_shas(worktree)
 
+    config_dir: TaskConfigDir | None = None
     try:
+        # Per-investigation isolated CLAUDE_CONFIG_DIR, named distinctly from
+        # the main task's `claude-config-{task_id}` dir so this background
+        # investigation cannot collide with the blocked task's own session/
+        # credentials. Passing config_dir + session_id to invoke_with_cap_retry
+        # (below) revives the startup-wedge fast-kill in
+        # shared/cli_invoke.py._run_subprocess — without both, `_grace_spent`
+        # is forced True and a pre-turn-1 wedge burns the full timeout ceiling.
+        config_dir = TaskConfigDir(f'{task_id}-unblock', base_dir=Path(worktree) / '.task')
+
         system_prompt = _load_skill_system_prompt()
         user_prompt = (
             f'Task ID: {task_id}\n'
@@ -263,7 +293,19 @@ async def run_dry_run_unblock(
 
         mcp_config = mcp.mcp_config_json() if mcp is not None else None
 
-        result = await invoke_agent(
+        result = await invoke_with_cap_retry(
+            usage_gate=usage_gate,
+            label=f'Task {task_id} [unblock_auto]',
+            config_dir=config_dir,
+            cost_store=cost_store,
+            run_id=run_id,
+            task_id=task_id,
+            project_id=project_id,
+            role='unblock_auto',
+            cap_wait_sanity_secs=_DRY_RUN_CAP_WAIT_SANITY_SECS,
+            invoke_fn=invoke_agent,
+            backend=ua_cfg.backend,
+            session_id=str(uuid.uuid4()),
             prompt=user_prompt,
             system_prompt=system_prompt,
             cwd=Path(worktree),
@@ -275,7 +317,6 @@ async def run_dry_run_unblock(
             mcp_config=mcp_config,
             output_schema=DRY_RUN_PROPOSAL_SCHEMA,
             effort=ua_cfg.effort,
-            backend=ua_cfg.backend,
             timeout_seconds=ua_cfg.timeout_seconds,
         )
 
@@ -295,6 +336,9 @@ async def run_dry_run_unblock(
             **_failure_diagnostics(None),
         }
         result = None
+    finally:
+        if config_dir is not None:
+            config_dir.cleanup()
 
     # Stamp the git anchor onto the entry at a single point so all four
     # shapes (ok, investigation_failed, budget_exhausted, exception fallback)
