@@ -1,14 +1,15 @@
 """Tests for harness wiring of StaleServiceRestartCoordinator (multi-coordinator API).
 
-Two coordinators are built and stored in a list:
+Three coordinators are built and stored in a list:
   - fused-memory (service_name='fused-memory', require_idle=True)
   - dashboard   (service_name='dashboard', require_idle=False)
+  - orchestrator (service_name='orchestrator', require_idle=True, U2 — task 1973)
 
 Asserts:
   (a) _build_service_restart_coordinator() returns fused-memory coordinator.
   (b) _build_dashboard_restart_coordinator() returns dashboard coordinator.
   (c) After _start_merge_worker, harness._service_restart_coordinators is a
-      list of two coordinators.
+      list of three coordinators.
   (d) _maybe_restart_stale_service(agents_idle=X) calls maybe_restart(agents_idle=X)
       on EVERY coordinator in the list; returns True iff any returned True.
       No-op returning False when list is empty.
@@ -178,29 +179,32 @@ class TestBuildDashboardRestartCoordinator:
 
 
 # ---------------------------------------------------------------------------
-# (c) _start_merge_worker stores list of two coordinators
+# (c) _start_merge_worker stores list of three coordinators
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestStartMergeWorkerBuildsCoordinatorList:
-    """After _start_merge_worker, harness._service_restart_coordinators is a list of two."""
+    """After _start_merge_worker, harness._service_restart_coordinators is a list of three."""
 
-    async def test_coordinators_list_has_two_entries(self, harness: Harness):
-        """_start_merge_worker populates _service_restart_coordinators with fused+dashboard."""
+    async def test_coordinators_list_has_three_entries(self, harness: Harness):
+        """_start_merge_worker populates _service_restart_coordinators with fused+dashboard+orchestrator."""
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
              patch('asyncio.create_task'), \
              patch('orchestrator.merge_queue.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         assert isinstance(harness._service_restart_coordinators, list)
-        assert len(harness._service_restart_coordinators) == 2
+        assert len(harness._service_restart_coordinators) == 3
         # First entry: fused-memory (require_idle=True)
         assert harness._service_restart_coordinators[0]._service_name == 'fused-memory'
         assert harness._service_restart_coordinators[0]._require_idle is True
         # Second entry: dashboard (require_idle=False)
         assert harness._service_restart_coordinators[1]._service_name == 'dashboard'
         assert harness._service_restart_coordinators[1]._require_idle is False
+        # Third entry: orchestrator (require_idle=True, U2 — task 1973)
+        assert harness._service_restart_coordinators[2]._service_name == 'orchestrator'
+        assert harness._service_restart_coordinators[2]._require_idle is True
 
     async def test_start_merge_worker_continues_when_liveness_check_raises(
         self, harness: Harness, caplog
@@ -217,7 +221,7 @@ class TestStartMergeWorkerBuildsCoordinatorList:
 
         mock_smw.assert_called_once()
         assert isinstance(harness._service_restart_coordinators, list)
-        assert len(harness._service_restart_coordinators) == 2
+        assert len(harness._service_restart_coordinators) == 3
         mock_ct.assert_called_once()
         assert 'liveness boom' in caplog.text
 
@@ -614,3 +618,103 @@ class TestBuildOrchestratorRestartCoordinator:
         coord = harness._build_orchestrator_restart_coordinator()
 
         assert coord._project_root == Path(harness.config.project_root)
+
+
+# ---------------------------------------------------------------------------
+# U2 (task 1973): end-to-end — armed -> drain-gated -> systemd-run fire
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOrchestratorCoordinatorEndToEnd:
+    """Full wiring through the real list built by _start_merge_worker.
+
+    Exercises the actual production path: note_merge fan-out
+    (_note_merge_all) arms the orchestrator coordinator on a watched-path
+    diff, and _maybe_restart_stale_service fires it via systemd-run only once
+    the merge pipeline is drained (restart_precondition).
+    """
+
+    async def test_fires_systemd_run_once_pipeline_drained(self, harness: Harness):
+        """note_merge arms the coordinator; a drained pipeline lets it fire via systemd-run."""
+        harness.config.orchestrator_restart_on_merge_enabled = True
+        harness.config.orchestrator_restart_debounce_secs = 0.0
+
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+             patch('asyncio.create_task'), \
+             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+            await harness._start_merge_worker()
+
+        # Drained pipeline: no in-flight/verifying merge, empty queue.
+        mock_smw.return_value.snapshot.return_value = {'depth': 0}
+        assert harness._merge_queue.empty()
+
+        harness.git_ops.get_merge_diff_files = AsyncMock(
+            return_value=(['orchestrator/src/orchestrator/git_ops.py'], None)
+        )
+        orch_coord = harness._service_restart_coordinators[2]
+
+        await harness._note_merge_all('task-1', 'base', 'head')
+        assert orch_coord.is_pending is True
+
+        fake_proc = MagicMock()
+        fake_proc.communicate = AsyncMock(return_value=(b'', None))
+        fake_proc.returncode = 0
+        with patch(
+            'orchestrator.service_restart.asyncio.create_subprocess_exec',
+            new_callable=AsyncMock,
+            return_value=fake_proc,
+        ) as mock_exec:
+            fired = await harness._maybe_restart_stale_service(agents_idle=True)
+
+        assert fired is True
+        mock_exec.assert_awaited_once()
+        pos_args = mock_exec.call_args.args
+        assert pos_args[0] == 'systemd-run'
+        assert orch_coord.is_pending is False
+
+    async def test_precondition_blocks_fire_when_merge_in_flight(self, harness: Harness):
+        """When the merge pipeline is NOT drained (depth>0), the fire is deferred."""
+        harness.config.orchestrator_restart_on_merge_enabled = True
+        harness.config.orchestrator_restart_debounce_secs = 0.0
+
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
+             patch('asyncio.create_task'), \
+             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+            await harness._start_merge_worker()
+
+        mock_smw.return_value.snapshot.return_value = {'depth': 1}  # in-flight — NOT drained
+
+        harness.git_ops.get_merge_diff_files = AsyncMock(
+            return_value=(['orchestrator/src/orchestrator/git_ops.py'], None)
+        )
+        orch_coord = harness._service_restart_coordinators[2]
+
+        await harness._note_merge_all('task-1', 'base', 'head')
+        assert orch_coord.is_pending is True
+
+        with patch(
+            'orchestrator.service_restart.asyncio.create_subprocess_exec',
+            new_callable=AsyncMock,
+        ) as mock_exec:
+            fired = await harness._maybe_restart_stale_service(agents_idle=True)
+
+        assert fired is False
+        mock_exec.assert_not_awaited()
+        assert orch_coord.is_pending is True  # still armed, waiting for drain
+
+    async def test_disabled_config_never_arms(self, harness: Harness):
+        """With orchestrator_restart_on_merge_enabled=False (fixture default), it never arms."""
+        with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
+             patch('asyncio.create_task'), \
+             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+            await harness._start_merge_worker()
+
+        orch_coord = harness._service_restart_coordinators[2]
+        assert orch_coord.enabled is False
+
+        result = await orch_coord.note_merge('task-1', 'base', 'head')
+
+        assert result is False
+        assert orch_coord.is_pending is False
+        harness.git_ops.get_merge_diff_files.assert_not_awaited()
