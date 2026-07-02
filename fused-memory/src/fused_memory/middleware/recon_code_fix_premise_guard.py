@@ -236,3 +236,50 @@ def match_candidate(
         return entry
 
     return None
+
+
+def _assertion_holds(assertion: SourceAssertion, source_root: Path) -> bool:
+    """Return True iff *assertion* currently holds against the live source tree.
+
+    Reads ``source_root / assertion.file`` fresh (no caching) on every call —
+    this is what makes the guard self-correcting. A missing or unreadable
+    file, or any unexpected error, fails open (returns False, i.e. the
+    assertion does NOT hold, so the candidate is NOT dropped).
+    """
+    target = source_root / assertion.file
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError) as exc:
+        logger.warning(
+            "recon_code_fix_premise_guard: cannot read %s: %s — assertion fails open", target, exc,
+        )
+        return False
+    except Exception:  # noqa: BLE001 - never raise out of the guard
+        logger.warning(
+            "recon_code_fix_premise_guard: unexpected error reading %s — assertion fails open",
+            target,
+            exc_info=True,
+        )
+        return False
+
+    if not all(token in text for token in assertion.must_contain):
+        return False
+    if any(token in text for token in assertion.must_not_contain):
+        return False
+    return True
+
+
+def verify_premise_refuted(entry: PremiseEntry, source_root: Path) -> bool:
+    """Return True iff EVERY source assertion in *entry* currently holds.
+
+    Re-reads each cited file fresh against *source_root* on every call — the
+    result is never cached, so a later change to the source tree (e.g. a
+    genuine fix that removes the invalid_at filter) changes the outcome on
+    the very next call. Short-circuits to False on the first assertion that
+    does not hold; vacuously True when ``entry.source_assertions`` is empty.
+    Never raises.
+    """
+    for assertion in entry.source_assertions:
+        if not _assertion_holds(assertion, source_root):
+            return False
+    return True
