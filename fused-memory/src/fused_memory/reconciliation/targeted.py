@@ -58,6 +58,48 @@ _PARENT_CANCELLED_REOPEN_PREFIX = 'parent_cancelled:'
 # convention used by scope_violation_escalator.py and ticket_janitor.py.
 _ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 
+# Metadata `source` value stamped on the completion-echo memory written by
+# _on_task_done's fast path.  Single-sourced so _is_authoritative_resolution
+# and the fast-path write can't drift out of sync (task 1984).
+_ECHO_SOURCE = 'targeted_reconciliation'
+
+# Cap on the authoritative-memory pre-check query in _on_task_done's hot
+# path (task 1984 review: hot_path_efficiency).  That query runs on EVERY
+# `done` transition; get_memories_by_metadata defaults to limit=1000, which
+# is a full Qdrant scroll + enumeration for a check that only needs "does at
+# least one authoritative memory exist for this task_id".  A handful of
+# per-task memories (completion echoes, guard markers) is the norm, so a
+# small cap keeps the common case cheap while still covering it; it trades
+# away detecting an authoritative marker that happens to land outside the
+# first N points for a task_id with a pathologically large memory count —
+# an accepted, documented trade-off rather than an unbounded scroll on the
+# hot path.
+_AUTHORITATIVE_PRECHECK_LIMIT = 25
+
+# Metadata key recognized as an authoritative resolution/superseding marker
+# by _is_authoritative_resolution, in addition to a truthy `supersedes`
+# marker.  This is Stage 2's real, task_id-scoped "Completion-Note
+# Suppression Pre-Check (stage2_suppress guard)" write side
+# (prompts/stage2.py) — documented there as "the only writer of the
+# `stage2_suppress` key" — which stamps
+# metadata={'stage2_suppress': True, 'task_id': str(task_id)} on its
+# protective completion-note guard writes. Because it carries task_id, it
+# intersects _on_task_done's deterministic {'task_id': task_id} pre-check
+# filter below. prompts/stage2.py's write side is the source of truth for
+# this key; there is no mechanical (code-level) test tying the two together
+# because the write side is a natural-language LLM prompt instruction (Stage
+# 2 is instructed to tag its output with
+# metadata={stage2_suppress: True, ...}), not deterministic code — so this
+# trigger is inherently best-effort, not compiler/test-enforced, and can
+# drift if the prompt wording changes without a matching update here.
+#
+# Replaces an earlier revision's `_AUTHORITATIVE_SOURCES =
+# frozenset({'stage2_task_knowledge_sync'})` source-allowlist: a task 1984
+# review pass found that allowlist was dead code — no writer anywhere in the
+# codebase ever stamped source='stage2_task_knowledge_sync', so the branch
+# could never fire in production (dead_trigger_correctness finding).
+_STAGE2_SUPPRESS_KEY = 'stage2_suppress'
+
 
 class TargetedReconciler:
     """Lightweight reconciliation triggered by task state transitions."""
@@ -215,29 +257,66 @@ class TargetedReconciler:
 
         # 0. Fast-path: write completion fact immediately (no search/verify needed)
         try:
+            # Narrowly scoped: a Mem0/Qdrant hiccup here must fail open (treat the
+            # task as having no authoritative memory) rather than propagate into
+            # the broad try/except below and skip the completion write entirely.
+            #
+            # Mem0-only scope (task 1984 amendment): get_memories_by_metadata
+            # enumerates Mem0/Qdrant only — it does not query Graphiti. A
+            # superseding/resolution memory routed to Graphiti (e.g. written to
+            # decisions_and_rationale, entities_and_relations, or temporal_facts)
+            # is invisible to this pre-check. The primary intended trigger
+            # (Stage-2 knowledge-sync echoes) writes observations_and_summaries
+            # to Mem0, so this is acceptable today, but a Graphiti-resident
+            # resolution will not suppress a stale description here.
+            try:
+                memories = await self.memory.get_memories_by_metadata(
+                    project_id=project_id, filters={'task_id': task_id},
+                    limit=_AUTHORITATIVE_PRECHECK_LIMIT,
+                )
+            except Exception as e:
+                logger.warning(
+                    f'Authoritative-memory pre-check failed for task {task_id}: {e}; '
+                    'echoing description (fail-open)'
+                )
+                memories = []
+            has_authoritative = any(
+                _is_authoritative_resolution(m.get('metadata') or {}) for m in memories
+            )
+
             content = f"Task '{title}' completed."
-            if description:
-                content += f" {description}"
-            details = task.get('details', '')
-            if details:
-                content += f"\nDetails: {details[:500]}"
+            if not has_authoritative:
+                if description:
+                    content += f" {description}"
+                details = task.get('details', '')
+                if details:
+                    content += f"\nDetails: {details[:500]}"
+
+            write_metadata: dict[str, Any] = {
+                'source': _ECHO_SOURCE,
+                'task_id': task_id,
+                'transition': 'done',
+            }
+            if has_authoritative:
+                write_metadata['echo_suppressed_stale_description'] = True
 
             written = await self._fenced_add_memory(
                 content=content,
                 category='observations_and_summaries',
                 project_id=project_id,
-                metadata={
-                    'source': 'targeted_reconciliation',
-                    'task_id': task_id,
-                    'transition': 'done',
-                },
+                metadata=write_metadata,
                 causation_id=run_id,
             )
             action_type = 'knowledge_captured_fast' if written else 'knowledge_deferred_fast'
             result['actions'].append({'type': action_type})
             await self.journal.add_run_action(
                 run_id, 'write', 'memory', 'add_memory',
-                {'task_id': task_id, 'type': 'completion_fast', 'deferred': not written},
+                {
+                    'task_id': task_id,
+                    'type': 'completion_fast',
+                    'deferred': not written,
+                    'echo_suppressed': has_authoritative,
+                },
                 causation_id=run_id,
             )
         except Exception as e:
@@ -897,3 +976,40 @@ def _extract_scope_hints(task: dict) -> list[str]:
             if cleaned:
                 hints.append(cleaned)
     return hints[:5]
+
+
+def _is_authoritative_resolution(metadata: dict) -> bool:
+    """True when *metadata* marks an authoritative resolution/superseding memory.
+
+    A memory is authoritative when its metadata carries EITHER:
+
+    - a truthy ``supersedes`` marker — the established superseding-memory
+      convention (harness.py:849); or
+    - a truthy ``_STAGE2_SUPPRESS_KEY`` (``stage2_suppress``) marker — Stage 2's
+      real, task_id-scoped "Completion-Note Suppression Pre-Check (stage2_suppress
+      guard)" write side (prompts/stage2.py), documented there as "the only
+      writer of the ``stage2_suppress`` key".
+
+    Neither check treats "any other source" as authoritative. Several real
+    task_id-tagged writers are lifecycle / flag markers rather than
+    resolutions — e.g. flag_dedup.py's ``stage1_flag_marker``,
+    stage1_stall_detector.py's ``stage1_human_operator_stall_marker`` — and
+    must NOT suppress the completion description; treating any non-echo
+    ``source`` as authoritative would wrongly suppress it for any task that
+    ever picked up one of those markers (task 1984 amendment: over-suppression
+    guard). An earlier revision instead allowlisted
+    ``source == 'stage2_task_knowledge_sync'``, but a task 1984 review pass
+    found no writer in the codebase ever stamped that value, making the
+    branch dead code (dead_trigger_correctness finding) — replaced here with
+    the real ``stage2_suppress`` marker.
+
+    Plain prior targeted echoes (``source=_ECHO_SOURCE``, no ``supersedes``, no
+    ``stage2_suppress``) are deliberately NOT authoritative, so a task's own
+    earlier echoes never trigger suppression or oscillation — see
+    _on_task_done's pre-echo guard (task 1984).
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get('supersedes'):
+        return True
+    return bool(metadata.get(_STAGE2_SUPPRESS_KEY))

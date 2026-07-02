@@ -30,6 +30,10 @@ def mock_memory_service():
     svc = AsyncMock()
     svc.search = AsyncMock(return_value=[])
     svc.add_memory = AsyncMock(return_value=AsyncMock(model_dump=lambda: {}))
+    # Deterministic per-task metadata lookup used by _on_task_done's pre-echo
+    # authoritative-resolution check (task 1984). Default: no memories found,
+    # so existing fast-path tests are unaffected (has_authoritative=False).
+    svc.get_memories_by_metadata = AsyncMock(return_value=[])
     return svc
 
 
@@ -1763,3 +1767,301 @@ async def test_on_task_done_writes_own_title_in_multicompletion_window(
                     f"Task {task['id']}: content contains neighbor title {other_title!r}.\n"
                     f"  content: {content!r}"
                 )
+
+
+# ── Pre-echo authoritative-resolution check (task 1984) ─────────────────────
+#
+# _on_task_done's completion echo must not re-append a stale raw description
+# when an authoritative resolution/superseding memory already exists for the
+# task (e.g. a re-scoped/reopened-then-redone task whose earlier echo was
+# superseded).  _is_authoritative_resolution(metadata) is the pure classifier;
+# the fast-path guard in _on_task_done queries get_memories_by_metadata and
+# suppresses the description/details append when any returned memory is
+# authoritative, while always still writing a title-only completion fact.
+
+
+@pytest.mark.parametrize(
+    'metadata, expected',
+    [
+        pytest.param({'supersedes': '959b8497'}, True, id='truthy_supersedes'),
+        pytest.param(
+            {'stage2_suppress': True, 'task_id': '7'}, True, id='stage2_suppress_guard',
+        ),
+        pytest.param(
+            {'stage2_suppress': False, 'task_id': '7'},
+            False,
+            id='falsy_stage2_suppress_no_other_marker',
+        ),
+        pytest.param(
+            {'source': 'stage2_task_knowledge_sync'},
+            False,
+            id='dead_trigger_source_removed',
+        ),
+        pytest.param(
+            {'source': 'targeted_reconciliation', 'task_id': '361', 'transition': 'done'},
+            False,
+            id='plain_prior_echo',
+        ),
+        pytest.param(
+            {'source': 'stage1_flag_marker', 'task_id': '7', 'flag_type': 'x'},
+            False,
+            id='non_authoritative_flag_marker_source',
+        ),
+        pytest.param(
+            {'source': 'stage1_human_operator_stall_marker', 'task_id': '7'},
+            False,
+            id='non_authoritative_stall_marker_source',
+        ),
+        pytest.param({}, False, id='empty_metadata'),
+        pytest.param({'supersedes': ''}, False, id='falsy_supersedes_no_other_marker'),
+    ],
+)
+def test_is_authoritative_resolution_truth_table(metadata, expected):
+    """Pure classifier: truthy `supersedes` OR truthy `stage2_suppress` => authoritative.
+
+    `stage2_suppress` is Stage 2's real completion-note guard key
+    (prompts/stage2.py documents its write side as "the only writer of the
+    `stage2_suppress` key") — replacing an earlier revision's `source`
+    allowlist (`_AUTHORITATIVE_SOURCES = {'stage2_task_knowledge_sync'}`) that
+    a task 1984 review pass found was never actually stamped by any writer in
+    the codebase (dead-trigger fix): `dead_trigger_source_removed` below locks
+    in that a bare `source='stage2_task_knowledge_sync'` is no longer
+    authoritative on its own.
+
+    Neither check treats "any other source" as authoritative — real
+    task_id-tagged writers like flag_dedup.py's `stage1_flag_marker` and
+    stage1_stall_detector.py's `stage1_human_operator_stall_marker` are
+    lifecycle/flag markers, not resolutions, and must NOT suppress the
+    completion echo's description (task 1984 amendment: over-suppression-risk
+    fix).
+
+    Plain prior targeted echoes (source='targeted_reconciliation', no
+    supersedes, no stage2_suppress) are deliberately NOT authoritative, so a
+    task's own earlier echoes never trigger suppression or oscillation.
+    """
+    from fused_memory.reconciliation.targeted import _is_authoritative_resolution
+
+    assert _is_authoritative_resolution(metadata) is expected
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_suppresses_stale_description_when_authoritative_memory_exists(
+    reconciler, mock_memory_service,
+):
+    """When an authoritative resolution/superseding memory already exists for the
+    task, the fast-path completion echo must NOT re-append the (possibly stale,
+    re-scoped) raw description/details — only the title-only completion fact —
+    and the write must be flagged so operators can query suppressed echoes."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {'id': '959b8497', 'metadata': {'task_id': '361', 'supersedes': 'cd09e261'}},
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE re-scoped description text',
+            'details': 'stale details',
+        },
+    )
+
+    # (a) the deterministic per-task metadata query was awaited correctly
+    mock_memory_service.get_memories_by_metadata.assert_awaited_once()
+    query_call = mock_memory_service.get_memories_by_metadata.await_args
+    assert query_call is not None
+    assert query_call.kwargs.get('project_id') == 'test-project'
+    assert query_call.kwargs.get('filters') == {'task_id': '361'}
+
+    # (b) the fast-path add_memory content is title-only — no stale prose
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content')
+    assert content == "Task 'Autopilot task' completed.", (
+        f'Expected title-only completion fact, got: {content!r}'
+    )
+    assert 'STALE re-scoped description text' not in content
+    assert 'stale details' not in content
+
+    # (c) metadata carries the suppression flag alongside the existing fields
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_suppressed_stale_description') is True
+    assert metadata.get('source') == 'targeted_reconciliation'
+    assert metadata.get('task_id') == '361'
+    assert metadata.get('transition') == 'done'
+
+    # (d) completion-fact audit action is preserved
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_suppresses_when_stage2_suppress_guard_exists(
+    reconciler, mock_memory_service,
+):
+    """End-to-end regression guard for the REAL production trigger.
+
+    Unlike the `supersedes`-shaped fixture above, this mocks
+    get_memories_by_metadata to return a memory shaped exactly as Stage 2's
+    documented write-side contract produces it — `metadata={'stage2_suppress':
+    True, 'task_id': str(task_id)}`, no `supersedes` key (prompts/stage2.py
+    "Completion-Note Suppression Pre-Check (stage2_suppress guard)": "the only
+    writer of the `stage2_suppress` key"). A task 1984 review pass found the
+    prior `_AUTHORITATIVE_SOURCES` allowlist had no real writer backing it —
+    this test locks in that the classifier now fires on the shape Stage 2
+    actually produces, not just a synthetic `supersedes` fixture, and that the
+    task_id-scoped pre-check filter intersects that real writer's task_id."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {'id': 'a1b2c3', 'metadata': {'task_id': '361', 'stage2_suppress': True}},
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE re-scoped description text',
+            'details': 'stale details',
+        },
+    )
+
+    # (a) the deterministic per-task metadata query was awaited once, and its
+    # task_id-scoped filter is exactly what intersects the real Stage 2 writer.
+    mock_memory_service.get_memories_by_metadata.assert_awaited_once()
+    query_call = mock_memory_service.get_memories_by_metadata.await_args
+    assert query_call is not None
+    assert query_call.kwargs.get('project_id') == 'test-project'
+    assert query_call.kwargs.get('filters') == {'task_id': '361'}
+
+    # (b) the fast-path add_memory content is title-only — no stale prose
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content')
+    assert content == "Task 'Autopilot task' completed.", (
+        f'Expected title-only completion fact, got: {content!r}'
+    )
+    assert 'STALE re-scoped description text' not in content
+    assert 'stale details' not in content
+
+    # (c) metadata carries the suppression flag
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_suppressed_stale_description') is True
+
+    # (d) completion-fact audit action is preserved
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_fails_open_when_metadata_query_raises(
+    reconciler, mock_memory_service, journal,
+):
+    """A Mem0/Qdrant hiccup during the authoritative-memory pre-check must never
+    drop the completion echo — it must fail open and preserve the current
+    description-appended behavior, exactly as if no authoritative memory existed."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(
+        side_effect=RuntimeError('qdrant down'),
+    )
+
+    result = await reconciler.reconcile_task(
+        task_id='7', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '7', 'title': 'T', 'status': 'in-progress', 'description': 'DESC text'},
+    )
+
+    # (a) the fast-path completion fact WAS written despite the query error
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1, 'Expected a fast-path add_memory call despite the query error'
+    first_call = calls[0]
+
+    # (b) fail-open preserves the current description-appended behavior
+    content = first_call.kwargs.get('content')
+    assert content is not None and 'DESC text' in content, (
+        f'Expected fail-open content to still contain the description, got: {content!r}'
+    )
+
+    # (c) no suppression flag on fail-open
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert 'echo_suppressed_stale_description' not in metadata, (
+        f'fail-open write must not carry the suppression flag, got metadata: {metadata}'
+    )
+
+    # (d) completion-fact audit action is preserved
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+    # (e) the journal audit row must not leak a truthy echo_suppressed flag on
+    # the fail-open path — mirrors test_on_task_done_echo_suppressed_flag_in_journal_action's
+    # non-authoritative case so a future refactor can't regress this silently.
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    completion_rows = [
+        a for a in actions
+        if a['operation'] == 'add_memory' and a['detail'].get('type') == 'completion_fast'
+    ]
+    assert len(completion_rows) == 1, (
+        f'Expected exactly one completion_fast journal row, got: {completion_rows}'
+    )
+    assert completion_rows[0]['detail'].get('echo_suppressed') is False, (
+        f'Expected echo_suppressed=False on the fail-open path, '
+        f'got detail: {completion_rows[0]["detail"]}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'memories, expected_suppressed',
+    [
+        pytest.param([], False, id='no_memories'),
+        pytest.param(
+            [{'metadata': {'source': 'targeted_reconciliation', 'task_id': '5'}}],
+            False,
+            id='plain_prior_echo_only',
+        ),
+        pytest.param(
+            [{'id': '959b8497', 'metadata': {'task_id': '5', 'supersedes': 'cd09e261'}}],
+            True,
+            id='authoritative_memory',
+        ),
+    ],
+)
+async def test_on_task_done_echo_suppressed_flag_in_journal_action(
+    reconciler, mock_memory_service, journal, memories, expected_suppressed,
+):
+    """The journal audit row for the fast-path completion write must carry a
+    queryable echo_suppressed flag reflecting whether the raw description was
+    suppressed — mirroring the hints_skipped audit convention. Non-authoritative
+    memories (including a task's own plain prior echoes) must NOT suppress the
+    description (regression guard against oscillation)."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=memories)
+
+    await reconciler.reconcile_task(
+        task_id='5', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '5', 'title': 'Task Five', 'status': 'in-progress',
+            'description': 'Five description',
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    content = calls[0].kwargs.get('content') or ''
+    if not expected_suppressed:
+        assert 'Five description' in content, (
+            f'Expected description preserved when not suppressed, got: {content!r}'
+        )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    completion_rows = [
+        a for a in actions
+        if a['operation'] == 'add_memory' and a['detail'].get('type') == 'completion_fast'
+    ]
+    assert len(completion_rows) == 1, (
+        f'Expected exactly one completion_fast journal row, got: {completion_rows}'
+    )
+    assert completion_rows[0]['detail'].get('echo_suppressed') is expected_suppressed, (
+        f'Expected echo_suppressed={expected_suppressed}, got detail: {completion_rows[0]["detail"]}'
+    )
