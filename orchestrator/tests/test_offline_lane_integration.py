@@ -528,3 +528,32 @@ async def test_b4_confirmed_red_files_fix_task_and_info_escalation(harness, git_
 
     # The merge queue itself is left completely untouched by the red path.
     assert harness.get_merge_halt_status() == {'wired': False}
+
+
+# ---------------------------------------------------------------------------
+# B5 — dedup: a same-set recurrence updates rather than duplicates
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b5_same_set_recurrence_updates_not_duplicates(harness, git_ops, repo, tmp_path):
+    """B5 (PRD §8) — a SECOND red advance with the SAME failing-test set
+    updates the existing fix task (appends a suspect range) rather than
+    filing a duplicate task or raising a second escalation."""
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    failing_ids = ['t::a', 't::b']
+    worker = _build_worker(git_ops, tmp_path)
+    _wire_lane(harness, worker)
+
+    await _drive_reds(harness, repo, worker, failing_ids, 2)
+
+    worker.task_client.submit_fix_task.assert_awaited_once()
+    worker.task_client.append_suspect_range.assert_awaited_once()
+
+    fp = compute_failing_test_set_fingerprint(failing_ids)
+    task_id = worker.open_fix_tasks[fp]
+    escalations = _l0_info_escalations(worker.escalation_queue, task_id)
+    assert len(escalations) == 1, (
+        'a same-set recurrence must not raise a second L0 escalation'
+    )
