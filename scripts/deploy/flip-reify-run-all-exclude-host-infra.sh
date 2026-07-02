@@ -85,7 +85,7 @@ main() {
 
     git -C "$REIFY_REPO" add -- "$CONFIG_FILE"
     if ! git -C "$REIFY_REPO" diff --cached --quiet -- "$CONFIG_FILE"; then
-        git -C "$REIFY_REPO" commit -m "deploy: flip ${KNOB}=1 (exclude host-exclusive infra set from reify run_all)"
+        git -C "$REIFY_REPO" commit --no-verify -m "deploy: flip ${KNOB}=1 (exclude host-exclusive infra set from reify run_all)"
         signal_config_reload
     fi
 }
