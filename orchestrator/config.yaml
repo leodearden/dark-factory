@@ -65,3 +65,28 @@ usage_cap:
 
 # Project root (absolute path)
 project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"
+
+# Post-merge staleness hook — U2 restart-on-merge for the orchestrator fleet
+# itself. Flips the (previously dormant, enabled=False-by-default) coordinator
+# on for dark-factory's own daemon. All six orchestrator-*.service units are
+# restarted via scripts/restart-all-orchestrators.sh, which enumerates running
+# units, verifies a fresh ActiveEnterTimestampMonotonic per unit, and defers
+# SELF_UNIT=orchestrator-dark-factory.service to last so a same-cgroup caller
+# doesn't get killed before the other units are restarted.
+#
+# See orchestrator/src/orchestrator/config.py (orchestrator_restart_* field
+# docstrings) and orchestrator/src/orchestrator/service_restart.py for the
+# coordinator's debounce / agents-idle / merge-drain-precondition policy.
+# Per plans/orchestrator-fleet-staleness-prd.md task γ.
+#
+# ACTIVATION NOTE: this flip is inert in the running daemon until the next
+# orchestrator restart — these knobs are not in the config hot-reload
+# allowlist. Activation is a separate deterministic capstone task.
+orchestrator_restart_on_merge_enabled: true
+orchestrator_restart_script: "scripts/restart-all-orchestrators.sh"
+orchestrator_restart_watch_prefixes:
+  - "orchestrator/src/"
+  - "escalation/src/"
+  - "orchestrator/pyproject.toml"
+  - "orchestrator/uv.lock"
+  - "escalation/pyproject.toml"
