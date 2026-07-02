@@ -1413,3 +1413,38 @@ def test_staleness_pass_none_elapsed_does_not_block_restart(
         f"A None elapsed must not block the staleness restart; got {restarted}"
     )
 
+
+def test_staleness_pass_commit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """staleness_pass restarts nothing when the newest watched commit is too young.
+
+    A commit younger than STALENESS_GRACE_SECS gives the polite event-driven
+    restart coordinator its head start — the backstop must not race it (I5).
+    This is a fleet-wide gate: it must suppress every unit's restart, not
+    just the one under test.
+
+    The commit_epoch-None fall-safe (a complete no-op, no enumeration) is
+    covered separately by test_staleness_pass_noop_when_commit_epoch_none.
+    """
+    wdog = _load_watchdog()
+    restarted: list[str] = []
+
+    now = 2_000_000_000.0
+    commit_epoch = int(now) - 300  # younger than STALENESS_GRACE_SECS=1800
+
+    stale_unit = "orchestrator-young-commit.service"
+
+    monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [stale_unit])
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "_unit_start_epoch", lambda _u: commit_epoch - 100)  # stale
+    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.staleness_pass()
+
+    assert restarted == [], (
+        f"A commit younger than STALENESS_GRACE_SECS must suppress all restarts; got {restarted}"
+    )
+
