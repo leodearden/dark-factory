@@ -16,7 +16,6 @@ test_interactive_worktree_reaper.py):
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,7 +25,7 @@ import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, ReapedInteractiveWorktree, _run
+from orchestrator.git_ops import ReapedInteractiveWorktree, _run
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
 
