@@ -4387,6 +4387,154 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
 
 
 # ---------------------------------------------------------------------------
+# Task 2029 scenario (a) — MemoryConsolidator acknowledges flags dropped by
+# the Stage-1 filter chain via acknowledge_resolved_flags(mode='delete').
+#
+# RED until step-8 wires acknowledge_resolved_flags into memory_consolidator.py.
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorFlagAcknowledgment:
+    """MemoryConsolidator.run() acknowledges Stage-1 flags dropped by the filter
+    chain (terminal-metadata / false-absence / stale-snapshot) so any persisted
+    stage1_flag_marker for a moot flag is reclaimed (task-2029 scenario a).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_dropped_flag_acknowledged_and_stat_set(self, mock_deps):
+        """A flag dropped by filter_terminal_metadata_flags (cancelled task) is
+        forwarded to acknowledge_resolved_flags(mode='delete'); the surviving
+        flag is NOT forwarded; report.stats reflects the mocked return value.
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        dropped_flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[dropped_flag, active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        async def _mock_get_task(task_id, project_root_arg, **_kw):
+            if str(task_id) == '1703':
+                return {'status': 'cancelled'}
+            return {'status': 'pending'}
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(side_effect=_mock_get_task)
+
+        ack_mock = AsyncMock(return_value=1)
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        ack_mock.assert_awaited_once()
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('run_id') == 'r-test'
+        assert call_kwargs.get('project_id') == 'p'
+        resolved = call_kwargs.get('resolved_flags')
+        assert resolved == [dropped_flag], (
+            f'expected exactly the dropped flag (and only it) to be forwarded; got {resolved!r}'
+        )
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 1
+
+    @pytest.mark.asyncio
+    async def test_no_drops_acknowledges_empty_list_and_stat_zero(self, mock_deps):
+        """When no flag is dropped by the filter chain, acknowledge_resolved_flags
+        is called with an empty list and the stat is explicitly 0 (not absent).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+
+        ack_mock = AsyncMock(return_value=0)
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        ack_mock.assert_awaited_once()
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('resolved_flags') == []
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 0
+
+
+# ---------------------------------------------------------------------------
 # Task 1201 — MemoryConsolidator stale human-operator detector integration
 # ---------------------------------------------------------------------------
 
