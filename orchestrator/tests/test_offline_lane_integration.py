@@ -59,6 +59,8 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.offline_lane import OfflineLaneWorker
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Shared end-to-end scaffolding (prerequisite P1)
 # ---------------------------------------------------------------------------
