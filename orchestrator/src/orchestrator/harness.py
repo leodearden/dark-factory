@@ -488,6 +488,62 @@ def build_train_callback_factory(scheduler: Any, git_ops: Any = None) -> TrainCa
 _TRAIN_MEMBER_READY_STATUS: str = 'merge-deferred'
 
 
+class _OfflineLaneTaskClient:
+    """Concrete ``offline_lane.OfflineLaneTaskClient`` adapter over the scheduler.
+
+    Structurally satisfies the ``OfflineLaneTaskClient`` Protocol
+    (``offline_lane.py``) so ``OfflineLaneWorker`` never talks to the
+    fused-memory MCP directly (task 2016, closing Bug #1) — mirrors that
+    module's ``SuiteRunner``/cross-project scope boundary. Delegates
+    entirely to existing, tested ``Scheduler`` helpers; no new MCP plumbing.
+    Module-level (not nested in ``Harness``) so it stays trivially
+    constructible in isolation, e.g. ``_OfflineLaneTaskClient(scheduler)``.
+    """
+
+    def __init__(self, scheduler: Scheduler) -> None:
+        self._scheduler = scheduler
+
+    async def submit_fix_task(self, arguments: dict) -> str:
+        """Submit a new fix task and return its id.
+
+        Reuses ``Harness._extract_task_id`` to normalise the task_id out of
+        the MCP ``tools/call`` response envelope, whatever shape it arrives
+        in (``{'task_id': ...}``, ``structuredContent``, or a ``content``
+        text block).
+        """
+        result = await self._scheduler.dispatch_tool('submit_task', arguments, timeout=30)
+        return Harness._extract_task_id(result) or ''
+
+    async def append_suspect_range(self, task_id: str, suspect_range: str) -> None:
+        """Append a suspect commit range to an already-open fix task.
+
+        Uses ``metadata_mode='additive'`` — a recursive list-union performed
+        server-side — so the range is appended (and dedup'd) atomically with
+        no read-modify-write round-trip.
+        """
+        await self._scheduler.update_task(
+            task_id, {'suspect_ranges': [suspect_range]}, metadata_mode='additive',
+        )
+
+    async def get_status(self, task_id: str) -> str:
+        """Return a previously filed fix task's current status.
+
+        Logs (rather than silently swallows) a non-``None`` error half from
+        ``get_statuses`` — e.g. a transient MCP outage — so it stays
+        observable; the caller (``_maybe_promote_blocker``) still degrades
+        to treating the empty status as "not done, not terminal" either way
+        (task 2016 amendment).
+        """
+        statuses, err = await self._scheduler.get_statuses([task_id])
+        if err is not None:
+            logger.warning(
+                'offline-lane: get_statuses failed for task %s: %s — '
+                'treating status as unknown this check',
+                task_id, err,
+            )
+        return statuses.get(task_id, '')
+
+
 class Harness:
     """Top-level orchestration loop."""
 
@@ -5111,7 +5167,13 @@ Output JSON matching the schema. Every task must appear in the output.
             return
 
         lock_path = self.config.project_root / 'data' / 'orchestrator' / 'offline_lane.lock'
-        worker = OfflineLaneWorker(self.git_ops, self.config, lock_path=lock_path)
+        worker = OfflineLaneWorker(
+            self.git_ops,
+            self.config,
+            lock_path=lock_path,
+            task_client=_OfflineLaneTaskClient(self.scheduler),
+            escalation_queue=self._escalation_queue,
+        )
         if not worker.acquire_lock():
             logger.warning(
                 'Offline-deep lane: lock acquire refused (another instance holds '
