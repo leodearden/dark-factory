@@ -275,6 +275,46 @@ class TestClaimWarmWorktreeGuards:
             f'expected reason=invalid_slug, got: {result}'
         )
 
+    async def test_e_maps_runtime_error(self, tmp_path: Path) -> None:
+        """(e) create_interactive_worktree raising RuntimeError (git failure) → {'error', reason}."""
+        root = tmp_path / 'root'
+        root.mkdir()
+
+        async def _raise_runtime(slug: str, *, start_ref: str | None = None) -> Any:
+            raise RuntimeError('git worktree add failed')
+
+        fake_git_ops = types.SimpleNamespace(
+            project_root=root, create_interactive_worktree=_raise_runtime,
+        )
+        stub_harness = types.SimpleNamespace(git_ops=fake_git_ops)
+        server = create_server(EscalationQueue(tmp_path / 'esc'), harness=stub_harness)
+
+        result = await _call_tool(
+            server, 'claim_warm_worktree', slug='x', project_root=str(root),
+        )
+
+        assert 'error' in result, f'expected an error key, got: {result}'
+        assert result.get('reason') == 'git_failure', (
+            f'expected reason=git_failure, got: {result}'
+        )
+
+    async def test_f_seed_failure_is_still_a_fail_soft_success(self, tmp_path: Path) -> None:
+        """warm=False (seed script exit != 0) is a SUCCESS — no 'error' key (α fail-soft contract)."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+        await _add_seed_script(repo, exit_code=1)
+        git_ops = GitOps(GitConfig(), repo)
+        stub_harness = types.SimpleNamespace(git_ops=git_ops)
+        server = create_server(EscalationQueue(tmp_path / 'esc'), harness=stub_harness)
+
+        result = await _call_tool(
+            server, 'claim_warm_worktree', slug='cold', project_root=str(repo),
+        )
+
+        assert 'error' not in result, f'warm=False must still be a success, got: {result}'
+        assert result['warm'] is False, f'expected warm=False (seed script exit 1), got: {result}'
+
 
 # ---------------------------------------------------------------------------
 # step-5 (RED) / step-6 (GREEN): release_warm_worktree by path — removal,
