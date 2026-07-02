@@ -1275,3 +1275,84 @@ class TestDryRunCapExhaustion:
         ):
             assert key in entry, f'{key} must be present on the cap-exhaustion entry'
             assert entry[key] is None, f'{key} must be None on the cap-exhaustion entry'
+
+
+# ---------------------------------------------------------------------------
+# task 2021 step-7: preserve the config dir on a doubly-wedged (forensic) run
+# ---------------------------------------------------------------------------
+
+class TestDryRunConfigDirPreserve:
+    """The per-investigation TaskConfigDir is preserved (cleanup skipped)
+    when the FINAL result — after the single retry — is still a zero-output
+    timeout wedge, mirroring task-1739's _preserve_config_dir forensics
+    pattern. A healthy run still cleans up normally (pinned both ways here
+    so the preserve branch cannot regress into always-preserve).
+    """
+
+    @pytest.mark.asyncio
+    async def test_doubly_wedged_run_preserves_config_dir(self, tmp_path):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        wedge = _make_agent_result(
+            success=False, timed_out=True, transcript_turns=0,
+            subtype='error_empty_output', session_id='w1',
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(side_effect=[wedge, wedge]),
+        ):
+            await run_dry_run_unblock(
+                task_id='2300',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        task_dir = tmp_path / '.task'
+        preserved = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert len(preserved) == 1, (
+            f'Expected the config dir to be PRESERVED after a doubly-wedged '
+            f'run (forensics), found: {preserved}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_run_still_cleans_up_config_dir(self, tmp_path):
+        """Counterpart pin: a clean success still cleans up — guards against
+        a naive fix that preserves the config dir unconditionally.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        agent_result = _make_agent_result(structured_output=structured)
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=AsyncMock(return_value=agent_result),
+        ):
+            await run_dry_run_unblock(
+                task_id='2301',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(),
+            )
+
+        task_dir = tmp_path / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], f'Expected config dir cleanup on success, found: {leftover}'
