@@ -335,7 +335,7 @@ class OfflineLaneWorker:
                 await asyncio.sleep(_OFFLINE_LANE_FAILURE_BACKOFF_SECS)
 
     async def _run_once(self) -> None:
-        """Snapshot head, reset the warm worktree, and invoke the suite seam.
+        """Snapshot head, reset the warm worktree, and invoke both sub-run seams.
 
         See module docstring — always-from-head, clear-before-snapshot.
 
@@ -344,6 +344,34 @@ class OfflineLaneWorker:
         landing after the clear either lands inside this run's snapshot
         (fine) or re-sets ``_dirty`` for a coalesced re-run (fine).
         Clearing AFTER the snapshot would open a lost-update window.
+
+        Two sub-runs per coalesced cadence, both at this ONE snapshot head
+        and in the SAME ``_offline-deep`` worktree (task 1959, IE1):
+
+        1. NUMERIC — the existing ``scripts/run-offline-deep.sh`` suite via
+           :attr:`suite_runner`. Unchanged: on red it calls
+           :meth:`_handle_red_run` BARE (``_handle_red_run(wt, head)``),
+           preserving back-compat with the numeric-only red path.
+        2. INFRA — reify's ``run_all --scope host-infra`` (H9 = reify:4929)
+           via :attr:`infra_runner`, gated on
+           ``config.git.offline_lane_infra_enabled`` (default False =
+           numeric-only, byte-identical to prior behavior). On red, it
+           reuses :meth:`_handle_red_run` with :attr:`infra_confirmation_runner`
+           injected via the optional ``confirmation_runner`` kwarg — the
+           entire confirm→fingerprint→file/update→escalate machinery is
+           shared, unchanged (IE-D1/§6: no new dedup mechanism). IE-D2: the
+           infra scope self-acquires the H8 Lane-X flock — no DF-side flock
+           is taken here. IE-D4: infra ``.sh``/cargo tests never touch
+           ``_offline-deep/target/``, so reusing δ's worktree does not
+           violate C5's single-consumer-of-target invariant.
+
+        Both sub-runs are logged (the run record). ``_last_green_head``
+        advances only when ALL EXECUTED sub-runs passed at this head — the
+        last-both-green head is a sound (if sometimes wider) lower bound for
+        either sub-run's suspect range (see :meth:`_suspect_range`). When
+        infra is disabled, the infra leg is vacuously green, so numeric-only
+        semantics are unchanged. Never a gate (C7): a red infra result files
+        a normal queued fix task — it never blocks the merge queue.
         """
         self._dirty = False
         head = await self.git_ops.get_main_sha()
@@ -352,18 +380,36 @@ class OfflineLaneWorker:
             return
         wt = await self.git_ops.reset_persistent_offline_deep_worktree(head)
         threads = self.config.git.offline_lane_test_threads
+
         start = time.monotonic()
         rc, _tail = await self.suite_runner(wt, head, threads)
         duration = time.monotonic() - start
         self._last_run_head = head
         logger.info(
-            'offline-lane: run head=%s status=%s duration=%.1fs',
+            'offline-lane: numeric sub-run head=%s status=%s duration=%.1fs',
             head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
         )
-        if rc == 0:
-            self._last_green_head = head
-        else:
+        numeric_green = rc == 0
+        if not numeric_green:
             await self._handle_red_run(wt, head)
+
+        infra_green = True
+        if self.config.git.offline_lane_infra_enabled:
+            start = time.monotonic()
+            rc, _tail = await self.infra_runner(wt, head, threads)
+            duration = time.monotonic() - start
+            logger.info(
+                'offline-lane: infra sub-run head=%s status=%s duration=%.1fs',
+                head[:12], 'PASS' if rc == 0 else 'FAIL', duration,
+            )
+            infra_green = rc == 0
+            if not infra_green:
+                await self._handle_red_run(
+                    wt, head, confirmation_runner=self.infra_confirmation_runner,
+                )
+
+        if numeric_green and infra_green:
+            self._last_green_head = head
 
     # ------------------------------------------------------------------
     # Red-path handling — confirmation, fingerprint, dedup'd fix-task spawn,
