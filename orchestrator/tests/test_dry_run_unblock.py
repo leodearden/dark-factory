@@ -124,7 +124,9 @@ def _init_git_repo(path) -> str:
 
 
 def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
-                       subtype='', output='', duration_ms=1000):
+                       subtype='', output='', duration_ms=1000,
+                       timed_out=False, transcript_turns=None, session_id='',
+                       stderr='', turns=0, api_error_status=None):
     r = MagicMock()
     r.success = success
     r.cost_usd = cost_usd
@@ -132,6 +134,17 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
     r.subtype = subtype
     r.output = output
     r.duration_ms = duration_ms
+    # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
+    # A bare MagicMock auto-vivifies .timed_out as a truthy attribute, which
+    # would make classify_agent_failure() misclassify every failure result as
+    # TIMED_OUT -> infra. Setting explicit defaults keeps these mocks faithful
+    # stand-ins for classify_agent_failure()'s decision rules.
+    r.timed_out = timed_out
+    r.transcript_turns = transcript_turns
+    r.session_id = session_id
+    r.stderr = stderr
+    r.turns = turns
+    r.api_error_status = api_error_status
     return r
 
 
