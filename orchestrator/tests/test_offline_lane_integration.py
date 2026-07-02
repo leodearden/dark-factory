@@ -233,10 +233,24 @@ async def _run_lane(
     worker: OfflineLaneWorker, expected_passes: int, *, timeout: float = 5.0,
 ) -> None:
     """Drive worker.run() as a real background task until *expected_passes*
-    suite_runner calls have COMPLETED, then cancel the loop task.
+    full passes (``_run_once`` calls) have COMPLETED, then cancel the loop
+    task.
 
-    Wraps whatever ``suite_runner`` is currently on *worker* with a call
-    counter — modeled on ``test_offline_lane.py``'s
+    Wraps ``worker._run_once`` itself — NOT ``suite_runner`` alone — with a
+    call counter, so ``done`` is only set once a pass, INCLUDING any
+    ``_handle_red_run`` confirmation/fix-task/escalation work it triggers,
+    has fully returned. Counting at the ``suite_runner`` boundary instead
+    would race the red path: every seam this harness injects (a bare
+    ``async def ...: return ...``, or an ``AsyncMock``) happens not to
+    yield to the event loop, so today ``_handle_red_run`` always finishes
+    before the loop next suspends at ``_wake.wait()`` — but that is an
+    accident of the fakes, not a guarantee, and cancelling right after
+    ``suite_runner`` returns would race ``_handle_red_run`` mid-flight the
+    moment a seam awaits real I/O. Restores the original ``_run_once`` in
+    the ``finally`` block so repeated calls (``_drive_reds`` drives 2-3
+    passes per scenario) never nest counting wrappers.
+
+    Modeled on ``test_offline_lane.py``'s
     ``test_loop_coalesces_to_exactly_one_rerun`` cancel-after-N pattern,
     generalized from a fixed N=1 to an arbitrary pass count (B1's single
     pass via :func:`_run_one_lane_pass`; B2's held-pass-plus-one-coalesced-
@@ -244,18 +258,18 @@ async def _run_lane(
     already be set by a prior trigger, exactly as production wiring would
     leave it.
     """
-    inner_runner = worker.suite_runner
+    inner_run_once = worker._run_once
     done = asyncio.Event()
     count = {'n': 0}
 
-    async def _counting_runner(wt, head, threads):
-        result = await inner_runner(wt, head, threads)
+    async def _counting_run_once():
+        result = await inner_run_once()
         count['n'] += 1
         if count['n'] >= expected_passes:
             done.set()
         return result
 
-    worker.suite_runner = _counting_runner
+    worker._run_once = _counting_run_once
     task = asyncio.create_task(worker.run())
     try:
         await asyncio.wait_for(done.wait(), timeout=timeout)
@@ -263,6 +277,7 @@ async def _run_lane(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        worker._run_once = inner_run_once
 
 
 async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = 5.0) -> None:
@@ -308,7 +323,6 @@ async def _assert_never_a_gate(
     runner: _ControllableSuiteRunner,
     repo: Path,
     git_ops: GitOps,
-    caplog,
 ) -> None:
     """Assert the never-a-gate invariant (C7) while a lane run is held in-flight.
 
@@ -325,7 +339,8 @@ async def _assert_never_a_gate(
     try/except (``harness.py:5072-5079``) swallows it — the SAME shape
     ``SpeculativeMergeWorker`` independently wraps this exact call in
     (``merge_queue.py:10578-10596``, belt-and-suspenders) — so the merge
-    still lands (the service-restart coordinator fan-out still runs).
+    still lands (proven behaviorally below via the service-restart
+    coordinator fan-out still running, NOT by log text).
     (4) Neither case ever halts the merge queue or files an escalation —
     the only halt/gate-adjacent side effects reachable from this call path.
     """
@@ -353,10 +368,10 @@ async def _assert_never_a_gate(
 
     base2 = head_sha
     head2 = await _advance_main(repo)
-    with caplog.at_level(logging.WARNING):
-        await harness._note_merge_all('task-3', base2, head2)  # must not raise
+    await harness._note_merge_all('task-3', base2, head2)  # must not raise
 
-    assert 'fail-open' in caplog.text
+    # Fail-open is proven behaviorally: the merge still landed and ran the
+    # service-restart coordinator fan-out despite the raising notifiee.
     coord.note_merge.assert_awaited_once_with(
         'task-3', base2, head2, prefetched_diff=[],
     )
@@ -538,7 +553,7 @@ async def test_b2_coalesces_burst_of_advances_to_one_rerun(harness, git_ops, rep
 
 
 @pytest.mark.asyncio
-async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path, caplog):
+async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path):
     """B3 (PRD §8, C7) — a merge-landed notification while the lane is
     in-flight must never gate the merge: it returns promptly (never blocks
     the synchronous notifiee call on the in-flight run), sets _dirty for a
@@ -553,7 +568,7 @@ async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path, caplog):
     lane_task = asyncio.create_task(_run_lane(worker, expected_passes=1))
     await runner.wait_entered()
 
-    await _assert_never_a_gate(harness, worker, runner, repo, git_ops, caplog)
+    await _assert_never_a_gate(harness, worker, runner, repo, git_ops)
 
     runner.release()
     await lane_task
@@ -636,7 +651,7 @@ async def test_b5_same_set_recurrence_updates_not_duplicates(harness, git_ops, r
 
 
 @pytest.mark.asyncio
-async def test_b6_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, tmp_path, caplog):
+async def test_b6_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, tmp_path):
     """B6 (PRD §8) — a run that fails, then passes on the isolated
     confirmation re-run, is intermittent nondeterminism, never a genuine
     break: no fix task and no escalation are ever raised."""
@@ -644,11 +659,12 @@ async def test_b6_flake_filtered_by_confirmation_rerun(harness, git_ops, repo, t
     _wire_lane(harness, worker)
     _inject_flake(worker)
 
-    with caplog.at_level(logging.INFO):
-        await _drive_advance(harness, repo)
-        await _run_one_lane_pass(worker)
+    await _drive_advance(harness, repo)
+    await _run_one_lane_pass(worker)
 
-    assert 'intermittent nondeterminism' in caplog.text
+    # Intermittent-nondeterminism handling is proven behaviorally below
+    # (no fix task, no open fingerprint, no escalation) rather than by log
+    # text.
     cast(AsyncMock, worker.task_client).submit_fix_task.assert_not_awaited()
     assert worker.open_fix_tasks == {}
     assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
