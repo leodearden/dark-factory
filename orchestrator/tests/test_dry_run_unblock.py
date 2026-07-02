@@ -849,6 +849,15 @@ class TestInfraFailureClassification:
         assert entry['risk_label'] == 'human-review-required'
         assert entry['files_referenced'] == []
 
+        # task 2020 step-3: discrete diagnostic keys carried on the entry.
+        assert entry['timed_out'] is True
+        assert entry['duration_ms'] == 600000
+        assert entry['subtype'] == 'error_empty_output'
+        assert entry['transcript_turns'] == 0
+        assert entry['session_id'] == 'sess-x'
+        assert 'Absolute ceiling reached after 600.0s' in entry['stderr_tail']
+        assert len(entry['stderr_tail']) <= 500
+
     @pytest.mark.asyncio
     async def test_substantive_failure_stays_investigation_failed(self, tmp_path):
         """Guard against over-broad infra classification: a non-timed-out,
