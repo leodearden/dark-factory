@@ -451,8 +451,8 @@ class TestMarkBlockedForwardsResilienceContext:
 
         usage_gate_sentinel = object()
         cost_store_sentinel = object()
-        wf.usage_gate = usage_gate_sentinel
-        wf.cost_store = cost_store_sentinel
+        wf.usage_gate = usage_gate_sentinel  # type: ignore[assignment]
+        wf.cost_store = cost_store_sentinel  # type: ignore[assignment]
 
         calls = []
 
