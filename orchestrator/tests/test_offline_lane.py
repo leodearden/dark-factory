@@ -1297,3 +1297,137 @@ async def test_run_once_runs_both_sub_runs_when_infra_enabled(tmp_path: Path):
     infra_runner_c.assert_not_awaited()
     worker_c._handle_red_run.assert_not_awaited()
     assert worker_c._last_green_head == 'HEAD3'
+
+
+# ---------------------------------------------------------------------------
+# _run_once / run() — a red-handling/infra-leg exception must not advance
+# _last_run_head, so the poll backstop can retry (task 2016, step-1/2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_once_red_handling_exception_does_not_advance_last_run_head(
+    tmp_path: Path,
+):
+    """A numeric red-handling exception must NOT permanently advance _last_run_head.
+
+    Today ``_last_run_head`` is set immediately after ``suite_runner``
+    returns — BEFORE ``_handle_red_run`` runs — so a raise from the
+    red-handling leg still leaves ``_last_run_head`` pointing at the
+    just-failed head, silently defeating ``run()``'s poll-backstop retry
+    (the head no longer looks "missed"). The step-2 fix moves the advance
+    to the end of ``_run_once``, after red-handling completes without
+    raising.
+
+    Step 1 (RED): ``_last_run_head`` is still set before ``_handle_red_run``
+    runs — must fail (``_last_run_head`` will be ``'HEAD1'``, not ``None``)
+    before the step-2 reorder.
+    """
+    git_ops = _make_git_ops(head='HEAD1')
+    suite_runner = AsyncMock(return_value=(1, ''))
+    worker = _make_worker(tmp_path, git_ops=git_ops, suite_runner=suite_runner)
+    worker._handle_red_run = AsyncMock(side_effect=RuntimeError('red handling boom'))
+    worker._dirty = True
+
+    with pytest.raises(RuntimeError, match='red handling boom'):
+        await worker._run_once()
+
+    assert worker._last_run_head is None, (
+        '_last_run_head must NOT advance when _handle_red_run raises — the '
+        'run-start snapshot head must stay outstanding so the poll backstop '
+        'retries it'
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_once_infra_leg_exception_does_not_advance_last_run_head(
+    tmp_path: Path,
+):
+    """An infra sub-run leg exception must also NOT advance _last_run_head.
+
+    Mirrors the numeric-leg test above but for the infra sub-run
+    (``offline_lane_infra_enabled=True``): a numeric-green pass followed by
+    an ``infra_runner`` raise must leave ``_last_run_head`` unadvanced too —
+    the step-2 fix must place the advance after BOTH red-handling legs and
+    the infra sub-run, not just the numeric leg.
+
+    Step 1 (RED): ``_last_run_head`` is set right after the numeric
+    ``suite_runner`` returns, before the infra sub-run even starts — must
+    fail before the step-2 reorder.
+    """
+    git_ops = _make_git_ops(head='HEAD1')
+    config = _make_config(tmp_path, offline_lane_infra_enabled=True)
+    suite_runner = AsyncMock(return_value=(0, ''))
+    infra_runner = AsyncMock(side_effect=RuntimeError('infra boom'))
+    worker = _make_worker(
+        tmp_path,
+        git_ops=git_ops,
+        config=config,
+        suite_runner=suite_runner,
+        infra_runner=infra_runner,
+    )
+    worker._dirty = True
+
+    with pytest.raises(RuntimeError, match='infra boom'):
+        await worker._run_once()
+
+    assert worker._last_run_head is None, (
+        '_last_run_head must NOT advance when the infra sub-run raises, even '
+        'though the numeric leg was green'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10)
+async def test_loop_retries_after_red_handling_exception(tmp_path: Path):
+    """run()'s poll backstop retries a red-handling exception (Bug #2, end-to-end).
+
+    Because ``_run_once`` (after the step-2 reorder) no longer advances
+    ``_last_run_head`` until red-handling completes without raising, a
+    failed pass leaves the head outstanding; ``run()``'s existing poll
+    backstop (``head != self._last_run_head``) re-flags it on the very next
+    poll tick, so ``_handle_red_run`` is retried rather than silently
+    dropped. Mirrors ``test_loop_is_fail_open_and_cancellation_clean``'s
+    background-task + done-Event + tracking-sleep pattern.
+
+    Step 1 (RED): before the step-2 reorder, the first (failing) pass's
+    ``_last_run_head = head`` (set before ``_handle_red_run`` runs) leaves
+    the poll backstop believing the head was already handled —
+    ``_handle_red_run`` is never retried and this test times out waiting for
+    the 2nd call. Must fail before impl.
+    """
+    calls = {'n': 0}
+    done = asyncio.Event()
+
+    async def _handle_red_run_effect(wt, head):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError('red handling boom')
+        done.set()
+
+    git_ops = _make_git_ops(head='HEAD1')
+    config = _make_config(tmp_path, offline_lane_poll_interval_secs=0.05)
+    suite_runner = AsyncMock(return_value=(1, ''))
+    worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=suite_runner)
+    worker._handle_red_run = AsyncMock(side_effect=_handle_red_run_effect)
+    worker._dirty = True
+
+    real_sleep = asyncio.sleep
+
+    async def _tracking_sleep(delay, *a, **k):
+        return await real_sleep(0)
+
+    with patch('orchestrator.offline_lane.asyncio.sleep', side_effect=_tracking_sleep), \
+            patch('orchestrator.offline_lane.logger'):
+        task = asyncio.create_task(worker.run())
+        try:
+            await asyncio.wait_for(done.wait(), timeout=3.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert worker._handle_red_run.await_count >= 2, (
+        'the poll backstop must re-flag the still-outstanding head and retry '
+        '_handle_red_run after the first pass raised'
+    )
