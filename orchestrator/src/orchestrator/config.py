@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -2618,15 +2618,39 @@ def apply_reload(
     """Diff *live* against *fresh* and apply every allowlisted differing leaf
     to *live* in place.
 
+    I5 hybrid re-validation: leaf-copies bypass per-write validation (see
+    _set_leaf), so after copying, the resulting *live* is re-validated as a
+    whole via OrchestratorConfig.model_validate. Two individually-valid
+    configs can still combine into an invalid hybrid when an allowlist omits
+    one side of a cross-field invariant (e.g.
+    _validate_steward_timeout_invariant) — if that happens, every applied
+    leaf is synchronously rolled back to its captured old value and the
+    reload is reported as failed. Nothing is left mutated on failure.
+
     Returns {reloaded, applied, restart_required, unchanged, error} — see
     plans/config-hot-reload-prd.md §Contract. config_path is intentionally
     absent; the harness-level reload_config (task beta) supplies it.
     """
     d = diff_config(live, fresh, allowlist)
     applied: dict[str, dict[str, Any]] = {}
-    for path, old_new in d.applied_candidates.items():
-        _set_leaf(live, path, old_new['new'])
-        applied[path] = old_new
+    try:
+        for path, old_new in d.applied_candidates.items():
+            _set_leaf(live, path, old_new['new'])
+            applied[path] = old_new
+        OrchestratorConfig.model_validate(live.model_dump())
+    except (ValidationError, ValueError) as exc:
+        # Roll back every leaf applied so far (order-independent: each
+        # write restores its own captured old value) so `live` is left
+        # exactly as it was before this call, even on a mid-loop raise.
+        for path, old_new in applied.items():
+            _set_leaf(live, path, old_new['old'])
+        return {
+            'reloaded': False,
+            'applied': {},
+            'restart_required': d.restart_required,
+            'unchanged': d.unchanged,
+            'error': f'hybrid-invariant: {exc}',
+        }
     return {
         'reloaded': True,
         'applied': applied,
