@@ -453,6 +453,19 @@ def _terminal_status_task_client(status: str) -> AsyncMock:
     return task_client
 
 
+def _materialized_worktree_names(worktree_base: Path) -> set[str]:
+    """Top-level entry names materialized under *worktree_base* so far (B8).
+
+    A before/after diff of this set proves a lane reset touches ONLY its
+    own persistent worktree directory, never the other lane's. Returns the
+    empty set when *worktree_base* itself has not been created yet (the
+    "before" case, prior to any worktree ever being registered).
+    """
+    if not worktree_base.exists():
+        return set()
+    return {p.name for p in worktree_base.iterdir()}
+
+
 # ---------------------------------------------------------------------------
 # B1 — advance triggers a from-head run
 # ---------------------------------------------------------------------------
