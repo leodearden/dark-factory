@@ -295,3 +295,61 @@ class TestInteractiveReaperStartupSweep:
         await self._drive_empty_until_idle_run(harness, monkeypatch)
 
         mock_pass.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Step-15/16: end-to-end I2 user-observable signal over a real repo — the
+# stale worktree is gone from `git worktree list`, the live one remains, and
+# a summary INFO line reports the reaped count. This is the ζ-facing signal
+# that no _iact-* leaks past interactive_worktree_ttl + one sweep interval.
+# ---------------------------------------------------------------------------
+
+
+class TestInteractiveReaperEndToEndSummarySignal:
+    """RED until step-16 GREEN adds a summary log line to
+    _run_interactive_worktree_reaper_pass.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_reaped_live_preserved_with_summary_log(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Over a real repo: a TTL-expired idle worktree is reaped and gone
+        from `git worktree list`; a within-TTL live worktree remains; a
+        summary INFO line reports the count of worktrees reaped."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+
+        harness, _rs = _make_harness(repo)
+        git_ops = harness.git_ops
+
+        info_stale = await git_ops.create_interactive_worktree('stale')
+        info_live = await git_ops.create_interactive_worktree('live')
+        await _commit_file(info_live.path, 'work.txt', 'work\n', 'wip on live')
+
+        _backdate_stamp(
+            info_stale.path,
+            datetime.now(UTC)
+            - timedelta(seconds=harness.config.git.interactive_worktree_ttl + 3600),
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._run_interactive_worktree_reaper_pass()
+
+        registered = await _registered_worktree_paths(repo)
+        assert str(info_stale.path.resolve()) not in registered, (
+            f'expected the stale worktree to be reaped; registered: {registered}'
+        )
+        assert str(info_live.path.resolve()) in registered, (
+            f'expected the live worktree to remain; registered: {registered}'
+        )
+
+        info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'reaped' in r.getMessage().lower() and '1' in r.getMessage()
+            for r in info_records
+        ), (
+            'expected a summary INFO line reporting the count of reaped '
+            f'interactive worktrees; got: {[r.getMessage() for r in info_records]}'
+        )
