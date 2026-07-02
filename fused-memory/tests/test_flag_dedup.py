@@ -2204,6 +2204,132 @@ async def test_dedup_flags_invalid_tid_flags_not_collapsed_when_repeated():
     memory_service.add_memory.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_dedup_flags_in_batch_repeat_annotation():
+    """RED (task-1978): the in-batch memo's repeat annotation must match the
+    FIRST occurrence's resolved outcome, not the step-2 placeholder (which
+    always stores the current run_id regardless of HIT/MISS).
+
+    HIT-first: a prior marker (run_id='r0') exists before the call. Two copies
+    of the signature are processed in one call with run_id='r_now'. Both
+    output flags must carry persisted_from_run='r0' (inherited from the first
+    occurrence's HIT) and last_seen_run_id='r_now'.
+
+    MISS-first: no prior marker exists. Two copies of a (different) signature
+    are processed in one call with run_id='r_now'. The first output flag
+    follows the existing MISS behavior (no persisted_from_run). The second
+    (repeat) output flag is a genuine same-run duplicate, so its
+    persisted_from_run is the CURRENT run_id ('r_now').
+
+    Both sub-cases also assert the caller's original flag dicts are never
+    mutated in place (copy-before-annotate).
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    # --- HIT-first ---
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '1970',
+        'flag_type': 'task_blocked_stale_escalations',
+        'run_id': 'r0',
+    })
+    prior_marker.id = 'prior-1970'
+    new_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '1970',
+        'flag_type': 'task_blocked_stale_escalations',
+        'run_id': 'r_now',
+    })
+    new_marker.id = 'new-1970-r_now'
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('1970', 'task_blocked_stale_escalations'): [[prior_marker], [new_marker]]},
+    ))
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    hit_flag = {'task_id': 1970, 'flag_type': 'task_blocked_stale_escalations', 'description': 'x'}
+    hit_flags = [dict(hit_flag), dict(hit_flag)]
+    original_hit_flags = [dict(f) for f in hit_flags]
+
+    hit_result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r_now',
+        flags=hit_flags,
+    )
+
+    assert len(hit_result) == 2
+    for i, flag in enumerate(hit_result):
+        assert flag.get('persisted_from_run') == 'r0', (
+            f'HIT-first flag[{i}]: expected persisted_from_run="r0" (inherited '
+            f'from the first occurrence) but got {flag.get("persisted_from_run")!r}'
+        )
+        assert flag.get('last_seen_run_id') == 'r_now', (
+            f'HIT-first flag[{i}]: expected last_seen_run_id="r_now" but got '
+            f'{flag.get("last_seen_run_id")!r}'
+        )
+    # Only ONE search+write+delete cycle ran — the repeat skipped it entirely.
+    memory_service.add_memory.assert_called_once()
+    memory_service.delete_memory.assert_called_once()
+    # Caller's original dicts must not be mutated (copy-before-annotate).
+    assert hit_flags == original_hit_flags, (
+        'dedup_flags must not mutate the caller-supplied flag dicts in place'
+    )
+
+    # --- MISS-first ---
+    new_marker_1971 = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'task_id': '1971',
+        'flag_type': 'task_blocked_stale_escalations',
+        'run_id': 'r_now',
+    })
+    new_marker_1971.id = 'new-1971-r_now'
+
+    memory_service2 = AsyncMock()
+    memory_service2.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('1971', 'task_blocked_stale_escalations'): [[], [new_marker_1971]]},
+    ))
+    memory_service2.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+    miss_flag = {'task_id': 1971, 'flag_type': 'task_blocked_stale_escalations', 'description': 'y'}
+    miss_flags = [dict(miss_flag), dict(miss_flag)]
+    original_miss_flags = [dict(f) for f in miss_flags]
+
+    miss_result = await dedup_flags(
+        memory_service=memory_service2,
+        project_id='p',
+        run_id='r_now',
+        flags=miss_flags,
+    )
+
+    assert len(miss_result) == 2
+    # First occurrence: existing MISS behavior — no persisted_from_run annotation.
+    assert 'persisted_from_run' not in miss_result[0], (
+        f'MISS-first flag[0] must follow existing MISS behavior (no '
+        f'persisted_from_run) but got {miss_result[0]}'
+    )
+    # Second occurrence (in-batch repeat): a genuine same-run duplicate, so
+    # persisted_from_run is the CURRENT run_id.
+    assert miss_result[1].get('persisted_from_run') == 'r_now', (
+        f'MISS-first flag[1] (repeat): expected persisted_from_run="r_now" but '
+        f'got {miss_result[1].get("persisted_from_run")!r}'
+    )
+    assert miss_result[1].get('last_seen_run_id') == 'r_now', (
+        f'MISS-first flag[1] (repeat): expected last_seen_run_id="r_now" but got '
+        f'{miss_result[1].get("last_seen_run_id")!r}'
+    )
+    # Only ONE write happened — the repeat skipped the write cycle entirely.
+    memory_service2.add_memory.assert_called_once()
+    # Caller's original dicts must not be mutated.
+    assert miss_flags == original_miss_flags, (
+        'dedup_flags must not mutate the caller-supplied flag dicts in place'
+    )
+
+
 # ---------------------------------------------------------------------------
 # build_suppression_payload tests (task-1185 step-1)
 # ---------------------------------------------------------------------------
