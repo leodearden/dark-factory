@@ -113,3 +113,32 @@ class TestRunInteractiveWorktreeReaperPass:
         mock_reap.assert_awaited_once()
         errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert errors, 'expected an ERROR log when reap_interactive_worktrees raises'
+
+
+# ---------------------------------------------------------------------------
+# Step-11: the interactive reaper is folded into the existing warm-lane GC
+# cadence tick (_run_warm_lane_gc_pass), per PRD δ "folded into the existing
+# warm-lane GC cadence" — no new config knob, no new loop.
+# ---------------------------------------------------------------------------
+
+
+class TestWarmLaneGcPassFoldsInInteractiveReaper:
+    """_run_warm_lane_gc_pass() also drives the interactive-worktree reaper.
+
+    RED until step-12 GREEN adds the delegation call to
+    Harness._run_warm_lane_gc_pass.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gc_pass_awaits_interactive_reaper_pass_once(
+        self, tmp_path: Path,
+    ) -> None:
+        """Every warm-lane GC cadence tick also runs the interactive reaper."""
+        harness, _rs = _make_harness(tmp_path)
+        harness.git_ops._run_warm_lane_gc_reclaim = AsyncMock(return_value=0)
+        mock_reaper_pass = AsyncMock(return_value=None)
+        harness._run_interactive_worktree_reaper_pass = mock_reaper_pass
+
+        await harness._run_warm_lane_gc_pass()
+
+        mock_reaper_pass.assert_awaited_once()
