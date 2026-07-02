@@ -49,10 +49,17 @@ apply_flip() {
 }
 
 main() {
+    if is_flipped; then
+        echo "flip-reify-run-all: already flipped (no-op)"
+        exit 0
+    fi
+
     apply_flip
 
     git -C "$REIFY_REPO" add -- "$CONFIG_FILE"
-    git -C "$REIFY_REPO" commit -m "deploy: flip ${KNOB}=1 (exclude host-exclusive infra set from reify run_all)"
+    if ! git -C "$REIFY_REPO" diff --cached --quiet -- "$CONFIG_FILE"; then
+        git -C "$REIFY_REPO" commit -m "deploy: flip ${KNOB}=1 (exclude host-exclusive infra set from reify run_all)"
+    fi
 }
 
 main
