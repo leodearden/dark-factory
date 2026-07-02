@@ -32,6 +32,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "PremiseEntry",
+    "SourceAssertion",
+    "load_premise_registry",
+    "match_candidate",
+    "premise_refuted_entry",
+    "verify_premise_refuted",
+]
+
 
 @dataclass(frozen=True)
 class SourceAssertion:
@@ -283,3 +292,23 @@ def verify_premise_refuted(entry: PremiseEntry, source_root: Path) -> bool:
         if not _assertion_holds(assertion, source_root):
             return False
     return True
+
+
+def premise_refuted_entry(
+    candidate: CandidateTask,
+    entries: list[PremiseEntry],
+    source_root: Path,
+) -> PremiseEntry | None:
+    """Return the matched entry iff the candidate's premise is refuted, else ``None``.
+
+    Composes ``match_candidate`` (textual match) and ``verify_premise_refuted``
+    (live source/test re-verification). Both must hold — a textual match on a
+    premise the source no longer refutes returns ``None`` (the self-correcting
+    case), as does live source verification on a candidate that never matched.
+    """
+    entry = match_candidate(candidate, entries)
+    if entry is None:
+        return None
+    if not verify_premise_refuted(entry, source_root):
+        return None
+    return entry
