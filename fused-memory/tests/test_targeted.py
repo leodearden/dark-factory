@@ -1897,6 +1897,64 @@ async def test_on_task_done_suppresses_stale_description_when_authoritative_memo
 
 
 @pytest.mark.asyncio
+async def test_on_task_done_suppresses_when_stage2_suppress_guard_exists(
+    reconciler, mock_memory_service,
+):
+    """End-to-end regression guard for the REAL production trigger.
+
+    Unlike the `supersedes`-shaped fixture above, this mocks
+    get_memories_by_metadata to return a memory shaped exactly as Stage 2's
+    documented write-side contract produces it — `metadata={'stage2_suppress':
+    True, 'task_id': str(task_id)}`, no `supersedes` key (prompts/stage2.py
+    "Completion-Note Suppression Pre-Check (stage2_suppress guard)": "the only
+    writer of the `stage2_suppress` key"). A task 1984 review pass found the
+    prior `_AUTHORITATIVE_SOURCES` allowlist had no real writer backing it —
+    this test locks in that the classifier now fires on the shape Stage 2
+    actually produces, not just a synthetic `supersedes` fixture, and that the
+    task_id-scoped pre-check filter intersects that real writer's task_id."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {'id': 'a1b2c3', 'metadata': {'task_id': '361', 'stage2_suppress': True}},
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE re-scoped description text',
+            'details': 'stale details',
+        },
+    )
+
+    # (a) the deterministic per-task metadata query was awaited once, and its
+    # task_id-scoped filter is exactly what intersects the real Stage 2 writer.
+    mock_memory_service.get_memories_by_metadata.assert_awaited_once()
+    query_call = mock_memory_service.get_memories_by_metadata.await_args
+    assert query_call is not None
+    assert query_call.kwargs.get('project_id') == 'test-project'
+    assert query_call.kwargs.get('filters') == {'task_id': '361'}
+
+    # (b) the fast-path add_memory content is title-only — no stale prose
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content')
+    assert content == "Task 'Autopilot task' completed.", (
+        f'Expected title-only completion fact, got: {content!r}'
+    )
+    assert 'STALE re-scoped description text' not in content
+    assert 'stale details' not in content
+
+    # (c) metadata carries the suppression flag
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_suppressed_stale_description') is True
+
+    # (d) completion-fact audit action is preserved
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
 async def test_on_task_done_fails_open_when_metadata_query_raises(
     reconciler, mock_memory_service,
 ):
