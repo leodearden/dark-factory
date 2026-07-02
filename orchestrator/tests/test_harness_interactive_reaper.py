@@ -142,3 +142,110 @@ class TestWarmLaneGcPassFoldsInInteractiveReaper:
         await harness._run_warm_lane_gc_pass()
 
         mock_reaper_pass.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Step-13: unconditional startup sweep, independent of warm_lane_gc_enabled
+# ---------------------------------------------------------------------------
+
+
+def _neutralise_heavy_startup(harness: Harness) -> None:
+    """Stub heavyweight startup/shutdown so the real run() loop is drivable.
+
+    Mirrors TestHarnessRunForever._neutralise in test_harness_park_stop.py —
+    every background-loop starter and external-server touchpoint is stubbed
+    so run() can be driven end-to-end against a bare tmp_path (no real MCP
+    server, no real git repo needed for this startup-wiring test).
+    """
+    harness.mcp = MagicMock()
+    harness.mcp.start = AsyncMock()
+    harness.mcp.stop = AsyncMock()
+    harness.mcp.url = 'http://localhost:0'
+    harness.usage_gate = None
+    harness.review_checkpoint = None
+
+    harness._start_escalation_server = AsyncMock()
+    harness._start_merge_worker = AsyncMock()
+    harness._dismiss_stale_escalations = AsyncMock()
+    harness._rehydrate_merge_halt = MagicMock()
+    harness._file_restored_pause_escalation = MagicMock()
+    harness._start_orphan_l0_reaper = MagicMock()
+    harness._start_terminal_status_watcher = MagicMock()
+    harness._start_watcher_supervisor = MagicMock()
+    harness._start_stranded_reconcile = MagicMock()
+    harness._start_main_tip_sweep = MagicMock()
+    harness._start_no_landings_breaker = MagicMock()  # task 1918 loop
+    harness._start_warm_lane_gc = MagicMock()  # task 1926 loop — neutralised
+    harness._tag_task_modules = AsyncMock()
+    harness._recover_crashed_tasks = AsyncMock()
+    harness._reconcile_stranded_in_progress = AsyncMock(return_value=0)
+    harness._enforce_cost_ceilings = AsyncMock()
+
+
+class TestInteractiveReaperStartupSweep:
+    """An unconditional interactive-worktree reaper sweep runs once at
+    ``run()`` startup, independent of the ``warm_lane_gc_enabled``
+    kill-switch — crash recovery on boot must not wait for (or depend on)
+    the periodic cadence loop.
+
+    RED until step-14 GREEN adds the unconditional startup call in run()
+    adjacent to ``_start_warm_lane_gc()``.
+    """
+
+    async def _drive_empty_until_idle_run(
+        self, harness: Harness, monkeypatch,
+    ) -> None:
+        """Drive run() to a clean, immediate exit on a drained empty tree.
+
+        Mirrors TestHarnessRunForever.test_until_idle_empty_tree_exits_cleanly:
+        with until_idle=True and acquire_next always None, the loop breaks
+        on the first completion check without ever reaching idle-sleep.
+        """
+        _neutralise_heavy_startup(harness)
+        harness.scheduler.acquire_next = AsyncMock(return_value=None)
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'1': 'pending'}, None),
+        )
+
+        async def fake_sleep(_secs, *args, **kwargs):
+            return
+
+        monkeypatch.setattr('orchestrator.harness.asyncio.sleep', fake_sleep)
+
+        await harness.run(
+            prd_path=None, dry_run=False, force_dirty_start=True,
+            until_idle=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_startup_sweep_runs_once_when_gc_enabled(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The baseline case: gc_enabled=True (default) still gets exactly
+        one startup sweep — distinct from (and in addition to) the periodic
+        cadence, which never fires here since _start_warm_lane_gc is
+        neutralised to a MagicMock no-op."""
+        harness, _rs = _make_harness(tmp_path)
+        harness.config.warm_lane_gc_enabled = True
+        mock_pass = AsyncMock(return_value=None)
+        harness._run_interactive_worktree_reaper_pass = mock_pass
+
+        await self._drive_empty_until_idle_run(harness, monkeypatch)
+
+        mock_pass.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_startup_sweep_runs_even_when_gc_disabled(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Crash-recovery sweep at boot is independent of the periodic-cadence
+        kill-switch: a crash-leaked _iact-* worktree must still be reaped on
+        boot even when warm_lane_gc_enabled=False disables the loop."""
+        harness, _rs = _make_harness(tmp_path)
+        harness.config.warm_lane_gc_enabled = False
+        mock_pass = AsyncMock(return_value=None)
+        harness._run_interactive_worktree_reaper_pass = mock_pass
+
+        await self._drive_empty_until_idle_run(harness, monkeypatch)
+
+        mock_pass.assert_awaited_once()
