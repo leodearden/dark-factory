@@ -18,13 +18,15 @@ from pathlib import Path
 
 from _orch_helpers import make_placeholder_future
 
+from orchestrator.config import OrchestratorConfig
+
 
 def test_merge_types_exports_moved_public_symbols() -> None:
     from orchestrator.merge_types import (
         GroupMergeRequest,
         InflightEntry,
-        InflightVerifyResult,
         InFlightMergeRegistry,
+        InflightVerifyResult,
         MainHealthAutoHealRegistry,
         MergeBounceRegistry,
         MergeDispatchResult,
@@ -119,7 +121,7 @@ def test_merge_queue_reexports_identical_objects() -> None:
         pre_rebased=False,
         task_files=None,
         module_configs=[],
-        config=None,
+        config=OrchestratorConfig(),
         result=make_placeholder_future(),
     )
     assert request.task_id == 't1'
