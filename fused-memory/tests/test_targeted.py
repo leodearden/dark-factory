@@ -1855,3 +1855,40 @@ async def test_on_task_done_suppresses_stale_description_when_authoritative_memo
 
     # (d) completion-fact audit action is preserved
     assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_fails_open_when_metadata_query_raises(
+    reconciler, mock_memory_service,
+):
+    """A Mem0/Qdrant hiccup during the authoritative-memory pre-check must never
+    drop the completion echo — it must fail open and preserve the current
+    description-appended behavior, exactly as if no authoritative memory existed."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(
+        side_effect=RuntimeError('qdrant down'),
+    )
+
+    result = await reconciler.reconcile_task(
+        task_id='7', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '7', 'title': 'T', 'status': 'in-progress', 'description': 'DESC text'},
+    )
+
+    # (a) the fast-path completion fact WAS written despite the query error
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1, 'Expected a fast-path add_memory call despite the query error'
+    first_call = calls[0]
+
+    # (b) fail-open preserves the current description-appended behavior
+    content = first_call.kwargs.get('content')
+    assert content is not None and 'DESC text' in content, (
+        f'Expected fail-open content to still contain the description, got: {content!r}'
+    )
+
+    # (c) no suppression flag on fail-open
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert 'echo_suppressed_stale_description' not in metadata, (
+        f'fail-open write must not carry the suppression flag, got metadata: {metadata}'
+    )
+
+    # (d) completion-fact audit action is preserved
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
