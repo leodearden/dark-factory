@@ -11147,6 +11147,74 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected live task id in section; got section:\n{section_body!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_live_workflow_signals_section_drops_orchestrator_signal_for_deferred_task(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """A deferred task's ONLY live signal (the project-wide orchestrator lock) is
+        dropped by the status-aware detector, so it is NOT listed under Live-Workflow
+        Signals — while a pending task with the same (orchestrator-only) evidence IS
+        still listed, because a live orchestrator legitimately means "don't race the
+        pipeline" for a dispatch-eligible task.
+
+        Drives the REAL (status-aware) detect_live_workflow — does NOT monkeypatch
+        it — to prove the renderer actually threads task status through to the
+        detector rather than just filtering elsewhere.
+        """
+        import subprocess
+
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        deferred_task_id = '452'
+        pending_task_id = '100'
+        deferred_task = {
+            'id': int(deferred_task_id), 'title': 'Deferred task', 'status': 'deferred',
+        }
+        pending_task = {
+            'id': int(pending_task_id), 'title': 'Pending task', 'status': 'pending',
+        }
+
+        # Project-wide orchestrator lock reports live...
+        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+
+        # ...and both git-derived signals are False for every branch (no worktree
+        # registered, unparseable "commit timestamp" => recent_commit fail-safe
+        # False), so orchestrator_live is the ONLY signal in play for both tasks.
+        def _no_git_signals(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout='worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n',
+                stderr='',
+            )
+
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        stage.filtered_task_tree = self._make_filtered_tree_with_tasks(
+            [deferred_task, pending_task]
+        )
+
+        with patch('subprocess.run', side_effect=_no_git_signals):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Live-Workflow Signals' in payload, (
+            f"Expected '### Live-Workflow Signals' section (pending task is live via "
+            f"the orchestrator signal); got snippet:\n{payload[-500:]!r}"
+        )
+        section_start = payload.find('### Live-Workflow Signals')
+        section_end = payload.find('\n#', section_start + 1)
+        section_body = payload[section_start:section_end if section_end != -1 else None]
+
+        assert f'task/{pending_task_id}' in section_body, (
+            f"Expected pending task 100 (status still eligible for the orchestrator "
+            f"signal) listed; got section:\n{section_body!r}"
+        )
+        assert f'task/{deferred_task_id}' not in section_body, (
+            f"Expected deferred task 452 NOT listed — its only signal (the "
+            f"project-wide orchestrator lock) must be dropped for a never-dispatched "
+            f"status; got section:\n{section_body!r}"
+        )
+
 
 class TestEnforceStage2SummaryPoolCap:
     """_enforce_stage2_summary_pool_cap trims oldest pool members to cap=2."""
