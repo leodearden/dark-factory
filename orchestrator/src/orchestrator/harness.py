@@ -3732,8 +3732,12 @@ Output JSON matching the schema. Every task must appear in the output.
         calls this directly.
 
         Logs one INFO line per reaped record naming slug/branch/reason — the
-        per-worktree half of the I2 user-observable signal. Failure logging
-        is a bounded one-line ``logger.error`` summary — NOT
+        per-worktree half of the I2 user-observable signal — plus a summary
+        INFO line with the total count (mirroring
+        ``prune_stale_merge_worktrees``'s "removed N" summary) when at least
+        one worktree was reaped. When none were reaped, logs at DEBUG
+        instead, to avoid noise on the ~144 ticks/day cadence. Failure
+        logging is a bounded one-line ``logger.error`` summary — NOT
         ``logger.exception`` — matching ``_warm_lane_gc_loop``'s rationale
         (unbounded traceback formatting can exceed per-test timeouts).
 
@@ -3746,6 +3750,16 @@ Output JSON matching the schema. Every task must appear in the output.
                 logger.info(
                     'Reaped interactive worktree %s (branch=%s, reason=%s)',
                     record.slug, record.branch, record.reason,
+                )
+            if reaped:
+                logger.info(
+                    'Interactive-worktree reaper: reaped %d worktree(s): %s',
+                    len(reaped),
+                    ', '.join(record.slug for record in reaped),
+                )
+            else:
+                logger.debug(
+                    'Interactive-worktree reaper: no worktrees reaped',
                 )
         except Exception as exc:
             logger.error(
