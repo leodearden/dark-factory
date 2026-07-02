@@ -102,6 +102,24 @@ def log(msg: str) -> None:
     )
 
 
+class _JournalLog:
+    """Route ``.warning(...)`` through the systemd-cat ``log()`` helper (single
+    'orchestrator-watchdog' tag).
+
+    Itself fail-soft: a journald-write failure must never convert a probe's
+    return-None contract into a raised exception.
+    """
+
+    def warning(self, msg: str) -> None:
+        try:
+            log(f"WARNING: {msg}")
+        except Exception:  # noqa: BLE001 -- logging must never break a fail-soft probe
+            pass
+
+
+logger = _JournalLog()
+
+
 def probe_port(port: int) -> bool:
     """Return True iff a process is listening on *port* (TCP, local).
 
@@ -355,7 +373,11 @@ def _unit_start_epoch(unit: str) -> int | None:
                 return None  # unit has never started (or no PID recorded)
             return epoch
         return None
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_unit_start_epoch({unit!r}): swallowed {exc!r}; "
+            "returning None (staleness undeterminable this tick)"
+        )
         return None
 
 
@@ -401,7 +423,11 @@ def _newest_watched_commit_epoch() -> int | None:
             return int(stdout)
         except ValueError:
             return None
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"_newest_watched_commit_epoch: swallowed {exc!r}; "
+            "returning None (staleness undeterminable this tick)"
+        )
         return None
 
 
