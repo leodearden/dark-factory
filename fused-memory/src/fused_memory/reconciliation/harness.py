@@ -2410,6 +2410,28 @@ class ReconciliationHarness:
             else await self._fetch_filtered_task_tree(project_root)
         )
 
+        # Task 2031: {str(task_id): status} map derived from remediation_tree, used
+        # by the live-workflow gate below so never-dispatched cited tasks
+        # (deferred/done/cancelled) drop the project-wide orchestrator_live signal
+        # instead of being suppressed by it. remediation_tree is always a valid
+        # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+        # Coverage caveat: active_tasks is uncapped (deferred — the cited case —
+        # always resolves), but done_tasks/cancelled_tasks are capped at
+        # MAX_DONE_TASKS_RETAINED=30 / MAX_CANCELLED_TASKS_RETAINED=15
+        # (task_filter.py). A cited done/cancelled task outside those caps, or one
+        # with an untracked status, is simply absent here and status_by_id.get(tid)
+        # falls back to None below — the pre-2031 status-blind behavior for that
+        # one id, not a new failure mode.
+        status_by_id: dict[str, str | None] = {
+            str(t.get('id')): t.get('status')
+            for t in (
+                list(remediation_tree.active_tasks)
+                + list(remediation_tree.done_tasks)
+                + list(remediation_tree.cancelled_tasks)
+            )
+            if isinstance(t, dict) and t.get('id') is not None
+        }
+
         current_stage_name: str | None = None
         stages = self._make_stages()
         try:
@@ -2544,6 +2566,10 @@ class ReconciliationHarness:
                         # finishes — so genuine stranded cases (all signals False) still
                         # escalate.  Guard detector errors as not-live (fail toward escalating
                         # rather than toward silencing a genuine stranded-work escalation).
+                        # Task 2031: cited tasks in a never-dispatched status
+                        # (deferred/done/cancelled, via status_by_id above) drop the
+                        # project-wide orchestrator_live signal, so a deferred task stuck
+                        # behind an unrelated live orchestrator still escalates.
                         affected_ids = _derive_affected_ids(finding)
                         # For liveness, iterate only cited task ids.
                         # _derive_affected_ids mixes in entity canonical_names,
@@ -2559,7 +2585,9 @@ class ReconciliationHarness:
                         any_live = False
                         for tid in cited_task_ids:
                             try:
-                                if is_workflow_live_for_task(tid, project_root):
+                                if is_workflow_live_for_task(
+                                    tid, project_root, status=status_by_id.get(tid)
+                                ):
                                     any_live = True
                                     break
                             except Exception as _det_exc:

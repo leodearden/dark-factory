@@ -838,11 +838,13 @@ async def test_timeout_marks_run_failed(journal, event_buffer, mock_memory_servi
     # re-raises TimeoutError.  A fixed sub-100ms sleep races those background writes and
     # starves under full-suite CPU contention.  Polling returns as soon as cleanup lands
     # (~ms in isolation) and only fails after a generous deadline — eliminating the race
-    # rather than widening it.  5s is ~100× the normal sub-50ms cleanup latency yet far
-    # below the 60s global thread-method pytest-timeout (pyproject.toml).
-    # De-flake precedent: task 1836 commit b12a5ffeb9.
+    # rather than widening it.  30s is well below the 60s global thread-method
+    # pytest-timeout (pyproject.toml) yet gives real headroom over the sub-50ms
+    # cleanup latency; 5s was measured to still starve (and fail this assertion)
+    # under `-n auto` worker contention.
+    # De-flake precedent: task 1836 commit b12a5ffeb9 (same 10s->30s pattern).
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 5.0
+    deadline = loop.time() + 30.0
     recent_runs = []
     run = None
     stats = None
@@ -7159,6 +7161,135 @@ async def test_live_workflow_gate_allows_escalation_when_task_is_not_live(
     assert len(stranded_escalations) >= 1, (
         f'Expected escalation for genuinely stranded task (not live); '
         f'got pending: {[e.summary for e in pending]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_workflow_gate_threads_task_status_for_deferred_cited_task(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    """_run_remediation_pass must thread the cited task's status into
+    is_workflow_live_for_task so a DEFERRED task (never actively dispatched)
+    whose only live signal would be the project-wide orchestrator lock is NOT
+    treated as live — the persistently-unresolved escalation FIRES instead of
+    being suppressed.
+
+    Regression test for the autopilot_video task-452 case (task 2031): a
+    deferred, human-review-pending task with no worktree/commit evidence was
+    suppressed from escalation purely because the orchestrator was busy on an
+    unrelated task. The fake is_workflow_live_for_task below returns False
+    ONLY when it receives status='deferred' — so this test passes only if the
+    harness actually forwards the cited task's status (sourced from
+    remediation_tree) rather than calling the detector with no status.
+    """
+    import uuid as _uuid
+
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.reconciliation.harness as harness_module
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    task_id = '452'
+    actionable_finding = _make_finding_with_cited_task(task_id)
+
+    # remediation_tree is built (inside _run_remediation_pass) from
+    # taskmaster.get_tasks — populate it with the deferred cited task so the
+    # harness has a status to look up and forward.
+    harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+        'tasks': [
+            {'id': 452, 'title': 'Deferred task', 'status': 'deferred', 'dependencies': []},
+        ]
+    }
+
+    # Fake detector: reports "live" for anything EXCEPT status='deferred'.
+    # A pre-fix call site passes no status kwarg, so kw.get('status') is None,
+    # `None not in (...)` is True (live) — which would suppress the escalation
+    # and fail this test, proving the harness must forward the real status.
+    received_statuses: list[str | None] = []
+
+    def _fake_is_live(_tid, _pr, **kw):
+        received_statuses.append(kw.get('status'))
+        return kw.get('status') not in ('deferred', 'done', 'cancelled')
+
+    monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _fake_is_live)
+
+    # Seed N-2 prior completed runs so persistence reaches threshold.
+    n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
+    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+    for i in range(n_seed):
+        rid = str(_uuid.uuid4())
+        run = ReconciliationRun(
+            id=rid,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:1',
+            started_at=base_time + timedelta(minutes=i),
+            events_processed=1,
+            status=RunStatus.running,
+        )
+        await journal.start_run(run)
+        await journal.update_run_stage_reports(
+            rid, {'integrity_check': {'items_flagged': [actionable_finding]}}
+        )
+        await journal.complete_run(rid, 'completed')
+
+    await event_buffer.push(_make_event())
+
+    async def s3_returns_finding(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[actionable_finding],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    harness.stages[2].run = s3_returns_finding
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # (a) Escalation MUST be emitted — the deferred task's project-wide
+    # orchestrator signal must not suppress it.
+    pending = esc_queue.get_pending()
+    stranded_escalations = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue'
+        and 'Persistently unresolved' in e.summary
+    ]
+    assert len(stranded_escalations) >= 1, (
+        f'Expected an escalation for the deferred cited task (status must be '
+        f'forwarded so the project-wide orchestrator signal is dropped); '
+        f'got pending: {[e.summary for e in pending]}'
+    )
+
+    # (b) No suppression log fired for task 452.
+    suppressed_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.integrity_escalation_suppressed_live_workflow'
+    ]
+    assert suppressed_records == [], (
+        f'Expected NO suppression log for the deferred task; got affected_ids: '
+        f'{[r.__dict__.get("affected_ids") for r in suppressed_records]}'
+    )
+
+    # (c) The harness actually forwarded status="deferred" to the detector.
+    assert 'deferred' in received_statuses, (
+        f'Expected is_workflow_live_for_task to receive status="deferred" for '
+        f'task 452; got received_statuses={received_statuses!r}'
     )
 
 

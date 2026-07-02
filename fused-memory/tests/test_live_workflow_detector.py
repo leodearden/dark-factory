@@ -391,3 +391,94 @@ class TestConvenienceWrapper:
             )
 
         assert live is True
+
+
+# ---------------------------------------------------------------------------
+# Status-scoped orchestrator_live signal
+# ---------------------------------------------------------------------------
+
+
+class TestStatusScopedOrchestratorSignal:
+    """detect_live_workflow(status=...) suppresses the project-wide orchestrator_live
+    signal for statuses that are never actively dispatched (deferred/done/cancelled),
+    while the per-task worktree_registered/recent_commit signals remain unaffected.
+    """
+
+    def _no_worktree_no_commit_side_effect(self):
+        """subprocess.run side_effect driving both git signals False."""
+        def side_effect(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_no_branch(), stderr=''
+            )
+        return side_effect
+
+    @pytest.mark.parametrize('status', ['deferred', 'done', 'cancelled'])
+    def test_ineligible_status_suppresses_orchestrator_signal(self, tmp_path, status):
+        """Ineligible statuses force orchestrator_live False even when _orchestrator_live=True.
+
+        Both git signals are False, so is_live=False proves the project-wide
+        orchestrator lock is not being consulted at all for these statuses.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert result.is_live is False
+
+    @pytest.mark.parametrize(
+        'status', ['pending', 'in-progress', 'blocked', 'review', 'merge-deferred']
+    )
+    def test_non_ineligible_status_preserves_orchestrator_signal(self, tmp_path, status):
+        """Non-ineligible statuses leave the project-wide orchestrator_live signal intact."""
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), status=status, _orchestrator_live=True
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    def test_status_none_preserves_orchestrator_signal_backward_compatible(self, tmp_path):
+        """status=None (the default) is backward-compatible: signal is unaffected."""
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), _orchestrator_live=True
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    def test_ineligible_status_does_not_suppress_worktree_signal(self, tmp_path):
+        """A deferred task with a REGISTERED worktree is still live — per-task evidence wins."""
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=_worktree_porcelain_with_branch(_BRANCH), stderr=''
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr=''
+            )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), status='deferred', _orchestrator_live=True
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_registered is True
+        assert result.is_live is True
+
+    def test_is_workflow_live_for_task_forwards_status(self, tmp_path):
+        """is_workflow_live_for_task forwards status through to detect_live_workflow."""
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            live = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path), status='deferred', _orchestrator_live=True
+            )
+
+        assert live is False

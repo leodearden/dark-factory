@@ -1855,6 +1855,12 @@ def _render_live_workflow_section(
     Detector errors per task are swallowed and logged at WARNING level (the task
     is treated as not-live for that call — fail-safe, matching the harness gate).
 
+    Each task's ``status`` is forwarded to the detector, so never-dispatched
+    statuses (deferred/done/cancelled — see
+    :data:`~fused_memory.services.live_workflow_detector.ORCH_LIVE_INELIGIBLE_STATUSES`)
+    drop the project-wide orchestrator_live signal for that task while leaving
+    its per-task worktree/commit signals unaffected.
+
     Args:
         tasks: Task dicts from the active/proactive-sample pool.  Only tasks
             with a parseable ``id`` are inspected (non-int ids are skipped).
@@ -1889,7 +1895,9 @@ def _render_live_workflow_section(
             continue
         task_id = str(raw_id)
         try:
-            liveness = detect_live_workflow(task_id, project_root, **kwargs)
+            liveness = detect_live_workflow(
+                task_id, project_root, status=task.get('status'), **kwargs
+            )
         except Exception:
             logger.warning(
                 'reconciliation._render_live_workflow_section: '
