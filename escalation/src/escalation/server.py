@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -1300,6 +1301,65 @@ def create_server(
             'warm': info.warm,
             'base_ref': info.base_ref,
         }
+
+    @mcp.tool()
+    async def release_warm_worktree(path_or_branch: str, project_root: str) -> dict[str, Any]:
+        """Release an interactive warm-worktree claimed via claim_warm_worktree.
+
+        *path_or_branch* accepts either shape claim_warm_worktree returned: an
+        absolute worktree ``path``, or the ``task/<slug>`` ``branch`` name
+        (bare ``<slug>`` is also accepted). An existing directory is treated
+        as path-mode; anything else is treated as branch-mode.
+
+        *project_root* is validated exactly like claim_warm_worktree's guard.
+
+        Runs ``git worktree remove --force`` + ``git worktree prune``
+        directly (task α added no removal primitive, and
+        ``GitOps.release_warm_lane`` is unusable here — it mutates
+        WarmLanePool, violating isolation invariant I1: interactive
+        worktrees never touch the dispatch/speculation pools).
+
+        Returns ``{removed, path, branch}``. ``removed`` is False (not an
+        error) when the target was already gone — idempotent, safe to call
+        from a session-end hook after the δ reaper already cleaned up.  A
+        standalone server or a ``project_root`` mismatch returns ``{error}``
+        instead, and removes nothing.
+        """
+        if harness is None or getattr(harness, 'git_ops', None) is None:
+            return {'error': 'escalation server running standalone — no harness wired'}
+        mismatch = _require_matching_project_root(harness, project_root)
+        if mismatch is not None:
+            return {'error': mismatch}
+
+        gops = harness.git_ops
+        candidate = Path(path_or_branch)
+        if candidate.is_dir():
+            path = candidate.resolve()
+            stamp_path = path / '.task' / 'interactive.json'
+            if stamp_path.exists():
+                branch = json.loads(stamp_path.read_text())['branch']
+            else:
+                branch = (
+                    f'{gops.config.branch_prefix}'
+                    f'{path.name.removeprefix(gops.config.iact_prefix)}'
+                )
+        else:
+            branch = path_or_branch
+            if not branch.startswith(gops.config.branch_prefix):
+                branch = f'{gops.config.branch_prefix}{branch}'
+            slug = branch.removeprefix(gops.config.branch_prefix)
+            path = gops.worktree_base / f'{gops.config.iact_prefix}{slug}'
+
+        # Runtime-only reverse import — mirrors claim_warm_worktree above.
+        from orchestrator.git_ops import _run  # type: ignore[reportMissingImports]
+
+        rc, _, _ = await _run(
+            ['git', 'worktree', 'remove', '--force', str(path)], cwd=gops.project_root,
+        )
+        await _run(['git', 'worktree', 'prune'], cwd=gops.project_root)
+        removed = rc == 0
+
+        return {'removed': removed, 'path': str(path), 'branch': branch}
 
     # ── merge_status — read-only lifecycle probe (PRD α3 / task 1630) ──────────
 
