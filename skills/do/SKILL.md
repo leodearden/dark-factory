@@ -37,7 +37,10 @@ Write it to the plan file named in the plan-mode system message. Write for a rea
 - **Implementation** — ordered, concrete steps. Name files and functions wherever you already know them.
 - **Verification** — how to confirm it actually works: which tests / lint / type-check to run, or what behavior to observe.
 - **Execution protocol** — include this, adapted to the task. It is the user's fixed recipe and must live *inside* the plan, because the prompt that asked for it won't survive the context clear:
-  1. Do all the work in a **git worktree** — call `EnterWorktree`. Name it so the resulting branch follows the `task/<short-slug>` convention `/merge-queue` expects; rename the branch if EnterWorktree's default doesn't match.
+  1. Do all the work in a **git worktree**, preferring a **warm claim** over a cold one:
+     - First try `mcp__escalation__claim_warm_worktree(slug="<short-slug>", project_root="<the project's main-checkout root, e.g. git rev-parse --show-toplevel / CLAUDE.md project_root>")` on the project's escalation MCP.
+     - **Success** (`{path, branch, warm, base_ref}`): `cd` into `path` — it's already checked out on the `task/<slug>` branch `/merge-queue` expects, so skip `EnterWorktree` and skip any branch rename. Surface `warm`/`base_ref` to the user. If `warm` is `false`, that's still a **fail-soft success** — use the worktree as-is and just note the build cache is cold; do NOT fall back to a cold worktree for this.
+     - **Escalation MCP unreachable, or any `{error}` / `{error, reason}` return** (`reason` ∈ `interactive_worktree_limit`, `invalid_slug`, `git_failure`; or a bare `{error}` when the server is standalone or `project_root` doesn't match): explicitly note the fallback — never fail silently — and fall back to the cold path exactly as before: call `EnterWorktree`. Name it so the resulting branch follows the `task/<short-slug>` convention `/merge-queue` expects; rename the branch if EnterWorktree's default doesn't match.
   2. Implement the plan in the worktree and run the verification above until it passes.
   3. Run **`/merge-queue`** to land the branch on main. It auto-detects whether the orchestrator is running and routes the merge safely either way.
   4. Run **`/reflect`** to capture the decisions and discoveries from the implementation to memory.
