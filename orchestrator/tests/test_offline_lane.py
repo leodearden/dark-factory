@@ -974,3 +974,63 @@ def test_infra_seams_injected_or_default(tmp_path: Path):
         worker_default.infra_confirmation_runner
         == worker_default._default_infra_confirmation_run
     )
+
+
+# ---------------------------------------------------------------------------
+# Default infra-runner seam (task 1959, IE1, step-5/6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: Path):
+    """The default (uninjected) infra_runner seam builds reify's H9 invocation.
+
+    No infra_runner is supplied, so the worker falls back to its
+    ``_default_run_infra`` seam. ``asyncio.create_subprocess_exec`` is
+    mocked, so this asserts ONLY that the argv/env/cwd invocation is built
+    correctly — real script existence/execution on reify main is
+    cross-project scope (see module docstring), mirroring
+    ``test_default_suite_runner_builds_run_offline_deep_command``.
+
+    NO ``--test-threads``: the host-exclusive set self-serializes under
+    H9's own flock (IE-D2).
+
+    Step 5 (RED): _default_run_infra is a NotImplementedError stub — must
+    fail before impl.
+    """
+    worker = _make_worker(tmp_path)  # no infra_runner injected -> default seam
+    wt_path = tmp_path / '_offline-deep'
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'infra output\n', b''))
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        rc, tail = await worker.infra_runner(wt_path, 'HEAD1', 6)
+
+    assert rc == 0
+    assert 'infra output' in tail
+
+    mock_exec.assert_awaited_once()
+    argv = mock_exec.call_args.args
+    kwargs = mock_exec.call_args.kwargs
+    assert list(argv) == ['tests/infra/run_all.sh', '--scope', 'host-infra'], (
+        'argv must invoke reify H9 with the host-infra scope and NO '
+        '--test-threads (the set self-serializes under its own flock)'
+    )
+    assert kwargs['cwd'] == str(wt_path), 'cwd must be the _offline-deep worktree'
+    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
+        'DF_VERIFY_ROLE=offline must be set, same as the numeric sub-run'
+    )
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
+            f'not replace it (missing/altered {key!r})'
+        )
+    assert kwargs['stdout'] == asyncio.subprocess.PIPE
+    assert kwargs['stderr'] == asyncio.subprocess.STDOUT
