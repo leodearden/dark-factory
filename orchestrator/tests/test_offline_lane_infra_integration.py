@@ -73,7 +73,7 @@ import asyncio
 import contextlib
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -545,3 +545,108 @@ async def test_ib1_advance_triggers_from_head_infra_sub_run(
     assert 'offline-lane: on_post_merge' in caplog.text
     assert base_sha[:12] in caplog.text
     assert head_sha[:12] in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# IB2 — never a gate (C7/§6, load-bearing): infra sub-run in-flight
+# ---------------------------------------------------------------------------
+
+
+async def _assert_infra_never_a_gate(
+    harness: Harness,
+    worker: OfflineLaneWorker,
+    runner: _ControllableInfraRunner,
+    repo: Path,
+    git_ops: GitOps,
+) -> None:
+    """Assert the never-a-gate invariant (C7/§6) while an INFRA run is held in-flight.
+
+    Called with the FIRST infra pass already confirmed in-flight (the
+    caller awaited ``runner.wait_entered()``) and released only after this
+    returns, so the bounded ``wait_for`` below proves the synchronous
+    on_merge_landed fan-out never blocks on it.
+
+    Adapts ``test_offline_lane_integration.py``'s ``_assert_never_a_gate``
+    for the infra seam — same four assertions, held on the INFRA sub-run
+    in-flight rather than the numeric one:
+
+    (1)+(2) ``harness._note_merge_all`` — the exact ``on_merge_landed``
+    callback ``SpeculativeMergeWorker`` invokes (``harness.py:4979``) —
+    must return promptly and must set ``worker._dirty`` (arming a
+    coalesced re-run).
+    (3) A raising notifiee is fail-open: ``_note_offline_lane``'s own
+    try/except (``harness.py:5072-5079``) swallows it — the SAME shape
+    ``SpeculativeMergeWorker`` independently wraps this exact call in
+    (``merge_queue.py:10578-10596``, belt-and-suspenders) — so the merge
+    still lands (proven behaviorally below via the service-restart
+    coordinator fan-out still running, NOT by log text).
+    (4) Neither case ever halts the merge queue or files an escalation —
+    the only halt/gate-adjacent side effects reachable from this call path.
+    """
+    assert harness.get_merge_halt_status() == {'wired': False}
+
+    base_sha = await git_ops.get_main_sha()
+    head_sha = await _advance_main(repo)
+    await asyncio.wait_for(
+        harness._note_merge_all('task-2', base_sha, head_sha),
+        timeout=0.5,
+    )
+    assert worker._dirty is True, (
+        'a landed advance during an in-flight infra run must arm a coalesced re-run'
+    )
+    assert harness.get_merge_halt_status() == {'wired': False}
+    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
+
+    async def _raising_notifiee(task_id: str, base: str, head: str) -> None:
+        await worker.on_post_merge(task_id, base, head)
+        raise RuntimeError('infra lane boom')
+
+    harness._offline_lane_notifiee = _raising_notifiee
+    coord = MagicMock()
+    coord.note_merge = AsyncMock()
+    harness._service_restart_coordinators = [coord]
+
+    base2 = head_sha
+    head2 = await _advance_main(repo)
+    await harness._note_merge_all('task-3', base2, head2)  # must not raise
+
+    # Fail-open is proven behaviorally: the merge still landed and ran the
+    # service-restart coordinator fan-out despite the raising notifiee.
+    coord.note_merge.assert_awaited_once_with(
+        'task-3',
+        base2,
+        head2,
+        prefetched_diff=[],
+    )
+    assert harness.get_merge_halt_status() == {'wired': False}
+    assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
+
+
+@pytest.mark.asyncio
+async def test_ib2_infra_run_in_flight_never_gates_merge(harness, git_ops, repo, tmp_path):
+    """IB2 (C7/§6, load-bearing) — a merge-landed notification while the
+    INFRA sub-run is in-flight must never gate the merge: it returns
+    promptly (never blocks the synchronous notifiee call on the in-flight
+    infra run), sets _dirty for a coalesced re-run, is fail-open when the
+    notifiee raises, and never files an escalation (the only halt/gate-
+    adjacent side-effect reachable from this call path).
+
+    The numeric suite_runner returns green immediately (the
+    :func:`_build_infra_worker` default), so the numeric leg completes and
+    the INFRA leg is the one held in-flight by :class:`_ControllableInfraRunner`.
+
+    Negative control: any inline/blocking infra run on the notifiee path,
+    or a halt/escalation reachable from this call path, makes this RED.
+    """
+    runner = _ControllableInfraRunner()
+    worker = _build_infra_worker(git_ops, tmp_path, infra_runner=runner)
+    _wire_lane(harness, worker)
+
+    await _drive_advance(harness, repo)
+    lane_task = asyncio.create_task(_run_lane(worker, expected_passes=1))
+    await runner.wait_entered()
+
+    await _assert_infra_never_a_gate(harness, worker, runner, repo, git_ops)
+
+    runner.release()
+    await lane_task
