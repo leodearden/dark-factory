@@ -13751,3 +13751,217 @@ class TestRunStage2SummaryReconstructionWiring:
         assert verify_mock.await_count == 2
         assert report.stats['stage2_cycle_summary_reconstructed'] == 1
         assert report.stats['stage2_cycle_summary_verified_count'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 2029 scenario (b) — TaskKnowledgeSync acknowledges Stage-1
+# stage1_flag_marker records for flags Stage 2 resolved via FIX C deletion,
+# by tagging addressed_by=<run_id> (mode='tag') rather than deleting them.
+#
+# RED until step-10 adds _acknowledge_resolved_stage1_markers to
+# task_knowledge_sync.py and wires it into assemble_payload (combined_flags
+# stash) and _apply_post_flight_guards (near Guard 4b).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcknowledgeResolvedStage1Markers:
+    """RED tests for the new _acknowledge_resolved_stage1_markers helper (step-9A).
+
+    RED until step-10 adds _acknowledge_resolved_stage1_markers to
+    task_knowledge_sync.py.
+    """
+
+    async def test_joins_on_flag_id_and_delegates_matched_signatures(self, monkeypatch):
+        """Joins flag_deleted_records against rendered_flags on flag_id. F1 has
+        action='flag_deleted' and matches a rendered flag -> forwarded. F2 has
+        no 'action' key at all (any dict carrying flag_id is a candidate) but
+        has no matching rendered flag (only F1/F3 are rendered) -> skipped.
+        acknowledge_resolved_flags is called once with mode='tag' and only the
+        matched (task_id, flag_type)-bearing flag; result is its return value.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_mod
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _acknowledge_resolved_stage1_markers,
+        )
+
+        ack_mock = AsyncMock(return_value=1)
+        monkeypatch.setattr(tks_mod, 'acknowledge_resolved_flags', ack_mock)
+
+        memory_service = AsyncMock()
+        flag_deleted_records = [
+            {'action': 'flag_deleted', 'flag_id': 'F1'},
+            {'flag_id': 'F2'},
+        ]
+        rendered_flags = [
+            {'flag_id': 'F1', 'task_id': '7', 'flag_type': 'x'},
+            {'flag_id': 'F3', 'task_id': '9', 'flag_type': 'y'},
+        ]
+
+        result = await _acknowledge_resolved_stage1_markers(
+            memory_service, 'p', 'r1', flag_deleted_records, rendered_flags,
+        )
+
+        assert result == 1
+        ack_mock.assert_awaited_once()
+        call_args = ack_mock.await_args.args
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'tag'
+        assert call_args[0] is memory_service
+        assert call_args[1] == 'p'
+        assert call_args[2] == 'r1'
+        resolved = call_args[3]
+        assert len(resolved) == 1, f'expected only the F1 match forwarded; got {resolved!r}'
+        assert resolved[0]['task_id'] == '7'
+        assert resolved[0]['flag_type'] == 'x'
+
+    async def test_malformed_or_absent_flag_deleted_records_returns_zero_no_call(
+        self, monkeypatch,
+    ):
+        """None / non-list / empty flag_deleted_records short-circuits to 0
+        with no acknowledge_resolved_flags call."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_mod
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _acknowledge_resolved_stage1_markers,
+        )
+
+        ack_mock = AsyncMock(return_value=1)
+        monkeypatch.setattr(tks_mod, 'acknowledge_resolved_flags', ack_mock)
+
+        memory_service = AsyncMock()
+        rendered_flags = [{'flag_id': 'F1', 'task_id': '7', 'flag_type': 'x'}]
+
+        for malformed in (None, 'not-a-list', []):
+            result = await _acknowledge_resolved_stage1_markers(
+                memory_service, 'p', 'r1', malformed, rendered_flags,
+            )
+            assert result == 0, f'expected 0 for flag_deleted_records={malformed!r}, got {result!r}'
+
+        ack_mock.assert_not_called()
+
+
+class TestTaskKnowledgeSyncStage2FlagMarkersAcknowledgedStat:
+    """TaskKnowledgeSync.run() sets report.stats['stage2_flag_markers_acknowledged']
+    from _acknowledge_resolved_stage1_markers's return value (task-2029 scenario b).
+
+    Monkeypatches the module-level _acknowledge_resolved_stage1_markers helper
+    (step-9A covers its own join/delegate behavior exhaustively) — these tests
+    verify only that run() calls it and threads its count into report.stats.
+    Mirrors TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_stage2_flag_markers_acknowledged_stat_set_after_run(self, mock_deps):
+        """run() calls _acknowledge_resolved_stage1_markers(self.memory,
+        self.project_id, run_id, flag_deleted_records, rendered_flags) and
+        injects its return value into report.stats. Since BaseStage.run is
+        mocked wholesale here, assemble_payload never runs, so rendered_flags
+        falls back to [] (the getattr(self, '_stage2_combined_flags', [])
+        default) — this test asserts that fallback wiring, not the join logic.
+        """
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        flag_deleted_records = [{'action': 'flag_deleted', 'flag_id': 'F1'}]
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'flag_deleted_records': flag_deleted_records},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        ack_mock = AM(return_value=2)
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._acknowledge_resolved_stage1_markers',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert report.stats.get('stage2_flag_markers_acknowledged') == 2
+        ack_mock.assert_awaited_once()
+        call_args = ack_mock.await_args.args
+        assert call_args[0] is mock_deps['memory_service']
+        assert call_args[1] == 'reify'
+        assert call_args[2] == 'test-run'
+        assert call_args[3] == flag_deleted_records
+        assert call_args[4] == []
+
+    @pytest.mark.asyncio
+    async def test_stage2_flag_markers_acknowledged_stat_explicit_zero(self, mock_deps):
+        """When nothing is acknowledged, the stat is 0 — explicitly set, not
+        absent — so downstream consumers never need a .get(..., 0) fallback."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._acknowledge_resolved_stage1_markers',
+                new=AM(return_value=0),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert 'stage2_flag_markers_acknowledged' in report.stats
+        assert report.stats['stage2_flag_markers_acknowledged'] == 0
