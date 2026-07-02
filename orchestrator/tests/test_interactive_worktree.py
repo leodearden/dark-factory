@@ -30,7 +30,6 @@ from orchestrator.git_ops import (
 )
 from orchestrator.warm_lane_pool import LaneState
 
-
 # ---------------------------------------------------------------------------
 # Repo fixture + seed-stub helper (mirrors test_warm_lane_integration_gate.py)
 # ---------------------------------------------------------------------------
