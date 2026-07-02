@@ -704,3 +704,40 @@ async def test_ib3_confirmed_infra_red_files_normal_fix_task_and_info_escalation
 
     # The merge queue itself is left completely untouched by the infra red path.
     assert harness.get_merge_halt_status() == {'wired': False}
+
+
+# ---------------------------------------------------------------------------
+# IB4 — dedup across advances: same-set recurrence updates, never duplicates
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ib4_same_infra_set_recurrence_updates_not_duplicates(
+    harness,
+    git_ops,
+    repo,
+    tmp_path,
+):
+    """IB4 — a SECOND infra-red advance with the SAME failing-test set
+    updates the existing fix task (appends a suspect range) rather than
+    filing a duplicate task or raising a second escalation.
+
+    Confirms the content-agnostic failing-test-set fingerprint from β3
+    dedups infra failures exactly like numeric IDs. Negative control:
+    re-keying on main_sha or filing a duplicate makes this RED.
+    """
+    from orchestrator.workflow import compute_failing_test_set_fingerprint
+
+    failing_ids = ['infra::test_cgroup_burn.sh']
+    worker = _build_infra_worker(git_ops, tmp_path)
+    _wire_lane(harness, worker)
+
+    await _drive_infra_reds(harness, repo, worker, failing_ids, 2)
+
+    cast(AsyncMock, worker.task_client).submit_fix_task.assert_awaited_once()
+    cast(AsyncMock, worker.task_client).append_suspect_range.assert_awaited_once()
+
+    fp = compute_failing_test_set_fingerprint(failing_ids)
+    task_id = worker.open_fix_tasks[fp]
+    escalations = _l0_info_escalations(cast(EscalationQueue, worker.escalation_queue), task_id)
+    assert len(escalations) == 1, 'a same-set recurrence must not raise a second L0 escalation'
