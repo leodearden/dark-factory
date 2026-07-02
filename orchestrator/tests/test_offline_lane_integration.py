@@ -285,3 +285,34 @@ async def test_b1_advance_triggers_from_head_run(harness, git_ops, repo, tmp_pat
     assert 'offline-lane: on_post_merge' in caplog.text
     assert base_sha[:12] in caplog.text
     assert head_sha[:12] in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# B2 — coalescing under a burst of advances
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b2_coalesces_burst_of_advances_to_one_rerun(harness, git_ops, repo, tmp_path):
+    """B2 (PRD §8) — advances landing while a run is in-flight coalesce into
+    exactly ONE re-run at the newest head, never a queue of stale re-runs."""
+    runner = _ControllableSuiteRunner()
+    worker = _build_worker(git_ops, tmp_path, suite_runner=runner)
+    _wire_lane(harness, worker)
+
+    _, first_head = await _drive_advance(harness, repo)
+
+    lane_task = asyncio.create_task(_run_lane(worker, expected_passes=2))
+    await runner.wait_entered()
+
+    newest_head = first_head
+    for _ in range(3):
+        _, newest_head = await _drive_advance(harness, repo)
+
+    runner.release()
+    await lane_task
+
+    assert runner.heads == [first_head, newest_head], (
+        'a burst of advances during an in-flight run must coalesce into '
+        'exactly one re-run at the newest head, never a queue of stale runs'
+    )
