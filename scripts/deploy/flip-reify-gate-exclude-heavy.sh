@@ -16,7 +16,9 @@ set -euo pipefail
 #   flip-reify-gate-exclude-heavy.sh [--check|--dry-run]
 #
 # --check / --dry-run: print the one-line diff that WOULD be applied and
-# exit 0 without touching the repo.
+# exit 0 without touching the repo. If the config is already flipped,
+# --check reports the same "already flipped (no-op)" state as apply
+# instead of the intended-diff line, since applying would change nothing.
 #
 # Env overrides (mirrors restart-orchestrator.sh's RESTART_VERIFY_TIMEOUT):
 #   REIFY_REPO - path to the reify checkout (default: /home/leo/src/reify)
@@ -40,8 +42,12 @@ for arg in "$@"; do
     esac
 done
 
+is_flipped_in() {
+    grep -qE "^[[:space:]]*${KNOB}:[[:space:]]*\"?1\"?[[:space:]]*\$" "$1"
+}
+
 is_flipped() {
-    grep -qE "^[[:space:]]*${KNOB}:[[:space:]]*\"?1\"?[[:space:]]*\$" "$CONFIG_PATH"
+    is_flipped_in "$CONFIG_PATH"
 }
 
 print_intended_diff() {
@@ -61,6 +67,11 @@ apply_flip() {
     # pre-existing knob line (any indentation/value), then insert the
     # canonical line as the first child immediately after the unique
     # top-level `verify_env:` anchor. Single awk pass, atomic mktemp+mv.
+    if ! grep -qE "^verify_env:" "$CONFIG_PATH"; then
+        echo "ERROR: ${CONFIG_PATH} has no top-level verify_env: anchor; refusing to apply a blind edit" >&2
+        exit 1
+    fi
+
     local tmp
     tmp="$(mktemp "${CONFIG_PATH}.XXXXXX")"
     awk -v knob="$KNOB" '
@@ -71,6 +82,17 @@ apply_flip() {
             inserted = 1
         }
     ' "$CONFIG_PATH" > "$tmp"
+
+    if ! is_flipped_in "$tmp"; then
+        rm -f "$tmp"
+        echo "ERROR: failed to insert ${KNOB} into ${CONFIG_PATH}; aborting without committing" >&2
+        exit 1
+    fi
+
+    # Preserve the original file's mode -- mktemp defaults to 0600, which
+    # would otherwise silently reset orchestrator.yaml's permissions on
+    # every flip.
+    chmod --reference="$CONFIG_PATH" "$tmp"
     mv "$tmp" "$CONFIG_PATH"
 }
 
