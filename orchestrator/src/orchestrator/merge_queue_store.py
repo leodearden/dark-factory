@@ -104,10 +104,15 @@ class MergeQueueStore:
         if isinstance(req, GroupMergeRequest):
             return
 
+        # Normalize to the bare canonical shape before persisting (task 2037
+        # fix 2): strip a leading branch_prefix so the journal only ever
+        # holds ONE canonical shape, regardless of what shape the caller
+        # submitted.  removeprefix is a no-op when the branch is already
+        # bare (or the prefix is empty), so this is safe/idempotent.
         persisted = PersistedMergeRequest(
             request_id=req.request_id,
             task_id=req.task_id,
-            branch=req.branch,
+            branch=req.branch.removeprefix(req.config.git.branch_prefix),
             worktree=str(req.worktree),
             pre_rebased=req.pre_rebased,
             task_files=req.task_files,
