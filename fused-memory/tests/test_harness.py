@@ -3566,6 +3566,73 @@ async def test_recover_stale_runs_suppresses_escalation_for_dead_owner_shielded(
     )
 
 
+# ── instance_id threading spy test (task 2039) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_passes_dead_owner_instance_id_to_storm_counter(
+    journal, event_buffer, mock_memory_service,
+):
+    """_recover_stale_runs() must thread the dead owner's instance_id into
+    _record_dead_owner_suppression(), not just project_id (task 2039).
+
+    Regression for esc-recon-50da2482-1: a single multi-project restart
+    recovers one dead_owner_shielded orphan per project, all left by the SAME
+    prior (dead) instance.  The storm counter can only distinguish "1 dead
+    owner, N projects" (benign restart) from "N distinct dead owners" (real
+    storm) if it is given the dead owner's instance_id alongside project_id.
+    Today's call site only passes project_id, so this spy test is RED against
+    it.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    harness._record_dead_owner_suppression = MagicMock(return_value=None)
+
+    project_id = 'project-instance-thread-test'
+    cutoff = harness.config.stale_run_recovery_seconds  # 1800s
+
+    run = ReconciliationRun(
+        id='run-instance-thread-0001',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='unit-test-instance-thread',
+        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+        status=RunStatus.running,
+        instance_id=event_buffer.instance_id,
+    )
+    await journal.start_run(run)
+
+    acquired = await event_buffer.mark_run_active(project_id)
+    assert acquired is True
+
+    # Backdate heartbeat_at past the cutoff → dead_owner_shielded
+    dead_heartbeat = (
+        datetime.now(UTC) - timedelta(seconds=cutoff + 100)
+    ).isoformat()
+    async with event_buffer._txn() as db:
+        await db.execute(
+            'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
+            (dead_heartbeat, project_id),
+        )
+
+    await harness._recover_stale_runs()
+
+    assert harness._record_dead_owner_suppression.call_count == 1, (
+        f'Expected exactly one call to _record_dead_owner_suppression; '
+        f'got {harness._record_dead_owner_suppression.call_args_list}'
+    )
+    call = harness._record_dead_owner_suppression.call_args
+    passed_values = list(call.args) + list(call.kwargs.values())
+    assert project_id in passed_values, (
+        f'project_id must still be passed through; got args={call.args!r} '
+        f'kwargs={call.kwargs!r}'
+    )
+    assert event_buffer.instance_id in passed_values, (
+        'the dead owner instance_id (run.instance_id) must be passed through to '
+        f'_record_dead_owner_suppression; got args={call.args!r} kwargs={call.kwargs!r}'
+    )
+
+
 # ── suppression-site storm integration test ───────────────────────────────────
 
 
