@@ -2337,6 +2337,160 @@ async def reverify_member_solo(
     )
 
 
+async def classify_and_merge(
+    worker: MergeWorker | SpeculativeMergeWorker,
+    req: MergeRequest,
+    base_sha: str,
+    *,
+    speculative: bool,
+    started_monotonic: float | None,
+) -> MergedOk | Decided:
+    """Shared pre-merge guard + merge + drop-guard pipeline (MQ-refactor kappa).
+
+    Covers the EQUIVALENCE-MATRIX CORE common to ``MergeWorker._do_merge``,
+    ``SpeculativeMergeWorker._merger_loop``, and
+    ``SpeculativeMergeWorker._remerge``: branch-presence guard →
+    already-merged detection → merge → conflict / non-conflict-failure →
+    drop-guard.  Returns :class:`MergedOk` on success or :class:`Decided`
+    wrapping the terminal :class:`MergeOutcome` otherwise.
+
+    Divergences between the three call sites are preserved via parameters
+    rather than per-caller branches inside this function:
+
+    * ``speculative`` selects the merge base (``base_sha`` vs current main)
+      and whether a ``speculative_merge`` event is emitted.
+    * ``base_sha`` doubles as the merge base (when ``speculative``) and the
+      drop-guard base (always).
+    * Worker CAPABILITY — ``isinstance(worker, SpeculativeMergeWorker)`` —
+      gates the drift-bookkeeping (``_note_conflict_detected``) and the rich
+      failure diagnostic (``_build_merge_failure_diagnostic`` +
+      ``_render_failure_diagnostic``).  ``MergeWorker`` has neither, so
+      routing ``_do_merge`` through this function reproduces its plain
+      ``MergeOutcome('blocked', reason=details)`` byte-identically.
+
+    The verify-timeout loop-breaker and the ``_request_abandoned`` silent
+    dequeue-drop are worker-lifecycle concerns and stay inline at each call
+    site — they are not part of this pipeline.
+    """
+    git_ops = worker._git_ops
+    event_store = worker._event_store
+
+    # 1. Branch-presence guard.  Terminal outcomes (unknown_branch /
+    # already_merged-via-marker) emit their own merge_attempt internally —
+    # do not re-emit here.
+    guard = await _classify_branch_presence(
+        git_ops, event_store, req.task_id, req.branch, started_monotonic,
+        worktree=req.worktree,
+    )
+    if guard is not None:
+        return Decided(guard)
+
+    # 2. Already-merged detection (ghost-loop fix).  snapshot_tip, when set,
+    # is drift-proof vs a worktree HEAD that may have been rebased to an
+    # orphaned lineage after snapshotting; it is a no-op (None) for
+    # speculative requests, which retain the worktree-HEAD basis.
+    rc, branch_head_raw, err = await _run(
+        ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
+    )
+    if rc != 0:
+        return Decided(MergeOutcome(
+            'blocked', reason=f'rev-parse HEAD failed: {err.strip()}',
+        ))
+    branch_head = branch_head_raw.strip()
+    actual_main = await git_ops.get_main_sha()
+    effective_tip = req.snapshot_tip or branch_head
+    if (
+        await git_ops.is_ancestor(effective_tip, actual_main)
+        and not await git_ops.has_uncommitted_work(req.worktree)
+    ):
+        _emit_merge_attempt(
+            event_store, req.task_id, 'already_merged',
+            duration_ms=_elapsed_ms(started_monotonic),
+        )
+        return Decided(MergeOutcome('already_merged'))
+
+    # 3. Merge (speculative or normal).  speculative=True is only ever passed
+    # for a SpeculativeMergeWorker caller; the isinstance check is a static-
+    # typing narrowing (MergeWorker has no _emit_speculative), not a
+    # behavioural gate.
+    if speculative and isinstance(worker, SpeculativeMergeWorker):
+        worker._emit_speculative(
+            EventType.speculative_merge, req.task_id, base_sha=base_sha,
+        )
+    merge_result = await git_ops.merge_to_main(
+        req.worktree, req.branch, base_sha=base_sha if speculative else None,
+    )
+
+    # 4. Conflict → reject immediately (caller resolves outside queue).
+    if merge_result.conflicts:
+        _emit_merge_attempt(
+            event_store, req.task_id, 'conflict',
+            duration_ms=_elapsed_ms(started_monotonic),
+        )
+        if isinstance(worker, SpeculativeMergeWorker):
+            # ι=1894: record drift = main_position − base at merge-start.
+            worker._note_conflict_detected(req.request_id)
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        return Decided(
+            MergeOutcome('conflict', conflict_details=merge_result.details),
+            merge_result=merge_result,
+        )
+
+    # 5. Non-conflict failure.
+    if not merge_result.success:
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        if isinstance(worker, SpeculativeMergeWorker):
+            diag = await worker._build_merge_failure_diagnostic(
+                req,
+                base_sha=merge_result.pre_merge_sha or base_sha,
+                base_label='speculative' if speculative else 'main_head',
+                git_stderr=merge_result.details,
+            )
+            rendered = worker._render_failure_diagnostic(diag)
+            return Decided(
+                MergeOutcome(
+                    'blocked',
+                    reason=f'{merge_result.details}\n{rendered}',
+                    failure_diagnostic=diag,
+                ),
+                merge_result=merge_result,
+            )
+        return Decided(
+            MergeOutcome('blocked', reason=merge_result.details),
+            merge_result=merge_result,
+        )
+
+    # 6. Drop-guard: every file the task planned must survive the merge.
+    assert merge_result.merge_commit is not None
+    merge_commit = merge_result.merge_commit.strip()
+    drop_result = await _check_plan_targets_in_tree(
+        merge_commit, req.worktree, git_ops, base_sha, task_id=req.task_id,
+    )
+    if drop_result.dropped:
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        _emit_merge_attempt(
+            event_store, req.task_id, 'dropped_plan_targets',
+            duration_ms=_elapsed_ms(started_monotonic),
+        )
+        reason = (
+            f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: '
+            f'{", ".join(drop_result.dropped)}. '
+            f'Conflict resolution likely dropped planned work. '
+            f'Review the merge commit and restore missing files.'
+        )
+        return Decided(MergeOutcome('blocked', reason=reason))
+
+    # 7. Success.
+    return MergedOk(
+        merge_result=merge_result,
+        merge_wt=merge_result.merge_worktree,
+        branch_tip=branch_head,
+    )
+
+
 async def _do_train_merge(
     worker: _TrainMergeHost,
     req: GroupMergeRequest,
