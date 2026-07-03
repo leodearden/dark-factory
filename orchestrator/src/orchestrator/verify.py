@@ -3389,20 +3389,23 @@ async def run_main_tip_sweep(
           - ``get_main_sha()`` raises or returns an empty string.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during sweep setup.
-          - ``run_full_verification`` returns ``category=='pytest_internalerror'``
-            on either the first pass or the retry (infra crash, not drift).
+          - ``run_full_verification`` returns ``category`` in
+            ``{'pytest_internalerror', 'env_transient'}`` on either the first
+            pass or the retry (infra crash / shared-venv-mutation transient,
+            not drift).
         The harness treats ``None`` as "no signal — retry next tick" and does
         NOT mark the SHA as swept, so the same tip is retried on the next interval.
 
-    Retry-on-flake: when the first ``run_full_verification`` call fails (and is
-    NOT a pytest INTERNALERROR), the function re-runs it ONCE in the same pinned
-    worktree (idempotent; no second ``git worktree add``).  **The retry reuses
-    first-pass worktree state by design** — no cleanup of temp files, partially-
-    written DBs, or caches is performed before the re-run.  This is intentional:
-    the purpose is a fast flake-vs-drift heuristic, not a hermetic isolation
-    guarantee.  A first run that fails partway may leave residue that makes the
-    retry non-representative in either direction; the single-retry bound and the
-    two-failure-escalates rule limit the blast radius.
+    Retry-on-flake: when the first ``run_full_verification`` call fails (and its
+    category is NOT one of the infra sentinels above), the function re-runs it
+    ONCE in the same pinned worktree (idempotent; no second ``git worktree
+    add``).  **The retry reuses first-pass worktree state by design** — no
+    cleanup of temp files, partially-written DBs, or caches is performed before
+    the re-run.  This is intentional: the purpose is a fast flake-vs-drift
+    heuristic, not a hermetic isolation guarantee.  A first run that fails
+    partway may leave residue that makes the retry non-representative in either
+    direction; the single-retry bound and the two-failure-escalates rule limit
+    the blast radius.
 
     - Retry PASSES → emit a WARNING, append a record to
       ``verify._suppressed_flake_records`` (durable in-process audit trail), and
@@ -3411,7 +3414,8 @@ async def run_main_tip_sweep(
       intermittent regression** introduced by a merge.
     - Retry FAILS → return ``(main_sha, retry_result)`` so deterministic drift
       still escalates.
-    - Retry hits pytest INTERNALERROR → return ``None`` (infra, retry next tick).
+    - Retry hits pytest INTERNALERROR or env_transient → return ``None``
+      (infra, retry next tick).
 
     Cleanup: scoped ``git worktree remove --force <tmp_path>`` + ``shutil.rmtree``
     always runs in a ``finally`` block.  NO broad ``git worktree prune`` (DD5
@@ -3472,14 +3476,18 @@ async def run_main_tip_sweep(
         result = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
 
         # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
-        # xdist worker was killed by os._exit).  Treat it as an infra failure — return
-        # the None sentinel so the harness retries next tick and files no false-positive
-        # drift L1.  The finally block's worktree cleanup still runs.
-        if result.category == 'pytest_internalerror':
+        # xdist worker was killed by os._exit).  env_transient means a concurrent
+        # `uv sync` elsewhere transiently mutated the shared venv mid-run (vanished
+        # xdist/pip).  Both are infra failures, not drift — return the None sentinel
+        # so the harness retries next tick and files no false-positive drift L1.
+        # The finally block's worktree cleanup still runs.
+        if result.category in {'pytest_internalerror', 'env_transient'}:
             logger.warning(
-                'run_main_tip_sweep: pytest INTERNALERROR in first-pass sweep — '
+                'run_main_tip_sweep: %s in first-pass sweep — '
                 'treating as infra crash, not drift (retrying next tick); '
                 'cause_hint=%r',
+                'pytest INTERNALERROR' if result.category == 'pytest_internalerror'
+                else 'environmental shared-venv transient (env_transient)',
                 result.cause_hint,
             )
             return None
@@ -3501,12 +3509,15 @@ async def run_main_tip_sweep(
             )
             retry = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
 
-            if retry.category == 'pytest_internalerror':
+            if retry.category in {'pytest_internalerror', 'env_transient'}:
                 logger.warning(
-                    'run_main_tip_sweep: retry at %s hit pytest INTERNALERROR — '
+                    'run_main_tip_sweep: retry at %s hit %s — '
                     'treating as infra crash, not drift (retrying next tick); '
                     'cause_hint=%r',
-                    _sha_prefix, retry.cause_hint,
+                    _sha_prefix,
+                    'pytest INTERNALERROR' if retry.category == 'pytest_internalerror'
+                    else 'an environmental shared-venv transient (env_transient)',
+                    retry.cause_hint,
                 )
                 return None
 
