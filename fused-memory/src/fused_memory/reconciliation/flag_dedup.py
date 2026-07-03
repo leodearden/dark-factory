@@ -2117,6 +2117,11 @@ async def acknowledge_resolved_flags(
     :func:`acknowledge_flag_marker` for the ``(task_id, flag_type)`` pair.
     Flags for which both signature helpers return ``None`` are skipped (no I/O).
 
+    Signable flags are dispatched to ``acknowledge_flag_marker`` concurrently via
+    ``asyncio.gather(return_exceptions=True)`` — mirroring the delete fan-out
+    ``acknowledge_flag_marker`` itself already uses — rather than one-at-a-time,
+    since each is an independent Mem0 round-trip.
+
     Best-effort: a single flag's acknowledgment failing is logged at WARNING and
     does NOT abort the batch — the remaining flags are still processed. (This
     also guards against a caller-supplied replacement for
@@ -2135,16 +2140,21 @@ async def acknowledge_resolved_flags(
     Returns:
         Total count of markers acknowledged across all flags in the batch.
     """
-    total = 0
+    sigs: list[tuple[str, str]] = []
     for flag in resolved_flags:
         sig = compute_flag_signature(flag)
         if sig is None:
             sig = compute_content_fingerprint_signature(flag)
         if sig is None:
             continue
-        tid, ftype = sig
-        try:
-            total += await acknowledge_flag_marker(
+        sigs.append(sig)
+
+    if not sigs:
+        return 0
+
+    results = await asyncio.gather(
+        *(
+            acknowledge_flag_marker(
                 memory_service,
                 project_id=project_id,
                 run_id=run_id,
@@ -2153,13 +2163,20 @@ async def acknowledge_resolved_flags(
                 mode=mode,
                 log=log,
             )
-        except Exception as e:
+            for tid, ftype in sigs
+        ),
+        return_exceptions=True,
+    )
+    total = 0
+    for (tid, ftype), result in zip(sigs, results, strict=True):
+        if isinstance(result, BaseException):
             log.warning(
                 'acknowledge_resolved_flags: acknowledge_flag_marker failed for task %s'
                 ' flag_type %s: %s',
-                tid, ftype, e,
+                tid, ftype, result,
             )
-            continue
+        else:
+            total += result
     return total
 
 
