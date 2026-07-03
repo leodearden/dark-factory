@@ -7701,6 +7701,81 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if not req.result.done():
             req.result.set_result(outcome)
 
+    async def _resolve_and_release(
+        self,
+        entry_or_item: InflightEntry | SpeculativeItem,
+        outcome: MergeOutcome,
+        *,
+        chain_failed: bool,
+        release_resources: bool = True,
+        cancel_lease: bool = False,
+    ) -> None:
+        """Single resolve-and-release chokepoint for the _verifier_loop
+        BaseException handlers (task 1991 / MQ-refactor zeta).
+
+        Unifies the six near-identical except-handler bodies that used to
+        inline: resolve the caller's Future, release the host lease (release
+        vs cancel_and_release), clean up an owned merge worktree, release the
+        speculation slot, and flag the chain as failed.  Each call site keeps
+        its own ``logger.exception`` message and its own
+        ``except (CancelledError, KeyboardInterrupt): raise`` clause; only the
+        resolve-and-release tail is centralised here.
+
+        *entry_or_item* is normalised to (req, lease, merge_wt, slot_held):
+        an ``InflightEntry`` carries ``lease``/``merge_wt``/``was_speculative``
+        (post-dispatch state); a bare ``SpeculativeItem`` has no lease yet
+        (pre-dispatch state) and uses ``merge_wt``/``speculative`` directly.
+
+        *release_resources* controls whether this call performs any release
+        at all.  It must be ``False`` for the POST-finalize handlers
+        (passthrough-finalize x2, finalize-head): ``_finalize_inflight``'s own
+        ``finally`` clause already released the lease and speculation slot on
+        every exit path including exceptions, so releasing again here would
+        double-release.  It defaults to ``True`` for the PRE-finalize dispatch
+        handlers, which own the item's resources outright.
+
+        *cancel_lease* selects ``cancel_and_release`` over plain ``release``
+        (mirrors ``_finalize_inflight``'s own ``_cancel_release`` switch) —
+        used by the cascade handler, which aborts a still-verifying entry.
+
+        *chain_failed* is guarded (``if chain_failed: self._n_failed = True``)
+        rather than assigned unconditionally, so a caller can never reset
+        ``_n_failed`` back to False.  All six current call sites pass True.
+
+        This is also the intended hook surface for task eta's liveness-ledger
+        'resolved' transition: every _verifier_loop error-resolution path now
+        funnels through this one coroutine.
+        """
+        if isinstance(entry_or_item, InflightEntry):
+            item = entry_or_item.item
+            lease: Any | None = entry_or_item.lease
+            merge_wt = entry_or_item.merge_wt
+            slot_held = entry_or_item.was_speculative
+        else:
+            item = entry_or_item
+            lease = None
+            merge_wt = entry_or_item.merge_wt
+            slot_held = entry_or_item.speculative
+        req = item.request
+
+        self._resolve_or_drop_abandoned(req, outcome)
+
+        if release_resources:
+            if lease is not None and self._host_allocator is not None:
+                with contextlib.suppress(BaseException):
+                    if cancel_lease:
+                        await self._host_allocator.cancel_and_release(lease)
+                    else:
+                        await self._host_allocator.release(lease)
+            if merge_wt is not None:
+                with contextlib.suppress(BaseException):
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+            if slot_held:
+                self._speculation_slot.release()
+
+        if chain_failed:
+            self._n_failed = True
+
     async def _abort_remote_verify(self, lease: Any, task_id: str) -> None:
         """Fire remote cancel-verify while *_inflight_request_id* is still live.
 
