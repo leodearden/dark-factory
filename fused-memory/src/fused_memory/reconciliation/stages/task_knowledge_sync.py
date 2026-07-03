@@ -35,6 +35,7 @@ from fused_memory.reconciliation.flag_dedup import (
     acknowledge_resolved_flags,
     compute_flag_signature,
     filter_blocked_snapshot_findings,
+    is_content_fingerprint_task_id,
 )
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
@@ -1218,6 +1219,7 @@ async def _sweep_stale_flag_markers(
     max_age_days: int = STAGE1_FLAG_MARKER_MAX_AGE_DAYS,
     now: datetime | None = None,
     scroll_limit: int = 1000,
+    run_window_start: datetime | None = None,
 ) -> int:
     """Age-GC orphaned ``stage1_flag_marker`` Mem0 records (task 1944).
 
@@ -1237,6 +1239,31 @@ async def _sweep_stale_flag_markers(
     with a missing or unparseable ``created_at`` are KEPT (never deleted),
     mirroring ``summary_pool._sort_key``'s sort-last / prefer-keep posture.
 
+    Cross-cycle fingerprint sweep (task-2047 Gap 2): a member is stale if
+    EITHER of two independent predicates holds:
+
+    - ``aged_out`` — the existing ``created_at < now - max_age_days`` check,
+      applied to every marker regardless of ``task_id`` shape.
+    - ``predates_cycle`` — ``run_window_start`` is not ``None`` AND the
+      marker's ``metadata.task_id`` is a canonical ``fp:`` content-fingerprint
+      key (:func:`~fused_memory.reconciliation.flag_dedup.is_content_fingerprint_task_id`)
+      AND it is NOT within the current run window
+      (:func:`_marker_is_within_run_window`). Scoped to ``fp:`` markers only:
+      numeric/comma-joined task_ids are already resolvable anchors and their
+      task-1654 cross-cycle dedup must not regress by being swept after a
+      single skipped cycle.
+
+    ``predates_cycle`` is OR'd with ``aged_out``, not substituted for it, so
+    the 14-day age path is unchanged for every marker shape and is still the
+    only path taken when ``run_window_start`` is ``None`` (e.g. the journal
+    lookup in ``assemble_payload`` failed this cycle) — this is the
+    backward-compatible fallback the Gap-2 design requires.
+
+    A separate INFO log reports the count of markers swept *specifically* by
+    ``predates_cycle`` where ``aged_out`` did NOT already apply (i.e. the
+    incremental effect of the new predicate, distinct from ordinary age-outs)
+    for operator observability.
+
     Deletes are issued best-effort in parallel via ``asyncio.gather`` with
     ``return_exceptions=True`` (mirrors :func:`_sweep_stale_fixc_markers`):
     individual failures log WARNING and are excluded from the returned count.
@@ -1252,6 +1279,11 @@ async def _sweep_stale_flag_markers(
         now: Reference "current time" for the cutoff calculation. Defaults to
             ``datetime.now(UTC)``; tests inject a fixed value.
         scroll_limit: Max records to enumerate in one scroll (default 1000).
+        run_window_start: Start of the current reconciliation run's window
+            (journal ``started_at``), used ONLY to evaluate ``predates_cycle``
+            for ``fp:``-keyed markers. ``None`` (the default) disables the
+            cross-cycle predicate entirely — age-only sweep, unchanged from
+            the pre-task-2047 contract.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, or
@@ -1287,6 +1319,7 @@ async def _sweep_stale_flag_markers(
     cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
 
     stale_ids: list[str] = []
+    cross_cycle_fp_swept = 0
     for member in members:
         mid = member.get('id')
         if not mid:
@@ -1298,11 +1331,36 @@ async def _sweep_stale_flag_markers(
             created_at = _assume_utc(datetime.fromisoformat(raw))
         except (ValueError, TypeError):
             continue
-        if created_at < cutoff:
+
+        aged_out = created_at < cutoff
+
+        # Cross-cycle fp: predicate (task-2047 Gap 2) — see docstring. Scoped to
+        # fp:-keyed markers only; numeric/comma-joined markers always evaluate
+        # predates_cycle=False regardless of run_window_start.
+        predates_cycle = False
+        if run_window_start is not None:
+            metadata = member.get('metadata') or {}
+            task_id = str(metadata.get('task_id') or '')
+            if is_content_fingerprint_task_id(task_id) and not _marker_is_within_run_window(
+                raw, run_window_start
+            ):
+                predates_cycle = True
+
+        if aged_out or predates_cycle:
             stale_ids.append(mid)
+            if predates_cycle and not aged_out:
+                cross_cycle_fp_swept += 1
 
     if not stale_ids:
         return 0
+
+    if cross_cycle_fp_swept:
+        logger.info(
+            'reconciliation._sweep_stale_flag_markers: swept %d cross-cycle fp: marker(s) '
+            '(predates run_window_start=%s), distinct from age-based GC',
+            cross_cycle_fp_swept, run_window_start,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
 
     results = await asyncio.gather(
         *(
