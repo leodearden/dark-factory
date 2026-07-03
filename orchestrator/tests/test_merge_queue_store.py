@@ -11,6 +11,10 @@ Covers:
   step-11: recover_pending_merges() selects survivors and drops already-landed
            / branch-gone records.
   task-1808: journal_corrupt flag and corrupt-signal propagation into recover report.
+  task-2037: record() strips a leading branch_prefix so the journal only ever
+             holds the bare canonical branch shape; recover_pending_merges
+             tolerates legacy already-prefixed journal entries via the shared
+             canonical_queued_branch_name helper (double-prefix branch-drop fix).
 """
 
 from __future__ import annotations
@@ -587,3 +591,59 @@ class TestRecoverPendingMergesCorruptSignal:
             f'Expected no corrupt-journal WARNING for fresh journal; '
             f'got: {[r.message for r in corrupt_warns]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-2037 step-3 — MergeQueueStore.record() branch-prefix normalization
+# ---------------------------------------------------------------------------
+
+
+class TestMergeQueueStoreNormalizesBranch:
+    """record() strips a leading branch_prefix so the journal only ever holds
+    the bare canonical branch shape (task 2037 fix 2 — enqueue normalization).
+    """
+
+    def test_record_strips_leading_prefix(self, tmp_path: Path) -> None:
+        """A MergeRequest submitted with an already-prefixed branch is persisted bare."""
+        store_path = tmp_path / 'merge_queue.json'
+        store = MergeQueueStore(store_path)
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        req = _make_req('4959', 'task/4959', wt, config)
+        store.record(req)
+
+        [persisted] = store.load()
+        assert persisted.branch == '4959', (
+            f"Expected leading branch_prefix stripped to bare '4959'; "
+            f'got {persisted.branch!r}'
+        )
+
+    def test_record_bare_branch_is_idempotent(self, tmp_path: Path) -> None:
+        """A MergeRequest submitted with an already-bare branch is unchanged."""
+        store_path = tmp_path / 'merge_queue.json'
+        store = MergeQueueStore(store_path)
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        req = _make_req('4959', '4959', wt, config)
+        store.record(req)
+
+        [persisted] = store.load()
+        assert persisted.branch == '4959'
+
+    def test_record_bare_roundtrip_unchanged(self, tmp_path: Path) -> None:
+        """Confirms the plain bare round-trip (branch='42') stays unchanged."""
+        store_path = tmp_path / 'merge_queue.json'
+        store = MergeQueueStore(store_path)
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+
+        req = _make_req('42', '42', wt, config)
+        store.record(req)
+
+        [persisted] = store.load()
+        assert persisted.branch == '42'
