@@ -34,12 +34,13 @@ rest of the file during the RED steps.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, PERSISTENT_MERGE_WORKTREE_NAME, _run
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -188,3 +189,128 @@ class TestSpeculationAccountingViolations:
         worker._running = False
 
         assert worker.speculation_accounting_violations() == []
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: worktree_ledger_violations()
+# ---------------------------------------------------------------------------
+
+
+def _mkdir_worktree(git_ops: GitOps, name: str, *, mtime: float | None = None) -> Path:
+    """Create worktree_base/name (creating worktree_base itself if absent).
+
+    When *mtime* is given, backdates/sets the directory's mtime via
+    ``os.utime`` so age-based grace-window tests are deterministic without
+    any real sleeping.
+    """
+    git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+    wt = git_ops.worktree_base / name
+    wt.mkdir()
+    if mtime is not None:
+        os.utime(wt, (mtime, mtime))
+    return wt
+
+
+class TestWorktreeLedgerViolations:
+    """Unit tests for SpeculativeMergeWorker.worktree_ledger_violations(now=None).
+
+    RED until step-4 GREEN adds the method to merge_queue.py.
+
+    ``_GRACE`` is a test-local override of ``RESOURCE_AUDIT_WORKTREE_GRACE_SECS``
+    (monkeypatched per-instance), decoupled from whatever tactical production
+    default step-4 chooses.
+    """
+
+    _GRACE = 100.0
+    _NOW = 1_000_000.0
+
+    def test_no_on_disk_merge_dirs_yields_no_violations(self, git_ops: GitOps) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        assert worker.worktree_ledger_violations(now=self._NOW) == []
+
+    def test_missing_worktree_base_yields_no_violations(self, git_ops: GitOps) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+
+        assert not git_ops.worktree_base.exists()
+        assert worker.worktree_ledger_violations(now=self._NOW) == []
+
+    def test_unregistered_aged_dir_yields_one_violation_naming_the_path(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        wt = _mkdir_worktree(
+            git_ops, '_merge-deadbeef', mtime=self._NOW - self._GRACE - 10,
+        )
+
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+
+        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
+        assert str(wt.resolve()) in violations[0]
+
+    def test_registered_dir_yields_no_violation(self, git_ops: GitOps) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        wt = _mkdir_worktree(
+            git_ops, '_merge-registered', mtime=self._NOW - self._GRACE - 10,
+        )
+        worker._register_owned_merge_worktree(wt)
+
+        assert worker.worktree_ledger_violations(now=self._NOW) == []
+
+    def test_persistent_verify_worktree_never_flagged(self, git_ops: GitOps) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        _mkdir_worktree(
+            git_ops, PERSISTENT_MERGE_WORKTREE_NAME, mtime=self._NOW - self._GRACE - 10,
+        )
+
+        assert worker.worktree_ledger_violations(now=self._NOW) == []
+
+    def test_wrong_prefix_dir_never_flagged(self, git_ops: GitOps) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        _mkdir_worktree(git_ops, '_solo-xyz', mtime=self._NOW - self._GRACE - 10)
+
+        assert worker.worktree_ledger_violations(now=self._NOW) == []
+
+    def test_fresh_unregistered_dir_within_grace_yields_no_violation(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        _mkdir_worktree(git_ops, '_merge-fresh', mtime=self._NOW - 1)
+
+        assert worker.worktree_ledger_violations(now=self._NOW) == []
+
+    def test_not_running_suppresses_even_aged_unregistered_dir(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        _mkdir_worktree(
+            git_ops, '_merge-abandoned', mtime=self._NOW - self._GRACE - 10,
+        )
+        worker._running = False
+
+        assert worker.worktree_ledger_violations(now=self._NOW) == []
