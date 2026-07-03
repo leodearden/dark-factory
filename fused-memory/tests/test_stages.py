@@ -888,6 +888,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
             'stage1_cycle_summary_pool_trimmed': 0,
+            # Always present (task-2029 amendment), even when nothing was flagged —
+            # symmetric with stats['stage2_flag_markers_acknowledged'].
+            'stage1_flag_markers_acknowledged': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -980,6 +983,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
             'stage1_cycle_summary_pool_trimmed': 0,
+            # Always present (task-2029 amendment), even when nothing was flagged —
+            # symmetric with stats['stage2_flag_markers_acknowledged'].
+            'stage1_flag_markers_acknowledged': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
