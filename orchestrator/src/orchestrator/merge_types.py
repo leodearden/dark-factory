@@ -876,6 +876,20 @@ class InflightEntry:
     status: str | None = None               # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
 
+    def __post_init__(self) -> None:
+        """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).
+
+        A passthrough entry (immediate-outcome delivery, no real verify) must
+        wrap a DECIDED item — i.e. passthrough_outcome is set only when the
+        wrapped item's own immediate_outcome is also set.
+        """
+        if self.passthrough_outcome is not None and self.item.immediate_outcome is None:
+            raise ValueError(
+                'InflightEntry.passthrough_outcome requires item.immediate_outcome '
+                f'to be set; got passthrough_outcome={self.passthrough_outcome!r} on '
+                f'an item with immediate_outcome=None (merge_result={self.item.merge_result!r})',
+            )
+
 
 @dataclass
 class _HostUnavailability:
