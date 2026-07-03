@@ -1446,8 +1446,11 @@ def _build_fallback_config(
             ),
             'ruff check',
         )
-        type_cmd = _strip_leading_cd(
-            _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
+        type_cmd = _reproject_bare_uv_run(
+            _strip_leading_cd(
+                _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
+            ),
+            'pyright',
         )
     else:
         lint_cmd = 'ruff check ' + ' '.join(py_files)
