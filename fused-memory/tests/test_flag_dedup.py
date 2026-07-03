@@ -5116,6 +5116,83 @@ class TestWriteAndConfirmMarker:
         assert 'missing_deliverable' in warning_msgs[0]
         assert 'failed to write marker' in warning_msgs[0]
 
+    async def test_deduped_against_included_in_metadata_when_provided(self, caplog):
+        """deduped_against=[...] is included in the add_memory metadata payload,
+        additive to the existing source/kind/task_id/flag_type/run_id/last_seen_run_id
+        keys (task-2047 Gap 1)."""
+        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
+
+        memory_service = MagicMock()
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        confirm_and_track = AsyncMock(return_value=True)
+        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
+
+        result = await _write_and_confirm_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            tid='fp:9216e85ac497b68d93043b64684eb049',
+            ftype='duplicate_procedural_knowledge',
+            log=log,
+            confirm_and_track=confirm_and_track,
+            active_miss_warning_template='active-%s-%s',
+            tripped_skip_warning_template='tripped-%s-%s',
+            deduped_against=['uuid-a', 'uuid-b'],
+        )
+
+        assert result is True
+        memory_service.add_memory.assert_called_once()
+        kwargs = memory_service.add_memory.call_args.kwargs
+        _assert_valid_stage1_marker(
+            kwargs,
+            task_id='fp:9216e85ac497b68d93043b64684eb049',
+            flag_type='duplicate_procedural_knowledge',
+            run_id='r1',
+        )
+        assert kwargs['metadata']['deduped_against'] == ['uuid-a', 'uuid-b'], (
+            f"metadata must carry deduped_against; got {kwargs['metadata']!r}"
+        )
+
+    async def test_deduped_against_omitted_from_metadata_when_none_or_empty(self, caplog):
+        """deduped_against=None (or []) must NOT add a 'deduped_against' metadata key —
+        locks the additive/no-regression contract: the payload is otherwise
+        byte-identical to the pre-task-2047 contract (task-2047 Gap 1)."""
+        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
+
+        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
+
+        for deduped_against in (None, []):
+            memory_service = MagicMock()
+            memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+            confirm_and_track = AsyncMock(return_value=True)
+
+            await _write_and_confirm_marker(
+                memory_service,
+                project_id='p',
+                run_id='r1',
+                tid='42',
+                ftype='missing_deliverable',
+                log=log,
+                confirm_and_track=confirm_and_track,
+                active_miss_warning_template='active-%s-%s',
+                tripped_skip_warning_template='tripped-%s-%s',
+                deduped_against=deduped_against,
+            )
+
+            kwargs = memory_service.add_memory.call_args.kwargs
+            assert 'deduped_against' not in kwargs['metadata'], (
+                f'deduped_against={deduped_against!r} must not add a metadata key; '
+                f"got metadata={kwargs['metadata']!r}"
+            )
+            assert kwargs['metadata'] == {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': '42',
+                'flag_type': 'missing_deliverable',
+                'run_id': 'r1',
+                'last_seen_run_id': 'r1',
+            }, 'payload must be byte-identical to the pre-change contract when deduped_against is empty/None'
+
 
 # ---------------------------------------------------------------------------
 # Step 7: confirm_task_absent fail-closed classifier (RED tests)
