@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import functools
 import logging
 from collections.abc import Callable
 
@@ -141,6 +142,28 @@ EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
 """Sentinel empty SuffixConflictGraph for the default/zero-suffix case."""
 
 
+@functools.lru_cache(maxsize=1)
+def _merge_queue_constants() -> tuple[tuple[str, ...], int, str]:
+    """Resolve MERGE_LANES / MERGE_BOUNCE_CAP / NEEDS_REBASE_REASON_PREFIX once.
+
+    These three constants stay in ``merge_queue.py`` (not moved — see module
+    docstring).  The function-local (deferred) import is required to avoid
+    deadlocking merge_queue's re-export shim, but that constraint only binds
+    at *module import time*; by the time :meth:`SuffixConflictTracker.recompute`
+    or :meth:`SuffixConflictTracker.bounce_conflicting_suffix_items` actually
+    run (the merge-acquire hot path), both modules are already fully loaded.
+    Memoizing the lookup here means those hot-path calls pay for the
+    sys.modules dict lookup + attribute rebind once, not on every call
+    (amend: reviewer performance).
+    """
+    from orchestrator.merge_queue import (
+        MERGE_BOUNCE_CAP,
+        MERGE_LANES,
+        NEEDS_REBASE_REASON_PREFIX,
+    )
+    return MERGE_LANES, MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX
+
+
 class SuffixConflictTracker:
     """Owns the two-layer suffix-conflict state + logic (task δ=1988).
 
@@ -167,8 +190,8 @@ class SuffixConflictTracker:
 
     def __init__(
         self,
-        git_ops: Callable[[], GitOps],
         *,
+        git_ops: Callable[[], GitOps],
         lane_buffers: Callable[[], dict[str, collections.deque[MergeRequest]]],
         frozen_prefix: Callable[[], tuple[str, ...]],
         frozen_prefix_tip: Callable[[str], str],
@@ -215,9 +238,9 @@ class SuffixConflictTracker:
         This method is async (forks git subprocesses) while snapshot() stays
         synchronous and cheap (reads the stored graph; no await).
         """
-        # Deferred reach-back: MERGE_LANES stays in merge_queue.py (not moved).
-        # A top-level import would deadlock module load — see module docstring.
-        from orchestrator.merge_queue import MERGE_LANES
+        # Deferred reach-back, memoized after the first call — see
+        # _merge_queue_constants() (amend: reviewer performance).
+        MERGE_LANES, _, _ = _merge_queue_constants()
 
         # ── 1. Build ordered suffix list ──────────────────────────────────────
         # ε=1890 defensive exclusion: frozen items (currently verifying) must
@@ -473,14 +496,9 @@ class SuffixConflictTracker:
         Fail-open: if ``get_main_sha()`` raises, log a warning and return
         without touching any item.
         """
-        # Deferred reach-back: these three constants stay in merge_queue.py
-        # (not moved). A top-level import would deadlock module load — see
-        # module docstring.
-        from orchestrator.merge_queue import (
-            MERGE_BOUNCE_CAP,
-            MERGE_LANES,
-            NEEDS_REBASE_REASON_PREFIX,
-        )
+        # Deferred reach-back, memoized after the first call — see
+        # _merge_queue_constants() (amend: reviewer performance).
+        MERGE_LANES, MERGE_BOUNCE_CAP, NEEDS_REBASE_REASON_PREFIX = _merge_queue_constants()
 
         if not self.graph.conflicts_with_main:
             return  # nothing to bounce — leave signature intact

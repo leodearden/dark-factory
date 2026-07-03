@@ -133,7 +133,7 @@ def _make_tracker(
             return main_sha
         frozen_prefix_tip = _default_frozen_prefix_tip
     return SuffixConflictTracker(
-        lambda: git_ops,
+        git_ops=lambda: git_ops,
         lane_buffers=lane_buffers,
         frozen_prefix=frozen_prefix,
         frozen_prefix_tip=frozen_prefix_tip,
