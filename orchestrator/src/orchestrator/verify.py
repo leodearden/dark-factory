@@ -2646,6 +2646,57 @@ async def run_verification(
         cause_hint = ' | '.join(hint_parts)
         category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
+    # Bounded env-recovery retry: a shared-venv-mutation transient (a
+    # concurrent `uv sync` elsewhere vanishing xdist/pip mid-run) is an infra
+    # transient, not a code regression. Auto-recover with a single
+    # forced-serial retry of the test command — mirrors the pure-timeout
+    # retry loop above, but is gated on `category` rather than a timeout
+    # flag, and only re-runs the test command since lint/type do not
+    # exercise xdist/pip. Recovery passing means the env recovered -> GREEN;
+    # recovery still hitting env_transient means it stays environmental
+    # (NOT misattributed to test_failure/unknown_test_failure); recovery
+    # surfacing a different category means that real signal is reported.
+    if category == 'env_transient' and test_cmd is not None:
+        logger.warning(
+            'Verification hit an environmental shared-venv transient '
+            '(vanished xdist/pip); retrying test command once, forced serial'
+        )
+        recovered_test_cmd = _force_serial_pytest(test_cmd)
+        (
+            test_rc, test_out, test_timed_out, test_started_at, test_duration,
+        ) = await _run_or_skip_timed(
+            recovered_test_cmd, label='test', current_attempt=current_attempt_id,
+        )
+        test_cmd = recovered_test_cmd
+        passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
+        if passed:
+            cause_hint = ''
+            category = 'passed'
+            summary = 'All checks passed'
+        else:
+            hint_parts = []
+            per_check_categories = []
+            for rc, out, to in (
+                (test_rc, test_out, test_timed_out),
+                (lint_rc, lint_out, lint_timed_out),
+                (type_rc, type_out, type_timed_out),
+            ):
+                if rc != 0:
+                    h = _extract_cause_hint(out)
+                    if h:
+                        hint_parts.append(h)
+                    per_check_categories.append(_classify_failure(out, rc, to))
+            cause_hint = ' | '.join(hint_parts)
+            category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
+            parts = []
+            if test_rc != 0:
+                parts.append('tests failed')
+            if lint_rc != 0:
+                parts.append('lint issues')
+            if type_rc != 0:
+                parts.append('type errors')
+            summary = f'Failures: {", ".join(parts)}'
+
     # Hoist runs list so both the merge-path and task-path branches can use it.
     runs = [
         {
