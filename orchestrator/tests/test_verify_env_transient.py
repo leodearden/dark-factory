@@ -33,7 +33,7 @@ from unittest.mock import patch
 import pytest
 
 from orchestrator import verify
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import OrchestratorConfig
 
 
 class TestClassifyFailureEnvTransient:
@@ -196,3 +196,96 @@ class TestForceSerialPytest:
     def test_none_returns_none(self):
         """A None command (skipped check) stays None."""
         assert verify._force_serial_pytest(None) is None
+
+
+_XDIST_VANISHED_OUTPUT = (
+    'usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+    'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
+)
+
+
+class TestRunVerificationEnvRecovery:
+    """step-7: run_verification auto-recovers from a shared-venv-mutation
+    transient via a single bounded serial retry (_force_serial_pytest)
+    instead of misattributing it as test drift.
+
+    Mirrors TestRunVerificationColdFirstUse's `_run_cmd` mocking pattern.
+    RED today: no env-recovery retry exists, so the rewritten (recovery)
+    command is never invoked and a still-transient retry can't be
+    distinguished from "no retry happened at all".
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        # lint/type are non-Optional str fields on OrchestratorConfig (unlike
+        # ModuleConfig, which allows None to mean "skip") — use harmless
+        # always-succeeding placeholders so only the 'test' check is under
+        # test here.
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='uv run pytest tests/',
+            lint_command='echo lint',
+            type_check_command='echo type',
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_transient_recovers_on_serial_retry(self, tmp_path: Path):
+        """Case A: the original run hits the xdist usage-error; the serial
+        (_force_serial_pytest-rewritten) retry passes -> GREEN, env recovered."""
+        config = self._make_config(tmp_path)
+        invoked_cmds: list[str] = []
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            invoked_cmds.append(cmd)
+            if 'pytest' in cmd and "-o addopts=''" not in cmd:
+                return 4, _XDIST_VANISHED_OUTPUT, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(tmp_path, config)
+
+        assert result.passed is True, f'Expected recovery to pass, got {result!r}'
+        assert result.category == 'passed'
+        pytest_invocations = [c for c in invoked_cmds if 'pytest' in c]
+        assert len(pytest_invocations) == 2, (
+            f'Expected exactly 2 pytest invocations (original + one bounded '
+            f'recovery retry), got {len(pytest_invocations)}: {pytest_invocations!r}'
+        )
+        assert any("-o addopts=''" in c for c in pytest_invocations), (
+            f"Expected a recovery command containing -o addopts='' to be "
+            f'invoked, got {pytest_invocations!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_transient_preserved_when_retry_still_transient(self, tmp_path: Path):
+        """Case B: both the original run AND the serial retry hit the
+        xdist-vanished signature -> category stays 'env_transient' (NOT
+        misattributed as unknown_test_failure/test_failure), and the
+        recovery retry must actually have been attempted."""
+        config = self._make_config(tmp_path)
+        invoked_cmds: list[str] = []
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            invoked_cmds.append(cmd)
+            if 'pytest' in cmd:
+                return 4, _XDIST_VANISHED_OUTPUT, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(tmp_path, config)
+
+        assert result.passed is False
+        assert result.category == 'env_transient', (
+            f'Expected env_transient to be preserved (not misattributed), '
+            f'got category={result.category!r}'
+        )
+        pytest_invocations = [c for c in invoked_cmds if 'pytest' in c]
+        assert len(pytest_invocations) == 2, (
+            f'Expected exactly 2 pytest invocations (original + one bounded '
+            f'recovery retry — the retry must actually fire, not just leave '
+            f'the first-pass category untouched), got {len(pytest_invocations)}: '
+            f'{pytest_invocations!r}'
+        )
+        assert any("-o addopts=''" in c for c in pytest_invocations), (
+            f"Expected the bounded recovery retry to invoke a command "
+            f"containing -o addopts='', got {pytest_invocations!r}"
+        )
