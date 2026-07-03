@@ -143,3 +143,50 @@ class TestEnvTransientNonMisattributionWiring:
             verify._CATEGORY_PRIORITY.index('env_transient')
             < verify._CATEGORY_PRIORITY.index('test_failure')
         )
+
+
+class TestForceSerialPytest:
+    """step-5: _force_serial_pytest(cmd) is a pure string-rewrite helper.
+
+    Appends ` -p no:xdist -o addopts=''` to every `pytest` invocation in a
+    `&&`-chain — reproducing task 2045's proven `-o addopts=""` serial
+    workaround (clears the pyproject `-n auto`/xdist addopts) plus a
+    belt-and-suspenders `-p no:xdist` plugin disable. Non-pytest commands and
+    None pass through unchanged. RED today: _force_serial_pytest does not exist.
+    """
+
+    # The real multi-module test_command from orchestrator/config.yaml —
+    # five chained `cd <module> && uv run pytest tests/` invocations.
+    REAL_CONFIG_TEST_COMMAND = (
+        'cd shared && uv run pytest tests/ && '
+        'cd ../escalation && uv run pytest tests/ && '
+        'cd ../orchestrator && uv run pytest tests/ && '
+        'cd ../fused-memory && uv run pytest tests/ && '
+        'cd ../dashboard && uv run pytest tests/'
+    )
+
+    def test_rewrites_every_pytest_invocation_in_chained_command(self):
+        """Each of the 5 chained `uv run pytest tests/` segments gains the flags."""
+        result = verify._force_serial_pytest(self.REAL_CONFIG_TEST_COMMAND)
+
+        expected = (
+            "cd shared && uv run pytest tests/ -p no:xdist -o addopts='' && "
+            "cd ../escalation && uv run pytest tests/ -p no:xdist -o addopts='' && "
+            "cd ../orchestrator && uv run pytest tests/ -p no:xdist -o addopts='' && "
+            "cd ../fused-memory && uv run pytest tests/ -p no:xdist -o addopts='' && "
+            "cd ../dashboard && uv run pytest tests/ -p no:xdist -o addopts=''"
+        )
+        assert result == expected
+
+        # Number of rewrites equals the number of pytest invocations (5).
+        assert self.REAL_CONFIG_TEST_COMMAND.count('pytest') == 5
+        assert result.count("-p no:xdist -o addopts=''") == 5
+
+    def test_non_pytest_command_returned_unchanged(self):
+        """A command with no `pytest` token (e.g. cargo) passes through unchanged."""
+        cmd = 'cargo test --workspace'
+        assert verify._force_serial_pytest(cmd) == cmd
+
+    def test_none_returns_none(self):
+        """A None command (skipped check) stays None."""
+        assert verify._force_serial_pytest(None) is None
