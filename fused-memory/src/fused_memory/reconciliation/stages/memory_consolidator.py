@@ -148,9 +148,11 @@ class MemoryConsolidator(BaseStage):
 
         if report.items_flagged:
             # Snapshot before the filter chain (task-2029): used below to compute
-            # which flags the chain dropped, so any persisted stage1_flag_marker for
-            # a now-moot flag (terminal task, false-absence, stale-snapshot) can be
-            # reclaimed instead of waiting for the 14-day age-GC or a recurrence.
+            # which flags the chain dropped — for ANY reason (terminal task,
+            # false-absence, stale-snapshot, or dedup_flags' own suppression gate;
+            # see the acknowledgment block below) — so any persisted
+            # stage1_flag_marker for a now-moot flag can be reclaimed instead of
+            # waiting for the 14-day age-GC or a recurrence.
             _pre_filter_flags = list(report.items_flagged)
 
             # ── Stale count-snapshot correction filter (task-1786): drop false ────
