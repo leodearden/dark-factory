@@ -39,3 +39,26 @@ class TestHarnessParkEvictionStoreWiring:
             f'db_path mismatch: store has {store.db_path!r}, '
             f'config expects {config.park_eviction_requests_db_path!r}'
         )
+
+
+class TestMockConfigParkEvictionNoLeak:
+    """Regression coverage for task 2045 (same failure mode as tasks 1313/1339):
+    Harness(mock_orch_config) must not stringify an unpatched MagicMock
+    park_eviction_requests_db_path into a stray on-disk sqlite file.
+    """
+
+    def test_harness_from_mock_config_leaks_no_magicmock_park_eviction_file(
+        self, mock_orch_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Isolate any relative-path side-effect into the auto-cleaned tmp dir
+        # instead of wherever pytest was invoked from (normally orchestrator/).
+        monkeypatch.chdir(tmp_path)
+
+        Harness(mock_orch_config)
+
+        strays = sorted(
+            str(p) for p in tmp_path.glob('<MagicMock*park_eviction_requests_db_path*')
+        )
+        assert strays == [], (
+            f'mock_orch_config leaked stray MagicMock db file(s): {strays}'
+        )
