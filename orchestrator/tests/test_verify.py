@@ -4190,6 +4190,25 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         assert result.type_check_command == 'npx pyright tests/scripts/test_spawn_claude.py'
         assert not result.type_check_command.startswith('cd ')
 
+    def test_fallback_type_reprojects_bare_uv_run_pyright_for_root_file(self, tmp_path: Path) -> None:
+        """A hypothetical bare ``uv run pyright`` type command shares the lint defect.
+
+        Task 2036: dark_factory's real ``type_check_command`` uses ``npx``
+        (see test_chained_type_command_strips_leading_cd_for_root_file), which
+        does not share the depless-workspace-root spawn failure. But a
+        ``uv run pyright ...`` type command would fail the same way bare ``uv
+        run ruff check`` did, so it must be reprojected into a pyright-bearing
+        member uv context too.
+        """
+        cfg = self._make_config(
+            tmp_path,
+            type_check_command='uv run pyright src/ tests/',
+            test_command='cd shared && uv run pytest tests/',
+        )
+        result = _build_fallback_config(['tests/scripts/test_orchestrator_watchdog.py'], cfg)
+        assert result is not None
+        assert result.type_check_command == 'uv run --project shared pyright tests/scripts/test_orchestrator_watchdog.py'
+
     def test_uv_run_lint_command_scopes_to_root_file(self, tmp_path: Path) -> None:
         """``uv run ruff check <dirs>`` scopes to the touched root-level file, in a ruff-bearing context.
 
