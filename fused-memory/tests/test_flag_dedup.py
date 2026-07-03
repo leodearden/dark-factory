@@ -4981,6 +4981,22 @@ class TestExtractDedupedAgainstUuids:
         flag = {'deduped_against': [None, '', '   ', 'uuid-a', 123]}
         assert _extract_deduped_against_uuids(flag) == ['123', 'uuid-a']
 
+    def test_drops_structured_elements_instead_of_stringifying(self):
+        """A dict or nested-list element inside a candidate field is DROPPED,
+        not str()-coerced into a junk 'UUID' (task-2047 amendment)."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {
+            'deduped_against': [
+                'uuid-a',
+                {'k': 'v'},
+                ['nested', 'list'],
+                3.14,
+                'uuid-b',
+            ],
+        }
+        assert _extract_deduped_against_uuids(flag) == ['uuid-a', 'uuid-b']
+
     def test_returns_empty_list_when_no_candidate_field_present(self):
         """No candidate field present at all -> []."""
         from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
@@ -6032,6 +6048,105 @@ class TestDedupFlagsDedupedAgainstEnrichment:
         meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
         assert 'deduped_against' not in meta, (
             f'fp: marker with no UUID fields must NOT carry deduped_against; got metadata={meta!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_alias_only_enrichment_logs_observability_notice(self, caplog):
+        """When deduped_against is populated ONLY from an alias field (the
+        canonical 'deduped_against' field is absent), dedup_flags logs an INFO
+        notice so alias-sourced enrichment is observable (task-2047 amendment)."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge about deploy steps, alias only',
+            'duplicate_ids': ['m1', 'm2'],
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': fp,
+                'flag_type': ftype,
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=[flag],
+            )
+
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'sourced only from alias' in m and fp in m and ftype in m for m in info_msgs
+        ), f'Expected an alias-fallback INFO log naming task_id/flag_type; got {info_msgs!r}'
+
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('deduped_against') == ['m1', 'm2'], (
+            f'Alias-sourced enrichment must still be written; got {meta.get("deduped_against")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_canonical_field_present_does_not_log_alias_fallback(self, caplog):
+        """When the canonical 'deduped_against' field is present (non-empty), no
+        alias-fallback observability log fires — the log exists specifically to
+        flag alias-ONLY enrichment (task-2047 amendment)."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge about deploy steps, canonical present',
+            'deduped_against': ['m1', 'm2'],
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': fp,
+                'flag_type': ftype,
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=[flag],
+            )
+
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert not any('sourced only from alias' in m for m in info_msgs), (
+            f'Canonical-field enrichment must NOT log the alias-fallback notice; got {info_msgs!r}'
         )
 
 

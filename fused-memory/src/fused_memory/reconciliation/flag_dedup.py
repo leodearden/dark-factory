@@ -599,6 +599,11 @@ async def filter_suppressed(
 #: dicts with no fixture pinning the exact field name in practice, so a small
 #: union-of-candidates keeps extraction robust to shape drift.  Order only
 #: affects readability here — extraction UNIONS values across every field.
+#: This is a CONSCIOUS robustness/precision tradeoff: a generic alias (e.g.
+#: ``'memory_ids'``) could in principle mean something other than "duplicate
+#: of" on a producer's flag. To keep false-positive enrichment observable,
+#: ``dedup_flags`` logs at INFO whenever a marker's ``deduped_against`` is
+#: populated entirely from an alias rather than the canonical field.
 _DEDUPED_AGAINST_FLAG_FIELDS: tuple[str, ...] = (
     'deduped_against',
     'duplicate_memory_ids',
@@ -621,9 +626,13 @@ def _extract_deduped_against_uuids(flag: dict[str, Any]) -> list[str]:
     - Any other shape (e.g. ``None``, ``int``, ``dict``) is skipped rather
       than raising, since ``flag`` is a free-form LLM-emitted dict.
 
-    Each element is ``None``-checked, ``str``-coerced, and stripped; blank
-    results (empty string or whitespace-only) are dropped.  Non-str elements
-    (e.g. an int) are coerced to ``str`` rather than dropped.
+    Each list element is type-checked before coercion: only ``str`` and
+    ``int`` elements are accepted (e.g. an int ``123`` becomes ``'123'``);
+    any other element shape (``dict``, nested ``list``, ``float``, ``bool``,
+    etc.) is DROPPED rather than stringified, since ``str()`` on a
+    dict/list would otherwise mint a junk 'UUID' like ``"{'k': 'v'}"``
+    (task-2047 amendment).  Accepted elements are then stripped; blank
+    results (empty string or whitespace-only) are also dropped.
 
     Returns ``[]`` when no candidate field is present, when every present
     field is empty, or when *flag* carries none of the candidate fields at
@@ -647,6 +656,11 @@ def _extract_deduped_against_uuids(flag: dict[str, Any]) -> list[str]:
             continue
         for item in candidates:
             if item is None:
+                continue
+            if not isinstance(item, (str, int)):
+                # Structured/garbage element (dict, nested list, float, ...)
+                # — drop rather than str()-coerce so it can't pollute
+                # metadata.deduped_against with a non-UUID string.
                 continue
             s = str(item).strip()
             if not s:
@@ -961,6 +975,21 @@ async def dedup_flags(
             if is_content_fingerprint_task_id(tid)
             else None
         )
+        if deduped_against and not flag.get('deduped_against'):
+            # Observability (task-2047 amendment): _DEDUPED_AGAINST_FLAG_FIELDS
+            # unions several undocumented alias fields alongside the canonical
+            # 'deduped_against' contract (prompts/stage1.py only instructs the
+            # LLM to emit the canonical field). When enrichment is sourced
+            # entirely from an alias — meaning the canonical field was absent
+            # or empty — log it so a false-positive enrichment (an alias that
+            # means something other than "duplicates", e.g. "all memories
+            # examined") is observable rather than silently trusted.
+            logger.info(
+                'flag_dedup: deduped_against enrichment for task_id %r flag_type %s'
+                ' sourced only from alias field(s), not the canonical'
+                ' "deduped_against" field — verify producer output shape',
+                tid, ftype,
+            )
         # In-batch signature memoization (task-1978): the SAME (task_id, flag_type)
         # signature can be emitted multiple times in ONE items_flagged list within a
         # single dedup_flags call (e.g. a task genuinely re-evaluated multiple times
