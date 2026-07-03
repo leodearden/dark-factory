@@ -4257,29 +4257,37 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
     def test_fallback_lint_reprojects_repo_root_file_to_ruff_bearing_context(self, tmp_path: Path) -> None:
         """The real dark_factory chained lint command reprojects for a repo-root file.
 
-        Task 2036: ``config.lint_command`` mirrors the actual dark_factory
-        ``orchestrator/config.yaml`` shape (``uv run ruff check <members> &&
-        python3 <script> ...``). ``_scope_command`` truncates at ``ruff check``
-        and inserts the touched file, leaving a bare ``uv run ruff check
-        <file>`` that fails to spawn ruff from the depless workspace root. The
-        fallback must reproject it into a ruff-bearing member uv context.
+        Task 2036: ``config.lint_command`` matches the real dark_factory
+        ``orchestrator/config.yaml`` value verbatim (``uv run ruff check
+        <members> && python3 <script> <dirs>``, no trailing flags — see
+        orchestrator/config.yaml:23). ``_scope_command`` truncates at ``ruff
+        check`` and inserts the touched file, leaving a bare ``uv run ruff
+        check <file>`` that fails to spawn ruff from the depless workspace
+        root. The fallback must reproject it into a ruff-bearing member uv
+        context. Asserts the *full* resulting command string (not just
+        startswith/contains) so an orphaned flag mistakenly harvested by
+        ``_scope_command`` from the ``&&``-chained remainder would fail this
+        test instead of being silently masked (amendment: a prior version of
+        this test appended a synthetic ``--config <path>`` the real config
+        does not have, which ``_scope_command`` harvested as a dangling flag
+        with its value dropped — masked by the startswith/contains asserts).
         """
         cfg = self._make_config(
             tmp_path,
             lint_command=(
                 'uv run ruff check shared escalation fused-memory orchestrator dashboard '
                 '&& python3 fused-memory/scripts/check_bare_magicmock_config.py '
-                '--config fused-memory/config/config.yaml'
+                'shared/tests escalation/tests fused-memory/tests orchestrator/tests '
+                'dashboard/tests'
             ),
             test_command='cd shared && uv run pytest tests/',
         )
         result = _build_fallback_config(['tests/scripts/test_orchestrator_watchdog.py'], cfg)
         assert result is not None
-        assert result.lint_command is not None
-        assert result.lint_command.startswith('uv run --project shared ruff check')
-        assert 'tests/scripts/test_orchestrator_watchdog.py' in result.lint_command
-        assert not result.lint_command.startswith('uv run ruff check tests/scripts')
-        assert '--directory' not in result.lint_command
+        assert (
+            result.lint_command
+            == 'uv run --project shared ruff check tests/scripts/test_orchestrator_watchdog.py'
+        )
 
 
 class TestBuildFallbackConfigDataModule:
