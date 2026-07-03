@@ -16,6 +16,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -825,6 +826,25 @@ class SpeculativeItem:
             )
 
 
+class InflightStatus(StrEnum):
+    """Sentinel status values for :class:`InflightEntry` / :class:`InflightVerifyResult`.
+
+    A single str-compatible Enum (task 1990 / MQ-invariants ε) shared by both
+    dataclasses' ``status`` fields — ``InflightEntry.status`` may carry any of
+    the five members; ``InflightVerifyResult.status`` carries only the first
+    three (DROPPED / REQUEUED / RUNNER_UNAVAILABLE).  Members are ``str``
+    instances (mirrors ``event_store.EventType`` / ``verify_runner.DriftVerdict``),
+    so every existing ``==`` / ``in`` comparison against the raw sentinel
+    strings keeps working unchanged.
+    """
+
+    DROPPED = 'DROPPED'
+    REQUEUED = 'REQUEUED'
+    RUNNER_UNAVAILABLE = 'RUNNER_UNAVAILABLE'
+    ABANDONED_PREDISPATCH = 'ABANDONED_PREDISPATCH'
+    REQUEUED_PREDISPATCH = 'REQUEUED_PREDISPATCH'
+
+
 @dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
@@ -873,7 +893,7 @@ class InflightEntry:
     phase: str
     passthrough_outcome: MergeOutcome | None = None
     verify_result: VerifyResult | None = None  # None = pass; VerifyResult = fail/skip
-    status: str | None = None               # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
+    status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
 
     def __post_init__(self) -> None:
@@ -935,6 +955,6 @@ class InflightVerifyResult:
     outcome: MergeOutcome | None
     merge_wt: Path | None
     warm_results: dict[str, str] = dataclasses.field(default_factory=dict)
-    status: str | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
+    status: InflightStatus | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
     reason: str | None = None  # str(RunnerUnavailable exc) when status='RUNNER_UNAVAILABLE'
     spec_warm: bool = False   # True when merge_wt is a warm _spec- lane (not an ephemeral wt)

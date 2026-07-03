@@ -981,11 +981,11 @@ class TestInflightVerifyResultReasonField:
 
     def test_reason_field_in_runner_unavailable_sentinel(self):
         """InflightVerifyResult with status='RUNNER_UNAVAILABLE' can carry reason."""
-        from orchestrator.merge_queue import InflightVerifyResult
+        from orchestrator.merge_queue import InflightStatus, InflightVerifyResult
         ivr = InflightVerifyResult(
             outcome=None,
             merge_wt=None,
-            status='RUNNER_UNAVAILABLE',
+            status=InflightStatus.RUNNER_UNAVAILABLE,
             reason='ssh: Could not resolve hostname leo-laptop',
         )
         assert ivr.status == 'RUNNER_UNAVAILABLE'
@@ -1380,6 +1380,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
 
         from orchestrator.merge_queue import (
             InflightEntry,
+            InflightStatus,
             InflightVerifyResult,
             MergeRequest,
             SpeculativeItem,
@@ -1419,7 +1420,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=item.merge_wt,
-                status='RUNNER_UNAVAILABLE',
+                status=InflightStatus.RUNNER_UNAVAILABLE,
                 reason=reason,
             )
 

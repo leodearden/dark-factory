@@ -103,6 +103,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     GroupMergeRequest,
     InflightEntry,
     InFlightMergeRegistry,
+    InflightStatus,
     InflightVerifyResult,
     MainHealthAutoHealRegistry,
     MergeBounceRegistry,
@@ -7222,7 +7223,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         try:
                             _hvt = head.verify_task.result()
                             _head_was_requeued = (
-                                getattr(_hvt, 'status', None) == 'REQUEUED'
+                                getattr(_hvt, 'status', None) == InflightStatus.REQUEUED
                             )
                         except BaseException:
                             pass
@@ -7300,7 +7301,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # handler must not re-release on any path below.
                             _entry_released = True
                             # REQUEUED: abort-poll already put req on _queue → skip.
-                            if _entry_status == 'REQUEUED':
+                            if _entry_status == InflightStatus.REQUEUED:
                                 continue
                             # Head was REQUEUED (operator halt) and we cancelled
                             # this downstream task before its abort-poll could
@@ -7853,7 +7854,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
-                        status='DROPPED',
+                        status=InflightStatus.DROPPED,
                     )
                 # Abort trigger 2 — operator halt: terminate the in-flight
                 # verify and RE-QUEUE the merge for re-verify after un-halt.
@@ -7873,7 +7874,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
-                        status='REQUEUED',
+                        status=InflightStatus.REQUEUED,
                     )
         except RunnerUnavailable as exc:
             # Remote transport failure: do NOT clean merge_wt — the item will
@@ -7888,7 +7889,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=merge_wt,
-                status='RUNNER_UNAVAILABLE',
+                status=InflightStatus.RUNNER_UNAVAILABLE,
                 reason=str(exc),
             )
         except Exception as exc:
@@ -7982,7 +7983,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Handled inline in _dispatch_item: merge_wt already cleaned, req already
             # re-queued (REQUEUED_PREDISPATCH) or result already done (ABANDONED_PREDISPATCH).
             # Nothing to deliver; chain is stale → n_failed=True.
-            if entry.status in ('ABANDONED_PREDISPATCH', 'REQUEUED_PREDISPATCH'):
+            if entry.status in (InflightStatus.ABANDONED_PREDISPATCH, InflightStatus.REQUEUED_PREDISPATCH):
                 _n_failed_val = True
                 _skip_release = True  # no lease
                 return False
@@ -8009,7 +8010,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 vr = await entry.verify_task
 
             # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
-            if vr is not None and vr.status in ('DROPPED', 'REQUEUED'):
+            if vr is not None and vr.status in (InflightStatus.DROPPED, InflightStatus.REQUEUED):
                 _cancel_release = True
                 _n_failed_val = True  # abandon / operator-halt → chain stale
                 return False
@@ -8031,7 +8032,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # re-merged items are on _redispatch in the correct order.
             # Downstream entries do NOT remain in _inflight with stale commits;
             # the cascade is the correctness mechanism, not the CAS backstop alone.
-            if vr is not None and vr.status == 'RUNNER_UNAVAILABLE':
+            if vr is not None and vr.status == InflightStatus.RUNNER_UNAVAILABLE:
                 _skip_release = True   # quarantine_and_release handles the lease
                 _n_failed_val = False  # not a chain failure
                 if entry.lease is not None and self._host_allocator is not None:
@@ -8403,7 +8404,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 merge_wt=None,
                 was_speculative=item.speculative,
                 phase='abandoned',
-                status='ABANDONED_PREDISPATCH',
+                status=InflightStatus.ABANDONED_PREDISPATCH,
             )
 
         # ── Pre-dispatch operator-halt ──────────────────────────────────────
@@ -8422,7 +8423,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 merge_wt=None,
                 was_speculative=item.speculative,
                 phase='halted',
-                status='REQUEUED_PREDISPATCH',
+                status=InflightStatus.REQUEUED_PREDISPATCH,
             )
 
         # ── Immediate outcome (conflict / already_merged / blocked) ────────
