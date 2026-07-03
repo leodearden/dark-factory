@@ -16,6 +16,7 @@ from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 from graphiti_core.errors import EdgeNotFoundError
+from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
@@ -352,6 +353,29 @@ class GraphitiBackend:
         except TimeoutError:
             logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
             return []
+
+    async def get_episode_by_uuid(self, episode_uuid: str, *, group_id: str) -> EpisodicNode | None:
+        """Fetch an episode node by UUID.
+
+        Mirrors remove_episode's driver-selection + EpisodicNode.get_by_uuid
+        call, but is fail-safe rather than propagating: a missing episode
+        (graphiti_core's NodeNotFoundError) or a timeout (matching
+        retrieve_episodes' timeout handling) both return None instead of
+        raising, since callers (e.g. the reconciliation promotion-time
+        batch-plan gate, task 2033) treat "can't determine content" as a
+        graceful fallback rather than a hard failure.
+        """
+        driver = self._driver_for(group_id)
+        try:
+            return await asyncio.wait_for(
+                EpisodicNode.get_by_uuid(driver, episode_uuid),
+                timeout=self._read_timeout,
+            )
+        except GraphitiCoreNodeNotFoundError:
+            return None
+        except TimeoutError:
+            logger.warning(f'Graphiti get_episode_by_uuid timed out after {self._read_timeout}s')
+            return None
 
     async def remove_episode(self, episode_uuid: str, *, group_id: str) -> None:
         """Delete an episode by UUID."""

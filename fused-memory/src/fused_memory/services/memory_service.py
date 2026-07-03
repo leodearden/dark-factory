@@ -1430,6 +1430,23 @@ class MemoryService:
         ]
 
     # ------------------------------------------------------------------
+    # Read: get_episode_content
+    # ------------------------------------------------------------------
+
+    async def get_episode_content(self, episode_uuid: str, project_id: str) -> str | None:
+        """Fetch a single episode's original source text by UUID.
+
+        Thin passthrough to graphiti.get_episode_by_uuid. Unlike get_episodes
+        (recent-N only) or search results (edge/fact text only), this is the
+        by-UUID episode-body lookup needed by the reconciliation promotion-time
+        batch-plan gate (task 2033) to run is_batch_plan_framing on the
+        episode's actual content. Returns None when the episode is not found
+        (or on a fail-safe timeout inside get_episode_by_uuid).
+        """
+        node = await self.graphiti.get_episode_by_uuid(episode_uuid, group_id=project_id)
+        return getattr(node, 'content', None) if node is not None else None
+
+    # ------------------------------------------------------------------
     # Read: deterministic metadata count
     # ------------------------------------------------------------------
 
