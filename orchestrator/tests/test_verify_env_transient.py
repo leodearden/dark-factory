@@ -107,3 +107,39 @@ class TestClassifyFailureEnvTransient:
         """
         output = 'error: something went wrong unrelated to xdist or pip\n'
         assert self._classify(output, rc=1, timed_out=False) == 'unknown_test_failure'
+
+
+class TestEnvTransientNonMisattributionWiring:
+    """step-3: env_transient must be wired into every non-misattribution collection.
+
+    Classifying the failure correctly (step 1/2) is not enough on its own —
+    downstream selection (_worst_category), the preexisting-main-break probe,
+    and archival must all treat env_transient as an infra category, not a
+    human-triage-worthy or drift-worthy one. RED today: env_transient is
+    absent from all three collections.
+    """
+
+    def test_worst_category_ranks_env_transient_above_test_failure(self):
+        """A mixed-category run resolves to env_transient, not test_failure.
+
+        This mirrors how a xdist-death run whose output contains BOTH the
+        env_transient signature and collateral FAILED lines must resolve to
+        the infra category, not the test-drift category.
+        """
+        assert verify._worst_category(['test_failure', 'env_transient']) == 'env_transient'
+
+    def test_env_transient_skips_preexisting_break_probe(self):
+        """env_transient is non-deterministic to re-probe on main (like infra_timeout)."""
+        assert 'env_transient' in verify.PREEXISTING_BREAK_SKIP_CATEGORIES
+
+    def test_env_transient_not_archived(self):
+        """env_transient is infra, not human-triage-worthy — must not be archived."""
+        assert verify._should_archive_category('env_transient') is False
+
+    def test_env_transient_ranked_above_test_failure_in_category_priority(self):
+        """env_transient must outrank test_failure in the severity list."""
+        assert 'env_transient' in verify._CATEGORY_PRIORITY
+        assert (
+            verify._CATEGORY_PRIORITY.index('env_transient')
+            < verify._CATEGORY_PRIORITY.index('test_failure')
+        )
