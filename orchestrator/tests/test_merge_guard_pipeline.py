@@ -33,16 +33,25 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from pathlib import Path
 from typing import Literal
 
 import pytest
 from _orch_helpers import make_placeholder_future
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_queue import MergeOutcome, MergeRequest
+from orchestrator.merge_queue import (
+    DROPPED_PLAN_TARGETS_REASON_PREFIX,
+    Decided,
+    MergedOk,
+    MergeOutcome,
+    MergeRequest,
+    SpeculativeMergeWorker,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures (copied from test_merge_queue.py:62-101 — per-file duplication
