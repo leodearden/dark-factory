@@ -437,6 +437,7 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
         base_sha='abc123dead',
         speculative=False,
         skip_verify=False,
+        immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
     )
 
     # Build a minimal InflightEntry (passthrough: verify_task=None)

@@ -16,6 +16,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -799,6 +800,50 @@ class SpeculativeItem:
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
     counts_against_cap: bool = False  # True for non-speculative, non-train successful merges (Mechanism 1)
 
+    def __post_init__(self) -> None:
+        """Enforce the I2 shape invariants (task 1990 / MQ-invariants ε).
+
+        A SpeculativeItem is either REAL (a merge actually happened; carries
+        merge_result + merge_wt) or DECIDED (conflict/already_merged/skip;
+        carries immediate_outcome) — never both, never neither.  Structurally
+        retires the task-1928 bug class where a hand-rebuilt item silently
+        dropped a field into an inconsistent shape.
+        """
+        if (self.merge_result is None) == (self.immediate_outcome is None):
+            raise ValueError(
+                'SpeculativeItem requires exactly one of merge_result or '
+                f'immediate_outcome to be set (REAL xor DECIDED); got '
+                f'merge_result={self.merge_result!r}, immediate_outcome={self.immediate_outcome!r}',
+            )
+        if (self.merge_wt is not None) != (self.merge_result is not None):
+            raise ValueError(
+                'SpeculativeItem.merge_wt must be set iff merge_result is set; got '
+                f'merge_wt={self.merge_wt!r}, merge_result={self.merge_result!r}',
+            )
+        if self.already_delivered and self.immediate_outcome is None:
+            raise ValueError(
+                'SpeculativeItem.already_delivered=True requires immediate_outcome to be set',
+            )
+
+
+class InflightStatus(StrEnum):
+    """Sentinel status values for :class:`InflightEntry` / :class:`InflightVerifyResult`.
+
+    A single str-compatible Enum (task 1990 / MQ-invariants ε) shared by both
+    dataclasses' ``status`` fields — ``InflightEntry.status`` may carry any of
+    the five members; ``InflightVerifyResult.status`` carries only the first
+    three (DROPPED / REQUEUED / RUNNER_UNAVAILABLE).  Members are ``str``
+    instances (mirrors ``event_store.EventType`` / ``verify_runner.DriftVerdict``),
+    so every existing ``==`` / ``in`` comparison against the raw sentinel
+    strings keeps working unchanged.
+    """
+
+    DROPPED = 'DROPPED'
+    REQUEUED = 'REQUEUED'
+    RUNNER_UNAVAILABLE = 'RUNNER_UNAVAILABLE'
+    ABANDONED_PREDISPATCH = 'ABANDONED_PREDISPATCH'
+    REQUEUED_PREDISPATCH = 'REQUEUED_PREDISPATCH'
+
 
 @dataclass
 class InflightEntry:
@@ -848,8 +893,22 @@ class InflightEntry:
     phase: str
     passthrough_outcome: MergeOutcome | None = None
     verify_result: VerifyResult | None = None  # None = pass; VerifyResult = fail/skip
-    status: str | None = None               # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
+    status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
+
+    def __post_init__(self) -> None:
+        """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).
+
+        A passthrough entry (immediate-outcome delivery, no real verify) must
+        wrap a DECIDED item — i.e. passthrough_outcome is set only when the
+        wrapped item's own immediate_outcome is also set.
+        """
+        if self.passthrough_outcome is not None and self.item.immediate_outcome is None:
+            raise ValueError(
+                'InflightEntry.passthrough_outcome requires item.immediate_outcome '
+                f'to be set; got passthrough_outcome={self.passthrough_outcome!r} on '
+                f'an item with immediate_outcome=None (merge_result={self.item.merge_result!r})',
+            )
 
 
 @dataclass
@@ -882,20 +941,43 @@ class InflightVerifyResult:
                   the verify was aborted/dropped before starting.
     warm_results: dict[str, bool] of per-test results from warm verify (for shadow compare);
                   empty dict if the warm path was not taken.
-    status      : None on normal completion; sentinel string for special cases:
-                  'DROPPED'           — sole-waiter abandoned; merge_wt cleaned
-                  'REQUEUED'          — operator halt; req re-queued on _queue
-                  'RUNNER_UNAVAILABLE' — remote runner raised RunnerUnavailable;
+    status      : None on normal completion; sentinel InflightStatus member for
+                  special cases (see __post_init__ for the enforced subset):
+                  InflightStatus.DROPPED             — sole-waiter abandoned; merge_wt cleaned
+                  InflightStatus.REQUEUED             — operator halt; req re-queued on _queue
+                  InflightStatus.RUNNER_UNAVAILABLE — remote runner raised RunnerUnavailable;
                                         merge_wt NOT cleaned (will be re-dispatched)
     reason      : str(exc) from the RunnerUnavailable exception when status is
-                  'RUNNER_UNAVAILABLE'; None on all other paths.  Used by the
-                  unavailability tracker + alarm to name the actual failure cause
+                  InflightStatus.RUNNER_UNAVAILABLE; None on all other paths.  Used by
+                  the unavailability tracker + alarm to name the actual failure cause
                   in escalation summaries.
     """
 
     outcome: MergeOutcome | None
     merge_wt: Path | None
     warm_results: dict[str, str] = dataclasses.field(default_factory=dict)
-    status: str | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
-    reason: str | None = None  # str(RunnerUnavailable exc) when status='RUNNER_UNAVAILABLE'
+    status: InflightStatus | None = None  # None | DROPPED | REQUEUED | RUNNER_UNAVAILABLE
+    reason: str | None = None  # str(RunnerUnavailable exc) when status=RUNNER_UNAVAILABLE
     spec_warm: bool = False   # True when merge_wt is a warm _spec- lane (not an ephemeral wt)
+
+    def __post_init__(self) -> None:
+        """Enforce status is restricted to the 3 verify-result sentinels (task
+        1990 review parity with SpeculativeItem / InflightEntry).
+
+        InflightVerifyResult is a verify-outcome message; ABANDONED_PREDISPATCH
+        and REQUEUED_PREDISPATCH are InflightEntry-only predispatch sentinels
+        (set before a verify even starts) and must never appear here. Raw
+        strings equal to a valid member (e.g. 'DROPPED') satisfy this via
+        InflightStatus's str-compatibility, matching existing test fixtures.
+        """
+        if self.status is not None and self.status not in (
+            InflightStatus.DROPPED,
+            InflightStatus.REQUEUED,
+            InflightStatus.RUNNER_UNAVAILABLE,
+        ):
+            raise ValueError(
+                'InflightVerifyResult.status must be one of None, '
+                'InflightStatus.DROPPED, InflightStatus.REQUEUED, or '
+                'InflightStatus.RUNNER_UNAVAILABLE (ABANDONED_PREDISPATCH / '
+                f'REQUEUED_PREDISPATCH are InflightEntry-only); got {self.status!r}',
+            )

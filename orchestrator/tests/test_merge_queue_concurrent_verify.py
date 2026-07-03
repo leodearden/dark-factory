@@ -34,7 +34,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator
@@ -2524,18 +2524,20 @@ class TestStopDrainsInflight:
         req_a = _make_request('stop-a', 'task/stop-a', git_ops.project_root, config)
         req_b = _make_request('stop-b', 'task/stop-b', git_ops.project_root, config)
 
+        wt_a = git_ops.project_root / '.worktrees' / 'stop-a'
+        wt_b = git_ops.project_root / '.worktrees' / 'stop-b'
         item_a = SpeculativeItem(
             request=req_a,
-            merge_result=None,
-            merge_wt=None,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt_a),
+            merge_wt=wt_a,
             base_sha='aaa',
             speculative=False,
             skip_verify=False,
         )
         item_b = SpeculativeItem(
             request=req_b,
-            merge_result=None,
-            merge_wt=None,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt_b),
+            merge_wt=wt_b,
             base_sha='bbb',
             speculative=False,
             skip_verify=False,
@@ -2609,6 +2611,7 @@ class TestStopDrainsInflight:
             base_sha='ccc',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         entry = InflightEntry(
             item=item,
@@ -2654,6 +2657,7 @@ class TestStopDrainsInflight:
             base_sha='ddd',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         worker._redispatch.append(item)
 
@@ -2705,6 +2709,7 @@ class TestSnapshotInflight:
             base_sha='aaa',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         item_b = SpeculativeItem(
             request=req_b,
@@ -2713,6 +2718,7 @@ class TestSnapshotInflight:
             base_sha='bbb',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
 
         entry_a = InflightEntry(
@@ -2778,6 +2784,7 @@ class TestSnapshotInflight:
             base_sha='aaa',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         entry = InflightEntry(
             item=item,
@@ -2825,10 +2832,12 @@ class TestSnapshotInflight:
         item_a = SpeculativeItem(
             request=req_a, merge_result=None, merge_wt=None,
             base_sha='aaa', speculative=False, skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         item_b = SpeculativeItem(
             request=req_b, merge_result=None, merge_wt=None,
             base_sha='bbb', speculative=False, skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         entry_a = InflightEntry(
             item=item_a, lease=None, verify_task=None, merge_wt=None,
@@ -3511,6 +3520,7 @@ class TestStopDrainFiresRemoteCancel:
             base_sha='abc',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         # Start run_merge_verify so the id is live (gate_entered set, awaits release).
         verify_task = asyncio.ensure_future(
@@ -3547,6 +3557,7 @@ class TestStopDrainFiresRemoteCancel:
             base_sha='def',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         verify_task_local = asyncio.ensure_future(asyncio.sleep(999))
         entry_local = InflightEntry(

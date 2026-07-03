@@ -1285,6 +1285,7 @@ class TestUnreachableHostCapstone:
 
         from orchestrator.merge_queue import (
             InflightEntry,
+            InflightStatus,
             InflightVerifyResult,
             MergeRequest,
             SpeculativeItem,
@@ -1334,7 +1335,7 @@ class TestUnreachableHostCapstone:
             async def _ru_verify():
                 return InflightVerifyResult(
                     outcome=None, merge_wt=item.merge_wt,
-                    status='RUNNER_UNAVAILABLE', reason=reason,
+                    status=InflightStatus.RUNNER_UNAVAILABLE, reason=reason,
                 )
 
             vt = asyncio.ensure_future(_ru_verify())

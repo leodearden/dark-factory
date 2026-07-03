@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import os
 import re
@@ -3310,11 +3311,15 @@ class TestSpeculativeMergeWorker:
         dummy_wt2 = git_ops.project_root / '.worktrees' / 'dummy2'
 
         item1 = SpeculativeItem(
-            request=req1, merge_result=None, merge_wt=dummy_wt1,
+            request=req1,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=dummy_wt1),
+            merge_wt=dummy_wt1,
             base_sha='aaa', speculative=False, skip_verify=False,
         )
         item2 = SpeculativeItem(
-            request=req2, merge_result=None, merge_wt=dummy_wt2,
+            request=req2,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=dummy_wt2),
+            merge_wt=dummy_wt2,
             base_sha='bbb', speculative=False, skip_verify=False,
         )
         await worker._verifier_queue.put(item1)
@@ -4338,10 +4343,21 @@ class TestSpeculativeMergeWorker:
         )
         worker._remerge = AsyncMock(return_value=remerged_item)  # type: ignore[method-assign]
 
+        # token2 is discarded by the n_failed short-circuit and replaced by
+        # worker._remerge's mocked return value — it must be a REAL item
+        # (immediate_outcome=None), not DECIDED: _dispatch_item's
+        # immediate-outcome branch returns a passthrough entry BEFORE the
+        # chain-invalidation check ever runs, so a DECIDED token2 would skip
+        # _remerge entirely. merge_wt/merge_result content is unread on the
+        # exercised path (mocked _remerge only takes req + started_monotonic),
+        # so a dummy worktree path (established pattern elsewhere in this file)
+        # is a safe filler.
+        dummy_wt2 = git_ops.project_root / '.worktrees' / 'vot-b2-stale'
         token2 = SpeculativeItem(
-            request=req2, merge_result=None, merge_wt=None,
+            request=req2,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=dummy_wt2),
+            merge_wt=dummy_wt2,
             base_sha='stalebase', speculative=True, skip_verify=False,
-            immediate_outcome=None,
         )
 
         await worker._verifier_queue.put(token1)
@@ -5851,6 +5867,7 @@ class TestSpeculativeItemDefaults:
             base_sha='',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked'),
         )
         assert item.started_monotonic is None
         # Tie the default to the observability guarantee: None → NULL duration_ms
@@ -5873,6 +5890,7 @@ class TestSpeculativeItemDefaults:
             base_sha='',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked'),
         )
         assert item.already_delivered is False
 
@@ -9881,6 +9899,232 @@ class TestMergedBranchTipCarryThroughRebuild:
             f'got {captured_equiv_kw.get("merged_tip")!r}. '
             f'Without the PRIMARY fix the cas_failed rebuild drops the field.'
         )
+
+    # ------------------------------------------------------------------
+    # I3 amendment (task 1990 review): full-field preservation through the
+    # replace-only rebuilds. Tests (A)/(A-drift)/(C) above lock down
+    # merged_branch_tip specifically — the one field task-1928's original
+    # hand-fix had to add back. These lock the general dataclasses.replace
+    # guarantee that motivated the I3 switch: EVERY other SpeculativeItem
+    # field survives the rebuild unchanged, including counts_against_cap,
+    # which the pre-1990 hand-rebuild silently reset to its default (False).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _assert_only_base_sha_changed(
+        original: SpeculativeItem,
+        rebuilt: SpeculativeItem,
+        expected_new_base_sha: str,
+    ) -> None:
+        """Assert a replace-only rebuild changed base_sha and NOTHING else.
+
+        Walks every SpeculativeItem field via dataclasses.fields so a future
+        field addition is covered automatically — no hand-maintained field
+        list to fall out of sync here.
+        """
+        assert rebuilt is not original, 'dataclasses.replace must return a new instance'
+        assert rebuilt.base_sha == expected_new_base_sha, (
+            f'expected rebuilt base_sha={expected_new_base_sha!r}, got {rebuilt.base_sha!r}'
+        )
+        assert rebuilt.base_sha != original.base_sha, (
+            'base_sha must actually change across the rebuild (test setup bug otherwise)'
+        )
+        for f in dataclasses.fields(SpeculativeItem):
+            if f.name == 'base_sha':
+                continue
+            original_value = getattr(original, f.name)
+            rebuilt_value = getattr(rebuilt, f.name)
+            assert rebuilt_value == original_value, (
+                f'replace-only rebuild must preserve {f.name!r} unchanged (task-1928 '
+                f'regression class: a hand-rebuild silently dropped fields to their '
+                f'defaults); original={original_value!r}, rebuilt={rebuilt_value!r}'
+            )
+
+    async def test_rebased_pending_reverify_rebuild_preserves_all_fields(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(A2) The rebased_pending_reverify replace-only rebuild (~:8258) must
+        change ONLY base_sha — every other field, including counts_against_cap,
+        survives unchanged. Complements test (A), which only checks
+        merged_branch_tip.
+        """
+        branch = 'field-carry-reverify'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        branch_wt, ORIGINAL_TIP, base_main, req = await self._setup_overlap_branch(
+            git_ops, branch, config,
+        )
+
+        merge_result = await git_ops.merge_to_main(branch_wt, branch)
+        assert merge_result.success and merge_result.merge_commit is not None
+        worker._register_owned_merge_worktree(merge_result.merge_worktree)
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_main,
+            speculative=False,
+            skip_verify=False,
+            merged_branch_tip=ORIGINAL_TIP,
+            counts_against_cap=True,
+        )
+
+        # Move main: edit line18 (non-adjacent) → rebase succeeds → rebased_onto
+        # becomes the new main tip, which must land in the rebuilt base_sha.
+        (git_ops.project_root / 'shared.py').write_text(
+            self._SHARED_BASE.replace('line18\n', 'line18\nmain-edit\n')
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: field-carry-reverify overlap'],
+            cwd=git_ops.project_root,
+        )
+        new_main_sha = await git_ops.get_main_sha()
+
+        captured: list[SpeculativeItem] = []
+        _real_replace = dataclasses.replace
+
+        def _spy_replace(obj, **changes):
+            rebuilt = _real_replace(obj, **changes)
+            captured.append(rebuilt)
+            return rebuilt
+
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=passing),
+            ),
+            patch(
+                'orchestrator.merge_queue._reverify_rebased_tree',
+                AsyncMock(return_value=None),  # gate cleared (disjoint or green re-verify)
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+            patch('orchestrator.merge_queue.dataclasses.replace', side_effect=_spy_replace),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, 'Expected True (main advanced)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', f'unexpected outcome: {outcome!r}'
+        assert len(captured) == 1, (
+            f'expected exactly one replace-only rebuild, got {len(captured)}: {captured!r}'
+        )
+        self._assert_only_base_sha_changed(item, captured[0], expected_new_base_sha=new_main_sha)
+
+    async def test_cas_failed_rebuild_preserves_all_fields(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(C2) The cas_failed replace-only rebuild (~:8322) must change ONLY
+        base_sha — every other field, including counts_against_cap, survives
+        unchanged. Complements test (C), which only checks merged_branch_tip.
+        """
+        branch = 'field-carry-cas'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        branch_wt = (await git_ops.create_worktree(branch)).path
+        (branch_wt / 'tip_carry_c2.py').write_text('tip_c2 = 1\n')
+        await git_ops.commit(branch_wt, 'Add tip_carry_c2.py')
+
+        rc, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=branch_wt)
+        assert rc == 0
+        ORIGINAL_TIP = head_out.strip()
+
+        base_sha = await git_ops.get_main_sha()
+
+        merge_result = await git_ops.merge_to_main(branch_wt, branch)
+        assert merge_result.success and merge_result.merge_commit is not None
+        actual_merge_commit = merge_result.merge_commit
+        worker._register_owned_merge_worktree(merge_result.merge_worktree)
+
+        req = _make_request(branch, branch, branch_wt, config)
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=False,
+            skip_verify=False,
+            merged_branch_tip=ORIGINAL_TIP,
+            counts_against_cap=True,
+        )
+
+        # Advance main for real (unrelated commit) so the CAS-retry's
+        # get_main_sha() below can be mocked to a genuinely different, valid
+        # SHA — merge_to_main never touches project_root, so main only moves
+        # here.
+        (git_ops.project_root / 'unrelated.py').write_text('unrelated = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Move main: field-carry-cas unrelated advance'],
+            cwd=git_ops.project_root,
+        )
+        new_main_sha = await git_ops.get_main_sha()
+        assert new_main_sha != base_sha
+
+        captured: list[SpeculativeItem] = []
+        _real_replace = dataclasses.replace
+
+        def _spy_replace(obj, **changes):
+            rebuilt = _real_replace(obj, **changes)
+            captured.append(rebuilt)
+            return rebuilt
+
+        advance_calls = [0]
+
+        async def _fake_advance(sha, wt, **kw):
+            advance_calls[0] += 1
+            if advance_calls[0] == 1:
+                return 'cas_failed'
+            git_ops._last_advanced_sha = actual_merge_commit
+            return 'advanced'
+
+        passing = MagicMock(passed=True, summary='', timed_out=False)
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=passing),
+            ),
+            patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
+            patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=new_main_sha)),
+            # Eliminate term-1 so an unrelated merged_branch_tip regression
+            # elsewhere can't accidentally mask a dropped field here too.
+            patch(
+                'orchestrator.merge_queue._resolve_second_parent',
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+            patch('orchestrator.merge_queue.dataclasses.replace', side_effect=_spy_replace),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced, 'Expected True (main advanced)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', f'unexpected outcome: {outcome!r}'
+        assert len(captured) == 1, (
+            f'expected exactly one replace-only rebuild, got {len(captured)}: {captured!r}'
+        )
+        self._assert_only_base_sha_changed(item, captured[0], expected_new_base_sha=new_main_sha)
 
 
 # ---------------------------------------------------------------------------
@@ -17228,6 +17472,7 @@ class TestSMWGenerationChain:
             base_sha='base',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked'),
         )
         assert hasattr(item, 'merged_branch_tip')
         assert item.merged_branch_tip is None
@@ -17240,6 +17485,7 @@ class TestSMWGenerationChain:
             speculative=False,
             skip_verify=False,
             merged_branch_tip='T1',
+            immediate_outcome=MergeOutcome('blocked'),
         )
         assert item2.merged_branch_tip == 'T1'
 
@@ -21353,7 +21599,9 @@ class TestSnapshotInflightCollection:
 
         req_a = _make_request('snap-a', 'snap-a', wt, config)
         item_a = SpeculativeItem(
-            request=req_a, merge_result=None, merge_wt=wt / 'a',
+            request=req_a,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt / 'a'),
+            merge_wt=wt / 'a',
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         lease_local = HostLease(name='local', runner=fake_runner, is_local=True)
@@ -21365,7 +21613,9 @@ class TestSnapshotInflightCollection:
 
         req_b = _make_request('snap-b', 'snap-b', wt, config)
         item_b = SpeculativeItem(
-            request=req_b, merge_result=None, merge_wt=wt / 'b',
+            request=req_b,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt / 'b'),
+            merge_wt=wt / 'b',
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         lease_remote = HostLease(name='laptop', runner=fake_runner, is_local=False)
@@ -21418,6 +21668,7 @@ class TestSnapshotInflightCollection:
         item_stale = SpeculativeItem(
             request=req_stale, merge_result=None, merge_wt=None,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked'),
         )
         worker._verify_item = item_stale   # stale, never cleared -- the gamma latent bug
         worker._verify_phase = 'verifying'
@@ -21455,7 +21706,9 @@ class TestSnapshotInflightCollection:
 
         req_head = _make_request('head-task', 'head-task', wt, config)
         item_head = SpeculativeItem(
-            request=req_head, merge_result=None, merge_wt=wt,
+            request=req_head,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
+            merge_wt=wt,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         entry_head = InflightEntry(
@@ -21467,7 +21720,9 @@ class TestSnapshotInflightCollection:
 
         req_second = _make_request('second-task', 'second-task', wt, config)
         item_second = SpeculativeItem(
-            request=req_second, merge_result=None, merge_wt=wt,
+            request=req_second,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
+            merge_wt=wt,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         entry_second = InflightEntry(
@@ -21613,7 +21868,9 @@ class TestHeartbeatOccupancy:
 
         req_a = _make_request('hb-local', 'hb-local', wt, config)
         item_a = SpeculativeItem(
-            request=req_a, merge_result=None, merge_wt=wt,
+            request=req_a,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
+            merge_wt=wt,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         entry_a = InflightEntry(
@@ -21625,7 +21882,9 @@ class TestHeartbeatOccupancy:
 
         req_b = _make_request('hb-laptop', 'hb-laptop', wt, config)
         item_b = SpeculativeItem(
-            request=req_b, merge_result=None, merge_wt=wt,
+            request=req_b,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
+            merge_wt=wt,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         entry_b = InflightEntry(
