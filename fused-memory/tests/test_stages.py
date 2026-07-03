@@ -4648,6 +4648,95 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         )
         assert report.stats.get('stage1_flag_markers_acknowledged') == 0
 
+    @pytest.mark.asyncio
+    async def test_suppressed_and_terminal_drops_distinguished_in_same_run(self, mock_deps):
+        """A suppression-gate drop and a terminal-metadata drop occurring in
+        the SAME run must be distinguished: the suppressed flag's signature is
+        excluded from acknowledgment while the terminal-dropped flag's
+        signature IS forwarded.
+
+        This is the central safety property of scenario (a) — the whole
+        reason _pre_dedup_flags/_post_dedup_signatures/suppressed_signatures
+        exist. A prior test (test_suppression_gate_drop_excluded_from_
+        acknowledgment) covers a suppression drop in isolation and
+        test_dropped_flag_acknowledged_and_stat_set covers a terminal drop in
+        isolation (with dedup_flags mocked to pass everything through
+        unchanged, so suppressed_signatures is always empty there) — neither
+        exercises both drop reasons together. Combining them here guards
+        against a regression that stops subtracting suppressed_signatures (or
+        one that over-broadly excludes every dropped flag, terminal included)
+        (task-2029 amendment round 2, reviewer finding: test_coverage).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        terminal_flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        suppressed_flag = {'task_id': '55', 'flag_type': 'stale_metadata'}
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[terminal_flag, suppressed_flag, active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        async def _mock_get_task(task_id, project_root_arg, **_kw):
+            if str(task_id) == '1703':
+                return {'status': 'cancelled'}
+            return {'status': 'pending'}
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(side_effect=_mock_get_task)
+
+        ack_mock = AsyncMock(return_value=1)
+
+        async def _fake_dedup(*, memory_service, project_id, run_id, flags):
+            # By the time dedup_flags runs, filter_terminal_metadata_flags has
+            # already dropped terminal_flag (real implementation, driven by
+            # the taskmaster mock above) — so `flags` here is only
+            # [suppressed_flag, active_flag]. Simulate dedup_flags' internal
+            # filter_suppressed dropping suppressed_flag.
+            return [f for f in flags if f.get('task_id') != suppressed_flag['task_id']]
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=_fake_dedup),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        resolved = call_kwargs.get('resolved_flags')
+        assert resolved == [terminal_flag], (
+            'terminal-dropped flag must be forwarded for acknowledgment while the '
+            f'suppressed flag must not be; got {resolved!r}'
+        )
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 1
+
 
 # ---------------------------------------------------------------------------
 # Task 1201 — MemoryConsolidator stale human-operator detector integration
