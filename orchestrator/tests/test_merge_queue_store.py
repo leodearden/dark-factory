@@ -647,3 +647,125 @@ class TestMergeQueueStoreNormalizesBranch:
 
         [persisted] = store.load()
         assert persisted.branch == '42'
+
+
+# ---------------------------------------------------------------------------
+# task-2037 step-5 — recover_pending_merges tolerates a legacy prefixed journal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoverPendingMergesPrefixedBranch:
+    """MANDATED regression test (task 2037).
+
+    Reproduces the pre-fix on-disk journal shape directly (bypassing the
+    now-normalizing ``MergeQueueStore.record()`` from step-4) by writing the
+    journal JSON file to disk verbatim, so the regression is exercised
+    independent of the enqueue-normalization fix — legacy journals written
+    before this change may still hold already-prefixed branch values (the
+    observed mr-dd1014fe / branch 'task/4959' shape).
+
+    Without the fix, ``recover_pending_merges`` builds
+    ``f'{branch_prefix}{record.branch}'`` == ``'task/task/4959'`` (double
+    prefix), which never resolves — silently dropping a live in-flight merge.
+    """
+
+    async def test_prefixed_branch_re_enqueues_live_drops_deleted(
+        self, tmp_path: Path,
+    ) -> None:
+        import json
+        from dataclasses import asdict
+
+        config = _real_config(tmp_path)
+        branch_prefix = 'task/'
+        main_branch = 'main'
+
+        wt_live = tmp_path / 'wt-4959'
+        wt_live.mkdir()
+        wt_deleted = tmp_path / 'wt-9999'
+        wt_deleted.mkdir()
+
+        live = PersistedMergeRequest(
+            request_id='mr-4959',
+            task_id='4959',
+            branch='task/4959',  # already-prefixed: the legacy/pre-fix on-disk shape
+            worktree=str(wt_live),
+            pre_rebased=False,
+            task_files=None,
+            snapshot_tip=None,
+            generation=1,
+            lane='normal',
+            enqueued_at=1000.0,
+        )
+        deleted = PersistedMergeRequest(
+            request_id='mr-9999',
+            task_id='9999',
+            branch='task/9999',  # already-prefixed; branch no longer exists
+            worktree=str(wt_deleted),
+            pre_rebased=False,
+            task_files=None,
+            snapshot_tip=None,
+            generation=1,
+            lane='normal',
+            enqueued_at=1000.0,
+        )
+
+        # Write the journal file DIRECTLY — reproduces a pre-fix journal
+        # independent of the new record() normalization (step-4).
+        store_path = tmp_path / 'merge_queue.json'
+        store_path.write_text(
+            json.dumps({
+                live.request_id: asdict(live),
+                deleted.request_id: asdict(deleted),
+            }),
+            encoding='utf-8',
+        )
+
+        store = MergeQueueStore(store_path)
+        assert store.journal_corrupt is False, 'Hand-written journal must parse cleanly'
+
+        # Fake git_ops: resolves ONLY the exact key 'task/4959'. A naive
+        # double-concat (f'{branch_prefix}{record.branch}' == 'task/task/4959')
+        # would resolve to None here — reproducing the pre-fix bug.
+        async def fake_resolve(branch: str) -> str | None:
+            return 'sha-4959' if branch == 'task/4959' else None
+
+        async def fake_is_ancestor(ancestor: str, descendant: str) -> bool:
+            return False
+
+        fake_git_ops = MagicMock()
+        fake_git_ops.resolve_branch_sha = fake_resolve
+        fake_git_ops.is_ancestor = fake_is_ancestor
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store,
+            queue,
+            fake_git_ops,
+            config,
+            event_store=None,
+            main_branch=main_branch,
+            branch_prefix=branch_prefix,
+        )
+
+        # --- live branch: re-enqueued, NOT dropped ---
+        assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
+        assert queue.qsize() == 1, f'Expected exactly 1 re-enqueued item; got {queue.qsize()}'
+        recovered_req = queue.get_nowait()
+        assert recovered_req.request_id == 'mr-4959'
+        assert recovered_req.branch == 'task/4959', (
+            f'Expected reconstructed branch to resolve via the already-prefixed '
+            f"shape 'task/4959'; got {recovered_req.branch!r}"
+        )
+        assert report['requests'][0].request_id == 'mr-4959'
+
+        # --- deleted branch: dropped ---
+        assert report['dropped'] == 1, f'Expected 1 dropped; got {report}'
+
+        remaining_ids = {r.request_id for r in store.load()}
+        assert 'mr-9999' not in remaining_ids, 'Deleted-branch record must be removed'
+        assert 'mr-4959' in remaining_ids, (
+            'Recovered (re-enqueued) record must REMAIN in the store — removal '
+            'happens elsewhere, on merge completion'
+        )
