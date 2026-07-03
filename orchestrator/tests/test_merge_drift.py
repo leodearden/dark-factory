@@ -129,7 +129,7 @@ class TestReachBackRouting:
         which only fires if DriftDetector.check ever gets a real LocalRunner
         talking to the merge_queue-patched run_scoped_verification.
         """
-        from orchestrator.event_store import EventType
+        from orchestrator.event_store import EventStore, EventType
         from orchestrator.merge_drift import _run_drift_check
         from orchestrator.verify_runner import HostAllocator
 
@@ -154,11 +154,12 @@ class TestReachBackRouting:
         fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
         allocator = HostAllocator([fake_remote], quarantine=set())
 
-        class _FakeEventStore:
+        class _FakeEventStore(EventStore):
             def __init__(self) -> None:
+                object.__init__(self)
                 self.emitted: list = []
 
-            def emit(self, event_type, *, task_id=None, data=None, **kw) -> None:
+            def emit(self, event_type, *, task_id=None, data=None, **kw) -> None:  # type: ignore[override]
                 self.emitted.append(event_type)
 
         event_store = _FakeEventStore()
