@@ -3739,24 +3739,163 @@ async def test_recover_stale_runs_emits_storm_escalation_for_dead_owner_shielded
     )
 
 
+# ── distinct-dead-owner-instance storm integration tests (task 2039) ──────────
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_no_storm_for_single_restart_multi_project_burst(
+    journal, event_buffer, mock_memory_service,
+):
+    """A single restart recovering one dead_owner_shielded orphan per
+    project — all left by the SAME dead prior incarnation — must NOT storm
+    (task 2039).
+
+    End-to-end regression for esc-recon-50da2482-1: 6 dead_owner_shielded
+    suppressions in a 35s startup burst, all from ONE dead owner instance,
+    across the 6 registered projects. At the DEFAULT threshold (6) this
+    must never escalate recon_watchdog_kill_storm, and every orphan must
+    still be reaped.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    assert harness.config.dead_owner_suppression_storm_threshold == 6
+
+    dead_instance_id = 'c258d183-dead-owner'
+    projects = [
+        'autopilot_video', 'dark_factory', 'know_live',
+        'my_solar_challenge', 'reify', 'solar_challenge_platform',
+    ]
+    cutoff = harness.config.stale_run_recovery_seconds  # 1800s
+    dead_heartbeat = (datetime.now(UTC) - timedelta(seconds=cutoff + 100)).isoformat()
+    acquired_at = (datetime.now(UTC) - timedelta(seconds=cutoff * 2)).isoformat()
+
+    for i, project_id in enumerate(projects):
+        run = ReconciliationRun(
+            id=f'run-single-restart-{i:04d}',
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='unit-test-single-restart-burst',
+            started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+            status=RunStatus.running,
+            instance_id=dead_instance_id,
+        )
+        await journal.start_run(run)
+        # Fabricate the dead owner's lock row directly (bypassing mark_run_active,
+        # which always stamps THIS process's own instance_id) so the lock's
+        # instance_id matches the run's dead-owner instance_id exactly.
+        async with event_buffer._txn() as db:
+            await db.execute(
+                'INSERT INTO reconciliation_locks '
+                '(project_id, instance_id, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?)',
+                (project_id, dead_instance_id, acquired_at, dead_heartbeat),
+            )
+
+    await harness._recover_stale_runs()
+
+    storm_calls = [
+        call for call in harness._escalate.call_args_list
+        if (call.args[0] if call.args else call.kwargs.get('category')) == 'recon_watchdog_kill_storm'
+    ]
+    assert storm_calls == [], (
+        'a single dead-owner instance recovered across all 6 projects must never '
+        f'storm; got _escalate calls: {harness._escalate.call_args_list}'
+    )
+
+    for i, project_id in enumerate(projects):
+        after = await journal.get_run(f'run-single-restart-{i:04d}')
+        assert after is not None
+        assert after.status == RunStatus.failed, f'{project_id} orphan must be reaped'
+        err = after.stage_reports.get('_error')
+        assert isinstance(err, dict)
+        assert err.get('error_type') == 'StaleRunRecovery'
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_runs_storm_for_distinct_dead_owner_instances(
+    journal, event_buffer, mock_memory_service,
+):
+    """N distinct dead-owner instances crossing the threshold within the
+    window must still storm exactly once (task 2039) — the detection
+    intent from the 2026-06-15 event is preserved even though counting
+    changed from per-suppression to per-distinct-instance.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalate = MagicMock()
+    assert harness.config.dead_owner_suppression_storm_threshold == 6
+
+    projects = [
+        'autopilot_video', 'dark_factory', 'know_live',
+        'my_solar_challenge', 'reify', 'solar_challenge_platform',
+    ]
+    cutoff = harness.config.stale_run_recovery_seconds  # 1800s
+    dead_heartbeat = (datetime.now(UTC) - timedelta(seconds=cutoff + 100)).isoformat()
+    acquired_at = (datetime.now(UTC) - timedelta(seconds=cutoff * 2)).isoformat()
+
+    for i, project_id in enumerate(projects):
+        dead_instance_id = f'dead-owner-{i}'
+        run = ReconciliationRun(
+            id=f'run-distinct-kills-{i:04d}',
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='unit-test-distinct-kills',
+            started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
+            status=RunStatus.running,
+            instance_id=dead_instance_id,
+        )
+        await journal.start_run(run)
+        async with event_buffer._txn() as db:
+            await db.execute(
+                'INSERT INTO reconciliation_locks '
+                '(project_id, instance_id, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?)',
+                (project_id, dead_instance_id, acquired_at, dead_heartbeat),
+            )
+
+    await harness._recover_stale_runs()
+
+    storm_calls = [
+        call for call in harness._escalate.call_args_list
+        if (call.args[0] if call.args else call.kwargs.get('category')) == 'recon_watchdog_kill_storm'
+    ]
+    assert len(storm_calls) == 1, (
+        f'{len(projects)} distinct dead-owner instances must storm exactly once; '
+        f'got _escalate calls: {harness._escalate.call_args_list}'
+    )
+
+    for i, project_id in enumerate(projects):
+        after = await journal.get_run(f'run-distinct-kills-{i:04d}')
+        assert after is not None
+        assert after.status == RunStatus.failed, f'{project_id} orphan must be reaped'
+
+
 # ── _record_dead_owner_suppression unit tests ─────────────────────────────────
 
 
 def test_record_dead_owner_suppression_rolling_window(
     journal, event_buffer, mock_memory_service,
 ):
-    """Unit tests for ReconciliationHarness._record_dead_owner_suppression().
+    """Unit tests for ReconciliationHarness._record_dead_owner_suppression()
+    distinct-dead-owner-instance counting (task 2039).
 
     Phase 1 — threshold crossing + per-project labels:
-        6 calls in the window (3× 'reify', 3× 'autopilot_video') → first 5
-        return None, 6th returns a storm dict with count>=6,
-        window_seconds==3600.0, and projects==['autopilot_video','reify'].
+        6 calls in the window, each from a DISTINCT dead-owner instance_id
+        (3× 'reify', 3× 'autopilot_video') → first 5 return None, 6th
+        returns a storm dict with count>=6, window_seconds==3600.0, and
+        projects==['autopilot_video','reify'].
 
     Phase 2 — no re-fire in the same window:
-        Two more calls at base+6s / base+7s return None (rate-limited).
+        Two more calls (distinct instance_ids) at base+6s / base+7s return
+        None (rate-limited).
 
     Phase 3 — re-fire after a full window during sustained storm:
-        6 calls at now=base+7200s → first 5 None, 6th returns storm dict.
+        6 more calls (distinct instance_ids) at now=base+7200s → first 5
+        None, 6th returns storm dict.
+
+    Every call here uses its own fresh instance_id, so distinct-instance
+    counting and per-event counting coincide — this test locks in the
+    threshold/rate-limit/re-fire mechanics for genuinely independent
+    watchdog kills. The degenerate "one dead owner, many projects" case
+    that must NOT storm is covered separately by
+    test_record_dead_owner_suppression_single_dead_owner_multi_project_no_storm.
     """
     from fused_memory.reconciliation.harness import ReconciliationHarness  # noqa: F401
 
@@ -3769,7 +3908,9 @@ def test_record_dead_owner_suppression_rolling_window(
     results = []
     projects = ['reify', 'autopilot_video', 'reify', 'autopilot_video', 'reify', 'autopilot_video']
     for i, proj in enumerate(projects):
-        result = harness._record_dead_owner_suppression(proj, now=base + timedelta(seconds=i))
+        result = harness._record_dead_owner_suppression(
+            proj, f'iid-phase1-{i}', now=base + timedelta(seconds=i)
+        )
         results.append(result)
 
     # First 5 must be None
@@ -3787,8 +3928,8 @@ def test_record_dead_owner_suppression_rolling_window(
 
     # ── Phase 2: no re-fire in the same window ───────────────────────────────
 
-    r6 = harness._record_dead_owner_suppression('reify', now=base + timedelta(seconds=6))
-    r7 = harness._record_dead_owner_suppression('reify', now=base + timedelta(seconds=7))
+    r6 = harness._record_dead_owner_suppression('reify', 'iid-phase2-a', now=base + timedelta(seconds=6))
+    r7 = harness._record_dead_owner_suppression('reify', 'iid-phase2-b', now=base + timedelta(seconds=7))
     assert r6 is None, f'Call 7 (same window, already fired) should return None, got {r6!r}'
     assert r7 is None, f'Call 8 (same window, already fired) should return None, got {r7!r}'
 
@@ -3797,7 +3938,9 @@ def test_record_dead_owner_suppression_rolling_window(
     future_base = base + timedelta(seconds=7200)
     results3 = []
     for i, proj in enumerate(['reify', 'autopilot_video', 'reify', 'autopilot_video', 'reify', 'autopilot_video']):
-        result = harness._record_dead_owner_suppression(proj, now=future_base + timedelta(seconds=i))
+        result = harness._record_dead_owner_suppression(
+            proj, f'iid-phase3-{i}', now=future_base + timedelta(seconds=i)
+        )
         results3.append(result)
 
     # First 5 must be None again (count in the new window)
@@ -3807,6 +3950,40 @@ def test_record_dead_owner_suppression_rolling_window(
     storm3 = results3[5]
     assert storm3 is not None, 'Phase-3 call 6 should return a storm dict (new window re-fires)'
     assert storm3['count'] >= 6
+
+
+def test_record_dead_owner_suppression_single_dead_owner_multi_project_no_storm(
+    journal, event_buffer, mock_memory_service,
+):
+    """One dead-owner instance recovered across N projects in a single
+    restart must NOT storm, however many projects it touches (task 2039).
+
+    Direct regression for esc-recon-50da2482-1: 6 dead_owner_shielded
+    suppressions, all sharing the SAME dead-owner instance_id, across the 6
+    registered projects — at the DEFAULT threshold (6) this must never fire,
+    because the distinct-dead-owner-instance count stays 1 throughout.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.config.dead_owner_suppression_storm_threshold == 6
+
+    base = datetime(2026, 7, 3, 13, 42, 37, tzinfo=UTC)
+    dead_instance_id = 'c258d183-dead-owner'
+    projects = [
+        'autopilot_video', 'dark_factory', 'know_live',
+        'my_solar_challenge', 'reify', 'solar_challenge_platform',
+    ]
+
+    results = [
+        harness._record_dead_owner_suppression(
+            proj, dead_instance_id, now=base + timedelta(seconds=i * 5)
+        )
+        for i, proj in enumerate(projects)
+    ]
+
+    assert all(r is None for r in results), (
+        f'A single dead-owner instance recovered across {len(projects)} projects '
+        f'must never storm (distinct count stays 1); got {results!r}'
+    )
 
 
 # ── build_stale_run_diagnostics unit tests ────────────────────────────────────
