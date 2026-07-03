@@ -2069,6 +2069,17 @@ class TaskKnowledgeSync(BaseStage):
     # report.stats['stage2_recon_report_systemic_polled'] after super().run().
     _recon_report_systemic_polled: int = 0
 
+    # Combined Stage 2 flags (Stage 1 items + surviving Mem0 active-query flags)
+    # assembled by assemble_payload() during the current run (task-2029 scenario
+    # b).  Read via getattr(self, '_stage2_combined_flags', []) by the post-run
+    # guard flow to join report.stats['flag_deleted_records'] on flag_id and
+    # recover (task_id, flag_type) for Channel-1 tagging.  Reset to [] at the
+    # top of run() (amendment round 2, reviewer finding: robustness) so that a
+    # run whose assembly is skipped/short-circuited can never leave a PRIOR
+    # run's flags visible to the join — the getattr default only covers the
+    # never-set case, not the stale-from-a-prior-run case.
+    _stage2_combined_flags: list[dict] | None = None
+
     def get_system_prompt(self) -> str:
         return build_stage2_system_prompt(self.project_id)
 
@@ -2104,6 +2115,11 @@ class TaskKnowledgeSync(BaseStage):
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
         self._recon_report_systemic_polled = 0
+        # Amendment round 2 (reviewer finding: robustness): reset BEFORE
+        # super().run() so a run whose assemble_payload call is skipped or
+        # short-circuited can never leave a PRIOR run's combined_flags visible
+        # to the post-flight guard's flag_deleted_records join.
+        self._stage2_combined_flags = []
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         # --- trim-then-write: pre-trim pool to cap-1 BEFORE agent writes (task 1831) ---
         # Runs unconditionally (full + remediation) so the pool is bounded every cycle.

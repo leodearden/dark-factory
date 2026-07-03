@@ -14082,3 +14082,73 @@ class TestTaskKnowledgeSyncStage2FlagMarkersAcknowledgedStat:
 
         assert 'stage2_flag_markers_acknowledged' in report.stats
         assert report.stats['stage2_flag_markers_acknowledged'] == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_combined_flags_reset_at_top_of_run_not_leaked_to_join(self, mock_deps):
+        """A PRIOR run's leftover self._stage2_combined_flags must never be
+        visible to a later run's flag_deleted_records join.
+
+        self._stage2_combined_flags is normally (re)populated by
+        assemble_payload() during super().run(); here BaseStage.run is mocked
+        wholesale (assemble_payload never runs), so this test simulates an
+        instance REUSED across runs where a skipped/early-return assembly path
+        left a stale value on the attribute from a previous run. Without an
+        explicit reset at the top of run(), the getattr(...) fallback in the
+        post-flight guard would see the STALE list (it is non-empty, so the
+        `or []` does not kick in) instead of the current run's — a stale-join
+        hazard, even though flag_ids being run-scoped usually yields a 0-match
+        join in practice (amendment round 2, reviewer finding: robustness).
+        """
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # Simulate a previous run's leftover combined_flags sitting on the
+        # instance BEFORE this run starts.
+        stage._stage2_combined_flags = [
+            {'flag_id': 'STALE', 'task_id': '999', 'flag_type': 'stale_ghost'}
+        ]
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        flag_deleted_records = [{'action': 'flag_deleted', 'flag_id': 'F1'}]
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'flag_deleted_records': flag_deleted_records},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        ack_mock = AM(return_value=0)
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._acknowledge_resolved_stage1_markers',
+                new=ack_mock,
+            ),
+        ):
+            await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_args = ack_mock.await_args.args
+        assert call_args[4] == [], (
+            'a previous run\'s leftover _stage2_combined_flags must not be '
+            f'visible to this run\'s join; got {call_args[4]!r}'
+        )
