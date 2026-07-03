@@ -27,7 +27,13 @@ Test coverage:
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
 from orchestrator import verify
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 
 class TestClassifyFailureEnvTransient:
