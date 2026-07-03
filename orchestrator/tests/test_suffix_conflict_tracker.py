@@ -113,9 +113,12 @@ def _make_tracker(
     """Build a bare SuffixConflictTracker with trivial default callables.
 
     No SpeculativeMergeWorker involved — exercises the tracker's own
-    unit-testability contract (task δ=1988 design: git_ops passed directly,
-    lane buffers / frozen-prefix accessors injected as callables so the
-    tracker never needs a worker reference).
+    unit-testability contract (task δ=1988 design, amended per reviewer
+    robustness_stale_reference/consistency: git_ops, like lane_buffers and
+    the frozen-prefix accessors, is injected as a re-reading callable —
+    ``lambda: git_ops`` — rather than a direct GitOps reference, so the
+    tracker never needs a worker reference and always observes the
+    caller's live GitOps object).
     """
     if lane_buffers is None:
         def _default_lane_buffers():
@@ -130,7 +133,7 @@ def _make_tracker(
             return main_sha
         frozen_prefix_tip = _default_frozen_prefix_tip
     return SuffixConflictTracker(
-        git_ops,
+        lambda: git_ops,
         lane_buffers=lane_buffers,
         frozen_prefix=frozen_prefix,
         frozen_prefix_tip=frozen_prefix_tip,
@@ -673,6 +676,30 @@ class TestWorkerDelegatesToTracker:
             worker.snapshot()['suffix_conflict_graph']
             == worker._suffix_tracker.graph.to_snapshot_dict()
         )
+
+    def test_git_ops_reassignment_observed(self, git_ops):
+        """amend (reviewer robustness_stale_reference): reassigning
+        worker._git_ops after construction must be observed by the tracker
+        on its next call — not the GitOps snapshotted at construction time.
+        Mirrors the worker._git_ops reassignment pattern already used
+        elsewhere (e.g. test_merge_queue.py, test_merge_queue_train_attribution.py).
+        """
+        worker = _make_worker(git_ops)
+        new_git_ops = object()
+        worker._git_ops = new_git_ops
+        assert worker._suffix_tracker._git_ops() is new_git_ops
+
+    def test_frozen_prefix_reassignment_observed(self, git_ops):
+        """amend (reviewer consistency): reassigning worker.frozen_prefix /
+        frozen_prefix_tip after construction must be observed by the
+        tracker, removing the asymmetry with lane_buffers' existing
+        re-reading-lambda semantics."""
+        worker = _make_worker(git_ops)
+        sentinel_prefix = ('sentinel-rid',)
+        worker.frozen_prefix = lambda: sentinel_prefix
+        worker.frozen_prefix_tip = lambda main_sha: 'SENTINEL-TIP'
+        assert worker._suffix_tracker._frozen_prefix() == sentinel_prefix
+        assert worker._suffix_tracker._frozen_prefix_tip('irrelevant') == 'SENTINEL-TIP'
 
 
 @pytest.mark.asyncio

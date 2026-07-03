@@ -18,10 +18,14 @@ the worker's original attribute names (``_suffix_conflict_graph``,
 ``_bounce_registry``) and method signatures
 (``recompute_suffix_conflict_graph()``, ``_bounce_conflicting_suffix_items()``)
 so the existing conflict-graph and bounce test suites keep passing with zero
-churn.  The tracker itself never holds a worker reference: lane-buffer
-access and frozen-prefix reads are injected as narrow callables
-(``lane_buffers``, ``frozen_prefix``, ``frozen_prefix_tip``) captured at
-construction, so it is unit-testable standalone.
+churn.  The tracker itself never holds a worker reference: GitOps access,
+lane-buffer access, and frozen-prefix reads are injected as narrow
+*re-reading* callables (``git_ops``, ``lane_buffers``, ``frozen_prefix``,
+``frozen_prefix_tip``) that look up the caller's live attribute on every
+call — not a value or bound method captured once at construction — so the
+tracker is unit-testable standalone AND stays correct if the caller later
+reassigns e.g. ``worker._git_ops`` (amend: reviewer
+robustness_stale_reference / consistency, task δ=1988).
 
 A moved method that reads a merge_queue-resident constant (``MERGE_LANES``,
 ``MERGE_BOUNCE_CAP``, ``NEEDS_REBASE_REASON_PREFIX``) — these stay in
@@ -140,12 +144,15 @@ EMPTY_SUFFIX_CONFLICT_GRAPH = SuffixConflictGraph(
 class SuffixConflictTracker:
     """Owns the two-layer suffix-conflict state + logic (task δ=1988).
 
-    Constructed with a live :class:`~orchestrator.git_ops.GitOps` reference
-    plus three narrow accessor callables — ``lane_buffers``, ``frozen_prefix``,
-    ``frozen_prefix_tip`` — instead of a worker reference, so the tracker is
-    fully unit-testable without a :class:`SpeculativeMergeWorker`.  Callables
-    are captured (not their values) so the tracker always observes the
-    caller's live state at call time.
+    Constructed with four narrow accessor callables — ``git_ops``,
+    ``lane_buffers``, ``frozen_prefix``, ``frozen_prefix_tip`` — instead of a
+    worker reference, so the tracker is fully unit-testable without a
+    :class:`SpeculativeMergeWorker`.  All four are captured as callables (not
+    their values, and not a bound-method snapshot) so the tracker always
+    re-reads the caller's live state at call time, including a
+    :class:`~orchestrator.git_ops.GitOps` reassigned on the caller *after*
+    this tracker was constructed (e.g. ``worker._git_ops = new_instance``;
+    amend: reviewer robustness_stale_reference / consistency).
 
     Attributes:
         graph: The current :class:`SuffixConflictGraph` (starts at the empty
@@ -160,7 +167,7 @@ class SuffixConflictTracker:
 
     def __init__(
         self,
-        git_ops: GitOps,
+        git_ops: Callable[[], GitOps],
         *,
         lane_buffers: Callable[[], dict[str, collections.deque[MergeRequest]]],
         frozen_prefix: Callable[[], tuple[str, ...]],
@@ -227,7 +234,7 @@ class SuffixConflictTracker:
 
         # ── 2. Debounce: fetch main_sha once, compare signature ───────────────
         try:
-            main_sha = await self._git_ops.get_main_sha()
+            main_sha = await self._git_ops().get_main_sha()
         except Exception:
             logger.warning('recompute_suffix_conflict_graph: get_main_sha failed; skipping')
             return
@@ -258,7 +265,7 @@ class SuffixConflictTracker:
         # end of this method.  Do NOT re-initialise this flag in later steps.
         _any_probe_error = False
 
-        branch_prefix = self._git_ops.config.branch_prefix
+        branch_prefix = self._git_ops().config.branch_prefix
         for req in suffix:
             ref = None
             head = None
@@ -269,11 +276,11 @@ class SuffixConflictTracker:
                 # the previous resolve_queued_branch_ref + resolve_branch_sha
                 # pattern (each call forks a git subprocess).
                 prefixed = f'{branch_prefix}{req.branch}'
-                sha = await self._git_ops.resolve_branch_sha(prefixed)
+                sha = await self._git_ops().resolve_branch_sha(prefixed)
                 if sha is not None:
                     ref, head = prefixed, sha
                 else:
-                    sha2 = await self._git_ops.resolve_branch_sha(req.branch)
+                    sha2 = await self._git_ops().resolve_branch_sha(req.branch)
                     if sha2 is not None:
                         ref, head = req.branch, sha2
             except Exception:
@@ -293,7 +300,7 @@ class SuffixConflictTracker:
                 # using branch..main ancestor as from (git diff main..branch).
                 # Simpler: get_changed_files(main_sha, head) captures the branch
                 # delta relative to current main (sufficient for overlap detection).
-                paths = await self._git_ops.get_changed_files(main_sha, head)
+                paths = await self._git_ops().get_changed_files(main_sha, head)
             except Exception:
                 logger.warning(
                     'recompute_suffix_conflict_graph: get_changed_files failed for %r; '
@@ -368,7 +375,7 @@ class SuffixConflictTracker:
                 has_conflict = _probe_cache[cache_key]
             else:
                 try:
-                    probe = await self._git_ops.merge_tree_conflicts(head_i, head_j)
+                    probe = await self._git_ops().merge_tree_conflicts(head_i, head_j)
                     has_conflict = not probe.clean
                 except Exception:
                     logger.warning(
@@ -410,7 +417,7 @@ class SuffixConflictTracker:
                 has_main_conflict = _probe_cache[cache_key]
             else:
                 try:
-                    probe = await self._git_ops.merge_tree_conflicts(probe_base, head)
+                    probe = await self._git_ops().merge_tree_conflicts(probe_base, head)
                     has_main_conflict = not probe.clean
                 except Exception:
                     logger.warning(
@@ -492,7 +499,7 @@ class SuffixConflictTracker:
             main_sha = self.signature[1]
         else:
             try:
-                main_sha = await self._git_ops.get_main_sha()
+                main_sha = await self._git_ops().get_main_sha()
             except Exception:
                 logger.warning(
                     '_bounce_conflicting_suffix_items: get_main_sha failed; skipping bounce'
@@ -555,7 +562,7 @@ class SuffixConflictTracker:
                 continue
 
             # Attempt mechanical rebase onto the frozen tip.
-            clean = await self._git_ops.rebase_onto_main(req.worktree, onto=frozen_tip)
+            clean = await self._git_ops().rebase_onto_main(req.worktree, onto=frozen_tip)
             if clean:
                 # Clean rebase — item stays in the lane buffer (re-queued).
                 # Future and merge_first_enqueued_at are untouched.

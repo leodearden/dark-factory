@@ -4080,21 +4080,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # graph over the unfrozen suffix, debounce signature, cached main SHA,
         # per-branch bounce counter) now live on a SuffixConflictTracker
         # (orchestrator.suffix_graph), owned here as self._suffix_tracker.
-        # lane_buffers/frozen_prefix/frozen_prefix_tip are injected as narrow
-        # callables (not `self`) so the tracker is unit-testable without a
-        # worker; must be constructed AFTER self._lane_buffers above. The 4
-        # @property delegators below (_suffix_conflict_graph,
-        # _suffix_conflict_signature, _last_known_main_sha, _bounce_registry)
-        # preserve the original attribute names for existing callers/tests;
+        # git_ops/lane_buffers/frozen_prefix/frozen_prefix_tip are ALL injected
+        # as narrow callables that RE-READ the live attribute on `self` on
+        # every call (not `self` itself, and not a value/bound-method
+        # snapshot captured once here) so the tracker is unit-testable
+        # without a worker AND stays correct if this worker's `_git_ops` /
+        # `frozen_prefix` / `frozen_prefix_tip` is ever reassigned after
+        # construction (amend: reviewer robustness_stale_reference +
+        # consistency — previously git_ops was a direct snapshot and
+        # frozen_prefix/frozen_prefix_tip were bound-method snapshots, an
+        # asymmetry with lane_buffers' existing re-reading lambda). Must be
+        # constructed AFTER self._lane_buffers above. The 4 @property
+        # delegators below (_suffix_conflict_graph, _suffix_conflict_signature,
+        # _last_known_main_sha, _bounce_registry) preserve the original
+        # attribute names for existing callers/tests;
         # recompute_suffix_conflict_graph() and _bounce_conflicting_suffix_items()
         # are thin delegators to self._suffix_tracker. See suffix_graph.py's
         # module docstring + SuffixConflictTracker docstring for the full
         # debounce/fail-open/TOCTOU/cap contract.
         self._suffix_tracker = SuffixConflictTracker(
-            git_ops,
+            git_ops=lambda: self._git_ops,
             lane_buffers=lambda: self._lane_buffers,
-            frozen_prefix=self.frozen_prefix,
-            frozen_prefix_tip=self.frozen_prefix_tip,
+            frozen_prefix=lambda: self.frozen_prefix(),
+            frozen_prefix_tip=lambda main_sha: self.frozen_prefix_tip(main_sha),
         )
         # Resume signal: set by every unhalt method so a blocked merger
         # (waiting with no pickable item) wakes up to re-check lanes.
