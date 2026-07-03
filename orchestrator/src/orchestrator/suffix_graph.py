@@ -442,9 +442,166 @@ class SuffixConflictTracker:
     async def bounce_conflicting_suffix_items(self) -> None:
         """η=1892 graph-time bounce: divert suffix items that conflict with the frozen tip.
 
-        See the original
-        :meth:`SpeculativeMergeWorker._bounce_conflicting_suffix_items`
-        docstring (preserved verbatim on the worker's thin delegator) for the
-        full cap/escalation/TOCTOU contract.
+        For each request_id in ``graph.conflicts_with_main``:
+
+        1. Skip :class:`GroupMergeRequest` items (trains keep their existing
+           TRAIN_REBASE_CONFLICT path).
+        2. Emit a structured ``needs_rebase`` log line.
+        3. Bump the bounce registry; if the count exceeds :data:`MERGE_BOUNCE_CAP`
+           → escalate WITHOUT rebasing (cap exceeded).
+        4. Else: attempt a mechanical rebase onto the frozen tip via
+           ``rebase_onto_main(req.worktree, onto=frozen_tip)``.
+           - True (clean) → leave the item in the lane buffer (re-queue);
+             the future and ``merge_first_enqueued_at`` are untouched.
+           - False (real conflict) → remove from the lane buffer and escalate.
+
+        After processing any bounce, set ``signature = None`` so the next
+        :meth:`recompute` call re-probes reality (prevents a successfully-
+        rebased item from being re-bounced off a stale graph).
+
+        Called by :meth:`SpeculativeMergeWorker._acquire_next_request`
+        immediately after :meth:`recompute` and before ``_pop_next_pickable()``,
+        so bounced/escalated items are diverted before consuming a verify slot.
+
+        Fail-open: if ``get_main_sha()`` raises, log a warning and return
+        without touching any item.
         """
-        raise NotImplementedError
+        # Deferred reach-back: these three constants stay in merge_queue.py
+        # (not moved). A top-level import would deadlock module load — see
+        # module docstring.
+        from orchestrator.merge_queue import (
+            MERGE_BOUNCE_CAP,
+            MERGE_LANES,
+            NEEDS_REBASE_REASON_PREFIX,
+        )
+
+        if not self.graph.conflicts_with_main:
+            return  # nothing to bounce — leave signature intact
+
+        # Use the same main_sha that recompute() used to populate
+        # conflicts_with_main.  A concurrent asyncio task (e.g. a verify
+        # completion that mutates _inflight) can change the frozen prefix between
+        # recompute() and here; a freshly-fetched main_sha would give a frozen_tip
+        # inconsistent with the probe_base that actually flagged the conflict —
+        # causing an unnecessary rebase/escalation off a stale graph (TOCTOU).
+        # Reading sig[1] (the main_sha stored in the debounce signature) gives
+        # exactly the same base used during recompute().
+        # Fall back to a fresh fetch only when the signature is None (cleared by a
+        # prior bounce in the same acquire cycle — rare, but handle fail-open).
+        if self.signature is not None:
+            main_sha = self.signature[1]
+        else:
+            try:
+                main_sha = await self._git_ops.get_main_sha()
+            except Exception:
+                logger.warning(
+                    '_bounce_conflicting_suffix_items: get_main_sha failed; skipping bounce'
+                )
+                return
+
+        frozen_tip = self._frozen_prefix_tip(main_sha)
+
+        # Build a rid → MergeRequest index over all lane buffers.
+        rid_to_req: dict[str, MergeRequest] = {}
+        for lane in MERGE_LANES:
+            for req in self._lane_buffers()[lane]:
+                rid_to_req[req.request_id] = req
+
+        _any_bounced = False
+
+        for rid in self.graph.conflicts_with_main:
+            req = rid_to_req.get(rid)
+            if req is None:
+                continue  # item already gone (escalated or removed)
+            if isinstance(req, GroupMergeRequest):
+                continue  # trains keep their own TRAIN_REBASE_CONFLICT path
+
+            branch = req.branch
+            logger.info(
+                '_bounce_conflicting_suffix_items: needs_rebase task_id=%s rid=%s '
+                'branch=%s frozen_tip=%s',
+                req.task_id, rid, branch, frozen_tip,
+            )
+
+            count = self.bounce_registry.record_bounce(branch)
+            _any_bounced = True
+
+            if count > MERGE_BOUNCE_CAP:
+                # Cap exceeded — escalate WITHOUT rebasing.
+                #
+                # Trade-off note (robustness_premature_escalation): frozen_tip
+                # is speculative — the frozen items are still verifying and may
+                # themselves fail verification.  A branch that is clean vs bare
+                # main but conflicts with frozen_tip may be escalated for a
+                # collision with an item that never lands.  This is accepted: the
+                # steward resolves it, and if the frozen item later fails, the
+                # branch can be cleanly requeued without prejudice.
+                self._lane_buffers()[req.lane].remove(req)
+                self.bounce_registry.clear(branch)  # fresh slate on resubmission
+                outcome = MergeOutcome(
+                    status='blocked',
+                    reason=(
+                        f'{NEEDS_REBASE_REASON_PREFIX}: branch {branch!r} '
+                        f'bounce cap exceeded (count={count}, cap={MERGE_BOUNCE_CAP})'
+                    ),
+                )
+                logger.warning(
+                    '_bounce_conflicting_suffix_items: cap exceeded task_id=%s '
+                    'branch=%s count=%d cap=%d; escalating without rebase',
+                    req.task_id, branch, count, MERGE_BOUNCE_CAP,
+                )
+                if not req.result.done():
+                    req.result.set_result(outcome)
+                continue
+
+            # Attempt mechanical rebase onto the frozen tip.
+            clean = await self._git_ops.rebase_onto_main(req.worktree, onto=frozen_tip)
+            if clean:
+                # Clean rebase — item stays in the lane buffer (re-queued).
+                # Future and merge_first_enqueued_at are untouched.
+                #
+                # Downstream path note (design_double_rebase): the next call to
+                # _pop_next_pickable() may pick this item for dispatch.  The
+                # dispatch loop calls merge_to_main() which performs a
+                # ``git merge --no-ff`` — NOT another rebase — so there is no
+                # double-rebase hazard.  If actual_main has advanced past
+                # frozen_tip since the bounce, the merge integrates those extra
+                # main commits; this is expected behaviour for a speculative
+                # queue.  pre_rebased is intentionally not updated: skip_verify
+                # is always False for single-item merges (task-1724), so updating
+                # it would be a no-op.
+                logger.info(
+                    '_bounce_conflicting_suffix_items: clean rebase; re-queued '
+                    'task_id=%s branch=%s onto=%s',
+                    req.task_id, branch, frozen_tip,
+                )
+            else:
+                # Real conflict — remove from lane buffer and escalate.
+                #
+                # Trade-off note (robustness_premature_escalation): frozen_tip
+                # is speculative — frozen items are still verifying and may fail.
+                # A branch clean vs bare main can thus be escalated for a
+                # collision with an item that never lands.  Accepted: the steward
+                # resolves it; if the frozen item fails, the branch requeues.
+                self._lane_buffers()[req.lane].remove(req)
+                self.bounce_registry.clear(branch)  # fresh slate on resubmission
+                outcome = MergeOutcome(
+                    status='blocked',
+                    reason=(
+                        f'{NEEDS_REBASE_REASON_PREFIX}: branch {branch!r} '
+                        f'has a real rebase conflict onto frozen tip {frozen_tip!r}'
+                    ),
+                )
+                logger.warning(
+                    '_bounce_conflicting_suffix_items: rebase conflict task_id=%s '
+                    'branch=%s onto=%s; escalating',
+                    req.task_id, branch, frozen_tip,
+                )
+                if not req.result.done():
+                    req.result.set_result(outcome)
+
+        if _any_bounced:
+            # Invalidate the debounce signature so the next recompute re-probes
+            # reality.  A clean rebase mutates the branch HEAD; an escalated
+            # item removes an entry — in both cases the cached graph is stale.
+            self.signature = None
