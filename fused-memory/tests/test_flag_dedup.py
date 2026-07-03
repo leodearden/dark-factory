@@ -7413,3 +7413,40 @@ class TestAcknowledgeResolvedFlags:
             f'expected a WARNING mentioning the failed flag; got {warning_messages!r}'
         )
 
+    async def test_duplicate_signatures_deduplicated_before_dispatch(self, monkeypatch):
+        """Two flags reducing to the SAME (task_id, flag_type) signature — e.g.
+        two stale_metadata findings on the same task — must result in exactly
+        ONE acknowledge_flag_marker call, not two concurrent calls racing to
+        delete/tag the same prior marker(s) (amendment round 2, reviewer
+        finding: robustness). Without de-duplication the count would also be
+        inflated (2 instead of 1 for the duplicated signature).
+        """
+        import fused_memory.reconciliation.flag_dedup as flag_dedup_mod
+        from fused_memory.reconciliation.flag_dedup import acknowledge_resolved_flags
+
+        calls: list[tuple[str, str, str]] = []
+
+        async def _fake_ack(memory_service, *, project_id, run_id, task_id, flag_type, mode, log=None):
+            calls.append((task_id, flag_type, mode))
+            return 1
+
+        monkeypatch.setattr(
+            flag_dedup_mod, 'acknowledge_flag_marker', AsyncMock(side_effect=_fake_ack)
+        )
+
+        memory_service = AsyncMock()
+        resolved_flags = [
+            {'task_id': 42, 'flag_type': 'x', 'description': 'first finding'},
+            {'task_id': 42, 'flag_type': 'x', 'description': 'second finding'},
+            {'task_id': 7, 'flag_type': 'y'},
+        ]
+
+        result = await acknowledge_resolved_flags(
+            memory_service, 'p', 'r1', resolved_flags, mode='delete',
+        )
+
+        assert calls == [('42', 'x', 'delete'), ('7', 'y', 'delete')], (
+            f'expected exactly one call per de-duplicated signature; got {calls!r}'
+        )
+        assert result == 2
+

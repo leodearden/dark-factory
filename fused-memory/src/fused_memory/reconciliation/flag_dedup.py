@@ -2117,10 +2117,19 @@ async def acknowledge_resolved_flags(
     :func:`acknowledge_flag_marker` for the ``(task_id, flag_type)`` pair.
     Flags for which both signature helpers return ``None`` are skipped (no I/O).
 
-    Signable flags are dispatched to ``acknowledge_flag_marker`` concurrently via
-    ``asyncio.gather(return_exceptions=True)`` — mirroring the delete fan-out
-    ``acknowledge_flag_marker`` itself already uses — rather than one-at-a-time,
-    since each is an independent Mem0 round-trip.
+    Signatures are de-duplicated (order-preserving) BEFORE dispatch: two flags
+    reducing to the same ``(task_id, flag_type)`` — e.g. two ``stale_metadata``
+    findings on the same task — must acknowledge exactly once, not twice.
+    Without this, two concurrent ``acknowledge_flag_marker`` calls for the same
+    signature would each run their own search and race to delete the SAME prior
+    marker id(s) (and, in ``mode='tag'``, each write its own duplicate
+    replacement marker), inflating the returned count (amendment round 2,
+    reviewer finding: robustness).
+
+    Signable (de-duplicated) flags are dispatched to ``acknowledge_flag_marker``
+    concurrently via ``asyncio.gather(return_exceptions=True)`` — mirroring the
+    delete fan-out ``acknowledge_flag_marker`` itself already uses — rather than
+    one-at-a-time, since each is an independent Mem0 round-trip.
 
     Best-effort: a single flag's acknowledgment failing is logged at WARNING and
     does NOT abort the batch — the remaining flags are still processed. (This
@@ -2152,6 +2161,13 @@ async def acknowledge_resolved_flags(
     if not sigs:
         return 0
 
+    # De-duplicate signatures before the fan-out (amendment round 2, reviewer
+    # finding: robustness): dict.fromkeys preserves first-seen order while
+    # dropping repeats, so a batch with two flags sharing one (task_id,
+    # flag_type) signature acknowledges it exactly once instead of racing two
+    # concurrent acknowledge_flag_marker calls against the same prior marker(s).
+    deduped_sigs = list(dict.fromkeys(sigs))
+
     results = await asyncio.gather(
         *(
             acknowledge_flag_marker(
@@ -2163,12 +2179,12 @@ async def acknowledge_resolved_flags(
                 mode=mode,
                 log=log,
             )
-            for tid, ftype in sigs
+            for tid, ftype in deduped_sigs
         ),
         return_exceptions=True,
     )
     total = 0
-    for (tid, ftype), result in zip(sigs, results, strict=True):
+    for (tid, ftype), result in zip(deduped_sigs, results, strict=True):
         if isinstance(result, BaseException):
             log.warning(
                 'acknowledge_resolved_flags: acknowledge_flag_marker failed for task %s'
