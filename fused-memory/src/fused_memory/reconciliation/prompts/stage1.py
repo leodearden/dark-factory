@@ -558,6 +558,12 @@ post-processor will attach `persisted_from_run` for repeats. Do, however, set `t
 and `flag_type` fields on each flagged item where applicable so the deduplicator can \
 compute a signature.
 
+For duplicate-detection findings (e.g. `duplicate_procedural_knowledge`, or other \
+near-duplicate-memory findings) that have no `task_id`, also include a `deduped_against` \
+field listing the resolvable Mem0 memory UUID(s) the finding identified as duplicates — \
+this lets the code-side fingerprint marker carry them into `metadata.deduped_against` for \
+Stage 2 resolution.
+
 ## Stage 2 Flag Relay (FIX B)
 When you write a flag to Mem0 with `metadata.flag_for_stage2=true`, you MUST ALSO include \
 the same flag content in the `flagged_items` field of your structured-output report. \
