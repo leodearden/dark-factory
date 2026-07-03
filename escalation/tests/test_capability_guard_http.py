@@ -489,3 +489,57 @@ class TestHumanUnrestrictedFullAuthority:
         assert reread_c.resolved_by == 'escalation-watcher', (
             f'Expected tool-arg resolved_by (no Identity header), got: {reread_c.resolved_by!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestCascadeIntactHeaderless: l2-cascade member resolution is unaffected by
+# the capability guard for a permitted header-less parent-L2 resolve.
+# ---------------------------------------------------------------------------
+
+
+class TestCascadeIntactHeaderless:
+    """A header-less caller resolving an L2 that carries member L1s still
+    triggers the l2-cascade member resolution (queue.py:483-499): each
+    member is archived with resolved_by=f'l2-cascade:{l2_id}', proving the
+    pre-existing cascade is unaffected by the capability guard on a
+    permitted (header-less) parent-L2 resolve.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cascade_resolves_members_header_less(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        m1 = _seed(queue, level=1, task_id='task-cascade-m1')
+        m2 = _seed(queue, level=1, task_id='task-cascade-m2')
+        l2 = _seed(
+            queue, level=2, task_id='task-cascade-l2', members=[m1.id, m2.id],
+        )
+
+        result = await _resolve_over_http(
+            base_url,
+            escalation_id=l2.id, resolution='cluster resolved',
+            action='close_only', resolved_by='escalation-watcher',
+        )
+        assert 'code' not in result and 'error' not in result, (
+            f'Expected a clean success, got: {result}'
+        )
+
+        reread_l2 = queue.get(l2.id)
+        assert reread_l2 is not None
+        assert reread_l2.status in {'resolved', 'dismissed'}, (
+            f'Expected the L2 archived, got: {reread_l2.status}'
+        )
+
+        for member in (m1, m2):
+            reread_member = queue.get(member.id)
+            assert reread_member is not None, (
+                f'Expected member {member.id} still readable (archived), got None'
+            )
+            assert reread_member.status in {'resolved', 'dismissed'}, (
+                f'Expected member {member.id} archived, got: {reread_member.status}'
+            )
+            assert reread_member.resolved_by == f'l2-cascade:{l2.id}', (
+                f'Expected the cascade stamp to override the tool arg for member '
+                f'{member.id}, got: {reread_member.resolved_by!r}'
+            )
