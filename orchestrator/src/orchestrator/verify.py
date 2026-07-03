@@ -555,9 +555,11 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
 # pytest_internalerror is an infra crash (xdist worker killed by os._exit); it is
 # non-deterministic and does NOT warrant human triage — the sweep already retries it.
 # test_failure is handled by the debugger (self-correcting); compile_error likewise.
+# env_transient is a shared-venv mutation transient (task 2048) — infra, not
+# human triage; run_verification already retries it via _force_serial_pytest.
 _ARCHIVE_DENY_LIST = frozenset({
     'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
-    'pytest_internalerror',
+    'pytest_internalerror', 'env_transient',
 })
 
 # Ordered from highest to lowest severity; used by ``_worst_category``.
@@ -570,6 +572,7 @@ _CATEGORY_PRIORITY: list[str] = [
     'flock_error',
     'npm_error',
     'pytest_internalerror',   # above test_failure: an infra crash, not a test drift
+    'env_transient',          # shared-venv mutation transient; also infra, not test drift
     'test_failure',
     'unknown_test_failure',
     'passed',
@@ -589,6 +592,9 @@ PREEXISTING_BREAK_SKIP_CATEGORIES: frozenset[str] = frozenset({
     # pytest_internalerror: xdist worker was killed by os._exit — non-deterministic,
     # so re-probing main is not a reliable signal.  The sweep already retries it.
     'pytest_internalerror',
+    # env_transient: shared-venv mutation from a concurrent `uv sync` (task 2048) —
+    # non-deterministic to re-probe on main; the sweep already retries it.
+    'env_transient',
 })
 
 # Process-wide cache for main-probe results: avoids redundant worktree-add +
