@@ -190,3 +190,72 @@ class TestHarnessSanity:
         assert result.data['id'] == esc.id, f'Expected id {esc.id!r}, got: {result.data}'
         assert result.data['level'] == 2
         assert result.data['status'] == 'pending'
+
+
+# ---------------------------------------------------------------------------
+# TestLevelForbidden: X-Escalation-Levels denies out-of-set resolve/park;
+# a header-less connection stays default-open.
+# ---------------------------------------------------------------------------
+
+
+class TestLevelForbidden:
+    """X-Escalation-Levels='0,1' forbids resolve/park on an L2 record; a
+    header-less connection is unaffected (default-open)."""
+
+    @pytest.mark.asyncio
+    async def test_denied_resolve_and_park_vs_default_open(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc_deny_resolve = _seed(queue, level=2, task_id='task-deny-resolve')
+        esc_deny_park = _seed(queue, level=2, task_id='task-deny-park')
+        esc_open = _seed(queue, level=2, task_id='task-open')
+
+        # (a) 0,1 client denied a close_only resolve on an L2 record — no mutation.
+        result_a = await _resolve_over_http(
+            base_url, levels='0,1',
+            escalation_id=esc_deny_resolve.id, resolution='x', action='close_only',
+        )
+        assert result_a.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result_a}"
+        )
+        reread_a = queue.get(esc_deny_resolve.id)
+        assert reread_a is not None
+        assert reread_a.status == 'pending', f'Expected pending, got: {reread_a.status}'
+        assert (queue.queue_dir / f'{esc_deny_resolve.id}.json').exists(), (
+            'Denied record must remain in the queue root (not archived)'
+        )
+        assert reread_a.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread_a.resolution_action}'
+        )
+
+        # (b) 0,1 client denied park on an L2 record — no park stamp either.
+        result_b = await _resolve_over_http(
+            base_url, levels='0,1',
+            escalation_id=esc_deny_park.id, action='park', resolution='x',
+        )
+        assert result_b.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result_b}"
+        )
+        reread_b = queue.get(esc_deny_park.id)
+        assert reread_b is not None
+        assert reread_b.status == 'pending', f'Expected pending, got: {reread_b.status}'
+        assert reread_b.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread_b.resolution_action}'
+        )
+        assert reread_b.resolution is None, (
+            f'Expected no resolution text (no park stamp), got: {reread_b.resolution!r}'
+        )
+
+        # (c) Contrast: a header-less client stays default-open on the same level.
+        result_c = await _resolve_over_http(
+            base_url, escalation_id=esc_open.id, resolution='ok', action='close_only',
+        )
+        assert 'code' not in result_c and 'error' not in result_c, (
+            f'Expected a clean success (no code/error), got: {result_c}'
+        )
+        reread_c = queue.get(esc_open.id)
+        assert reread_c is not None
+        assert reread_c.status in {'resolved', 'dismissed'}, (
+            f'Expected archived status, got: {reread_c.status}'
+        )
