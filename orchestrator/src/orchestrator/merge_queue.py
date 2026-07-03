@@ -3876,6 +3876,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # for fast, deterministic coverage.  Mirrors the MAX_*/
     # VERIFY_ABANDON_POLL_SECS monkeypatch convention above.
     RESOURCE_AUDIT_WORKTREE_GRACE_SECS: float = 9000.0
+    # MQ-invariants iota (task 1994): number of CONSECUTIVE
+    # _check_resource_audit heartbeats a resource-conservation violation
+    # (speculation_accounting_violations / worktree_ledger_violations) must
+    # persist before the dedup'd L1 escalation (_alarm_resource_audit) fires.
+    # Every violating call still logs a WARNING immediately — this only
+    # gates the louder escalation, so a transient/racy single-poll blip
+    # (e.g. a register/deregister race) never pages, while a genuine leak
+    # trips well within a handful of heartbeat intervals. Kept as a class
+    # attribute so tests can monkeypatch (e.g.
+    # worker.RESOURCE_AUDIT_ESCALATION_STREAK = 1) for fast, deterministic
+    # coverage. Mirrors the RESOURCE_AUDIT_WORKTREE_GRACE_SECS/MAX_*
+    # monkeypatch convention above.
+    RESOURCE_AUDIT_ESCALATION_STREAK: int = 3
 
     def __init__(
         self,
@@ -4238,6 +4251,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # See merge_request_ledger.py's module docstring for the full
         # lifecycle contract.
         self._request_ledger = RequestLedger()
+        # MQ-invariants iota (task 1994): count of CONSECUTIVE
+        # _check_resource_audit heartbeats that found a resource-
+        # conservation violation. Reset to 0 the moment a heartbeat is
+        # clean; once it reaches RESOURCE_AUDIT_ESCALATION_STREAK the
+        # dedup'd L1 escalation (_alarm_resource_audit) fires. See
+        # _check_resource_audit for the full contract.
+        self._resource_audit_violation_streak: int = 0
 
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
@@ -5580,6 +5600,54 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._request_ledger.mark_warned(stuck.request_id)
             _alarm_merge_request_stuck(
                 self._escalation_queue, stuck, event_store=self._event_store,
+            )
+
+    def _check_resource_audit(self, now: float) -> None:
+        """Run both resource-conservation audits and alarm on a persisting violation.
+
+        Synchronous and clock-injectable (``now``) — mirrors
+        :meth:`_check_request_liveness`'s clock-injection convention so tests
+        can drive the escalation-streak boundary deterministically without
+        real time.
+
+        MQ-invariants iota (task 1994): OBSERVATION + ESCALATION ONLY (PRD
+        design decision 4) — never mutates queue/inflight/worktree state and
+        never halts the pipeline. Combines
+        :meth:`speculation_accounting_violations` (I4 permits/caps) and
+        :meth:`worktree_ledger_violations` (I6 worktree ledger, given *now*).
+
+        A clean call (no violations) resets
+        :attr:`_resource_audit_violation_streak` to 0 and returns. A
+        violating call ALWAYS logs a WARNING naming every violation — unlike
+        :meth:`_check_request_liveness`'s log-dedup, this is not
+        per-episode-deduped, since the streak counter below already bounds
+        how often the louder escalation fires — and increments the streak.
+        Once the streak reaches :attr:`RESOURCE_AUDIT_ESCALATION_STREAK`
+        consecutive violating calls, :func:`_alarm_resource_audit` is
+        invoked on every further violating call; its own ``has_open_l1``
+        dedup (see that function) ensures at most one open L1 regardless of
+        how many times this method calls it.
+        """
+        violations = (
+            self.speculation_accounting_violations()
+            + self.worktree_ledger_violations(now=now)
+        )
+
+        if not violations:
+            self._resource_audit_violation_streak = 0
+            return
+
+        logger.warning(
+            'merge queue resource-conservation audit: %d violation(s) found '
+            '(consecutive streak=%d): %s',
+            len(violations), self._resource_audit_violation_streak + 1,
+            '; '.join(violations),
+        )
+        self._resource_audit_violation_streak += 1
+
+        if self._resource_audit_violation_streak >= self.RESOURCE_AUDIT_ESCALATION_STREAK:
+            _alarm_resource_audit(
+                self._escalation_queue, violations, event_store=self._event_store,
             )
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
