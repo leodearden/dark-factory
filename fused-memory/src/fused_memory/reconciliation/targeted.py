@@ -278,9 +278,14 @@ class TargetedReconciler:
         before): the taskmaster status fetch happens at most once per
         _on_task_done call, shared across every candidate episode evaluated in
         that call, and is skipped entirely when no candidate is batch-shaped.
-        A fetch failure caches None, which conservatively withholds every
-        confirmed-batch candidate for the rest of this block — self-healing,
-        since promotion re-runs on the next related task-done transition.
+        A fetch failure OR a non-dict/malformed response both cache None, which
+        conservatively withholds every confirmed-batch candidate for the rest of
+        this block — self-healing, since promotion re-runs on the next related
+        task-done transition. (The malformed-response case is deliberately
+        treated the same as an exception rather than coerced to {}: silently
+        coercing to {} would make every enumerated id look "absent" — and
+        therefore non-blocking — which fails open exactly when we don't actually
+        know the statuses.)
         """
         try:
             content = await self.memory.get_episode_content(ep_uuid, project_id)
@@ -298,7 +303,15 @@ class TargetedReconciler:
         if 'statuses' not in statuses_cache:
             try:
                 raw = await self.taskmaster.get_statuses(project_root=project_root)
-                statuses_cache['statuses'] = raw if isinstance(raw, dict) else {}
+                if isinstance(raw, dict):
+                    statuses_cache['statuses'] = raw
+                else:
+                    logger.warning(
+                        f'get_statuses returned non-dict ({type(raw).__name__}) while '
+                        f'gating batch-plan promotion for episode {ep_uuid}; treating as '
+                        f'unknown and withholding (conservative)'
+                    )
+                    statuses_cache['statuses'] = None
             except Exception as e:
                 logger.warning(
                     f'get_statuses failed while gating batch-plan promotion for '
@@ -412,6 +425,16 @@ class TargetedReconciler:
         #      ANY ONE sibling would promote the whole episode and re-surface every
         #      other still-aspirational sibling's edges into default search. See
         #      _should_withhold_batch_promotion.
+        #
+        #      Known limitation (search-recall dependency): a withheld batch episode
+        #      is only re-evaluated on a task-done event whose title+description
+        #      semantically surface it in the bounded `planned_related` search just
+        #      below. If the last sibling to go terminal doesn't search-match the
+        #      episode, the now-all-terminal episode isn't re-checked by that event
+        #      and stays withheld until some later, differently-worded task-done
+        #      event happens to match it — there is no periodic/fallback sweep that
+        #      re-evaluates lingering withheld episodes independent of search
+        #      recall. Acceptable for this task's scope; flagged as a follow-up.
         if self.planned_episode_registry is not None:
             try:
                 planned_related = await self.memory.search(
@@ -430,6 +453,14 @@ class TargetedReconciler:
                 statuses_cache: dict = {}
                 promoted_count = 0
                 withheld_count = 0
+                # One get_episode_content round-trip per candidate episode below —
+                # an N+1-style pattern where the reconciliation hot path previously
+                # did zero content fetches. Bounded by the limit=10 planned search
+                # above (ep_uuids can exceed 10 since provenance is flattened across
+                # results, but stays small in practice); accepted for correctness,
+                # not batched/short-circuited further since most task-done events
+                # have zero batch-plan candidates and the taskmaster status fetch
+                # is already cached once per block via statuses_cache.
                 for ep_uuid in ep_uuids:
                     if await self._should_withhold_batch_promotion(
                         ep_uuid, project_id, project_root, statuses_cache
