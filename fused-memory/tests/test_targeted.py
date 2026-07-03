@@ -2091,6 +2091,67 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     assert _is_authoritative_resolution(metadata) is expected
 
 
+# ---------------------------------------------------------------------------
+# _format_outcome_echo truth table (task 2049)
+#
+# _on_task_done's fast-path completion echo currently appends the task's raw
+# `description` verbatim whenever no authoritative resolution memory exists
+# yet (task 1984's guard correctly doesn't fire on a FIRST done-transition).
+# `description` is usually the pre-fix bug/problem statement, so a fresh echo
+# reads as if the bug is still open. _format_outcome_echo is the pure
+# formatter that prefers the landed-outcome `done_provenance` (note and/or
+# commit) over that raw description; it returns None when no usable
+# provenance exists so the caller can fall back to the existing behavior.
+
+
+@pytest.mark.parametrize(
+    'provenance, expected_contains',
+    [
+        pytest.param(
+            {'note': 'Refactored dispatch; added guard'},
+            ['Refactored dispatch; added guard'],
+            id='note_only',
+        ),
+        pytest.param(
+            {'kind': 'merged', 'commit': 'abc123def'},
+            ['abc123def'],
+            id='commit_only_no_note',
+        ),
+        pytest.param(
+            {'note': 'Added retry', 'commit': 'abc123'},
+            ['Added retry', 'abc123'],
+            id='note_and_commit',
+        ),
+        pytest.param({}, None, id='empty_dict'),
+        pytest.param(None, None, id='none_provenance'),
+        pytest.param({'kind': 'found_on_main'}, None, id='kind_only_no_note_or_commit'),
+        pytest.param({'note': 123}, None, id='non_str_note'),
+        pytest.param({'commit': 456}, None, id='non_str_commit'),
+        pytest.param({'note': '   '}, None, id='whitespace_only_note'),
+    ],
+)
+def test_format_outcome_echo_truth_table(provenance, expected_contains):
+    """Pure formatter: prefer note, include commit, else commit-only ref, else None.
+
+    Mirrors test_is_authoritative_resolution_truth_table's truth-table pattern
+    (task 1984) for the new _format_outcome_echo helper (task 2049): the
+    completion echo should describe the landed outcome (done_provenance) —
+    note text and/or commit — rather than a raw, potentially stale task
+    description. Malformed/empty/non-string provenance must degrade to None
+    so the caller falls back to the existing description-append behavior
+    (legacy tasks / a failed provenance write must not lose their echo).
+    """
+    from fused_memory.reconciliation.targeted import _format_outcome_echo
+
+    result = _format_outcome_echo(provenance)
+    if expected_contains is None:
+        assert result is None, f'Expected None, got: {result!r}'
+    else:
+        assert result is not None
+        for substr in expected_contains:
+            assert substr in result, f'Expected {substr!r} in {result!r}'
+
+
 @pytest.mark.asyncio
 async def test_on_task_done_suppresses_stale_description_when_authoritative_memory_exists(
     reconciler, mock_memory_service,
