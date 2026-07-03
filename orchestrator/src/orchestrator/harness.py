@@ -200,6 +200,15 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
 # the server denies (level_forbidden) any attempt to resolve an L2 directly.
 # X-Escalation-Identity pins the server-stamped resolved_by so a watcher
 # can't spoof attribution via a tool argument.
+#
+# CONTRACT: must stay in lockstep with escalation/src/escalation/server.py —
+# header names match its _LEVELS_HEADER/_IDENTITY_HEADER (HTTP header names
+# are case-insensitive on the wire, so title-case here is fine); the levels
+# value must parse under its _parse_levels() (comma-separated non-negative
+# ints, fail-closed on anything else). No test in this repo exercises this
+# constant against the live server parser — escalation/tests/
+# test_capability_guard_http.py covers the server side only. If either
+# contract changes, update both sides together.
 _WATCHER_ESCALATION_HEADERS: dict[str, str] = {
     'X-Escalation-Levels': '0,1',
     'X-Escalation-Identity': 'orchestrator-escalation-watcher-auto',
