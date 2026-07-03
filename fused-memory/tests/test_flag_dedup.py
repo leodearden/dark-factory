@@ -4932,6 +4932,82 @@ class TestMarkerQuery:
 
 
 # ---------------------------------------------------------------------------
+# _extract_deduped_against_uuids helper (task-2047 step-1 / step-2)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDedupedAgainstUuids:
+    """Unit tests for _extract_deduped_against_uuids(flag) -> list[str].
+
+    Pure, sync, no-I/O helper that extracts the resolvable Mem0 memory
+    UUID(s) a duplicate-detection finding cites as duplicates, from a
+    documented set of candidate flag-dict fields (canonical
+    'deduped_against' plus common aliases the LLM might use instead).
+    """
+
+    def test_reads_canonical_field_sorted_unique(self):
+        """Canonical 'deduped_against' list is returned sorted-unique."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'deduped_against': ['uuid-b', 'uuid-a', 'uuid-b']}
+        assert _extract_deduped_against_uuids(flag) == ['uuid-a', 'uuid-b']
+
+    def test_unions_alias_fields_with_canonical_field(self):
+        """Values from alias fields are unioned together with the canonical field."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {
+            'deduped_against': ['uuid-a'],
+            'duplicate_memory_ids': ['uuid-b'],
+            'duplicate_ids': ['uuid-c'],
+            'memory_ids': ['uuid-d'],
+            'cited_memory_ids': ['uuid-e'],
+        }
+        assert _extract_deduped_against_uuids(flag) == [
+            'uuid-a', 'uuid-b', 'uuid-c', 'uuid-d', 'uuid-e',
+        ]
+
+    def test_accepts_single_str_value_not_wrapped_in_list(self):
+        """A bare str value (not a list) on any candidate field is accepted as a 1-item result."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'deduped_against': 'uuid-solo'}
+        assert _extract_deduped_against_uuids(flag) == ['uuid-solo']
+
+    def test_drops_none_and_blank_entries_and_coerces_non_str_to_str(self):
+        """None/empty/whitespace-only entries are dropped; non-str entries are str-coerced."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'deduped_against': [None, '', '   ', 'uuid-a', 123]}
+        assert _extract_deduped_against_uuids(flag) == ['123', 'uuid-a']
+
+    def test_returns_empty_list_when_no_candidate_field_present(self):
+        """No candidate field present at all -> []."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'x',
+        }
+        assert _extract_deduped_against_uuids(flag) == []
+
+    def test_returns_empty_list_when_candidate_fields_are_all_empty(self):
+        """Candidate fields present but every value is empty/None -> []."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'deduped_against': [], 'duplicate_ids': None, 'memory_ids': ''}
+        assert _extract_deduped_against_uuids(flag) == []
+
+    def test_returns_empty_list_for_bare_dict_with_unrelated_keys(self):
+        """A flag dict carrying only unrelated keys -> [] (no KeyError/AttributeError)."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'foo': 'bar', 'baz': [1, 2, 3]}
+        assert _extract_deduped_against_uuids(flag) == []
+
+
+# ---------------------------------------------------------------------------
 # _write_and_confirm_marker helper (step-4 / step-5)
 # ---------------------------------------------------------------------------
 
