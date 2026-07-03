@@ -666,6 +666,7 @@ async def _write_and_confirm_marker(
     confirm_and_track,  # async callable: (response_memory_ids, active_miss_warning_msg, tripped_skip_warning_msg, *, tid, ftype) -> bool
     active_miss_warning_template: str,
     tripped_skip_warning_template: str,
+    deduped_against: list[str] | None = None,
 ) -> bool:
     """Write a stage1_flag_marker memory and confirm it is findable.
 
@@ -676,6 +677,13 @@ async def _write_and_confirm_marker(
                   'task_id':tid, 'flag_type':ftype,
                   'run_id':run_id, 'last_seen_run_id':run_id}``
     - ``_source='stage1_flag_dedup'`` sentinel
+
+    ``deduped_against`` (task-2047 Gap 1) is an OPTIONAL additive field: when
+    a non-empty list of resolvable memory UUIDs is passed, it is included as
+    ``metadata['deduped_against']``.  When ``None`` or empty (the default),
+    no such key is added and the payload is byte-identical to the pre-2047
+    contract — this keeps the numeric-task_id marker path (and every
+    existing payload assertion) unchanged.
 
     **Validation guard (defense-in-depth):** before calling ``add_memory``,
     ``tid`` is checked by :func:`_is_valid_marker_task_id`.  Under normal
@@ -720,19 +728,22 @@ async def _write_and_confirm_marker(
             tid, ftype,
         )
         return False
+    metadata: dict[str, Any] = {
+        'source': 'stage1_flag_marker',
+        'kind': 'stage1_flag_marker',
+        'task_id': tid,
+        'flag_type': ftype,
+        'run_id': run_id,
+        'last_seen_run_id': run_id,
+    }
+    if deduped_against:
+        metadata['deduped_against'] = list(deduped_against)
     try:
         response = await memory_service.add_memory(
             content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
             category='observations_and_summaries',
             project_id=project_id,
-            metadata={
-                'source': 'stage1_flag_marker',
-                'kind': 'stage1_flag_marker',
-                'task_id': tid,
-                'flag_type': ftype,
-                'run_id': run_id,
-                'last_seen_run_id': run_id,
-            },
+            metadata=metadata,
             causation_id=run_id,
             _source='stage1_flag_dedup',
         )
