@@ -686,7 +686,7 @@ class TestWorkerDelegatesToTracker:
         """
         worker = _make_worker(git_ops)
         new_git_ops = object()
-        worker._git_ops = new_git_ops
+        worker._git_ops = new_git_ops  # type: ignore[assignment]
         assert worker._suffix_tracker._git_ops() is new_git_ops
 
     def test_frozen_prefix_reassignment_observed(self, git_ops):
