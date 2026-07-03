@@ -31,6 +31,17 @@ Lifecycle (see :class:`RequestLedger`):
   is True (set via any of the ~20 ``set_result`` call sites, the zeta
   chokepoint, or Future cancellation on abandonment) is swept on the next
   ``stuck_entries`` call.  No per-site instrumentation is required.
+* ``mark_warned`` records that the caller has already logged a WARNING for
+  an entry's current episode; ``stuck_entries`` surfaces this via
+  ``StuckRequest.already_warned`` so ``_check_request_liveness`` logs at
+  most one WARNING per open episode (mirroring the escalation's
+  ``has_open_l1`` dedup) instead of re-logging on every heartbeat poll. A
+  fresh episode (``on_requeued`` followed by a re-``on_dequeue``) resets
+  ``warned`` back to False.
+* ``discard`` unconditionally drops an entry regardless of Future state — a
+  manual/operator-driven "stop tracking this" for a request that will never
+  resolve on its own and was never requeued (the genuine silent-hang case);
+  see :class:`RequestLedger`'s docstring for the unbounded-lifetime note.
 
 ``merge_queue.py`` re-exports every public name here through its top-level
 shim so existing importers (``from orchestrator.merge_queue import X``)
@@ -61,6 +72,13 @@ class StuckRequest:
     annotates it from ``snapshot()['entries']`` when the request_id is still
     visible somewhere in the pipeline (e.g. ``'verifying'``); a request absent
     from every pipeline structure (leaked) keeps the ``'unowned'`` default.
+
+    ``already_warned`` mirrors the ledger entry's ``warned`` flag — True once
+    ``_check_request_liveness`` has already logged a WARNING for this
+    request's CURRENT open episode, so the caller logs at most once per
+    episode instead of re-logging on every heartbeat poll. The dedup'd L1
+    escalation is unaffected by this flag — it continues to follow its own
+    independent ``has_open_l1`` contract.
     """
 
     request_id: str
@@ -68,6 +86,7 @@ class StuckRequest:
     branch: str
     age_secs: float
     phase: str = 'unowned'
+    already_warned: bool = False
 
 
 @dataclass
@@ -79,6 +98,11 @@ class _LedgerEntry:
     branch: str
     request: Any  # MergeRequest — Any to avoid a runtime import of merge_types
     dequeued_at: float
+    # True once a WARNING has been logged for this episode (see mark_warned).
+    # Reset to False only by creating a brand-new entry (on_dequeue when no
+    # entry is already present) — i.e. after a prior entry was cleared by
+    # on_requeued or swept as resolved.
+    warned: bool = False
 
 
 class RequestLedger:
@@ -89,6 +113,21 @@ class RequestLedger:
     passively) for as long as they remain armed.  Process-lifetime only —
     not persisted, and intentionally so: a restart re-dequeues whatever is
     still on-disk/in-queue, which re-arms the ledger from scratch.
+
+    Unbounded-lifetime note: a request whose Future is never resolved
+    (``set_result``/``cancel``) AND never explicitly requeued (``on_requeued``)
+    — the genuine silent-hang case this ledger exists to catch — is NOT
+    automatically evicted. ``sweep_resolved`` only drops ``done()`` entries;
+    nothing else removes an armed entry on a timer. Such an entry (and its
+    strong reference to the ``MergeRequest``) persists for the life of the
+    process, continuing to surface via ``stuck_entries()`` /
+    ``_check_request_liveness`` on every heartbeat poll (subject to the
+    ``warned`` log-dedup contract) even after an operator has inspected and
+    resolved the corresponding L1 escalation — ``has_open_l1`` flipping back
+    to False (via ``resolve_issue``) makes the NEXT sweep resubmit. Call
+    ``discard(request_id)`` explicitly once an operator has finished
+    investigating to stop tracking it (this does not touch escalation-queue
+    state).
     """
 
     def __init__(self) -> None:
@@ -126,6 +165,42 @@ class RequestLedger:
         """
         self._entries.pop(request_id, None)
 
+    def discard(self, request_id: str) -> None:
+        """Unconditionally drop the entry for *request_id*, regardless of Future state.
+
+        For operator/programmatic eviction of a request that will never
+        resolve on its own (the genuine silent-hang case) once its stuck
+        escalation has been inspected — see :class:`RequestLedger`'s
+        docstring for the unbounded-lifetime note this addresses. Unlike
+        ``on_requeued`` (which implies the request will be re-armed by a
+        subsequent ``on_dequeue``), ``discard`` is a terminal "stop tracking
+        this": the ledger will not report on this request_id again unless a
+        future ``on_dequeue`` re-arms it from scratch. Idempotent:
+        discarding an absent request_id is a silent no-op, never a
+        ``KeyError``. Does not touch escalation-queue state (e.g.
+        ``has_open_l1``) — that is resolved independently via
+        ``resolve_issue``.
+        """
+        self._entries.pop(request_id, None)
+
+    def mark_warned(self, request_id: str) -> None:
+        """Record that a stuck WARNING has been logged for this entry's current episode.
+
+        Consulted via ``StuckRequest.already_warned`` (populated by
+        ``stuck_entries``) so callers (``_check_request_liveness``) log the
+        stuck WARNING at most once per open episode instead of on every
+        heartbeat poll — mirroring the escalation's ``has_open_l1`` dedup.
+        A fresh episode begins the next time ``on_dequeue`` creates a
+        brand-new entry (i.e. after the previous one was cleared by
+        ``on_requeued`` or swept as resolved), which resets ``warned`` back
+        to False. Idempotent and a silent no-op when *request_id* is absent
+        (already resolved/requeued/never armed) — mirrors ``on_requeued``'s
+        tolerance.
+        """
+        entry = self._entries.get(request_id)
+        if entry is not None:
+            entry.warned = True
+
     def sweep_resolved(self) -> None:
         """Drop every entry whose request's Future is already ``done()``.
 
@@ -160,6 +235,7 @@ class RequestLedger:
                         task_id=entry.task_id,
                         branch=entry.branch,
                         age_secs=age_secs,
+                        already_warned=entry.warned,
                     )
                 )
         return stuck

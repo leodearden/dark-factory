@@ -209,15 +209,29 @@ class TestCheckRequestLiveness:
         t0 = 1_000_000.0
         worker._request_ledger.on_dequeue(req, now=t0)
 
-        worker._check_request_liveness(t0 + 2000, threshold_s=1000)
-        assert len(fake_eq.submitted) == 1
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._check_request_liveness(t0 + 2000, threshold_s=1000)
+            assert len(fake_eq.submitted) == 1
 
-        # An open L1 now exists for this request's sentinel (real escalation
-        # queues would report has_open_l1 True after the submit above); mirror
-        # that with the fake's open_it() and confirm no duplicate is filed.
-        fake_eq.open_it()
-        worker._check_request_liveness(t0 + 3000, threshold_s=1000)
-        assert len(fake_eq.submitted) == 1, 'second call must not submit a duplicate escalation'
+            warnings_after_first = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings_after_first) == 1, 'first call must warn exactly once'
+
+            # An open L1 now exists for this request's sentinel (real escalation
+            # queues would report has_open_l1 True after the submit above); mirror
+            # that with the fake's open_it() and confirm no duplicate is filed.
+            fake_eq.open_it()
+            worker._check_request_liveness(t0 + 3000, threshold_s=1000)
+            assert len(fake_eq.submitted) == 1, 'second call must not submit a duplicate escalation'
+
+            # The WARNING log is dedup'd exactly like the escalation: a second
+            # sweep of the SAME still-open (never resolved/requeued) episode
+            # must not re-log — otherwise a genuinely leaked/wedged request
+            # would spam an identical WARNING on every heartbeat poll forever.
+            warnings_after_second = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings_after_second) == 1, (
+                'second call for the same open stuck episode must not re-warn '
+                '— the WARNING log must be dedup\'d per episode like the escalation'
+            )
 
     async def test_observation_only_never_resolves_or_halts(
         self,
@@ -271,6 +285,53 @@ class TestCheckRequestLiveness:
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 0
         assert len(fake_eq.submitted) == 0
         assert worker._request_ledger.is_empty()  # swept as resolved
+
+    async def test_warning_relogs_after_requeue_and_redequeue_restarts_episode(
+        self,
+        tmp_path: Path,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Amendment (post-verification review, task 1992): the WARNING log
+        dedup is per-EPISODE, not permanent — a requeue (on_requeued) followed
+        by a later re-dequeue (on_dequeue) must re-warn, mirroring the
+        escalation's has_open_l1 contract which likewise only dedups within a
+        single open episode.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('requeued-episode-task', 'requeued-episode-task', wt, config)
+
+        t0 = 1_000_000.0
+        worker._request_ledger.on_dequeue(req, now=t0)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._check_request_liveness(t0 + 2000, threshold_s=1000)
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+        # Requeue clears the entry (operator halt / cascade); a later
+        # re-dequeue re-arms it fresh — a brand-new episode.
+        worker._request_ledger.on_requeued(req.request_id)
+        t2 = t0 + 10_000.0
+        worker._request_ledger.on_dequeue(req, now=t2)
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._check_request_liveness(t2 + 2000, threshold_s=1000)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, (
+            'a fresh episode after on_requeued + re-on_dequeue must re-warn '
+            'once, not stay silently suppressed by the PRIOR episode\'s '
+            'warned flag'
+        )
 
 
 # ---------------------------------------------------------------------------

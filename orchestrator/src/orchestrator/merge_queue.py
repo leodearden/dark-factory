@@ -5301,6 +5301,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         string-path monkeypatch of
         ``orchestrator.merge_queue.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``
         stays effective.
+
+        The WARNING log line is dedup'd exactly like the escalation: at most
+        once per open episode per request_id (``stuck.already_warned``,
+        cleared via ``self._request_ledger.mark_warned``) — otherwise a
+        genuinely leaked/wedged request would log an identical WARNING on
+        every ``_HEARTBEAT_POLL_S`` poll indefinitely. The escalation call
+        below still runs on every sweep regardless of ``already_warned``; it
+        has its own independent ``has_open_l1`` dedup so a resubmission after
+        an operator resolves the L1 is unaffected by the log-dedup state.
         """
         if threshold_s is None:
             from orchestrator.merge_queue import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
@@ -5318,11 +5327,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         for stuck in stuck_list:
             phase = phase_by_request_id.get(stuck.request_id, 'unowned')
             stuck = dataclasses.replace(stuck, phase=phase)
-            logger.warning(
-                'merge request stuck: request_id=%s task=%s branch=%s age=%.0fs '
-                'phase=%s — dequeued but never resolved (silent-hang failure mode)',
-                stuck.request_id, stuck.task_id, stuck.branch, stuck.age_secs, stuck.phase,
-            )
+            if not stuck.already_warned:
+                logger.warning(
+                    'merge request stuck: request_id=%s task=%s branch=%s age=%.0fs '
+                    'phase=%s — dequeued but never resolved (silent-hang failure mode)',
+                    stuck.request_id, stuck.task_id, stuck.branch, stuck.age_secs, stuck.phase,
+                )
+                self._request_ledger.mark_warned(stuck.request_id)
             _alarm_merge_request_stuck(
                 self._escalation_queue, stuck, event_store=self._event_store,
             )
@@ -6500,6 +6511,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # design) keeps its earliest dequeued_at rather than resetting
                 # the age clock.  Observation-only — never resolves/mutates/halts;
                 # see merge_request_ledger.py's module docstring.
+                #
+                # Known narrow blind spot: a speculative look-ahead item
+                # harvested by _pop_next_pickable() into the `prefetched` local
+                # (below, near the speculation-permit acquire) has already been
+                # removed from the lane buffers/`_queue` but is NOT armed here
+                # until it is consumed as `req` on the NEXT loop iteration — it
+                # is invisible to both snapshot() and the liveness ledger while
+                # merely sitting in `prefetched`. This is intentionally left
+                # uncovered: the window is a single loop iteration (the very
+                # next thing the loop does with a non-None `prefetched` is
+                # consume it here), never spans an await, and prefetching only
+                # happens when the current `req` is itself already armed and
+                # being actively processed — so a hang cannot silently vanish,
+                # it will simply attribute to the request that owns the
+                # in-flight iteration until `prefetched` is consumed.
                 self._request_ledger.on_dequeue(req, now=time.time())
 
                 self._inflight_req = req  # track for stop() race resolution

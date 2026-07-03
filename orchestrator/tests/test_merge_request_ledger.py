@@ -194,6 +194,84 @@ class TestRequestLedgerLifecycle:
         ledger.on_requeued(req.request_id)
         assert ledger.is_empty()
 
+    # -----------------------------------------------------------------
+    # Amendment (post-verification review pass, task 1992): mark_warned /
+    # discard — added to close two review findings:
+    #   (1) the stuck WARNING log had no per-episode dedup of its own
+    #       (only the escalation did), so a leaked request would log
+    #       identically on every heartbeat poll forever;
+    #   (4) a truly leaked (never-resolved, never-requeued) entry had no
+    #       eviction path other than the process dying.
+    # -----------------------------------------------------------------
+
+    async def test_mark_warned_reflected_in_stuck_entries_already_warned(self) -> None:
+        from orchestrator.merge_request_ledger import RequestLedger
+
+        ledger = RequestLedger()
+        req = _make_request('t9', 'task/t9')
+        t0 = 1_000_000.0
+        ledger.on_dequeue(req, now=t0)
+
+        stuck = ledger.stuck_entries(now=t0 + 2000, threshold_s=1000)
+        assert len(stuck) == 1
+        assert stuck[0].already_warned is False
+
+        ledger.mark_warned(req.request_id)
+
+        stuck = ledger.stuck_entries(now=t0 + 3000, threshold_s=1000)
+        assert len(stuck) == 1
+        assert stuck[0].already_warned is True
+
+    async def test_mark_warned_resets_on_requeue_and_redequeue(self) -> None:
+        """A fresh episode (on_requeued then a later on_dequeue) must clear
+        the previous episode's warned flag — mirrors the escalation's
+        has_open_l1 dedup, which likewise doesn't dedup across episodes.
+        """
+        from orchestrator.merge_request_ledger import RequestLedger
+
+        ledger = RequestLedger()
+        req = _make_request('t10', 'task/t10')
+        t0 = 1_000_000.0
+        ledger.on_dequeue(req, now=t0)
+        ledger.mark_warned(req.request_id)
+
+        ledger.on_requeued(req.request_id)
+        t2 = t0 + 10_000.0
+        ledger.on_dequeue(req, now=t2)  # brand-new entry — fresh episode
+
+        stuck = ledger.stuck_entries(now=t2 + 2000, threshold_s=1000)
+        assert len(stuck) == 1
+        assert stuck[0].already_warned is False, (
+            'a fresh episode after on_requeued + re-on_dequeue must reset warned'
+        )
+
+    async def test_mark_warned_is_a_noop_for_absent_request_id(self) -> None:
+        from orchestrator.merge_request_ledger import RequestLedger
+
+        ledger = RequestLedger()
+        ledger.mark_warned('no-such-request')  # must not raise
+
+    async def test_discard_removes_entry_regardless_of_unresolved_future(self) -> None:
+        from orchestrator.merge_request_ledger import RequestLedger
+
+        ledger = RequestLedger()
+        req = _make_request('t11', 'task/t11')
+        t0 = 1_000_000.0
+        ledger.on_dequeue(req, now=t0)
+        assert not req.result.done()
+
+        ledger.discard(req.request_id)
+
+        assert ledger.is_empty()
+        assert not req.result.done()  # discard never touches the Future
+
+    async def test_discard_is_idempotent_for_absent_request_id(self) -> None:
+        from orchestrator.merge_request_ledger import RequestLedger
+
+        ledger = RequestLedger()
+        ledger.discard('no-such-request')  # must not raise
+        ledger.discard('no-such-request')  # still must not raise
+
 
 # ---------------------------------------------------------------------------
 # step-3 RED / step-4 GREEN: _alarm_merge_request_stuck + _merge_request_stuck_sentinel
