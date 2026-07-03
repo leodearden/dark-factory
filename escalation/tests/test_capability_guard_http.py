@@ -1,4 +1,7 @@
-"""HTTP integration tests for the resolve_issue capability guard (PRD alpha).
+"""HTTP integration tests for the resolve_issue capability guard.
+
+The complete seven-scenario two-way boundary gate for the escalation
+level+identity capability seam (PRD tasks alpha/beta/gamma).
 
 These tests drive a RUNNING FastMCP escalation server over real HTTP rather
 than calling ``tool.fn(...)`` in-process, because
@@ -7,7 +10,26 @@ headers under an ASGI request context — an in-process ``tool.fn(...)`` call
 always sees ``{}``, which would make the X-Escalation-Levels /
 X-Escalation-Identity capability gate untestable.
 
-See plans/escalation-connection-capability-guard-prd.md (task alpha).
+Seven boundary scenarios, each mapped to its asserting test class:
+
+  1. Deny an out-of-set resolve on an L2 record            -> TestLevelForbidden
+  2. Deny an out-of-set park on an L2 record                -> TestLevelForbidden
+  3. Allowed L1 resolve + X-Escalation-Identity override    -> TestIdentityOverride
+  4. promote_to_l2 is never gated by X-Escalation-Levels    -> TestIdentityOverride
+  5. Header-less (human) connection keeps FULL L2 authority
+     (resume / park / close_only all succeed; resolved_by
+     comes from the tool arg, not a server override)        -> TestHumanUnrestrictedFullAuthority
+  6. l2-cascade member resolution is unaffected by the
+     capability guard for a permitted header-less resolve   -> TestCascadeIntactHeaderless
+  7. A malformed X-Escalation-Levels header fails closed
+     (bad_capability_header, no mutation)                   -> TestMalformedHeaderFailsClosed
+
+Two-way lockstep (beyond the seven scenarios above): the REAL orchestrator
+constant ``orchestrator.harness._WATCHER_ESCALATION_HEADERS`` is imported and
+driven against this running server, proving the client-side header contract
+and the server-side header parser stay in lockstep -> TestWatcherConstantLockstep.
+
+See plans/escalation-connection-capability-guard-prd.md (tasks alpha/beta/gamma).
 """
 
 from __future__ import annotations
@@ -380,4 +402,90 @@ class TestMalformedHeaderFailsClosed:
         assert reread_park.status == 'pending', f'Expected pending, got: {reread_park.status}'
         assert reread_park.resolution_action is None, (
             f'Expected no resolution_action stamp, got: {reread_park.resolution_action}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestHumanUnrestrictedFullAuthority: a header-less (human) connection keeps
+# FULL L2 authority — resume, park, and close_only all succeed, and
+# resolved_by comes from the tool arg (no server-side override).
+# ---------------------------------------------------------------------------
+
+
+class TestHumanUnrestrictedFullAuthority:
+    """A header-less connection retains full L2 authority across all three
+    resolve_issue actions that touch an L2 record; resolved_by always comes
+    from the tool arg since no X-Escalation-Identity header is present to
+    override it.
+
+    Strengthens alpha's partial scenario 5, which only proved header-less
+    close_only and never asserted resolved_by provenance.
+    """
+
+    @pytest.mark.asyncio
+    async def test_resume_park_close_only_all_succeed_header_less(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc_resume = _seed(queue, level=2, task_id='task-human-resume')
+        esc_park = _seed(queue, level=2, task_id='task-human-park')
+        esc_close = _seed(queue, level=2, task_id='task-human-close')
+
+        # (a) resume — header-less connection resolves an L2; resolved_by is
+        # the tool arg verbatim (no Identity header to override it).
+        result_a = await _resolve_over_http(
+            base_url,
+            escalation_id=esc_resume.id, resolution='fixed', action='resume',
+            resolved_by='escalation-watcher',
+        )
+        assert 'code' not in result_a and 'error' not in result_a, (
+            f'Expected a clean success, got: {result_a}'
+        )
+        reread_a = queue.get(esc_resume.id)
+        assert reread_a is not None
+        assert reread_a.status == 'resolved', f'Expected resolved, got: {reread_a.status}'
+        assert reread_a.resolved_by == 'escalation-watcher', (
+            f'Expected tool-arg resolved_by (no Identity header), got: {reread_a.resolved_by!r}'
+        )
+
+        # (b) park — keeps the L2 OPEN (status stays pending); park stamps
+        # resolution_action + resolution text + resolved_by, all from the
+        # tool call since there is no Identity header.
+        result_b = await _resolve_over_http(
+            base_url,
+            escalation_id=esc_park.id, resolution='parked pending human',
+            action='park', resolved_by='escalation-watcher',
+        )
+        assert 'code' not in result_b and 'error' not in result_b, (
+            f'Expected a clean success, got: {result_b}'
+        )
+        reread_b = queue.get(esc_park.id)
+        assert reread_b is not None
+        assert reread_b.status == 'pending', (
+            f'Expected pending (park keeps the L2 open), got: {reread_b.status}'
+        )
+        assert reread_b.resolution_action == 'park', (
+            f"Expected resolution_action='park', got: {reread_b.resolution_action!r}"
+        )
+        assert reread_b.resolution == 'parked pending human', (
+            f'Expected resolution text stamped, got: {reread_b.resolution!r}'
+        )
+        assert reread_b.resolved_by == 'escalation-watcher', (
+            f'Expected tool-arg resolved_by (no Identity header), got: {reread_b.resolved_by!r}'
+        )
+
+        # (c) close_only — dismisses with no workflow effect.
+        result_c = await _resolve_over_http(
+            base_url,
+            escalation_id=esc_close.id, resolution='no longer relevant',
+            action='close_only', resolved_by='escalation-watcher',
+        )
+        assert 'code' not in result_c and 'error' not in result_c, (
+            f'Expected a clean success, got: {result_c}'
+        )
+        reread_c = queue.get(esc_close.id)
+        assert reread_c is not None
+        assert reread_c.status == 'dismissed', f'Expected dismissed, got: {reread_c.status}'
+        assert reread_c.resolved_by == 'escalation-watcher', (
+            f'Expected tool-arg resolved_by (no Identity header), got: {reread_c.resolved_by!r}'
         )
