@@ -4191,11 +4191,14 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         assert not result.type_check_command.startswith('cd ')
 
     def test_uv_run_lint_command_scopes_to_root_file(self, tmp_path: Path) -> None:
-        """``uv run ruff check <dirs>`` scopes to the touched root-level file, runner intact.
+        """``uv run ruff check <dirs>`` scopes to the touched root-level file, in a ruff-bearing context.
 
         Regression for task 1643 / esc-1643-4: a bare ``ruff check`` scoped to
         ``ruff check <file>`` exited 127 (ruff not on PATH). With the ``uv run``
-        prefix the scoped command keeps the runner: ``uv run ruff check <file>``.
+        prefix the scoped command keeps the runner. Regression for task 2036: a
+        bare ``uv run ruff check <file>`` run from the depless workspace-root
+        project fails to spawn ruff (rc=2), so the scoped command must also be
+        reprojected into a ruff-bearing member uv context (``--project shared``).
         """
         cfg = self._make_config(
             tmp_path,
@@ -4204,7 +4207,34 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         )
         result = _build_fallback_config(['tests/scripts/test_spawn_claude.py'], cfg)
         assert result is not None
-        assert result.lint_command == 'uv run ruff check tests/scripts/test_spawn_claude.py'
+        assert result.lint_command == 'uv run --project shared ruff check tests/scripts/test_spawn_claude.py'
+
+    def test_fallback_lint_reprojects_repo_root_file_to_ruff_bearing_context(self, tmp_path: Path) -> None:
+        """The real dark_factory chained lint command reprojects for a repo-root file.
+
+        Task 2036: ``config.lint_command`` mirrors the actual dark_factory
+        ``orchestrator/config.yaml`` shape (``uv run ruff check <members> &&
+        python3 <script> ...``). ``_scope_command`` truncates at ``ruff check``
+        and inserts the touched file, leaving a bare ``uv run ruff check
+        <file>`` that fails to spawn ruff from the depless workspace root. The
+        fallback must reproject it into a ruff-bearing member uv context.
+        """
+        cfg = self._make_config(
+            tmp_path,
+            lint_command=(
+                'uv run ruff check shared escalation fused-memory orchestrator dashboard '
+                '&& python3 fused-memory/scripts/check_bare_magicmock_config.py '
+                '--config fused-memory/config/config.yaml'
+            ),
+            test_command='cd shared && uv run pytest tests/',
+        )
+        result = _build_fallback_config(['tests/scripts/test_orchestrator_watchdog.py'], cfg)
+        assert result is not None
+        assert result.lint_command is not None
+        assert result.lint_command.startswith('uv run --project shared ruff check')
+        assert 'tests/scripts/test_orchestrator_watchdog.py' in result.lint_command
+        assert not result.lint_command.startswith('uv run ruff check tests/scripts')
+        assert '--directory' not in result.lint_command
 
 
 class TestBuildFallbackConfigDataModule:
