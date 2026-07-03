@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.git_ops import MergeResult
-from orchestrator.merge_queue import MergeOutcome, SpeculativeItem
+from orchestrator.merge_queue import InflightEntry, MergeOutcome, SpeculativeItem
 
 # ── step-1: SpeculativeItem shape validation ─────────────────────────────────
 
@@ -105,3 +105,42 @@ class TestSpeculativeItemAlreadyDeliveredInvariant:
         kwargs['already_delivered'] = True
         item = SpeculativeItem(**kwargs)
         assert item.already_delivered is True
+
+
+# ── step-3: InflightEntry passthrough_outcome shadow invariant ───────────────
+
+
+def _entry_kwargs(item: SpeculativeItem, **overrides: object) -> dict:
+    base = dict(
+        item=item,
+        lease=None,
+        verify_task=None,
+        merge_wt=None,
+        was_speculative=False,
+        phase='passthrough',
+        passthrough_outcome=None,
+    )
+    base.update(overrides)
+    return base
+
+
+class TestInflightEntryPassthroughInvariant:
+    """passthrough_outcome is not None => item.immediate_outcome is not None."""
+
+    def test_passthrough_outcome_wrapping_real_item_raises(self) -> None:
+        real_item = SpeculativeItem(**_real_kwargs())
+        with pytest.raises(ValueError):
+            InflightEntry(**_entry_kwargs(real_item, passthrough_outcome=MergeOutcome('conflict')))
+
+    def test_passthrough_outcome_wrapping_decided_item_constructs(self) -> None:
+        decided_item = SpeculativeItem(**_decided_kwargs())
+        entry = InflightEntry(
+            **_entry_kwargs(decided_item, passthrough_outcome=decided_item.immediate_outcome),
+        )
+        assert entry.passthrough_outcome is decided_item.immediate_outcome
+
+    def test_no_passthrough_outcome_wrapping_any_item_constructs(self) -> None:
+        real_item = SpeculativeItem(**_real_kwargs())
+        decided_item = SpeculativeItem(**_decided_kwargs())
+        InflightEntry(**_entry_kwargs(real_item, passthrough_outcome=None))
+        InflightEntry(**_entry_kwargs(decided_item, passthrough_outcome=None))
