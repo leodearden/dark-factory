@@ -22,11 +22,20 @@ not-yet-wired attribute/key never breaks collection during the RED steps.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
+from test_merge_queue_concurrent_verify import (
+    _gated_runner,
+    _inject_two_host_allocator,
+    _make_branch_with_file,
+    _make_request,
+)
 
-from orchestrator.config import GitConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 
 # ---------------------------------------------------------------------------
@@ -134,3 +143,406 @@ class TestWorkerWiringAndAdditiveSnapshotKey:
         assert spec['held_by_merger'] == 0
         assert spec['slot_available'] == depth
         assert spec['inflight_speculative'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-11 RED / step-12 GREEN: permit-conservation property across live
+# concurrent-verify scenarios
+# ---------------------------------------------------------------------------
+#
+# Conservation identity (task 1993; consumed by task iota's downstream audit):
+#
+#     slot_available + held_by_merger + inflight_speculative == depth (K)
+#
+# This holds no matter WHERE a given permit currently sits — available,
+# retained by the merger for a look-ahead/late-arrival attach, or handed off
+# to an in-flight speculative verify — it is a pure counting invariant, not a
+# claim about timing. Every snapshot() sampled below observes a consistent
+# checkpoint because asyncio is single-threaded/cooperative: the test
+# coroutine only regains control while the merger/verifier are themselves
+# suspended at an `await`, so whatever SpeculationController last recorded is
+# exactly what is true at that instant.
+#
+# RED (before step-12): `_merger_loop` still threads its own loop-locals
+# (spec_base/prefetched/held_spec_permit/pending_spec_base/
+# pending_predecessor) and never calls into `self._speculation_controller`,
+# so `held_by_merger` reads 0 even while a permit is genuinely held on the
+# shared `_speculation_slot` — the identity reads (K-1) != K at the
+# retain-state checkpoints below.
+#
+# GREEN (step-12): `_merger_loop` delegates every speculation-state
+# transition to the controller, so held_by_merger tracks the real permit
+# ownership and the identity holds at every checkpoint, including full
+# restoration (slot_available==K, held_by_merger==0, inflight_speculative==0)
+# after the worker fully quiesces / shuts down.
+
+
+def _speculation_snapshot(worker: Any) -> dict:
+    return worker.snapshot()['speculation']
+
+
+def _assert_conservation(worker: Any, *, where: str) -> dict:
+    """Assert slot_available + held_by_merger + inflight_speculative == depth.
+
+    Returns the sampled 'speculation' snapshot dict for further inspection.
+    """
+    spec = _speculation_snapshot(worker)
+    total = (
+        spec['slot_available'] + spec['held_by_merger'] + spec['inflight_speculative']
+    )
+    assert total == spec['depth'], (
+        f'[{where}] permit-conservation identity violated: '
+        f'slot_available({spec["slot_available"]}) + '
+        f'held_by_merger({spec["held_by_merger"]}) + '
+        f'inflight_speculative({spec["inflight_speculative"]}) == {total}, '
+        f'expected depth={spec["depth"]}.\n'
+        f'Full speculation snapshot: {spec!r}'
+    )
+    return spec
+
+
+def _assert_fully_idle(worker: Any, *, where: str, depth: int) -> None:
+    """Assert the conservation identity AND full restoration to an idle state:
+    slot_available == depth, held_by_merger == 0, inflight_speculative == 0.
+    """
+    spec = _assert_conservation(worker, where=where)
+    assert spec['slot_available'] == depth, (
+        f'[{where}] slot_available must be fully restored to depth={depth}; '
+        f'got {spec["slot_available"]}.'
+    )
+    assert spec['held_by_merger'] == 0, (
+        f'[{where}] held_by_merger must be 0 (idle); got {spec["held_by_merger"]}.'
+    )
+    assert spec['inflight_speculative'] == 0, (
+        f'[{where}] inflight_speculative must be 0 (idle); '
+        f'got {spec["inflight_speculative"]}.'
+    )
+
+
+@pytest.mark.asyncio
+class TestPrefetchLookaheadAndAttachConservation:
+    """Scenarios (1) prefetch look-ahead + (2) late-arrival ATTACH (step-11).
+
+    A's local verify is gated so the merger's one-shot look-ahead peek fires,
+    finds nothing pickable, and RETAINS the permit for a possible late
+    arrival. B then arrives late and ATTACHes to A's in-flight merge commit;
+    B's remote verify is separately gated so there is an observable
+    checkpoint while the transferred permit is owned by the verifier side.
+
+    RED until step-12: held_by_merger stays 0 throughout even though a
+    permit is genuinely held/transferred on the shared semaphore.
+    """
+
+    async def test_prefetch_and_attach_conserve_permits(
+        self, git_ops: GitOps, git_config: GitConfig,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        K = 2
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        fake_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='pc-attach-laptop',
+        )
+
+        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/pc-attach-a', 'pc_attach_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/pc-attach-b', 'pc_attach_b.py', 'b = 2\n',
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, speculation_depth=K)
+        _inject_two_host_allocator(worker, fake_remote)
+
+        req_a = _make_request('pc-attach-a', 'task/pc-attach-a', wt_a, config)
+        req_b = _make_request('pc-attach-b', 'task/pc-attach-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # (1) prefetch look-ahead: A merged, look-ahead peeked (found
+            # nothing), permit RETAINED for a possible late arrival.
+            _assert_conservation(worker, where='after look-ahead retain (A in-flight)')
+
+            # (2) late-arrival ATTACH: B attaches to A's retained spec_base.
+            await queue.put(req_b)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            _assert_conservation(worker, where='after ATTACH transfer (B in-flight)')
+
+            gate_a_release.set()
+            gate_b_release.set()
+
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+            assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
+
+            _assert_conservation(worker, where='post-landing quiescence')
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        _assert_fully_idle(worker, where='post-shutdown', depth=K)
+
+
+@pytest.mark.asyncio
+class TestFallbackConservation:
+    """Scenario (3) FALLBACK to plain main (step-11).
+
+    B arrives only after A's result Future is already done, so the
+    ATTACH/FALLBACK decision's condition (d) fails: the retained permit is
+    released immediately and B merges non-speculatively.
+    """
+
+    async def test_fallback_conserves_permits(
+        self, git_ops: GitOps, git_config: GitConfig,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        K = 2
+
+        async def _passing_local(*args: Any, **kwargs: Any) -> MagicMock:
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_prerelease = asyncio.Event()
+        gate_b_prerelease.set()
+        fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='pc-fallback-laptop')
+
+        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/pc-fallback-a', 'pc_fallback_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/pc-fallback-b', 'pc_fallback_b.py', 'b = 2\n',
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, speculation_depth=K)
+        _inject_two_host_allocator(worker, fake_remote)
+
+        req_a = _make_request('pc-fallback-a', 'task/pc-fallback-a', wt_a, config)
+        req_b = _make_request('pc-fallback-b', 'task/pc-fallback-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _passing_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await queue.put(req_a)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+
+            # A is fully done before B is even enqueued — the ATTACH
+            # condition (predecessor not yet done) fails, so B FALLBACKs.
+            _assert_conservation(worker, where='after A lands, before B enqueued')
+
+            await queue.put(req_b)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
+
+            _assert_conservation(worker, where='after FALLBACK, B lands')
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        _assert_fully_idle(worker, where='post-shutdown', depth=K)
+
+
+@pytest.mark.asyncio
+class TestCascadeRemergeConservation:
+    """Scenario (4) cascade re-merge on speculative-predecessor verify failure
+    (step-11).
+
+    A's local verify is gated and FAILS; B late-arrival-attaches to A's
+    in-flight commit and starts a gated remote verify. When A fails, the
+    existing head-failure cascade cancels B's remote verify, re-merges B
+    against actual main, and re-dispatches it — the permit must remain
+    conserved throughout the cancel + remerge + redispatch sequence.
+    """
+
+    async def test_cascade_remerge_conserves_permits(
+        self, git_ops: GitOps, git_config: GitConfig,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        K = 2
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls = [0]
+
+        async def _gated_failing_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False, summary='tests failed', test_output='FAIL',
+                    lint_output='', type_output='', category='',
+                    timed_out=False, verify_skipped=False,
+                )
+            # B's re-verify after the cascade remerges it: passes.
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        fake_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='pc-cascade-laptop',
+        )
+
+        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/pc-cascade-a', 'pc_cascade_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/pc-cascade-b', 'pc_cascade_b.py', 'b = 2\n',
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, speculation_depth=K)
+        _inject_two_host_allocator(worker, fake_remote)
+
+        req_a = _make_request('pc-cascade-a', 'task/pc-cascade-a', wt_a, config)
+        req_b = _make_request('pc-cascade-b', 'task/pc-cascade-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_failing_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            _assert_conservation(
+                worker, where='after look-ahead retain (A in-flight, failing)',
+            )
+
+            await queue.put(req_b)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            _assert_conservation(
+                worker, where='after ATTACH transfer (B in-flight, pre-cascade)',
+            )
+
+            # Release A's gate with passed=False -> A fails; the head-failure
+            # cascade cancels B's remote verify, re-merges B against actual
+            # main, and re-dispatches it (local re-verify, passes).
+            gate_a_release.set()
+
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=25.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=10.0)
+
+            assert outcome_a.status != 'done', f'A must NOT land; got {outcome_a!r}'
+            assert outcome_b.status == 'done', (
+                f'B must land after cascade + remerge + re-verify; got {outcome_b!r}'
+            )
+
+            _assert_conservation(worker, where='after cascade + remerge + B lands')
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        _assert_fully_idle(worker, where='post-shutdown', depth=K)
+
+
+@pytest.mark.asyncio
+class TestShutdownRetainedPermitConservation:
+    """Scenario (5) shutdown while a permit is retained, no late arrival ever
+    arrives (step-11).
+
+    A's local verify is gated so the merger enters RETAIN state (permit held,
+    blocked in _acquire_next_request()). The worker is then stopped with the
+    queue otherwise empty — the outer finally's on_shutdown() must release
+    the retained permit and fully restore the idle state. Parametrized over
+    K=1 and K=2 per the task's scenario matrix.
+    """
+
+    @pytest.mark.parametrize('K', [1, 2])
+    async def test_shutdown_during_retain_conserves_permits(
+        self, git_ops: GitOps, git_config: GitConfig, K: int,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        gate_b_prerelease = asyncio.Event()
+        gate_b_prerelease.set()
+        fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='pc-shutdown-laptop')
+
+        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/pc-shutdown-a', 'pc_shutdown_a.py', 'a = 1\n',
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, speculation_depth=K)
+        _inject_two_host_allocator(worker, fake_remote)
+
+        req_a = _make_request('pc-shutdown-a', 'task/pc-shutdown-a', wt_a, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # Retain state: one permit held; no B ever arrives.
+            _assert_conservation(worker, where='retain state, no late arrival')
+
+            gate_a_release.set()
+
+            # Shut down while the merger is blocked in _acquire_next_request()
+            # (queue empty) — possibly still holding the retained permit.
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=10.0)
+
+        _assert_fully_idle(worker, where='post-shutdown', depth=K)
