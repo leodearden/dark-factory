@@ -583,6 +583,75 @@ async def filter_suppressed(
     return [f for f in flags if _keep(f)]
 
 
+# --------------------------------------------------------------------------- #
+# Deduped-against UUID extraction (task-2047 Gap 1)
+# --------------------------------------------------------------------------- #
+
+#: Candidate flag-dict fields consulted by :func:`_extract_deduped_against_uuids`
+#: for the resolvable Mem0 memory UUID(s) a duplicate-detection finding cites.
+#: The canonical field is ``'deduped_against'`` — the field
+#: ``prompts/stage1.py`` instructs the LLM to emit for duplicate-detection
+#: findings (e.g. ``duplicate_procedural_knowledge``).  The remaining entries
+#: are tolerated aliases: ``items_flagged`` entries are free-form LLM-emitted
+#: dicts with no fixture pinning the exact field name in practice, so a small
+#: union-of-candidates keeps extraction robust to shape drift.  Order only
+#: affects readability here — extraction UNIONS values across every field.
+_DEDUPED_AGAINST_FLAG_FIELDS: tuple[str, ...] = (
+    'deduped_against',
+    'duplicate_memory_ids',
+    'duplicate_ids',
+    'memory_ids',
+    'cited_memory_ids',
+)
+
+
+def _extract_deduped_against_uuids(flag: dict[str, Any]) -> list[str]:
+    """Return the sorted-unique memory UUID(s) *flag* cites as duplicates.
+
+    Reads :data:`_DEDUPED_AGAINST_FLAG_FIELDS` in order and UNIONS every
+    value found across all of them (a flag may carry more than one such
+    field; all are honoured, not just the first present). For each field's
+    value:
+
+    - A bare ``str`` is treated as a single-item list (task-2047 step-1(c)).
+    - A ``list`` is iterated element-by-element.
+    - Any other shape (e.g. ``None``, ``int``, ``dict``) is skipped rather
+      than raising, since ``flag`` is a free-form LLM-emitted dict.
+
+    Each element is ``None``-checked, ``str``-coerced, and stripped; blank
+    results (empty string or whitespace-only) are dropped.  Non-str elements
+    (e.g. an int) are coerced to ``str`` rather than dropped.
+
+    Returns ``[]`` when no candidate field is present, when every present
+    field is empty, or when *flag* carries none of the candidate fields at
+    all — never raises.
+
+    Pure, sync, no I/O.
+    """
+    collected: set[str] = set()
+    for field in _DEDUPED_AGAINST_FLAG_FIELDS:
+        value = flag.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            candidates: list[Any] = [value]
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            # Unexpected shape for this field — skip rather than raise; the
+            # flag is a free-form LLM-emitted dict and other fields may still
+            # yield a usable value.
+            continue
+        for item in candidates:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if not s:
+                continue
+            collected.add(s)
+    return sorted(collected)
+
+
 async def _write_and_confirm_marker(
     memory_service: Any,
     *,
