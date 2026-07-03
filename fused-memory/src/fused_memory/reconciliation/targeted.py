@@ -1137,3 +1137,41 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     if metadata.get('supersedes'):
         return True
     return bool(metadata.get(_STAGE2_SUPPRESS_KEY))
+
+
+def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) -> str | None:
+    """Format ``done_provenance`` into a landed-outcome completion echo, or None.
+
+    Task 2049: on a FIRST done-transition, no authoritative resolution memory
+    exists yet (task 1984's ``_is_authoritative_resolution`` guard correctly
+    doesn't fire), so `_on_task_done`'s fast path previously appended the raw
+    task ``description`` — usually the pre-fix bug/problem statement — making
+    a fresh completion echo read as if the bug were still open. This formats
+    the ``metadata.done_provenance`` dict (``{kind?, commit?, note?}`` — see
+    task_interceptor.py ``_validate_done_provenance``) into a one-line echo of
+    the actual landed outcome instead:
+
+    - ``note`` and ``commit`` both present -> ``"<note> (commit <commit>)"``;
+    - ``note`` only -> the note text;
+    - ``commit`` only (e.g. ``kind='merged'`` with no note) -> a generic
+      ``"Landed in commit <commit>."`` reference;
+    - neither usable (missing, empty/whitespace-only, or non-string) -> None,
+      signalling the caller to fall back to the existing description+details
+      append (preserves legacy/no-provenance behavior).
+
+    ``note`` is truncated to ``max_note_chars`` to bound the memory write —
+    mirroring the existing ``details[:500]`` cap in the fast-path append.
+    """
+    if not isinstance(provenance, dict):
+        return None
+    raw_note = provenance.get('note')
+    raw_commit = provenance.get('commit')
+    note = raw_note.strip() if isinstance(raw_note, str) else ''
+    commit = raw_commit.strip() if isinstance(raw_commit, str) else ''
+    if note and commit:
+        return f'{note[:max_note_chars]} (commit {commit})'
+    if note:
+        return note[:max_note_chars]
+    if commit:
+        return f'Landed in commit {commit}.'
+    return None
