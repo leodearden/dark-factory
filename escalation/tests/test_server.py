@@ -2267,6 +2267,7 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
+        from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
             MergeRequest,
@@ -2295,9 +2296,10 @@ class TestGetMergeQueue:
         # A — in the verifier queue (awaiting_verify)
         merge_wt_A = tmp_path / 'mergeA'
         merge_wt_A.mkdir()
+        merge_result_A = MergeResult(success=True, merge_commit='deadbeefA0000000', merge_worktree=merge_wt_A)
         item_A = SpeculativeItem(
             request=_req('A'),
-            merge_result=None, merge_wt=merge_wt_A,
+            merge_result=merge_result_A, merge_wt=merge_wt_A,
             base_sha='base', speculative=False, skip_verify=False,
         )
         await worker._verifier_queue.put(item_A)
@@ -2310,9 +2312,10 @@ class TestGetMergeQueue:
         # position 0, ahead of the awaiting_verify (A) and merging (M) sections.
         merge_wt_V = tmp_path / 'mergeV'
         merge_wt_V.mkdir()
+        merge_result_V = MergeResult(success=True, merge_commit='deadbeefV0000000', merge_worktree=merge_wt_V)
         item_V = SpeculativeItem(
             request=_req('V'),
-            merge_result=None, merge_wt=merge_wt_V,
+            merge_result=merge_result_V, merge_wt=merge_wt_V,
             base_sha='base', speculative=False, skip_verify=False,
         )
         worker._inflight.append(InflightEntry(
@@ -3476,6 +3479,7 @@ class TestMergeStatus:
             module_configs=[], config=config, result=loop.create_future(),
         )
 
+        from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
         )
@@ -3486,9 +3490,10 @@ class TestMergeStatus:
             # Put req through the verify item path
             merge_wt = tmp_path / 'merge-wt'
             merge_wt.mkdir()
+            merge_result = MergeResult(success=True, merge_commit='deadbeefP0000000', merge_worktree=merge_wt)
             item = SpeculativeItem(
                 request=req,
-                merge_result=None, merge_wt=merge_wt,
+                merge_result=merge_result, merge_wt=merge_wt,
                 base_sha='base', speculative=False, skip_verify=False,
             )
             if verify_phase in ('merging',):
