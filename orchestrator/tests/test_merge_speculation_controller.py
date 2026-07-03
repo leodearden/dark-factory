@@ -339,3 +339,127 @@ class TestLookaheadAndTransferLifecycle:
         controller.on_transfer()
         assert slot._value == depth - 1  # now held by the verifier, not merger
         assert controller.held_by_merger == 0
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED / step-8 GREEN: release paths + double-release tolerance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReleasePathsAndDoubleReleaseTolerance:
+    """on_abort/on_shutdown release paths (task 1993 step-7).
+
+    RED until step-8 GREEN implements these methods.
+    """
+
+    async def test_on_abort_releases_when_held(self) -> None:
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+
+        controller.on_abort()
+
+        assert slot._value == depth  # released back
+        assert controller.spec_base is None
+        assert controller.held_by_merger == 0
+
+    async def test_on_abort_is_noop_when_not_held(self) -> None:
+        """When not held, on_abort must never call release() (over-release
+        guard) even if spec_base was left set by some other path — it still
+        clears spec_base as a pure state-cleanup, just without touching the
+        semaphore.
+        """
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+        controller.spec_base = 'STALE_SHA'  # simulate leftover state
+        controller._held = False
+
+        controller.on_abort()
+
+        assert slot._value == depth  # unchanged — never held, never released
+        assert controller.spec_base is None
+        assert controller.held_by_merger == 0
+
+    async def test_on_shutdown_releases_and_clears_all_fields_when_held(self) -> None:
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+        # Seed pending_* too, so shutdown's "clears ALL five fields" claim is
+        # exercised beyond what on_lookahead_found alone touches.
+        pred = _make_pending_request('pred')
+        controller.pending_spec_base = 'PRED_SHA'
+        controller.pending_predecessor = pred
+
+        controller.on_shutdown()
+
+        assert slot._value == depth  # released back
+        assert controller.spec_base is None
+        assert controller.prefetched is None
+        assert controller.pending_spec_base is None
+        assert controller.pending_predecessor is None
+        assert controller.held_by_merger == 0
+        assert controller.is_idle() is True
+
+    async def test_on_shutdown_is_idempotent_when_already_idle(self) -> None:
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+
+        controller.on_shutdown()
+        controller.on_shutdown()  # second call — must not double-release
+
+        assert slot._value == depth  # unchanged, no phantom release
+        assert controller.is_idle() is True
+        assert controller.held_by_merger == 0
+
+    async def test_double_release_tolerance_survives_phantom_held_after_transfer(
+        self,
+    ) -> None:
+        """Pins the plain-Semaphore (never BoundedSemaphore) contract.
+
+        A pathological CancelledError-after-put race can leave a phantom
+        ``_held`` True after the permit has already been handed off and
+        independently released (e.g. by the verifier's drain). A stray
+        ``on_shutdown()``/``on_abort()`` call in that state must NOT raise
+        and MAY push the semaphore's internal counter above ``depth`` — this
+        over-release is documented-tolerated, not a bug in this controller
+        (see module docstring's "Plain-Semaphore double-release tolerance").
+        """
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 1
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+        controller.on_transfer()  # held -> 0; slot stays at 0 (verifier's now)
+
+        # Simulate the verifier's own drain release (the real release owed
+        # for this transferred permit) racing independently of the
+        # controller:
+        slot.release()
+        assert slot._value == depth
+
+        # Simulate the pathological race: a phantom `_held` flag left True
+        # (e.g. the merger's outer finally not yet aware of the transfer).
+        controller._held = True
+        controller.on_shutdown()  # must NOT raise ValueError
+
+        assert slot._value == depth + 1  # over depth — plain Semaphore tolerates it
