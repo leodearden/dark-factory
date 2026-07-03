@@ -3962,6 +3962,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # _speculation_depth (K) at all times.  Plain Semaphore (not Bounded)
         # so stop() may over-release without raising.
         self._speculation_slot = asyncio.Semaphore(self._speculation_depth)
+        # MQ-refactor theta (task 1993): owns the merger-side speculation
+        # state machine (spec_base/prefetched/pending_spec_base/
+        # pending_predecessor + the _speculation_slot permit lifecycle) with
+        # EXPLICIT ownership-transfer semantics. Holds a REFERENCE to the
+        # shared _speculation_slot above (never its own) so the verifier-side
+        # releases (_resolve_and_release/_finalize_inflight/cascade) keep
+        # releasing the same semaphore unchanged. See
+        # merge_speculation_controller.py's module docstring for the full
+        # lifecycle contract.
+        self._speculation_controller = SpeculationController(
+            self._speculation_slot, self._speculation_depth,
+        )
         # Merger-ahead cap (Mechanism 1, task 1646): limits non-speculative
         # build-ahead to speculation_depth items in the verifier queue.
         # Plain Semaphore (not BoundedSemaphore) so stop() may over-release
@@ -5278,6 +5290,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'two_layer_invariants': self.two_layer_invariants(
                 self._last_known_main_sha or 'unknown'
             ),
+            # θ=1993 additive key: merger-side speculation state (from
+            # self._speculation_controller.snapshot()) plus
+            # inflight_speculative — the count of speculative items now owned
+            # by the verifier (self._inflight entries with was_speculative +
+            # self._verifier_queue items with .speculative; same CPython
+            # internal-deque read as the 'entries' section above). Together
+            # these make the permit-conservation identity slot_available +
+            # held_by_merger + inflight_speculative == depth fully computable
+            # from snapshot() (task iota's conservation audit). Pure
+            # synchronous read — no await, no git calls. No collision with
+            # existing keys.
+            'speculation': {
+                **self._speculation_controller.snapshot(),
+                'inflight_speculative': (
+                    sum(1 for _ie in self._inflight if _ie.was_speculative)
+                    + sum(
+                        1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
+                        if _item is not None and _item.speculative
+                    )
+                ),
+            },
         }
 
     def _check_request_liveness(self, now: float, *, threshold_s: float | None = None) -> None:
