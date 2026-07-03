@@ -182,6 +182,17 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
 ]
+# Connection-capability headers for the escalation-watcher-auto rotation's
+# escalation MCP connection (plans/escalation-connection-capability-guard-prd.md
+# task beta, consuming the server-side enforcement landed by task alpha/2041).
+# X-Escalation-Levels='0,1' scopes resolve_issue/promote_to_l2 to L0/L1 only —
+# the server denies (level_forbidden) any attempt to resolve an L2 directly.
+# X-Escalation-Identity pins the server-stamped resolved_by so a watcher
+# can't spoof attribution via a tool argument.
+_WATCHER_ESCALATION_HEADERS: dict[str, str] = {
+    'X-Escalation-Levels': '0,1',
+    'X-Escalation-Identity': 'orchestrator-escalation-watcher-auto',
+}
 # Mutating tools blocked — no code edits, no destructive git, no infra commands.
 _WATCHER_DISALLOWED_TOOLS: list[str] = [
     'Edit',
@@ -5953,7 +5964,10 @@ Output JSON matching the schema. Every task must appear in the output.
         )
         system_prompt = load_skill_system_prompt('escalation-watcher-auto')
         escalation_url = f'http://{cfg.escalation.host}:{cfg.escalation.port}/mcp'
-        mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
+        mcp_config = self.mcp.mcp_config_json(
+            escalation_url=escalation_url,
+            escalation_headers=_WATCHER_ESCALATION_HEADERS,
+        )
         timeout_secs = cfg.watcher_rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS
         bash_max_timeout_ms = str(int(timeout_secs * 1000))
         logger.info(
