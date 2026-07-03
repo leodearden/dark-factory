@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -393,3 +394,86 @@ class TestSnapshotResourceAuditKey:
         assert snap['resource_audit']['worktree_ledger'] == (
             worker.worktree_ledger_violations()
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED / step-8 GREEN: _alarm_resource_audit(...)
+# ---------------------------------------------------------------------------
+
+
+class TestAlarmResourceAudit:
+    """Unit tests for the module-level ``_alarm_resource_audit(escalation_queue,
+    violations, *, event_store=None)`` helper (task 1994 step-7).
+
+    Modeled on ``TestAlarmMergeRequestStuck`` in test_merge_request_ledger.py
+    (the eta/1992 sibling). Unlike that helper's PER-REQUEST sentinel,
+    ``_alarm_resource_audit`` alarms on a single FIXED worker-level sentinel
+    — there is one resource audit per worker, not one per request.
+
+    RED until step-8 GREEN adds the function (+ sentinel constant) to
+    merge_queue.py.
+    """
+
+    def _call(self, eq, violations, *, event_store=None) -> None:
+        from orchestrator.merge_queue import _alarm_resource_audit
+
+        _alarm_resource_audit(eq, violations, event_store=event_store)
+
+    def test_none_queue_is_noop(self) -> None:
+        """None escalation_queue -> returns silently, no raise."""
+        self._call(None, ['some violation'])  # must not raise
+
+    def test_first_call_submits_exactly_one_escalation(self) -> None:
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, ['speculation-slot conservation violated: ...'])
+        assert len(eq.submitted) == 1
+
+    def test_escalation_has_level_1_and_blocking_severity(self) -> None:
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, ['a violation'])
+        esc = eq.submitted[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+
+    def test_escalation_has_merge_resource_leak_category(self) -> None:
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, ['a violation'])
+        esc = eq.submitted[0]
+        assert esc.category == 'merge_resource_leak'
+
+    def test_escalation_task_id_is_the_fixed_sentinel(self) -> None:
+        from orchestrator.merge_queue import _RESOURCE_AUDIT_SENTINEL
+
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, ['a violation'])
+        esc = eq.submitted[0]
+        assert esc.task_id == _RESOURCE_AUDIT_SENTINEL
+
+    def test_summary_and_detail_name_the_violations(self) -> None:
+        eq = _FakeEscalationQueue(open_l1=False)
+        violations = [
+            'speculation-slot conservation violated: foo',
+            'unregistered on-disk merge worktree /tmp/x/_merge-deadbeef',
+        ]
+        self._call(eq, violations)
+        esc = eq.submitted[0]
+        combined = esc.summary + esc.detail
+        assert 'speculation-slot conservation violated: foo' in combined
+        assert 'unregistered on-disk merge worktree /tmp/x/_merge-deadbeef' in combined
+
+    def test_second_call_with_open_l1_is_deduped(self) -> None:
+        eq = _FakeEscalationQueue(open_l1=True)  # alarm already open
+        self._call(eq, ['a violation'])
+        assert len(eq.submitted) == 0
+
+    def test_event_store_emits_escalation_created_event(self) -> None:
+        from orchestrator.event_store import EventType
+
+        eq = _FakeEscalationQueue(open_l1=False)
+        es = MagicMock()
+        self._call(eq, ['a violation'], event_store=es)
+
+        assert es.emit.called
+        args, kwargs = es.emit.call_args
+        emitted_type = args[0] if args else kwargs.get('event_type')
+        assert emitted_type == EventType.escalation_created
