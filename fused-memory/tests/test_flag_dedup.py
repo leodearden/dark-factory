@@ -6999,6 +6999,101 @@ class TestAcknowledgeFlagMarkerDelete:
             f'expected a WARNING mentioning the failed marker id; got {warning_messages!r}'
         )
 
+    async def test_deletes_two_matching_priors_returns_two(self):
+        """Two matching priors -> both deleted via the gather fan-out; returns 2
+        (task-2029 amendment: pins the multi-prior branch, previously untested).
+        """
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        prior1 = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior1.id = 'm1'
+        prior2 = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior2.id = 'm2'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[prior1, prior2])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await acknowledge_flag_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            task_id='42',
+            flag_type='missing_deliverable',
+            mode='delete',
+        )
+
+        assert result == 2
+        assert memory_service.delete_memory.await_count == 2
+        deleted_ids = {
+            c.kwargs.get('memory_id') for c in memory_service.delete_memory.await_args_list
+        }
+        assert deleted_ids == {'m1', 'm2'}
+
+    async def test_two_priors_one_delete_fails_returns_one_with_warning(self, caplog):
+        """Two priors, one delete raises -> the count excludes only the failure (1,
+        not 0) and a WARNING names the failed marker id (task-2029 amendment:
+        pins the partial-failure mix across N>1 priors, previously untested).
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        prior_ok = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior_ok.id = 'm-ok'
+        prior_bad = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior_bad.id = 'm-bad'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[prior_ok, prior_bad])
+
+        async def _delete_side_effect(*, memory_id, **_kwargs):
+            if memory_id == 'm-bad':
+                raise RuntimeError('delete blew up')
+            return None
+
+        memory_service.delete_memory = AsyncMock(side_effect=_delete_side_effect)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await acknowledge_flag_marker(
+                memory_service,
+                project_id='p',
+                run_id='r1',
+                task_id='42',
+                flag_type='missing_deliverable',
+                mode='delete',
+            )
+
+        assert result == 1
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('m-bad' in m for m in warning_messages), (
+            f'expected a WARNING naming the failed marker id; got {warning_messages!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # acknowledge_flag_marker(mode='tag') — step-3 RED tests.
@@ -7138,6 +7233,62 @@ class TestAcknowledgeFlagMarkerTag:
 
         assert result == 0
         memory_service.delete_memory.assert_not_called()
+
+    async def test_two_priors_one_add_memory_then_two_deletes(self):
+        """Two matching priors in tag mode -> exactly ONE add_memory (the single
+        replacement marker), followed by BOTH priors being deleted; returns 2
+        (task-2029 amendment: pins the multi-prior tag branch, previously
+        untested).
+        """
+        from fused_memory.reconciliation.flag_dedup import acknowledge_flag_marker
+
+        prior1 = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior1.id = 'm1'
+        prior2 = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'run_id': 'r0',
+        })
+        prior2.id = 'm2'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(return_value=[prior1, prior2])
+        memory_service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['new']))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await acknowledge_flag_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            task_id='42',
+            flag_type='missing_deliverable',
+            mode='tag',
+        )
+
+        assert result == 2
+        memory_service.add_memory.assert_called_once()
+        assert memory_service.delete_memory.await_count == 2
+        deleted_ids = {
+            c.kwargs.get('memory_id') for c in memory_service.delete_memory.await_args_list
+        }
+        assert deleted_ids == {'m1', 'm2'}
+
+        # write-first ordering: the single add_memory precedes BOTH deletes.
+        method_names = [c[0] for c in memory_service.method_calls]
+        add_idx = method_names.index('add_memory')
+        delete_indices = [i for i, name in enumerate(method_names) if name == 'delete_memory']
+        assert len(delete_indices) == 2
+        assert all(add_idx < i for i in delete_indices), (
+            f'add_memory (idx {add_idx}) must precede both deletes (idx {delete_indices})'
+        )
 
 
 # ---------------------------------------------------------------------------
