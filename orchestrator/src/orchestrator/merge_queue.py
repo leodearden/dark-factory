@@ -109,6 +109,7 @@ from orchestrator.merge_speculation_controller import (  # noqa: F401  re-export
 )
 from orchestrator.merge_types import (  # noqa: F401  re-export shim
     _INFLIGHT_MERGE_ETA_ESTIMATE_SECS,
+    Decided,
     GroupMergeRequest,
     InflightEntry,
     InFlightMergeRegistry,
@@ -117,6 +118,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     MainHealthAutoHealRegistry,
     MergeBounceRegistry,
     MergeDispatchResult,
+    MergedOk,
     MergeOutcome,
     MergeReadyPredicate,
     MergeRequest,
