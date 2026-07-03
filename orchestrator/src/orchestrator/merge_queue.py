@@ -3863,6 +3863,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # = 0.01) for fast, deterministic abort-path coverage.  Mirrors the MAX_*
     # monkeypatch convention above.
     VERIFY_ABANDON_POLL_SECS: float = 10.0
+    # MQ-invariants iota (task 1994): grace window (seconds, wall-clock mtime)
+    # before an unregistered on-disk `_merge-*` worktree is flagged by
+    # worktree_ledger_violations().  Tactical default sits strictly between
+    # the shipped cold merge-verify budget
+    # (merge_verify_cold_command_timeout_secs = 7200 s, defaults.yaml) — so a
+    # legitimately slow cold-shadow/drift-check worktree never trips a false
+    # alarm — and the reaper's INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+    # (10800 s) — so a genuine leak is always caught well before the reaper
+    # would otherwise silently absorb it.  Kept as a class attribute so tests
+    # can monkeypatch (e.g. worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = 100.0)
+    # for fast, deterministic coverage.  Mirrors the MAX_*/
+    # VERIFY_ABANDON_POLL_SECS monkeypatch convention above.
+    RESOURCE_AUDIT_WORKTREE_GRACE_SECS: float = 9000.0
+    # MQ-invariants iota (task 1994): number of CONSECUTIVE
+    # _check_resource_audit heartbeats a resource-conservation violation
+    # (speculation_accounting_violations / worktree_ledger_violations) must
+    # persist before the dedup'd L1 escalation (_alarm_resource_audit) fires.
+    # Every violating call still logs a WARNING immediately — this only
+    # gates the louder escalation, so a transient/racy single-poll blip
+    # (e.g. a register/deregister race) never pages, while a genuine leak
+    # trips well within a handful of heartbeat intervals. Kept as a class
+    # attribute so tests can monkeypatch (e.g.
+    # worker.RESOURCE_AUDIT_ESCALATION_STREAK = 1) for fast, deterministic
+    # coverage. Mirrors the RESOURCE_AUDIT_WORKTREE_GRACE_SECS/MAX_*
+    # monkeypatch convention above.
+    RESOURCE_AUDIT_ESCALATION_STREAK: int = 3
 
     def __init__(
         self,
@@ -4225,6 +4251,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # See merge_request_ledger.py's module docstring for the full
         # lifecycle contract.
         self._request_ledger = RequestLedger()
+        # MQ-invariants iota (task 1994): count of CONSECUTIVE
+        # _check_resource_audit heartbeats that found a resource-
+        # conservation violation. Reset to 0 the moment a heartbeat is
+        # clean; once it reaches RESOURCE_AUDIT_ESCALATION_STREAK the
+        # dedup'd L1 escalation (_alarm_resource_audit) fires. See
+        # _check_resource_audit for the full contract.
+        self._resource_audit_violation_streak: int = 0
 
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
@@ -4877,6 +4910,196 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
+    # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
+    #
+    # Two pure, fail-safe audit methods mirroring the two_layer_invariants
+    # idiom immediately above: each returns list[str] (empty = healthy),
+    # never raises, and is OBSERVATION ONLY (PRD design decision 4) — see
+    # _check_resource_audit / _alarm_resource_audit below for the
+    # heartbeat-driven WARNING + dedup'd L1 escalation this feeds.
+
+    def _inflight_speculative_count(self) -> int:
+        """Return the count of speculative items now owned by the verifier.
+
+        Single source of truth for the ``inflight_speculative`` term shared
+        by :meth:`snapshot`'s ``'speculation'`` key and
+        :meth:`speculation_accounting_violations`. Counts
+        ``self._inflight`` entries with ``was_speculative`` plus
+        ``self._verifier_queue`` items with ``.speculative`` — the same
+        CPython internal-deque read ``snapshot()`` already performs
+        elsewhere (synchronous, no await, no lock; safe under asyncio's
+        single-loop model).
+        """
+        return (
+            sum(1 for _ie in self._inflight if _ie.was_speculative)
+            + sum(
+                1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
+                if _item is not None and _item.speculative
+            )
+        )
+
+    def _inflight_cap_count(self) -> int:
+        """Return the count of _verifier_queue items holding a merge-ahead-cap permit.
+
+        Mechanism 1 (task 1646): the cap is acquired at the single
+        non-speculative success-enqueue site and released ON-DRAIN in
+        ``_dispatch_item`` immediately after ``_verifier_queue.get()`` —
+        never once an item reaches ``self._inflight``. So the in-flight cap
+        count is exactly the number of ``_verifier_queue`` items with
+        ``counts_against_cap=True``. Same CPython internal-deque read as
+        :meth:`_inflight_speculative_count`.
+        """
+        return sum(
+            1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
+            if _item is not None and _item.counts_against_cap
+        )
+
+    def speculation_accounting_violations(self) -> list[str]:
+        """Return I4 permit/cap conservation violations as human-readable strings.
+
+        Empty list → both conservation identities hold. Checks:
+
+          (a) speculation-slot identity: ``slot_available + held_by_merger +
+              inflight_speculative == depth`` — the permit-conservation
+              identity task theta/1993 built ``SpeculationController`` to
+              make computable (its ``held_by_merger`` docstring names this
+              task explicitly).
+          (b) merge-ahead-cap identity: ``merge_ahead_cap._value +
+              inflight_cap_count == depth`` — the Mechanism-1 cap analogue.
+
+        Returns ``[]`` immediately when ``not self._running``: ``stop()``
+        deliberately over-releases both semaphores by ``depth + 1`` as a
+        shutdown safety valve, which would otherwise read as a spurious
+        violation (extra permits, not a leak).
+
+        Pure/synchronous (no await, no git calls). Fail-safe: each identity
+        check has its own try/except so an unexpected exception in one never
+        suppresses the other, and is surfaced as a violation string rather
+        than raised — mirrors :meth:`two_layer_invariants`'s idiom. Reads
+        ``self._speculation_controller.snapshot()`` and the two helpers
+        above; deliberately does NOT call ``self.snapshot()`` (that would
+        recurse via the ``resource_audit`` key).
+        """
+        if not self._running:
+            return []
+
+        violations: list[str] = []
+
+        # ── (a) speculation-slot identity ────────────────────────────────────
+        try:
+            spec = self._speculation_controller.snapshot()
+            depth = spec['depth']
+            slot_available = spec['slot_available']
+            held_by_merger = spec['held_by_merger']
+            inflight_speculative = self._inflight_speculative_count()
+            total = slot_available + held_by_merger + inflight_speculative
+            if total != depth:
+                violations.append(
+                    f'speculation-slot conservation violated: slot_available'
+                    f'({slot_available}) + held_by_merger({held_by_merger}) + '
+                    f'inflight_speculative({inflight_speculative}) == {total}, '
+                    f'expected depth={depth}'
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(
+                f'speculation_accounting_violations: speculation-slot check raised: {exc}'
+            )
+
+        # ── (b) merge-ahead-cap identity ─────────────────────────────────────
+        try:
+            depth = self._speculation_depth
+            cap_available = self._merge_ahead_cap._value  # type: ignore[attr-defined]
+            inflight_cap = self._inflight_cap_count()
+            total = cap_available + inflight_cap
+            if total != depth:
+                violations.append(
+                    f'merge-ahead-cap conservation violated: '
+                    f'merge_ahead_cap_available({cap_available}) + '
+                    f'inflight_cap_count({inflight_cap}) == {total}, '
+                    f'expected depth={depth}'
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(
+                f'speculation_accounting_violations: merge-ahead-cap check raised: {exc}'
+            )
+
+        return violations
+
+    def worktree_ledger_violations(self, *, now: float | None = None) -> list[str]:
+        """Return I6 worktree-ledger violations as human-readable strings.
+
+        Empty list → every on-disk ``_merge-*`` worktree is accounted for.
+        Synchronously scans ``git_ops.worktree_base`` via ``os.scandir`` —
+        NOT the async git-based ``GitOps._iter_merge_worktrees`` — because
+        :meth:`snapshot` (this audit's primary caller) is strictly
+        synchronous (no await, no lock).  A direct filesystem scan is also
+        strictly-more-correct for leak detection: it catches worktrees git
+        itself no longer tracks.
+
+        Collects direct-child directories of ``worktree_base`` whose name
+        starts with ``'_merge-'``, excluding the persistent warm worktree
+        (:data:`PERSISTENT_MERGE_WORKTREE_NAME`, ``'_merge-verify'`` — reset
+        in place every verify, never a leak).  Any such directory absent from
+        :attr:`_owned_merge_worktrees` (this worker's liveness ledger; see
+        its declaration for the full scope note) is a candidate leak, but is
+        only flagged once its mtime age exceeds
+        :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`.  The grace window is the
+        exemption mechanism for short-lived UNREGISTERED ``_merge-<uuid>``
+        worktrees created by cold-shadow verify and drift-check (cleaned up
+        in their caller's ``finally``, never registered) and for ordinary
+        register/deregister races; a persistent leak eventually trips once
+        it outlives the window.
+
+        Returns ``[]`` immediately when ``not self._running``: mirrors
+        :meth:`speculation_accounting_violations` — ``stop()`` drains and
+        cleans up owned worktrees, so auditing during/after shutdown would
+        report spurious violations.
+
+        *now* is injectable for deterministic tests; defaults to
+        ``time.time()``.
+
+        Pure/synchronous (no await, no git subprocess). Fail-safe: never
+        raises; any unexpected exception is caught and surfaced as a
+        violation string, mirroring :meth:`two_layer_invariants`'s idiom.
+        """
+        if not self._running:
+            return []
+
+        violations: list[str] = []
+        try:
+            base = getattr(self._git_ops, 'worktree_base', None)
+            if base is None or not base.is_dir():
+                return []
+            effective_now = now if now is not None else time.time()
+            grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+            owned = {p.resolve() for p in self._owned_merge_worktrees}
+            with os.scandir(base) as it:
+                candidates = list(it)
+            for entry in candidates:
+                name = entry.name
+                if not name.startswith('_merge-') or name == PERSISTENT_MERGE_WORKTREE_NAME:
+                    continue
+                try:
+                    if not entry.is_dir():
+                        continue
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                path = Path(entry.path).resolve()
+                if path in owned:
+                    continue
+                age = effective_now - mtime
+                if age > grace:
+                    violations.append(
+                        f'unregistered on-disk merge worktree {path} '
+                        f'(age {age:.0f}s > grace {grace:.0f}s) absent from '
+                        f'owned ledger — possible leak'
+                    )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(f'worktree_ledger_violations: check raised: {exc}')
+
+        return violations
+
     def _warn_if_verify_base_not_frozen_tip(
         self,
         item: SpeculativeItem,
@@ -5303,13 +5526,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # existing keys.
             'speculation': {
                 **self._speculation_controller.snapshot(),
-                'inflight_speculative': (
-                    sum(1 for _ie in self._inflight if _ie.was_speculative)
-                    + sum(
-                        1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
-                        if _item is not None and _item.speculative
-                    )
-                ),
+                'inflight_speculative': self._inflight_speculative_count(),
+            },
+            # ι=1994 additive key: resource-conservation audits (I4 permits/
+            # caps + I6 worktree ledger). Each sub-key is the direct list[str]
+            # result of the correspondingly-named audit method — empty list =
+            # healthy. Pure synchronous read — no await, no git calls (see
+            # speculation_accounting_violations / worktree_ledger_violations
+            # docstrings for what each identity checks). No collision with
+            # existing keys.
+            'resource_audit': {
+                'speculation_accounting': self.speculation_accounting_violations(),
+                'worktree_ledger': self.worktree_ledger_violations(),
             },
         }
 
@@ -5374,6 +5602,54 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._escalation_queue, stuck, event_store=self._event_store,
             )
 
+    def _check_resource_audit(self, now: float) -> None:
+        """Run both resource-conservation audits and alarm on a persisting violation.
+
+        Synchronous and clock-injectable (``now``) — mirrors
+        :meth:`_check_request_liveness`'s clock-injection convention so tests
+        can drive the escalation-streak boundary deterministically without
+        real time.
+
+        MQ-invariants iota (task 1994): OBSERVATION + ESCALATION ONLY (PRD
+        design decision 4) — never mutates queue/inflight/worktree state and
+        never halts the pipeline. Combines
+        :meth:`speculation_accounting_violations` (I4 permits/caps) and
+        :meth:`worktree_ledger_violations` (I6 worktree ledger, given *now*).
+
+        A clean call (no violations) resets
+        :attr:`_resource_audit_violation_streak` to 0 and returns. A
+        violating call ALWAYS logs a WARNING naming every violation — unlike
+        :meth:`_check_request_liveness`'s log-dedup, this is not
+        per-episode-deduped, since the streak counter below already bounds
+        how often the louder escalation fires — and increments the streak.
+        Once the streak reaches :attr:`RESOURCE_AUDIT_ESCALATION_STREAK`
+        consecutive violating calls, :func:`_alarm_resource_audit` is
+        invoked on every further violating call; its own ``has_open_l1``
+        dedup (see that function) ensures at most one open L1 regardless of
+        how many times this method calls it.
+        """
+        violations = (
+            self.speculation_accounting_violations()
+            + self.worktree_ledger_violations(now=now)
+        )
+
+        if not violations:
+            self._resource_audit_violation_streak = 0
+            return
+
+        logger.warning(
+            'merge queue resource-conservation audit: %d violation(s) found '
+            '(consecutive streak=%d): %s',
+            len(violations), self._resource_audit_violation_streak + 1,
+            '; '.join(violations),
+        )
+        self._resource_audit_violation_streak += 1
+
+        if self._resource_audit_violation_streak >= self.RESOURCE_AUDIT_ESCALATION_STREAK:
+            _alarm_resource_audit(
+                self._escalation_queue, violations, event_store=self._event_store,
+            )
+
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
         """Emit a queue-depth heartbeat log line and event if conditions are met.
 
@@ -5398,11 +5674,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (mirrors ``_heartbeat_loop``'s swallow-and-log convention). This
         side-check never affects this method's own return value, which still
         means exactly "a depth heartbeat was emitted".
+
+        MQ-invariants iota (task 1994): immediately after, UNCONDITIONALLY
+        and for the same reason, runs the clock-injectable
+        :meth:`_check_resource_audit` sweep — a leaked speculation permit/
+        merge-ahead-cap slot or an abandoned on-disk merge worktree can exist
+        while the pipeline is otherwise idle (depth==0), which would
+        otherwise short-circuit this method before the audit ever ran. Also
+        wrapped in its own try/except so a resource-audit bug can never
+        suppress the depth heartbeat below, and likewise never affects this
+        method's own return value.
         """
         try:
             self._check_request_liveness(now)
         except Exception:
             logger.exception('merge queue heartbeat: request-liveness check failed')
+
+        try:
+            self._check_resource_audit(now)
+        except Exception:
+            logger.exception('merge queue heartbeat: resource-audit check failed')
 
         snap = self.snapshot()
         if snap['depth'] == 0:
@@ -8876,3 +9167,120 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         )
 
         return await self._finalize_inflight(entry)
+
+
+# ── MQ-invariants iota (task 1994): resource-audit escalation ───────────────
+#
+# Module-level function (mirrors merge_request_ledger._alarm_merge_request_stuck,
+# which is likewise a bare function rather than a worker method) fired by
+# SpeculativeMergeWorker._check_resource_audit once a resource-conservation
+# violation (I4 speculation permits/merge-ahead caps, I6 worktree ledger)
+# persists across RESOURCE_AUDIT_ESCALATION_STREAK consecutive heartbeats.
+# See speculation_accounting_violations / worktree_ledger_violations above
+# for what each identity checks.
+
+_RESOURCE_AUDIT_SENTINEL = '__merge_resource_leak__'
+"""Fixed dedup sentinel task_id for resource-conservation-audit alarms.
+
+Unlike ``_merge_request_stuck_sentinel`` (parameterized per request_id), this
+audit is worker-level, not per-request — there is exactly one open/resolved
+L1 at a time for the whole worker's resource-conservation health, so the
+sentinel is a single fixed string rather than parameterized.
+"""
+
+
+def _alarm_resource_audit(
+    escalation_queue: Any,
+    violations: list[str],
+    *,
+    event_store: Any = None,
+) -> None:
+    """Submit a dedup'd L1 escalation for persisting resource-conservation violations.
+
+    Modeled verbatim on
+    :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`.
+    Fires at most ONCE while an L1 escalation is open for
+    :data:`_RESOURCE_AUDIT_SENTINEL`. Callers (see
+    ``SpeculativeMergeWorker._check_resource_audit``) only invoke this after
+    *violations* has persisted across
+    ``SpeculativeMergeWorker.RESOURCE_AUDIT_ESCALATION_STREAK`` consecutive
+    heartbeats, so a transient/racy leak (see
+    ``worktree_ledger_violations``'s grace-window docstring) that
+    self-resolves between heartbeats never trips an alarm.
+
+    This is OBSERVATION + ESCALATION only — it never mutates queue/inflight/
+    worktree state or halts the pipeline (PRD design decision 4: invariants
+    escalate loudly, degrade never).
+
+    * ``level=1`` (L1 blocking).
+    * ``category='merge_resource_leak'``
+    * ``task_id=_RESOURCE_AUDIT_SENTINEL`` (fixed — one audit per worker, not
+      per-request).
+
+    None-safe: returns immediately when *escalation_queue* is None.
+    Dedup: returns immediately when an open L1 already exists for the sentinel.
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        violations: Non-empty list[str] — the combined output of
+            ``SpeculativeMergeWorker.speculation_accounting_violations()``
+            and ``SpeculativeMergeWorker.worktree_ledger_violations()``.
+        event_store: Optional event store; when provided an
+            ``EventType.escalation_created`` event is emitted.
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = _RESOURCE_AUDIT_SENTINEL
+
+    # Dedup: don't re-alarm while an open L1 already exists.
+    if escalation_queue.has_open_l1(sentinel):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    count = len(violations)
+    headline = violations[0] if violations else 'unknown violation'
+    summary = (
+        f'Merge queue resource-conservation audit found {count} '
+        f'violation(s) persisting across consecutive heartbeats: {headline!r}'
+        + (' (+ more — see detail)' if count > 1 else '')
+    )
+    detail = (
+        'The following resource-conservation invariants (I4 speculation '
+        'permits / merge-ahead caps, I6 worktree ledger) have been violated '
+        'for multiple consecutive heartbeats:\n\n'
+        + '\n'.join(f'- {v}' for v in violations)
+        + '\n\n'
+        'The orchestrator has NOT halted or mutated any pipeline state — '
+        'this is observation-only (PRD design decision 4).'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-merge-resource-monitor',
+        severity='blocking',
+        level=1,
+        category='merge_resource_leak',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            "Inspect the merge worker's snapshot()['resource_audit'] key "
+            '(speculation_accounting / worktree_ledger sub-lists) to '
+            'identify the leaked permit, cap, or worktree; fix the code '
+            'path that failed to release it.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+
+        event_store.emit(
+            EventType.escalation_created,
+            data={
+                'violations': list(violations),
+                'count': count,
+            },
+        )
