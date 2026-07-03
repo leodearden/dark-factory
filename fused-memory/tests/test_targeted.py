@@ -854,6 +854,95 @@ class TestBatchPlanPromotionGate:
             f'Non-batch content must never withhold, got actions={result.get("actions")!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_content_fetch_failure_fails_open_and_promotes(
+        self, reconciler_with_registry, mock_memory_service, mock_taskmaster
+    ):
+        """A get_episode_content failure degrades to content=None, which is
+        indistinguishable from non-batch content — the episode promotes exactly
+        like the pre-2033 common path (fail-open), and get_statuses is never
+        reached since batch-shape was never confirmed."""
+        ep_uuid = 'plan-ep-transient-failure'
+        planned_result = MemoryResult(
+            id='edge-planned-transient',
+            content='PRD: some future feature',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=[ep_uuid],
+            metadata={'planned': True},
+        )
+
+        call_results = [[], [planned_result]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            return call_results[idx] if idx < len(call_results) else []
+
+        mock_memory_service.search = mock_search
+        mock_memory_service.get_episode_content = AsyncMock(
+            side_effect=RuntimeError('Graphiti timeout')
+        )
+
+        result = await reconciler_with_registry.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1', 'title': 'Some feature', 'status': 'in-progress'},
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_called_once_with(ep_uuid)
+        mock_taskmaster.get_statuses.assert_not_awaited()
+        assert not any(a.get('type') == 'planned_episodes_withheld' for a in result.get('actions', [])), (
+            f'Content-fetch failure must fail open (promote), got actions={result.get("actions")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_status_fetch_failure_fails_conservative_and_withholds(
+        self, reconciler_with_registry, mock_memory_service, mock_taskmaster
+    ):
+        """Once an episode is confirmed batch-shaped, a get_statuses failure caches
+        None and withholds conservatively — the opposite fail direction from a
+        content-fetch failure, since here we know the episode is batch-plan-shaped
+        but cannot determine whether its siblings are terminal."""
+        batch_ep_uuid = 'batch-ep-1985-2002'
+        planned_result = MemoryResult(
+            id='edge-planned-batch',
+            content='Merge-queue batch queued together as df 1985-2002',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=[batch_ep_uuid],
+            metadata={'planned': True},
+        )
+
+        call_results = [[], [planned_result]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            return call_results[idx] if idx < len(call_results) else []
+
+        mock_memory_service.search = mock_search
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value='Merge-queue batch queued together as df 1985-2002'
+        )
+        mock_taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('taskmaster unavailable'))
+
+        result = await reconciler_with_registry.reconcile_task(
+            task_id='1985', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1985', 'title': 'Merge-queue modularization', 'status': 'in-progress'},
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_not_called()
+        assert any(a.get('type') == 'planned_episodes_withheld' for a in result.get('actions', [])), (
+            f'get_statuses failure on a confirmed batch episode must withhold '
+            f'conservatively, got actions={result.get("actions")!r}'
+        )
+
 
 # ── task-1136: route _on_task_blocked metadata write through TaskInterceptor ──
 
