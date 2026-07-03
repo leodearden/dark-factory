@@ -799,6 +799,31 @@ class SpeculativeItem:
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
     counts_against_cap: bool = False  # True for non-speculative, non-train successful merges (Mechanism 1)
 
+    def __post_init__(self) -> None:
+        """Enforce the I2 shape invariants (task 1990 / MQ-invariants ε).
+
+        A SpeculativeItem is either REAL (a merge actually happened; carries
+        merge_result + merge_wt) or DECIDED (conflict/already_merged/skip;
+        carries immediate_outcome) — never both, never neither.  Structurally
+        retires the task-1928 bug class where a hand-rebuilt item silently
+        dropped a field into an inconsistent shape.
+        """
+        if (self.merge_result is None) == (self.immediate_outcome is None):
+            raise ValueError(
+                'SpeculativeItem requires exactly one of merge_result or '
+                f'immediate_outcome to be set (REAL xor DECIDED); got '
+                f'merge_result={self.merge_result!r}, immediate_outcome={self.immediate_outcome!r}',
+            )
+        if (self.merge_wt is not None) != (self.merge_result is not None):
+            raise ValueError(
+                'SpeculativeItem.merge_wt must be set iff merge_result is set; got '
+                f'merge_wt={self.merge_wt!r}, merge_result={self.merge_result!r}',
+            )
+        if self.already_delivered and self.immediate_outcome is None:
+            raise ValueError(
+                'SpeculativeItem.already_delivered=True requires immediate_outcome to be set',
+            )
+
 
 @dataclass
 class InflightEntry:
