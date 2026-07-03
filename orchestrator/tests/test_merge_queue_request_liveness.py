@@ -20,8 +20,11 @@ of the file — mirrors test_merge_request_ledger.py's step-5 convention.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -94,6 +97,23 @@ def _make_request(
         result=asyncio.get_running_loop().create_future(),
         lane='normal',
     )
+
+
+async def _make_branch_with_file(
+    git_ops: GitOps,
+    branch_name: str,
+    filename: str,
+    content: str,
+) -> Path:
+    """Create a worktree branch with one committed file and return its path.
+
+    Duplicated from test_merge_queue_concurrent_verify.py / test_merge_queue_resolve_release.py
+    (per-file duplication convention — see this file's module docstring).
+    """
+    worktree = (await git_ops.create_worktree(branch_name)).path
+    (worktree / filename).write_text(content)
+    await git_ops.commit(worktree, f'Add {filename}')
+    return worktree
 
 
 class _FakeEscalationQueue:
@@ -307,3 +327,125 @@ class TestHeartbeatWiringRunsLivenessCheckFirst:
 
         assert len(fake_eq.submitted) == 1
         assert fake_eq.submitted[0].category == 'merge_request_stuck'
+
+
+# ---------------------------------------------------------------------------
+# step-11 RED / step-12 GREEN: end-to-end wedged-verify integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWedgedVerifyIntegration:
+    """A REAL dequeued MergeRequest wedged in in-flight verify (PRD boundary
+    #5) must be armed by the merger-loop dequeue hook and detected by
+    ``_check_request_liveness`` while still genuinely owned by an
+    ``_inflight`` slot (``state == 'verifying'``) — distinct from the
+    leaked/unowned shape covered by ``TestHeartbeatWiringRunsLivenessCheckFirst``
+    above.
+
+    RED until step-12 GREEN wires ``self._request_ledger.on_dequeue(...)``
+    at the merger-loop head: today a real ``worker.run()`` dequeue never
+    arms the ledger, so it stays empty and the liveness check finds nothing.
+    """
+
+    async def test_wedged_verify_is_armed_and_alarmed_then_resolves_cleanly(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.merge_queue import (
+            INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+            SpeculativeMergeWorker,
+        )
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+
+        async def _gated_local_verify(*args: object, **kwargs: object) -> MagicMock:
+            gate_entered.set()
+            await gate_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        wt = await _make_branch_with_file(
+            git_ops, 'task/wedged-verify', 'wedged.py', 'x = 1\n',
+        )
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=fake_eq)
+
+        req = _make_request('wedged-verify', 'task/wedged-verify', wt, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local_verify):
+            worker_task = asyncio.create_task(worker.run())
+
+            try:
+                await q.put(req)
+                await asyncio.wait_for(gate_entered.wait(), timeout=15.0)
+            except TimeoutError:
+                gate_release.set()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker.stop(), timeout=5.0)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker_task, timeout=5.0)
+                raise
+
+            # The request must be genuinely owned by an in-flight verify slot
+            # (boundary #5 — wedged, not leaked) before we probe liveness.
+            snap = worker.snapshot()
+            matching = [e for e in snap['entries'] if e['request_id'] == req.request_id]
+            assert len(matching) == 1 and matching[0]['state'] == 'verifying', (
+                f"Expected req in an in-flight 'verifying' entry, got: {snap['entries']!r}"
+            )
+
+            # The merger-loop dequeue hook must already have armed the ledger —
+            # this is the crux of the RED/GREEN split for step-11/step-12.
+            assert req.request_id in worker._request_ledger.open_request_ids(), (
+                'merger-loop dequeue hook not wired — ledger never armed for a '
+                'real dequeue, so the wedged request is invisible to the '
+                'liveness sweep (RED until step-12)'
+            )
+
+            threshold_s = 1.5 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+            now = time.time() + threshold_s + 60.0  # comfortably past threshold
+
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                worker._check_request_liveness(now)
+
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
+            msg = warnings[0].message
+            assert req.request_id in msg
+            assert req.branch in msg
+
+            assert len(fake_eq.submitted) == 1
+            esc = fake_eq.submitted[0]
+            assert esc.category == 'merge_request_stuck'
+            assert req.request_id in esc.summary
+
+            # Observation-only: still wedged, nothing mutated or halted.
+            assert not req.result.done()
+            assert not worker._operator_halt.is_set()
+
+            # ── Release the gate and confirm clean shutdown ────────────────
+            gate_release.set()
+            outcome = await asyncio.wait_for(req.result, timeout=15.0)
+            assert outcome.status == 'done', f'expected clean resolution, got {outcome!r}'
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=10.0)
+
+        # Passive resolution: production only sweeps a resolved entry on the
+        # NEXT liveness check, never eagerly on resolve — so trigger that
+        # sweep explicitly and confirm the ledger is left clean.
+        worker._request_ledger.sweep_resolved()
+        assert worker._request_ledger.is_empty(), (
+            'ledger must be swept empty after the request resolves cleanly'
+        )
