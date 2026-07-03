@@ -444,6 +444,7 @@ class TargetedReconciler:
                     'type': 'completion_fast',
                     'deferred': not written,
                     'echo_suppressed': has_authoritative,
+                    'echo_used_provenance': used_provenance,
                 },
                 causation_id=run_id,
             )
