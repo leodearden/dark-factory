@@ -42,20 +42,18 @@ cold claims, reap I2 composed with I1, and the cold (no-harness) fallback.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
-
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import _run
 from orchestrator.harness import Harness
 from orchestrator.warm_lane_pool import LaneState
 
@@ -503,3 +501,126 @@ class TestColdFallbackNoHarness:
             f'expected a reported, structured fallback error when no harness '
             f'is wired (never a raise), got: {res}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-11/12: the combined B+H integration gate — the single ζ deliverable
+# roping α (create_interactive_worktree) / β (claim/release verbs) / δ (the
+# reaper) into one end-to-end flow, proving I1 ∧ I2 hold throughout.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInteractiveWarmWorktreeIntegrationGate:
+    """The ζ deliverable: one harness+pool+server drives claim → release →
+    (claim stale + live) → reap, and asserts the WarmLanePool FREE count,
+    assignments_snapshot(), and scheduler._dispatched are byte-for-byte
+    unchanged across the ENTIRE flow — the one "boundary test passes in CI"
+    signal for the PRD's B+H (escalation verb + harness) gate.
+    """
+
+    async def test_full_claim_release_reap_preserves_isolation(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+        await _add_seed_script(repo)
+        config = _make_config(repo, max_concurrent_tasks=3)
+        harness, server = _build_harness_and_server(config, tmp_path)
+        pool = harness.git_ops.warm_lane_pool
+        assert pool is not None, 'setup: warm_lane_pool must be enabled'
+
+        def _free_count() -> int:
+            return sum(1 for s in pool._lanes.values() if s == LaneState.FREE)
+
+        free_before = _free_count()
+        assert free_before == 3, f'setup: expected 3 FREE lanes, got {free_before}'
+        assignments_before = pool.assignments_snapshot()
+        dispatched_before = set(harness.scheduler._dispatched)
+
+        def _assert_i1_holds(where: str) -> None:
+            assert _free_count() == free_before, (
+                f'I1 VIOLATION at {where}: FREE lane count changed '
+                f'(before={free_before}, after={_free_count()})'
+            )
+            assert pool.assignments_snapshot() == assignments_before, (
+                f'I1 VIOLATION at {where}: assignments_snapshot() changed'
+            )
+            assert harness.scheduler._dispatched == dispatched_before, (
+                f'I1 VIOLATION at {where}: scheduler._dispatched changed'
+            )
+
+        # ── Phase 1 (β claim) ──────────────────────────────────────────
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='gate', project_root=str(repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+        assert claim['warm'] is True, (
+            f"expected warm is True (committed seed script ran), got {claim['warm']!r}"
+        )
+        claim_path = Path(claim['path'])
+        assert pool.is_lane(claim_path) is False, (
+            'I1 VIOLATION: the interactive worktree path is registered as a pool lane'
+        )
+        lane_dirs = sorted(
+            p.name for p in harness.git_ops.worktree_base.iterdir()
+            if p.name.startswith('_lane-')
+        )
+        assert lane_dirs == [], (
+            f'I1 VIOLATION: a _lane-* dir was created on disk: {lane_dirs}'
+        )
+        _assert_i1_holds('after phase 1 claim')
+
+        # ── Phase 2 (β release) ────────────────────────────────────────
+        rel = await _call_tool(
+            server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(repo),
+        )
+        assert rel['removed'] is True, f'expected removed=True, got: {rel}'
+        registered_after_release = await _registered_worktree_paths(repo)
+        assert str(claim_path.resolve()) not in registered_after_release, (
+            f'expected {claim_path} gone from `git worktree list` after release; '
+            f'got: {registered_after_release}'
+        )
+        _assert_i1_holds('after phase 2 release')
+
+        # ── Phase 3 (δ reap, I2) ───────────────────────────────────────
+        stale_claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='gate-stale', project_root=str(repo),
+        )
+        assert 'error' not in stale_claim, f'setup: gate-stale claim failed: {stale_claim}'
+        live_claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='gate-live', project_root=str(repo),
+        )
+        assert 'error' not in live_claim, f'setup: gate-live claim failed: {live_claim}'
+
+        stale_path = Path(stale_claim['path'])
+        live_path = Path(live_claim['path'])
+
+        # Keep 'gate-live' active with a fresh commit beyond main (mirrors
+        # TestReapI2ViaHarnessPass's convention).
+        (live_path / 'work.txt').write_text('work\n')
+        await _run(['git', 'add', '-A'], cwd=live_path)
+        await _run(['git', 'commit', '-m', 'wip on gate-live'], cwd=live_path)
+
+        # 'gate-stale' has no commits beyond main — backdate its stamp past
+        # the TTL so the reaper reclaims it.
+        _backdate_stamp(
+            stale_path,
+            datetime.now(UTC)
+            - timedelta(seconds=harness.config.git.interactive_worktree_ttl + 3600),
+        )
+
+        await harness._run_interactive_worktree_reaper_pass()
+
+        registered_after_reap = await _registered_worktree_paths(repo)
+        assert str(stale_path.resolve()) not in registered_after_reap, (
+            f'expected gate-stale to be reaped; registered: {registered_after_reap}'
+        )
+        assert str(live_path.resolve()) in registered_after_reap, (
+            f'expected gate-live to be preserved; registered: {registered_after_reap}'
+        )
+
+        # ── Final re-assertion: I1 held across the ENTIRE flow ──────────
+        _assert_i1_holds('at the end of the full claim/release/reap flow')
