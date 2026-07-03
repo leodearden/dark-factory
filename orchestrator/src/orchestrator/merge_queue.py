@@ -7137,19 +7137,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if entry.verify_task is None:
                     try:
                         await self._finalize_inflight(entry)
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
                     except BaseException as exc:
-                        if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                            req_pt = entry.item.request
-                            logger.exception(
-                                'Task %s: unexpected passthrough finalize error', req_pt.task_id
-                            )
-                            if not req_pt.result.done():
-                                req_pt.result.set_result(MergeOutcome(
-                                    'blocked', reason=f'Verifier error: {exc}',
-                                ))
-                            self._n_failed = True
-                        else:
-                            raise
+                        logger.exception(
+                            'Task %s: unexpected passthrough finalize error',
+                            entry.item.request.task_id,
+                        )
+                        await self._resolve_and_release(
+                            entry, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                            chain_failed=True, release_resources=False,
+                        )
                     continue  # don't append to _inflight; fetch next item
 
                 self._inflight.append(entry)
@@ -7398,20 +7396,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if entry.verify_task is None:
                     try:
                         await self._finalize_inflight(entry)
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
                     except BaseException as exc:
-                        if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                            req_pt = entry.item.request
-                            logger.exception(
-                                'Task %s: unexpected passthrough finalize error '
-                                '(blocking-get path)', req_pt.task_id,
-                            )
-                            if not req_pt.result.done():
-                                req_pt.result.set_result(MergeOutcome(
-                                    'blocked', reason=f'Verifier error: {exc}',
-                                ))
-                            self._n_failed = True
-                        else:
-                            raise
+                        logger.exception(
+                            'Task %s: unexpected passthrough finalize error '
+                            '(blocking-get path)', entry.item.request.task_id,
+                        )
+                        await self._resolve_and_release(
+                            entry, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                            chain_failed=True, release_resources=False,
+                        )
                     continue  # restart outer loop → fill loop picks up next item
 
                 # Real verify entry: append to _inflight and loop back to fill.
