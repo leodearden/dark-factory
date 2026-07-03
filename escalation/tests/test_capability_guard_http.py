@@ -543,3 +543,75 @@ class TestCascadeIntactHeaderless:
                 f'Expected the cascade stamp to override the tool arg for member '
                 f'{member.id}, got: {reread_member.resolved_by!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# TestWatcherConstantLockstep: the REAL orchestrator constant
+# (_WATCHER_ESCALATION_HEADERS) is driven against this running server,
+# proving the client-side header contract and the server-side header parser
+# stay in lockstep.
+# ---------------------------------------------------------------------------
+
+
+class TestWatcherConstantLockstep:
+    """Drives the actual ``orchestrator.harness._WATCHER_ESCALATION_HEADERS``
+    constant against the running escalation server: its Levels='0,1' denies
+    an L2 resolve and its Identity stamps resolved_by on an allowed L1
+    resolve, overriding a spoofed tool arg.
+
+    Closes the gap flagged at orchestrator/src/orchestrator/harness.py:206-211
+    ('No test in this repo exercises this constant against the live server
+    parser') — this is the genuine two-way (client-constant <-> server-
+    enforcement) half of the boundary gate, beyond the seven scenarios above.
+    """
+
+    @pytest.mark.asyncio
+    async def test_real_watcher_headers_deny_l2_and_stamp_l1_identity(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        levels = _WATCHER_ESCALATION_HEADERS['X-Escalation-Levels']
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+        assert identity == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the canonical watcher identity string, got: {identity!r}'
+        )
+
+        # (a) Real watcher headers deny a close_only resolve on an L2 — no mutation.
+        esc_l2 = _seed(queue, level=2, task_id='task-lockstep-l2')
+        result_a = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc_l2.id, resolution='x', action='close_only',
+        )
+        assert result_a.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result_a}"
+        )
+        reread_a = queue.get(esc_l2.id)
+        assert reread_a is not None
+        assert reread_a.status == 'pending', f'Expected pending, got: {reread_a.status}'
+        assert (queue.queue_dir / f'{esc_l2.id}.json').exists(), (
+            'Denied record must remain in the queue root (not archived)'
+        )
+        assert reread_a.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread_a.resolution_action}'
+        )
+
+        # (b) Real watcher headers allow an L1 resolve; the Identity header
+        # stamps resolved_by, overriding a spoofed tool arg.
+        esc_l1 = _seed(queue, level=1, task_id='task-lockstep-l1')
+        result_b = await _resolve_over_http(
+            base_url, levels=levels, identity=identity,
+            escalation_id=esc_l1.id, resolution='fixed', action='resume',
+            resolved_by='spoofed-by-agent',
+        )
+        assert 'code' not in result_b and 'error' not in result_b, (
+            f'Expected a clean success (level 1 is in the watcher set), got: {result_b}'
+        )
+        reread_b = queue.get(esc_l1.id)
+        assert reread_b is not None
+        assert reread_b.status == 'resolved', f'Expected resolved, got: {reread_b.status}'
+        assert reread_b.resolved_by == identity, (
+            f'Expected the header identity to win over the spoofed tool arg, got: '
+            f'{reread_b.resolved_by!r}'
+        )
