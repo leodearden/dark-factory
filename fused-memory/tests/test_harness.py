@@ -4510,8 +4510,6 @@ async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
             status=RunStatus.completed,
         )
 
-    harness.run_full_cycle = fake_run_full_cycle
-
     def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
         inst = MagicMock()
 
@@ -4543,9 +4541,12 @@ async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
 
     event_buffer.restore_drained = spy_restore
 
-    with patch(
-        'fused_memory.reconciliation.context_assembler.ContextAssembler',
-        side_effect=fake_assembler_factory,
+    with (
+        patch.object(harness, 'run_full_cycle', side_effect=fake_run_full_cycle),
+        patch(
+            'fused_memory.reconciliation.context_assembler.ContextAssembler',
+            side_effect=fake_assembler_factory,
+        ),
     ):
         iterator = BacklogIterator(
             harness.config, harness.journal, harness.buffer, harness,
@@ -4683,8 +4684,6 @@ async def test_backlog_iterator_budget_bounds_chunks_and_converges_across_invoca
             status=RunStatus.completed,
         )
 
-    harness.run_full_cycle = fake_run_full_cycle
-
     def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
         inst = MagicMock()
 
@@ -4725,6 +4724,7 @@ async def test_backlog_iterator_budget_bounds_chunks_and_converges_across_invoca
     )
 
     with (
+        patch.object(harness, 'run_full_cycle', side_effect=fake_run_full_cycle),
         patch(
             'fused_memory.reconciliation.context_assembler.ContextAssembler',
             side_effect=fake_assembler_factory,
