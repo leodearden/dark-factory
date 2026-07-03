@@ -329,3 +329,55 @@ class TestIdentityOverride:
         assert result_b.get('status') in {'created', 'updated'}, (
             f"Expected status in {{'created','updated'}}, got: {result_b}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestMalformedHeaderFailsClosed: an unparseable X-Escalation-Levels rejects
+# the call — with NO mutation — for both resolve and park.
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedHeaderFailsClosed:
+    """A malformed X-Escalation-Levels header fails closed with no mutation,
+    for both a plain resolve and a park action."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_levels_header_rejected_before_any_mutation(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+        esc_bad = _seed(queue, level=2, task_id='task-bad-resolve')
+        esc_bad_park = _seed(queue, level=2, task_id='task-bad-park')
+
+        # Malformed header rejected before a close_only resolve — no mutation.
+        result = await _resolve_over_http(
+            base_url, levels='garbage',
+            escalation_id=esc_bad.id, resolution='x', action='close_only',
+        )
+        assert result.get('code') == 'bad_capability_header', (
+            f"Expected code='bad_capability_header', got: {result}"
+        )
+        reread = queue.get(esc_bad.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending, got: {reread.status}'
+        assert (queue.queue_dir / f'{esc_bad.id}.json').exists(), (
+            'Rejected record must remain in the queue root (not archived)'
+        )
+        assert reread.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread.resolution_action}'
+        )
+
+        # Malformed header rejected before park too.
+        result_park = await _resolve_over_http(
+            base_url, levels='garbage',
+            escalation_id=esc_bad_park.id, action='park', resolution='x',
+        )
+        assert result_park.get('code') == 'bad_capability_header', (
+            f"Expected code='bad_capability_header', got: {result_park}"
+        )
+        reread_park = queue.get(esc_bad_park.id)
+        assert reread_park is not None
+        assert reread_park.status == 'pending', f'Expected pending, got: {reread_park.status}'
+        assert reread_park.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread_park.resolution_action}'
+        )
