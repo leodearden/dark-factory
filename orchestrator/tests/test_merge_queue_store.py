@@ -620,33 +620,24 @@ class TestMergeQueueStoreNormalizesBranch:
             f'got {persisted.branch!r}'
         )
 
-    def test_record_bare_branch_is_idempotent(self, tmp_path: Path) -> None:
-        """A MergeRequest submitted with an already-bare branch is unchanged."""
+    @pytest.mark.parametrize('branch', ['4959', '42'])
+    def test_record_bare_branch_is_idempotent(self, tmp_path: Path, branch: str) -> None:
+        """A MergeRequest submitted with an already-bare branch is unchanged.
+
+        Parametrized over a couple of bare-branch values (was previously two
+        near-identical tests differing only in the literal id).
+        """
         store_path = tmp_path / 'merge_queue.json'
         store = MergeQueueStore(store_path)
         config = _real_config(tmp_path)
         wt = tmp_path / 'wt'
         wt.mkdir()
 
-        req = _make_req('4959', '4959', wt, config)
+        req = _make_req(branch, branch, wt, config)
         store.record(req)
 
         [persisted] = store.load()
-        assert persisted.branch == '4959'
-
-    def test_record_bare_roundtrip_unchanged(self, tmp_path: Path) -> None:
-        """Confirms the plain bare round-trip (branch='42') stays unchanged."""
-        store_path = tmp_path / 'merge_queue.json'
-        store = MergeQueueStore(store_path)
-        config = _real_config(tmp_path)
-        wt = tmp_path / 'wt'
-        wt.mkdir()
-
-        req = _make_req('42', '42', wt, config)
-        store.record(req)
-
-        [persisted] = store.load()
-        assert persisted.branch == '42'
+        assert persisted.branch == branch
 
 
 # ---------------------------------------------------------------------------
@@ -768,4 +759,87 @@ class TestRecoverPendingMergesPrefixedBranch:
         assert 'mr-4959' in remaining_ids, (
             'Recovered (re-enqueued) record must REMAIN in the store — removal '
             'happens elsewhere, on merge completion'
+        )
+
+    async def test_bare_branch_re_enqueues_via_canonical_prefix(
+        self, tmp_path: Path,
+    ) -> None:
+        """Sibling case: the post-fix normal journal shape (bare branch).
+
+        A journal written after the step-4 enqueue normalization holds the
+        bare branch ('4959') rather than the legacy prefixed shape exercised
+        above.  Recovery must still resolve it by prepending branch_prefix
+        (canonical_queued_branch_name is shape-tolerant either way), while
+        the reconstructed request's ``branch`` stays bare — reconstruct_merge_
+        request passes ``persisted.branch`` through verbatim, so the shape on
+        the re-enqueued MergeRequest differs by journal generation even though
+        resolution succeeds identically for both.
+        """
+        import json
+        from dataclasses import asdict
+
+        config = _real_config(tmp_path)
+        branch_prefix = 'task/'
+        main_branch = 'main'
+
+        wt_live = tmp_path / 'wt-4959-bare'
+        wt_live.mkdir()
+
+        live = PersistedMergeRequest(
+            request_id='mr-4959',
+            task_id='4959',
+            branch='4959',  # bare: the post-fix (step-4 normalized) on-disk shape
+            worktree=str(wt_live),
+            pre_rebased=False,
+            task_files=None,
+            snapshot_tip=None,
+            generation=1,
+            lane='normal',
+            enqueued_at=1000.0,
+        )
+
+        store_path = tmp_path / 'merge_queue.json'
+        store_path.write_text(
+            json.dumps({live.request_id: asdict(live)}),
+            encoding='utf-8',
+        )
+
+        store = MergeQueueStore(store_path)
+        assert store.journal_corrupt is False, 'Hand-written journal must parse cleanly'
+
+        # Fake git_ops: resolves ONLY the canonically-prefixed key 'task/4959'
+        # — the bare persisted shape 'task/4959' -> unchanged by canonical_
+        # queued_branch_name is NOT what's stored; the bare '4959' itself
+        # must be prepended by the fix (mirrors the prefixed-branch case).
+        async def fake_resolve(branch: str) -> str | None:
+            return 'sha-4959' if branch == 'task/4959' else None
+
+        async def fake_is_ancestor(ancestor: str, descendant: str) -> bool:
+            return False
+
+        fake_git_ops = MagicMock()
+        fake_git_ops.resolve_branch_sha = fake_resolve
+        fake_git_ops.is_ancestor = fake_is_ancestor
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+
+        report = await recover_pending_merges(
+            store,
+            queue,
+            fake_git_ops,
+            config,
+            event_store=None,
+            main_branch=main_branch,
+            branch_prefix=branch_prefix,
+        )
+
+        assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
+        assert queue.qsize() == 1, f'Expected exactly 1 re-enqueued item; got {queue.qsize()}'
+        recovered_req = queue.get_nowait()
+        assert recovered_req.request_id == 'mr-4959'
+        assert recovered_req.branch == '4959', (
+            f"Expected the reconstructed request's branch to stay bare "
+            f"('4959', passed through verbatim from the persisted record) "
+            f"even though resolution went through the canonically prefixed "
+            f"'task/4959' ref; got {recovered_req.branch!r}"
         )
