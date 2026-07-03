@@ -581,6 +581,12 @@ def create_server(
                     ),
                     'code': 'level_forbidden',
                 }
+        identity = headers.get(_IDENTITY_HEADER)
+        if identity is not None:
+            # Server-attributed identity overrides the tool arg for both the
+            # park stamp (below) and the resolve call further down — a caller
+            # cannot spoof resolved_by once the connection asserts an identity.
+            resolved_by = identity
 
         if action == 'park':
             # Version-a: park keeps the escalation open at L2.
