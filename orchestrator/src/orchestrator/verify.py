@@ -416,6 +416,36 @@ def _extract_cause_hint(output: str) -> str:
     return meaningful[0].strip()[:200]
 
 
+# Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from
+# another orchestrator process on the shared .venv can transiently
+# remove-then-readd packages WHILE a consumer is mid-pytest against it (a
+# non-atomic install window).  Grounded in task 2045's observation: an
+# identical `pytest -n auto` that had just passed failed with a pytest usage
+# error naming -n/--dist/--max-worker-restart (the xdist plugin vanished),
+# `python -c "import xdist"` raised ModuleNotFoundError, and `python -m pip`
+# reported "No module named pip".  Checked BEFORE _CLASSIFY_PATTERNS in
+# _classify_failure so these harness-infrastructure-absence signatures are
+# never misattributed as a code regression (compile_error /
+# pytest_internalerror / test_failure).  Deliberately narrow: application
+# code does not normally emit these exact xdist/pip-absence strings, so a
+# genuine code failure is not silently relabelled environmental.
+_ENV_TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
+    # pytest usage error (rc=4) when the xdist plugin vanished mid-run:
+    # "pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0"
+    re.compile(
+        r'^.*unrecognized arguments:.*(?:-n\b|--dist\b|--max-worker-restart\b).*$',
+        re.MULTILINE,
+    ),
+    # `python -m pip` when pip itself vanished from the venv.
+    re.compile(r'''No module named ['"]?pip['"]?''', re.MULTILINE),
+    # `import xdist` / `import pytest_xdist` when the plugin vanished.
+    re.compile(
+        r'''ModuleNotFoundError: No module named ['"](xdist|pytest_xdist)['"]''',
+        re.MULTILINE,
+    ),
+]
+
+
 # Compiled regex patterns for _classify_failure — hoisted to module scope so
 # re.compile() runs once at import time rather than on every call.
 # Order matters: rustc diagnostic codes (error[E0308]) appear before plain
@@ -478,15 +508,16 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
     Uses a pattern ladder (first match wins):
     1. ``rc == 0``                              → ``'passed'``
     2. ``timed_out``                            → ``'infra_timeout'``
-    3. ``error[E\\d+]:``                        → ``'compile_error'``
-    4. ``compile error``                         → ``'compile_error'``
-    5. ``error: <cargo CLI prefix>``             → ``'cargo_cli_error'`` (allowlist of cargo CLI prefixes; rustc top-level ``error: aborting…`` / ``error: could not compile`` fall through)
-    6. ``INTERNALERROR>``                        → ``'pytest_internalerror'`` (checked BEFORE FAILED so a worker-death run with collateral FAILED lines classifies as infra, not drift)
-    7. ``… FAILED``                              → ``'test_failure'``
-    8. ``npm (ERR!|error)``                      → ``'npm_error'``
-    9. ``flock:``                                → ``'flock_error'``
-    10. ``tree-sitter generate``                 → ``'tree_sitter_generate_error'``
-    11. fallback (rc != 0)                       → ``'unknown_test_failure'``
+    3. xdist/pip absence (shared-venv mutation) → ``'env_transient'`` (checked BEFORE every other output pattern — see ``_ENV_TRANSIENT_PATTERNS`` — so a concurrent ``uv sync`` window that killed xdist/pip mid-run is never misattributed as a code regression)
+    4. ``error[E\\d+]:``                        → ``'compile_error'``
+    5. ``compile error``                         → ``'compile_error'``
+    6. ``error: <cargo CLI prefix>``             → ``'cargo_cli_error'`` (allowlist of cargo CLI prefixes; rustc top-level ``error: aborting…`` / ``error: could not compile`` fall through)
+    7. ``INTERNALERROR>``                        → ``'pytest_internalerror'`` (checked BEFORE FAILED so a worker-death run with collateral FAILED lines classifies as infra, not drift)
+    8. ``… FAILED``                              → ``'test_failure'``
+    9. ``npm (ERR!|error)``                      → ``'npm_error'``
+    10. ``flock:``                                → ``'flock_error'``
+    11. ``tree-sitter generate``                 → ``'tree_sitter_generate_error'``
+    12. fallback (rc != 0)                       → ``'unknown_test_failure'``
 
     The ``timed_out`` flag wins over any output pattern because the root
     cause is the wall-clock limit, not the command output.
@@ -495,6 +526,10 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
         return 'passed'
     if timed_out:
         return 'infra_timeout'
+
+    for env_pattern in _ENV_TRANSIENT_PATTERNS:
+        if env_pattern.search(output):
+            return 'env_transient'
 
     for pattern, category in _CLASSIFY_PATTERNS:
         if pattern.search(output):
