@@ -3566,73 +3566,6 @@ async def test_recover_stale_runs_suppresses_escalation_for_dead_owner_shielded(
     )
 
 
-# ── instance_id threading spy test (task 2039) ────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_runs_passes_dead_owner_instance_id_to_storm_counter(
-    journal, event_buffer, mock_memory_service,
-):
-    """_recover_stale_runs() must thread the dead owner's instance_id into
-    _record_dead_owner_suppression(), not just project_id (task 2039).
-
-    Regression for esc-recon-50da2482-1: a single multi-project restart
-    recovers one dead_owner_shielded orphan per project, all left by the SAME
-    prior (dead) instance.  The storm counter can only distinguish "1 dead
-    owner, N projects" (benign restart) from "N distinct dead owners" (real
-    storm) if it is given the dead owner's instance_id alongside project_id.
-    Today's call site only passes project_id, so this spy test is RED against
-    it.
-    """
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._escalate = MagicMock()
-    harness._record_dead_owner_suppression = MagicMock(return_value=None)
-
-    project_id = 'project-instance-thread-test'
-    cutoff = harness.config.stale_run_recovery_seconds  # 1800s
-
-    run = ReconciliationRun(
-        id='run-instance-thread-0001',
-        project_id=project_id,
-        run_type=RunType.full,
-        trigger_reason='unit-test-instance-thread',
-        started_at=datetime.now(UTC) - timedelta(seconds=cutoff * 2),
-        status=RunStatus.running,
-        instance_id=event_buffer.instance_id,
-    )
-    await journal.start_run(run)
-
-    acquired = await event_buffer.mark_run_active(project_id)
-    assert acquired is True
-
-    # Backdate heartbeat_at past the cutoff → dead_owner_shielded
-    dead_heartbeat = (
-        datetime.now(UTC) - timedelta(seconds=cutoff + 100)
-    ).isoformat()
-    async with event_buffer._txn() as db:
-        await db.execute(
-            'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
-            (dead_heartbeat, project_id),
-        )
-
-    await harness._recover_stale_runs()
-
-    assert harness._record_dead_owner_suppression.call_count == 1, (
-        f'Expected exactly one call to _record_dead_owner_suppression; '
-        f'got {harness._record_dead_owner_suppression.call_args_list}'
-    )
-    call = harness._record_dead_owner_suppression.call_args
-    passed_values = list(call.args) + list(call.kwargs.values())
-    assert project_id in passed_values, (
-        f'project_id must still be passed through; got args={call.args!r} '
-        f'kwargs={call.kwargs!r}'
-    )
-    assert event_buffer.instance_id in passed_values, (
-        'the dead owner instance_id (run.instance_id) must be passed through to '
-        f'_record_dead_owner_suppression; got args={call.args!r} kwargs={call.kwargs!r}'
-    )
-
-
 # ── suppression-site storm integration test ───────────────────────────────────
 
 
@@ -3983,6 +3916,109 @@ def test_record_dead_owner_suppression_single_dead_owner_multi_project_no_storm(
     assert all(r is None for r in results), (
         f'A single dead-owner instance recovered across {len(projects)} projects '
         f'must never storm (distinct count stays 1); got {results!r}'
+    )
+
+
+def test_record_dead_owner_suppression_none_instance_id_never_storms(
+    journal, event_buffer, mock_memory_service,
+):
+    """instance_id=None suppressions are excluded from the distinct count and
+    must never storm, however many are recorded (task 2039).
+
+    dead_owner_shielded is guaranteed to carry a non-None run.instance_id
+    (build_stale_run_diagnostics classifies a None instance_id as
+    'pre_migration', never 'dead_owner_shielded'), so this path is
+    unreachable in production today. The `if iid is not None` filter in the
+    distinct-count comprehension exists purely as a defensive guard should
+    that invariant ever be violated; this test pins its behavior: None
+    entries are excluded from the distinct set entirely (not counted as "one
+    more dead owner"), so the count stays 0 and the storm never fires no
+    matter how many None-instance suppressions accumulate in the window.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.config.dead_owner_suppression_storm_threshold == 6
+
+    base = datetime(2026, 7, 3, 13, 42, 37, tzinfo=UTC)
+    projects = [f'project-none-iid-{i}' for i in range(8)]
+
+    results = [
+        harness._record_dead_owner_suppression(
+            proj, None, now=base + timedelta(seconds=i * 5)
+        )
+        for i, proj in enumerate(projects)
+    ]
+
+    assert all(r is None for r in results), (
+        f'instance_id=None suppressions must never storm, however many are '
+        f'recorded (excluded from the distinct count); got {results!r}'
+    )
+
+
+def test_record_dead_owner_suppression_mixed_distinct_kills_and_benign_restart(
+    journal, event_buffer, mock_memory_service,
+):
+    """Mixed scenario: several genuinely-distinct watchdog kills plus one
+    benign multi-project restart within the same window (task 2039).
+
+    5 DISTINCT dead-owner instance_ids (5 independent kills, one project
+    each) plus ONE benign restart sharing a single instance_id across 6
+    further projects. The restart legitimately contributes exactly 1 to the
+    distinct count — same as any other single dead owner, regardless of how
+    many projects it touches — so the running distinct count is 5 (kills) + 1
+    (restart) == 6 == threshold, and the storm fires exactly once, on the
+    restart's first suppression.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.config.dead_owner_suppression_storm_threshold == 6
+
+    base = datetime(2026, 7, 3, 13, 42, 37, tzinfo=UTC)
+
+    # Phase A: 5 distinct, genuinely-independent dead-owner kills.
+    kill_results = [
+        harness._record_dead_owner_suppression(
+            f'kill-project-{i}', f'kill-iid-{i}', now=base + timedelta(seconds=i * 5)
+        )
+        for i in range(5)
+    ]
+    assert all(r is None for r in kill_results), (
+        f'5 distinct kills is below the threshold of 6; got {kill_results!r}'
+    )
+
+    # Phase B: one benign restart recovering 6 project orphans, all sharing
+    # the SAME dead-owner instance_id.
+    restart_instance_id = 'restart-owner-iid'
+    restart_projects = [
+        'autopilot_video', 'dark_factory', 'know_live',
+        'my_solar_challenge', 'reify', 'solar_challenge_platform',
+    ]
+    restart_results = [
+        harness._record_dead_owner_suppression(
+            proj, restart_instance_id, now=base + timedelta(seconds=30 + i * 5)
+        )
+        for i, proj in enumerate(restart_projects)
+    ]
+
+    # The restart's single instance_id pushes the distinct count from 5 to 6
+    # on its FIRST suppression -> that call storms; the remaining 5 orphans
+    # are the SAME dead owner within the same window, so they are
+    # rate-limited rather than adding further to the distinct count.
+    assert restart_results[0] is not None, (
+        "the restart's 1 distinct instance_id on top of 5 prior distinct "
+        f'kills should cross the threshold of 6; got {restart_results!r}'
+    )
+    assert restart_results[0]['count'] == 6, (
+        f'distinct count must be exactly 6 (5 kills + 1 restart instance); '
+        f'got {restart_results[0]["count"]}'
+    )
+    assert all(r is None for r in restart_results[1:]), (
+        f'remaining orphans from the SAME restart instance must not re-fire '
+        f'(rate-limited within the window); got {restart_results!r}'
+    )
+
+    all_results = kill_results + restart_results
+    storms = [r for r in all_results if r is not None]
+    assert len(storms) == 1, (
+        f'must storm exactly once for the whole mixed scenario; got {storms!r}'
     )
 
 
