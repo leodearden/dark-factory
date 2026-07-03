@@ -7171,22 +7171,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 _head_advanced = False
                 try:
                     _head_advanced = await self._finalize_inflight(head)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
                 except BaseException as exc:
-                    if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                        req = head.item.request
-                        logger.exception(
-                            'Task %s: unexpected finalize error', req.task_id
-                        )
-                        # _finalize_inflight's finally already released the lease
-                        # and speculation slot; we just need to resolve the future
-                        # and mark the chain as failed.
-                        if not req.result.done():
-                            req.result.set_result(MergeOutcome(
-                                'blocked', reason=f'Verifier error: {exc}',
-                            ))
-                        self._n_failed = True
-                    else:
-                        raise
+                    logger.exception(
+                        'Task %s: unexpected finalize error', head.item.request.task_id
+                    )
+                    # _finalize_inflight's finally already released the lease
+                    # and speculation slot; the chokepoint just resolves the
+                    # future and marks the chain as failed.
+                    await self._resolve_and_release(
+                        head, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                        chain_failed=True, release_resources=False,
+                    )
 
                 # HEAD-FAILURE CASCADE (γ step-20): when the head fails, abort
                 # all downstream in-flight verifies, re-merge each item onto
