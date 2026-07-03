@@ -76,6 +76,12 @@ from orchestrator.merge_liveness import (  # noqa: F401  re-export shim
     enforce_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
+from orchestrator.merge_request_ledger import (  # noqa: F401  re-export shim
+    RequestLedger,
+    StuckRequest,
+    _alarm_merge_request_stuck,
+    _merge_request_stuck_sentinel,
+)
 from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     _LIBTEST_TEST_LINE_RE,
     _NEXTEST_SUMMARY_LINE_RE,
@@ -4197,6 +4203,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # or conflict detection.  Mirrors the _cas_retries / _gate_retries
         # per-task counter-dict lifecycle idiom (:5225-5245).
         self._drift_base: dict[str, int] = {}
+        # MQ-invariants eta (task 1992): request-liveness ledger.  Arms an
+        # entry per dequeued request and detects a never-resolved Future
+        # (silent-hang failure mode) for a loud, dedup'd L1 escalation.
+        # None-safe/no external deps, so bare-worker tests are unaffected.
+        # See merge_request_ledger.py's module docstring for the full
+        # lifecycle contract.
+        self._request_ledger = RequestLedger()
 
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
@@ -5264,6 +5277,67 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ),
         }
 
+    def _check_request_liveness(self, now: float, *, threshold_s: float | None = None) -> None:
+        """Sweep the request-liveness ledger and alarm on any entry stuck past threshold.
+
+        Synchronous and clock-injectable (``now``/``threshold_s``) — mirrors
+        :meth:`_maybe_log_queue_heartbeat`'s clock-injection convention so
+        tests can drive the stuck boundary deterministically without real
+        time.
+
+        MQ-invariants eta (task 1992): OBSERVATION + ESCALATION ONLY (PRD
+        design decision 4) — never resolves a Future, never mutates
+        ``_queue``/``_inflight``, never halts the pipeline.  See
+        ``merge_request_ledger.py``'s module docstring for the ledger
+        lifecycle this sweeps, and
+        :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`
+        for the dedup'd-escalation contract.
+
+        ``threshold_s`` defaults to ``None``, resolved in-body to 1.5 ×
+        :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` (~4.5h — comfortably
+        past the cold-verify ceiling, so anything still unresolved past it is
+        definitively stuck).  Resolved via the same deferred reach-back
+        import used throughout ``merge_liveness.py`` so a test's
+        string-path monkeypatch of
+        ``orchestrator.merge_queue.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``
+        stays effective.
+
+        The WARNING log line is dedup'd exactly like the escalation: at most
+        once per open episode per request_id (``stuck.already_warned``,
+        cleared via ``self._request_ledger.mark_warned``) — otherwise a
+        genuinely leaked/wedged request would log an identical WARNING on
+        every ``_HEARTBEAT_POLL_S`` poll indefinitely. The escalation call
+        below still runs on every sweep regardless of ``already_warned``; it
+        has its own independent ``has_open_l1`` dedup so a resubmission after
+        an operator resolves the L1 is unaffected by the log-dedup state.
+        """
+        if threshold_s is None:
+            from orchestrator.merge_queue import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+
+            threshold_s = 1.5 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+
+        stuck_list = self._request_ledger.stuck_entries(now, threshold_s)
+        if not stuck_list:
+            return
+
+        phase_by_request_id = {
+            entry['request_id']: entry['state'] for entry in self.snapshot()['entries']
+        }
+
+        for stuck in stuck_list:
+            phase = phase_by_request_id.get(stuck.request_id, 'unowned')
+            stuck = dataclasses.replace(stuck, phase=phase)
+            if not stuck.already_warned:
+                logger.warning(
+                    'merge request stuck: request_id=%s task=%s branch=%s age=%.0fs '
+                    'phase=%s — dequeued but never resolved (silent-hang failure mode)',
+                    stuck.request_id, stuck.task_id, stuck.branch, stuck.age_secs, stuck.phase,
+                )
+                self._request_ledger.mark_warned(stuck.request_id)
+            _alarm_merge_request_stuck(
+                self._escalation_queue, stuck, event_store=self._event_store,
+            )
+
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
         """Emit a queue-depth heartbeat log line and event if conditions are met.
 
@@ -5276,7 +5350,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           - ``snapshot()['depth'] == 0`` (idle pipeline — no journal spam)
           - ``now - self._last_heartbeat_at < self._heartbeat_interval_s``
             (rate-limit — respects the overridable interval)
+
+        MQ-invariants eta (task 1992): before either of the above checks,
+        UNCONDITIONALLY runs the clock-injectable
+        :meth:`_check_request_liveness` sweep — a request that has fallen out
+        of every pipeline structure is invisible to ``snapshot()`` (depth==0
+        would otherwise short-circuit this method before ever looking at it),
+        so the liveness side-check must run first, on every poll, regardless
+        of queue depth or heartbeat rate-limiting. Wrapped in try/except so a
+        liveness-check bug can never suppress the depth heartbeat below
+        (mirrors ``_heartbeat_loop``'s swallow-and-log convention). This
+        side-check never affects this method's own return value, which still
+        means exactly "a depth heartbeat was emitted".
         """
+        try:
+            self._check_request_liveness(now)
+        except Exception:
+            logger.exception('merge queue heartbeat: request-liveness check failed')
+
         snap = self.snapshot()
         if snap['depth'] == 0:
             return False
@@ -6409,6 +6500,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     pending_spec_base = None
                     pending_predecessor = None
 
+                # MQ-invariants eta (task 1992): arm the request-liveness ledger
+                # for this freshly-dequeued request.  Single hook site — covers
+                # BOTH the prefetched-consumption branch (req = prefetched) and
+                # the _acquire_next_request() branch above (whose `if req is
+                # None` shutdown sentinel already `break`s the loop, so req is
+                # guaranteed bound and non-None here).  Idempotent: a request
+                # that is somehow already armed (should not happen at a single
+                # hook site, but RequestLedger.on_dequeue is idempotent by
+                # design) keeps its earliest dequeued_at rather than resetting
+                # the age clock.  Observation-only — never resolves/mutates/halts;
+                # see merge_request_ledger.py's module docstring.
+                #
+                # Known narrow blind spot: a speculative look-ahead item
+                # harvested by _pop_next_pickable() into the `prefetched` local
+                # (below, near the speculation-permit acquire) has already been
+                # removed from the lane buffers/`_queue` but is NOT armed here
+                # until it is consumed as `req` on the NEXT loop iteration — it
+                # is invisible to both snapshot() and the liveness ledger while
+                # merely sitting in `prefetched`. This is intentionally left
+                # uncovered: the window is a single loop iteration (the very
+                # next thing the loop does with a non-None `prefetched` is
+                # consume it here), never spans an await, and prefetching only
+                # happens when the current `req` is itself already armed and
+                # being actively processed — so a hang cannot silently vanish,
+                # it will simply attribute to the request that owns the
+                # in-flight iteration until `prefetched` is consumed.
+                self._request_ledger.on_dequeue(req, now=time.time())
+
                 self._inflight_req = req  # track for stop() race resolution
                 # ι=1894: stash main_position for this request so
                 # _note_conflict_detected can compute drift later.
@@ -7303,6 +7422,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 _entry_req = _entry.item.request
                                 if not _entry_req.result.done():
                                     self._queue.put_nowait(_entry_req)
+                                    # MQ-invariants eta (task 1992): Future left
+                                    # deliberately pending — remove the ledger
+                                    # entry so this parked request never ages
+                                    # out; the next dequeue re-arms it fresh.
+                                    self._request_ledger.on_requeued(_entry_req.request_id)
                                 continue
                             _remerged = await self._remerge(
                                 _entry.item.request,
@@ -7945,6 +8069,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await verify_task
                     await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                     self._queue.put_nowait(req)
+                    # MQ-invariants eta (task 1992): Future left deliberately
+                    # pending — remove the ledger entry so this parked request
+                    # never ages out; the next dequeue re-arms it fresh.
+                    self._request_ledger.on_requeued(req.request_id)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -8489,6 +8617,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 with contextlib.suppress(BaseException):
                     await self._cleanup_owned_merge_worktree(item.merge_wt)
             self._queue.put_nowait(req)
+            # MQ-invariants eta (task 1992): Future left deliberately pending —
+            # remove the ledger entry so this parked request never ages out;
+            # the next dequeue re-arms it fresh.
+            self._request_ledger.on_requeued(req.request_id)
             self._remerge_occurred = False  # halt → reset chain flag
             return InflightEntry(
                 item=item,
