@@ -9084,3 +9084,120 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         )
 
         return await self._finalize_inflight(entry)
+
+
+# ── MQ-invariants iota (task 1994): resource-audit escalation ───────────────
+#
+# Module-level function (mirrors merge_request_ledger._alarm_merge_request_stuck,
+# which is likewise a bare function rather than a worker method) fired by
+# SpeculativeMergeWorker._check_resource_audit once a resource-conservation
+# violation (I4 speculation permits/merge-ahead caps, I6 worktree ledger)
+# persists across RESOURCE_AUDIT_ESCALATION_STREAK consecutive heartbeats.
+# See speculation_accounting_violations / worktree_ledger_violations above
+# for what each identity checks.
+
+_RESOURCE_AUDIT_SENTINEL = '__merge_resource_leak__'
+"""Fixed dedup sentinel task_id for resource-conservation-audit alarms.
+
+Unlike ``_merge_request_stuck_sentinel`` (parameterized per request_id), this
+audit is worker-level, not per-request — there is exactly one open/resolved
+L1 at a time for the whole worker's resource-conservation health, so the
+sentinel is a single fixed string rather than parameterized.
+"""
+
+
+def _alarm_resource_audit(
+    escalation_queue: Any,
+    violations: list[str],
+    *,
+    event_store: Any = None,
+) -> None:
+    """Submit a dedup'd L1 escalation for persisting resource-conservation violations.
+
+    Modeled verbatim on
+    :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`.
+    Fires at most ONCE while an L1 escalation is open for
+    :data:`_RESOURCE_AUDIT_SENTINEL`. Callers (see
+    ``SpeculativeMergeWorker._check_resource_audit``) only invoke this after
+    *violations* has persisted across
+    ``SpeculativeMergeWorker.RESOURCE_AUDIT_ESCALATION_STREAK`` consecutive
+    heartbeats, so a transient/racy leak (see
+    ``worktree_ledger_violations``'s grace-window docstring) that
+    self-resolves between heartbeats never trips an alarm.
+
+    This is OBSERVATION + ESCALATION only — it never mutates queue/inflight/
+    worktree state or halts the pipeline (PRD design decision 4: invariants
+    escalate loudly, degrade never).
+
+    * ``level=1`` (L1 blocking).
+    * ``category='merge_resource_leak'``
+    * ``task_id=_RESOURCE_AUDIT_SENTINEL`` (fixed — one audit per worker, not
+      per-request).
+
+    None-safe: returns immediately when *escalation_queue* is None.
+    Dedup: returns immediately when an open L1 already exists for the sentinel.
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        violations: Non-empty list[str] — the combined output of
+            ``SpeculativeMergeWorker.speculation_accounting_violations()``
+            and ``SpeculativeMergeWorker.worktree_ledger_violations()``.
+        event_store: Optional event store; when provided an
+            ``EventType.escalation_created`` event is emitted.
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = _RESOURCE_AUDIT_SENTINEL
+
+    # Dedup: don't re-alarm while an open L1 already exists.
+    if escalation_queue.has_open_l1(sentinel):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    count = len(violations)
+    headline = violations[0] if violations else 'unknown violation'
+    summary = (
+        f'Merge queue resource-conservation audit found {count} '
+        f'violation(s) persisting across consecutive heartbeats: {headline!r}'
+        + (' (+ more — see detail)' if count > 1 else '')
+    )
+    detail = (
+        'The following resource-conservation invariants (I4 speculation '
+        'permits / merge-ahead caps, I6 worktree ledger) have been violated '
+        'for multiple consecutive heartbeats:\n\n'
+        + '\n'.join(f'- {v}' for v in violations)
+        + '\n\n'
+        'The orchestrator has NOT halted or mutated any pipeline state — '
+        'this is observation-only (PRD design decision 4).'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-merge-resource-monitor',
+        severity='blocking',
+        level=1,
+        category='merge_resource_leak',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            "Inspect the merge worker's snapshot()['resource_audit'] key "
+            '(speculation_accounting / worktree_ledger sub-lists) to '
+            'identify the leaked permit, cap, or worktree; fix the code '
+            'path that failed to release it.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+
+        event_store.emit(
+            EventType.escalation_created,
+            data={
+                'violations': list(violations),
+                'count': count,
+            },
+        )
