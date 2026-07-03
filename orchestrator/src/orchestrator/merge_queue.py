@@ -5339,7 +5339,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           - ``snapshot()['depth'] == 0`` (idle pipeline — no journal spam)
           - ``now - self._last_heartbeat_at < self._heartbeat_interval_s``
             (rate-limit — respects the overridable interval)
+
+        MQ-invariants eta (task 1992): before either of the above checks,
+        UNCONDITIONALLY runs the clock-injectable
+        :meth:`_check_request_liveness` sweep — a request that has fallen out
+        of every pipeline structure is invisible to ``snapshot()`` (depth==0
+        would otherwise short-circuit this method before ever looking at it),
+        so the liveness side-check must run first, on every poll, regardless
+        of queue depth or heartbeat rate-limiting. Wrapped in try/except so a
+        liveness-check bug can never suppress the depth heartbeat below
+        (mirrors ``_heartbeat_loop``'s swallow-and-log convention). This
+        side-check never affects this method's own return value, which still
+        means exactly "a depth heartbeat was emitted".
         """
+        try:
+            self._check_request_liveness(now)
+        except Exception:
+            logger.exception('merge queue heartbeat: request-liveness check failed')
+
         snap = self.snapshot()
         if snap['depth'] == 0:
             return False
