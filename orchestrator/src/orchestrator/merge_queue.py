@@ -6512,7 +6512,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                         'raised unexpectedly — members may remain stranded',
                                         req.train_id,
                                     )
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(SpeculativeItem(  # spec-factory
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=False,
                             skip_verify=False, immediate_outcome=outcome,
@@ -6550,7 +6550,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         _abandon = self._abandon_outcome(req.task_id, prior_timeouts)
                         _already = self._oob_deliver(req, _abandon, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(SpeculativeItem(  # spec-factory
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
                             skip_verify=False,
@@ -6581,7 +6581,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     )
                     if guard is not None:
                         _already = self._oob_deliver(req, guard, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(SpeculativeItem(  # spec-factory
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
                             skip_verify=False, immediate_outcome=guard,
@@ -6612,7 +6612,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             reason=f'rev-parse HEAD failed: {err.strip()}',
                         )
                         _already = self._oob_deliver(req, _revparse_fail, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(SpeculativeItem(  # spec-factory
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
                             skip_verify=False,
@@ -6630,7 +6630,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             f'Task {req.task_id}: branch already on main — skipping'
                         )
                         _emit_merge_attempt(self._event_store, req.task_id, 'already_merged', duration_ms=_elapsed_ms(t0))
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(SpeculativeItem(  # spec-factory
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=actual_main, speculative=speculative,
                             skip_verify=False,
@@ -6667,7 +6667,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             'conflict', conflict_details=merge_result.details,
                         )
                         _already = self._oob_deliver(req, _conflict, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(SpeculativeItem(  # spec-factory
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
@@ -6698,7 +6698,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             failure_diagnostic=_diag,
                         )
                         _already = self._oob_deliver(req, _merge_fail, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(SpeculativeItem(  # spec-factory
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
@@ -6745,7 +6745,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         _drop = MergeOutcome('blocked', reason=reason)
                         _already = self._oob_deliver(req, _drop, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(SpeculativeItem(  # spec-factory
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
@@ -6767,7 +6767,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await self._merge_ahead_cap.acquire()
                     try:
                         self._register_owned_merge_worktree(merge_result.merge_worktree)
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(SpeculativeItem(  # spec-factory
                             request=req, merge_result=merge_result,
                             merge_wt=merge_result.merge_worktree,
                             base_sha=base_for_merge, speculative=speculative,
@@ -7571,7 +7571,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # NOT hold; skipping verification would let semantically-unverified
                 # main commits land on the protected branch.  Always verify.
                 self._register_owned_merge_worktree(retry_result.merge_worktree)
-                return SpeculativeItem(
+                return SpeculativeItem(  # spec-factory
                     request=req, merge_result=retry_result,
                     merge_wt=retry_result.merge_worktree,
                     base_sha=retry_main, speculative=False, skip_verify=False,
@@ -7585,7 +7585,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 if retry_result.merge_worktree:
                     await self._git_ops.cleanup_merge_worktree(retry_result.merge_worktree)
-                return SpeculativeItem(
+                return SpeculativeItem(  # spec-factory
                     request=req, merge_result=None, merge_wt=None,
                     base_sha=retry_main, speculative=False, skip_verify=False,
                     immediate_outcome=MergeOutcome(
@@ -7628,7 +7628,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 reason=combined_reason,
                 failure_diagnostic=combined_diag,
             )
-            return SpeculativeItem(
+            return SpeculativeItem(  # spec-factory
                 request=req, merge_result=None, merge_wt=None,
                 base_sha=retry_main, speculative=False, skip_verify=False,
                 immediate_outcome=retry_outcome,
@@ -7641,7 +7641,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(started_monotonic))
             if merge_result.merge_worktree:
                 await self._git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-            return SpeculativeItem(
+            return SpeculativeItem(  # spec-factory
                 request=req, merge_result=None, merge_wt=None,
                 base_sha=actual_main, speculative=False, skip_verify=False,
                 immediate_outcome=MergeOutcome(
@@ -7664,7 +7664,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 reason=f'{merge_result.details}\n{rendered}',
                 failure_diagnostic=diag,
             )
-            return SpeculativeItem(
+            return SpeculativeItem(  # spec-factory
                 request=req, merge_result=None, merge_wt=None,
                 base_sha=actual_main, speculative=False, skip_verify=False,
                 immediate_outcome=outcome,
@@ -7673,7 +7673,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
         # task-1724: merge gate always runs — skip_verify is unconditionally False.
         self._register_owned_merge_worktree(merge_result.merge_worktree)
-        return SpeculativeItem(
+        return SpeculativeItem(  # spec-factory
             request=req, merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=actual_main, speculative=False, skip_verify=False,
@@ -8248,23 +8248,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             ))
                         return False
 
-                    item = SpeculativeItem(
-                        request=item.request,
-                        merge_result=item.merge_result,
-                        merge_wt=item.merge_wt,
-                        base_sha=rebased_onto,
-                        speculative=item.speculative,
-                        skip_verify=item.skip_verify,
-                        started_monotonic=item.started_monotonic,
-                        # task-1928 PRIMARY fix: carry the branch tip at merge
-                        # time (γ2 term-2) through the rebuild so that
-                        # _finalize_advanced_merge can pass it to
-                        # _check_post_merge_equivalence as merged_tip.  Without
-                        # this, all three tip-resolution terms collapse to None
-                        # on a rebase-flattened landing → gate reads the live
-                        # worktree HEAD → phantom POST_MERGE_EQUIVALENCE_FAILED.
-                        merged_branch_tip=item.merged_branch_tip,
-                    )
+                    # I3 (task 1990): replace-only rebuild — dataclasses.replace
+                    # copies EVERY field except base_sha, so this can no longer
+                    # silently drop one (the task-1928 bug class this guards
+                    # against; merged_branch_tip was the field 1928 had to add
+                    # back by hand).  Re-invokes __post_init__, re-validating
+                    # the rebuilt REAL item.
+                    item = dataclasses.replace(item, base_sha=rebased_onto)
                     logger.info(
                         'Task %s: gate cleared (disjoint or green re-verify); '
                         'advancing with rebased SHA %s (gate attempt %d/%d)',
@@ -8325,20 +8315,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         ))
                     return False
 
-                # Update base_sha to current main for retry
-                item = SpeculativeItem(
-                    request=item.request,
-                    merge_result=item.merge_result,
-                    merge_wt=item.merge_wt,
-                    base_sha=await self._git_ops.get_main_sha(),
-                    speculative=item.speculative,
-                    skip_verify=item.skip_verify,
-                    started_monotonic=item.started_monotonic,
-                    # task-1928 PRIMARY fix: carry merged_branch_tip (γ2 term-2)
-                    # through the cas_failed rebuild for the same reason as the
-                    # rebased_pending_reverify rebuild above.
-                    merged_branch_tip=item.merged_branch_tip,
-                )
+                # Update base_sha to current main for retry.
+                # I3 (task 1990): replace-only rebuild — see the
+                # rebased_pending_reverify rebuild above for rationale.
+                item = dataclasses.replace(item, base_sha=await self._git_ops.get_main_sha())
                 logger.info(
                     f'Task {req.task_id}: CAS failed (attempt {total}/'
                     f'{self.MAX_CAS_RETRIES}), retrying'
