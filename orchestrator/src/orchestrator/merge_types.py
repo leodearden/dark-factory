@@ -941,20 +941,43 @@ class InflightVerifyResult:
                   the verify was aborted/dropped before starting.
     warm_results: dict[str, bool] of per-test results from warm verify (for shadow compare);
                   empty dict if the warm path was not taken.
-    status      : None on normal completion; sentinel string for special cases:
-                  'DROPPED'           — sole-waiter abandoned; merge_wt cleaned
-                  'REQUEUED'          — operator halt; req re-queued on _queue
-                  'RUNNER_UNAVAILABLE' — remote runner raised RunnerUnavailable;
+    status      : None on normal completion; sentinel InflightStatus member for
+                  special cases (see __post_init__ for the enforced subset):
+                  InflightStatus.DROPPED             — sole-waiter abandoned; merge_wt cleaned
+                  InflightStatus.REQUEUED             — operator halt; req re-queued on _queue
+                  InflightStatus.RUNNER_UNAVAILABLE — remote runner raised RunnerUnavailable;
                                         merge_wt NOT cleaned (will be re-dispatched)
     reason      : str(exc) from the RunnerUnavailable exception when status is
-                  'RUNNER_UNAVAILABLE'; None on all other paths.  Used by the
-                  unavailability tracker + alarm to name the actual failure cause
+                  InflightStatus.RUNNER_UNAVAILABLE; None on all other paths.  Used by
+                  the unavailability tracker + alarm to name the actual failure cause
                   in escalation summaries.
     """
 
     outcome: MergeOutcome | None
     merge_wt: Path | None
     warm_results: dict[str, str] = dataclasses.field(default_factory=dict)
-    status: InflightStatus | None = None  # None | 'DROPPED' | 'REQUEUED' | 'RUNNER_UNAVAILABLE'
-    reason: str | None = None  # str(RunnerUnavailable exc) when status='RUNNER_UNAVAILABLE'
+    status: InflightStatus | None = None  # None | DROPPED | REQUEUED | RUNNER_UNAVAILABLE
+    reason: str | None = None  # str(RunnerUnavailable exc) when status=RUNNER_UNAVAILABLE
     spec_warm: bool = False   # True when merge_wt is a warm _spec- lane (not an ephemeral wt)
+
+    def __post_init__(self) -> None:
+        """Enforce status is restricted to the 3 verify-result sentinels (task
+        1990 review parity with SpeculativeItem / InflightEntry).
+
+        InflightVerifyResult is a verify-outcome message; ABANDONED_PREDISPATCH
+        and REQUEUED_PREDISPATCH are InflightEntry-only predispatch sentinels
+        (set before a verify even starts) and must never appear here. Raw
+        strings equal to a valid member (e.g. 'DROPPED') satisfy this via
+        InflightStatus's str-compatibility, matching existing test fixtures.
+        """
+        if self.status is not None and self.status not in (
+            InflightStatus.DROPPED,
+            InflightStatus.REQUEUED,
+            InflightStatus.RUNNER_UNAVAILABLE,
+        ):
+            raise ValueError(
+                'InflightVerifyResult.status must be one of None, '
+                'InflightStatus.DROPPED, InflightStatus.REQUEUED, or '
+                'InflightStatus.RUNNER_UNAVAILABLE (ABANDONED_PREDISPATCH / '
+                f'REQUEUED_PREDISPATCH are InflightEntry-only); got {self.status!r}',
+            )

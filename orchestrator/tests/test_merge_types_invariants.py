@@ -195,3 +195,49 @@ class TestInflightStatusEnum:
         from orchestrator.merge_types import InflightStatus
         result = InflightVerifyResult(outcome=None, merge_wt=None, status=InflightStatus.DROPPED)
         assert result.status == 'DROPPED'
+
+
+# ── amendment (task 1990 review): InflightVerifyResult status subset ────────
+
+
+class TestInflightVerifyResultStatusInvariant:
+    """InflightVerifyResult.status is restricted to the 3 verify-result
+    sentinels; the 2 predispatch-only sentinels belong exclusively to
+    InflightEntry and must be rejected here (parity with SpeculativeItem /
+    InflightEntry, which both validate their shape in __post_init__)."""
+
+    def test_none_constructs(self) -> None:
+        result = InflightVerifyResult(outcome=None, merge_wt=None, status=None)
+        assert result.status is None
+
+    def test_each_valid_member_constructs(self) -> None:
+        from orchestrator.merge_types import InflightStatus
+        for member in (
+            InflightStatus.DROPPED,
+            InflightStatus.REQUEUED,
+            InflightStatus.RUNNER_UNAVAILABLE,
+        ):
+            result = InflightVerifyResult(outcome=None, merge_wt=None, status=member)
+            assert result.status == member
+
+    def test_raw_string_equal_to_valid_member_constructs(self) -> None:
+        # Matches existing test fixtures (e.g. test_merge_queue_concurrent_verify.py's
+        # _make_sentinel_entry) that pass a raw string rather than the enum member;
+        # InflightStatus's str-compatibility must keep this working at runtime even
+        # though a bare literal is a static type mismatch (deliberately exercised here).
+        result = InflightVerifyResult(outcome=None, merge_wt=None, status='DROPPED')  # type: ignore[arg-type]
+        assert result.status == 'DROPPED'
+
+    def test_predispatch_only_member_raises(self) -> None:
+        from orchestrator.merge_types import InflightStatus
+        with pytest.raises(ValueError):
+            InflightVerifyResult(
+                outcome=None, merge_wt=None, status=InflightStatus.ABANDONED_PREDISPATCH,
+            )
+
+    def test_other_predispatch_only_member_raises(self) -> None:
+        from orchestrator.merge_types import InflightStatus
+        with pytest.raises(ValueError):
+            InflightVerifyResult(
+                outcome=None, merge_wt=None, status=InflightStatus.REQUEUED_PREDISPATCH,
+            )
