@@ -179,6 +179,45 @@ class SpeculationController:
         self.pending_predecessor = None
         return self.spec_base
 
+    async def acquire_for_lookahead(self) -> None:
+        """Acquire one speculation permit before peeking for a look-ahead item.
+
+        The depth-K cap acquire (mirrors ``_merger_loop``'s look-ahead site,
+        ``merge_queue.py:6936-6937``). Blocks until a permit is available;
+        sets ``held_by_merger`` to 1 once acquired.
+        """
+        await self._slot.acquire()
+        self._held = True
+
+    def on_lookahead_found(self, next_req: MergeRequest, merge_commit: str) -> None:
+        """Record a pickable look-ahead item found while a permit is held.
+
+        The permit STAYS held (not released) — the Verifier releases it on
+        drain of the resulting speculative item. Mirrors
+        ``merge_queue.py:6951-6952``.
+        """
+        self.prefetched = next_req
+        self.spec_base = merge_commit
+
+    def on_lookahead_pending(self, merge_commit: str, predecessor: MergeRequest) -> None:
+        """Record a late-arrival-pending state: nothing pickable yet, but the
+        predecessor is still in-flight.
+
+        The permit STAYS held (retained) for a possible ATTACH at the next
+        ``on_dequeue``. Mirrors ``merge_queue.py:6975-6977``.
+        """
+        self.pending_spec_base = merge_commit
+        self.pending_predecessor = predecessor
+
+    def on_transfer(self) -> None:
+        """The merger has handed a speculative item to the verifier.
+
+        Clears ``held_by_merger`` WITHOUT releasing the semaphore — the
+        verifier now owns the permit and will release it itself on drain
+        (the zeta chokepoint). Mirrors ``merge_queue.py:6926``.
+        """
+        self._held = False
+
     def snapshot(self) -> dict[str, Any]:
         """Return a synchronous read-only snapshot of the controller's state.
 
