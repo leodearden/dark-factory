@@ -233,3 +233,109 @@ class TestOnDequeueAttachFallback:
         assert controller.pending_predecessor is None
         assert controller.held_by_merger == 0
         assert slot._value == 1  # released
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED / step-6 GREEN: look-ahead + transfer lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLookaheadAndTransferLifecycle:
+    """acquire_for_lookahead/on_lookahead_found/on_lookahead_pending/on_transfer
+    (task 1993 step-5).
+
+    RED until step-6 GREEN implements these methods. Uses depth=2 throughout
+    so a post-acquire slot value of K-1==1 is distinguishable from a fully
+    exhausted 0 — sharpening the "decrements by exactly one" assertions.
+    """
+
+    async def test_acquire_for_lookahead_decrements_slot_and_sets_held(self) -> None:
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+
+        await controller.acquire_for_lookahead()
+
+        assert slot._value == depth - 1
+        assert controller.held_by_merger == 1
+
+    async def test_on_lookahead_found_sets_prefetched_and_spec_base_without_releasing(
+        self,
+    ) -> None:
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+
+        assert controller.prefetched is next_req
+        assert controller.spec_base == 'MERGE_SHA'
+        assert controller.held_by_merger == 1
+        assert slot._value == depth - 1  # unchanged — no release on found
+        assert controller.is_idle() is False
+
+    async def test_on_lookahead_pending_retains_permit_for_late_arrival(self) -> None:
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+        await controller.acquire_for_lookahead()
+        pred = _make_pending_request('pred')
+
+        controller.on_lookahead_pending('MERGE_SHA', pred)
+
+        assert controller.pending_spec_base == 'MERGE_SHA'
+        assert controller.pending_predecessor is pred
+        assert controller.held_by_merger == 1
+        assert slot._value == depth - 1  # unchanged — retained, not released
+        assert controller.is_idle() is False
+
+    async def test_on_transfer_clears_held_without_releasing_slot(self) -> None:
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+
+        controller.on_transfer()
+
+        assert controller.held_by_merger == 0
+        # UNCHANGED by on_transfer — the verifier now owns this permit and
+        # will release it itself on drain (the zeta chokepoint).
+        assert slot._value == depth - 1
+
+    async def test_acquire_found_transfer_sequence_conserves_permit(self) -> None:
+        """Net effect of acquire -> found -> transfer: exactly one permit is
+        handed off to the verifier. The slot stays at depth-1 throughout —
+        it is never released by the merger side; only the (unexercised here)
+        verifier drain would restore it to depth.
+        """
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+
+        await controller.acquire_for_lookahead()
+        assert slot._value == depth - 1
+        assert controller.held_by_merger == 1
+
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+        assert slot._value == depth - 1
+        assert controller.held_by_merger == 1
+
+        controller.on_transfer()
+        assert slot._value == depth - 1  # now held by the verifier, not merger
+        assert controller.held_by_merger == 0
