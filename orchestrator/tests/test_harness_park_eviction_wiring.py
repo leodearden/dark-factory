@@ -54,7 +54,17 @@ class TestMockConfigParkEvictionNoLeak:
         # instead of wherever pytest was invoked from (normally orchestrator/).
         monkeypatch.chdir(tmp_path)
 
-        Harness(mock_orch_config)
+        harness = Harness(mock_orch_config)
+
+        # Guard against the assertion below passing vacuously: confirm the
+        # store/connect path was actually exercised, not skipped by a future
+        # refactor that stops wiring ParkEvictionRequestStore into Harness.
+        assert isinstance(
+            harness.scheduler._park_eviction_store, ParkEvictionRequestStore
+        ), (
+            f'Expected ParkEvictionRequestStore, got '
+            f'{type(harness.scheduler._park_eviction_store)!r}'
+        )
 
         strays = sorted(
             str(p) for p in tmp_path.glob('<MagicMock*park_eviction_requests_db_path*')
