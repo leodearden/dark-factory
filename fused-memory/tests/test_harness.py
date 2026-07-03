@@ -4468,6 +4468,109 @@ async def test_known_project_roots_wins_over_event_payload_in_backlog_iterator(
     )
 
 
+# ── Tests for Task 2040: bound BacklogIterator with a cumulative budget ────
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
+    journal, event_buffer, mock_memory_service
+):
+    """BacklogIterator.run() must stop launching new chunks once the
+    cumulative wall-clock budget (config.backlog_iteration_budget_seconds) is
+    exceeded between chunks, leaving the remainder buffered (not restored)
+    and skipping the final consolidation pass.
+
+    Sets up 3 buffered events and a ContextAssembler stub that hands back one
+    event per chunk. An injected fake time_provider reports the budget as
+    already blown by the time the between-chunks check runs after chunk 1, so
+    only chunk 1 should execute.
+
+    RED before step-4: BacklogIterator.__init__ has no time_provider
+    parameter yet, so constructing the iterator with time_provider= raises
+    TypeError.
+    """
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+    harness._known_projects['dark_factory'] = '/abs/from/config'
+    harness.config.backlog_iteration_budget_seconds = 100
+
+    for _ in range(3):
+        await event_buffer.push(_make_event('dark_factory'))
+
+    run_full_cycle_calls: list[str] = []
+
+    async def fake_run_full_cycle(project_id, trigger_reason, **kwargs):
+        run_full_cycle_calls.append(trigger_reason)
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason=trigger_reason,
+            started_at=datetime.now(UTC),
+            events_processed=len(kwargs.get('events') or []),
+            status=RunStatus.completed,
+        )
+
+    harness.run_full_cycle = fake_run_full_cycle
+
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        inst = MagicMock()
+
+        async def fake_assemble(peeked, watermark, project_id):
+            if not peeked:
+                return AssembledPayload(events=[])
+            # One-event-per-chunk, mirrors production token-budget chunking.
+            return AssembledPayload(events=[peeked[0]], events_remaining=len(peeked) - 1)
+
+        inst.assemble = fake_assemble
+        return inst
+
+    # Fake clock: `start` reads 0.0; the next read (the between-chunks check
+    # after chunk 1) reads 200.0 — comfortably past the 100s budget.
+    time_values = iter([0.0, 200.0])
+
+    def fake_time_provider():
+        try:
+            return next(time_values)
+        except StopIteration:
+            return 200.0
+
+    restore_calls: list[str] = []
+    original_restore = event_buffer.restore_drained
+
+    async def spy_restore(pid):
+        restore_calls.append(pid)
+        return await original_restore(pid)
+
+    event_buffer.restore_drained = spy_restore
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=fake_assembler_factory,
+    ):
+        iterator = BacklogIterator(
+            harness.config, harness.journal, harness.buffer, harness,
+            time_provider=fake_time_provider,
+        )
+        await iterator.run('dark_factory')
+
+    # Exactly one chunk executed — the budget check stopped a 2nd chunk from
+    # launching, and no final-consolidation cycle ran either.
+    assert run_full_cycle_calls == ['backlog_chunk:1:1'], (
+        f'Expected exactly one chunk cycle before the budget yield, got {run_full_cycle_calls!r}'
+    )
+
+    # The 2 unprocessed events remain buffered (net-drain of exactly 1 event).
+    stats = await event_buffer.get_buffer_stats('dark_factory')
+    assert stats['size'] == 2, (
+        f"Expected 2 events still buffered after a 1-chunk budget yield, got {stats['size']}"
+    )
+
+    # No rollback on a clean yield — restore_drained is reserved for failure paths.
+    assert restore_calls == [], (
+        f'restore_drained must NOT be called on a clean budget yield, got calls: {restore_calls!r}'
+    )
+
+
 @pytest.mark.asyncio
 async def test_fetch_filtered_task_tree_short_circuits_on_empty_project_root(
     journal, event_buffer, mock_memory_service

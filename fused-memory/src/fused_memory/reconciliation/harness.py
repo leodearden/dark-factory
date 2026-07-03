@@ -7,9 +7,10 @@ import dataclasses
 import json
 import logging
 import os
+import time
 import traceback
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -2709,11 +2710,13 @@ class BacklogIterator:
         journal: ReconciliationJournal,
         buffer: EventBuffer,
         harness: ReconciliationHarness,
+        time_provider: Callable[[], float] = time.monotonic,
     ):
         self.config = config
         self.journal = journal
         self.buffer = buffer
         self.harness = harness
+        self.time_provider = time_provider
 
     async def should_iterate(self, project_id: str) -> bool:
         """Buffer count > 150% of trigger threshold."""
