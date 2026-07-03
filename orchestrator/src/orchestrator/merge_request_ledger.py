@@ -174,3 +174,112 @@ class RequestLedger:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+
+# ---------------------------------------------------------------------------
+# Dedup'd L1 escalation — fires when a request has aged past the stuck
+# threshold without resolving.  See ``SpeculativeMergeWorker._check_request_liveness``
+# in merge_queue.py, which calls this from the heartbeat loop.
+# ---------------------------------------------------------------------------
+
+_MERGE_REQUEST_STUCK_SENTINEL_PREFIX = '__merge_request_stuck__'
+
+
+def _merge_request_stuck_sentinel(request_id: str) -> str:
+    """Return the per-request dedup sentinel task_id for stuck-request alarms."""
+    return f'{_MERGE_REQUEST_STUCK_SENTINEL_PREFIX}{request_id}'
+
+
+def _alarm_merge_request_stuck(
+    escalation_queue: Any,
+    stuck: StuckRequest,
+    *,
+    event_store: Any = None,
+) -> None:
+    """Submit a dedup'd L1 escalation for a request stuck past the liveness threshold.
+
+    Modeled verbatim on
+    :func:`orchestrator.merge_liveness._alarm_verify_host_unreachable`. Fires at
+    most ONCE per open episode per request_id (dedup'd via ``has_open_l1``).
+    This is OBSERVATION + ESCALATION only — it never resolves the stuck
+    request's Future, mutates queue/inflight state, or halts the pipeline
+    (PRD design decision 4: invariants escalate loudly, degrade never).
+
+    * ``level=1`` (L1 blocking) — loud (steward -> auto-watcher -> human
+      ladder), but not itself a merge-halt trigger; the merge-halt gate keys
+      off the ``wip_conflict`` / ``unmerged_state`` categories only.
+    * ``category='merge_request_stuck'``
+    * ``task_id=_merge_request_stuck_sentinel(stuck.request_id)``
+
+    None-safe: returns immediately when *escalation_queue* is None.
+    Dedup: returns immediately when an open L1 already exists for the sentinel.
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        stuck: The :class:`StuckRequest` snapshot to alarm on.
+        event_store: Optional event store; when provided an
+            ``EventType.escalation_created`` event is emitted.
+    """
+    if escalation_queue is None:
+        return
+
+    sentinel = _merge_request_stuck_sentinel(stuck.request_id)
+
+    # Dedup: don't re-alarm while an open L1 already exists for this request.
+    if escalation_queue.has_open_l1(sentinel):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    age_int = int(stuck.age_secs)
+    summary = (
+        f'MergeRequest {stuck.request_id!r} (branch {stuck.branch!r}) has been '
+        f'dequeued for {age_int}s without resolving (phase={stuck.phase!r}).'
+    )
+    detail = (
+        f'request_id: {stuck.request_id}\n'
+        f'task_id: {stuck.task_id}\n'
+        f'branch: {stuck.branch}\n'
+        f'phase: {stuck.phase}\n'
+        f'age_secs: {age_int}\n'
+        '\n'
+        'This request was dequeued by the merger loop but its result Future '
+        'has neither resolved (set_result) nor been abandoned (cancel) within '
+        'the stuck threshold. This is the silent-hang failure mode: some code '
+        'path is holding the request without ever finalizing it. The '
+        'orchestrator has NOT halted or mutated any pipeline state — this is '
+        'observation-only.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-merge-liveness-monitor',
+        severity='blocking',
+        level=1,
+        category='merge_request_stuck',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            f'Inspect the merge worker for request {stuck.request_id!r} '
+            f'(branch {stuck.branch!r}, phase {stuck.phase!r}). Determine '
+            'whether the request is wedged in-flight (e.g. a hung verify) or '
+            'has leaked out of every pipeline structure, then resolve or '
+            'abandon it manually.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+    if event_store is not None:
+        from orchestrator.event_store import EventType
+
+        event_store.emit(
+            EventType.escalation_created,
+            data={
+                'request_id': stuck.request_id,
+                'task_id': stuck.task_id,
+                'branch': stuck.branch,
+                'age_secs': stuck.age_secs,
+                'phase': stuck.phase,
+            },
+        )
