@@ -640,6 +640,49 @@ def _should_archive_category(category: str) -> bool:
     return category.endswith('_error')
 
 
+# Matches a pytest invocation up to (but not including) the next shell chain
+# operator (&&, ||, ;) or end of string — the span _force_serial_pytest
+# rewrites.  Word-bounded so it doesn't match inside 'pytest_xdist' etc.
+_PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
+
+
+def _force_serial_pytest(cmd: str | None) -> str | None:
+    """Rewrite every ``pytest`` invocation in *cmd* to run serially.
+
+    Appends `` -p no:xdist -o addopts=''`` immediately after each ``pytest``
+    invocation's arguments (before the next ``&&``/``||``/``;`` or end of
+    string).  ``-o addopts=''`` clears any pyproject-level ``addopts`` (e.g.
+    ``-n auto``) — this is the exact ``-o addopts=""`` workaround that task
+    2045 proved recovers a shared-venv-mutation transient, reproduced here
+    programmatically rather than gambling on the concurrent ``uv sync``
+    window having closed.  ``-p no:xdist`` is belt-and-suspenders: it
+    disables the xdist plugin outright and is safe even when xdist is
+    already absent from the venv.
+
+    Returns *cmd* unchanged when it is ``None`` or contains no ``pytest``
+    token (e.g. a ``cargo test --workspace`` command).
+
+    Tradeoff: clearing ``addopts`` also drops any per-subproject marker
+    filters baked into pyproject (e.g. ``-m 'not integration'``).  Accepted
+    for a single bounded recovery run whose only purpose is a
+    non-misattributed pass/fail signal — see run_verification's env-recovery
+    retry — and unavoidable at the CLI layer since the subproject's addopts
+    contents aren't visible to this string rewrite.
+    """
+    if cmd is None:
+        return cmd
+    if not _PYTEST_INVOCATION_RE.search(cmd):
+        return cmd
+
+    def _rewrite(m: re.Match[str]) -> str:
+        segment = m.group(0)
+        stripped = segment.rstrip()
+        trailing = segment[len(stripped):]
+        return f"{stripped} -p no:xdist -o addopts=''{trailing}"
+
+    return _PYTEST_INVOCATION_RE.sub(_rewrite, cmd)
+
+
 def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> dict:
     """Build the summary.json payload dict from a list of run dicts.
 
