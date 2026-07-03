@@ -26,8 +26,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from orchestrator.git_ops import canonical_queued_branch_name
 from shared.safe_io import load_json_or_warn
+
+from orchestrator.git_ops import canonical_queued_branch_name
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
