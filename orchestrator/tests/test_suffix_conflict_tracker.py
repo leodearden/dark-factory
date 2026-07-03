@@ -118,14 +118,17 @@ def _make_tracker(
     tracker never needs a worker reference).
     """
     if lane_buffers is None:
-        def lane_buffers():
+        def _default_lane_buffers():
             return {'high': collections.deque(), 'normal': collections.deque()}
+        lane_buffers = _default_lane_buffers
     if frozen_prefix is None:
-        def frozen_prefix():
+        def _default_frozen_prefix():
             return ()
+        frozen_prefix = _default_frozen_prefix
     if frozen_prefix_tip is None:
-        def frozen_prefix_tip(main_sha):
+        def _default_frozen_prefix_tip(main_sha):
             return main_sha
+        frozen_prefix_tip = _default_frozen_prefix_tip
     return SuffixConflictTracker(
         git_ops,
         lane_buffers=lane_buffers,
