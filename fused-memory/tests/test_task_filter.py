@@ -2739,6 +2739,84 @@ class TestIsBatchPlanFraming:
 
 
 # ---------------------------------------------------------------------------
+# extract_batch_plan_task_ids (task 2033)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractBatchPlanTaskIds:
+    """Tests for extract_batch_plan_task_ids() in task_filter.py.
+
+    Reuses TASK_ID_RANGE_RE / TASK_ID_TOKEN_RE — the same regexes
+    is_batch_plan_framing uses — to turn batch-plan text into a concrete set
+    of enumerated task ids. This powers the promotion-time gate (task 2033):
+    a batch-plan episode is withheld from promotion while any enumerated
+    sibling id is still active. Intended to be called only after
+    is_batch_plan_framing(text) has already returned True for the same text.
+    """
+
+    def test_range_expands_to_full_inclusive_set(self):
+        """A 'lo-hi' range expands to the full inclusive set of ids."""
+        from fused_memory.reconciliation.task_filter import extract_batch_plan_task_ids
+
+        text = 'Merge-queue modularization batch queued as df 1985-2002'
+        result = extract_batch_plan_task_ids(text)
+        expected = set(range(1985, 2003))
+        assert len(expected) == 18, 'sanity check on the fixture itself'
+        assert result == expected, (
+            f'Expected extract_batch_plan_task_ids to expand the range to the '
+            f'full inclusive 18-id set, got {result!r}.\ntext={text!r}'
+        )
+
+    def test_to_form_range_expands_identically(self):
+        """A 'lo to hi' range expands identically to the '-' form."""
+        from fused_memory.reconciliation.task_filter import extract_batch_plan_task_ids
+
+        text = 'Queued tasks 1985 to 2002 as a batch'
+        result = extract_batch_plan_task_ids(text)
+        expected = set(range(1985, 2003))
+        assert result == expected, (
+            f'Expected extract_batch_plan_task_ids to expand the "to" form range '
+            f'identically to the "-" form, got {result!r}.\ntext={text!r}'
+        )
+
+    def test_enumeration_of_ids_returns_exact_set(self):
+        """An enumeration of >=3 individual task ids returns exactly those ids."""
+        from fused_memory.reconciliation.task_filter import extract_batch_plan_task_ids
+
+        text = 'Queued tasks 1985, 1986, 1987 as a batch'
+        result = extract_batch_plan_task_ids(text)
+        assert result == {1985, 1986, 1987}, (
+            f'Expected extract_batch_plan_task_ids to return exactly the '
+            f'enumerated ids, got {result!r}.\ntext={text!r}'
+        )
+
+    def test_combined_range_and_standalone_token_returns_union(self):
+        """A range plus an extra standalone token returns the union of both."""
+        from fused_memory.reconciliation.task_filter import extract_batch_plan_task_ids
+
+        text = 'Batch queued as df 1985-1990, plus follow-up 2050'
+        result = extract_batch_plan_task_ids(text)
+        expected = set(range(1985, 1991)) | {2050}
+        assert result == expected, (
+            f'Expected extract_batch_plan_task_ids to return the union of the '
+            f'range expansion and the standalone token, got {result!r}.\ntext={text!r}'
+        )
+
+    def test_pathological_wide_range_capped_to_endpoints(self):
+        """A pathologically wide range returns only its two endpoints, not the full span."""
+        from fused_memory.reconciliation.task_filter import extract_batch_plan_task_ids
+
+        text = 'Batch queued as df 10000000-99999999'
+        result = extract_batch_plan_task_ids(text)
+        assert result == {10000000, 99999999}, (
+            f'Expected extract_batch_plan_task_ids to cap a pathologically wide '
+            f'range to just its two endpoints (range-expansion cap guard) instead '
+            f'of materializing the full span, got a set of size {len(result)}.'
+            f'\ntext={text!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # detect_task_dump_contamination (task 1661)
 # ---------------------------------------------------------------------------
 
