@@ -7396,7 +7396,117 @@ class TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat:
             )
 
         assert report.stats.get('stale_flag_markers_gc_swept') == 3
-        mock_sweep.assert_awaited_once_with(mock_deps['memory_service'], 'reify', 'test-run')
+        # BaseStage.run is fully mocked here (assemble_payload never executes), so
+        # self._run_window_start stays at its unset default — the sweep call must
+        # forward run_window_start=None (task-2047 step-12).
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run', run_window_start=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sweep_call_forwards_run_window_start_stashed_by_assemble_payload(self, mock_deps):
+        """run() forwards whatever run_window_start assemble_payload stashed on
+        self._run_window_start into the _sweep_stale_flag_markers call (task-2047
+        step-12). Since assemble_payload only executes inside the REAL
+        BaseStage.run(), the stash is simulated here via a BaseStage.run
+        replacement whose side effect mimics what assemble_payload does."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+        stashed_value = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+
+        async def _fake_super_run(*args, **kwargs):
+            # Simulates assemble_payload stashing run_window_start during the
+            # real BaseStage.run() -> assemble_payload() call chain.
+            stage._run_window_start = stashed_value
+            return base_report
+
+        with (
+            patch.object(BaseStage, 'run', new=_fake_super_run),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_stale_flag_markers',
+                new=AM(return_value=1),
+            ) as mock_sweep,
+        ):
+            await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run', run_window_start=stashed_value,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_window_start_reset_to_none_at_top_of_run_prevents_leak(self, mock_deps):
+        """A PRIOR run's stashed _run_window_start must not leak into a new
+        run() call whose (mocked) super().run() does not set a fresh value —
+        proves the reset-at-top-of-run() contract (task-2047 step-12)."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        # Pre-seed a stale value as if left over from a PRIOR run() call.
+        stage._run_window_start = datetime(2020, 1, 1, tzinfo=UTC)
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_stale_flag_markers',
+                new=AM(return_value=0),
+            ) as mock_sweep,
+        ):
+            await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        # The mocked super().run() never touches _run_window_start, so the ONLY
+        # way the sweep call can see run_window_start=None (rather than the
+        # pre-seeded 2020 date) is if run() resets self._run_window_start = None
+        # BEFORE calling super().run().
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run', run_window_start=None,
+        )
 
     @pytest.mark.asyncio
     async def test_stale_flag_markers_gc_swept_stat_explicit_zero(self, mock_deps):
