@@ -373,6 +373,132 @@ class TestMCPToolAddEpisodeTemporalContext:
 
 
 # ---------------------------------------------------------------------------
+# Batch-plan auto-tag (task 2022): MCP tool add_episode forwarding
+# ---------------------------------------------------------------------------
+
+
+class TestMCPToolAddEpisodeBatchPlanAutoTag:
+    """MCP tool add_episode auto-forwards temporal_context='planning' for
+    batch-plan-shaped content when temporal_context is not explicitly set
+    (task 2022, incident episode 128442e1).
+    """
+
+    @pytest.mark.asyncio
+    async def test_batch_plan_content_with_no_temporal_context_auto_tagged_planning(
+        self, mcp_server, mock_memory_service
+    ):
+        """Batch-plan-shaped content with NO temporal_context → forwarded as 'planning'."""
+        await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': (
+                    'Merge-queue modularization and invariant-enforcement batch '
+                    'were queued together as df 1985-2002'
+                ),
+                'project_id': 'test',
+            },
+        )
+        mock_memory_service.add_episode.assert_called_once()
+        _, kwargs = mock_memory_service.add_episode.call_args
+        assert kwargs.get('temporal_context') == 'planning', (
+            f"Expected batch-plan content with no temporal_context to be "
+            f"auto-tagged 'planning', got {kwargs.get('temporal_context')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ordinary_content_with_no_temporal_context_stays_none(
+        self, mcp_server, mock_memory_service
+    ):
+        """Ordinary (non-batch-plan) content with NO temporal_context → forwarded as None."""
+        await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'CostStore was implemented in cost_store.py',
+                'project_id': 'test',
+            },
+        )
+        mock_memory_service.add_episode.assert_called_once()
+        _, kwargs = mock_memory_service.add_episode.call_args
+        assert kwargs.get('temporal_context') is None, (
+            f"Expected ordinary content with no temporal_context to remain "
+            f"None, got {kwargs.get('temporal_context')!r}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Precedence: an explicit temporal_context is never overridden
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_explicit_current_not_overridden_by_batch_plan_content(
+        self, mcp_server, mock_memory_service
+    ):
+        """Batch-plan content WITH explicit temporal_context='current' → stays 'current'."""
+        await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': (
+                    'Merge-queue modularization and invariant-enforcement batch '
+                    'were queued together as df 1985-2002'
+                ),
+                'project_id': 'test',
+                'temporal_context': 'current',
+            },
+        )
+        mock_memory_service.add_episode.assert_called_once()
+        _, kwargs = mock_memory_service.add_episode.call_args
+        assert kwargs.get('temporal_context') == 'current', (
+            f"Expected explicit temporal_context='current' to be preserved "
+            f"despite batch-plan content, got {kwargs.get('temporal_context')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_retrospective_not_overridden_by_batch_plan_content(
+        self, mcp_server, mock_memory_service
+    ):
+        """Batch-plan content WITH explicit temporal_context='retrospective' → stays 'retrospective'."""
+        await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': (
+                    'Merge-queue modularization and invariant-enforcement batch '
+                    'were queued together as df 1985-2002'
+                ),
+                'project_id': 'test',
+                'temporal_context': 'retrospective',
+            },
+        )
+        mock_memory_service.add_episode.assert_called_once()
+        _, kwargs = mock_memory_service.add_episode.call_args
+        assert kwargs.get('temporal_context') == 'retrospective', (
+            f"Expected explicit temporal_context='retrospective' to be preserved "
+            f"despite batch-plan content, got {kwargs.get('temporal_context')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_planning_not_overridden_by_batch_plan_content(
+        self, mcp_server, mock_memory_service
+    ):
+        """Batch-plan content WITH explicit temporal_context='planning' → stays 'planning'."""
+        await mcp_server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': (
+                    'Merge-queue modularization and invariant-enforcement batch '
+                    'were queued together as df 1985-2002'
+                ),
+                'project_id': 'test',
+                'temporal_context': 'planning',
+            },
+        )
+        mock_memory_service.add_episode.assert_called_once()
+        _, kwargs = mock_memory_service.add_episode.call_args
+        assert kwargs.get('temporal_context') == 'planning', (
+            f"Expected explicit temporal_context='planning' to be preserved "
+            f"despite batch-plan content, got {kwargs.get('temporal_context')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step 1 (reference_time): GraphitiBackend.add_episode — reference_time forwarding
 # ---------------------------------------------------------------------------
 

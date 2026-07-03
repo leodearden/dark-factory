@@ -37,6 +37,7 @@ from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
+    is_batch_plan_framing,
     is_count_snapshot,
     is_mixed_temporal_framing,
 )
@@ -685,6 +686,14 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        # task 2022: auto-upgrade the batch-queue / decompose-and-queue plan-episode
+        # shape to temporal_context='planning' so its Graphiti-extracted completion
+        # edges are registered as planned (excluded from default search) instead of
+        # polluting factual search while the batch is still undone. Only the unset
+        # default is upgraded — an explicit temporal_context is always respected.
+        if temporal_context is None and is_batch_plan_framing(content):
+            temporal_context = 'planning'
+            logger.info('add_episode: auto-tagged batch-plan content as planning (task 2022)')
         parsed_reference_time = None
         if reference_time is not None:
             try:
