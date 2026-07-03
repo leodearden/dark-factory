@@ -7312,35 +7312,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         except (asyncio.CancelledError, KeyboardInterrupt):
                             raise
                         except BaseException as _cascade_exc:
-                            _req = _entry.item.request
                             logger.exception(
-                                'Task %s: unexpected cascade error', _req.task_id
+                                'Task %s: unexpected cascade error',
+                                _entry.item.request.task_id,
                             )
-                            if not _req.result.done():
-                                _req.result.set_result(MergeOutcome(
+                            # In-body release already ran (_entry_released=True)
+                            # UNLESS it raised before completing (e.g.
+                            # cancel_and_release itself raised) — in which case
+                            # the chokepoint performs the best-effort release
+                            # (lease/slot/merge-worktree) to avoid a leak.
+                            await self._resolve_and_release(
+                                _entry, MergeOutcome(
                                     'blocked',
                                     reason=f'Verifier cascade error: {_cascade_exc}',
-                                ))
-                            if not _entry_released:
-                                # In-body release did not run (e.g. cancel_and_release
-                                # itself raised): best-effort release here to avoid
-                                # a lease/slot or merge-worktree leak.
-                                if (
-                                    _entry.lease is not None
-                                    and _allocator is not None
-                                ):
-                                    with contextlib.suppress(BaseException):
-                                        await _allocator.cancel_and_release(
-                                            _entry.lease
-                                        )
-                                if _entry.merge_wt is not None:
-                                    with contextlib.suppress(BaseException):
-                                        await self._cleanup_owned_merge_worktree(
-                                            _entry.merge_wt
-                                        )
-                                if _entry.was_speculative:
-                                    self._speculation_slot.release()
-                            self._n_failed = True
+                                ),
+                                chain_failed=True,
+                                release_resources=not _entry_released,
+                                cancel_lease=True,
+                            )
                             continue
                     # Signal dispatch that any not-yet-dispatched followers also
                     # need re-merge (chain_invalidated guard in _dispatch_item).
