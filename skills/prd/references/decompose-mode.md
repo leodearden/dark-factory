@@ -111,10 +111,10 @@ Do **not** flip anything to `pending` until every edge is in. A partially-wired 
 Flip **every task in the batch together** in a single call — never one-at-a-time, never in dependency-root order. The whole batch becomes schedulable in one atomic moment; the scheduler handles unmet-deps tasks correctly (a task with pending deps stays effectively blocked until they clear).
 
 ```
-mcp__fused-memory__set_task_status(
-    id="<id1>,<id2>,<id3>,...",   # comma-separated, all batch IDs
-    status="pending",
+mcp__fused-memory__commit_planning(
     project_root="<project_root>",
+    task_ids="<id1>,<id2>,<id3>,...",   # comma-separated, all batch IDs
+    target_status="pending",
 )
 ```
 
@@ -146,7 +146,7 @@ State:
 
 - **Curator gate closed / planning_mode batch rejected.** Do **not** switch to non-planning_mode to paper over it. Wait or escalate — PRD-decomp batches are the precise case where planning_mode is correct.
 - **`add_dependency` fails** because a referenced task doesn't exist. Likely the out-of-batch prereq is `deferred` or `cancelled`; check via `get_task` and resolve with the user.
-- **`set_task_status` rejects with "metadata.files missing".** Decompose mode shouldn't hit this (fresh tasks); if it does, a stale entry was probably combined into one of the new tasks — investigate before retrying.
+- **`commit_planning` rejects with "metadata.files missing".** Decompose mode shouldn't hit this (fresh tasks); if it does, a stale entry was probably combined into one of the new tasks — investigate before retrying.
 
 ## Anti-patterns
 
@@ -161,6 +161,6 @@ State:
 2. Match against the PRD's decomposition plan (by `prd_task_label` metadata or title) — what's filed, what's missing.
 3. Resume at the first missing task; new ones still go in `planning_mode=True` even if siblings exist.
 4. Wire **all** dependencies (re-add is idempotent) before flipping anything.
-5. Bulk-flip every still-`deferred` batch task to `pending` in a single call.
+5. Bulk-flip every still-`deferred` batch task to `pending` in a single `commit_planning` call.
 
 Avoid double-filing — detect existing entries first.

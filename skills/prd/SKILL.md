@@ -50,7 +50,7 @@ See `references/author-mode.md`.
 
 ### Decompose mode
 
-Read a committed PRD, re-walk gates, then file the whole task batch via fused-memory `submit_task` with **`planning_mode=True` on every task, no exceptions** (synchronous, curator-bypassing; lands them as `deferred`, returns `task_id` directly). After filing, wire **all** dependencies, then flip the **entire batch** `deferred` → `pending` in a single bulk `set_task_status` call. Fused-memory owns persistence — no commit step.
+Read a committed PRD, re-walk gates, then file the whole task batch via fused-memory `submit_task` with **`planning_mode=True` on every task, no exceptions** (synchronous, curator-bypassing; lands them as `deferred`, returns `task_id` directly). After filing, wire **all** dependencies, then flip the **entire batch** `deferred` → `pending` in a single bulk `commit_planning` call — fused-memory persists the flip directly; there's no separate git-commit step.
 
 See `references/decompose-mode.md`.
 
@@ -83,7 +83,7 @@ Each gate has a calibrated response level. See `references/gates.md` for what ea
 - A batch of tasks filed via `submit_task` with `planning_mode=True` (always). Each carries metadata fields `user_observable_signal`, `consumer_ref`, and a substrate-confirmed flag (e.g. `grammar_confirmed`).
 - All declared dependencies (intra-batch and out-of-batch, including cross-PRD) wired via `add_dependency` while the batch is still `deferred`.
 - A committed **capability manifest** beside the PRD binding each leaf signal's asserted capabilities to evidence (mechanizing G3+G6); any FAIL binding blocks the batch until resolved.
-- The whole batch flipped `deferred` → `pending` together in a single bulk `set_task_status` call — never one-at-a-time.
+- The whole batch flipped `deferred` → `pending` together in a single bulk `commit_planning` call — never one-at-a-time.
 - The orchestrator does **not** currently read the `user_observable_signal` / `consumer_ref` / substrate-confirmed metadata fields; they are substrate for a future tracking-infra session. Surface this in the hand-back.
 
 ## Conversational style
