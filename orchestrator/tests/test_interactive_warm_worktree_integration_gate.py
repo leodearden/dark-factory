@@ -472,3 +472,34 @@ class TestReapI2ViaHarnessPass:
         assert pool.assignments_snapshot() == assignments_before, (
             'I1/I2 VIOLATION: the reaper perturbed assignments_snapshot()'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-09/10: cold fallback — claim_warm_worktree on a standalone (no
+# harness) server reports a structured error, never raises.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestColdFallbackNoHarness:
+    """The CI-producible boundary of /do's "escalation MCP unreachable"
+    path (the actual /do cold-fall-back-to-EnterWorktree wiring is task ε,
+    out of ζ scope): claim_warm_worktree on a standalone server
+    (``harness=None``, modeling an unreachable/absent orchestrator) must
+    report a structured ``{'error': ...}`` rather than raise.
+    """
+
+    async def test_claim_reports_structured_error_never_raises(
+        self, tmp_path: Path,
+    ) -> None:
+        server_no_harness = create_server(EscalationQueue(tmp_path / 'esc'))
+
+        res = await _call_tool(
+            server_no_harness, 'claim_warm_worktree',
+            slug='cf', project_root=str(tmp_path),
+        )
+
+        assert 'error' in res, (
+            f'expected a reported, structured fallback error when no harness '
+            f'is wired (never a raise), got: {res}'
+        )
