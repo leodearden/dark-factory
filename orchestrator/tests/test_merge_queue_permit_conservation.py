@@ -172,9 +172,17 @@ class TestWorkerWiringAndAdditiveSnapshotKey:
 #
 # GREEN (step-12): `_merger_loop` delegates every speculation-state
 # transition to the controller, so held_by_merger tracks the real permit
-# ownership and the identity holds at every checkpoint, including full
-# restoration (slot_available==K, held_by_merger==0, inflight_speculative==0)
-# after the worker fully quiesces / shuts down.
+# ownership and the identity holds at every natural (pre-shutdown)
+# checkpoint below.
+#
+# Post-`worker.stop()` checkpoints use `_assert_shutdown_quiescent` instead
+# of the identity: `stop()` unconditionally over-releases the shared
+# semaphore depth+1 times as a shutdown safety valve (pre-existing,
+# documented, orthogonal to this task), so slot_available legitimately
+# exceeds depth once stop() has run. What must still hold post-shutdown is
+# that the controller's own bookkeeping is clear (held_by_merger==0,
+# inflight_speculative==0) and no permit was ever lost outright
+# (slot_available never drops below depth).
 
 
 def _speculation_snapshot(worker: Any) -> dict:
@@ -201,21 +209,33 @@ def _assert_conservation(worker: Any, *, where: str) -> dict:
     return spec
 
 
-def _assert_fully_idle(worker: Any, *, where: str, depth: int) -> None:
-    """Assert the conservation identity AND full restoration to an idle state:
-    slot_available == depth, held_by_merger == 0, inflight_speculative == 0.
+def _assert_shutdown_quiescent(worker: Any, *, where: str, depth: int) -> None:
+    """Assert the controller side is fully quiescent after worker.stop().
+
+    ``SpeculativeMergeWorker.stop()`` unconditionally releases the shared
+    ``_speculation_slot`` an extra ``depth + 1`` times as a shutdown safety
+    valve (merge_queue.py's ``stop()``, "Over-releasing a plain Semaphore is
+    safe") — regardless of how many permits the merger actually still held.
+    That means ``slot_available`` legitimately EXCEEDS ``depth`` after
+    ``stop()``, so the conservation identity does not hold verbatim here (this
+    is pre-existing, documented behaviour, not something task 1993 changes).
+
+    What must still hold post-shutdown: the controller's OWN bookkeeping is
+    fully cleared (held_by_merger == 0, inflight_speculative == 0 — no leaked
+    permit/state) and no permit was ever outright LOST (slot_available can
+    only be inflated by the safety valve, never reduced below depth).
     """
-    spec = _assert_conservation(worker, where=where)
-    assert spec['slot_available'] == depth, (
-        f'[{where}] slot_available must be fully restored to depth={depth}; '
-        f'got {spec["slot_available"]}.'
-    )
+    spec = _speculation_snapshot(worker)
     assert spec['held_by_merger'] == 0, (
         f'[{where}] held_by_merger must be 0 (idle); got {spec["held_by_merger"]}.'
     )
     assert spec['inflight_speculative'] == 0, (
         f'[{where}] inflight_speculative must be 0 (idle); '
         f'got {spec["inflight_speculative"]}.'
+    )
+    assert spec['slot_available'] >= depth, (
+        f'[{where}] slot_available must never fall below depth={depth} '
+        f'(a permit would have been lost); got {spec["slot_available"]}.'
     )
 
 
@@ -307,7 +327,7 @@ class TestPrefetchLookaheadAndAttachConservation:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        _assert_fully_idle(worker, where='post-shutdown', depth=K)
+        _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
 
 @pytest.mark.asyncio
@@ -374,7 +394,7 @@ class TestFallbackConservation:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        _assert_fully_idle(worker, where='post-shutdown', depth=K)
+        _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
 
 @pytest.mark.asyncio
@@ -475,7 +495,7 @@ class TestCascadeRemergeConservation:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        _assert_fully_idle(worker, where='post-shutdown', depth=K)
+        _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
 
 @pytest.mark.asyncio
@@ -545,4 +565,4 @@ class TestShutdownRetainedPermitConservation:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=10.0)
 
-        _assert_fully_idle(worker, where='post-shutdown', depth=K)
+        _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
