@@ -2756,7 +2756,31 @@ class BacklogIterator:
         watermark = await self.journal.get_watermark(project_id)
 
         chunk_num = 0
+        start = self.time_provider()
+        yielded = False
         while True:
+            # Cumulative between-chunks budget (task 2040): once at least one
+            # chunk has completed and the wall-clock budget is exhausted,
+            # stop launching new chunks and leave the remainder buffered.
+            # The per-project lock releases via _project_loop's finally, so
+            # the next cycle / trigger_reconciliation keeps draining instead
+            # of one iteration holding the lock forever.
+            if (
+                chunk_num > 0
+                and self.time_provider() - start >= self.config.backlog_iteration_budget_seconds
+            ):
+                stats = await self.buffer.get_buffer_stats(project_id)
+                logger.info(
+                    'reconciliation.backlog_iteration_yielded',
+                    extra={
+                        'project_id': project_id,
+                        'chunks_processed': chunk_num,
+                        'events_remaining': stats.get('size', 0),
+                    },
+                )
+                yielded = True
+                break
+
             # Peek at up to 1000 events (far more than a single budget can hold)
             peeked = await self.buffer.peek_buffered(
                 project_id, limit=1000, before=cutoff,
@@ -2804,8 +2828,11 @@ class BacklogIterator:
                 await self.buffer.restore_drained(project_id)
                 return  # Stop iteration on failure
 
-        # Final consolidation pass
-        if chunk_num > 0:
+        # Final consolidation pass — skipped when the loop yielded on the
+        # cumulative budget (task 2040): the remaining backlog stays
+        # buffered for the next cycle instead of forcing an extra
+        # consolidation cycle past the budget.
+        if chunk_num > 0 and not yielded:
             logger.info(f'Backlog final consolidation for {project_id}')
             try:
                 await asyncio.wait_for(
