@@ -390,3 +390,85 @@ class TestSeedInvocationFreshCheckout:
             f'expected the cold worktree to still be registered (retained, never '
             f'removed on a seed fault); got: {registered}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-07/08: reap I2 through the harness reaper pass, composed with I1 pool
+# isolation — δ's harness-cadence wiring folded into the same B+H gate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapI2ViaHarnessPass:
+    """I2: harness._run_interactive_worktree_reaper_pass() reclaims a stale
+    _iact-* worktree claimed via the β verb, preserves a within-TTL live
+    one, and — composing with I1 — never perturbs WarmLanePool state while
+    doing so (the reaper structurally only ever touches the _iact-* band).
+    """
+
+    async def test_stale_reaped_live_preserved_pool_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+        await _add_seed_script(repo)
+        config = _make_config(repo, max_concurrent_tasks=3)
+        harness, server = _build_harness_and_server(config, tmp_path)
+        pool = harness.git_ops.warm_lane_pool
+        assert pool is not None, 'setup: warm_lane_pool must be enabled'
+
+        def _free_count() -> int:
+            return sum(1 for s in pool._lanes.values() if s == LaneState.FREE)
+
+        free_before = _free_count()
+        assignments_before = pool.assignments_snapshot()
+
+        stale_claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='stale', project_root=str(repo),
+        )
+        assert 'error' not in stale_claim, f'setup: stale claim failed: {stale_claim}'
+        live_claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='live', project_root=str(repo),
+        )
+        assert 'error' not in live_claim, f'setup: live claim failed: {live_claim}'
+
+        stale_path = Path(stale_claim['path'])
+        live_path = Path(live_claim['path'])
+
+        # Make 'live' active: a fresh commit beyond main means its age is
+        # measured from the newest-commit time (not the stamp), comfortably
+        # within TTL — mirrors test_harness_interactive_reaper.py's
+        # end-to-end convention.
+        (live_path / 'work.txt').write_text('work\n')
+        await _run(['git', 'add', '-A'], cwd=live_path)
+        await _run(['git', 'commit', '-m', 'wip on live'], cwd=live_path)
+
+        # 'stale' has no commits beyond main, so its age is measured from
+        # the .task/interactive.json stamp — backdate it past the TTL.
+        _backdate_stamp(
+            stale_path,
+            datetime.now(UTC)
+            - timedelta(seconds=harness.config.git.interactive_worktree_ttl + 3600),
+        )
+
+        await harness._run_interactive_worktree_reaper_pass()
+
+        registered = await _registered_worktree_paths(repo)
+        assert str(stale_path.resolve()) not in registered, (
+            f'expected the stale interactive worktree to be reaped; '
+            f'registered: {registered}'
+        )
+        assert str(live_path.resolve()) in registered, (
+            f'expected the live interactive worktree to be preserved; '
+            f'registered: {registered}'
+        )
+
+        # I1 ∧ I2 composition: the reap must never perturb the pool.
+        assert _free_count() == free_before, (
+            f'I1/I2 VIOLATION: the reaper changed the FREE lane count '
+            f'(before={free_before}, after={_free_count()})'
+        )
+        assert pool.assignments_snapshot() == assignments_before, (
+            'I1/I2 VIOLATION: the reaper perturbed assignments_snapshot()'
+        )
