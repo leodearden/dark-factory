@@ -5836,6 +5836,206 @@ class TestDedupFlagsContentFingerprintPath:
 
 
 # ---------------------------------------------------------------------------
+# task-2047 step-7 — RED: dedup_flags deduped_against enrichment (Gap 1)
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsDedupedAgainstEnrichment:
+    """dedup_flags threads deduped_against UUIDs into fp:-keyed markers ONLY
+    (task-2047 Gap 1): numeric-task_id markers are unaffected by scoping, and
+    a fp: flag with no UUID-bearing fields writes a marker with no
+    deduped_against key (extraction correctly yields empty -> field omitted).
+    """
+
+    @pytest.mark.asyncio
+    async def test_miss_branch_fp_marker_carries_deduped_against(self):
+        """MISS: a content-fingerprint flag carrying deduped_against=['m1','m2']
+        -> the written marker's metadata.deduped_against == ['m1', 'm2'] and
+        metadata.task_id is a canonical fp:+32hex key."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+            is_content_fingerprint_task_id,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge about deploy steps',
+            'deduped_against': ['m1', 'm2'],
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None, 'Test setup: signature must be computable for this flag'
+        expected_fp, expected_ftype = sig
+
+        written_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': expected_fp,
+            'flag_type': expected_ftype,
+            'run_id': 'r1',
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(expected_fp, expected_ftype): [[], [written_marker]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('deduped_against') == ['m1', 'm2'], (
+            f'Expected deduped_against=["m1","m2"]; got {meta.get("deduped_against")!r}'
+        )
+        assert is_content_fingerprint_task_id(meta.get('task_id')), (
+            f"marker task_id {meta.get('task_id')!r} must be a canonical fp:+32hex key"
+        )
+
+    @pytest.mark.asyncio
+    async def test_hit_branch_replacement_fp_marker_carries_deduped_against(self):
+        """HIT: with a prior fp: marker present, the replacement marker write
+        ALSO carries metadata.deduped_against == ['m1', 'm2']."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge about deploy steps',
+            'deduped_against': ['m1', 'm2'],
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        fp_prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': fp,
+            'flag_type': ftype,
+            'run_id': 'r1',
+        })
+        fp_prior.id = 'fp-prior-r1'
+        replacement = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': fp,
+            'flag_type': ftype,
+            'run_id': 'r2',
+        })
+        replacement.id = 'fp-replacement-r2'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[fp_prior], [replacement]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r2',
+            flags=[flag],
+        )
+
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('deduped_against') == ['m1', 'm2'], (
+            f'Replacement marker must carry deduped_against; got {meta.get("deduped_against")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_numeric_task_id_flag_scoped_out_no_deduped_against(self):
+        """Scoping: a numeric-task_id flag (task_id=42) carrying a duplicate_ids
+        field must NOT get deduped_against in its marker metadata — enrichment
+        is fp:-only."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {
+            'task_id': 42,
+            'flag_type': 'missing_deliverable',
+            'duplicate_ids': ['m1', 'm2'],
+        }
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={('42', 'missing_deliverable'): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': '42',
+                'flag_type': 'missing_deliverable',
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert 'deduped_against' not in meta, (
+            f'Numeric-task_id marker must NOT carry deduped_against; got metadata={meta!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fp_flag_with_no_uuid_fields_no_deduped_against(self):
+        """fp: flag with no UUID-bearing fields -> marker written with no
+        deduped_against key (extraction correctly returns empty -> field omitted)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge with no cited UUIDs',
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': fp,
+                'flag_type': ftype,
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert 'deduped_against' not in meta, (
+            f'fp: marker with no UUID fields must NOT carry deduped_against; got metadata={meta!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task-1656 step-3 — RED: dedup_flags write-guard integration tests
 # ---------------------------------------------------------------------------
 
