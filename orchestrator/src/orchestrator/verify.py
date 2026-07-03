@@ -1437,9 +1437,14 @@ def _build_fallback_config(
         # _strip_leading_cd drops a ``cd <subproject> &&`` prefix that the
         # per-subproject lint/type commands carry: the fallback runs from the
         # worktree root, so a module-cd would misresolve the root-relative file
-        # path the scoper just inserted.
-        lint_cmd = _strip_leading_cd(
-            _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
+        # path the scoper just inserted. _reproject_bare_uv_run then reprojects
+        # a bare ``uv run <tool>`` into a tool-bearing member uv context (task
+        # 2036): the depless workspace-root project cannot spawn ruff/pyright.
+        lint_cmd = _reproject_bare_uv_run(
+            _strip_leading_cd(
+                _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
+            ),
+            'ruff check',
         )
         type_cmd = _strip_leading_cd(
             _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
