@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any
 
 from shared.safe_io import load_json_or_warn
 
+from orchestrator.git_ops import canonical_queued_branch_name
+
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
     from orchestrator.merge_queue import MergeRequest
@@ -104,10 +106,15 @@ class MergeQueueStore:
         if isinstance(req, GroupMergeRequest):
             return
 
+        # Normalize to the bare canonical shape before persisting (task 2037
+        # fix 2): strip a leading branch_prefix so the journal only ever
+        # holds ONE canonical shape, regardless of what shape the caller
+        # submitted.  removeprefix is a no-op when the branch is already
+        # bare (or the prefix is empty), so this is safe/idempotent.
         persisted = PersistedMergeRequest(
             request_id=req.request_id,
             task_id=req.task_id,
-            branch=req.branch,
+            branch=req.branch.removeprefix(req.config.git.branch_prefix),
             worktree=str(req.worktree),
             pre_rebased=req.pre_rebased,
             task_files=req.task_files,
@@ -251,7 +258,11 @@ async def recover_pending_merges(
     """Re-enqueue surviving merge requests from the durable journal.
 
     For each journaled record:
-    * Builds ``full_branch = f'{branch_prefix}{record.branch}'``.
+    * Builds ``full_branch = canonical_queued_branch_name(record.branch,
+      branch_prefix)`` — shape-tolerant so a legacy journal entry that was
+      already persisted in the prefixed shape (e.g. ``'task/4959'``, from a
+      journal written before the step-4 enqueue normalization) is not
+      double-prefixed into an unresolvable ``'task/task/4959'``.
     * Drops the record (and removes it from the store) if:
         - ``git_ops.resolve_branch_sha(full_branch)`` is ``None``
           (branch was deleted after the crash), OR
@@ -287,7 +298,10 @@ async def recover_pending_merges(
     recovered_requests: list[MergeRequest] = []
 
     for record in records:
-        full_branch = f'{branch_prefix}{record.branch}'
+        # Shape-tolerant: prepend branch_prefix unless record.branch is
+        # already prefixed (legacy on-disk journals may predate the step-4
+        # enqueue normalization).  See canonical_queued_branch_name docstring.
+        full_branch = canonical_queued_branch_name(record.branch, branch_prefix)
         try:
             sha = await git_ops.resolve_branch_sha(full_branch)
             if sha is None:

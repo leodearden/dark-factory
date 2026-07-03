@@ -20,6 +20,7 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _merge_subject,
     _run,
+    canonical_queued_branch_name,
     scrub_task_dir_from_tree,
 )
 
@@ -3912,6 +3913,36 @@ class TestMergeSubject:
     ) -> None:
         """_merge_subject returns 'Merge {branch} into {main_branch}'."""
         assert _merge_subject(branch, main_branch) == expected
+
+
+class TestCanonicalQueuedBranchName:
+    """Unit tests for the canonical_queued_branch_name helper.
+
+    Locks the "prepend branch_prefix unless branch already starts with it"
+    shape-normalization rule shared by ``recover_pending_merges``
+    (merge_queue_store.py) and merge_status's git-authority tier
+    (escalation/server.py).  This is the pure-string, name-only sibling of
+    ``GitOps.resolve_queued_branch_ref`` (the I/O existence-resolver): this
+    helper must produce a deterministic full-ref name even when the ref does
+    not exist on disk.
+    """
+
+    @pytest.mark.parametrize(
+        'branch, branch_prefix, expected',
+        [
+            ('4959', 'task/', 'task/4959'),
+            # Already-prefixed: NO double prefix — this is the bug guard.
+            ('task/4959', 'task/', 'task/4959'),
+            ('cost-min-prd', 'task/', 'task/cost-min-prd'),
+            ('4959', '', '4959'),
+            ('', 'task/', 'task/'),
+        ],
+    )
+    def test_canonical_shape(
+        self, branch: str, branch_prefix: str, expected: str
+    ) -> None:
+        """canonical_queued_branch_name prepends branch_prefix unless already present."""
+        assert canonical_queued_branch_name(branch, branch_prefix) == expected
 
 
 @pytest.mark.asyncio
