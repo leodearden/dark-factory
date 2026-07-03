@@ -227,6 +227,14 @@ Public API
 - ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
   ``filter_suppressed`` first then does Mem0 search + write + confirm + delete
   per flag; best-effort (exceptions are logged, not raised).
+- ``acknowledge_flag_marker(memory_service, *, project_id, run_id, task_id, flag_type, mode, log)``
+  — async, best-effort delete or tag (write-replacement + delete-old) of the
+  prior ``stage1_flag_marker``(s) for one (task_id, flag_type) signature;
+  never raises; returns the count acknowledged.
+- ``acknowledge_resolved_flags(memory_service, project_id, run_id, resolved_flags, *, mode, log)``
+  — async, generic batch entry point; computes each flag's signature and
+  delegates to ``acknowledge_flag_marker`` per flag; best-effort (one flag
+  failing never aborts the batch); returns the summed count.
 """
 from __future__ import annotations
 
@@ -1946,6 +1954,260 @@ def _is_task_count_snapshot_finding(flag: dict[str, Any]) -> bool:
 
     # Branch 2: raw count-string detection (handles numeric memory_stale shape)
     return is_count_snapshot(f'{description} {suggested_action}')
+
+
+async def acknowledge_flag_marker(
+    memory_service: Any,
+    *,
+    project_id: str,
+    run_id: str,
+    task_id: str,
+    flag_type: str,
+    mode: Literal['delete', 'tag'] = 'delete',
+    log: logging.Logger = logger,
+) -> int:
+    """Best-effort acknowledge (delete or tag) prior ``stage1_flag_marker``(s).
+
+    Locates every prior ``stage1_flag_marker`` for the ``(task_id, flag_type)``
+    signature via the same ``find_prior_memories`` + :func:`_marker_query` search
+    ``dedup_flags`` uses, then:
+
+    - ``mode='delete'``: deletes every located prior (best-effort parallel
+      delete via ``asyncio.gather(return_exceptions=True)``, mirroring
+      ``task_knowledge_sync._sweep_stale_fixc_markers``). Returns the number of
+      deletes that completed without raising.
+    - ``mode='tag'``: writes ONE replacement marker carrying the canonical
+      ``stage1_flag_marker`` payload plus ``addressed_by``/``addressed_at_run``
+      set to *run_id*, then — only if the write is confirmed (non-empty
+      ``memory_ids``) — deletes the located priors the same way as
+      ``mode='delete'``.  An unconfirmed/failed write leaves all priors intact
+      and returns 0 (mirrors ``_write_and_confirm_marker``'s best-effort
+      at-least-one-marker contract).
+
+    Guards: an invalid *task_id* (per :func:`_is_valid_marker_task_id`) or no
+    located priors short-circuits to a no-op ``0`` with no Mem0 I/O beyond the
+    (skipped or empty) search.  Never raises — every I/O call is wrapped in its
+    own try/except so a transient Mem0 outage can never abort a caller's batch.
+
+    ``addressed_by`` visibility to recurrence detection (amendment round 2,
+    reviewer finding: design — confirmed safe by construction, not changed):
+    neither ``find_prior_memories``'s ``kind`` equality filter nor
+    ``dedup_flags`` special-case ``addressed_by`` — an addressed replacement
+    marker is found by a later ``dedup_flags`` search exactly like any other
+    prior.  This is safe because ``dedup_flags`` never drops/suppresses a flag
+    on a HIT (it only annotates ``persisted_from_run``/``last_seen_run_id`` and
+    replaces the marker), so a genuine recurrence is still surfaced to Stage 2;
+    and the HIT-path replacement marker never carries ``addressed_by``/
+    ``addressed_at_run``, so the tag self-clears on the very next recurrence
+    rather than persisting indefinitely.  See
+    ``test_dedup_flags_hit_on_addressed_marker_does_not_suppress_flag`` in
+    ``test_flag_dedup.py`` for the pinned regression coverage.
+
+    Args:
+        memory_service: Mem0 service with async ``search``/``add_memory``/
+            ``delete_memory`` methods.
+        project_id: Project scope for search/write/delete.
+        run_id: Current reconciliation run identifier; used as ``causation_id``
+            on writes/deletes and, in ``mode='tag'``, as the ``addressed_by``/
+            ``addressed_at_run`` provenance value.
+        task_id: The flag's task_id (or comma-joined/``fp:`` signature key).
+        flag_type: The flag's flag_type.
+        mode: ``'delete'`` (default) or ``'tag'``.
+        log: Logger for WARNING/DEBUG messages; defaults to this module's logger.
+
+    Returns:
+        Count of priors successfully acknowledged (0 on any guard/no-op/failure).
+    """
+    tid = str(task_id)
+    ftype = str(flag_type)
+
+    if not _is_valid_marker_task_id(tid):
+        log.debug(
+            'acknowledge_flag_marker: skipping invalid task_id %r flag_type %s',
+            tid, ftype,
+        )
+        return 0
+
+    try:
+        priors = await find_prior_memories(
+            memory_service,
+            project_id=project_id,
+            task_id=tid,
+            kind={'source': 'stage1_flag_marker', 'flag_type': ftype},
+            query=_marker_query(tid, ftype),
+            categories=['observations_and_summaries'],
+            limit=50,
+            log=log,
+        )
+    except Exception as e:
+        log.warning(
+            'acknowledge_flag_marker: search failed for task %s flag_type %s: %s',
+            tid, ftype, e,
+        )
+        return 0
+
+    if not priors:
+        return 0
+
+    if mode == 'tag':
+        try:
+            response = await memory_service.add_memory(
+                content=(
+                    f'Stage 1 flag marker addressed: task={tid} type={ftype}'
+                    f' addressed_by run={run_id}'
+                ),
+                category='observations_and_summaries',
+                project_id=project_id,
+                metadata={
+                    'source': 'stage1_flag_marker',
+                    'kind': 'stage1_flag_marker',
+                    'task_id': tid,
+                    'flag_type': ftype,
+                    'run_id': run_id,
+                    'last_seen_run_id': run_id,
+                    'addressed_by': run_id,
+                    'addressed_at_run': run_id,
+                },
+                causation_id=run_id,
+                _source='flag_acknowledgment',
+            )
+        except Exception as e:
+            log.warning(
+                'acknowledge_flag_marker: failed to write tag replacement for task %s'
+                ' flag_type %s: %s',
+                tid, ftype, e,
+            )
+            return 0
+        if not response.memory_ids:
+            log.warning(
+                'acknowledge_flag_marker: tag replacement for task %s flag_type %s not'
+                ' confirmed (empty memory_ids) — leaving priors intact',
+                tid, ftype,
+            )
+            return 0
+
+    # mode == 'delete', or mode == 'tag' with a confirmed replacement write:
+    # delete all located priors best-effort (one bad delete does not abort the batch).
+    results = await asyncio.gather(
+        *(
+            memory_service.delete_memory(
+                memory_id=prior.id,
+                store='mem0',
+                project_id=project_id,
+                causation_id=run_id,
+                _source='flag_acknowledgment',
+            )
+            for prior in priors
+        ),
+        return_exceptions=True,
+    )
+    success_count = 0
+    for prior, result in zip(priors, results, strict=True):
+        if isinstance(result, BaseException):
+            log.warning(
+                'acknowledge_flag_marker: failed to delete prior marker %s for task %s'
+                ' flag_type %s: %s',
+                prior.id, tid, ftype, result,
+            )
+        else:
+            success_count += 1
+    return success_count
+
+
+async def acknowledge_resolved_flags(
+    memory_service: Any,
+    project_id: str,
+    run_id: str,
+    resolved_flags: list[dict[str, Any]],
+    *,
+    mode: Literal['delete', 'tag'] = 'delete',
+    log: logging.Logger = logger,
+) -> int:
+    """Best-effort batch acknowledgment entry point for a list of resolved flags.
+
+    For each flag in *resolved_flags*, computes its signature exactly as
+    ``dedup_flags`` does — :func:`compute_flag_signature` first, falling back to
+    :func:`compute_content_fingerprint_signature` — and delegates to
+    :func:`acknowledge_flag_marker` for the ``(task_id, flag_type)`` pair.
+    Flags for which both signature helpers return ``None`` are skipped (no I/O).
+
+    Signatures are de-duplicated (order-preserving) BEFORE dispatch: two flags
+    reducing to the same ``(task_id, flag_type)`` — e.g. two ``stale_metadata``
+    findings on the same task — must acknowledge exactly once, not twice.
+    Without this, two concurrent ``acknowledge_flag_marker`` calls for the same
+    signature would each run their own search and race to delete the SAME prior
+    marker id(s) (and, in ``mode='tag'``, each write its own duplicate
+    replacement marker), inflating the returned count (amendment round 2,
+    reviewer finding: robustness).
+
+    Signable (de-duplicated) flags are dispatched to ``acknowledge_flag_marker``
+    concurrently via ``asyncio.gather(return_exceptions=True)`` — mirroring the
+    delete fan-out ``acknowledge_flag_marker`` itself already uses — rather than
+    one-at-a-time, since each is an independent Mem0 round-trip.
+
+    Best-effort: a single flag's acknowledgment failing is logged at WARNING and
+    does NOT abort the batch — the remaining flags are still processed. (This
+    also guards against a caller-supplied replacement for
+    ``acknowledge_flag_marker`` that raises, even though the real implementation
+    never does.)
+
+    Args:
+        memory_service: Mem0 service forwarded to ``acknowledge_flag_marker``.
+        project_id: Project scope forwarded to ``acknowledge_flag_marker``.
+        run_id: Current reconciliation run identifier.
+        resolved_flags: Flags whose requested action is already fulfilled.
+        mode: ``'delete'`` (default) or ``'tag'``; forwarded verbatim to every
+            ``acknowledge_flag_marker`` call in this batch.
+        log: Logger for WARNING messages; defaults to this module's logger.
+
+    Returns:
+        Total count of markers acknowledged across all flags in the batch.
+    """
+    sigs: list[tuple[str, str]] = []
+    for flag in resolved_flags:
+        sig = compute_flag_signature(flag)
+        if sig is None:
+            sig = compute_content_fingerprint_signature(flag)
+        if sig is None:
+            continue
+        sigs.append(sig)
+
+    if not sigs:
+        return 0
+
+    # De-duplicate signatures before the fan-out (amendment round 2, reviewer
+    # finding: robustness): dict.fromkeys preserves first-seen order while
+    # dropping repeats, so a batch with two flags sharing one (task_id,
+    # flag_type) signature acknowledges it exactly once instead of racing two
+    # concurrent acknowledge_flag_marker calls against the same prior marker(s).
+    deduped_sigs = list(dict.fromkeys(sigs))
+
+    results = await asyncio.gather(
+        *(
+            acknowledge_flag_marker(
+                memory_service,
+                project_id=project_id,
+                run_id=run_id,
+                task_id=tid,
+                flag_type=ftype,
+                mode=mode,
+                log=log,
+            )
+            for tid, ftype in deduped_sigs
+        ),
+        return_exceptions=True,
+    )
+    total = 0
+    for (tid, ftype), result in zip(deduped_sigs, results, strict=True):
+        if isinstance(result, BaseException):
+            log.warning(
+                'acknowledge_resolved_flags: acknowledge_flag_marker failed for task %s'
+                ' flag_type %s: %s',
+                tid, ftype, result,
+            )
+        else:
+            total += result
+    return total
 
 
 def filter_blocked_snapshot_findings(

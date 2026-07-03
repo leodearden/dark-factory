@@ -32,6 +32,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     generate_summary_nonce,
 )
 from fused_memory.reconciliation.flag_dedup import (
+    acknowledge_resolved_flags,
     compute_flag_signature,
     filter_blocked_snapshot_findings,
 )
@@ -667,6 +668,92 @@ def _check_mem0_flag_counter_completeness(report_stats: dict) -> dict:
         'reported': reported,
         'mismatch': expected != reported,
     }
+
+
+async def _acknowledge_resolved_stage1_markers(
+    memory_service: Any,
+    project_id: str,
+    run_id: str,
+    flag_deleted_records: object,
+    rendered_flags: object,
+) -> int:
+    """Best-effort: tag Channel-1 ``stage1_flag_marker``(s) for flags Stage 2 resolved.
+
+    Joins *flag_deleted_records* (Stage 2's own FIX C deletion action records,
+    each carrying a ``flag_id``) against *rendered_flags* (the ``combined_flags``
+    Stage 2 rendered into its prompt this run — see ``assemble_payload`` —
+    each carrying ``flag_id``/``task_id``/``flag_type``) on ``flag_id`` to
+    recover the ``(task_id, flag_type)`` signature for each resolved flag, then
+    delegates to :func:`~fused_memory.reconciliation.flag_dedup.acknowledge_resolved_flags`
+    with ``mode='tag'`` so the Channel-1 marker is tagged
+    ``addressed_by=<run_id>`` rather than deleted outright (task-2029 scenario b).
+
+    A record is a join candidate whenever it is a dict carrying a ``flag_id``
+    key — the documented shape stamps ``action='flag_deleted'``, but the join
+    itself does not require that key, only ``flag_id``. Unmatched records
+    (no ``rendered_flags`` entry with that ``flag_id``, or a match missing
+    ``task_id``/``flag_type``) are skipped.
+
+    Best-effort and non-raising: a malformed/absent *flag_deleted_records* or
+    *rendered_flags* (not a non-empty list) short-circuits to ``0`` with no
+    I/O; any exception raised while acknowledging is caught and logged at
+    WARNING, returning ``0``.
+
+    Args:
+        memory_service: Mem0 service forwarded to ``acknowledge_resolved_flags``.
+        project_id: Project scope.
+        run_id: Current reconciliation run identifier.
+        flag_deleted_records: ``report.stats['flag_deleted_records']`` from
+            this Stage 2 run.
+        rendered_flags: The ``combined_flags`` Stage 2 rendered this run.
+
+    Returns:
+        Count of Channel-1 markers acknowledged (0 on no-op/failure).
+    """
+    if not isinstance(flag_deleted_records, list) or not flag_deleted_records:
+        return 0
+    if not isinstance(rendered_flags, list) or not rendered_flags:
+        return 0
+
+    by_flag_id = {
+        f['flag_id']: f
+        for f in rendered_flags
+        if isinstance(f, dict) and f.get('flag_id') is not None
+    }
+
+    collected: list[dict] = []
+    for record in flag_deleted_records:
+        if not isinstance(record, dict):
+            continue
+        flag_id = record.get('flag_id')
+        if flag_id is None:
+            continue
+        matched = by_flag_id.get(flag_id)
+        if matched is None:
+            continue
+        if matched.get('task_id') is None or matched.get('flag_type') is None:
+            continue
+        collected.append(matched)
+
+    if not collected:
+        return 0
+
+    try:
+        return await acknowledge_resolved_flags(
+            memory_service,
+            project_id,
+            run_id,
+            collected,
+            mode='tag',
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._acknowledge_resolved_stage1_markers: '
+            'acknowledge_resolved_flags failed for run_id=%s',
+            run_id,
+            exc_info=True,
+        )
+        return 0
 
 
 def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
@@ -1982,6 +2069,17 @@ class TaskKnowledgeSync(BaseStage):
     # report.stats['stage2_recon_report_systemic_polled'] after super().run().
     _recon_report_systemic_polled: int = 0
 
+    # Combined Stage 2 flags (Stage 1 items + surviving Mem0 active-query flags)
+    # assembled by assemble_payload() during the current run (task-2029 scenario
+    # b).  Read via getattr(self, '_stage2_combined_flags', []) by the post-run
+    # guard flow to join report.stats['flag_deleted_records'] on flag_id and
+    # recover (task_id, flag_type) for Channel-1 tagging.  Reset to [] at the
+    # top of run() (amendment round 2, reviewer finding: robustness) so that a
+    # run whose assembly is skipped/short-circuited can never leave a PRIOR
+    # run's flags visible to the join — the getattr default only covers the
+    # never-set case, not the stale-from-a-prior-run case.
+    _stage2_combined_flags: list[dict] | None = None
+
     def get_system_prompt(self) -> str:
         return build_stage2_system_prompt(self.project_id)
 
@@ -2017,6 +2115,11 @@ class TaskKnowledgeSync(BaseStage):
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
         self._recon_report_systemic_polled = 0
+        # Amendment round 2 (reviewer finding: robustness): reset BEFORE
+        # super().run() so a run whose assemble_payload call is skipped or
+        # short-circuited can never leave a PRIOR run's combined_flags visible
+        # to the post-flight guard's flag_deleted_records join.
+        self._stage2_combined_flags = []
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         # --- trim-then-write: pre-trim pool to cap-1 BEFORE agent writes (task 1831) ---
         # Runs unconditionally (full + remediation) so the pool is bounded every cycle.
@@ -2351,6 +2454,22 @@ class TaskKnowledgeSync(BaseStage):
             )
             # Clamp to truth so downstream verifiers see the real picture.
             report.stats['stage1_mem0_flags_processed'] = mem0_check['expected']
+
+        # ── Stage-1 flag-marker acknowledgment (task-2029 scenario b) ──────────
+        # flag_deleted_records (read by Guard 4b above) names the flags Stage 2
+        # resolved via FIX C deletion this run.  Join those against the
+        # combined_flags rendered by assemble_payload (stashed on self) to
+        # recover each resolved flag's (task_id, flag_type), then tag the
+        # originating Channel-1 stage1_flag_marker addressed_by=run_id so it
+        # no longer needs manual per-cycle disambiguation.  Additive and
+        # best-effort — never raises, never touches Channel-2 sweeps.
+        report.stats['stage2_flag_markers_acknowledged'] = await _acknowledge_resolved_stage1_markers(
+            self.memory,
+            self.project_id,
+            run_id,
+            report.stats.get('flag_deleted_records', []),
+            getattr(self, '_stage2_combined_flags', []) or [],
+        )
 
         # Normalize: ensure both Stage 2 counters are always present in stats so
         # Stage 3's audit sees a deterministic, present pair via recon_report's
@@ -2740,6 +2859,13 @@ class TaskKnowledgeSync(BaseStage):
         self._recon_report_systemic_polled = appended
 
         flagged_text = _format_flagged(combined_flags, run_stage='stage2')
+
+        # Stash for the post-run guard flow (task-2029 scenario b): run()'s
+        # _apply_post_flight_guards joins report.stats['flag_deleted_records']
+        # against this list on flag_id to recover (task_id, flag_type) for
+        # each FIX-C-deleted flag, so the originating Channel-1
+        # stage1_flag_marker can be tagged addressed_by=<run_id>.
+        self._stage2_combined_flags = combined_flags
 
         # Emit per-flag warnings and build the stale-flag section.
         stale_section = ''

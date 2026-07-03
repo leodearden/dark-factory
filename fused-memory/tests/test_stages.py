@@ -888,6 +888,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
             'stage1_cycle_summary_pool_trimmed': 0,
+            # Always present (task-2029 amendment), even when nothing was flagged —
+            # symmetric with stats['stage2_flag_markers_acknowledged'].
+            'stage1_flag_markers_acknowledged': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -980,6 +983,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'entity_summary_snapshot_lines_stripped': 0,
             'stage1_fetch_degraded': [],
             'stage1_cycle_summary_pool_trimmed': 0,
+            # Always present (task-2029 amendment), even when nothing was flagged —
+            # symmetric with stats['stage2_flag_markers_acknowledged'].
+            'stage1_flag_markers_acknowledged': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -4384,6 +4390,352 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
         assert active_flag in flags_seen_by_dedup, (
             'Active flag must reach dedup_flags (only terminal metadata flags are dropped)'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2029 scenario (a) — MemoryConsolidator acknowledges flags dropped by
+# the Stage-1 filter chain via acknowledge_resolved_flags(mode='delete').
+#
+# RED until step-8 wires acknowledge_resolved_flags into memory_consolidator.py.
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorFlagAcknowledgment:
+    """MemoryConsolidator.run() acknowledges Stage-1 flags dropped by the filter
+    chain (terminal-metadata / false-absence / stale-snapshot) so any persisted
+    stage1_flag_marker for a moot flag is reclaimed (task-2029 scenario a).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_dropped_flag_acknowledged_and_stat_set(self, mock_deps):
+        """A flag dropped by filter_terminal_metadata_flags (cancelled task) is
+        forwarded to acknowledge_resolved_flags(mode='delete'); the surviving
+        flag is NOT forwarded; report.stats reflects the mocked return value.
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        dropped_flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[dropped_flag, active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        async def _mock_get_task(task_id, project_root_arg, **_kw):
+            if str(task_id) == '1703':
+                return {'status': 'cancelled'}
+            return {'status': 'pending'}
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(side_effect=_mock_get_task)
+
+        ack_mock = AsyncMock(return_value=1)
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('run_id') == 'r-test'
+        assert call_kwargs.get('project_id') == 'p'
+        resolved = call_kwargs.get('resolved_flags')
+        assert resolved == [dropped_flag], (
+            f'expected exactly the dropped flag (and only it) to be forwarded; got {resolved!r}'
+        )
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 1
+
+    @pytest.mark.asyncio
+    async def test_no_drops_acknowledges_empty_list_and_stat_zero(self, mock_deps):
+        """When no flag is dropped by the filter chain, acknowledge_resolved_flags
+        is called with an empty list and the stat is explicitly 0 (not absent).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+
+        ack_mock = AsyncMock(return_value=0)
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('resolved_flags') == []
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 0
+
+    @pytest.mark.asyncio
+    async def test_no_items_flagged_stat_still_explicitly_zero(self, mock_deps):
+        """When Stage 1 flags nothing at all (items_flagged falsy), the stat must
+        still be explicitly present and 0 — not absent — so it is symmetric with
+        stats['stage2_flag_markers_acknowledged'], which is unconditionally set
+        (task-2029 amendment).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        assert 'stage1_flag_markers_acknowledged' in report.stats, (
+            'stat must be present even when nothing was flagged, not absent'
+        )
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 0
+
+    @pytest.mark.asyncio
+    async def test_suppression_gate_drop_excluded_from_acknowledgment(self, mock_deps):
+        """A flag dropped by dedup_flags' internal suppression gate (filter_suppressed)
+        must NOT be forwarded to acknowledge_resolved_flags. Suppression means the
+        underlying issue is intentionally hidden, not resolved — acknowledging it
+        would erase recurrence history for when the suppression is later lifted
+        (task-2029 amendment).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        suppressed_flag = {'task_id': '55', 'flag_type': 'stale_metadata'}
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[suppressed_flag, active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+
+        ack_mock = AsyncMock(return_value=0)
+
+        async def _fake_dedup(*, memory_service, project_id, run_id, flags):
+            # Simulate dedup_flags' internal filter_suppressed dropping
+            # suppressed_flag before the signature-dedup loop runs.  Filters by
+            # content (not object identity): StageReport is a pydantic model,
+            # so flags round-tripped through it are revalidated copies with
+            # equal content but different identity from the locals above.
+            return [f for f in flags if f.get('task_id') != suppressed_flag['task_id']]
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=_fake_dedup),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        resolved = call_kwargs.get('resolved_flags')
+        assert resolved == [], (
+            f'suppression-gate drop must NOT be forwarded for acknowledgment; got {resolved!r}'
+        )
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 0
+
+    @pytest.mark.asyncio
+    async def test_suppressed_and_terminal_drops_distinguished_in_same_run(self, mock_deps):
+        """A suppression-gate drop and a terminal-metadata drop occurring in
+        the SAME run must be distinguished: the suppressed flag's signature is
+        excluded from acknowledgment while the terminal-dropped flag's
+        signature IS forwarded.
+
+        This is the central safety property of scenario (a) — the whole
+        reason _pre_dedup_flags/_post_dedup_signatures/suppressed_signatures
+        exist. A prior test (test_suppression_gate_drop_excluded_from_
+        acknowledgment) covers a suppression drop in isolation and
+        test_dropped_flag_acknowledged_and_stat_set covers a terminal drop in
+        isolation (with dedup_flags mocked to pass everything through
+        unchanged, so suppressed_signatures is always empty there) — neither
+        exercises both drop reasons together. Combining them here guards
+        against a regression that stops subtracting suppressed_signatures (or
+        one that over-broadly excludes every dropped flag, terminal included)
+        (task-2029 amendment round 2, reviewer finding: test_coverage).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        terminal_flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
+        suppressed_flag = {'task_id': '55', 'flag_type': 'stale_metadata'}
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[terminal_flag, suppressed_flag, active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        async def _mock_get_task(task_id, project_root_arg, **_kw):
+            if str(task_id) == '1703':
+                return {'status': 'cancelled'}
+            return {'status': 'pending'}
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(side_effect=_mock_get_task)
+
+        ack_mock = AsyncMock(return_value=1)
+
+        async def _fake_dedup(*, memory_service, project_id, run_id, flags):
+            # By the time dedup_flags runs, filter_terminal_metadata_flags has
+            # already dropped terminal_flag (real implementation, driven by
+            # the taskmaster mock above) — so `flags` here is only
+            # [suppressed_flag, active_flag]. Simulate dedup_flags' internal
+            # filter_suppressed dropping suppressed_flag.
+            return [f for f in flags if f.get('task_id') != suppressed_flag['task_id']]
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=_fake_dedup),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        resolved = call_kwargs.get('resolved_flags')
+        assert resolved == [terminal_flag], (
+            'terminal-dropped flag must be forwarded for acknowledgment while the '
+            f'suppressed flag must not be; got {resolved!r}'
+        )
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 1
 
 
 # ---------------------------------------------------------------------------
@@ -13603,3 +13955,289 @@ class TestRunStage2SummaryReconstructionWiring:
         assert verify_mock.await_count == 2
         assert report.stats['stage2_cycle_summary_reconstructed'] == 1
         assert report.stats['stage2_cycle_summary_verified_count'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 2029 scenario (b) — TaskKnowledgeSync acknowledges Stage-1
+# stage1_flag_marker records for flags Stage 2 resolved via FIX C deletion,
+# by tagging addressed_by=<run_id> (mode='tag') rather than deleting them.
+#
+# RED until step-10 adds _acknowledge_resolved_stage1_markers to
+# task_knowledge_sync.py and wires it into assemble_payload (combined_flags
+# stash) and _apply_post_flight_guards (near Guard 4b).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcknowledgeResolvedStage1Markers:
+    """RED tests for the new _acknowledge_resolved_stage1_markers helper (step-9A).
+
+    RED until step-10 adds _acknowledge_resolved_stage1_markers to
+    task_knowledge_sync.py.
+    """
+
+    async def test_joins_on_flag_id_and_delegates_matched_signatures(self, monkeypatch):
+        """Joins flag_deleted_records against rendered_flags on flag_id. F1 has
+        action='flag_deleted' and matches a rendered flag -> forwarded. F2 has
+        no 'action' key at all (any dict carrying flag_id is a candidate) but
+        has no matching rendered flag (only F1/F3 are rendered) -> skipped.
+        acknowledge_resolved_flags is called once with mode='tag' and only the
+        matched (task_id, flag_type)-bearing flag; result is its return value.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_mod
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _acknowledge_resolved_stage1_markers,
+        )
+
+        ack_mock = AsyncMock(return_value=1)
+        monkeypatch.setattr(tks_mod, 'acknowledge_resolved_flags', ack_mock)
+
+        memory_service = AsyncMock()
+        flag_deleted_records = [
+            {'action': 'flag_deleted', 'flag_id': 'F1'},
+            {'flag_id': 'F2'},
+        ]
+        rendered_flags = [
+            {'flag_id': 'F1', 'task_id': '7', 'flag_type': 'x'},
+            {'flag_id': 'F3', 'task_id': '9', 'flag_type': 'y'},
+        ]
+
+        result = await _acknowledge_resolved_stage1_markers(
+            memory_service, 'p', 'r1', flag_deleted_records, rendered_flags,
+        )
+
+        assert result == 1
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_args = ack_mock.await_args.args
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'tag'
+        assert call_args[0] is memory_service
+        assert call_args[1] == 'p'
+        assert call_args[2] == 'r1'
+        resolved = call_args[3]
+        assert len(resolved) == 1, f'expected only the F1 match forwarded; got {resolved!r}'
+        assert resolved[0]['task_id'] == '7'
+        assert resolved[0]['flag_type'] == 'x'
+
+    async def test_malformed_or_absent_flag_deleted_records_returns_zero_no_call(
+        self, monkeypatch,
+    ):
+        """None / non-list / empty flag_deleted_records short-circuits to 0
+        with no acknowledge_resolved_flags call."""
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_mod
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _acknowledge_resolved_stage1_markers,
+        )
+
+        ack_mock = AsyncMock(return_value=1)
+        monkeypatch.setattr(tks_mod, 'acknowledge_resolved_flags', ack_mock)
+
+        memory_service = AsyncMock()
+        rendered_flags = [{'flag_id': 'F1', 'task_id': '7', 'flag_type': 'x'}]
+
+        for malformed in (None, 'not-a-list', []):
+            result = await _acknowledge_resolved_stage1_markers(
+                memory_service, 'p', 'r1', malformed, rendered_flags,
+            )
+            assert result == 0, f'expected 0 for flag_deleted_records={malformed!r}, got {result!r}'
+
+        ack_mock.assert_not_called()
+
+
+class TestTaskKnowledgeSyncStage2FlagMarkersAcknowledgedStat:
+    """TaskKnowledgeSync.run() sets report.stats['stage2_flag_markers_acknowledged']
+    from _acknowledge_resolved_stage1_markers's return value (task-2029 scenario b).
+
+    Monkeypatches the module-level _acknowledge_resolved_stage1_markers helper
+    (step-9A covers its own join/delegate behavior exhaustively) — these tests
+    verify only that run() calls it and threads its count into report.stats.
+    Mirrors TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_stage2_flag_markers_acknowledged_stat_set_after_run(self, mock_deps):
+        """run() calls _acknowledge_resolved_stage1_markers(self.memory,
+        self.project_id, run_id, flag_deleted_records, rendered_flags) and
+        injects its return value into report.stats. Since BaseStage.run is
+        mocked wholesale here, assemble_payload never runs, so rendered_flags
+        falls back to [] (the getattr(self, '_stage2_combined_flags', [])
+        default) — this test asserts that fallback wiring, not the join logic.
+        """
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        flag_deleted_records = [{'action': 'flag_deleted', 'flag_id': 'F1'}]
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'flag_deleted_records': flag_deleted_records},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        ack_mock = AM(return_value=2)
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._acknowledge_resolved_stage1_markers',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert report.stats.get('stage2_flag_markers_acknowledged') == 2
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_args = ack_mock.await_args.args
+        assert call_args[0] is mock_deps['memory_service']
+        assert call_args[1] == 'reify'
+        assert call_args[2] == 'test-run'
+        assert call_args[3] == flag_deleted_records
+        assert call_args[4] == []
+
+    @pytest.mark.asyncio
+    async def test_stage2_flag_markers_acknowledged_stat_explicit_zero(self, mock_deps):
+        """When nothing is acknowledged, the stat is 0 — explicitly set, not
+        absent — so downstream consumers never need a .get(..., 0) fallback."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._acknowledge_resolved_stage1_markers',
+                new=AM(return_value=0),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert 'stage2_flag_markers_acknowledged' in report.stats
+        assert report.stats['stage2_flag_markers_acknowledged'] == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_combined_flags_reset_at_top_of_run_not_leaked_to_join(self, mock_deps):
+        """A PRIOR run's leftover self._stage2_combined_flags must never be
+        visible to a later run's flag_deleted_records join.
+
+        self._stage2_combined_flags is normally (re)populated by
+        assemble_payload() during super().run(); here BaseStage.run is mocked
+        wholesale (assemble_payload never runs), so this test simulates an
+        instance REUSED across runs where a skipped/early-return assembly path
+        left a stale value on the attribute from a previous run. Without an
+        explicit reset at the top of run(), the getattr(...) fallback in the
+        post-flight guard would see the STALE list (it is non-empty, so the
+        `or []` does not kick in) instead of the current run's — a stale-join
+        hazard, even though flag_ids being run-scoped usually yields a 0-match
+        join in practice (amendment round 2, reviewer finding: robustness).
+        """
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        # Simulate a previous run's leftover combined_flags sitting on the
+        # instance BEFORE this run starts.
+        stage._stage2_combined_flags = [
+            {'flag_id': 'STALE', 'task_id': '999', 'flag_type': 'stale_ghost'}
+        ]
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        flag_deleted_records = [{'action': 'flag_deleted', 'flag_id': 'F1'}]
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={'flag_deleted_records': flag_deleted_records},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        ack_mock = AM(return_value=0)
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync'
+                '._acknowledge_resolved_stage1_markers',
+                new=ack_mock,
+            ),
+        ):
+            await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_args = ack_mock.await_args.args
+        assert call_args[4] == [], (
+            'a previous run\'s leftover _stage2_combined_flags must not be '
+            f'visible to this run\'s join; got {call_args[4]!r}'
+        )
