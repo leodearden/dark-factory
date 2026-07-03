@@ -434,3 +434,97 @@ class TestDispatchErrorChokepoint:
             await worker._verifier_loop()
 
         assert len(calls) == 0, 'CancelledError must never reach the chokepoint'
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED / step-6 GREEN: PASSTHROUGH-FINALIZE path (fill-loop ~7144 +
+# blocking-get ~7411)
+# ---------------------------------------------------------------------------
+
+
+def _make_decided_item_and_entry(
+    req: MergeRequest, *, was_speculative: bool,
+) -> tuple[SpeculativeItem, InflightEntry]:
+    """Build a DECIDED SpeculativeItem (immediate_outcome set, no real merge)
+    and its passthrough InflightEntry (verify_task=None, lease=None,
+    merge_wt=None) — the shape _dispatch_item returns for conflict /
+    already_merged / skip_verify items.
+    """
+    immediate_outcome = MergeOutcome('blocked', reason='decided-elsewhere')
+    item = SpeculativeItem(
+        request=req,
+        merge_result=None,
+        merge_wt=None,
+        base_sha='abc123',
+        speculative=was_speculative,
+        skip_verify=False,
+        immediate_outcome=immediate_outcome,
+    )
+    entry = InflightEntry(
+        item=item,
+        lease=None,
+        verify_task=None,
+        merge_wt=None,
+        was_speculative=was_speculative,
+        phase='decided',
+        passthrough_outcome=immediate_outcome,
+    )
+    return item, entry
+
+
+@pytest.mark.asyncio
+class TestPassthroughFinalizeErrorChokepoint:
+    """PASSTHROUGH-FINALIZE path fault injection: _finalize_inflight raises
+    while finalizing a passthrough (verify_task=None) entry.
+
+    RED until step-6 GREEN routes both passthrough-finalize except-handlers
+    through _resolve_and_release with release_resources=False (the real
+    _finalize_inflight's finally clause is what would normally have released
+    lease+slot; here it is replaced entirely by a raising stub, so NO release
+    should occur at all — matching the current inline handler, which never
+    touches the slot). RED marker: the chokepoint spy call count is 0.
+    """
+
+    @pytest.mark.parametrize(
+        'driver', [_drive_verifier_loop_fill, _drive_verifier_loop_blocking_get],
+        ids=['fill', 'blocking_get'],
+    )
+    async def test_passthrough_finalize_error_routes_through_chokepoint(
+        self, git_ops: GitOps, git_repo: Path, config: OrchestratorConfig, driver: Any,
+    ) -> None:
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        req = _make_request(
+            f'pt-{driver.__name__}', f'task/pt-{driver.__name__}', git_repo, config,
+        )
+        item, entry = _make_decided_item_and_entry(req, was_speculative=True)
+        calls = _spy_on_resolve_and_release(worker)
+
+        async def _passthrough_dispatch(_item: Any) -> Any:
+            return entry
+
+        async def _raising_finalize(_entry: Any) -> Any:
+            raise Exception('boom')
+
+        worker._dispatch_item = _passthrough_dispatch  # type: ignore[method-assign]
+        worker._finalize_inflight = _raising_finalize  # type: ignore[method-assign]
+
+        depth0 = worker._speculation_slot._value
+
+        await driver(worker, item)
+
+        assert len(calls) == 1, (
+            f'Expected exactly one _resolve_and_release call, got {len(calls)}'
+        )
+        assert calls[0]['kwargs'].get('release_resources') is False, (
+            f"Expected release_resources=False, got kwargs={calls[0]['kwargs']!r}"
+        )
+        assert req.result.done()
+        outcome = req.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith('Verifier error:'), outcome.reason
+        assert worker._n_failed is True
+        assert worker._speculation_slot._value == depth0, (
+            'the chokepoint must perform NO release when release_resources=False '
+            '— the raising _finalize_inflight stub never ran its real finally'
+        )
