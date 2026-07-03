@@ -2604,10 +2604,11 @@ class TestStopDrainsInflight:
 
         verify_task = asyncio.ensure_future(_blocking_verify())
         req = _make_request('stop-ct', 'task/stop-ct', git_ops.project_root, config)
+        wt_ct = git_ops.project_root / '.worktrees' / 'stop-ct'
         item = SpeculativeItem(
             request=req,
-            merge_result=None,
-            merge_wt=None,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt_ct),
+            merge_wt=wt_ct,
             base_sha='ccc',
             speculative=False,
             skip_verify=False,

@@ -3310,11 +3310,15 @@ class TestSpeculativeMergeWorker:
         dummy_wt2 = git_ops.project_root / '.worktrees' / 'dummy2'
 
         item1 = SpeculativeItem(
-            request=req1, merge_result=None, merge_wt=dummy_wt1,
+            request=req1,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=dummy_wt1),
+            merge_wt=dummy_wt1,
             base_sha='aaa', speculative=False, skip_verify=False,
         )
         item2 = SpeculativeItem(
-            request=req2, merge_result=None, merge_wt=dummy_wt2,
+            request=req2,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=dummy_wt2),
+            merge_wt=dummy_wt2,
             base_sha='bbb', speculative=False, skip_verify=False,
         )
         await worker._verifier_queue.put(item1)
@@ -4338,10 +4342,13 @@ class TestSpeculativeMergeWorker:
         )
         worker._remerge = AsyncMock(return_value=remerged_item)  # type: ignore[method-assign]
 
+        # token2 is discarded by the n_failed short-circuit and replaced by
+        # worker._remerge's mocked return value — its own shape is unread on
+        # the exercised path, so any valid DECIDED shape is a safe filler.
         token2 = SpeculativeItem(
             request=req2, merge_result=None, merge_wt=None,
             base_sha='stalebase', speculative=True, skip_verify=False,
-            immediate_outcome=None,
+            immediate_outcome=MergeOutcome('conflict'),
         )
 
         await worker._verifier_queue.put(token1)
@@ -5851,6 +5858,7 @@ class TestSpeculativeItemDefaults:
             base_sha='',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked'),
         )
         assert item.started_monotonic is None
         # Tie the default to the observability guarantee: None → NULL duration_ms
@@ -5873,6 +5881,7 @@ class TestSpeculativeItemDefaults:
             base_sha='',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked'),
         )
         assert item.already_delivered is False
 
@@ -17228,6 +17237,7 @@ class TestSMWGenerationChain:
             base_sha='base',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked'),
         )
         assert hasattr(item, 'merged_branch_tip')
         assert item.merged_branch_tip is None
@@ -17240,6 +17250,7 @@ class TestSMWGenerationChain:
             speculative=False,
             skip_verify=False,
             merged_branch_tip='T1',
+            immediate_outcome=MergeOutcome('blocked'),
         )
         assert item2.merged_branch_tip == 'T1'
 
@@ -21353,7 +21364,9 @@ class TestSnapshotInflightCollection:
 
         req_a = _make_request('snap-a', 'snap-a', wt, config)
         item_a = SpeculativeItem(
-            request=req_a, merge_result=None, merge_wt=wt / 'a',
+            request=req_a,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt / 'a'),
+            merge_wt=wt / 'a',
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         lease_local = HostLease(name='local', runner=fake_runner, is_local=True)
@@ -21365,7 +21378,9 @@ class TestSnapshotInflightCollection:
 
         req_b = _make_request('snap-b', 'snap-b', wt, config)
         item_b = SpeculativeItem(
-            request=req_b, merge_result=None, merge_wt=wt / 'b',
+            request=req_b,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt / 'b'),
+            merge_wt=wt / 'b',
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         lease_remote = HostLease(name='laptop', runner=fake_runner, is_local=False)
@@ -21418,6 +21433,7 @@ class TestSnapshotInflightCollection:
         item_stale = SpeculativeItem(
             request=req_stale, merge_result=None, merge_wt=None,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked'),
         )
         worker._verify_item = item_stale   # stale, never cleared -- the gamma latent bug
         worker._verify_phase = 'verifying'
@@ -21455,7 +21471,9 @@ class TestSnapshotInflightCollection:
 
         req_head = _make_request('head-task', 'head-task', wt, config)
         item_head = SpeculativeItem(
-            request=req_head, merge_result=None, merge_wt=wt,
+            request=req_head,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
+            merge_wt=wt,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         entry_head = InflightEntry(
@@ -21467,7 +21485,9 @@ class TestSnapshotInflightCollection:
 
         req_second = _make_request('second-task', 'second-task', wt, config)
         item_second = SpeculativeItem(
-            request=req_second, merge_result=None, merge_wt=wt,
+            request=req_second,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
+            merge_wt=wt,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         entry_second = InflightEntry(
@@ -21613,7 +21633,9 @@ class TestHeartbeatOccupancy:
 
         req_a = _make_request('hb-local', 'hb-local', wt, config)
         item_a = SpeculativeItem(
-            request=req_a, merge_result=None, merge_wt=wt,
+            request=req_a,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
+            merge_wt=wt,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         entry_a = InflightEntry(
@@ -21625,7 +21647,9 @@ class TestHeartbeatOccupancy:
 
         req_b = _make_request('hb-laptop', 'hb-laptop', wt, config)
         item_b = SpeculativeItem(
-            request=req_b, merge_result=None, merge_wt=wt,
+            request=req_b,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
+            merge_wt=wt,
             base_sha='dead' * 10, speculative=False, skip_verify=False,
         )
         entry_b = InflightEntry(
