@@ -25,8 +25,37 @@ as test_merge_request_ledger.py.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.merge_types import MergeOutcome, MergeRequest
+
+# ---------------------------------------------------------------------------
+# Helpers (per-file duplication convention — see test_merge_request_ledger.py)
+# ---------------------------------------------------------------------------
+
+
+def _make_pending_request(task_id: str = 'pred') -> MergeRequest:
+    """Build a bare MergeRequest with a fresh, still-pending result Future.
+
+    Mirrors test_merge_request_ledger.py's _make_request helper —
+    worktree/config/module_configs are irrelevant to SpeculationController,
+    which only reads task_id/result off a predecessor request.
+    """
+    return MergeRequest(
+        task_id=task_id,
+        branch=f'task/{task_id}',
+        worktree=Path('/tmp/unused'),
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=OrchestratorConfig(),
+        result=asyncio.get_running_loop().create_future(),
+        lane='normal',
+    )
+
 
 # ---------------------------------------------------------------------------
 # step-1 RED / step-2 GREEN: initial state + is_idle/take_prefetched/base_for/
@@ -101,3 +130,106 @@ class TestSpeculationControllerInitialState:
         assert snap['pending_spec_base'] is None
         assert snap['pending_predecessor_task_id'] is None
         assert snap['slot_available'] == depth
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: on_dequeue ATTACH/FALLBACK four-condition rule
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOnDequeueAttachFallback:
+    """SpeculationController.on_dequeue ATTACH/FALLBACK rule (task 1993 step-3).
+
+    RED until step-4 GREEN implements on_dequeue.
+    """
+
+    async def _seeded_controller(self, depth: int = 1):
+        """Build a controller seeded into the late-arrival 'retain' state.
+
+        A permit is acquired directly on the real semaphore (mirrors what
+        acquire_for_lookahead will do once it exists — step-6) and `_held`/
+        `pending_spec_base`/`pending_predecessor` are set directly (mirrors
+        what on_lookahead_pending will do once it exists — step-6). Seeding
+        this way keeps this test's only RED dependency on the
+        not-yet-implemented `on_dequeue` itself.
+        """
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        slot = asyncio.Semaphore(depth)
+        await slot.acquire()  # simulate the permit already held by the merger
+        controller = SpeculationController(slot=slot, depth=depth)
+        controller._held = True
+        pred = _make_pending_request('pred')
+        controller.pending_spec_base = 'PRED_SHA'
+        controller.pending_predecessor = pred
+        return controller, slot, pred
+
+    async def test_attach_when_all_four_conditions_hold(self) -> None:
+        controller, slot, _pred = await self._seeded_controller()
+        new_req = _make_pending_request('new')
+
+        result = controller.on_dequeue(new_req)
+
+        assert result == 'PRED_SHA'
+        assert controller.spec_base == 'PRED_SHA'
+        assert controller.held_by_merger == 1
+        assert slot._value == 0  # unchanged — permit retained/transferred
+        assert controller.pending_spec_base is None
+        assert controller.pending_predecessor is None
+
+    async def test_fallback_when_pending_spec_base_is_none(self) -> None:
+        controller, slot, _pred = await self._seeded_controller()
+        controller.pending_spec_base = None  # break condition (a)
+        new_req = _make_pending_request('new')
+
+        result = controller.on_dequeue(new_req)
+
+        assert result is None
+        assert controller.spec_base is None
+        assert controller.pending_spec_base is None
+        assert controller.pending_predecessor is None
+        assert controller.held_by_merger == 0
+        assert slot._value == 1  # released
+
+    async def test_fallback_when_not_held(self) -> None:
+        controller, slot, _pred = await self._seeded_controller()
+        controller._held = False  # break condition (b)
+        new_req = _make_pending_request('new')
+
+        result = controller.on_dequeue(new_req)
+
+        assert result is None
+        assert controller.spec_base is None
+        assert controller.pending_spec_base is None
+        assert controller.pending_predecessor is None
+        assert controller.held_by_merger == 0
+        assert slot._value == 0  # not held -> no release (avoid over-release)
+
+    async def test_fallback_when_pending_predecessor_is_none(self) -> None:
+        controller, slot, _pred = await self._seeded_controller()
+        controller.pending_predecessor = None  # break condition (c)
+        new_req = _make_pending_request('new')
+
+        result = controller.on_dequeue(new_req)
+
+        assert result is None
+        assert controller.spec_base is None
+        assert controller.pending_spec_base is None
+        assert controller.pending_predecessor is None
+        assert controller.held_by_merger == 0
+        assert slot._value == 1  # released
+
+    async def test_fallback_when_predecessor_already_done(self) -> None:
+        controller, slot, pred = await self._seeded_controller()
+        pred.result.set_result(MergeOutcome('done'))  # break condition (d)
+        new_req = _make_pending_request('new')
+
+        result = controller.on_dequeue(new_req)
+
+        assert result is None
+        assert controller.spec_base is None
+        assert controller.pending_spec_base is None
+        assert controller.pending_predecessor is None
+        assert controller.held_by_merger == 0
+        assert slot._value == 1  # released
