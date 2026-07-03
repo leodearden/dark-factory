@@ -7098,26 +7098,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # chain-remerge logic, host acquire, verify task launch).
                 try:
                     entry = await self._dispatch_item(item)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
                 except BaseException as exc:
                     # Unexpected dispatch error (e.g. _remerge raised; _git_ops
                     # unavailable).  Resolve the request and continue the loop.
-                    req = item.request
-                    if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                        logger.exception(
-                            'Task %s: unexpected dispatch error', req.task_id
-                        )
-                        if item.merge_wt is not None:
-                            with contextlib.suppress(BaseException):
-                                await self._cleanup_owned_merge_worktree(item.merge_wt)
-                        if not req.result.done():
-                            req.result.set_result(MergeOutcome(
-                                'blocked', reason=f'Verifier error: {exc}',
-                            ))
-                        if item.speculative:
-                            self._speculation_slot.release()
-                        self._n_failed = True
-                        continue
-                    raise
+                    logger.exception(
+                        'Task %s: unexpected dispatch error', item.request.task_id
+                    )
+                    await self._resolve_and_release(
+                        item, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                        chain_failed=True,
+                    )
+                    continue
 
                 if entry is None:
                     # No host available: put item back on _redispatch.
@@ -7144,19 +7137,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if entry.verify_task is None:
                     try:
                         await self._finalize_inflight(entry)
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
                     except BaseException as exc:
-                        if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                            req_pt = entry.item.request
-                            logger.exception(
-                                'Task %s: unexpected passthrough finalize error', req_pt.task_id
-                            )
-                            if not req_pt.result.done():
-                                req_pt.result.set_result(MergeOutcome(
-                                    'blocked', reason=f'Verifier error: {exc}',
-                                ))
-                            self._n_failed = True
-                        else:
-                            raise
+                        logger.exception(
+                            'Task %s: unexpected passthrough finalize error',
+                            entry.item.request.task_id,
+                        )
+                        await self._resolve_and_release(
+                            entry, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                            chain_failed=True, release_resources=False,
+                        )
                     continue  # don't append to _inflight; fetch next item
 
                 self._inflight.append(entry)
@@ -7180,22 +7171,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 _head_advanced = False
                 try:
                     _head_advanced = await self._finalize_inflight(head)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
                 except BaseException as exc:
-                    if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                        req = head.item.request
-                        logger.exception(
-                            'Task %s: unexpected finalize error', req.task_id
-                        )
-                        # _finalize_inflight's finally already released the lease
-                        # and speculation slot; we just need to resolve the future
-                        # and mark the chain as failed.
-                        if not req.result.done():
-                            req.result.set_result(MergeOutcome(
-                                'blocked', reason=f'Verifier error: {exc}',
-                            ))
-                        self._n_failed = True
-                    else:
-                        raise
+                    logger.exception(
+                        'Task %s: unexpected finalize error', head.item.request.task_id
+                    )
+                    # _finalize_inflight's finally already released the lease
+                    # and speculation slot; the chokepoint just resolves the
+                    # future and marks the chain as failed.
+                    await self._resolve_and_release(
+                        head, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                        chain_failed=True, release_resources=False,
+                    )
 
                 # HEAD-FAILURE CASCADE (γ step-20): when the head fails, abort
                 # all downstream in-flight verifies, re-merge each item onto
@@ -7324,35 +7312,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         except (asyncio.CancelledError, KeyboardInterrupt):
                             raise
                         except BaseException as _cascade_exc:
-                            _req = _entry.item.request
                             logger.exception(
-                                'Task %s: unexpected cascade error', _req.task_id
+                                'Task %s: unexpected cascade error',
+                                _entry.item.request.task_id,
                             )
-                            if not _req.result.done():
-                                _req.result.set_result(MergeOutcome(
+                            # In-body release already ran (_entry_released=True)
+                            # UNLESS it raised before completing (e.g.
+                            # cancel_and_release itself raised) — in which case
+                            # the chokepoint performs the best-effort release
+                            # (lease/slot/merge-worktree) to avoid a leak.
+                            await self._resolve_and_release(
+                                _entry, MergeOutcome(
                                     'blocked',
                                     reason=f'Verifier cascade error: {_cascade_exc}',
-                                ))
-                            if not _entry_released:
-                                # In-body release did not run (e.g. cancel_and_release
-                                # itself raised): best-effort release here to avoid
-                                # a lease/slot or merge-worktree leak.
-                                if (
-                                    _entry.lease is not None
-                                    and _allocator is not None
-                                ):
-                                    with contextlib.suppress(BaseException):
-                                        await _allocator.cancel_and_release(
-                                            _entry.lease
-                                        )
-                                if _entry.merge_wt is not None:
-                                    with contextlib.suppress(BaseException):
-                                        await self._cleanup_owned_merge_worktree(
-                                            _entry.merge_wt
-                                        )
-                                if _entry.was_speculative:
-                                    self._speculation_slot.release()
-                            self._n_failed = True
+                                ),
+                                chain_failed=True,
+                                release_resources=not _entry_released,
+                                cancel_lease=True,
+                            )
                             continue
                     # Signal dispatch that any not-yet-dispatched followers also
                     # need re-merge (chain_invalidated guard in _dispatch_item).
@@ -7380,24 +7357,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 try:
                     entry = await self._dispatch_item(item)
-                except BaseException as exc:
-                    req = item.request
-                    if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                        logger.exception(
-                            'Task %s: unexpected dispatch error (blocking get)', req.task_id
-                        )
-                        if item.merge_wt is not None:
-                            with contextlib.suppress(BaseException):
-                                await self._cleanup_owned_merge_worktree(item.merge_wt)
-                        if not req.result.done():
-                            req.result.set_result(MergeOutcome(
-                                'blocked', reason=f'Verifier error: {exc}',
-                            ))
-                        if item.speculative:
-                            self._speculation_slot.release()
-                        self._n_failed = True
-                        continue
+                except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
+                except BaseException as exc:
+                    logger.exception(
+                        'Task %s: unexpected dispatch error (blocking get)',
+                        item.request.task_id,
+                    )
+                    await self._resolve_and_release(
+                        item, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                        chain_failed=True,
+                    )
+                    continue
 
                 if entry is None:
                     # No host (shouldn't happen with empty _inflight on a single-host
@@ -7411,20 +7382,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if entry.verify_task is None:
                     try:
                         await self._finalize_inflight(entry)
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        raise
                     except BaseException as exc:
-                        if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                            req_pt = entry.item.request
-                            logger.exception(
-                                'Task %s: unexpected passthrough finalize error '
-                                '(blocking-get path)', req_pt.task_id,
-                            )
-                            if not req_pt.result.done():
-                                req_pt.result.set_result(MergeOutcome(
-                                    'blocked', reason=f'Verifier error: {exc}',
-                                ))
-                            self._n_failed = True
-                        else:
-                            raise
+                        logger.exception(
+                            'Task %s: unexpected passthrough finalize error '
+                            '(blocking-get path)', entry.item.request.task_id,
+                        )
+                        await self._resolve_and_release(
+                            entry, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                            chain_failed=True, release_resources=False,
+                        )
                     continue  # restart outer loop → fill loop picks up next item
 
                 # Real verify entry: append to _inflight and loop back to fill.
@@ -7700,6 +7668,112 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
         if not req.result.done():
             req.result.set_result(outcome)
+
+    async def _resolve_and_release(
+        self,
+        entry_or_item: InflightEntry | SpeculativeItem,
+        outcome: MergeOutcome,
+        *,
+        chain_failed: bool,
+        release_resources: bool = True,
+        cancel_lease: bool = False,
+    ) -> None:
+        """Single resolve-and-release chokepoint for the _verifier_loop
+        BaseException handlers (task 1991 / MQ-refactor zeta).
+
+        Unifies the six near-identical except-handler bodies that used to
+        inline: resolve the caller's Future, release the host lease (release
+        vs cancel_and_release), clean up an owned merge worktree, release the
+        speculation slot, and flag the chain as failed.  Each call site keeps
+        its own ``logger.exception`` message and its own
+        ``except (CancelledError, KeyboardInterrupt): raise`` clause; only the
+        resolve-and-release tail is centralised here.
+
+        *entry_or_item* is normalised to (req, lease, merge_wt, slot_held):
+        an ``InflightEntry`` carries ``lease``/``merge_wt``/``was_speculative``
+        (post-dispatch state); a bare ``SpeculativeItem`` has no lease yet
+        (pre-dispatch state) and uses ``merge_wt``/``speculative`` directly.
+
+        *release_resources* controls whether this call performs any release
+        at all.  It must be ``False`` for the POST-finalize handlers
+        (passthrough-finalize x2, finalize-head): ``_finalize_inflight``'s own
+        ``finally`` clause already released the lease and speculation slot on
+        every exit path including exceptions, so releasing again here would
+        double-release.  It defaults to ``True`` for the PRE-finalize dispatch
+        handlers, which own the item's resources outright.
+
+        *cancel_lease* selects ``cancel_and_release`` over plain ``release``
+        (mirrors ``_finalize_inflight``'s own ``_cancel_release`` switch) —
+        used by the cascade handler, which aborts a still-verifying entry.
+
+        *chain_failed* is guarded (``if chain_failed: self._n_failed = True``)
+        rather than assigned unconditionally, so a caller can never reset
+        ``_n_failed`` back to False.  All six current call sites pass True.
+
+        Ordering (resolve-before-release): step 1 always resolves the
+        caller's Future before step 2 releases resources.  This matches the
+        pre-refactor cascade except-handler exactly, but reorders the
+        PRE-finalize dispatch handlers, which used to clean the merge
+        worktree BEFORE resolving the Future.  That reorder is intentional
+        and safe: the merge worktree is a worker-internal implementation
+        detail (tracked only in ``_owned_merge_worktrees``) that is never
+        exposed to the ``req.result`` waiter, so a waiter woken by the
+        just-resolved Future cannot observe the not-yet-cleaned worktree or
+        not-yet-released lease/slot.  No consumer or test depends on
+        intra-handler await ordering between resolve and release.
+
+        Abandoned-drop semantics: step 1 resolves via
+        ``_resolve_or_drop_abandoned`` — i.e. ``_request_abandoned``, which
+        is ``True`` iff ``req.result.cancelled()`` — rather than each site's
+        prior inline ``if not req.result.done(): req.result.set_result(...)``.
+        The two are behaviourally IDENTICAL in every reachable state, not
+        merely a compatible superset: ``cancelled()`` implies ``done()``, so
+        when the Future is already cancelled both the old inline check and
+        the new abandoned-check skip ``set_result``; when it is not
+        cancelled, ``_resolve_or_drop_abandoned`` falls through to that same
+        ``if not done(): set_result(...)``.  The sole producer of the
+        cancelled state is ``PendingMergeRegistry.detach()``
+        (merge_types.py), which implements "the waiter abandoned this
+        request" as cancelling ``req.result`` directly — there is no
+        separate detached-but-not-cancelled flag anywhere in this codebase,
+        so that intermediate state is not reachable.  The only observable
+        difference is a new INFO log line on the abandoned path.  This
+        equivalence is intentional and holds uniformly across all six call
+        sites now unified behind this chokepoint.
+
+        This is also the intended hook surface for task eta's liveness-ledger
+        'resolved' transition: every _verifier_loop error-resolution path now
+        funnels through this one coroutine.
+        """
+        if isinstance(entry_or_item, InflightEntry):
+            item = entry_or_item.item
+            lease: Any | None = entry_or_item.lease
+            merge_wt = entry_or_item.merge_wt
+            slot_held = entry_or_item.was_speculative
+        else:
+            item = entry_or_item
+            lease = None
+            merge_wt = entry_or_item.merge_wt
+            slot_held = entry_or_item.speculative
+        req = item.request
+
+        self._resolve_or_drop_abandoned(req, outcome)
+
+        if release_resources:
+            if lease is not None and self._host_allocator is not None:
+                with contextlib.suppress(BaseException):
+                    if cancel_lease:
+                        await self._host_allocator.cancel_and_release(lease)
+                    else:
+                        await self._host_allocator.release(lease)
+            if merge_wt is not None:
+                with contextlib.suppress(BaseException):
+                    await self._cleanup_owned_merge_worktree(merge_wt)
+            if slot_held:
+                self._speculation_slot.release()
+
+        if chain_failed:
+            self._n_failed = True
 
     async def _abort_remote_verify(self, lease: Any, task_id: str) -> None:
         """Fire remote cancel-verify while *_inflight_request_id* is still live.
