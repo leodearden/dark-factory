@@ -66,6 +66,11 @@ orchestrator/data/
 recon-watch/close-manifest*.json
 # /review skill phase outputs (review/briefing.yaml stays tracked):
 review/reports/
+# Editor/tool temp-backup files (e.g. foo.py.tmp.<pid>.<hash>) — one was
+# accidentally committed as test_merge_queue_concurrent_verify.py.tmp.* (task 1990):
+*.tmp.*
+# Same, scoped explicitly to Python source backups:
+*.py.tmp.*
 
 # ── Node / codex CLI install (ad-hoc, not a project dependency) ──────
 node_modules/
