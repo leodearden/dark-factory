@@ -3863,6 +3863,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # = 0.01) for fast, deterministic abort-path coverage.  Mirrors the MAX_*
     # monkeypatch convention above.
     VERIFY_ABANDON_POLL_SECS: float = 10.0
+    # MQ-invariants iota (task 1994): grace window (seconds, wall-clock mtime)
+    # before an unregistered on-disk `_merge-*` worktree is flagged by
+    # worktree_ledger_violations().  Tactical default sits strictly between
+    # the shipped cold merge-verify budget
+    # (merge_verify_cold_command_timeout_secs = 7200 s, defaults.yaml) — so a
+    # legitimately slow cold-shadow/drift-check worktree never trips a false
+    # alarm — and the reaper's INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+    # (10800 s) — so a genuine leak is always caught well before the reaper
+    # would otherwise silently absorb it.  Kept as a class attribute so tests
+    # can monkeypatch (e.g. worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = 100.0)
+    # for fast, deterministic coverage.  Mirrors the MAX_*/
+    # VERIFY_ABANDON_POLL_SECS monkeypatch convention above.
+    RESOURCE_AUDIT_WORKTREE_GRACE_SECS: float = 9000.0
 
     def __init__(
         self,
@@ -4989,6 +5002,81 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             violations.append(
                 f'speculation_accounting_violations: merge-ahead-cap check raised: {exc}'
             )
+
+        return violations
+
+    def worktree_ledger_violations(self, *, now: float | None = None) -> list[str]:
+        """Return I6 worktree-ledger violations as human-readable strings.
+
+        Empty list → every on-disk ``_merge-*`` worktree is accounted for.
+        Synchronously scans ``git_ops.worktree_base`` via ``os.scandir`` —
+        NOT the async git-based ``GitOps._iter_merge_worktrees`` — because
+        :meth:`snapshot` (this audit's primary caller) is strictly
+        synchronous (no await, no lock).  A direct filesystem scan is also
+        strictly-more-correct for leak detection: it catches worktrees git
+        itself no longer tracks.
+
+        Collects direct-child directories of ``worktree_base`` whose name
+        starts with ``'_merge-'``, excluding the persistent warm worktree
+        (:data:`PERSISTENT_MERGE_WORKTREE_NAME`, ``'_merge-verify'`` — reset
+        in place every verify, never a leak).  Any such directory absent from
+        :attr:`_owned_merge_worktrees` (this worker's liveness ledger; see
+        its declaration for the full scope note) is a candidate leak, but is
+        only flagged once its mtime age exceeds
+        :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`.  The grace window is the
+        exemption mechanism for short-lived UNREGISTERED ``_merge-<uuid>``
+        worktrees created by cold-shadow verify and drift-check (cleaned up
+        in their caller's ``finally``, never registered) and for ordinary
+        register/deregister races; a persistent leak eventually trips once
+        it outlives the window.
+
+        Returns ``[]`` immediately when ``not self._running``: mirrors
+        :meth:`speculation_accounting_violations` — ``stop()`` drains and
+        cleans up owned worktrees, so auditing during/after shutdown would
+        report spurious violations.
+
+        *now* is injectable for deterministic tests; defaults to
+        ``time.time()``.
+
+        Pure/synchronous (no await, no git subprocess). Fail-safe: never
+        raises; any unexpected exception is caught and surfaced as a
+        violation string, mirroring :meth:`two_layer_invariants`'s idiom.
+        """
+        if not self._running:
+            return []
+
+        violations: list[str] = []
+        try:
+            base = getattr(self._git_ops, 'worktree_base', None)
+            if base is None or not base.is_dir():
+                return []
+            effective_now = now if now is not None else time.time()
+            grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+            owned = {p.resolve() for p in self._owned_merge_worktrees}
+            with os.scandir(base) as it:
+                candidates = list(it)
+            for entry in candidates:
+                name = entry.name
+                if not name.startswith('_merge-') or name == PERSISTENT_MERGE_WORKTREE_NAME:
+                    continue
+                try:
+                    if not entry.is_dir():
+                        continue
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                path = Path(entry.path).resolve()
+                if path in owned:
+                    continue
+                age = effective_now - mtime
+                if age > grace:
+                    violations.append(
+                        f'unregistered on-disk merge worktree {path} '
+                        f'(age {age:.0f}s > grace {grace:.0f}s) absent from '
+                        f'owned ledger — possible leak'
+                    )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(f'worktree_ledger_violations: check raised: {exc}')
 
         return violations
 
