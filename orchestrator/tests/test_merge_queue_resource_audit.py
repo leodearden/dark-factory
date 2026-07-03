@@ -616,8 +616,8 @@ def _make_request(task_id: str, branch: str, worktree: Path) -> MergeRequest:
         pre_rebased=False,
         task_files=None,
         module_configs=[],
-        config=None,
-        result=concurrent.futures.Future(),
+        config=None,  # type: ignore[arg-type]
+        result=concurrent.futures.Future(),  # type: ignore[arg-type]
         lane='normal',
     )
 
