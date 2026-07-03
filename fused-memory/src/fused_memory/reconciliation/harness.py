@@ -382,7 +382,7 @@ class ReconciliationHarness:
         # harness.py:741.  If single-orphan restart churn must also alarm,
         # count recent dead_owner_shielded _error records from the journal over
         # the window instead of the in-memory deque.
-        self._dead_owner_suppressions: deque[tuple[datetime, str]] = deque()
+        self._dead_owner_suppressions: deque[tuple[datetime, str, str | None]] = deque()
         # Timestamp of the last storm escalation — None means never fired.
         self._last_suppression_storm_escalation_at: datetime | None = None
 
@@ -1119,7 +1119,7 @@ class ReconciliationHarness:
                 # Operators who need the per-tick total should check the INFO
                 # log lines ("recon_stale_run suppressed: dead_owner_shielded
                 # orphan recovered") emitted for every suppression regardless.
-                storm = self._record_dead_owner_suppression(run.project_id)
+                storm = self._record_dead_owner_suppression(run.project_id, run.instance_id)
                 if storm is not None:
                     window_min = storm['window_seconds'] / 60
                     proj_label = ', '.join(storm['projects']) or run.project_id
@@ -1146,7 +1146,7 @@ class ReconciliationHarness:
     # ── Dead-owner suppression storm counter ─────────────────────────
 
     def _record_dead_owner_suppression(
-        self, project_id: str, *, now: datetime | None = None
+        self, project_id: str, instance_id: str | None = None, *, now: datetime | None = None
     ) -> dict | None:
         """Record one dead_owner_shielded suppression and check for a storm.
 
@@ -1166,7 +1166,7 @@ class ReconciliationHarness:
         effective_now = now if now is not None else datetime.now(UTC)
 
         # Append and prune the rolling window.
-        self._dead_owner_suppressions.append((effective_now, project_id))
+        self._dead_owner_suppressions.append((effective_now, project_id, instance_id))
         window = timedelta(seconds=self.config.dead_owner_suppression_storm_window_seconds)
         cutoff_ts = effective_now - window
         while self._dead_owner_suppressions and self._dead_owner_suppressions[0][0] < cutoff_ts:
@@ -1185,7 +1185,7 @@ class ReconciliationHarness:
 
         # Fire: set rate-limit timestamp and build the storm summary dict.
         self._last_suppression_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid in self._dead_owner_suppressions})
+        projects = sorted({pid for _, pid, _ in self._dead_owner_suppressions})
         return {
             'count': count,
             'window_seconds': self.config.dead_owner_suppression_storm_window_seconds,
