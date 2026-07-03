@@ -8,9 +8,13 @@ Steps covered:
   step-5 RED   — re-export shim identity + worker._request_ledger attribute
 
 This module intentionally imports only orchestrator.merge_types /
-orchestrator.config (NOT orchestrator.merge_queue) for the pure
-data-structure tests, per the plan's "narrow unit-test surface" design
-decision — RequestLedger has no git/GitOps dependency at all.
+orchestrator.config (NOT orchestrator.merge_queue) at module scope for the
+pure data-structure tests, per the plan's "narrow unit-test surface" design
+decision — RequestLedger has no git/GitOps dependency at all. The lone
+exception is step-5's shim-identity/worker-wiring check, which imports
+orchestrator.merge_queue LOCALLY inside its test methods (mirroring every
+other RED-until-GREEN symbol in this file) so a not-yet-wired name never
+breaks collection of the rest of the file.
 """
 
 from __future__ import annotations
@@ -20,7 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_types import MergeOutcome, MergeRequest
 
 # ---------------------------------------------------------------------------
@@ -339,3 +344,50 @@ class TestAlarmMergeRequestStuck:
         assert EventType.escalation_created in types
         events = [e for e in es.emitted if e['event_type'] == EventType.escalation_created]
         assert any('mr-evented' in str(e['data']) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: re-export shim identity + worker._request_ledger attribute
+# ---------------------------------------------------------------------------
+
+
+class TestReexportShimAndWorkerLedgerAttribute:
+    """merge_queue re-export shim identity + SpeculativeMergeWorker wiring
+    (task 1992 step-5).
+
+    RED until step-6 GREEN adds the re-export shim block to merge_queue.py
+    and initialises ``self._request_ledger`` in
+    ``SpeculativeMergeWorker.__init__``. merge_queue is imported LOCALLY here
+    (not at module scope — see module docstring) so this being RED does not
+    break collection of the rest of the file.
+    """
+
+    def test_shim_names_are_the_same_object_as_the_source_module(self):
+        import orchestrator.merge_request_ledger as ledger_module
+        from orchestrator.merge_queue import (
+            RequestLedger,
+            StuckRequest,
+            _alarm_merge_request_stuck,
+            _merge_request_stuck_sentinel,
+        )
+
+        assert RequestLedger is ledger_module.RequestLedger
+        assert StuckRequest is ledger_module.StuckRequest
+        assert _alarm_merge_request_stuck is ledger_module._alarm_merge_request_stuck
+        assert _merge_request_stuck_sentinel is ledger_module._merge_request_stuck_sentinel
+
+    def test_fresh_worker_has_an_empty_request_ledger(self, tmp_path: Path):
+        from orchestrator.merge_queue import RequestLedger, SpeculativeMergeWorker
+
+        git_config = GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+        )
+        git_ops = GitOps(git_config, tmp_path)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        assert isinstance(worker._request_ledger, RequestLedger)
+        assert worker._request_ledger.is_empty()
