@@ -251,3 +251,59 @@ class TestCheckRequestLiveness:
         assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 0
         assert len(fake_eq.submitted) == 0
         assert worker._request_ledger.is_empty()  # swept as resolved
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED / step-10 GREEN: heartbeat wiring runs the liveness check first
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHeartbeatWiringRunsLivenessCheckFirst:
+    """_maybe_log_queue_heartbeat must run the liveness check BEFORE its
+    depth==0 / rate-limit early-returns (task 1992 step-9).
+
+    RED until step-10 GREEN wires the call at the top of
+    _maybe_log_queue_heartbeat.
+    """
+
+    async def test_leaked_request_alarms_even_though_heartbeat_stays_idle(
+        self,
+        tmp_path: Path,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+        # High interval: this test's single call must not be the thing that
+        # rate-limits the depth heartbeat — depth==0 is what must short-circuit it.
+        worker._heartbeat_interval_s = 1_000_000.0
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('leaked-task', 'leaked-task', wt, config)
+
+        t0 = 1_000_000.0
+        worker._request_ledger.on_dequeue(req, now=t0)
+        # worker._queue is left EMPTY and the request is never dispatched into
+        # _inflight — it is absent from snapshot()['entries'] entirely, so
+        # snapshot()['depth'] == 0 (the leaked-request shape: fallen out of
+        # every pipeline structure).
+
+        far_future = t0 + 20_000.0  # past the 16200s (1.5x) default stuck threshold
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._maybe_log_queue_heartbeat(far_future)
+
+        assert result is False, 'heartbeat must stay idle — no depth to report (snapshot depth==0)'
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one stuck-request WARNING, got: {caplog.text}'
+        assert req.request_id in warnings[0].message
+
+        assert len(fake_eq.submitted) == 1
+        assert fake_eq.submitted[0].category == 'merge_request_stuck'
