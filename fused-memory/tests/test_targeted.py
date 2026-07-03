@@ -2549,3 +2549,71 @@ async def test_on_task_done_completion_journal_has_echo_used_provenance(
         f'Expected echo_used_provenance={expected_used_provenance}, '
         f'got detail: {completion_rows[0]["detail"]}'
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'get_task_kwargs',
+    [
+        pytest.param({'side_effect': RuntimeError('tm down')}, id='refetch_raises'),
+        pytest.param(
+            {'return_value': {'id': '7', 'title': 'T', 'metadata': {}}},
+            id='refetch_no_provenance',
+        ),
+    ],
+)
+async def test_on_task_done_provenance_refetch_fails_open(
+    reconciler, mock_memory_service, mock_taskmaster, journal, get_task_kwargs,
+):
+    """A hiccup while re-fetching the live task for done_provenance (or simply
+    finding none) must never drop the fast-path completion echo — it must fail
+    open to the existing raw-description behavior, exactly as if no provenance
+    existed. Before task 2049 step-8 hardens `_fetch_done_provenance`, an
+    unguarded re-fetch let a RuntimeError from `self.taskmaster.get_task`
+    propagate out into `_on_task_done`'s broad outer except, which logs a
+    warning and skips the completion write entirely — silently dropping the
+    fast-path echo instead of merely losing the provenance preference."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(**get_task_kwargs)
+
+    result = await reconciler.reconcile_task(
+        task_id='7', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '7', 'title': 'T', 'status': 'in-progress', 'description': 'DESC text'},
+    )
+
+    # (a) the fast-path completion fact WAS written despite the re-fetch hiccup
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1, 'Expected a fast-path add_memory call despite the provenance re-fetch failing'
+    first_call = calls[0]
+
+    # (b) fail-open preserves the current description-appended behavior
+    content = first_call.kwargs.get('content')
+    assert content is not None and 'DESC text' in content, (
+        f'Expected fail-open content to still contain the description, got: {content!r}'
+    )
+
+    # (c) no truthy echo_used_provenance on fail-open
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert not metadata.get('echo_used_provenance'), (
+        f'fail-open write must not carry a truthy echo_used_provenance, got metadata: {metadata}'
+    )
+
+    # (d) completion-fact audit action is preserved
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+    # (e) the journal row reflects echo_used_provenance False, mirroring
+    # test_on_task_done_fails_open_when_metadata_query_raises's journal check.
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    completion_rows = [
+        a for a in actions
+        if a['operation'] == 'add_memory' and a['detail'].get('type') == 'completion_fast'
+    ]
+    assert len(completion_rows) == 1, (
+        f'Expected exactly one completion_fast journal row, got: {completion_rows}'
+    )
+    assert completion_rows[0]['detail'].get('echo_used_provenance') is False, (
+        f'Expected echo_used_provenance=False on the fail-open path, '
+        f'got detail: {completion_rows[0]["detail"]}'
+    )
