@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
 
 from escalation import sweep as _sweep
 from escalation.dedupe import DedupeConfig
@@ -51,6 +52,34 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     through to the downgrade path instead of raising ``AttributeError``.
     """
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
+# Connection-capability header names — resolve_issue enforcement
+# (escalation-connection-capability-guard-prd.md, task alpha).
+# ---------------------------------------------------------------------------
+# No pre-existing house header convention was found in this codebase (a grep
+# turned up only mcp-session-id / content-type in HTTP tests), so these adopt
+# the PRD's proposed names. get_http_headers() lowercases every header key,
+# so these constants are lowercase; HTTP header names are themselves
+# case-insensitive on the wire, so a client may send any letter-casing.
+_LEVELS_HEADER = 'x-escalation-levels'
+_IDENTITY_HEADER = 'x-escalation-identity'
+
+
+def _parse_levels(raw: str) -> set[int]:
+    """Parse a comma-separated X-Escalation-Levels header value into a set of ints.
+
+    Whitespace around each token is tolerated (e.g. ``"0, 1"``). Raises
+    ``ValueError`` — fail-closed — when the header is empty/whitespace-only,
+    any token is empty (e.g. ``"0,,1"``), or any token is not a non-negative
+    integer (rejects negatives like ``"-1"`` and floats like ``"1.0"``), so a
+    malformed restriction is never silently treated as "no restriction".
+    """
+    tokens = [t.strip() for t in raw.split(',')]
+    if not tokens or any(not t or not t.isdigit() for t in tokens):
+        raise ValueError(f'invalid X-Escalation-Levels value: {raw!r}')
+    return {int(t) for t in tokens}
 
 
 def _get_merge_worker(harness: Any | None) -> Any | None:
@@ -532,6 +561,42 @@ def create_server(
             }
         if action not in RESOLVE_ACTIONS:
             return {'error': f'invalid action {action!r}; expected one of {list(RESOLVE_ACTIONS)}'}
+
+        # Connection-capability gate (escalation-connection-capability-guard-prd.md,
+        # task alpha). get_http_headers() returns {} outside an ASGI request context
+        # (in-process tool.fn() calls, stdio transport), so this gate is a no-op for
+        # those callers — default-open is preserved byte-for-byte.
+        headers = get_http_headers()
+        levels_raw = headers.get(_LEVELS_HEADER)
+        if levels_raw is not None:
+            try:
+                parsed = _parse_levels(levels_raw)
+            except ValueError:
+                return {
+                    'error': (
+                        f'unparseable X-Escalation-Levels header {levels_raw!r}; '
+                        'expected comma-separated non-negative ints'
+                    ),
+                    'code': 'bad_capability_header',
+                }
+            target = queue.get(escalation_id)
+            if target is None:
+                return {'error': f'Escalation {escalation_id} not found'}
+            if target.level not in parsed:
+                return {
+                    'error': (
+                        f'connection not permitted to change level-{target.level} '
+                        'escalations'
+                    ),
+                    'code': 'level_forbidden',
+                }
+        identity = headers.get(_IDENTITY_HEADER)
+        if identity is not None:
+            # Server-attributed identity overrides the tool arg for both the
+            # park stamp (below) and the resolve call further down — a caller
+            # cannot spoof resolved_by once the connection asserts an identity.
+            resolved_by = identity
+
         if action == 'park':
             # Version-a: park keeps the escalation open at L2.
             # queue.park() handles all stamping (level=2, resolution_action='park',
