@@ -5506,13 +5506,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # existing keys.
             'speculation': {
                 **self._speculation_controller.snapshot(),
-                'inflight_speculative': (
-                    sum(1 for _ie in self._inflight if _ie.was_speculative)
-                    + sum(
-                        1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
-                        if _item is not None and _item.speculative
-                    )
-                ),
+                'inflight_speculative': self._inflight_speculative_count(),
+            },
+            # ι=1994 additive key: resource-conservation audits (I4 permits/
+            # caps + I6 worktree ledger). Each sub-key is the direct list[str]
+            # result of the correspondingly-named audit method — empty list =
+            # healthy. Pure synchronous read — no await, no git calls (see
+            # speculation_accounting_violations / worktree_ledger_violations
+            # docstrings for what each identity checks). No collision with
+            # existing keys.
+            'resource_audit': {
+                'speculation_accounting': self.speculation_accounting_violations(),
+                'worktree_ledger': self.worktree_ledger_violations(),
             },
         }
 
