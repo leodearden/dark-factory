@@ -1563,8 +1563,10 @@ def create_server(
 
         The git-authority tier (Tier-3.5) fires when the durable tiers miss.
         It derives the full branch ref from the passed ``branch`` or
-        ``task_id`` (prepending ``orch_config.git.branch_prefix`` unless the
-        value already starts with the prefix), then:
+        ``task_id`` via ``canonical_queued_branch_name`` (prepending
+        ``orch_config.git.branch_prefix`` unless the value already starts
+        with the prefix — the same shape-tolerant rule shared with
+        ``recover_pending_merges``), then:
         - If the branch still exists: calls ``is_ancestor(tip, main)``.
           An additional ``tip != main_tip`` guard prevents a false-positive
           ``done`` when the branch sits at exactly main's HEAD with no extra
@@ -1662,8 +1664,15 @@ def create_server(
             key = branch if branch is not None else task_id
             if key is not None:
                 try:
+                    # Runtime-only reverse import: orchestrator depends on escalation,
+                    # not vice versa (mirrors the pattern above) — unresolvable in
+                    # escalation's standalone typecheck env, hence the suppression.
+                    from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
+                        canonical_queued_branch_name,
+                    )
+
                     prefix = orch_config.git.branch_prefix
-                    full_branch = key if key.startswith(prefix) else f'{prefix}{key}'
+                    full_branch = canonical_queued_branch_name(key, prefix)
                     tip = await git_ops.resolve_branch_sha(full_branch)
                     main_tip = await git_ops.resolve_branch_sha(orch_config.git.main_branch)
                     if (tip is not None and tip != main_tip
