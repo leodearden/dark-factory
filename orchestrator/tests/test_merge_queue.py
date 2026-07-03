@@ -4343,12 +4343,20 @@ class TestSpeculativeMergeWorker:
         worker._remerge = AsyncMock(return_value=remerged_item)  # type: ignore[method-assign]
 
         # token2 is discarded by the n_failed short-circuit and replaced by
-        # worker._remerge's mocked return value — its own shape is unread on
-        # the exercised path, so any valid DECIDED shape is a safe filler.
+        # worker._remerge's mocked return value — it must be a REAL item
+        # (immediate_outcome=None), not DECIDED: _dispatch_item's
+        # immediate-outcome branch returns a passthrough entry BEFORE the
+        # chain-invalidation check ever runs, so a DECIDED token2 would skip
+        # _remerge entirely. merge_wt/merge_result content is unread on the
+        # exercised path (mocked _remerge only takes req + started_monotonic),
+        # so a dummy worktree path (established pattern elsewhere in this file)
+        # is a safe filler.
+        dummy_wt2 = git_ops.project_root / '.worktrees' / 'vot-b2-stale'
         token2 = SpeculativeItem(
-            request=req2, merge_result=None, merge_wt=None,
+            request=req2,
+            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=dummy_wt2),
+            merge_wt=dummy_wt2,
             base_sha='stalebase', speculative=True, skip_verify=False,
-            immediate_outcome=MergeOutcome('conflict'),
         )
 
         await worker._verifier_queue.put(token1)

@@ -17,7 +17,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.git_ops import MergeResult
-from orchestrator.merge_queue import InflightEntry, InflightVerifyResult, MergeOutcome, SpeculativeItem
+from orchestrator.merge_queue import (
+    InflightEntry,
+    InflightVerifyResult,
+    MergeOutcome,
+    SpeculativeItem,
+)
 
 # ── step-1: SpeculativeItem shape validation ─────────────────────────────────
 
@@ -111,7 +116,7 @@ class TestSpeculativeItemAlreadyDeliveredInvariant:
 
 
 def _entry_kwargs(item: SpeculativeItem, **overrides: object) -> dict:
-    base = dict(
+    base: dict[str, object] = dict(
         item=item,
         lease=None,
         verify_task=None,
