@@ -163,6 +163,29 @@ async def _resolve_over_http(
         return result.data
 
 
+async def _promote_over_http(
+    base_url: str,
+    *,
+    levels: str | None = None,
+    identity: str | None = None,
+    **promote_kwargs: Any,
+) -> dict[str, Any]:
+    """Call ``promote_to_l2`` over real HTTP, optionally with capability headers.
+
+    Mirrors ``_resolve_over_http`` — used to prove ``promote_to_l2`` is never
+    gated by X-Escalation-Levels (it is intentionally left ungated).
+    """
+    headers: dict[str, str] = {}
+    if levels is not None:
+        headers['X-Escalation-Levels'] = levels
+    if identity is not None:
+        headers['X-Escalation-Identity'] = identity
+    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
+    async with Client(transport) as client:
+        result = await client.call_tool('promote_to_l2', promote_kwargs)
+        return result.data
+
+
 # ---------------------------------------------------------------------------
 # TestHarnessSanity: fixture plumbing only — no capability-guard behaviour yet.
 # ---------------------------------------------------------------------------
@@ -258,4 +281,51 @@ class TestLevelForbidden:
         assert reread_c is not None
         assert reread_c.status in {'resolved', 'dismissed'}, (
             f'Expected archived status, got: {reread_c.status}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestIdentityOverride: X-Escalation-Identity overrides resolved_by on an
+# allowed resolve; promote_to_l2 stays ungated by X-Escalation-Levels.
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityOverride:
+    """X-Escalation-Identity wins over the resolved_by tool arg; promote_to_l2
+    is never gated by X-Escalation-Levels (contrast)."""
+
+    @pytest.mark.asyncio
+    async def test_identity_override_and_promote_ungated_contrast(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        base_url, queue = http_server
+
+        # (a) Identity header wins over the tool-arg resolved_by on an allowed resolve.
+        esc_l1 = _seed(queue, level=1, task_id='task-l1-identity')
+        result_a = await _resolve_over_http(
+            base_url, levels='0,1', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc_l1.id, resolution='fixed', action='resume',
+            resolved_by='spoofed-by-agent',
+        )
+        assert 'code' not in result_a and 'error' not in result_a, (
+            f'Expected a clean success (level 1 is in {{0,1}}), got: {result_a}'
+        )
+        reread = queue.get(esc_l1.id)
+        assert reread is not None
+        assert reread.status == 'resolved', f'Expected resolved, got: {reread.status}'
+        assert reread.resolved_by == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the header identity to win over the tool arg, got: {reread.resolved_by!r}'
+        )
+
+        # (b) Contrast: promote_to_l2 is never gated by X-Escalation-Levels.
+        m1 = _seed(queue, level=1, task_id='task-promote-m1')
+        m2 = _seed(queue, level=1, task_id='task-promote-m2')
+        result_b = await _promote_over_http(
+            base_url, levels='0,1',
+            task_id='task-promote-cluster', agent_role='escalation-watcher-auto',
+            member_ids=[m1.id, m2.id], root_cause='rc-α', evidence='e',
+            options=['A', 'B'], summary='cluster',
+        )
+        assert result_b.get('status') in {'created', 'updated'}, (
+            f"Expected status in {{'created','updated'}}, got: {result_b}"
         )
