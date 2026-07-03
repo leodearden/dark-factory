@@ -327,6 +327,37 @@ class TargetedReconciler:
 
         return any(statuses.get(str(t)) in ACTIVE_TASK_STATUSES for t in batch_ids)
 
+    async def _fetch_done_provenance(
+        self, task_id: str, project_root: str, task_before_task: dict,
+    ) -> dict | None:
+        """Return the current-transition ``metadata.done_provenance``, or None.
+
+        Task 2049: ``task_before_task`` (already ``_extract_task``-normalized)
+        is the PRE-transition snapshot — task_interceptor.py's
+        ``_apply_status_transition`` captures it BEFORE ``done_provenance`` is
+        persisted — so on a first done-transition it never carries provenance.
+        Prefer it anyway (cheap, and correct for any caller that already has
+        it), then fall back to re-fetching the live task, which reliably
+        observes the just-persisted provenance: the persist happens inside the
+        write-lock, before the fire-and-forget ``reconcile_task`` is scheduled.
+        """
+        metadata = task_before_task.get('metadata') if isinstance(task_before_task, dict) else None
+        if isinstance(metadata, dict):
+            provenance = metadata.get('done_provenance')
+            if isinstance(provenance, dict):
+                return provenance
+
+        fresh = await self.taskmaster.get_task(task_id, project_root=project_root)
+        fresh_task = _extract_task(fresh) if isinstance(fresh, dict) else fresh
+        if not isinstance(fresh_task, dict):
+            return None
+        fresh_metadata = fresh_task.get('metadata')
+        if isinstance(fresh_metadata, dict):
+            provenance = fresh_metadata.get('done_provenance')
+            if isinstance(provenance, dict):
+                return provenance
+        return None
+
     async def _on_task_done(
         self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
     ) -> dict:
@@ -367,12 +398,25 @@ class TargetedReconciler:
             )
 
             content = f"Task '{title}' completed."
+            used_provenance = False
             if not has_authoritative:
-                if description:
-                    content += f" {description}"
-                details = task.get('details', '')
-                if details:
-                    content += f"\nDetails: {details[:500]}"
+                # Task 2049: prefer the landed-outcome done_provenance over the
+                # raw description — on a first done-transition `description` is
+                # usually the pre-fix bug/problem statement, so echoing it
+                # verbatim reads as if the bug is still open. Fall back to the
+                # legacy description+details append when no usable provenance
+                # exists (legacy tasks / a failed provenance write).
+                provenance = await self._fetch_done_provenance(task_id, project_root, task)
+                outcome = _format_outcome_echo(provenance)
+                if outcome:
+                    content += f" {outcome}"
+                    used_provenance = True
+                else:
+                    if description:
+                        content += f" {description}"
+                    details = task.get('details', '')
+                    if details:
+                        content += f"\nDetails: {details[:500]}"
 
             write_metadata: dict[str, Any] = {
                 'source': _ECHO_SOURCE,
@@ -381,6 +425,8 @@ class TargetedReconciler:
             }
             if has_authoritative:
                 write_metadata['echo_suppressed_stale_description'] = True
+            if used_provenance:
+                write_metadata['echo_used_provenance'] = True
 
             written = await self._fenced_add_memory(
                 content=content,
