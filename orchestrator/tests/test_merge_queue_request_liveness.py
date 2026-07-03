@@ -449,3 +449,91 @@ class TestWedgedVerifyIntegration:
         assert worker._request_ledger.is_empty(), (
             'ledger must be swept empty after the request resolves cleanly'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-13 RED / step-14 GREEN: operator-halt requeue must not false-alarm
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestOperatorHaltRequeueNoFalseAlarm:
+    """A requeued request (operator halt / cascade) deliberately leaves its
+    Future pending — passive resolution can never see it as done. Without an
+    explicit ``on_requeued`` hook, a request parked on ``_queue`` for a long
+    halt would eventually false-alarm even though it is not actually stuck.
+
+    Drives the pre-dispatch operator-halt branch of ``_dispatch_item``
+    directly (bare worker, no real ``worker.run()`` loop) — one of the 3
+    ``put_nowait`` requeue sites; step-14 wires ``on_requeued`` at all 3.
+
+    RED until step-14 GREEN wires ``on_requeued`` at the 3 ``put_nowait`` sites.
+    """
+
+    async def test_predispatch_operator_halt_requeue_clears_ledger_and_restarts_clock(
+        self,
+        tmp_path: Path,
+        config: OrchestratorConfig,
+        git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import (
+            InflightStatus,
+            SpeculativeItem,
+            SpeculativeMergeWorker,
+        )
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('halt-task', 'halt-task', wt, config)
+
+        t0 = 1_000_000.0
+        worker._request_ledger.on_dequeue(req, now=t0)
+
+        item = SpeculativeItem(
+            request=req,
+            merge_result=MagicMock(),
+            merge_wt=tmp_path / 'merge_wt',
+            base_sha='deadbeef',
+            speculative=False,
+            skip_verify=False,
+        )
+
+        worker._operator_halt.set()
+        entry = await worker._dispatch_item(item)
+
+        assert entry is not None and entry.status == InflightStatus.REQUEUED_PREDISPATCH
+        assert not queue.empty(), 'req must be put back on _queue by the halt branch'
+
+        # The stale T0 entry must be gone — a legitimately halted/parked
+        # request must never age out while parked.
+        assert req.request_id not in worker._request_ledger.open_request_ids(), (
+            'requeue hook not wired — stale T0 ledger entry survives the '
+            'operator halt (RED until step-14)'
+        )
+
+        worker._check_request_liveness(t0 + 100_000.0, threshold_s=1000)
+        assert len(fake_eq.submitted) == 0, (
+            'parked request must never alarm — its ledger entry should be gone'
+        )
+
+        # Re-dequeue: the NEXT on_dequeue must re-arm with a FRESH dequeued_at.
+        t2 = t0 + 50_000.0
+        worker._request_ledger.on_dequeue(req, now=t2)
+
+        # No alarm shortly after re-dequeue — the age clock restarted from T2,
+        # NOT the stale T0 (which would already be ~50000s old at t2+10, and
+        # thus WOULD exceed threshold_s=1000 if on_dequeue had kept the stale
+        # T0 timestamp instead of re-arming fresh).
+        worker._check_request_liveness(t2 + 10.0, threshold_s=1000)
+        assert len(fake_eq.submitted) == 0, (
+            'age clock must restart from T2 on re-dequeue, not resume from the '
+            'stale T0 — a bug here would immediately alarm (RED until step-14)'
+        )
+
+        # Sanity: the re-armed entry genuinely is back in the ledger (not
+        # silently dropped by the requeue/re-dequeue sequence).
+        assert req.request_id in worker._request_ledger.open_request_ids()
