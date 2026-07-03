@@ -2089,6 +2089,14 @@ class TaskKnowledgeSync(BaseStage):
     # loudly in that case so test authors are reminded to set this attribute.
     _current_run_id: str | None = None
 
+    # Start of the current run's window (journal started_at) — stashed by
+    # assemble_payload() (task-2047 Gap 2) so run() can forward it to
+    # _sweep_stale_flag_markers's cross-cycle fp: marker predicate. Mirrors the
+    # _current_run_id stash pattern. Reset to None at the top of run() so a
+    # prior run's value can never leak into a cycle whose assemble_payload call
+    # is skipped or short-circuited (age-only sweep fallback in that case).
+    _run_window_start: datetime | None = None
+
     # Count of stale fixc markers swept by _sweep_stale_fixc_markers in the
     # current assemble_payload() call (task 1224).  Reset to 0 at the top of
     # run() so cross-invocation contamination is impossible.  Written to
@@ -2173,6 +2181,11 @@ class TaskKnowledgeSync(BaseStage):
         self._stale_missing_run_id_markers = 0
         self._rescued_in_window_markers = 0
         self._recon_report_systemic_polled = 0
+        # Reset BEFORE super().run() (task-2047 Gap 2) so a run whose
+        # assemble_payload call is skipped or short-circuited can never forward
+        # a PRIOR run's run_window_start into this cycle's sweep — falls back to
+        # the age-only sweep instead (backward compatible).
+        self._run_window_start = None
         # Amendment round 2 (reviewer finding: robustness): reset BEFORE
         # super().run() so a run whose assemble_payload call is skipped or
         # short-circuited can never leave a PRIOR run's combined_flags visible
@@ -2294,13 +2307,20 @@ class TaskKnowledgeSync(BaseStage):
             verified_count if verified_count is not None else 0
         )
 
-        # --- stage1_flag_marker age-based GC (task 1944) ---
+        # --- stage1_flag_marker age-based + cross-cycle fp: GC (task 1944, task-2047 Gap 2) ---
         # The stage1_flag_marker pool is written by Stage 1, not by this stage's
         # agent write, so post-write placement is correct (unlike the pre-write
         # summary pool trim above). Runs unconditionally on both full and
         # remediation paths so the pool is bounded every cycle. Explicit zero
         # so downstream consumers never need a .get(..., 0) fallback.
-        gc_swept = await _sweep_stale_flag_markers(self.memory, self.project_id, run_id)
+        # run_window_start forwards whatever assemble_payload stashed on
+        # self._run_window_start this cycle (None if assemble_payload was
+        # skipped/short-circuited or never reached the journal lookup) — the
+        # getattr default covers instances where run() itself was never called.
+        gc_swept = await _sweep_stale_flag_markers(
+            self.memory, self.project_id, run_id,
+            run_window_start=getattr(self, '_run_window_start', None),
+        )
         report.stats['stale_flag_markers_gc_swept'] = gc_swept
 
         return report
