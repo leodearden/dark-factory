@@ -1,43 +1,56 @@
 """I3 factory grep-guard for SpeculativeItem construction sites (task 1990).
 
-step-5  RED   — no production site is marked yet
-step-6  GREEN — the 15 legit factory sites carry the marker; the 2 former
-                CAS-loop hand-rebuilds are now dataclasses.replace(...) calls
-                and no longer match the grep pattern at all.
+The guard enforces PRD invariant I3 ("pipeline items are constructed only at
+whitelisted factory sites; all rebuilds go through ``dataclasses.replace``") as
+a structural inventory tripwire: it git-greps ``orchestrator/src/`` for real
+``SpeculativeItem(...)`` constructions and asserts the per-file inventory
+matches a pinned allowlist. A NEW construction — in particular a CAS-loop
+hand-rebuild that reconstructs the item field-by-field (the task-1928
+dropped-field bug class) instead of calling ``dataclasses.replace(item, ...)``
+— changes the inventory and fails the build, forcing a deliberate review.
 
-step-9  RED   — a stale editor/tool temp-backup file
-                (test_merge_queue_concurrent_verify.py.tmp.2390297.d4b2fa0bada8)
-                was accidentally committed by a WIP-snapshot commit.
-step-10 GREEN — the stray file is removed and .gitignore gains a rule, but
-                since an already-tracked (or force-added) backup file
-                bypasses .gitignore, this repo-hygiene test is the durable
-                recurrence guard.
+This is deliberately NOT a comment-marker check: it cannot be satisfied by
+annotating a construction line, and it locks no wording. Shape correctness is
+guarded independently by ``SpeculativeItem.__post_init__`` (I2); this guard
+covers the orthogonal "no un-vetted new construction site" property that
+``__post_init__`` cannot see (a hand-rebuild can drop ``base_sha`` and still
+have a valid shape). Task ο extends this same inventory when it adds the union
+constructors.
+
+The sibling ``test_no_tracked_editor_backup_files_under_orchestrator`` is a
+repo-hygiene guard: a WIP-snapshot commit once force-added a ~4193-line
+``*.py.tmp.*`` near-duplicate; a ``.gitignore`` rule alone does not catch an
+already-tracked or force-added file, so this test scans the tracked-file list.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
-_MARKER = '# spec-factory'
 _SCOPED_PATH = 'orchestrator/src/orchestrator/'
 _BACKUP_GLOBS = ('*.tmp.*', '*.py.tmp.*', '*.orig', '*.rej', '*.bak', '*.swp', '*~')
 
+# Pinned inventory of the whitelisted SpeculativeItem factory sites, keyed by
+# repo-relative file. All live in the merger/verifier factory helpers of
+# merge_queue.py; the two former CAS-loop hand-rebuilds are now
+# ``dataclasses.replace(item, base_sha=...)`` and do not construct at all.
+# Bump a count (or add a file) ONLY for a genuine new factory site — never to
+# silence a hand-rebuild that should be ``dataclasses.replace`` instead.
+_EXPECTED_FACTORY_SITES = {
+    'orchestrator/src/orchestrator/merge_queue.py': 15,
+}
 
-def test_every_speculative_item_construction_in_src_is_marked(repo_root: Path | None) -> None:
-    """Every `SpeculativeItem(` construction under orchestrator/src/ must carry
-    the `# spec-factory` marker on its construction line.
 
-    Guards I3: a future hand-rebuild that bypasses `dataclasses.replace(...)`
-    and reconstructs a SpeculativeItem field-by-field (the task-1928 bug
-    class) shows up here as an un-marked hit.
-    """
-    if repo_root is None:
-        pytest.skip('not running inside a git checkout')
-
+def _real_construction_hits(repo_root: Path) -> list[str]:
+    """Return ``path:lineno:code`` git-grep hits that are actual
+    ``SpeculativeItem(`` constructions, excluding lines where the token only
+    appears inside a trailing comment (so a comment/docstring mention is not
+    miscounted as a construction)."""
     result = subprocess.run(
         ['git', 'grep', '-n', 'SpeculativeItem(', '--', _SCOPED_PATH],
         cwd=repo_root,
@@ -47,12 +60,49 @@ def test_every_speculative_item_construction_in_src_is_marked(repo_root: Path | 
     if result.returncode not in (0, 1):
         pytest.fail(f'git grep failed (exit {result.returncode}): {result.stderr}')
 
-    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
-    unmarked = [ln for ln in lines if _MARKER not in ln]
-    assert not unmarked, (
-        f'Found {len(unmarked)} SpeculativeItem( construction(s) in {_SCOPED_PATH} '
-        f'without the {_MARKER!r} factory marker (I3 — every src construction must '
-        f'be a whitelisted factory site or dataclasses.replace):\n' + '\n'.join(unmarked)
+    hits: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        # git grep -n → "path:lineno:code"
+        try:
+            path, lineno, code = line.split(':', 2)
+        except ValueError:
+            continue
+        # Drop pure-comment mentions: keep only hits where the construction
+        # token precedes any '#'. Production constructor lines have no '#'
+        # before the call; a comment like "# build a SpeculativeItem(...)" does.
+        code_before_comment = code.split('#', 1)[0]
+        if 'SpeculativeItem(' in code_before_comment:
+            hits.append(f'{path}:{lineno}:{code.strip()}')
+    return hits
+
+
+def test_speculative_item_constructed_only_at_whitelisted_factory_sites(
+    repo_root: Path | None,
+) -> None:
+    """The per-file inventory of ``SpeculativeItem(`` constructions under
+    orchestrator/src/ must match the pinned whitelist.
+
+    Guards I3: a future hand-rebuild that bypasses ``dataclasses.replace(...)``
+    and reconstructs a SpeculativeItem field-by-field (the task-1928 bug class)
+    appears as an inventory delta and fails here — forcing the author to either
+    use ``dataclasses.replace`` or deliberately extend the whitelist.
+    """
+    if repo_root is None:
+        pytest.skip('not running inside a git checkout')
+
+    hits = _real_construction_hits(repo_root)
+    inventory = dict(Counter(hit.split(':', 1)[0] for hit in hits))
+
+    assert inventory == _EXPECTED_FACTORY_SITES, (
+        'SpeculativeItem construction inventory drifted from the pinned factory '
+        f'whitelist (I3).\n  expected: {_EXPECTED_FACTORY_SITES}\n  actual:   {inventory}\n'
+        'A new/removed construction site changed this. If you added a CAS-loop or '
+        'other rebuild, use dataclasses.replace(item, ...) so no field is silently '
+        'dropped. If this is a genuine new factory site, update '
+        '_EXPECTED_FACTORY_SITES above.\nConstruction sites found:\n'
+        + '\n'.join(hits)
     )
 
 
