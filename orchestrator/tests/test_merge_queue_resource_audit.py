@@ -314,3 +314,82 @@ class TestWorktreeLedgerViolations:
         worker._running = False
 
         assert worker.worktree_ledger_violations(now=self._NOW) == []
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED / step-6 GREEN: additive snapshot()['resource_audit'] key
+# ---------------------------------------------------------------------------
+
+# The full pre-existing snapshot() key set (must remain present — additive-only
+# freeze), pinned as of task theta/1993 (which added 'speculation'). Mirrors
+# test_merge_queue_permit_conservation.py's _PRE_EXISTING_SNAPSHOT_KEYS with
+# 'speculation' folded in as pre-existing from task iota's point of view. See
+# merge_queue.py's snapshot() return dict.
+_PRE_EXISTING_SNAPSHOT_KEYS = {
+    'entries',
+    'depth',
+    'head_of_line',
+    'verify_in_progress',
+    'is_wip_halted',
+    'halt_owner_esc_id',
+    'occupancy',
+    'suffix_conflict_graph',
+    'metrics',
+    'frozen_prefix',
+    'two_layer_invariants',
+    'speculation',
+}
+
+
+class TestSnapshotResourceAuditKey:
+    """Unit tests for the additive ``snapshot()['resource_audit']`` key.
+
+    RED until step-6 GREEN adds the key to merge_queue.py's ``snapshot()``.
+    """
+
+    def test_healthy_worker_resource_audit_is_empty(self, git_ops: GitOps) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        assert worker.snapshot()['resource_audit'] == {
+            'speculation_accounting': [],
+            'worktree_ledger': [],
+        }
+
+    def test_forced_leak_surfaces_in_snapshot_resource_audit(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+        worker._speculation_slot._value -= 1
+
+        violations = worker.snapshot()['resource_audit']['speculation_accounting']
+
+        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
+
+    def test_resource_audit_is_additive_and_matches_direct_audit_calls(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+        worker._speculation_slot._value -= 1
+
+        snap = worker.snapshot()
+
+        # Additive-only: every pre-existing key (pinned through task theta)
+        # stays present alongside the new 'resource_audit' key.
+        assert set(snap) >= _PRE_EXISTING_SNAPSHOT_KEYS
+        assert 'resource_audit' in snap
+
+        # The snapshot's sub-values match calling the audit methods directly —
+        # same underlying state, read synchronously with no intervening
+        # mutation between the two calls.
+        assert snap['resource_audit']['speculation_accounting'] == (
+            worker.speculation_accounting_violations()
+        )
+        assert snap['resource_audit']['worktree_ledger'] == (
+            worker.worktree_ledger_violations()
+        )
