@@ -136,7 +136,7 @@ class TestWorkerWiringAndAdditiveSnapshotKey:
         snap = worker.snapshot()
 
         # Additive-only: every pre-existing key stays present.
-        assert _PRE_EXISTING_SNAPSHOT_KEYS <= set(snap)
+        assert set(snap) >= _PRE_EXISTING_SNAPSHOT_KEYS
 
         spec = snap['speculation']
         assert spec['depth'] == depth
