@@ -5674,11 +5674,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (mirrors ``_heartbeat_loop``'s swallow-and-log convention). This
         side-check never affects this method's own return value, which still
         means exactly "a depth heartbeat was emitted".
+
+        MQ-invariants iota (task 1994): immediately after, UNCONDITIONALLY
+        and for the same reason, runs the clock-injectable
+        :meth:`_check_resource_audit` sweep — a leaked speculation permit/
+        merge-ahead-cap slot or an abandoned on-disk merge worktree can exist
+        while the pipeline is otherwise idle (depth==0), which would
+        otherwise short-circuit this method before the audit ever ran. Also
+        wrapped in its own try/except so a resource-audit bug can never
+        suppress the depth heartbeat below, and likewise never affects this
+        method's own return value.
         """
         try:
             self._check_request_liveness(now)
         except Exception:
             logger.exception('merge queue heartbeat: request-liveness check failed')
+
+        try:
+            self._check_resource_audit(now)
+        except Exception:
+            logger.exception('merge queue heartbeat: resource-audit check failed')
 
         snap = self.snapshot()
         if snap['depth'] == 0:

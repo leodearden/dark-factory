@@ -43,7 +43,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, PERSISTENT_MERGE_WORKTREE_NAME, _run
+from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps, _run
 from orchestrator.merge_types import MergeRequest
 
 # ---------------------------------------------------------------------------
