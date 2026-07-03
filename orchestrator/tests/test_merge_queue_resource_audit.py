@@ -34,6 +34,7 @@ rest of the file during the RED steps.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -477,3 +478,110 @@ class TestAlarmResourceAudit:
         args, kwargs = es.emit.call_args
         emitted_type = args[0] if args else kwargs.get('event_type')
         assert emitted_type == EventType.escalation_created
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED / step-10 GREEN: _check_resource_audit(now)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckResourceAudit:
+    """Unit tests for SpeculativeMergeWorker._check_resource_audit(now)
+    (task 1994 step-9).
+
+    Mirrors TestCheckRequestLiveness (test_merge_queue_request_liveness.py):
+    sync, clock-injectable, WARNING-on-any-violation + streak-gated dedup'd
+    L1 escalation once the violation persists across
+    RESOURCE_AUDIT_ESCALATION_STREAK consecutive calls.
+
+    RED until step-10 GREEN adds the method (+ streak field/constant) to
+    merge_queue.py.
+    """
+
+    def test_healthy_worker_no_warning_no_streak_no_escalation(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._check_resource_audit(1000.0)
+
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 0
+        assert worker._resource_audit_violation_streak == 0
+        assert len(fake_eq.submitted) == 0
+
+    def test_single_violating_call_warns_and_bumps_streak_without_escalating(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        worker._speculation_slot._value -= 1  # forced permit leak
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._check_resource_audit(1000.0)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
+        assert 'speculation' in warnings[0].message.lower()
+        assert worker._resource_audit_violation_streak == 1
+        assert len(fake_eq.submitted) == 0, 'must not escalate before the streak threshold'
+
+    def test_n_consecutive_violations_escalates_exactly_once(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        worker._speculation_slot._value -= 1  # forced, PERSISTING permit leak
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+
+        for i in range(1, n + 1):
+            worker._check_resource_audit(1000.0 + i)
+
+        assert worker._resource_audit_violation_streak == n
+        assert len(fake_eq.submitted) == 1, (
+            f'expected exactly one escalation after {n} consecutive violating '
+            f'heartbeats, got {len(fake_eq.submitted)}'
+        )
+        esc = fake_eq.submitted[0]
+        assert esc.category == 'merge_resource_leak'
+
+        # Simulate the real escalation queue now reporting an open L1 (as it
+        # would after the submit above) so a further persisting violation
+        # does not resubmit a duplicate.
+        fake_eq.open_it()
+        worker._check_resource_audit(1000.0 + n + 1)
+        assert len(fake_eq.submitted) == 1, 'must not resubmit while the L1 is open'
+
+    def test_clearing_the_leak_resets_streak_to_zero(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        worker._speculation_slot._value -= 1  # forced permit leak
+
+        worker._check_resource_audit(1000.0)
+        worker._check_resource_audit(1001.0)
+        assert worker._resource_audit_violation_streak == 2
+
+        worker._speculation_slot._value += 1  # clear the leak
+
+        worker._check_resource_audit(1002.0)
+        assert worker._resource_audit_violation_streak == 0
+        assert len(fake_eq.submitted) == 0
