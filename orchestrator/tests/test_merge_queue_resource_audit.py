@@ -34,6 +34,7 @@ rest of the file during the RED steps.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 from pathlib import Path
@@ -43,6 +44,7 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, PERSISTENT_MERGE_WORKTREE_NAME, _run
+from orchestrator.merge_types import MergeRequest
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — see
@@ -585,3 +587,149 @@ class TestCheckResourceAudit:
         worker._check_resource_audit(1002.0)
         assert worker._resource_audit_violation_streak == 0
         assert len(fake_eq.submitted) == 0
+
+
+# ---------------------------------------------------------------------------
+# step-11 RED / step-12 GREEN: heartbeat wiring — _check_resource_audit runs
+# UNCONDITIONALLY near the top of _maybe_log_queue_heartbeat
+# ---------------------------------------------------------------------------
+
+
+def _make_request(task_id: str, branch: str, worktree: Path) -> MergeRequest:
+    """Build a minimal queued-only MergeRequest for a plain sync test (no
+    running event loop).
+
+    Unlike test_merge_queue_request_liveness.py's
+    ``asyncio.get_running_loop().create_future()`` helper (only callable
+    from ``async def`` tests), this module's tests are plain ``def
+    test_...`` (see module docstring), so ``result`` is a
+    ``concurrent.futures.Future`` instead — duck-type compatible with the
+    only method ``snapshot()`` calls on it (``.cancelled()``) and needs no
+    event loop. ``config=None`` because this request is only ever placed
+    directly on ``worker._queue`` (never dispatched by a running worker), so
+    ``.config`` is never read.
+    """
+    return MergeRequest(
+        task_id=task_id,
+        branch=branch,
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=None,
+        result=concurrent.futures.Future(),
+        lane='normal',
+    )
+
+
+class TestHeartbeatWiringRunsResourceAuditUnconditionally:
+    """_maybe_log_queue_heartbeat must invoke _check_resource_audit
+    UNCONDITIONALLY near the top — before the depth==0 short-circuit, and
+    wrapped in its own try/except so a resource-audit bug can never
+    suppress the depth heartbeat below it (mirrors the eta/1992
+    _check_request_liveness wiring — see
+    TestHeartbeatWiringRunsLivenessCheckFirst in
+    test_merge_queue_request_liveness.py) (task 1994 step-11).
+
+    RED until step-12 GREEN wires the call into _maybe_log_queue_heartbeat.
+    """
+
+    def test_idle_depth_zero_worker_still_warns_on_leak(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        worker._speculation_slot._value -= 1  # forced permit leak
+
+        # Idle pipeline — nothing enqueued/inflight — is exactly the shape
+        # that would otherwise short-circuit _maybe_log_queue_heartbeat
+        # before any resource-audit check ran.
+        assert worker.snapshot()['depth'] == 0
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._maybe_log_queue_heartbeat(1000.0)
+
+        assert result is False, 'heartbeat must stay idle — no depth to report (depth==0)'
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one resource-audit WARNING, got: {caplog.text}'
+        assert 'speculation' in warnings[0].message.lower()
+        assert worker._resource_audit_violation_streak == 1
+
+    def test_idle_depth_zero_worker_escalates_after_streak_threshold(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        worker._speculation_slot._value -= 1  # forced, PERSISTING permit leak
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+
+        for i in range(n):
+            result = worker._maybe_log_queue_heartbeat(1000.0 + i)
+            assert result is False, 'pipeline stays idle throughout — depth never becomes > 0'
+
+        assert worker._resource_audit_violation_streak == n
+        assert len(fake_eq.submitted) == 1, (
+            f'expected exactly one escalation after {n} consecutive violating heartbeats '
+            f'on a depth-0 idle pipeline, got {len(fake_eq.submitted)}'
+        )
+        assert fake_eq.submitted[0].category == 'merge_resource_leak'
+
+    def test_raising_resource_audit_does_not_suppress_depth_heartbeat(
+        self,
+        git_ops: GitOps,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        req = _make_request('hb-task', 'hb-task', wt)
+        worker._queue.put_nowait(req)  # non-zero depth so the depth heartbeat would fire
+
+        def _boom(now: float) -> None:  # noqa: ARG001
+            raise RuntimeError('boom')
+
+        monkeypatch.setattr(worker, '_check_resource_audit', _boom)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = worker._maybe_log_queue_heartbeat(1000.0)
+
+        assert result is True, 'depth heartbeat must still fire despite the resource-audit bug'
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, f'expected the swallowed exception to be logged, got: {caplog.text}'
+        assert 'resource-audit' in errors[0].message.lower()
+
+    def test_forced_leak_surfaces_in_both_snapshot_and_heartbeat_warning(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """End-to-end user-observable signal (step-11c): driving the check
+        exclusively through _maybe_log_queue_heartbeat (never calling
+        speculation_accounting_violations()/_check_resource_audit directly)
+        still surfaces the violation both via a heartbeat WARNING log line
+        and in the next snapshot()['resource_audit'].
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+        worker._speculation_slot._value -= 1  # forced permit leak
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._maybe_log_queue_heartbeat(1000.0)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
+
+        violations = worker.snapshot()['resource_audit']['speculation_accounting']
+        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
