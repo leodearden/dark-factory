@@ -528,3 +528,113 @@ class TestPassthroughFinalizeErrorChokepoint:
             'the chokepoint must perform NO release when release_resources=False '
             '— the raising _finalize_inflight stub never ran its real finally'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED / step-8 GREEN: FINALIZE-HEAD path (~7181)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeHeadErrorChokepoint:
+    """FINALIZE-HEAD path fault injection: _finalize_inflight raises while
+    finalizing the _inflight head — the FINALIZE-HEAD branch of _verifier_loop
+    (distinct from the inline passthrough finalize inside DISPATCH-FILL: this
+    entry carries a real verify_task, so it is appended to _inflight and
+    finalized by the ``if self._inflight:`` block instead).
+
+    RED until step-8 GREEN routes the finalize-head except-handler through
+    _resolve_and_release with release_resources=False — mirrors the
+    passthrough-finalize handlers: _finalize_inflight's own finally clause
+    would normally have released lease+slot on every exit path including
+    exceptions, but here the real _finalize_inflight is replaced by a raising
+    stub so its finally never runs, and NO release should occur at all.
+    RED marker: the chokepoint spy call count is 0 (the handler still inlines
+    resolve logic via ``isinstance(exc, (CancelledError, KeyboardInterrupt))``
+    + ``req.result.set_result``).
+    """
+
+    async def test_finalize_head_error_routes_through_chokepoint(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        req, item = await _make_real_merged_item(
+            git_ops, config, 'task/fh-head', 'fh_head.py', 'x = 1\n',
+            speculative=True,
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        async def _noop() -> None:
+            return None
+
+        verify_task = asyncio.ensure_future(_noop())
+        await verify_task  # dummy completed/awaitable task, per the plan
+
+        entry = InflightEntry(
+            item=item,
+            lease=MagicMock(),  # fake lease; must stay untouched (release_resources=False)
+            verify_task=verify_task,
+            merge_wt=item.merge_wt,
+            was_speculative=True,
+            phase='finalizing',
+        )
+
+        async def _dispatch_returns_entry(_item: Any) -> Any:
+            return entry
+
+        async def _raising_finalize(_entry: Any) -> Any:
+            raise Exception('boom')
+
+        worker._dispatch_item = _dispatch_returns_entry  # type: ignore[method-assign]
+        worker._finalize_inflight = _raising_finalize  # type: ignore[method-assign]
+
+        class _StubAllocator:
+            """free_host_count()==0 so DISPATCH-FILL stops after this one item
+            and proceeds straight to FINALIZE-HEAD, instead of continuing to
+            fetch the queued None sentinel (which would hit the unguarded
+            shutdown-drain loop's ``await self._finalize_inflight(head)``
+            instead of the FINALIZE-HEAD try/except this test targets).
+            """
+
+            @staticmethod
+            def free_host_count() -> int:
+                return 0
+
+        worker._ensure_host_allocator = (  # type: ignore[method-assign]
+            lambda _config: _StubAllocator()
+        )
+
+        calls = _spy_on_resolve_and_release(worker)
+        depth0 = worker._speculation_slot._value
+
+        await _drive_verifier_loop_fill(worker, item)
+
+        assert len(calls) == 1, (
+            f'Expected exactly one _resolve_and_release call, got {len(calls)}'
+        )
+        assert calls[0]['kwargs'].get('release_resources') is False, (
+            f"Expected release_resources=False, got kwargs={calls[0]['kwargs']!r}"
+        )
+        assert req.result.done()
+        outcome = req.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith('Verifier error:'), outcome.reason
+        assert worker._n_failed is True
+        assert worker._speculation_slot._value == depth0, (
+            'the chokepoint must perform NO release when release_resources=False '
+            '— the raising _finalize_inflight stub never ran its real finally'
+        )
+        assert item.merge_wt is not None and item.merge_wt.exists(), (
+            'worktree must be untouched on disk (release_resources=False → no cleanup)'
+        )
+        assert item.merge_wt in worker._owned_merge_worktrees, (
+            'worktree ledger entry must be untouched'
+        )
+        # Loop continues past the failed head: the only _inflight entry was
+        # popped as head, so the cascade guard
+        # (`not _head_advanced and self._inflight`) is False (empty deque) →
+        # no cascade fires → the loop reaches the queued None sentinel and
+        # returns cleanly (no exception propagated out of _verifier_loop, or
+        # _drive_verifier_loop_fill's asyncio.wait_for would have raised).
+        assert not worker._inflight
