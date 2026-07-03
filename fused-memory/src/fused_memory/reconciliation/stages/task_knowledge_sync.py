@@ -2813,6 +2813,13 @@ class TaskKnowledgeSync(BaseStage):
                 'run-window sweep guard disabled this cycle',
                 extra={'project_id': self.project_id, 'run_id': self._current_run_id},
             )
+        # Stash on the instance (task-2047 Gap 2) so run() can forward this cycle's
+        # run_window_start into _sweep_stale_flag_markers's cross-cycle fp: marker
+        # predicate after super().run() returns — mirrors the _current_run_id stash
+        # pattern. Stays None (set at the top of run()) when the journal lookup above
+        # failed or returned a non-datetime started_at, which disables the run-window
+        # guard here AND falls the sweep back to age-only (backward compatible).
+        self._run_window_start = run_window_start
         partition = await _query_stage2_flags(
             self.memory, self.project_id, run_id_for_markers,
             run_window_start=run_window_start,
