@@ -76,6 +76,12 @@ from orchestrator.merge_liveness import (  # noqa: F401  re-export shim
     enforce_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
+from orchestrator.merge_request_ledger import (  # noqa: F401  re-export shim
+    RequestLedger,
+    StuckRequest,
+    _alarm_merge_request_stuck,
+    _merge_request_stuck_sentinel,
+)
 from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     _LIBTEST_TEST_LINE_RE,
     _NEXTEST_SUMMARY_LINE_RE,
@@ -4197,6 +4203,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # or conflict detection.  Mirrors the _cas_retries / _gate_retries
         # per-task counter-dict lifecycle idiom (:5225-5245).
         self._drift_base: dict[str, int] = {}
+        # MQ-invariants eta (task 1992): request-liveness ledger.  Arms an
+        # entry per dequeued request and detects a never-resolved Future
+        # (silent-hang failure mode) for a loud, dedup'd L1 escalation.
+        # None-safe/no external deps, so bare-worker tests are unaffected.
+        # See merge_request_ledger.py's module docstring for the full
+        # lifecycle contract.
+        self._request_ledger = RequestLedger()
 
     # ── δ=1988 SuffixConflictTracker delegation ─────────────────────────────
     # Data-descriptor properties forwarding the original attribute names to
