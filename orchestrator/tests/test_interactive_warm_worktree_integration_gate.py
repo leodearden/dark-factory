@@ -323,3 +323,70 @@ class TestClaimReleaseRoundtrip:
             f'expected {claimed_path} gone from `git worktree list` after release; '
             f'got: {registered_after}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-05/06: seed invocation `--fresh-checkout` — warm success path THROUGH
+# the β verb, and the fail-soft cold path when the seed script is absent.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSeedInvocationFreshCheckout:
+    """Proves claim_warm_worktree's underlying create_interactive_worktree
+    invokes _seed_warm_lane in '--fresh-checkout' mode: a committed seed
+    stub CoW-seeds target/ (warm=True), while an absent seed script degrades
+    fail-soft (warm=False, no error, worktree retained) rather than raising
+    or losing the worktree. Does NOT assert any recompile/timing/warmth
+    magnitude (reify-side, out of scope — see module docstring's G6 note).
+    """
+
+    async def test_committed_seed_script_populates_target_seeded_bin(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+        await _add_seed_script(repo)
+        config = _make_config(repo, max_concurrent_tasks=3)
+        _harness, server = _build_harness_and_server(config, tmp_path)
+
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='warm', project_root=str(repo),
+        )
+        assert 'error' not in claim, f'setup: claim failed: {claim}'
+        assert claim['warm'] is True, (
+            f"expected warm is True (committed seed script ran), got {claim['warm']!r}"
+        )
+        seeded = Path(claim['path']) / 'target' / 'seeded.bin'
+        assert seeded.exists(), (
+            f'expected target/seeded.bin to exist after a --fresh-checkout CoW '
+            f'seed run invoked via claim_warm_worktree, got no file at {seeded}'
+        )
+
+    async def test_absent_seed_script_is_fail_soft_cold(self, tmp_path: Path) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_repo(repo)
+        # Deliberately do NOT commit scripts/seed-warm-lane.sh — models the
+        # absent-script fail-soft path (_seed_warm_lane returns rc=127).
+        # Separate repo + its own harness/server, per the plan's isolation
+        # of the fail-soft case from the warm-path fixture above.
+        config = _make_config(repo, max_concurrent_tasks=3)
+        _harness, server = _build_harness_and_server(config, tmp_path)
+
+        claim = await _call_tool(
+            server, 'claim_warm_worktree', slug='cold', project_root=str(repo),
+        )
+        assert 'error' not in claim, (
+            f'fail-soft is a SUCCESS, not an error — got: {claim}'
+        )
+        assert claim['warm'] is False, (
+            f"expected warm is False (no seed script present), got {claim['warm']!r}"
+        )
+        registered = await _registered_worktree_paths(repo)
+        claimed_path = str(Path(claim['path']).resolve())
+        assert claimed_path in registered, (
+            f'expected the cold worktree to still be registered (retained, never '
+            f'removed on a seed fault); got: {registered}'
+        )
