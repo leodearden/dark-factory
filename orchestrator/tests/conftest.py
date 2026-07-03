@@ -309,6 +309,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
       - ``fused_memory`` = pre-created sub-section mock (no default value)
       - ``escalation`` = pre-created sub-section mock (no default value)
       - ``overrides_db_path`` = ``tmp_path / 'overrides.db'``
+      - ``park_eviction_requests_db_path`` = ``tmp_path / 'park_eviction_requests.db'``
 
     The top-level mock and each sub-section (usage_cap, review, sandbox,
     fused_memory, escalation) are spec_set'd against their pydantic model's
@@ -396,4 +397,12 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # is a @property on OrchestratorConfig (see config.py) and Harness wires
     # OverrideStore.from_config(config) at construction (task 1313).
     config.overrides_db_path = tmp_path / 'overrides.db'
+    # Real Path so ParkEvictionRequestStore.from_config(config) can call
+    # .parent.mkdir() and sqlite3.connect(str(...)) without stringifying an
+    # unpatched MagicMock into a stray on-disk file — park_eviction_requests_db_path
+    # is a @property on OrchestratorConfig (see config.py) and Harness wires
+    # ParkEvictionRequestStore.from_config(config) at construction (task 1871).
+    # Same failure mode as overrides_db_path above (tasks 1313/1339); this
+    # instance of it is task 2045.
+    config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
     return config
