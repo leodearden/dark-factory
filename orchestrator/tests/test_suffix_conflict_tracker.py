@@ -25,7 +25,13 @@ import orchestrator.merge_queue as merge_queue
 import orchestrator.suffix_graph as suffix_graph
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest
+from orchestrator.merge_queue import (
+    MERGE_BOUNCE_CAP,
+    NEEDS_REBASE_REASON_PREFIX,
+    GroupMergeRequest,
+    MergeOutcome,
+    MergeRequest,
+)
 from orchestrator.merge_types import MergeBounceRegistry
 from orchestrator.suffix_graph import (
     EMPTY_SUFFIX_CONFLICT_GRAPH,
@@ -346,4 +352,248 @@ class TestTrackerRecomputeWithoutWorker:
         assert tracker.graph is original_graph, (
             'Expected the graph to be left untouched (fail-open) when '
             'get_main_sha() raises.'
+        )
+
+
+# ── step-5: bounce_conflicting_suffix_items() without a worker ─────────────────
+
+
+def _make_group_req(
+    config: OrchestratorConfig,
+    git_repo: Path,
+    branch: str = 'tip-task',
+) -> GroupMergeRequest:
+    """Build a minimal GroupMergeRequest for unit tests (mirrors the helper in
+    test_merge_queue_bounce.py).
+
+    Must be called from within an async context (asyncio.get_running_loop()).
+    """
+    async def _dummy_status_check(tids: list) -> dict:
+        return {}
+
+    async def _dummy_mark_done(tid: str, sha: str) -> None:
+        pass
+
+    return GroupMergeRequest(
+        task_id=branch,
+        branch=branch,
+        worktree=git_repo,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        lane='normal',
+        merge_first_enqueued_at=None,
+        train_id='train-1',
+        member_task_ids=[branch],
+        tip_branch=branch,
+        tip_task_id=branch,
+        status_check=_dummy_status_check,
+        mark_member_done=_dummy_mark_done,
+    )
+
+
+@pytest.mark.asyncio
+class TestTrackerBounceWithoutWorker:
+    """SuffixConflictTracker.bounce_conflicting_suffix_items() diverts suffix
+    items that conflict with the frozen tip — no SpeculativeMergeWorker
+    involved.
+
+    RED until step-6 GREEN moves the _bounce_conflicting_suffix_items() body
+    (verbatim) into SuffixConflictTracker.bounce_conflicting_suffix_items().
+    """
+
+    async def test_clean_rebase_requeues_item(self, git_ops, config, git_repo):
+        """Clean rebase -> item stays in the lane buffer, req.result is left
+        untouched, and the debounce signature is invalidated (set to None)."""
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([req])}
+        main_sha = 'deadbeef0000'
+        tracker = _make_tracker(
+            git_ops, lane_buffers=lambda: buffers,
+            frozen_prefix_tip=lambda s: 'FROZENTIP',
+        )
+        tracker.graph = SuffixConflictGraph(
+            nodes=(req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({req.request_id}),
+        )
+        tracker.signature = ((req.request_id,), main_sha)
+
+        git_ops.rebase_onto_main = AsyncMock(return_value=True)
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        git_ops.rebase_onto_main.assert_awaited_once()
+        call_kwargs = git_ops.rebase_onto_main.call_args
+        assert call_kwargs.kwargs.get('onto') == 'FROZENTIP' or (
+            len(call_kwargs.args) >= 2 and call_kwargs.args[1] == 'FROZENTIP'
+        ), f'Expected onto="FROZENTIP", got {call_kwargs}'
+
+        assert req in buffers['normal'], (
+            'Expected req to remain in the lane buffer after a clean rebase (re-queue).'
+        )
+        assert not req.result.done(), (
+            'Expected req.result future to remain pending after a clean rebase.'
+        )
+        assert tracker.signature is None, (
+            'Expected signature to be None after a bounce (debounce invalidated).'
+        )
+
+    async def test_real_conflict_escalates(self, git_ops, config, git_repo):
+        """Real rebase conflict -> item removed from the lane buffer and
+        req.result resolved 'blocked' with NEEDS_REBASE_REASON_PREFIX."""
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([req])}
+        tracker = _make_tracker(
+            git_ops, lane_buffers=lambda: buffers,
+            frozen_prefix_tip=lambda s: 'FROZENTIP',
+        )
+        tracker.graph = SuffixConflictGraph(
+            nodes=(req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({req.request_id}),
+        )
+        tracker.signature = ((req.request_id,), 'deadbeef0000')
+
+        git_ops.rebase_onto_main = AsyncMock(return_value=False)
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        assert req not in buffers['normal'], (
+            'Expected req to be removed from the lane buffer after a rebase conflict.'
+        )
+        assert req.result.done(), 'Expected req.result to be resolved after escalation.'
+        outcome: MergeOutcome = req.result.result()
+        assert outcome.status == 'blocked', (
+            f'Expected status="blocked" but got {outcome.status!r}.'
+        )
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+            f'Expected reason to start with NEEDS_REBASE_REASON_PREFIX but got '
+            f'{outcome.reason!r}.'
+        )
+        assert tracker.signature is None
+
+    async def test_cap_exceeded_escalates_without_rebase(self, git_ops, config, git_repo):
+        """Bounce cap already exceeded -> escalate WITHOUT calling rebase_onto_main."""
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([req])}
+        tracker = _make_tracker(
+            git_ops, lane_buffers=lambda: buffers,
+            frozen_prefix_tip=lambda s: 'FROZENTIP',
+        )
+        tracker.graph = SuffixConflictGraph(
+            nodes=(req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({req.request_id}),
+        )
+        tracker.signature = ((req.request_id,), 'deadbeef0000')
+
+        # Pre-bump the registry to MERGE_BOUNCE_CAP so the NEXT record_bounce exceeds it.
+        for _ in range(MERGE_BOUNCE_CAP):
+            tracker.bounce_registry.record_bounce('591')
+        assert tracker.bounce_registry.count('591') == MERGE_BOUNCE_CAP
+
+        rebase_spy = AsyncMock(return_value=True)
+        git_ops.rebase_onto_main = rebase_spy
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        rebase_spy.assert_not_awaited()
+        assert req not in buffers['normal'], (
+            'Expected req to be removed from the lane buffer when the bounce cap is exceeded.'
+        )
+        assert req.result.done(), 'Expected req.result to be resolved after cap escalation.'
+        outcome: MergeOutcome = req.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+            f'Expected cap-exceeded reason to start with NEEDS_REBASE_REASON_PREFIX, '
+            f'got {outcome.reason!r}.'
+        )
+        assert tracker.signature is None
+
+    async def test_toctou_reuses_signature_main_sha(self, git_ops, config, git_repo):
+        """With signature set, bounce must reuse signature[1] as main_sha and
+        must NOT call get_main_sha() (TOCTOU protection)."""
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([req])}
+        main_sha = 'deadbeef0000'
+        seen_main_shas: list[str] = []
+
+        def _tip(s):
+            seen_main_shas.append(s)
+            return 'FROZENTIP'
+
+        tracker = _make_tracker(git_ops, lane_buffers=lambda: buffers, frozen_prefix_tip=_tip)
+        tracker.graph = SuffixConflictGraph(
+            nodes=(req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({req.request_id}),
+        )
+        tracker.signature = ((req.request_id,), main_sha)
+
+        git_ops.rebase_onto_main = AsyncMock(return_value=True)
+        get_main_sha_spy = AsyncMock(return_value='SHOULD-NOT-BE-USED')
+        git_ops.get_main_sha = get_main_sha_spy
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        get_main_sha_spy.assert_not_awaited()
+        assert seen_main_shas == [main_sha], (
+            f'Expected frozen_prefix_tip to be called with signature[1]={main_sha!r} '
+            f'(TOCTOU reuse), got {seen_main_shas!r}.'
+        )
+
+    async def test_group_merge_request_skipped(self, git_ops, config, git_repo):
+        """A GroupMergeRequest in conflicts_with_main must NOT be bounced —
+        trains keep their existing TRAIN_REBASE_CONFLICT path."""
+        grp_req = _make_group_req(config, git_repo, branch='tip-task')
+        buffers = {'high': collections.deque(), 'normal': collections.deque([grp_req])}
+        tracker = _make_tracker(
+            git_ops, lane_buffers=lambda: buffers,
+            frozen_prefix_tip=lambda s: 'FROZENTIP',
+        )
+        tracker.graph = SuffixConflictGraph(
+            nodes=(grp_req.request_id,),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({grp_req.request_id}),
+        )
+        tracker.signature = ((grp_req.request_id,), 'deadbeef0000')
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        assert grp_req in buffers['normal'], (
+            'GroupMergeRequest was removed from the lane buffer — trains must '
+            'NOT be bounced by bounce_conflicting_suffix_items().'
+        )
+        assert not grp_req.result.done(), (
+            'GroupMergeRequest future was resolved — trains must NOT be '
+            'escalated by bounce_conflicting_suffix_items().'
+        )
+
+    async def test_empty_conflicts_with_main_is_a_noop(self, git_ops, config, git_repo):
+        """Empty conflicts_with_main -> return immediately; signature untouched."""
+        tracker = _make_tracker(git_ops, frozen_prefix_tip=lambda s: 'FROZENTIP')
+        sentinel_sig = (('rid-a',), 'abc123')
+        tracker.signature = sentinel_sig
+        tracker.graph = SuffixConflictGraph(
+            nodes=(),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset(),
+        )
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        assert tracker.signature == sentinel_sig, (
+            'signature was modified even though conflicts_with_main was empty. '
+            f'Expected {sentinel_sig!r}, got {tracker.signature!r}.'
         )
