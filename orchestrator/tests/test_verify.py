@@ -4093,6 +4093,32 @@ class TestReprojectBareUvRun:
         twice = _reproject_bare_uv_run(once, 'ruff check', 'shared')
         assert twice == once
 
+    def test_directory_flag_in_a_different_chained_clause_does_not_block_reprojection(self):
+        """A `--directory` in a *different* `&&` clause must not suppress reprojection.
+
+        Amendment (task 2036 review): the "already scoped" guard used to test
+        the whole command string for `--project`/`--directory`, so a chained
+        command whose *other* clause already carried `--directory` would bail
+        out entirely, leaving this clause's bare `uv run ruff check` unfixed.
+        This shape doesn't occur in current configs, but the guard must be
+        scoped to the matched clause, not the whole command.
+        """
+        cmd = 'uv run ruff check tests/scripts/foo.py && uv run --directory foo mypy bar'
+        result = _reproject_bare_uv_run(cmd, 'ruff check', 'shared')
+        assert result == (
+            'uv run --project shared ruff check tests/scripts/foo.py '
+            '&& uv run --directory foo mypy bar'
+        )
+
+    def test_project_flag_in_a_different_chained_clause_does_not_block_reprojection(self):
+        """A `--project` in a *preceding* `&&` clause must not suppress reprojection."""
+        cmd = 'uv run --project shared pytest tests/ && uv run ruff check tests/scripts/foo.py'
+        result = _reproject_bare_uv_run(cmd, 'ruff check', 'shared')
+        assert result == (
+            'uv run --project shared pytest tests/ '
+            '&& uv run --project shared ruff check tests/scripts/foo.py'
+        )
+
 
 class TestBuildFallbackConfigWithNonDefaultCommands:
     """``_build_fallback_config`` uses project-configured commands when non-default.

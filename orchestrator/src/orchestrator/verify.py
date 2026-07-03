@@ -271,21 +271,34 @@ def _reproject_bare_uv_run(
 
     Returns *cmd* unchanged when:
     - *cmd* is ``None``.
-    - *cmd* already carries ``--project`` or ``--directory`` (an explicit uv context
-      is already set; don't second-guess it — this also protects already-scoped
-      per-module commands, though those never reach this helper).
     - ``uv run`` is not immediately followed by *tool_keyword* (e.g. ``npx pyright
       ...``, ``uv run --extra dev mypy ...``, or ``true``).
+    - The matched ``&&``-delimited clause (the segment of *cmd* containing this
+      particular ``uv run <tool_keyword>`` occurrence, not the whole command)
+      already carries ``--project`` or ``--directory`` (an explicit uv context
+      is already set; don't second-guess it — this also protects already-scoped
+      per-module commands, though those never reach this helper). Scoping the
+      check to the matched clause means a *different* chained clause carrying
+      its own ``--project``/``--directory`` (e.g. an already-scoped
+      ``uv run --project shared pytest ... && uv run ruff check X``) does not
+      suppress reprojecting this clause's bare occurrence.
 
     Otherwise, rewrites the single ``uv run `` occurrence immediately preceding
     *tool_keyword* to ``uv run --project {member} ``.
     """
     if cmd is None:
         return None
-    if '--project' in cmd or '--directory' in cmd:
-        return cmd
     pattern = re.compile(r'\buv run\s+(?=' + re.escape(tool_keyword) + r'\b)')
-    if not pattern.search(cmd):
+    match = pattern.search(cmd)
+    if not match:
+        return cmd
+    clause_start = cmd.rfind('&&', 0, match.start())
+    clause_start = clause_start + 2 if clause_start != -1 else 0
+    clause_end = cmd.find('&&', match.end())
+    if clause_end == -1:
+        clause_end = len(cmd)
+    clause = cmd[clause_start:clause_end]
+    if '--project' in clause or '--directory' in clause:
         return cmd
     return pattern.sub(f'uv run --project {member} ', cmd, count=1)
 
