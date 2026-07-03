@@ -197,6 +197,94 @@ class TestReachBackRouting:
             f'emitted event types: {event_store.emitted!r}'
         )
 
+    async def test_run_drift_check_reachback_for_task_file_derivation(
+        self, tmp_path: Path,
+    ) -> None:
+        """_run_drift_check must resolve _derive_task_files_from_git via
+        orchestrator.merge_queue (not a merge_drift-local binding) when
+        task_files is None and Lever C verify runners are enabled.
+
+        This exercises the derivation branch that test_run_drift_check_reachback_to_verify_pool_deps
+        above does not: that test always supplies an explicit task_files list.
+        Mirrors test_dispatching_host_derives_task_files_when_enabled_runners in
+        test_merge_queue_multihost_wiring.py, which covers the identical gate for
+        _run_post_merge_verify's own dispatching-host derivation path.
+        """
+        import orchestrator.verify_runner as _vr
+        from orchestrator.event_store import EventStore
+        from orchestrator.merge_drift import _run_drift_check
+        from orchestrator.verify_runner import HostAllocator
+
+        git_ops = MagicMock()
+        git_ops.create_throwaway_verify_worktree = AsyncMock(
+            return_value=Path('/repo/_throwaway')
+        )
+        git_ops.cleanup_merge_worktree = AsyncMock()
+
+        req = MagicMock()
+        req.task_id = 'task-drift-derive'
+        req.task_files = None
+        req.module_configs = []
+        # enabled_verify_runners is a read-only property derived from
+        # verify_runners — must be populated at construction, not assigned.
+        req.config = OrchestratorConfig(
+            project_root=tmp_path,
+            verify_runners=[  # type: ignore[arg-type]
+                {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+            ],
+        )
+
+        pass_result = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        fake_remote = MagicMock()
+        fake_remote.name = 'laptop'
+        fake_remote.is_local = False
+        fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
+        allocator = HostAllocator([fake_remote], quarantine=set())
+
+        class _FakeEventStore(EventStore):
+            def __init__(self) -> None:
+                object.__init__(self)
+                self.emitted: list = []
+
+            def emit(self, event_type, *, task_id=None, data=None, **kw) -> None:  # type: ignore[override]
+                self.emitted.append(event_type)
+
+        event_store = _FakeEventStore()
+
+        spec_calls = []
+        orig_build_spec = _vr.build_merge_verify_spec
+
+        def spy_build_spec(config, module_configs, task_files, **kw):
+            spec_calls.append(task_files)
+            return orig_build_spec(config, module_configs, task_files, **kw)
+
+        with (
+            patch(
+                'orchestrator.merge_queue.build_merge_verify_spec',
+                side_effect=spy_build_spec,
+            ),
+            patch(
+                'orchestrator.merge_queue._derive_task_files_from_git',
+                AsyncMock(return_value=['derived/from/mq.py']),
+            ),
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=pass_result),
+            ),
+        ):
+            await _run_drift_check(
+                git_ops, req, 'commit-sha', None, event_store, set(),
+                allocator=allocator,
+            )
+
+        assert spec_calls, 'expected build_merge_verify_spec to be called at least once'
+        assert spec_calls[0] == ('derived/from/mq.py',), (
+            f'expected the orchestrator.merge_queue-patched _derive_task_files_from_git '
+            f'to flow into the built spec, got task_files={spec_calls[0]!r}'
+        )
+
 
 def test_merge_queue_reexports_identical_objects() -> None:
     """merge_queue re-exports the SAME objects from merge_drift (shim identity).

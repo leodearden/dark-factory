@@ -41,8 +41,11 @@ from orchestrator.merge_types import MergeRequest
 # _run_drift_check always reaches back to the orchestrator.merge_queue-
 # resident binding (see its body).  Imported here only so TestReachBackRouting
 # has a "naive" orchestrator.merge_drift.run_scoped_verification patch target
-# to assert is NOT what governs.
-from orchestrator.verify import _derive_task_files_from_git, run_scoped_verification  # noqa: F401
+# to assert is NOT what governs.  _derive_task_files_from_git is deliberately
+# NOT imported here: unlike run_scoped_verification, nothing needs to prove a
+# merge_drift-local patch is inert for it, and _run_drift_check reaches back
+# to orchestrator.merge_queue for it exclusively (see its body).
+from orchestrator.verify import run_scoped_verification  # noqa: F401
 
 # LocalRunner / VerifyRunnerPool / build_merge_verify_spec: same reasoning —
 # _run_drift_check always reaches back to orchestrator.merge_queue for these;
@@ -107,9 +110,13 @@ async def _run_drift_check(
     # LocalRunner / run_scoped_verification also have a module-level "naive"
     # import above (kept solely as a TestReachBackRouting patch target); a
     # `from ... import` reach-back would shadow-and-thus-dead-code that
-    # naive import, which ruff flags (F811).  _run_unscoped_typechecks and
-    # _build_remote_runners have no merge_drift-local copy at all (both stay
-    # permanently in merge_queue.py) but are accessed the same way for
+    # naive import, which ruff flags (F811).  _derive_task_files_from_git has
+    # no merge_drift-local "naive" import at all (there is nothing to prove
+    # inert) but is reached back to for the same reason as the others:
+    # merge_queue.py imports it at module level from orchestrator.verify and
+    # the test suite patches it on that namespace.  _run_unscoped_typechecks
+    # and _build_remote_runners have no merge_drift-local copy at all (both
+    # stay permanently in merge_queue.py) but are accessed the same way for
     # consistency.
     import orchestrator.merge_queue as _mq
 
@@ -126,7 +133,7 @@ async def _run_drift_check(
         # Derive task_files on the dispatching host (fresh main) when not supplied
         # and Lever C is on — mirrors the same gate in _run_post_merge_verify.
         if task_files_tuple is None and req.config.enabled_verify_runners:
-            derived = await _derive_task_files_from_git(wt, req.config)
+            derived = await _mq._derive_task_files_from_git(wt, req.config)
             if derived:
                 task_files_tuple = tuple(derived)
         spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
