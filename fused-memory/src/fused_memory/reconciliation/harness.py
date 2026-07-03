@@ -1631,7 +1631,15 @@ class ReconciliationHarness:
                 heartbeat_task = asyncio.create_task(self._heartbeat_loop(project_id))
                 try:
                     if await iterator.should_iterate(project_id):
-                        await iterator.run(project_id)
+                        # task 2040: symmetric outer bound with the else branch below —
+                        # the in-iterator cumulative budget (BacklogIterator.run) can only
+                        # stop new chunks from launching between chunks; it cannot
+                        # interrupt a hang INSIDE a single chunk. This wait_for is the
+                        # backstop for that case.
+                        await asyncio.wait_for(
+                            iterator.run(project_id),
+                            timeout=self.config.cycle_timeout_seconds,
+                        )
                     else:
                         await asyncio.wait_for(
                             self.run_full_cycle(project_id, reason, tier=tier),
@@ -1641,6 +1649,13 @@ class ReconciliationHarness:
                     logger.error(
                         f'Full cycle timed out after '
                         f'{self.config.cycle_timeout_seconds}s for {project_id}'
+                    )
+                    logger.error(
+                        'reconciliation.iteration_timed_out',
+                        extra={
+                            'project_id': project_id,
+                            'timeout': self.config.cycle_timeout_seconds,
+                        },
                     )
                     await self.buffer.restore_drained(project_id)
                 finally:
