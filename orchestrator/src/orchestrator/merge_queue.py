@@ -7710,6 +7710,37 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         rather than assigned unconditionally, so a caller can never reset
         ``_n_failed`` back to False.  All six current call sites pass True.
 
+        Ordering (resolve-before-release): step 1 always resolves the
+        caller's Future before step 2 releases resources.  This matches the
+        pre-refactor cascade except-handler exactly, but reorders the
+        PRE-finalize dispatch handlers, which used to clean the merge
+        worktree BEFORE resolving the Future.  That reorder is intentional
+        and safe: the merge worktree is a worker-internal implementation
+        detail (tracked only in ``_owned_merge_worktrees``) that is never
+        exposed to the ``req.result`` waiter, so a waiter woken by the
+        just-resolved Future cannot observe the not-yet-cleaned worktree or
+        not-yet-released lease/slot.  No consumer or test depends on
+        intra-handler await ordering between resolve and release.
+
+        Abandoned-drop semantics: step 1 resolves via
+        ``_resolve_or_drop_abandoned`` — i.e. ``_request_abandoned``, which
+        is ``True`` iff ``req.result.cancelled()`` — rather than each site's
+        prior inline ``if not req.result.done(): req.result.set_result(...)``.
+        The two are behaviourally IDENTICAL in every reachable state, not
+        merely a compatible superset: ``cancelled()`` implies ``done()``, so
+        when the Future is already cancelled both the old inline check and
+        the new abandoned-check skip ``set_result``; when it is not
+        cancelled, ``_resolve_or_drop_abandoned`` falls through to that same
+        ``if not done(): set_result(...)``.  The sole producer of the
+        cancelled state is ``PendingMergeRegistry.detach()``
+        (merge_types.py), which implements "the waiter abandoned this
+        request" as cancelling ``req.result`` directly — there is no
+        separate detached-but-not-cancelled flag anywhere in this codebase,
+        so that intermediate state is not reachable.  The only observable
+        difference is a new INFO log line on the abandoned path.  This
+        equivalence is intentional and holds uniformly across all six call
+        sites now unified behind this chokepoint.
+
         This is also the intended hook surface for task eta's liveness-ledger
         'resolved' transition: every _verifier_loop error-resolution path now
         funnels through this one coroutine.

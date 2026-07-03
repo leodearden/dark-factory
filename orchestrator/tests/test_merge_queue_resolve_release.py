@@ -310,6 +310,23 @@ def _spy_on_resolve_and_release(
     Delegates to the real (bound) implementation so end-state assertions
     (Future resolution, releases) still hold; records (args, kwargs) per call
     so tests can assert call count and inspect kwargs (e.g. release_resources).
+
+    Design note (reviewer_comprehensive test_coupling, task 1991 amendment):
+    every test in this module that uses this spy pairs the call-count
+    assertion with observable end-state assertions (Future outcome/status/
+    reason, ``_speculation_slot`` value, worktree existence on disk,
+    ``_n_failed``) — the call count is never the *sole* assertion.  The
+    call-count check is kept deliberately, not out of habit: this module's
+    entire purpose is verifying that task 1991 unified five near-identical
+    inline except-handlers into ONE chokepoint, so "routes through the
+    single chokepoint" is itself part of the contract under test here.  A
+    regression that reintroduced an inline resolve-and-release path
+    alongside the chokepoint could still leave end-state assertions green
+    while silently defeating the refactor's single-chokepoint goal; only the
+    call-count assertion catches that.  This is a conscious
+    maintainability-vs-robustness trade-off (high private-internals coupling
+    in exchange for locking in the architectural invariant) — expect churn
+    here if the resolve/release call sites are restructured again.
     """
     calls: list[dict[str, Any]] = []
     original = worker._resolve_and_release
