@@ -4535,6 +4535,113 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         assert call_kwargs.get('resolved_flags') == []
         assert report.stats.get('stage1_flag_markers_acknowledged') == 0
 
+    @pytest.mark.asyncio
+    async def test_no_items_flagged_stat_still_explicitly_zero(self, mock_deps):
+        """When Stage 1 flags nothing at all (items_flagged falsy), the stat must
+        still be explicitly present and 0 — not absent — so it is symmetric with
+        stats['stage2_flag_markers_acknowledged'], which is unconditionally set
+        (task-2029 amendment).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        assert 'stage1_flag_markers_acknowledged' in report.stats, (
+            'stat must be present even when nothing was flagged, not absent'
+        )
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 0
+
+    @pytest.mark.asyncio
+    async def test_suppression_gate_drop_excluded_from_acknowledgment(self, mock_deps):
+        """A flag dropped by dedup_flags' internal suppression gate (filter_suppressed)
+        must NOT be forwarded to acknowledge_resolved_flags. Suppression means the
+        underlying issue is intentionally hidden, not resolved — acknowledging it
+        would erase recurrence history for when the suppression is later lifted
+        (task-2029 amendment).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.project_id = 'p'
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.project_root = '/proj'
+
+        suppressed_flag = {'task_id': '55', 'flag_type': 'stale_metadata'}
+        active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[suppressed_flag, active_flag],
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+
+        ack_mock = AsyncMock(return_value=0)
+
+        async def _fake_dedup(*, memory_service, project_id, run_id, flags):
+            # Simulate dedup_flags' internal filter_suppressed dropping
+            # suppressed_flag before the signature-dedup loop runs.  Filters by
+            # content (not object identity): StageReport is a pydantic model,
+            # so flags round-tripped through it are revalidated copies with
+            # equal content but different identity from the locals above.
+            return [f for f in flags if f.get('task_id') != suppressed_flag['task_id']]
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=_fake_dedup),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-test',
+            )
+
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        resolved = call_kwargs.get('resolved_flags')
+        assert resolved == [], (
+            f'suppression-gate drop must NOT be forwarded for acknowledgment; got {resolved!r}'
+        )
+        assert report.stats.get('stage1_flag_markers_acknowledged') == 0
+
 
 # ---------------------------------------------------------------------------
 # Task 1201 — MemoryConsolidator stale human-operator detector integration

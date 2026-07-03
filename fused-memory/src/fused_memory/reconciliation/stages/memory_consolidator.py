@@ -146,13 +146,23 @@ class MemoryConsolidator(BaseStage):
         if self.remediation_findings is not None:
             return report
 
+        # Always present (task-2029 amendment): downstream consumers that read this
+        # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is
+        # unconditionally set) should never need a .get(..., 0) fallback.  Overwritten
+        # below when there is anything to acknowledge; stays 0 when items_flagged is
+        # empty/falsy.
+        report.stats['stage1_flag_markers_acknowledged'] = 0
         if report.items_flagged:
             # Snapshot before the filter chain (task-2029): used below to compute
-            # which flags the chain dropped — for ANY reason (terminal task,
-            # false-absence, stale-snapshot, or dedup_flags' own suppression gate;
-            # see the acknowledgment block below) — so any persisted
+            # which flags the chain dropped for a MOOT reason — terminal task,
+            # false-absence, or stale-snapshot correction — so any persisted
             # stage1_flag_marker for a now-moot flag can be reclaimed instead of
-            # waiting for the 14-day age-GC or a recurrence.
+            # waiting for the 14-day age-GC or a recurrence.  Flags dropped by
+            # dedup_flags' own suppression gate (filter_suppressed) are identified
+            # separately below and deliberately EXCLUDED from acknowledgment: a
+            # suppression means the issue is intentionally hidden, not resolved, so
+            # acknowledging it would erase recurrence history for when the
+            # suppression is later lifted.
             _pre_filter_flags = list(report.items_flagged)
 
             # ── Stale count-snapshot correction filter (task-1786): drop false ────
@@ -175,12 +185,31 @@ class MemoryConsolidator(BaseStage):
                 project_root=self.project_root,
                 flags=report.items_flagged,
             )
+            # Snapshot immediately before dedup_flags, which internally applies the
+            # suppression gate (filter_suppressed) as its first step, so suppression
+            # drops can be isolated below and excluded from acknowledgment.
+            _pre_dedup_flags = list(report.items_flagged)
             report.items_flagged = await dedup_flags(
                 memory_service=self.memory,
                 project_id=self.project_id,
                 run_id=run_id,
                 flags=report.items_flagged,
             )
+            # Signatures dropped specifically by dedup_flags' internal suppression
+            # gate: present before dedup_flags, absent after.  dedup_flags never
+            # drops a flag for any other reason — a HIT or MISS always keeps the
+            # flag (annotated or not) — so this diff isolates suppression drops
+            # without an extra Mem0 search.
+            _post_dedup_signatures = {
+                sig for f in report.items_flagged
+                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                is not None
+            }
+            suppressed_signatures = {
+                sig for f in _pre_dedup_flags
+                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
+                is not None and sig not in _post_dedup_signatures
+            }
             # ── Deletion guard: drop absence-type flags that cannot be confirmed absent ──
             # filter_false_absence_flags is fail-closed: keeps an absence-asserting flag
             # ONLY when get_task POSITIVELY confirms the task does not exist.  Present or
@@ -197,6 +226,8 @@ class MemoryConsolidator(BaseStage):
             # persisted stage1_flag_marker for them best-effort.  Computed as a
             # signature diff against the survivors rather than threading a "dropped"
             # list through each filter, so none of the filters' contracts change.
+            # suppressed_signatures (computed above) is explicitly subtracted out —
+            # suppression is not the same as resolved; see the snapshot comment above.
             surviving_signatures = {
                 sig for f in report.items_flagged
                 if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
@@ -205,7 +236,9 @@ class MemoryConsolidator(BaseStage):
             dropped_flags = [
                 f for f in _pre_filter_flags
                 if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None and sig not in surviving_signatures
+                is not None
+                and sig not in surviving_signatures
+                and sig not in suppressed_signatures
             ]
             report.stats['stage1_flag_markers_acknowledged'] = await acknowledge_resolved_flags(
                 memory_service=self.memory,
