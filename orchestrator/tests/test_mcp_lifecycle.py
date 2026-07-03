@@ -102,6 +102,82 @@ class TestJcodemunchLaunchPinned:
 
 
 # ---------------------------------------------------------------------------
+# Step-1/Step-2 (task 2042): mcp_config_json escalation_headers
+# ---------------------------------------------------------------------------
+
+
+class TestMcpConfigEscalationHeaders:
+    """mcp_config_json() attaches escalation_headers to the escalation block
+    only when BOTH escalation_url and escalation_headers are supplied; the
+    default (no headers) output stays byte-for-byte unchanged so every other
+    caller (steward, review-checkpoint, workflow, dry-run-unblock) keeps
+    full-authority, header-less connections."""
+
+    def test_headers_and_url_both_present_in_escalation_block(self, mock_orch_config):
+        """escalation_headers + escalation_url -> escalation block carries both url and the exact headers dict."""
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        mock_orch_config.fused_memory.url = 'http://localhost:8000'
+        lifecycle = McpLifecycle(mock_orch_config)
+        headers = {
+            'X-Escalation-Levels': '0,1',
+            'X-Escalation-Identity': 'orchestrator-escalation-watcher-auto',
+        }
+        out = lifecycle.mcp_config_json(
+            escalation_url='http://h:9999/mcp',
+            escalation_headers=headers,
+        )
+
+        escalation = out['mcpServers']['escalation']
+        assert escalation['url'] == 'http://h:9999/mcp'
+        assert escalation['headers'] == headers
+
+    def test_no_headers_kwarg_leaves_escalation_block_byte_for_byte(self, mock_orch_config):
+        """escalation_url alone (no escalation_headers) -> escalation block has NO 'headers' key."""
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        mock_orch_config.fused_memory.url = 'http://localhost:8000'
+        lifecycle = McpLifecycle(mock_orch_config)
+        out = lifecycle.mcp_config_json(escalation_url='http://h:9999/mcp')
+
+        escalation = out['mcpServers']['escalation']
+        assert escalation == {'type': 'http', 'url': 'http://h:9999/mcp'}
+        assert 'headers' not in escalation
+
+    def test_headers_without_url_ignored_no_escalation_block(self, mock_orch_config):
+        """No escalation_url -> no 'escalation' key at all, even if escalation_headers is passed (no crash)."""
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        mock_orch_config.fused_memory.url = 'http://localhost:8000'
+        lifecycle = McpLifecycle(mock_orch_config)
+
+        out_bare = lifecycle.mcp_config_json()
+        assert 'escalation' not in out_bare['mcpServers']
+
+        out_headers_only = lifecycle.mcp_config_json(
+            escalation_headers={'X-Escalation-Levels': '0,1'}
+        )
+        assert 'escalation' not in out_headers_only['mcpServers']
+
+    def test_headers_do_not_alter_other_server_blocks(self, mock_orch_config):
+        """escalation_headers only touches the escalation block; fused-memory/jcodemunch blocks unaffected."""
+        from orchestrator.mcp_lifecycle import McpLifecycle
+
+        mock_orch_config.fused_memory.url = 'http://localhost:8000'
+        lifecycle = McpLifecycle(mock_orch_config)
+        headers = {'X-Escalation-Levels': '0,1'}
+
+        baseline = lifecycle.mcp_config_json(escalation_url='http://h:9999/mcp')
+        with_headers = lifecycle.mcp_config_json(
+            escalation_url='http://h:9999/mcp',
+            escalation_headers=headers,
+        )
+
+        assert with_headers['mcpServers']['fused-memory'] == baseline['mcpServers']['fused-memory']
+        assert with_headers['mcpServers']['jcodemunch'] == baseline['mcpServers']['jcodemunch']
+
+
+# ---------------------------------------------------------------------------
 # Step-5/Step-6: _invoke_claude_with_sandbox injects MCP_TIMEOUT
 # ---------------------------------------------------------------------------
 
