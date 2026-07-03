@@ -7,9 +7,10 @@ import dataclasses
 import json
 import logging
 import os
+import time
 import traceback
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1628,18 +1629,51 @@ class ReconciliationHarness:
                 tier = await self._select_tier(project_id)
                 iterator = BacklogIterator(self.config, self.journal, self.buffer, self)
                 heartbeat_task = asyncio.create_task(self._heartbeat_loop(project_id))
+                use_iterator = False
                 try:
-                    if await iterator.should_iterate(project_id):
-                        await iterator.run(project_id)
+                    use_iterator = await iterator.should_iterate(project_id)
+                    if use_iterator:
+                        # task 2040: symmetric outer bound with the else branch below.
+                        # NOT redundant with the per-chunk wait_for(cycle_timeout_seconds)
+                        # that already wraps run_full_cycle inside BacklogIterator.run —
+                        # a hang inside a single chunk's run_full_cycle is already bounded
+                        # there. What this outer wait_for actually closes: (a) the awaits
+                        # between chunks that carry no timeout of their own — peek_buffered,
+                        # assemble, drain_by_ids, record_chunk_boundary — and (b) an
+                        # absolute cap on the TOTAL cumulative wall-clock of the whole
+                        # run() invocation, rather than relying solely on the in-iterator
+                        # between-chunks budget check.
+                        await asyncio.wait_for(
+                            iterator.run(project_id),
+                            timeout=self.config.cycle_timeout_seconds,
+                        )
                     else:
                         await asyncio.wait_for(
                             self.run_full_cycle(project_id, reason, tier=tier),
                             timeout=self.config.cycle_timeout_seconds,
                         )
                 except TimeoutError:
+                    # task 2040: name the event for the branch that actually timed
+                    # out — conflating the two here previously meant an else-branch
+                    # (full cycle) timeout was logged as 'iteration_timed_out' and an
+                    # iterate-branch timeout was logged as "Full cycle timed out",
+                    # which misleads anyone grepping logs/metrics for either failure
+                    # mode.
+                    branch = 'iterate' if use_iterator else 'full_cycle'
                     logger.error(
-                        f'Full cycle timed out after '
+                        f'{"Backlog iteration" if use_iterator else "Full cycle"} '
+                        f'timed out after '
                         f'{self.config.cycle_timeout_seconds}s for {project_id}'
+                    )
+                    logger.error(
+                        'reconciliation.iteration_timed_out'
+                        if use_iterator
+                        else 'reconciliation.full_cycle_timed_out',
+                        extra={
+                            'project_id': project_id,
+                            'timeout': self.config.cycle_timeout_seconds,
+                            'branch': branch,
+                        },
                     )
                     await self.buffer.restore_drained(project_id)
                 finally:
@@ -2709,11 +2743,13 @@ class BacklogIterator:
         journal: ReconciliationJournal,
         buffer: EventBuffer,
         harness: ReconciliationHarness,
+        time_provider: Callable[[], float] = time.monotonic,
     ):
         self.config = config
         self.journal = journal
         self.buffer = buffer
         self.harness = harness
+        self.time_provider = time_provider
 
     async def should_iterate(self, project_id: str) -> bool:
         """Buffer count > 150% of trigger threshold."""
@@ -2753,7 +2789,31 @@ class BacklogIterator:
         watermark = await self.journal.get_watermark(project_id)
 
         chunk_num = 0
+        start = self.time_provider()
+        yielded = False
         while True:
+            # Cumulative between-chunks budget (task 2040): once at least one
+            # chunk has completed and the wall-clock budget is exhausted,
+            # stop launching new chunks and leave the remainder buffered.
+            # The per-project lock releases via _project_loop's finally, so
+            # the next cycle / trigger_reconciliation keeps draining instead
+            # of one iteration holding the lock forever.
+            if (
+                chunk_num > 0
+                and self.time_provider() - start >= self.config.backlog_iteration_budget_seconds
+            ):
+                stats = await self.buffer.get_buffer_stats(project_id)
+                logger.info(
+                    'reconciliation.backlog_iteration_yielded',
+                    extra={
+                        'project_id': project_id,
+                        'chunks_processed': chunk_num,
+                        'events_remaining': stats.get('size', 0),
+                    },
+                )
+                yielded = True
+                break
+
             # Peek at up to 1000 events (far more than a single budget can hold)
             peeked = await self.buffer.peek_buffered(
                 project_id, limit=1000, before=cutoff,
@@ -2801,8 +2861,11 @@ class BacklogIterator:
                 await self.buffer.restore_drained(project_id)
                 return  # Stop iteration on failure
 
-        # Final consolidation pass
-        if chunk_num > 0:
+        # Final consolidation pass — skipped when the loop yielded on the
+        # cumulative budget (task 2040): the remaining backlog stays
+        # buffered for the next cycle instead of forcing an extra
+        # consolidation cycle past the budget.
+        if chunk_num > 0 and not yielded:
             logger.info(f'Backlog final consolidation for {project_id}')
             try:
                 await asyncio.wait_for(

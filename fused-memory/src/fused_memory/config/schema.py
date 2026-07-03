@@ -446,6 +446,23 @@ class ReconciliationConfig(BaseModel):
     tool_timeout_seconds: float = Field(default=120.0, gt=0)
     stage_timeout_seconds: int = Field(default=3600, gt=0)
     cycle_timeout_seconds: int = Field(default=21600, gt=0)
+    backlog_iteration_budget_seconds: int = Field(
+        default=1800,
+        gt=0,
+        description=(
+            'Cumulative per-invocation wall-clock budget (s) for '
+            'BacklogIterator.run(). Checked between chunks (after at least one '
+            'chunk has completed, so a single invocation always makes forward '
+            'progress): once elapsed time since the invocation started reaches '
+            'this budget, the iterator stops launching new chunks, skips the '
+            'final consolidation pass, and leaves the remaining backlog '
+            'buffered (not restored) so the next cycle — or an operator '
+            'trigger_reconciliation — continues draining it. Must be '
+            '<= cycle_timeout_seconds. Default 1800s mirrors '
+            'stale_run_recovery_seconds. Task 2040 (bounds the previously '
+            'unbounded BacklogIterator chunk loop).'
+        ),
+    )
     stale_run_recovery_seconds: int = Field(
         default=1800,
         gt=0,
@@ -489,7 +506,8 @@ class ReconciliationConfig(BaseModel):
     )
     @model_validator(mode='after')
     def _validate_cli_timeouts_within_stage(self) -> 'ReconciliationConfig':
-        """Enforce timeout hierarchy: per-CLI budgets ≤ stage guard ≤ cycle guard."""
+        """Enforce timeout hierarchy: per-CLI budgets ≤ stage guard ≤ cycle guard;
+        backlog_iteration_budget_seconds ≤ cycle guard."""
         if self.agent_cli_timeout_seconds > self.stage_timeout_seconds:
             raise ValueError(
                 f'agent_cli_timeout_seconds ({self.agent_cli_timeout_seconds}) must be '
@@ -507,6 +525,12 @@ class ReconciliationConfig(BaseModel):
                 f'stage_timeout_seconds ({self.stage_timeout_seconds}) must be '
                 f'<= cycle_timeout_seconds ({self.cycle_timeout_seconds}): '
                 'a stage that outlives its enclosing cycle is nonsensical.'
+            )
+        if self.backlog_iteration_budget_seconds > self.cycle_timeout_seconds:
+            raise ValueError(
+                f'backlog_iteration_budget_seconds ({self.backlog_iteration_budget_seconds}) '
+                f'must be <= cycle_timeout_seconds ({self.cycle_timeout_seconds}): '
+                'the backlog-iteration budget cannot exceed the outer cycle guard.'
             )
         return self
 

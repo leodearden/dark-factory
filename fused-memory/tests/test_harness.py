@@ -4468,6 +4468,358 @@ async def test_known_project_roots_wins_over_event_payload_in_backlog_iterator(
     )
 
 
+# ── Tests for Task 2040: bound BacklogIterator with a cumulative budget ────
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
+    journal, event_buffer, mock_memory_service
+):
+    """BacklogIterator.run() must stop launching new chunks once the
+    cumulative wall-clock budget (config.backlog_iteration_budget_seconds) is
+    exceeded between chunks, leaving the remainder buffered (not restored)
+    and skipping the final consolidation pass.
+
+    Sets up 3 buffered events and a ContextAssembler stub that hands back one
+    event per chunk. An injected fake time_provider reports the budget as
+    already blown by the time the between-chunks check runs after chunk 1, so
+    only chunk 1 should execute.
+
+    RED before step-4: BacklogIterator.__init__ has no time_provider
+    parameter yet, so constructing the iterator with time_provider= raises
+    TypeError.
+    """
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+    harness._known_projects['dark_factory'] = '/abs/from/config'
+    harness.config.backlog_iteration_budget_seconds = 100
+
+    for _ in range(3):
+        await event_buffer.push(_make_event('dark_factory'))
+
+    run_full_cycle_calls: list[str] = []
+
+    async def fake_run_full_cycle(project_id, trigger_reason, **kwargs):
+        run_full_cycle_calls.append(trigger_reason)
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason=trigger_reason,
+            started_at=datetime.now(UTC),
+            events_processed=len(kwargs.get('events') or []),
+            status=RunStatus.completed,
+        )
+
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        inst = MagicMock()
+
+        async def fake_assemble(peeked, watermark, project_id):
+            if not peeked:
+                return AssembledPayload(events=[])
+            # One-event-per-chunk, mirrors production token-budget chunking.
+            return AssembledPayload(events=[peeked[0]], events_remaining=len(peeked) - 1)
+
+        inst.assemble = fake_assemble
+        return inst
+
+    # Fake clock: `start` reads 0.0; the next read (the between-chunks check
+    # after chunk 1) reads 200.0 — comfortably past the 100s budget.
+    time_values = iter([0.0, 200.0])
+
+    def fake_time_provider():
+        try:
+            return next(time_values)
+        except StopIteration:
+            return 200.0
+
+    restore_calls: list[str] = []
+    original_restore = event_buffer.restore_drained
+
+    async def spy_restore(pid):
+        restore_calls.append(pid)
+        return await original_restore(pid)
+
+    event_buffer.restore_drained = spy_restore
+
+    with (
+        patch.object(harness, 'run_full_cycle', side_effect=fake_run_full_cycle),
+        patch(
+            'fused_memory.reconciliation.context_assembler.ContextAssembler',
+            side_effect=fake_assembler_factory,
+        ),
+    ):
+        iterator = BacklogIterator(
+            harness.config, harness.journal, harness.buffer, harness,
+            time_provider=fake_time_provider,
+        )
+        await iterator.run('dark_factory')
+
+    # Exactly one chunk executed — the budget check stopped a 2nd chunk from
+    # launching, and no final-consolidation cycle ran either.
+    assert run_full_cycle_calls == ['backlog_chunk:1:1'], (
+        f'Expected exactly one chunk cycle before the budget yield, got {run_full_cycle_calls!r}'
+    )
+
+    # The 2 unprocessed events remain buffered (net-drain of exactly 1 event).
+    stats = await event_buffer.get_buffer_stats('dark_factory')
+    assert stats['size'] == 2, (
+        f"Expected 2 events still buffered after a 1-chunk budget yield, got {stats['size']}"
+    )
+
+    # No rollback on a clean yield — restore_drained is reserved for failure paths.
+    assert restore_calls == [], (
+        f'restore_drained must NOT be called on a clean budget yield, got calls: {restore_calls!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_loop_bounds_iterate_branch_with_cycle_timeout(
+    journal, event_buffer, mock_memory_service, caplog
+):
+    """_project_loop must wrap the iterate branch (BacklogIterator.run) in the
+    same asyncio.wait_for(cycle_timeout_seconds) guard the non-iterate branch
+    already has, so a single wedged chunk is bounded and surfaces as an
+    observable timeout instead of hanging the per-project lock forever.
+
+    Forces the iterate branch via a class-patched BacklogIterator.should_iterate
+    (True) and wedges BacklogIterator.run with an unconditional asyncio.sleep,
+    mirroring the wedge technique in test_timeout_marks_run_failed (~L790). A
+    tiny cycle_timeout_seconds makes the wait_for fire quickly.
+
+    RED before step-6: iterator.run(project_id) is currently awaited
+    unwrapped in _project_loop, so it hangs for the full asyncio.sleep(999)
+    instead of timing out — restore_drained is never called and no
+    'reconciliation.iteration_timed_out' record is logged before the outer
+    test-harness wait_for below cuts the test off.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.cycle_timeout_seconds = 1
+    await _seed_recon_state(event_buffer)
+
+    restore_calls: list[str] = []
+    original_restore = event_buffer.restore_drained
+
+    async def spy_restore(pid):
+        restore_calls.append(pid)
+        return await original_restore(pid)
+
+    event_buffer.restore_drained = spy_restore
+
+    async def hang_forever(*_a, **_k):
+        await asyncio.sleep(999)
+
+    with (
+        patch.object(BacklogIterator, 'should_iterate', new=AsyncMock(return_value=True)),
+        patch.object(BacklogIterator, 'run', new=AsyncMock(side_effect=hang_forever)),
+        caplog.at_level(logging.ERROR, logger='fused_memory.reconciliation.harness'),
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness._project_loop('test-project'), timeout=2.5)
+
+    # The iterate branch must be bounded the same way the non-iterate branch
+    # is: a TimeoutError from the wrapping wait_for restores the buffer.
+    assert restore_calls, (
+        'Expected buffer.restore_drained to be called after the iterate branch '
+        'timed out, but it was never invoked — iterator.run() is not wrapped in '
+        'asyncio.wait_for(cycle_timeout_seconds).'
+    )
+    assert all(pid == 'test-project' for pid in restore_calls)
+
+    # The timeout must be observable, not silent.
+    timeout_records = [
+        r for r in caplog.records if r.getMessage() == 'reconciliation.iteration_timed_out'
+    ]
+    assert timeout_records, (
+        'Expected a reconciliation.iteration_timed_out log record after the '
+        f'iterate branch timed out, got records: {[r.getMessage() for r in caplog.records]}'
+    )
+    assert timeout_records[0].__dict__.get('project_id') == 'test-project'
+    assert timeout_records[0].__dict__.get('timeout') == 1
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_budget_bounds_chunks_and_converges_across_invocations(
+    journal, event_buffer, mock_memory_service, caplog
+):
+    """Task-mandated large-corpus regression (task 2040).
+
+    A single budgeted BacklogIterator.run() invocation against a multi-chunk
+    backlog must:
+      (a) process a BOUNDED number of chunks (K, strictly fewer than the
+          total backlog) and terminate on the budget yield;
+      (b) net-drain the buffer by exactly K events — processed chunks are
+          NOT restored;
+      (c) skip the final-consolidation pass (no 'backlog_final_consolidation'
+          run).
+
+    Repeated budgeted invocations must keep draining the remainder,
+    converging the buffer below the should_iterate threshold across
+    successive cycles — the mechanism that makes trigger_reconciliation (and
+    the next reconciliation cycle) an effective remedy instead of queuing
+    behind a lock held forever.
+    """
+    harness = _make_harness_927(journal, event_buffer, mock_memory_service)
+    harness._known_projects['dark_factory'] = '/abs/from/config'
+    harness.config.backlog_iteration_budget_seconds = 100
+    # Lower the should_iterate threshold so a modest corpus can demonstrate
+    # cross-invocation convergence without pushing thousands of events.
+    harness.config.buffer_size_threshold = 5
+    harness.config.opus_threshold_ratio = 1.0  # threshold = 5 * 1.0 = 5
+
+    total_events = 12
+    for _ in range(total_events):
+        await event_buffer.push(_make_event('dark_factory'))
+
+    run_full_cycle_calls: list[str] = []
+
+    async def fake_run_full_cycle(project_id, trigger_reason, **kwargs):
+        run_full_cycle_calls.append(trigger_reason)
+        return ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason=trigger_reason,
+            started_at=datetime.now(UTC),
+            events_processed=len(kwargs.get('events') or []),
+            status=RunStatus.completed,
+        )
+
+    def fake_assembler_factory(memory_service, taskmaster, config, project_root=''):
+        inst = MagicMock()
+
+        async def fake_assemble(peeked, watermark, project_id):
+            if not peeked:
+                return AssembledPayload(events=[])
+            # One-event-per-chunk, mirrors production token-budget chunking.
+            return AssembledPayload(events=[peeked[0]], events_remaining=len(peeked) - 1)
+
+        inst.assemble = fake_assemble
+        return inst
+
+    restore_calls: list[str] = []
+    original_restore = event_buffer.restore_drained
+
+    async def spy_restore(pid):
+        restore_calls.append(pid)
+        return await original_restore(pid)
+
+    event_buffer.restore_drained = spy_restore
+
+    # Fake clock: advances by 25s per call. `start` consumes the first call
+    # of each run() invocation; each between-chunks check consumes the next.
+    # With a 100s budget this trips (elapsed >= 100) on the 5th
+    # time_provider() call of a given invocation -- i.e. after 4 chunks have
+    # completed, gating the would-be 5th chunk. Each run() invocation
+    # captures its own `start`, so the same 4-chunks-per-invocation pattern
+    # repeats every call, regardless of the counter's running total.
+    call_count = [0]
+
+    def fake_time_provider():
+        call_count[0] += 1
+        return call_count[0] * 25.0
+
+    iterator = BacklogIterator(
+        harness.config, harness.journal, harness.buffer, harness,
+        time_provider=fake_time_provider,
+    )
+
+    with (
+        patch.object(harness, 'run_full_cycle', side_effect=fake_run_full_cycle),
+        patch(
+            'fused_memory.reconciliation.context_assembler.ContextAssembler',
+            side_effect=fake_assembler_factory,
+        ),
+        caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'),
+    ):
+        # --- Invocation 1: bounded chunks, net-drain, no final consolidation ---
+        await iterator.run('dark_factory')
+
+        expected_chunk_calls = [
+            'backlog_chunk:1:1', 'backlog_chunk:2:1', 'backlog_chunk:3:1', 'backlog_chunk:4:1',
+        ]
+        assert run_full_cycle_calls == expected_chunk_calls, (
+            f'Expected exactly 4 bounded chunk cycles before the budget yield '
+            f'(no final consolidation), got {run_full_cycle_calls!r}'
+        )
+        assert len(run_full_cycle_calls) < total_events, (
+            'Chunk count must be strictly bounded below the total backlog size.'
+        )
+
+        stats = await event_buffer.get_buffer_stats('dark_factory')
+        assert stats['size'] == total_events - 4, (
+            f'Expected a net-drain of exactly 4 events (no restore) after '
+            f"invocation 1, got size={stats['size']}"
+        )
+        assert restore_calls == [], (
+            f'restore_drained must NOT be called on a clean budget yield, got: {restore_calls!r}'
+        )
+        assert await iterator.should_iterate('dark_factory') is True, (
+            'Buffer should still be above the should_iterate threshold after only '
+            'one budgeted invocation.'
+        )
+
+        # The yielded log must carry accurate counters — this is what lets an
+        # operator observe a bounded, forward-progressing iteration instead
+        # of silence.
+        yielded_records = [
+            r for r in caplog.records
+            if r.getMessage() == 'reconciliation.backlog_iteration_yielded'
+        ]
+        assert len(yielded_records) == 1, (
+            f'Expected exactly one backlog_iteration_yielded record after '
+            f'invocation 1, got: {[r.getMessage() for r in caplog.records]}'
+        )
+        assert yielded_records[0].__dict__.get('project_id') == 'dark_factory'
+        assert yielded_records[0].__dict__.get('chunks_processed') == 4, (
+            f'Expected chunks_processed=4, got '
+            f"{yielded_records[0].__dict__.get('chunks_processed')}"
+        )
+        assert yielded_records[0].__dict__.get('events_remaining') == total_events - 4, (
+            f'Expected events_remaining={total_events - 4}, got '
+            f"{yielded_records[0].__dict__.get('events_remaining')}"
+        )
+        caplog.clear()
+
+        # --- Invocation 2: continued draining converges below the threshold ---
+        run_full_cycle_calls.clear()
+        await iterator.run('dark_factory')
+
+        assert run_full_cycle_calls == expected_chunk_calls, (
+            f'Expected invocation 2 to also bound itself to 4 chunk cycles, '
+            f'got {run_full_cycle_calls!r}'
+        )
+        stats = await event_buffer.get_buffer_stats('dark_factory')
+        assert stats['size'] == total_events - 8, (
+            f'Expected a cumulative net-drain of 8 events after invocation 2, '
+            f"got size={stats['size']}"
+        )
+        assert restore_calls == [], (
+            f'restore_drained must NOT be called across budgeted invocations, got: {restore_calls!r}'
+        )
+        assert await iterator.should_iterate('dark_factory') is False, (
+            'Buffer must have converged below the should_iterate threshold after '
+            'two budgeted invocations — the mechanism that makes '
+            'trigger_reconciliation / the next cycle an effective remedy.'
+        )
+
+        yielded_records_2 = [
+            r for r in caplog.records
+            if r.getMessage() == 'reconciliation.backlog_iteration_yielded'
+        ]
+        assert len(yielded_records_2) == 1, (
+            f'Expected exactly one backlog_iteration_yielded record after '
+            f'invocation 2, got: {[r.getMessage() for r in caplog.records]}'
+        )
+        assert yielded_records_2[0].__dict__.get('chunks_processed') == 4, (
+            f'Expected chunks_processed=4, got '
+            f"{yielded_records_2[0].__dict__.get('chunks_processed')}"
+        )
+        assert yielded_records_2[0].__dict__.get('events_remaining') == total_events - 8, (
+            f'Expected events_remaining={total_events - 8}, got '
+            f"{yielded_records_2[0].__dict__.get('events_remaining')}"
+        )
+
+
 @pytest.mark.asyncio
 async def test_fetch_filtered_task_tree_short_circuits_on_empty_project_root(
     journal, event_buffer, mock_memory_service
