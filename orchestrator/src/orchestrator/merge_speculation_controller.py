@@ -137,6 +137,48 @@ class SpeculationController:
         """
         return self.spec_base if self.spec_base is not None else actual_main
 
+    def on_dequeue(self, req: MergeRequest) -> str | None:
+        """Decide ATTACH vs FALLBACK for a freshly dequeued request.
+
+        ATTACH — all four conditions hold: ``pending_spec_base`` is
+        recorded, a permit is held, ``pending_predecessor`` is known, and
+        the predecessor is still in-flight (its result Future is not yet
+        done). The held permit is RETAINED — it transfers to the verifier
+        when the attached item is eventually put via ``on_transfer`` — and
+        ``spec_base`` becomes the predecessor's recorded commit so this
+        late arrival merges against it instead of plain main.
+
+        FALLBACK — any condition fails: release the held permit (if any)
+        and merge against plain main (``spec_base`` cleared to None).
+
+        Either way, ``pending_spec_base``/``pending_predecessor`` are
+        cleared — consumed by ATTACH or dropped by FALLBACK. Mirrors
+        ``_merger_loop``'s ATTACH/FALLBACK decision (task 1862).
+
+        ``req`` (the freshly dequeued request) does not affect the
+        decision itself — it is accepted for call-site symmetry with the
+        original loop-local logic and future extension (e.g. logging).
+        """
+        if (
+            self.pending_spec_base is not None
+            and self._held
+            and self.pending_predecessor is not None
+            and not self.pending_predecessor.result.done()
+        ):
+            self.spec_base = self.pending_spec_base  # ATTACH
+        else:
+            # FALLBACK — release retained permit (if any); over-release is
+            # avoided by the `if self._held` guard, never by the semaphore
+            # type (see module docstring's double-release tolerance note).
+            if self._held:
+                self._slot.release()
+                self._held = False
+            self.spec_base = None
+        # Clear pending locals — consumed by ATTACH or dropped by FALLBACK.
+        self.pending_spec_base = None
+        self.pending_predecessor = None
+        return self.spec_base
+
     def snapshot(self) -> dict[str, Any]:
         """Return a synchronous read-only snapshot of the controller's state.
 
