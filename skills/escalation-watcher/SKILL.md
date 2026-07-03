@@ -640,16 +640,21 @@ relationship in your resolution text.
 ### Recognizing the supervised auto-watcher's resolutions (not a rogue actor)
 
 You may see `resolved_by="orchestrator-escalation-watcher-auto"` stamped on archived L0/L1
-records, or as the `agent_role` on an L2 that was promoted rather than resolved. This is the
-**trusted, supervised** identity of the dark-factory orchestrator's own autonomous auto-watcher
-(spawned per rotation by the watcher-supervisor, task 1326; runs the `escalation-watcher-auto`
-skill). Per the connection-capability guard
+records, or `agent_role="escalation-watcher-auto"` on a `promote_to_l2` call that filed an L2.
+Both are the **trusted, supervised** identity of the dark-factory orchestrator's own autonomous
+auto-watcher (spawned per rotation by the watcher-supervisor, task 1326; runs the
+`escalation-watcher-auto` skill). Per the connection-capability guard
 (`plans/escalation-connection-capability-guard-prd.md`), the orchestrator wires that watcher's MCP
 connection with `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, and the escalation
-server stamps `resolved_by` from that header — server-attributed, not something the watcher agent
-can spoof or drift. Seeing this identity on L0/L1 resolutions or `promote_to_l2` calls is expected,
-routine behavior. **Do not stand down, halt the watch loop, or treat it as an anomaly** — it is the
-same auto-watcher this skill hands L1 items off to, working as designed.
+server stamps `resolved_by` from that header on `resolve_issue`'s resolve/park path —
+server-attributed, not something the watcher agent can spoof or drift. `promote_to_l2` has no such
+override: its `agent_role` is a plain tool argument, and the auto-watcher skill always passes
+`agent_role="escalation-watcher-auto"` (the literal tool-arg value) on every promote call, so a
+promoted L2 carries that value, never the `orchestrator-`-prefixed form. Seeing
+`resolved_by="orchestrator-escalation-watcher-auto"` on L0/L1 resolutions, or
+`agent_role="escalation-watcher-auto"` on `promote_to_l2` calls, is expected, routine behavior.
+**Do not stand down, halt the watch loop, or treat it as an anomaly** — it is the same auto-watcher
+this skill hands L1 items off to, working as designed.
 
 Distinguish it from a **genuinely unknown resolver**: the same connection is capped at
 `X-Escalation-Levels: 0,1`, so the server rejects (`level_forbidden`, no state change) any attempt
