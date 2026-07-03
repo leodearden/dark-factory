@@ -28,6 +28,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
+    _WATCHER_ESCALATION_HEADERS,
     _WATCHER_MAX_BACKOFF_SECS,
     _WATCHER_TIMEOUT_GRACE_SECS,
     Harness,
@@ -355,7 +356,8 @@ class TestRunWatcherRotation:
 
     @pytest.mark.asyncio
     async def test_mcp_config_from_escalation_url(self, tmp_path: Path) -> None:
-        """mcp_config comes from self.mcp.mcp_config_json with escalation_url."""
+        """mcp_config comes from self.mcp.mcp_config_json with escalation_url and the
+        watcher's capability headers (_WATCHER_ESCALATION_HEADERS)."""
         from shared.cli_invoke import AgentResult
 
         h = _make_rotation_harness(tmp_path)
@@ -369,8 +371,33 @@ class TestRunWatcherRotation:
             await h._run_watcher_rotation()
 
         expected_url = f'http://{h.config.escalation.host}:{h.config.escalation.port}/mcp'
-        h.mcp.mcp_config_json.assert_called_once_with(escalation_url=expected_url)  # type: ignore[union-attr]
+        h.mcp.mcp_config_json.assert_called_once_with(  # type: ignore[union-attr]
+            escalation_url=expected_url,
+            escalation_headers=_WATCHER_ESCALATION_HEADERS,
+        )
         assert captured.get('mcp_config') == {'mcp': 'config-sentinel'}
+
+    @pytest.mark.asyncio
+    async def test_watcher_mcp_config_carries_capability_headers(self, tmp_path: Path) -> None:
+        """_WATCHER_ESCALATION_HEADERS pins the exact Levels+Identity contract,
+        independent of the constant's name: the supervised watcher may only
+        resolve/park levels 0 and 1 (never L2), and the server stamps
+        resolved_by via the identity header rather than trusting a tool arg."""
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            return AgentResult(success=True, output='')
+
+        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+            await h._run_watcher_rotation()
+
+        _, kwargs = h.mcp.mcp_config_json.call_args  # type: ignore[union-attr]
+        assert kwargs.get('escalation_headers') == {
+            'X-Escalation-Levels': '0,1',
+            'X-Escalation-Identity': 'orchestrator-escalation-watcher-auto',
+        }
 
     @pytest.mark.asyncio
     async def test_tool_restrictions_passed(self, tmp_path: Path) -> None:

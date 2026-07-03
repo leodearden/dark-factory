@@ -669,8 +669,24 @@ class McpLifecycle:
             await asyncio.sleep(0.5)
         return False
 
-    def mcp_config_json(self, escalation_url: str | None = None) -> dict:
-        """Return MCP server config dict suitable for --mcp-config."""
+    def mcp_config_json(
+        self,
+        escalation_url: str | None = None,
+        escalation_headers: dict | None = None,
+    ) -> dict:
+        """Return MCP server config dict suitable for --mcp-config.
+
+        escalation_headers, when provided ALONGSIDE escalation_url, is copied
+        into the escalation server block as 'headers' (e.g. the connection
+        -capability X-Escalation-Levels / X-Escalation-Identity headers the
+        supervised watcher rotation attaches — see
+        plans/escalation-connection-capability-guard-prd.md task beta). It is
+        a no-op when escalation_url is absent, and the default (None) leaves
+        the escalation block — and this method's output overall — byte-for
+        -byte unchanged, so every other caller (steward, review-checkpoint,
+        workflow, dry-run-unblock) keeps full-authority, header-less
+        connections.
+        """
         config = {
             'mcpServers': {
                 'fused-memory': {
@@ -695,8 +711,11 @@ class McpLifecycle:
             },
         }
         if escalation_url:
-            config['mcpServers']['escalation'] = {
+            escalation_block: dict = {
                 'type': 'http',
                 'url': escalation_url,
             }
+            if escalation_headers:
+                escalation_block['headers'] = dict(escalation_headers)
+            config['mcpServers']['escalation'] = escalation_block
         return config
