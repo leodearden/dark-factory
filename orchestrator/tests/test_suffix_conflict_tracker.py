@@ -31,6 +31,7 @@ from orchestrator.merge_queue import (
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
+    SpeculativeMergeWorker,
 )
 from orchestrator.merge_types import MergeBounceRegistry
 from orchestrator.suffix_graph import (
@@ -596,4 +597,116 @@ class TestTrackerBounceWithoutWorker:
         assert tracker.signature == sentinel_sig, (
             'signature was modified even though conflicts_with_main was empty. '
             f'Expected {sentinel_sig!r}, got {tracker.signature!r}.'
+        )
+
+
+# ── step-7: SpeculativeMergeWorker delegates to SuffixConflictTracker ──────────
+
+
+def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
+    """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
+    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+
+class TestWorkerDelegatesToTracker:
+    """SpeculativeMergeWorker delegates its suffix-conflict state to a
+    SuffixConflictTracker instance (self._suffix_tracker) via thin property
+    wrappers that preserve the worker's original attribute names.
+
+    RED until step-8 GREEN rewires SpeculativeMergeWorker.__init__ to
+    construct self._suffix_tracker and replaces the 4 inline attrs with
+    delegating properties. (Sync-only class — see TestWorkerMethodDelegation
+    for the async method-delegation + recompute-visibility cases; mixing
+    sync defs into an @pytest.mark.asyncio class is a hard error here, see
+    the "Sync def collected inside an @pytest.mark.asyncio class" filterwarnings entry.)
+    """
+
+    def test_worker_has_suffix_tracker(self, git_ops):
+        worker = _make_worker(git_ops)
+        assert isinstance(worker._suffix_tracker, SuffixConflictTracker)
+
+    def test_read_delegation_graph(self, git_ops):
+        worker = _make_worker(git_ops)
+        assert worker._suffix_conflict_graph is worker._suffix_tracker.graph
+
+    def test_write_delegation_graph(self, git_ops):
+        worker = _make_worker(git_ops)
+        g = SuffixConflictGraph(
+            nodes=('rid-x',),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset(),
+        )
+        worker._suffix_conflict_graph = g
+        assert worker._suffix_tracker.graph is g, (
+            'Writing worker._suffix_conflict_graph must round-trip through '
+            'self._suffix_tracker.graph.'
+        )
+
+    def test_write_delegation_signature(self, git_ops):
+        worker = _make_worker(git_ops)
+        sig = (('rid-x',), 'deadbeef')
+        worker._suffix_conflict_signature = sig
+        assert worker._suffix_tracker.signature == sig
+        assert worker._suffix_conflict_signature == sig
+
+    def test_write_delegation_last_known_main_sha(self, git_ops):
+        worker = _make_worker(git_ops)
+        worker._last_known_main_sha = 'cafef00d'
+        assert worker._suffix_tracker.last_known_main_sha == 'cafef00d'
+        assert worker._last_known_main_sha == 'cafef00d'
+
+    def test_write_delegation_bounce_registry(self, git_ops):
+        worker = _make_worker(git_ops)
+        reg = MergeBounceRegistry()
+        reg.record_bounce('591')
+        worker._bounce_registry = reg
+        assert worker._suffix_tracker.bounce_registry is reg
+        assert worker._bounce_registry is reg
+
+    def test_snapshot_integrity(self, git_ops):
+        worker = _make_worker(git_ops)
+        assert (
+            worker.snapshot()['suffix_conflict_graph']
+            == worker._suffix_tracker.graph.to_snapshot_dict()
+        )
+
+
+@pytest.mark.asyncio
+class TestWorkerMethodDelegation:
+    """Async half of TestWorkerDelegatesToTracker: method delegation +
+    recompute-visibility (split out because mixing sync defs into an
+    @pytest.mark.asyncio class is a hard error in this repo).
+
+    RED until step-8 GREEN rewires recompute_suffix_conflict_graph() /
+    _bounce_conflicting_suffix_items() to thin `await self._suffix_tracker...`
+    delegators.
+    """
+
+    async def test_method_delegation_bounce(self, git_ops):
+        """worker._bounce_conflicting_suffix_items() must delegate (await)
+        to self._suffix_tracker.bounce_conflicting_suffix_items()."""
+        worker = _make_worker(git_ops)
+        sentinel_mock = AsyncMock()
+        worker._suffix_tracker.bounce_conflicting_suffix_items = sentinel_mock
+
+        await worker._bounce_conflicting_suffix_items()
+
+        sentinel_mock.assert_awaited_once()
+
+    async def test_method_delegation_recompute_visible_both_paths(
+        self, git_ops, config, git_repo,
+    ):
+        """Driving worker.recompute_suffix_conflict_graph() must make the
+        resulting graph visible through BOTH the worker's legacy attribute
+        name and the tracker's own field (same object)."""
+        req = _make_req('591', 'branch-591', config, git_repo)
+        worker = _make_worker(git_ops)
+        worker._lane_buffers['normal'].append(req)
+
+        await worker.recompute_suffix_conflict_graph()
+
+        assert worker._suffix_conflict_graph is worker._suffix_tracker.graph, (
+            'worker._suffix_conflict_graph and worker._suffix_tracker.graph '
+            'diverged after recompute_suffix_conflict_graph().'
         )
