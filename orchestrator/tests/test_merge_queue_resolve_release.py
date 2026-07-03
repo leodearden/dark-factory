@@ -286,3 +286,151 @@ class TestResolveAndReleaseContract:
         assert worker._n_failed is True, (
             'chain_failed=False must not reset _n_failed back to False'
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared fault-injection driving helpers (steps 3, 5, 7, 9)
+# ---------------------------------------------------------------------------
+
+
+def _spy_on_resolve_and_release(
+    worker: SpeculativeMergeWorker,
+) -> list[dict[str, Any]]:
+    """Wrap worker._resolve_and_release with a call-recording spy.
+
+    Delegates to the real (bound) implementation so end-state assertions
+    (Future resolution, releases) still hold; records (args, kwargs) per call
+    so tests can assert call count and inspect kwargs (e.g. release_resources).
+    """
+    calls: list[dict[str, Any]] = []
+    original = worker._resolve_and_release
+
+    async def _spy(*args: Any, **kwargs: Any) -> None:
+        calls.append({'args': args, 'kwargs': kwargs})
+        await original(*args, **kwargs)
+
+    worker._resolve_and_release = _spy  # type: ignore[method-assign]
+    return calls
+
+
+async def _drive_verifier_loop_fill(
+    worker: SpeculativeMergeWorker, item: SpeculativeItem,
+) -> None:
+    """Fill variant: pre-load the queue with [item, None] then run one pass.
+
+    Both items are already queued before _verifier_loop starts, so its first
+    DISPATCH-FILL iteration picks up *item* via the non-blocking get_nowait()
+    path (fill-loop dispatch site).
+    """
+    worker._verifier_queue.put_nowait(item)
+    worker._verifier_queue.put_nowait(None)
+    await asyncio.wait_for(worker._verifier_loop(), timeout=10.0)
+
+
+async def _drive_verifier_loop_blocking_get(
+    worker: SpeculativeMergeWorker, item: SpeculativeItem,
+) -> None:
+    """Blocking-get variant: start the loop on an EMPTY queue, let it reach
+    the blocking ``await self._verifier_queue.get()`` branch, THEN arrive.
+
+    The initial ``asyncio.sleep(0)`` yield is load-bearing: without it, both
+    queue.put() calls below (unbounded queue → put() never actually suspends)
+    would land before the task gets any run time, so the task would see a
+    non-empty queue on its very first DISPATCH-FILL iteration and take the
+    get_nowait() fill-loop path instead of the blocking-get path this variant
+    targets.  A single scheduler tick is sufficient because everything from
+    task-start to the blocking ``get()`` call is synchronous Python (no
+    intervening real await), so one `Task.__step` drives it all the way there.
+    """
+    task = asyncio.create_task(worker._verifier_loop())
+    await asyncio.sleep(0)
+    await worker._verifier_queue.put(item)
+    await worker._verifier_queue.put(None)
+    await asyncio.wait_for(task, timeout=10.0)
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: DISPATCH path (fill-loop ~7099 + blocking-get ~7381)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDispatchErrorChokepoint:
+    """DISPATCH path fault injection: _dispatch_item raises.
+
+    RED until step-4 GREEN routes both dispatch except-handlers through
+    _resolve_and_release. RED marker: the chokepoint spy call count is 0
+    (handlers still inline the resolve+release logic); all other assertions
+    already hold against the pre-refactor inline code.
+    """
+
+    @pytest.mark.parametrize(
+        'driver', [_drive_verifier_loop_fill, _drive_verifier_loop_blocking_get],
+        ids=['fill', 'blocking_get'],
+    )
+    async def test_dispatch_error_routes_through_chokepoint(
+        self, git_ops: GitOps, config: OrchestratorConfig, driver: Any,
+    ) -> None:
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        req, item = await _make_real_merged_item(
+            git_ops, config, f'task/disp-{driver.__name__}', 'disp.py', 'x = 1\n',
+            speculative=True,
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+        calls = _spy_on_resolve_and_release(worker)
+
+        async def _raising_dispatch(_item: Any) -> Any:
+            raise Exception('boom')
+
+        worker._dispatch_item = _raising_dispatch  # type: ignore[method-assign]
+
+        depth0 = worker._speculation_slot._value
+
+        await driver(worker, item)
+
+        assert len(calls) == 1, (
+            f'Expected exactly one _resolve_and_release call, got {len(calls)}'
+        )
+        assert req.result.done()
+        outcome = req.result.result()
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith('Verifier error:'), outcome.reason
+        assert worker._speculation_slot._value == depth0 + 1, (
+            'speculation slot must be released exactly once'
+        )
+        assert item.merge_wt is not None and not item.merge_wt.exists(), (
+            'merge worktree must be removed from disk'
+        )
+        assert item.merge_wt not in worker._owned_merge_worktrees, (
+            'merge worktree must be deregistered from the owned ledger'
+        )
+        assert worker._n_failed is True
+
+    async def test_dispatch_cancelled_error_propagates_and_skips_chokepoint(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """CancelledError from _dispatch_item must propagate out of
+        _verifier_loop untouched; the chokepoint must never see it.
+        """
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _req, item = await _make_real_merged_item(
+            git_ops, config, 'task/disp-cancel', 'disp_cancel.py', 'x = 1\n',
+            speculative=True,
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+        calls = _spy_on_resolve_and_release(worker)
+
+        async def _cancelling_dispatch(_item: Any) -> Any:
+            raise asyncio.CancelledError()
+
+        worker._dispatch_item = _cancelling_dispatch  # type: ignore[method-assign]
+
+        worker._verifier_queue.put_nowait(item)
+        worker._verifier_queue.put_nowait(None)
+
+        with pytest.raises(asyncio.CancelledError):
+            await worker._verifier_loop()
+
+        assert len(calls) == 0, 'CancelledError must never reach the chokepoint'
