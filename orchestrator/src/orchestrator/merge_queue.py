@@ -6678,7 +6678,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
-                        self._speculation_controller.on_transfer()
+                        self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -6707,7 +6707,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
-                        self._speculation_controller.on_transfer()
+                        self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -6738,7 +6738,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
-                        self._speculation_controller.on_transfer()
+                        self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
                     branch_head = branch_head.strip()
@@ -6754,7 +6754,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             immediate_outcome=MergeOutcome('already_merged'),
                             started_monotonic=t0,
                         ))
-                        self._speculation_controller.on_transfer()
+                        self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -6791,7 +6791,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
-                        self._speculation_controller.on_transfer()
+                        self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -6822,7 +6822,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             failure_diagnostic=_diag,
                             started_monotonic=t0,
                         ))
-                        self._speculation_controller.on_transfer()
+                        self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -6867,7 +6867,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             already_delivered=_already,
                             started_monotonic=t0,
                         ))
-                        self._speculation_controller.on_transfer()
+                        self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -6917,6 +6917,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         raise
                     # The put succeeded — verifier now owns the speculation
                     # permit for this item (released on drain if speculative).
+                    # Plain on_transfer() (not on_transfer_terminal()): unlike
+                    # the seven early-continue sites above, this is NOT a
+                    # `continue` — the look-ahead immediately below re-derives
+                    # spec_base for the NEXT request (on_lookahead_found) or
+                    # clears all state (on_shutdown); the retain branch
+                    # (on_lookahead_pending) leaves spec_base as-is (a
+                    # pre-existing, harmless staleness window — never read
+                    # again before the next on_dequeue overwrites it).
                     self._speculation_controller.on_transfer()
                     self._inflight_req = None  # item is now owned by verifier
 

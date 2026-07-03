@@ -315,6 +315,65 @@ class TestLookaheadAndTransferLifecycle:
         # will release it itself on drain (the zeta chokepoint).
         assert slot._value == depth - 1
 
+    async def test_on_transfer_terminal_clears_held_and_spec_base_without_releasing_slot(
+        self,
+    ) -> None:
+        """Amendment regression test (post-step-12 review): on_transfer_terminal()
+        is the early-continue counterpart of on_transfer() — it ALSO clears
+        spec_base (unlike plain on_transfer(), which leaves spec_base for the
+        immediately-following look-ahead to re-derive). Used at the seven
+        early-continue sites (already_merged/conflict/merge-fail/abandoned/
+        revparse-fail/drop/branch-presence-guard) where the loop `continue`s
+        with no subsequent look-ahead call.
+        """
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+        slot = asyncio.Semaphore(depth)
+        controller = SpeculationController(slot=slot, depth=depth)
+        # Seed a non-None spec_base as ATTACH would (on_dequeue), simulating
+        # a speculative request that is about to resolve via an
+        # early-continue outcome (e.g. conflict) rather than a real merge.
+        await controller.acquire_for_lookahead()
+        controller.spec_base = 'PRED_SHA'
+
+        controller.on_transfer_terminal()
+
+        assert controller.held_by_merger == 0
+        assert controller.spec_base is None
+        assert controller.is_idle() is True
+        # UNCHANGED by on_transfer_terminal() — the verifier now owns this
+        # permit and will release it itself on drain (the zeta chokepoint).
+        assert slot._value == depth - 1
+
+    async def test_on_transfer_terminal_is_idle_immediately_unlike_on_transfer(
+        self,
+    ) -> None:
+        """Pins the exact divergence the amendment fixes: after an
+        early-continue transfer, is_idle() must be True immediately (no
+        look-ahead ever runs to clean up); after the main-success transfer,
+        spec_base is deliberately left for the look-ahead to handle.
+        """
+        from orchestrator.merge_speculation_controller import SpeculationController
+
+        depth = 2
+
+        terminal_controller = SpeculationController(slot=asyncio.Semaphore(depth), depth=depth)
+        await terminal_controller.acquire_for_lookahead()
+        terminal_controller.spec_base = 'PRED_SHA'
+        terminal_controller.on_transfer_terminal()
+        assert terminal_controller.is_idle() is True
+
+        main_success_controller = SpeculationController(slot=asyncio.Semaphore(depth), depth=depth)
+        await main_success_controller.acquire_for_lookahead()
+        main_success_controller.spec_base = 'PRED_SHA'
+        main_success_controller.on_transfer()
+        # Not idle yet — spec_base is still the pre-transfer value until the
+        # look-ahead call (on_lookahead_found/on_lookahead_pending/
+        # on_shutdown) that always immediately follows on_transfer() in
+        # _merger_loop runs.
+        assert main_success_controller.is_idle() is False
+
     async def test_acquire_found_transfer_sequence_conserves_permit(self) -> None:
         """Net effect of acquire -> found -> transfer: exactly one permit is
         handed off to the verifier. The slot stays at depth-1 throughout —

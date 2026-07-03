@@ -566,3 +566,144 @@ class TestShutdownRetainedPermitConservation:
             await asyncio.wait_for(worker_task, timeout=10.0)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
+
+
+# ---------------------------------------------------------------------------
+# Amendment (post-step-12 review): terminal (early-continue) transfer must
+# clear spec_base, not just held_by_merger
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEarlyContinueTerminalTransferClearsSpecBase:
+    """A speculative (ATTACHed) request that resolves via one of the seven
+    early-continue sites — here, the Step-0 loop-breaker/abandoned path —
+    must return the controller to a genuinely idle state: ``spec_base``
+    cleared, ``is_idle()`` True. This exercises
+    ``SpeculationController.on_transfer_terminal()`` (added post-step-12) via
+    the real ``_merger_loop``, not just the unit-level controller test in
+    ``test_merge_speculation_controller.py``.
+
+    Before this fix, the loop's seven early-continue sites called plain
+    ``on_transfer()`` — which only clears ``held_by_merger`` (correct for the
+    permit-conservation identity, which this suite already covered) — leaving
+    ``spec_base`` stale until the next ``on_dequeue``. The permit-conservation
+    identity alone cannot see this: it only sums permits, not ``spec_base``.
+
+    A's local verify is gated so A stays in-flight (permit RETAINED via
+    ``on_lookahead_pending``, mirroring ``TestPrefetchLookaheadAndAttachConservation``).
+    B then ATTACHes to A's retained ``spec_base`` — but B's task_id is
+    pre-seeded past ``MAX_POST_MERGE_VERIFY_TIMEOUTS``, so B's dequeue
+    immediately hits the Step-0 loop-breaker (an early-continue site) instead
+    of attempting a real merge. B never reaches a verify runner, so — unlike
+    the ATTACH scenario above — no fake remote / host-allocator injection is
+    needed for B; the worker's lazily-built local-only allocator (no
+    ``verify_runners`` configured) is enough for A's single local verify.
+
+    B's terminal transfer happens entirely on the MERGER side and is
+    observed by polling ``is_idle()`` rather than awaiting ``req_b.result``:
+    with a single local host slot occupied by A's still-gated verify, the
+    verifier cannot dispatch (and inline-finalize) B's passthrough item
+    until A's FINALIZE-HEAD step completes — i.e. until ``gate_a_release``
+    is set — so ``req_b.result`` deliberately stays pending across the
+    checkpoint this test cares about.
+    """
+
+    async def test_attach_then_abandon_returns_to_idle(
+        self, git_ops: GitOps, git_config: GitConfig,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        K = 2
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                gate_a_entered.set()
+                await gate_a_release.wait()
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok',
+                lint_output='', type_output='', category='',
+                timed_out=False, verify_skipped=False,
+            )
+
+        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        wt_a = await _make_branch_with_file(
+            git_ops, 'task/pc-term-a', 'pc_term_a.py', 'a = 1\n',
+        )
+        wt_b = await _make_branch_with_file(
+            git_ops, 'task/pc-term-b', 'pc_term_b.py', 'b = 2\n',
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, speculation_depth=K)
+
+        req_a = _make_request('pc-term-a', 'task/pc-term-a', wt_a, config)
+        req_b = _make_request('pc-term-b', 'task/pc-term-b', wt_b, config)
+
+        # Pre-seed B past the loop-breaker threshold so its dequeue hits the
+        # Step-0 early-continue site (abandoned) instead of a real merge.
+        worker._post_merge_verify_timeouts[req_b.task_id] = (
+            worker.MAX_POST_MERGE_VERIFY_TIMEOUTS
+        )
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await queue.put(req_a)
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # A in-flight, permit RETAINED (pending) for a possible late
+            # arrival — genuinely not idle yet.
+            assert worker._speculation_controller.is_idle() is False
+
+            await queue.put(req_b)
+
+            # B's terminal (early-continue) transfer happens entirely on the
+            # MERGER side (on_dequeue's ATTACH + the Step-0 loop-breaker +
+            # on_transfer_terminal()) and does NOT require the verifier to
+            # drain B — A still holds the only local host slot until
+            # gate_a_release is set, so the verifier cannot reach B's item
+            # yet. Poll for the merger-side idle transition rather than
+            # awaiting req_b.result (see class docstring).
+            for _ in range(500):
+                if worker._speculation_controller.is_idle():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(
+                    'merger never returned to idle after B was abandoned '
+                    '(is_idle() stayed False — see is_idle()/spec_base below)'
+                    f': {_speculation_snapshot(worker)!r}'
+                )
+
+            # Core amendment assertion: a terminal (early-continue) transfer
+            # must fully clear spec_base, not just held_by_merger — so the
+            # controller reads genuinely idle immediately, not just
+            # permit-conserved.
+            spec = _speculation_snapshot(worker)
+            assert spec['spec_base'] is None, (
+                f"spec_base must be None after B's terminal transfer; got "
+                f'{spec["spec_base"]!r} (stale from on_transfer() not '
+                f'clearing it — see SpeculationController.on_transfer_terminal())'
+            )
+            _assert_conservation(worker, where='after early-continue terminal transfer')
+
+            gate_a_release.set()
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+            assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
+            assert outcome_b.status == 'blocked', f'B must be abandoned; got {outcome_b!r}'
+
+            _assert_conservation(worker, where='post-landing quiescence')
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)

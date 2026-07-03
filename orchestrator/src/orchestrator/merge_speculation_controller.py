@@ -30,7 +30,18 @@ own) and drives only the MERGER side of its lifecycle:
   immediately.
 * ``on_transfer`` — the merger has handed a speculative item to the
   verifier via ``_verifier_queue.put()``; the verifier now owns the permit,
-  so this clears ``held_by_merger`` WITHOUT releasing the semaphore.
+  so this clears ``held_by_merger`` WITHOUT releasing the semaphore. Used
+  ONLY at the single post-merge-success look-ahead site — ``spec_base`` is
+  deliberately left untouched because the immediately-following look-ahead
+  call (``on_lookahead_found`` / ``on_lookahead_pending`` / ``on_shutdown``)
+  re-derives or clears it.
+* ``on_transfer_terminal`` — the same held-by-merger clear as ``on_transfer``,
+  used at the seven early-continue sites (already_merged / conflict /
+  merge-fail / abandoned / revparse-fail / drop / branch-presence-guard)
+  where the loop ``continue``s immediately with no subsequent look-ahead to
+  re-derive state. ALSO clears ``spec_base`` — mirrors the original
+  loop-locals, which set both ``held_spec_permit = False`` AND
+  ``spec_base = None`` at these sites.
 * ``on_abort`` — a guard/failure/exception/train short-circuit before a
   put; releases the permit if held (covers the request_abandoned/train/
   WorktreeMissing/Exception in-body releases).
@@ -215,8 +226,38 @@ class SpeculationController:
         Clears ``held_by_merger`` WITHOUT releasing the semaphore — the
         verifier now owns the permit and will release it itself on drain
         (the zeta chokepoint). Mirrors ``merge_queue.py:6926``.
+
+        Used ONLY at the single post-merge-success look-ahead site:
+        ``spec_base`` is deliberately left as-is because the
+        immediately-following look-ahead call (``on_lookahead_found`` /
+        ``on_lookahead_pending`` / ``on_shutdown``) re-derives or clears it.
+        For the seven early-continue sites (no subsequent look-ahead ever
+        runs for this permit), use ``on_transfer_terminal`` instead so
+        ``spec_base`` does not leak stale between requests.
         """
         self._held = False
+
+    def on_transfer_terminal(self) -> None:
+        """The merger has handed a TERMINAL (early-continue) item to the verifier.
+
+        Like ``on_transfer``, clears ``held_by_merger`` WITHOUT releasing the
+        semaphore — the verifier now owns the permit. UNLIKE ``on_transfer``,
+        ALSO clears ``spec_base``: this is for the seven early-continue sites
+        (already_merged / conflict / merge-fail / abandoned / revparse-fail /
+        drop / branch-presence-guard) where the loop ``continue``s
+        immediately afterward, so no subsequent look-ahead call will ever
+        run to re-derive ``spec_base`` for this permit. Mirrors the original
+        loop-locals, which set BOTH ``held_spec_permit = False`` AND
+        ``spec_base = None`` at these sites (``merge_queue.py``'s Step
+        0/0.5/1/2/3 short-circuit ``continue``s).
+
+        Without this, ``spec_base`` would leak the just-completed request's
+        base SHA across the ``continue``, wrongly reporting ``is_idle()`` as
+        False and ``snapshot()['speculation']['spec_base']`` as non-None
+        until the next ``on_dequeue`` happens to overwrite or clear it.
+        """
+        self._held = False
+        self.spec_base = None
 
     def on_abort(self) -> None:
         """A guard/failure/exception/train short-circuit before a put.
