@@ -27,13 +27,15 @@ Test coverage:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator import verify
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.verify import VerifyResult
 
 
 class TestClassifyFailureEnvTransient:
@@ -288,4 +290,122 @@ class TestRunVerificationEnvRecovery:
         assert any("-o addopts=''" in c for c in pytest_invocations), (
             f"Expected the bounded recovery retry to invoke a command "
             f"containing -o addopts='', got {pytest_invocations!r}"
+        )
+
+
+class TestRunMainTipSweepEnvTransient:
+    """step-9: run_main_tip_sweep treats env_transient exactly like
+    pytest_internalerror — an infra crash, not drift — so it returns the
+    None sentinel (retry next tick, no false-positive L1 drift escalation)
+    instead of surfacing a false main-branch break.
+
+    Mirrors test_verify_main_tip_sweep.py's INTERNALERROR test structure
+    (mock strategy: monkeypatch orchestrator.git_ops._run for worktree
+    add/remove, and orchestrator.verify.run_full_verification for the sweep
+    itself). RED today: run_main_tip_sweep only special-cases
+    'pytest_internalerror', so category='env_transient' falls through to a
+    normal (sha, result) drift return instead of None.
+    """
+
+    MAIN_SHA = 'b' * 40
+
+    ENV_TRANSIENT_RESULT = VerifyResult(
+        passed=False,
+        test_output=_XDIST_VANISHED_OUTPUT,
+        lint_output='',
+        type_output='',
+        summary='env_transient',
+        cause_hint='pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0',
+        category='env_transient',
+    )
+
+    FAILING_RESULT = VerifyResult(
+        passed=False,
+        test_output='FAILED test_x',
+        lint_output='',
+        type_output='',
+        summary='test_failure',
+        cause_hint='FAILED test_x',
+        category='test_failure',
+    )
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            max_concurrent_tasks=1,
+            git=GitConfig(
+                main_branch='main',
+                branch_prefix='task/',
+                remote='origin',
+                worktree_dir='.worktrees',
+            ),
+        )
+
+    def _make_git_ops(self, tmp_path: Path) -> MagicMock:
+        mock = MagicMock()
+        mock.get_main_sha = AsyncMock(return_value=self.MAIN_SHA)
+        worktree_base = tmp_path / '.worktrees'
+        worktree_base.mkdir(parents=True, exist_ok=True)
+        mock.worktree_base = worktree_base
+        return mock
+
+    def test_env_transient_first_pass_returns_none(self, tmp_path: Path):
+        """First-pass env_transient -> None (infra sentinel); cleanup still runs."""
+        config = self._make_config(tmp_path)
+        git_ops = self._make_git_ops(tmp_path)
+        run_calls: list = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return (0, '', '')
+
+        async def _fake_full_verify(*args, **kwargs):
+            return self.ENV_TRANSIENT_RESULT
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify, 'run_full_verification', side_effect=_fake_full_verify),
+        ):
+            result = asyncio.run(verify.run_main_tip_sweep(config, git_ops))
+
+        assert result is None, (
+            f'Expected None (infra sentinel) when category=env_transient, got {result!r}'
+        )
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, (
+            'git worktree remove --force must run even when returning None for '
+            'env_transient (cleanup-in-finally guarantee)'
+        )
+
+    def test_env_transient_on_retry_returns_none(self, tmp_path: Path):
+        """First-pass FAIL (non-transient category) + retry env_transient -> None.
+
+        Mirrors test_run_main_tip_sweep_internalerror_on_retry_returns_none:
+        the retry, not just the first pass, must also be checked for the
+        infra sentinel category.
+        """
+        config = self._make_config(tmp_path)
+        git_ops = self._make_git_ops(tmp_path)
+        run_calls: list = []
+
+        async def _fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return (0, '', '')
+
+        rfv = AsyncMock(side_effect=[self.FAILING_RESULT, self.ENV_TRANSIENT_RESULT])
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(verify, 'run_full_verification', rfv),
+        ):
+            result = asyncio.run(verify.run_main_tip_sweep(config, git_ops))
+
+        assert result is None, (
+            f'Expected None (infra sentinel) when retry returns env_transient, '
+            f'got {result!r}'
+        )
+        remove_calls = [c for c in run_calls if 'worktree' in c and 'remove' in c]
+        assert remove_calls, (
+            'git worktree remove --force must run even when retry returns '
+            'env_transient (cleanup-in-finally guarantee)'
         )
