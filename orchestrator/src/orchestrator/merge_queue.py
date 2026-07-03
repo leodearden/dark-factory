@@ -7396,6 +7396,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 _entry_req = _entry.item.request
                                 if not _entry_req.result.done():
                                     self._queue.put_nowait(_entry_req)
+                                    # MQ-invariants eta (task 1992): Future left
+                                    # deliberately pending — remove the ledger
+                                    # entry so this parked request never ages
+                                    # out; the next dequeue re-arms it fresh.
+                                    self._request_ledger.on_requeued(_entry_req.request_id)
                                 continue
                             _remerged = await self._remerge(
                                 _entry.item.request,
@@ -8038,6 +8043,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await verify_task
                     await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                     self._queue.put_nowait(req)
+                    # MQ-invariants eta (task 1992): Future left deliberately
+                    # pending — remove the ledger entry so this parked request
+                    # never ages out; the next dequeue re-arms it fresh.
+                    self._request_ledger.on_requeued(req.request_id)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -8582,6 +8591,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 with contextlib.suppress(BaseException):
                     await self._cleanup_owned_merge_worktree(item.merge_wt)
             self._queue.put_nowait(req)
+            # MQ-invariants eta (task 1992): Future left deliberately pending —
+            # remove the ledger entry so this parked request never ages out;
+            # the next dequeue re-arms it fresh.
+            self._request_ledger.on_requeued(req.request_id)
             self._remerge_occurred = False  # halt → reset chain flag
             return InflightEntry(
                 item=item,
