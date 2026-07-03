@@ -41,7 +41,7 @@ from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest
 
 # ---------------------------------------------------------------------------
@@ -161,3 +161,57 @@ def _count_events(db_path, event_type: str) -> int:
         return row[0] if row else 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# step-0 (RED): MergedOk / Decided value types.
+#
+# MergedOk/Decided don't exist yet — imported LOCALLY inside each test
+# (mirrors test_merge_queue_resource_audit.py / test_merge_request_ledger.py
+# convention) so the not-yet-implemented symbols don't break collection of
+# the rest of this file across the incremental RED/GREEN steps that follow.
+# ---------------------------------------------------------------------------
+
+
+class TestMergedOkDecidedTypes:
+    """Value-type tests for MergedOk / Decided (step-0 / step-2, task 1995)."""
+
+    def test_merged_ok_exposes_merge_result_wt_and_branch_tip(self):
+        from orchestrator.merge_types import MergedOk
+
+        mr = MergeResult(success=True, conflicts=False, details='ok')
+        ok = MergedOk(merge_result=mr, merge_wt=Path('/x'), branch_tip='abc123')
+
+        assert ok.merge_result is mr
+        assert ok.merge_wt == Path('/x')
+        assert ok.branch_tip == 'abc123'
+
+    def test_decided_exposes_outcome_and_defaults_merge_result_to_none(self):
+        from orchestrator.merge_types import Decided
+
+        d = Decided(outcome=MergeOutcome('conflict', conflict_details='x'))
+
+        assert d.outcome.status == 'conflict'
+        assert d.outcome.conflict_details == 'x'
+        assert d.merge_result is None
+
+    def test_decided_carries_merge_result_when_explicitly_set(self):
+        from orchestrator.merge_types import Decided
+
+        mr = MergeResult(success=False, conflicts=True, details='c')
+        d = Decided(outcome=MergeOutcome('blocked'), merge_result=mr)
+
+        assert d.merge_result is mr
+
+    def test_merged_ok_and_decided_reexported_from_merge_queue(self):
+        """`from orchestrator.merge_queue import MergedOk, Decided` must work
+        and resolve to the SAME objects defined in merge_types.py (shim, not
+        a parallel redefinition) — mirrors the existing MergeOutcome/
+        SpeculativeItem re-export pattern."""
+        from orchestrator.merge_queue import Decided as Decided_via_queue
+        from orchestrator.merge_queue import MergedOk as MergedOk_via_queue
+        from orchestrator.merge_types import Decided as Decided_via_types
+        from orchestrator.merge_types import MergedOk as MergedOk_via_types
+
+        assert MergedOk_via_queue is MergedOk_via_types
+        assert Decided_via_queue is Decided_via_types
