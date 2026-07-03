@@ -1989,6 +1989,20 @@ async def acknowledge_flag_marker(
     (skipped or empty) search.  Never raises — every I/O call is wrapped in its
     own try/except so a transient Mem0 outage can never abort a caller's batch.
 
+    ``addressed_by`` visibility to recurrence detection (amendment round 2,
+    reviewer finding: design — confirmed safe by construction, not changed):
+    neither ``find_prior_memories``'s ``kind`` equality filter nor
+    ``dedup_flags`` special-case ``addressed_by`` — an addressed replacement
+    marker is found by a later ``dedup_flags`` search exactly like any other
+    prior.  This is safe because ``dedup_flags`` never drops/suppresses a flag
+    on a HIT (it only annotates ``persisted_from_run``/``last_seen_run_id`` and
+    replaces the marker), so a genuine recurrence is still surfaced to Stage 2;
+    and the HIT-path replacement marker never carries ``addressed_by``/
+    ``addressed_at_run``, so the tag self-clears on the very next recurrence
+    rather than persisting indefinitely.  See
+    ``test_dedup_flags_hit_on_addressed_marker_does_not_suppress_flag`` in
+    ``test_flag_dedup.py`` for the pinned regression coverage.
+
     Args:
         memory_service: Mem0 service with async ``search``/``add_memory``/
             ``delete_memory`` methods.
