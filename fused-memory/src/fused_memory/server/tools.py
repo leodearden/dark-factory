@@ -1686,14 +1686,25 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
-    async def get_queue_stats() -> dict[str, Any]:
+    async def get_queue_stats(project_id: str | None = None) -> dict[str, Any]:
         """Get durable write queue statistics — pending, retry, dead, completed
         counts and oldest pending item age. Use to monitor queue health.
+
+        Args:
+            project_id: Scope counts to a specific project (optional). When
+                omitted, returns global counts across all projects. This
+                tool's ``dead`` count is an unbounded ``SELECT COUNT(*)``.
+                ``get_dead_letters`` for the same project_id agrees only up
+                to its own ``limit`` (default 100) — a project with more
+                dead items than that ``limit`` will show a lower count there
+                than reported here, since it caps the rows it fetches. Pass
+                a ``limit`` at least as large as this tool's ``dead`` count
+                to ``get_dead_letters`` for a matching comparison.
         """
         try:
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
-            return await memory_service.durable_queue.get_stats()
+            return await memory_service.durable_queue.get_stats(group_id=project_id)
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
