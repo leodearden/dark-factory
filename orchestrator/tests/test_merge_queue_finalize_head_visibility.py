@@ -110,6 +110,7 @@ def _make_item(req: MergeRequest) -> SpeculativeItem:
         base_sha='abc123',
         speculative=False,
         skip_verify=False,
+        immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
     )
 
 

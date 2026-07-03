@@ -207,7 +207,7 @@ def _make_fake_item(
     item = SpeculativeItem(
         request=req,
         merge_result=fake_merge_result,
-        merge_wt=None,
+        merge_wt=Path('/fake/merge-wt') if fake_merge_result is not None else None,
         base_sha=base_sha,
         speculative=False,
         skip_verify=False,
@@ -435,7 +435,7 @@ class TestTwoLayerInvariants:
         item_a = SpeculativeItem(
             request=req_a,
             merge_result=MergeResult(success=True, merge_commit='merge-sha-a'),
-            merge_wt=None,
+            merge_wt=Path('/fake/merge-wt'),
             base_sha=main_sha,
             speculative=False,
             skip_verify=False,
@@ -625,7 +625,7 @@ class TestTwoLayerInvariants:
         item_frozen = SpeculativeItem(
             request=req_frozen,
             merge_result=MergeResult(success=True, merge_commit=m1),
-            merge_wt=None,
+            merge_wt=Path('/fake/merge-wt'),
             base_sha=m0,
             speculative=False,
             skip_verify=False,
@@ -1499,7 +1499,7 @@ class TestScenario6FrontierImmutableUnderReorder:
         item_d = SpeculativeItem(
             request=req_d,
             merge_result=MergeResult(success=True, merge_commit=merge_d_sha),
-            merge_wt=None,
+            merge_wt=Path('/fake/merge-wt-d'),
             base_sha=main_sha,
             speculative=False,
             skip_verify=False,
@@ -1510,7 +1510,7 @@ class TestScenario6FrontierImmutableUnderReorder:
         item_e = SpeculativeItem(
             request=req_e,
             merge_result=MergeResult(success=True, merge_commit=merge_e_sha),
-            merge_wt=None,
+            merge_wt=Path('/fake/merge-wt-e'),
             base_sha=merge_d_sha,  # chained off D
             speculative=False,
             skip_verify=False,

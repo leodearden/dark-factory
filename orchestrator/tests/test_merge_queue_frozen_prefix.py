@@ -39,6 +39,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     InflightEntry,
+    MergeOutcome,
     MergeRequest,
     SpeculativeItem,
     SpeculativeMergeWorker,
@@ -149,10 +150,11 @@ def _make_fake_item(
     item = SpeculativeItem(
         request=req,
         merge_result=fake_merge_result,
-        merge_wt=None,
+        merge_wt=Path('/fake/merge-wt') if fake_merge_result is not None else None,
         base_sha=base_sha,
         speculative=False,
         skip_verify=False,
+        immediate_outcome=None if fake_merge_result is not None else MergeOutcome('conflict'),
     )
     return req, item
 

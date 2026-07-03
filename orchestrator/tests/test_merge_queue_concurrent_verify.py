@@ -2611,6 +2611,7 @@ class TestStopDrainsInflight:
             base_sha='ccc',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         entry = InflightEntry(
             item=item,
@@ -2656,6 +2657,7 @@ class TestStopDrainsInflight:
             base_sha='ddd',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         worker._redispatch.append(item)
 
@@ -2707,6 +2709,7 @@ class TestSnapshotInflight:
             base_sha='aaa',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         item_b = SpeculativeItem(
             request=req_b,
@@ -2715,6 +2718,7 @@ class TestSnapshotInflight:
             base_sha='bbb',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
 
         entry_a = InflightEntry(
@@ -2780,6 +2784,7 @@ class TestSnapshotInflight:
             base_sha='aaa',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         entry = InflightEntry(
             item=item,
@@ -2827,10 +2832,12 @@ class TestSnapshotInflight:
         item_a = SpeculativeItem(
             request=req_a, merge_result=None, merge_wt=None,
             base_sha='aaa', speculative=False, skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         item_b = SpeculativeItem(
             request=req_b, merge_result=None, merge_wt=None,
             base_sha='bbb', speculative=False, skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         entry_a = InflightEntry(
             item=item_a, lease=None, verify_task=None, merge_wt=None,
@@ -3513,6 +3520,7 @@ class TestStopDrainFiresRemoteCancel:
             base_sha='abc',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         # Start run_merge_verify so the id is live (gate_entered set, awaits release).
         verify_task = asyncio.ensure_future(
@@ -3549,6 +3557,7 @@ class TestStopDrainFiresRemoteCancel:
             base_sha='def',
             speculative=False,
             skip_verify=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         verify_task_local = asyncio.ensure_future(asyncio.sleep(999))
         entry_local = InflightEntry(
