@@ -54,6 +54,14 @@ class TestMockConfigParkEvictionNoLeak:
         # instead of wherever pytest was invoked from (normally orchestrator/).
         monkeypatch.chdir(tmp_path)
 
+        # Snapshot directory contents before exercising the fixture. Diffing
+        # before/after (rather than globbing for the literal '<MagicMock...'
+        # repr) keeps the leak check independent of MagicMock.__repr__'s
+        # exact format, which is not a public/stable API and could drift in
+        # a future CPython — a format change would make a literal-repr glob
+        # match nothing and let this assertion pass vacuously on a real leak.
+        before = {p.name for p in tmp_path.iterdir()}
+
         harness = Harness(mock_orch_config)
 
         # Guard against the assertion below passing vacuously: confirm the
@@ -66,8 +74,9 @@ class TestMockConfigParkEvictionNoLeak:
             f'{type(harness.scheduler._park_eviction_store)!r}'
         )
 
+        after = {p.name for p in tmp_path.iterdir()}
         strays = sorted(
-            str(p) for p in tmp_path.glob('<MagicMock*park_eviction_requests_db_path*')
+            name for name in (after - before) if 'magicmock' in name.lower()
         )
         assert strays == [], (
             f'mock_orch_config leaked stray MagicMock db file(s): {strays}'
