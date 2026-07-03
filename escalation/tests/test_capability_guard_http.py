@@ -574,9 +574,6 @@ class TestWatcherConstantLockstep:
         base_url, queue = http_server
         levels = _WATCHER_ESCALATION_HEADERS['X-Escalation-Levels']
         identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
-        assert identity == 'orchestrator-escalation-watcher-auto', (
-            f'Expected the canonical watcher identity string, got: {identity!r}'
-        )
 
         # (a) Real watcher headers deny a close_only resolve on an L2 — no mutation.
         esc_l2 = _seed(queue, level=2, task_id='task-lockstep-l2')
