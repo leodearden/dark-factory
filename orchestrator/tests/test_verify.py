@@ -22,6 +22,7 @@ from orchestrator.verify import (
     _is_structural_python_file,
     _is_test_file,
     _maybe_prune_archive,
+    _reproject_bare_uv_run,
     _resolve_verify_env,
     _run_cmd,
     _scope_cargo_workspace,
@@ -4032,6 +4033,93 @@ class TestBuildFallbackConfigConftest:
         assert 'conftest.py' not in result.test_command
 
 
+class TestReprojectBareUvRun:
+    """`_reproject_bare_uv_run` rewrites a bare ``uv run <tool>`` into a uv context that has the tool.
+
+    Task 2036: the repo-root ``pyproject.toml`` is a depless uv workspace
+    coordinator, so ``uv run ruff check <file>`` run from the workspace root
+    fails to spawn ruff (rc=2). ``uv run --project <member> ruff check <file>``
+    selects a ruff-bearing member's venv while leaving cwd (and therefore
+    root-relative path resolution) alone.
+    """
+
+    def test_reprojects_bare_uv_run_ruff_check(self):
+        """`uv run ruff check <file>` gains `--project shared` immediately after `uv run`."""
+        result = _reproject_bare_uv_run(
+            'uv run ruff check tests/scripts/foo.py', 'ruff check', 'shared'
+        )
+        assert result == 'uv run --project shared ruff check tests/scripts/foo.py'
+
+    def test_reprojects_bare_uv_run_pyright(self):
+        """`uv run pyright <file>` gains `--project shared` immediately after `uv run`."""
+        result = _reproject_bare_uv_run(
+            'uv run pyright tests/scripts/foo.py', 'pyright', 'shared'
+        )
+        assert result == 'uv run --project shared pyright tests/scripts/foo.py'
+
+    def test_command_with_existing_project_flag_unchanged(self):
+        """A command that already carries `--project` is left alone."""
+        cmd = 'uv run --project orchestrator ruff check x'
+        assert _reproject_bare_uv_run(cmd, 'ruff check', 'shared') == cmd
+
+    def test_command_with_existing_directory_flag_unchanged(self):
+        """A command that already carries `--directory` is left alone."""
+        cmd = 'uv run --directory foo ruff check x'
+        assert _reproject_bare_uv_run(cmd, 'ruff check', 'shared') == cmd
+
+    def test_npx_command_unchanged_no_uv_run(self):
+        """`npx pyright x` has no `uv run` prefix, so it is left alone."""
+        cmd = 'npx pyright x'
+        assert _reproject_bare_uv_run(cmd, 'pyright', 'shared') == cmd
+
+    def test_uv_run_without_tool_adjacency_unchanged(self):
+        """`uv run --extra dev mypy src` has no `uv run pyright` adjacency, so it is left alone."""
+        cmd = 'uv run --extra dev mypy src'
+        assert _reproject_bare_uv_run(cmd, 'pyright', 'shared') == cmd
+
+    def test_true_noop_command_unchanged(self):
+        """`true` has no `uv run`, so it is returned unchanged."""
+        assert _reproject_bare_uv_run('true', 'ruff check', 'shared') == 'true'
+
+    def test_none_command_returns_none(self):
+        """`None` is returned unchanged (propagates absent commands)."""
+        assert _reproject_bare_uv_run(None, 'ruff check', 'shared') is None
+
+    def test_idempotent_on_already_reprojected_command(self):
+        """Applying the helper twice yields the same string as applying it once."""
+        once = _reproject_bare_uv_run(
+            'uv run ruff check tests/scripts/foo.py', 'ruff check', 'shared'
+        )
+        twice = _reproject_bare_uv_run(once, 'ruff check', 'shared')
+        assert twice == once
+
+    def test_directory_flag_in_a_different_chained_clause_does_not_block_reprojection(self):
+        """A `--directory` in a *different* `&&` clause must not suppress reprojection.
+
+        Amendment (task 2036 review): the "already scoped" guard used to test
+        the whole command string for `--project`/`--directory`, so a chained
+        command whose *other* clause already carried `--directory` would bail
+        out entirely, leaving this clause's bare `uv run ruff check` unfixed.
+        This shape doesn't occur in current configs, but the guard must be
+        scoped to the matched clause, not the whole command.
+        """
+        cmd = 'uv run ruff check tests/scripts/foo.py && uv run --directory foo mypy bar'
+        result = _reproject_bare_uv_run(cmd, 'ruff check', 'shared')
+        assert result == (
+            'uv run --project shared ruff check tests/scripts/foo.py '
+            '&& uv run --directory foo mypy bar'
+        )
+
+    def test_project_flag_in_a_different_chained_clause_does_not_block_reprojection(self):
+        """A `--project` in a *preceding* `&&` clause must not suppress reprojection."""
+        cmd = 'uv run --project shared pytest tests/ && uv run ruff check tests/scripts/foo.py'
+        result = _reproject_bare_uv_run(cmd, 'ruff check', 'shared')
+        assert result == (
+            'uv run --project shared pytest tests/ '
+            '&& uv run --project shared ruff check tests/scripts/foo.py'
+        )
+
+
 class TestBuildFallbackConfigWithNonDefaultCommands:
     """``_build_fallback_config`` uses project-configured commands when non-default.
 
@@ -4128,12 +4216,34 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         assert result.type_check_command == 'npx pyright tests/scripts/test_spawn_claude.py'
         assert not result.type_check_command.startswith('cd ')
 
+    def test_fallback_type_reprojects_bare_uv_run_pyright_for_root_file(self, tmp_path: Path) -> None:
+        """A hypothetical bare ``uv run pyright`` type command shares the lint defect.
+
+        Task 2036: dark_factory's real ``type_check_command`` uses ``npx``
+        (see test_chained_type_command_strips_leading_cd_for_root_file), which
+        does not share the depless-workspace-root spawn failure. But a
+        ``uv run pyright ...`` type command would fail the same way bare ``uv
+        run ruff check`` did, so it must be reprojected into a pyright-bearing
+        member uv context too.
+        """
+        cfg = self._make_config(
+            tmp_path,
+            type_check_command='uv run pyright src/ tests/',
+            test_command='cd shared && uv run pytest tests/',
+        )
+        result = _build_fallback_config(['tests/scripts/test_orchestrator_watchdog.py'], cfg)
+        assert result is not None
+        assert result.type_check_command == 'uv run --project shared pyright tests/scripts/test_orchestrator_watchdog.py'
+
     def test_uv_run_lint_command_scopes_to_root_file(self, tmp_path: Path) -> None:
-        """``uv run ruff check <dirs>`` scopes to the touched root-level file, runner intact.
+        """``uv run ruff check <dirs>`` scopes to the touched root-level file, in a ruff-bearing context.
 
         Regression for task 1643 / esc-1643-4: a bare ``ruff check`` scoped to
         ``ruff check <file>`` exited 127 (ruff not on PATH). With the ``uv run``
-        prefix the scoped command keeps the runner: ``uv run ruff check <file>``.
+        prefix the scoped command keeps the runner. Regression for task 2036: a
+        bare ``uv run ruff check <file>`` run from the depless workspace-root
+        project fails to spawn ruff (rc=2), so the scoped command must also be
+        reprojected into a ruff-bearing member uv context (``--project shared``).
         """
         cfg = self._make_config(
             tmp_path,
@@ -4142,7 +4252,42 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         )
         result = _build_fallback_config(['tests/scripts/test_spawn_claude.py'], cfg)
         assert result is not None
-        assert result.lint_command == 'uv run ruff check tests/scripts/test_spawn_claude.py'
+        assert result.lint_command == 'uv run --project shared ruff check tests/scripts/test_spawn_claude.py'
+
+    def test_fallback_lint_reprojects_repo_root_file_to_ruff_bearing_context(self, tmp_path: Path) -> None:
+        """The real dark_factory chained lint command reprojects for a repo-root file.
+
+        Task 2036: ``config.lint_command`` matches the real dark_factory
+        ``orchestrator/config.yaml`` value verbatim (``uv run ruff check
+        <members> && python3 <script> <dirs>``, no trailing flags — see
+        orchestrator/config.yaml:23). ``_scope_command`` truncates at ``ruff
+        check`` and inserts the touched file, leaving a bare ``uv run ruff
+        check <file>`` that fails to spawn ruff from the depless workspace
+        root. The fallback must reproject it into a ruff-bearing member uv
+        context. Asserts the *full* resulting command string (not just
+        startswith/contains) so an orphaned flag mistakenly harvested by
+        ``_scope_command`` from the ``&&``-chained remainder would fail this
+        test instead of being silently masked (amendment: a prior version of
+        this test appended a synthetic ``--config <path>`` the real config
+        does not have, which ``_scope_command`` harvested as a dangling flag
+        with its value dropped — masked by the startswith/contains asserts).
+        """
+        cfg = self._make_config(
+            tmp_path,
+            lint_command=(
+                'uv run ruff check shared escalation fused-memory orchestrator dashboard '
+                '&& python3 fused-memory/scripts/check_bare_magicmock_config.py '
+                'shared/tests escalation/tests fused-memory/tests orchestrator/tests '
+                'dashboard/tests'
+            ),
+            test_command='cd shared && uv run pytest tests/',
+        )
+        result = _build_fallback_config(['tests/scripts/test_orchestrator_watchdog.py'], cfg)
+        assert result is not None
+        assert (
+            result.lint_command
+            == 'uv run --project shared ruff check tests/scripts/test_orchestrator_watchdog.py'
+        )
 
 
 class TestBuildFallbackConfigDataModule:

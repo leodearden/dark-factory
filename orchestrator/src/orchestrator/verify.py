@@ -243,6 +243,66 @@ def _strip_leading_cd(cmd: str | None) -> str | None:
     return re.sub(r'^\s*cd\s+\S+\s*&&\s*', '', cmd, count=1)
 
 
+# Workspace member whose venv declares ``ruff`` (shared/pyproject.toml: ``ruff>=0.4``).
+# Used by :func:`_reproject_bare_uv_run` to reproject a bare ``uv run <tool>`` fallback
+# command into a uv context that can actually spawn the tool.  Mirrors the proven
+# ``uv run --project shared pytest tests/scripts/`` pattern in scripts/orchestrator.yaml
+# for this exact repo-root directory.
+_FALLBACK_UV_PROJECT = 'shared'
+
+
+def _reproject_bare_uv_run(
+    cmd: str | None, tool_keyword: str, member: str = _FALLBACK_UV_PROJECT
+) -> str | None:
+    """Reproject a bare ``uv run <tool_keyword>`` command into a tool-bearing uv context.
+
+    The repo-root ``pyproject.toml`` is a depless ``uv`` workspace *coordinator*
+    (``[tool.uv.workspace] members = [...]``, zero dependencies, no dev tooling).
+    Running ``uv run ruff check <file>`` (or any bare ``uv run <tool>``) from the
+    workspace root provisions a fresh env from that depless root project and fails
+    to spawn the tool (rc=2) — it only ever "works" interactively because a prior
+    ``uv sync`` happened to populate a member's ``.venv``.  Task 1647 prescribed the
+    fix — ``uv run --project <member> <tool> ...`` (``--project``, NOT
+    ``--directory``, so cwd stays at the worktree root and root-relative file paths
+    the scoper inserted still resolve) — but the fallback path (:func:`_build_fallback_config`,
+    task 2036) still emitted the bare form for repo-root files. This mirrors the
+    proven ``uv run --project shared pytest tests/scripts/`` pattern already used in
+    ``scripts/orchestrator.yaml`` for this same directory.
+
+    Returns *cmd* unchanged when:
+    - *cmd* is ``None``.
+    - ``uv run`` is not immediately followed by *tool_keyword* (e.g. ``npx pyright
+      ...``, ``uv run --extra dev mypy ...``, or ``true``).
+    - The matched ``&&``-delimited clause (the segment of *cmd* containing this
+      particular ``uv run <tool_keyword>`` occurrence, not the whole command)
+      already carries ``--project`` or ``--directory`` (an explicit uv context
+      is already set; don't second-guess it — this also protects already-scoped
+      per-module commands, though those never reach this helper). Scoping the
+      check to the matched clause means a *different* chained clause carrying
+      its own ``--project``/``--directory`` (e.g. an already-scoped
+      ``uv run --project shared pytest ... && uv run ruff check X``) does not
+      suppress reprojecting this clause's bare occurrence.
+
+    Otherwise, rewrites the single ``uv run `` occurrence immediately preceding
+    *tool_keyword* to ``uv run --project {member} ``.
+    """
+    if cmd is None:
+        return None
+    pattern = re.compile(r'\buv run\s+(?=' + re.escape(tool_keyword) + r'\b)')
+    match = pattern.search(cmd)
+    if not match:
+        return cmd
+    clause_start = cmd.rfind('&&', 0, match.start())
+    clause_start = clause_start + 2 if clause_start != -1 else 0
+    clause_end = cmd.find('&&', match.end())
+    if clause_end == -1:
+        clause_end = len(cmd)
+    clause = cmd[clause_start:clause_end]
+    if '--project' in clause or '--directory' in clause:
+        return cmd
+    return pattern.sub(f'uv run --project {member} ', cmd, count=1)
+
+
 # Cargo subcommands whose ``--workspace`` flag we know how to rewrite.  Other
 # cargo subcommands (doc, bench, ...) are left alone to avoid semantic drift.
 _CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
@@ -1390,12 +1450,20 @@ def _build_fallback_config(
         # _strip_leading_cd drops a ``cd <subproject> &&`` prefix that the
         # per-subproject lint/type commands carry: the fallback runs from the
         # worktree root, so a module-cd would misresolve the root-relative file
-        # path the scoper just inserted.
-        lint_cmd = _strip_leading_cd(
-            _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
+        # path the scoper just inserted. _reproject_bare_uv_run then reprojects
+        # a bare ``uv run <tool>`` into a tool-bearing member uv context (task
+        # 2036): the depless workspace-root project cannot spawn ruff/pyright.
+        lint_cmd = _reproject_bare_uv_run(
+            _strip_leading_cd(
+                _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
+            ),
+            'ruff check',
         )
-        type_cmd = _strip_leading_cd(
-            _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
+        type_cmd = _reproject_bare_uv_run(
+            _strip_leading_cd(
+                _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
+            ),
+            'pyright',
         )
     else:
         lint_cmd = 'ruff check ' + ' '.join(py_files)
