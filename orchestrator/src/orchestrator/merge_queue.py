@@ -7098,26 +7098,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # chain-remerge logic, host acquire, verify task launch).
                 try:
                     entry = await self._dispatch_item(item)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
                 except BaseException as exc:
                     # Unexpected dispatch error (e.g. _remerge raised; _git_ops
                     # unavailable).  Resolve the request and continue the loop.
-                    req = item.request
-                    if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                        logger.exception(
-                            'Task %s: unexpected dispatch error', req.task_id
-                        )
-                        if item.merge_wt is not None:
-                            with contextlib.suppress(BaseException):
-                                await self._cleanup_owned_merge_worktree(item.merge_wt)
-                        if not req.result.done():
-                            req.result.set_result(MergeOutcome(
-                                'blocked', reason=f'Verifier error: {exc}',
-                            ))
-                        if item.speculative:
-                            self._speculation_slot.release()
-                        self._n_failed = True
-                        continue
-                    raise
+                    logger.exception(
+                        'Task %s: unexpected dispatch error', item.request.task_id
+                    )
+                    await self._resolve_and_release(
+                        item, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                        chain_failed=True,
+                    )
+                    continue
 
                 if entry is None:
                     # No host available: put item back on _redispatch.
@@ -7380,24 +7373,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 try:
                     entry = await self._dispatch_item(item)
-                except BaseException as exc:
-                    req = item.request
-                    if not isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
-                        logger.exception(
-                            'Task %s: unexpected dispatch error (blocking get)', req.task_id
-                        )
-                        if item.merge_wt is not None:
-                            with contextlib.suppress(BaseException):
-                                await self._cleanup_owned_merge_worktree(item.merge_wt)
-                        if not req.result.done():
-                            req.result.set_result(MergeOutcome(
-                                'blocked', reason=f'Verifier error: {exc}',
-                            ))
-                        if item.speculative:
-                            self._speculation_slot.release()
-                        self._n_failed = True
-                        continue
+                except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
+                except BaseException as exc:
+                    logger.exception(
+                        'Task %s: unexpected dispatch error (blocking get)',
+                        item.request.task_id,
+                    )
+                    await self._resolve_and_release(
+                        item, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
+                        chain_failed=True,
+                    )
+                    continue
 
                 if entry is None:
                     # No host (shouldn't happen with empty _inflight on a single-host
