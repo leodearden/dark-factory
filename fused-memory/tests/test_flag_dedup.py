@@ -6206,6 +6206,98 @@ class TestIsValidMarkerTaskId:
 
 
 # ---------------------------------------------------------------------------
+# is_content_fingerprint_task_id helper (task-2047 step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+
+class TestIsContentFingerprintTaskId:
+    """Unit tests for is_content_fingerprint_task_id(tid) -> bool.
+
+    Unlike _is_valid_marker_task_id (which also accepts numeric and
+    comma-joined tids), this helper is the fp:-ONLY gate: True iff *tid* is
+    a canonical 'fp:' + exactly 32 lowercase hex digits key, False for
+    every other shape (including otherwise-valid numeric/comma-joined
+    marker keys).
+    """
+
+    def test_true_for_canonical_fp_key(self):
+        """A canonical fp:+32-lowercase-hex key (real emitter output) -> True."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _content_fingerprint,
+            is_content_fingerprint_task_id,
+        )
+
+        tid = _content_fingerprint('x')
+        assert is_content_fingerprint_task_id(tid) is True, (
+            f'{tid!r} must be accepted (canonical fp:+32-hex key)'
+        )
+
+    def test_false_for_bare_numeric_tid(self):
+        """A bare numeric tid ('42') is a valid marker key but NOT an fp: key -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('42') is False
+
+    def test_false_for_comma_joined_numerics(self):
+        """A comma-joined numeric tid ('12,15') is a valid marker key but NOT an fp: key -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('12,15') is False
+
+    def test_false_for_empty_string(self):
+        """Empty string -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('') is False
+
+    def test_false_for_fp_prefix_with_no_hex(self):
+        """'fp:' alone (no hex digits) -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('fp:') is False
+
+    def test_false_for_fp_too_short_hex(self):
+        """'fp:' + 30 hex chars (too short) -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('fp:' + 'a' * 30) is False
+
+    def test_false_for_fp_too_long_hex(self):
+        """'fp:' + 64 hex chars (too long) -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('fp:' + 'a' * 64) is False
+
+    def test_false_for_fp_uppercase_hex(self):
+        """'fp:' + uppercase hex (real emitter only produces lowercase) -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('fp:' + 'A' * 32) is False
+
+    def test_false_for_arbitrary_string(self):
+        """An arbitrary non-fp: string -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('not-a-marker-key-at-all') is False
+
+    def test_anti_drift_roundtrip_with_content_fingerprint(self):
+        """is_content_fingerprint_task_id(_content_fingerprint(<desc>)) must be True
+        for any non-blank description — ties the gate to the real emitter's output
+        so accept/emit drift is caught as a test failure."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _content_fingerprint,
+            is_content_fingerprint_task_id,
+        )
+
+        description = 'Any non-blank description for anti-drift validation'
+        fp = _content_fingerprint(description)
+        assert is_content_fingerprint_task_id(fp) is True, (
+            f'_content_fingerprint output {fp!r} must be accepted by '
+            f'is_content_fingerprint_task_id (anti-drift invariant)'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task-1725 step-1 — RED: filter_terminal_metadata_flags basic tests
 # ---------------------------------------------------------------------------
 
