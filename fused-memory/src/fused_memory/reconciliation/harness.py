@@ -364,25 +364,34 @@ class ReconciliationHarness:
         # don't re-fire every harness tick.
         self._halt_escalated: set[str] = set()
 
-        # Task 1755 / PRD β: rolling-window counter for dead_owner_shielded
-        # recon_stale_run suppressions.  Each entry is (timestamp, project_id).
-        # Pruned on each call to _record_dead_owner_suppression().
+        # Task 1755 / PRD β, amended by task 2039: rolling-window counter of
+        # DISTINCT dead-owner instance UUIDs among dead_owner_shielded
+        # recon_stale_run suppressions.  Each entry is
+        # (timestamp, project_id, instance_id); pruned on each call to
+        # _record_dead_owner_suppression().  The count that matters is the
+        # number of distinct non-None instance_id values in the window, NOT
+        # the number of suppression events.
         #
         # ⚠ In-process lifetime limitation: these counters are reset on every
-        # harness restart.  dead_owner_shielded orphans are by definition left
-        # by a *prior* killed incarnation, so a rapid single-orphan-per-restart
-        # churn (watchdog SIGABRT → relaunch → 1 orphan reaped → killed again)
-        # keeps count=1 per lifetime and never crosses the threshold of 6.  The
-        # storm alarm is designed for scenarios where >=threshold orphans surface
-        # WITHIN a single harness lifetime — e.g. a systemic failure that leaves
-        # many projects' runs orphaned simultaneously (the 2026-06-15 event that
-        # triggered this task: 38 in 8h across multiple projects, making count≫6
-        # in the first live incarnation that swept them all up).  Single-orphan
-        # churn is instead observable via the per-event INFO log emitted at
-        # harness.py:741.  If single-orphan restart churn must also alarm,
-        # count recent dead_owner_shielded _error records from the journal over
-        # the window instead of the in-memory deque.
-        self._dead_owner_suppressions: deque[tuple[datetime, str]] = deque()
+        # harness restart.  A single restart recovers one dead_owner_shielded
+        # orphan PER PROJECT it owns, all left by the SAME prior (dead)
+        # incarnation — every one of those orphans carries that one dead
+        # owner's instance_id, so the distinct count stays 1 regardless of
+        # how many projects the project registry holds, and a benign restart
+        # never crosses the threshold of 6 (task 2039 regression:
+        # esc-recon-50da2482-1 — a single restart across 6 registered
+        # projects previously false-fired because the old counter counted
+        # per-project suppressions, i.e. count=6, instead of distinct dead
+        # owners, i.e. count=1).  The storm alarm instead fires when
+        # >=threshold GENUINELY DISTINCT dead-owner instances — independent
+        # watchdog kills — are recovered WITHIN a single harness lifetime,
+        # e.g. the 2026-06-15 event that triggered this task (~one kill every
+        # ~10 min, ~6 distinct incarnations per rolling 60-minute window).
+        # Single-restart churn is instead observable via the per-event INFO
+        # log emitted at harness.py:741.  If single-owner restart churn must
+        # also alarm, count recent dead_owner_shielded _error records from
+        # the journal over the window instead of the in-memory deque.
+        self._dead_owner_suppressions: deque[tuple[datetime, str, str | None]] = deque()
         # Timestamp of the last storm escalation — None means never fired.
         self._last_suppression_storm_escalation_at: datetime | None = None
 
@@ -1119,13 +1128,14 @@ class ReconciliationHarness:
                 # Operators who need the per-tick total should check the INFO
                 # log lines ("recon_stale_run suppressed: dead_owner_shielded
                 # orphan recovered") emitted for every suppression regardless.
-                storm = self._record_dead_owner_suppression(run.project_id)
+                storm = self._record_dead_owner_suppression(run.project_id, run.instance_id)
                 if storm is not None:
                     window_min = storm['window_seconds'] / 60
                     proj_label = ', '.join(storm['projects']) or run.project_id
                     summary = (
                         f"dead_owner_shielded suppression storm: {storm['count']} in "
-                        f"{window_min:.0f} min (projects: {proj_label}) — "
+                        f"{window_min:.0f} min (distinct dead-owner instances; "
+                        f"projects: {proj_label}) — "
                         f'watchdog SIGABRT churn — full recon runs not completing'
                     )
                     self._escalate(
@@ -1146,33 +1156,45 @@ class ReconciliationHarness:
     # ── Dead-owner suppression storm counter ─────────────────────────
 
     def _record_dead_owner_suppression(
-        self, project_id: str, *, now: datetime | None = None
+        self, project_id: str, instance_id: str | None = None, *, now: datetime | None = None
     ) -> dict | None:
         """Record one dead_owner_shielded suppression and check for a storm.
 
-        Appends (effective_now, project_id) to the rolling deque, prunes
-        entries older than the configured window, then:
-        - Returns None if the count is below the threshold.
+        Appends (effective_now, project_id, instance_id) to the rolling deque,
+        prunes entries older than the configured window, then:
+        - Returns None if the number of DISTINCT non-None instance_id values
+          (dead-owner instances) in the window is below the threshold.
         - Returns None if the alarm already fired within this window
           (rate limit: <=1 per window).
         - Otherwise sets _last_suppression_storm_escalation_at = effective_now
-          and returns a storm summary dict with 'count', 'window_seconds', and
-          'projects' (sorted distinct project labels seen in the window).
+          and returns a storm summary dict with 'count' (the distinct
+          dead-owner-instance count), 'window_seconds', and 'projects'
+          (sorted distinct project labels seen in the window).
+
+        Task 2039: the count is keyed on DISTINCT dead-owner instance_id
+        values, not on the number of suppression events. All orphans
+        recovered by one restart share that ONE dead owner's instance_id, so
+        a single multi-project restart contributes only 1 to the count no
+        matter how many projects it touches; only genuinely-independent
+        watchdog kills (distinct instance_id values) accumulate toward the
+        threshold. instance_id=None entries (should not occur for
+        dead_owner_shielded, which requires a matching non-None instance_id)
+        are excluded from the distinct set defensively.
 
         The now= parameter follows the ``_finding_recently_resolved(..., now=None)``
         time-injection convention (harness.py:1592) for deterministic unit tests.
-        Task 1755 / PRD β.
+        Task 1755 / PRD β; distinct-instance counting added by task 2039.
         """
         effective_now = now if now is not None else datetime.now(UTC)
 
         # Append and prune the rolling window.
-        self._dead_owner_suppressions.append((effective_now, project_id))
+        self._dead_owner_suppressions.append((effective_now, project_id, instance_id))
         window = timedelta(seconds=self.config.dead_owner_suppression_storm_window_seconds)
         cutoff_ts = effective_now - window
         while self._dead_owner_suppressions and self._dead_owner_suppressions[0][0] < cutoff_ts:
             self._dead_owner_suppressions.popleft()
 
-        count = len(self._dead_owner_suppressions)
+        count = len({iid for _, _, iid in self._dead_owner_suppressions if iid is not None})
         if count < self.config.dead_owner_suppression_storm_threshold:
             return None
 
@@ -1185,7 +1207,7 @@ class ReconciliationHarness:
 
         # Fire: set rate-limit timestamp and build the storm summary dict.
         self._last_suppression_storm_escalation_at = effective_now
-        projects = sorted({pid for _, pid in self._dead_owner_suppressions})
+        projects = sorted({pid for _, pid, _ in self._dead_owner_suppressions})
         return {
             'count': count,
             'window_seconds': self.config.dead_owner_suppression_storm_window_seconds,
