@@ -347,7 +347,14 @@ class TargetedReconciler:
             if isinstance(provenance, dict):
                 return provenance
 
-        fresh = await self.taskmaster.get_task(task_id, project_root=project_root)
+        try:
+            fresh = await self.taskmaster.get_task(task_id, project_root=project_root)
+        except Exception as e:
+            logger.warning(
+                f'done_provenance re-fetch failed for task {task_id}: {e}; '
+                'echoing description (fail-open)'
+            )
+            return None
         fresh_task = _extract_task(fresh) if isinstance(fresh, dict) else fresh
         if not isinstance(fresh_task, dict):
             return None
