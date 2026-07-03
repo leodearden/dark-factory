@@ -188,3 +188,154 @@ class TestRequestLedgerLifecycle:
 
         ledger.on_requeued(req.request_id)
         assert ledger.is_empty()
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: _alarm_merge_request_stuck + _merge_request_stuck_sentinel
+# ---------------------------------------------------------------------------
+
+
+class _FakeEscalationQueue:
+    """Minimal fake escalation queue (copied from
+    test_merge_queue_multihost_wiring.py:1200 — per-file duplication
+    convention).
+    """
+
+    def __init__(self, *, open_l1: bool = False):
+        self._open_l1 = open_l1
+        self._seq = 0
+        self.submitted: list = []
+
+    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+        return self._open_l1
+
+    def make_id(self, task_id: str) -> str:
+        self._seq += 1
+        return f'esc-{self._seq}'
+
+    def submit(self, esc) -> None:
+        self.submitted.append(esc)
+
+    def open_it(self):
+        """Simulate a prior open L1 (for dedup tests)."""
+        self._open_l1 = True
+
+
+class _FakeEventStore:
+    """Minimal fake event store (copied from test_merge_queue_multihost_wiring.py)."""
+
+    def __init__(self):
+        self.emitted: list = []
+
+    def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
+        self.emitted.append({'event_type': event_type, 'task_id': task_id, 'data': data or {}})
+
+
+def _make_stuck(
+    request_id: str = 'mr-abc12345',
+    task_id: str = 'stuck-task',
+    branch: str = 'task/stuck-task',
+    age_secs: float = 16201.0,
+    phase: str = 'unowned',
+):
+    from orchestrator.merge_request_ledger import StuckRequest
+
+    return StuckRequest(
+        request_id=request_id, task_id=task_id, branch=branch,
+        age_secs=age_secs, phase=phase,
+    )
+
+
+class TestMergeRequestStuckSentinel:
+    """_merge_request_stuck_sentinel (task 1992 step-3).
+
+    RED until step-4 GREEN adds the function to merge_request_ledger.py.
+    """
+
+    def test_sentinel_is_per_request_id(self):
+        from orchestrator.merge_request_ledger import _merge_request_stuck_sentinel
+
+        assert _merge_request_stuck_sentinel('mr-abc12345') == '__merge_request_stuck__mr-abc12345'
+
+
+class TestAlarmMergeRequestStuck:
+    """_alarm_merge_request_stuck module-level helper (task 1992 step-3).
+
+    RED until step-4 GREEN adds the function to merge_request_ledger.py.
+    """
+
+    def _call(self, eq, stuck, *, event_store=None):
+        from orchestrator.merge_request_ledger import _alarm_merge_request_stuck
+        _alarm_merge_request_stuck(eq, stuck, event_store=event_store)
+
+    def test_none_queue_is_noop(self):
+        """None escalation_queue -> returns silently, no raise."""
+        self._call(None, _make_stuck())
+        # No assertion needed — must not raise
+
+    def test_first_call_submits_exactly_one_escalation(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, _make_stuck())
+        assert len(eq.submitted) == 1
+
+    def test_escalation_has_level_1_and_blocking_severity(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, _make_stuck())
+        esc = eq.submitted[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+
+    def test_escalation_has_merge_request_stuck_category(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, _make_stuck())
+        esc = eq.submitted[0]
+        assert esc.category == 'merge_request_stuck'
+
+    def test_escalation_agent_role_starts_with_orchestrator(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, _make_stuck())
+        esc = eq.submitted[0]
+        assert esc.agent_role.startswith('orchestrator-')
+
+    def test_escalation_task_id_is_the_sentinel(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        stuck = _make_stuck(request_id='mr-deadbeef')
+        self._call(eq, stuck)
+        esc = eq.submitted[0]
+        assert esc.task_id == '__merge_request_stuck__mr-deadbeef'
+
+    def test_summary_and_detail_name_request_id_and_branch(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        stuck = _make_stuck(request_id='mr-namecheck', branch='task/namecheck-branch')
+        self._call(eq, stuck)
+        esc = eq.submitted[0]
+        assert 'mr-namecheck' in esc.summary
+        assert 'task/namecheck-branch' in esc.summary
+        assert 'mr-namecheck' in esc.detail
+        assert 'task/namecheck-branch' in esc.detail
+
+    def test_detail_names_the_integer_age(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        stuck = _make_stuck(age_secs=16201.7)
+        self._call(eq, stuck)
+        esc = eq.submitted[0]
+        assert '16201' in esc.detail
+
+    def test_second_call_with_open_l1_is_deduped(self):
+        eq = _FakeEscalationQueue(open_l1=True)  # alarm already open
+        self._call(eq, _make_stuck())
+        assert len(eq.submitted) == 0
+
+    def test_event_store_emits_escalation_created_event(self):
+        from orchestrator.event_store import EventType
+
+        eq = _FakeEscalationQueue(open_l1=False)
+        es = _FakeEventStore()
+        stuck = _make_stuck(request_id='mr-evented')
+        self._call(eq, stuck, event_store=es)
+
+        assert len(es.emitted) >= 1
+        types = [e['event_type'] for e in es.emitted]
+        assert EventType.escalation_created in types
+        events = [e for e in es.emitted if e['event_type'] == EventType.escalation_created]
+        assert any('mr-evented' in str(e['data']) for e in events)
