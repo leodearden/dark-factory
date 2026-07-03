@@ -2498,3 +2498,54 @@ async def test_on_task_done_authoritative_memory_wins_over_provenance(
     )
 
     assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'get_task_return, expected_used_provenance',
+    [
+        pytest.param(
+            {
+                'id': '9', 'title': 'T',
+                'metadata': {'done_provenance': {'note': 'Landed cleanly'}},
+            },
+            True,
+            id='provenance_note_present',
+        ),
+        pytest.param(
+            {'id': '9', 'title': 'T', 'metadata': {}},
+            False,
+            id='no_done_provenance',
+        ),
+    ],
+)
+async def test_on_task_done_completion_journal_has_echo_used_provenance(
+    reconciler, mock_memory_service, mock_taskmaster, journal,
+    get_task_return, expected_used_provenance,
+):
+    """The journal audit row for the fast-path completion write must carry a
+    queryable echo_used_provenance flag mirroring task 1984's echo_suppressed
+    convention, so operators can query which first-transition echoes
+    described the landed outcome vs. fell back to the raw description."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value=get_task_return)
+
+    await reconciler.reconcile_task(
+        task_id='9', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '9', 'title': 'T', 'status': 'in-progress', 'description': 'Nine description'},
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    completion_rows = [
+        a for a in actions
+        if a['operation'] == 'add_memory' and a['detail'].get('type') == 'completion_fast'
+    ]
+    assert len(completion_rows) == 1, (
+        f'Expected exactly one completion_fast journal row, got: {completion_rows}'
+    )
+    assert completion_rows[0]['detail'].get('echo_used_provenance') is expected_used_provenance, (
+        f'Expected echo_used_provenance={expected_used_provenance}, '
+        f'got detail: {completion_rows[0]["detail"]}'
+    )
