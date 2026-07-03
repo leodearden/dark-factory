@@ -218,6 +218,37 @@ class SpeculationController:
         """
         self._held = False
 
+    def on_abort(self) -> None:
+        """A guard/failure/exception/train short-circuit before a put.
+
+        Releases the held permit (if any — guarded against over-release,
+        never by the semaphore type) and clears ``spec_base``. Covers the
+        merger's request_abandoned/train/WorktreeMissing/Exception in-body
+        releases (``merge_queue.py:6540/6645/7013/7045``).
+        """
+        if self._held:
+            self._slot.release()
+            self._held = False
+        self.spec_base = None
+
+    def on_shutdown(self) -> None:
+        """Worker shutdown: release any held permit and clear all state.
+
+        Releases the held permit (if any) and clears all five fields
+        (``spec_base``, ``prefetched``, ``pending_spec_base``,
+        ``pending_predecessor``, and — via the release — ``held_by_merger``).
+        Idempotent when already idle. Covers the shutdown-after-lookahead
+        branch and the outer ``finally`` (``merge_queue.py:6958-6962`` and
+        ``:7052-7053``).
+        """
+        if self._held:
+            self._slot.release()
+            self._held = False
+        self.spec_base = None
+        self.prefetched = None
+        self.pending_spec_base = None
+        self.pending_predecessor = None
+
     def snapshot(self) -> dict[str, Any]:
         """Return a synchronous read-only snapshot of the controller's state.
 
