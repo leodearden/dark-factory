@@ -569,7 +569,16 @@ def create_server(
         headers = get_http_headers()
         levels_raw = headers.get(_LEVELS_HEADER)
         if levels_raw is not None:
-            parsed = _parse_levels(levels_raw)
+            try:
+                parsed = _parse_levels(levels_raw)
+            except ValueError:
+                return {
+                    'error': (
+                        f'unparseable X-Escalation-Levels header {levels_raw!r}; '
+                        'expected comma-separated non-negative ints'
+                    ),
+                    'code': 'bad_capability_header',
+                }
             target = queue.get(escalation_id)
             if target is None:
                 return {'error': f'Escalation {escalation_id} not found'}
