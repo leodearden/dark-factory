@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.git_ops import MergeResult
-from orchestrator.merge_queue import InflightEntry, MergeOutcome, SpeculativeItem
+from orchestrator.merge_queue import InflightEntry, InflightVerifyResult, MergeOutcome, SpeculativeItem
 
 # ── step-1: SpeculativeItem shape validation ─────────────────────────────────
 
@@ -144,3 +144,49 @@ class TestInflightEntryPassthroughInvariant:
         decided_item = SpeculativeItem(**_decided_kwargs())
         InflightEntry(**_entry_kwargs(real_item, passthrough_outcome=None))
         InflightEntry(**_entry_kwargs(decided_item, passthrough_outcome=None))
+
+
+# ── step-7: InflightStatus str-compatible Enum ───────────────────────────────
+
+
+class TestInflightStatusEnum:
+    """InflightStatus is a single str-compatible Enum shared by
+    InflightEntry.status and InflightVerifyResult.status.
+
+    Imported inside each test body (not at module scope) so that, until
+    step-8 lands the enum, only these tests fail with ImportError — the
+    rest of this file's already-green step-1/step-3 tests keep collecting
+    and passing.
+    """
+
+    _MEMBER_NAMES = (
+        'DROPPED',
+        'REQUEUED',
+        'RUNNER_UNAVAILABLE',
+        'ABANDONED_PREDISPATCH',
+        'REQUEUED_PREDISPATCH',
+    )
+
+    def test_importable_from_merge_types(self) -> None:
+        from orchestrator.merge_types import InflightStatus
+        assert issubclass(InflightStatus, str)
+
+    def test_importable_from_merge_queue_reexport_shim(self) -> None:
+        from orchestrator.merge_queue import InflightStatus
+        assert issubclass(InflightStatus, str)
+
+    def test_members_exist_with_value_equal_to_name(self) -> None:
+        from orchestrator.merge_types import InflightStatus
+        for name in self._MEMBER_NAMES:
+            member = getattr(InflightStatus, name)
+            assert member.value == name
+
+    def test_str_compatibility(self) -> None:
+        from orchestrator.merge_types import InflightStatus
+        assert InflightStatus.DROPPED == 'DROPPED'
+        assert InflightStatus.REQUEUED in ('DROPPED', 'REQUEUED')
+
+    def test_inflight_verify_result_status_is_str_compatible(self) -> None:
+        from orchestrator.merge_types import InflightStatus
+        result = InflightVerifyResult(outcome=None, merge_wt=None, status=InflightStatus.DROPPED)
+        assert result.status == 'DROPPED'
