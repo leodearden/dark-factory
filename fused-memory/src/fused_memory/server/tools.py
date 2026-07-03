@@ -1692,9 +1692,14 @@ def create_mcp_server(
 
         Args:
             project_id: Scope counts to a specific project (optional). When
-                omitted, returns global counts across all projects. Pass the
-                same project_id used with ``get_dead_letters`` to compare
-                dead-letter counts consistently for that project.
+                omitted, returns global counts across all projects. This
+                tool's ``dead`` count is an unbounded ``SELECT COUNT(*)``.
+                ``get_dead_letters`` for the same project_id agrees only up
+                to its own ``limit`` (default 100) — a project with more
+                dead items than that ``limit`` will show a lower count there
+                than reported here, since it caps the rows it fetches. Pass
+                a ``limit`` at least as large as this tool's ``dead`` count
+                to ``get_dead_letters`` for a matching comparison.
         """
         try:
             if memory_service.durable_queue is None:
