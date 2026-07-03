@@ -235,6 +235,9 @@ Public API
   — async, generic batch entry point; computes each flag's signature and
   delegates to ``acknowledge_flag_marker`` per flag; best-effort (one flag
   failing never aborts the batch); returns the summed count.
+- ``is_content_fingerprint_task_id(tid)`` — cheap, sync, no I/O; the fp:-only
+  gate used to scope Gap 1/2 enrichment and sweep behaviour to fingerprint
+  markers (task-2047).
 """
 from __future__ import annotations
 
@@ -1352,6 +1355,27 @@ def _is_valid_marker_task_id(tid: str) -> bool:
     # Numeric / comma-joined branch (existing convention, unchanged).
     components = tid.split(',')
     return all(part.strip().isdigit() for part in components)
+
+
+def is_content_fingerprint_task_id(tid: str) -> bool:
+    """Return True iff *tid* is a canonical content-fingerprint marker key.
+
+    This is the fp:-ONLY gate: ``'fp:'`` followed by exactly
+    :data:`_CONTENT_FP_HEXLEN` (32) lowercase hex digits — the single shape
+    emitted by :func:`_content_fingerprint`.  Unlike
+    :func:`_is_valid_marker_task_id` (which ALSO accepts bare numeric and
+    comma-joined tids as valid marker keys), this helper rejects every shape
+    other than the canonical fp: key, including otherwise-valid numeric and
+    comma-joined marker keys.
+
+    Public (no leading underscore) because it is imported by
+    ``task_knowledge_sync`` (task-2047 Gap 2) to scope the cross-cycle
+    fingerprint-marker sweep to fp:-keyed markers only, leaving numeric
+    markers on the existing 14-day age-only GC.
+
+    Pure, sync, no I/O.
+    """
+    return bool(tid) and bool(_CONTENT_FP_RE.fullmatch(tid))
 
 
 def _content_fingerprint(description: str) -> str:
