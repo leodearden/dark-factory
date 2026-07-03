@@ -4877,6 +4877,121 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
+    # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
+    #
+    # Two pure, fail-safe audit methods mirroring the two_layer_invariants
+    # idiom immediately above: each returns list[str] (empty = healthy),
+    # never raises, and is OBSERVATION ONLY (PRD design decision 4) — see
+    # _check_resource_audit / _alarm_resource_audit below for the
+    # heartbeat-driven WARNING + dedup'd L1 escalation this feeds.
+
+    def _inflight_speculative_count(self) -> int:
+        """Return the count of speculative items now owned by the verifier.
+
+        Single source of truth for the ``inflight_speculative`` term shared
+        by :meth:`snapshot`'s ``'speculation'`` key and
+        :meth:`speculation_accounting_violations`. Counts
+        ``self._inflight`` entries with ``was_speculative`` plus
+        ``self._verifier_queue`` items with ``.speculative`` — the same
+        CPython internal-deque read ``snapshot()`` already performs
+        elsewhere (synchronous, no await, no lock; safe under asyncio's
+        single-loop model).
+        """
+        return (
+            sum(1 for _ie in self._inflight if _ie.was_speculative)
+            + sum(
+                1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
+                if _item is not None and _item.speculative
+            )
+        )
+
+    def _inflight_cap_count(self) -> int:
+        """Return the count of _verifier_queue items holding a merge-ahead-cap permit.
+
+        Mechanism 1 (task 1646): the cap is acquired at the single
+        non-speculative success-enqueue site and released ON-DRAIN in
+        ``_dispatch_item`` immediately after ``_verifier_queue.get()`` —
+        never once an item reaches ``self._inflight``. So the in-flight cap
+        count is exactly the number of ``_verifier_queue`` items with
+        ``counts_against_cap=True``. Same CPython internal-deque read as
+        :meth:`_inflight_speculative_count`.
+        """
+        return sum(
+            1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
+            if _item is not None and _item.counts_against_cap
+        )
+
+    def speculation_accounting_violations(self) -> list[str]:
+        """Return I4 permit/cap conservation violations as human-readable strings.
+
+        Empty list → both conservation identities hold. Checks:
+
+          (a) speculation-slot identity: ``slot_available + held_by_merger +
+              inflight_speculative == depth`` — the permit-conservation
+              identity task theta/1993 built ``SpeculationController`` to
+              make computable (its ``held_by_merger`` docstring names this
+              task explicitly).
+          (b) merge-ahead-cap identity: ``merge_ahead_cap._value +
+              inflight_cap_count == depth`` — the Mechanism-1 cap analogue.
+
+        Returns ``[]`` immediately when ``not self._running``: ``stop()``
+        deliberately over-releases both semaphores by ``depth + 1`` as a
+        shutdown safety valve, which would otherwise read as a spurious
+        violation (extra permits, not a leak).
+
+        Pure/synchronous (no await, no git calls). Fail-safe: each identity
+        check has its own try/except so an unexpected exception in one never
+        suppresses the other, and is surfaced as a violation string rather
+        than raised — mirrors :meth:`two_layer_invariants`'s idiom. Reads
+        ``self._speculation_controller.snapshot()`` and the two helpers
+        above; deliberately does NOT call ``self.snapshot()`` (that would
+        recurse via the ``resource_audit`` key).
+        """
+        if not self._running:
+            return []
+
+        violations: list[str] = []
+
+        # ── (a) speculation-slot identity ────────────────────────────────────
+        try:
+            spec = self._speculation_controller.snapshot()
+            depth = spec['depth']
+            slot_available = spec['slot_available']
+            held_by_merger = spec['held_by_merger']
+            inflight_speculative = self._inflight_speculative_count()
+            total = slot_available + held_by_merger + inflight_speculative
+            if total != depth:
+                violations.append(
+                    f'speculation-slot conservation violated: slot_available'
+                    f'({slot_available}) + held_by_merger({held_by_merger}) + '
+                    f'inflight_speculative({inflight_speculative}) == {total}, '
+                    f'expected depth={depth}'
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(
+                f'speculation_accounting_violations: speculation-slot check raised: {exc}'
+            )
+
+        # ── (b) merge-ahead-cap identity ─────────────────────────────────────
+        try:
+            depth = self._speculation_depth
+            cap_available = self._merge_ahead_cap._value  # type: ignore[attr-defined]
+            inflight_cap = self._inflight_cap_count()
+            total = cap_available + inflight_cap
+            if total != depth:
+                violations.append(
+                    f'merge-ahead-cap conservation violated: '
+                    f'merge_ahead_cap_available({cap_available}) + '
+                    f'inflight_cap_count({inflight_cap}) == {total}, '
+                    f'expected depth={depth}'
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(
+                f'speculation_accounting_violations: merge-ahead-cap check raised: {exc}'
+            )
+
+        return violations
+
     def _warn_if_verify_base_not_frozen_tip(
         self,
         item: SpeculativeItem,
