@@ -155,6 +155,17 @@ _IDLE_POLL_LOG_SECS: float = 180.0
 # escalation.watcher subprocess, safe git reads, and the MCP tools for
 # autonomous dispatch (update_task, add_dependency, resolve_issue).
 # Defence-in-depth mirrors the unblock-auto precedent (dry_run_unblock.py).
+#
+# NOTE — this allowlist is ADVISORY, not the durable enforcement boundary.
+# The watcher subprocess runs under `--permission-mode bypassPermissions`
+# (task 1326), so a hard boundary cannot live in a client-side tool
+# allowlist. The durable enforcement of the watcher's escalation scope is
+# now SERVER-SIDE: the escalation MCP server reads the connection-capability
+# headers in _WATCHER_ESCALATION_HEADERS (X-Escalation-Levels/-Identity) and
+# denies (level_forbidden) any resolve_issue/promote_to_l2 outside the
+# granted level set, regardless of which tools the client attempted to call.
+# See plans/escalation-connection-capability-guard-prd.md task alpha (2041,
+# server-side enforcement) and task beta (2042, this header wiring).
 _WATCHER_ALLOWED_TOOLS: list[str] = [
     'Read',
     'Glob',
