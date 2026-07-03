@@ -6489,6 +6489,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     pending_spec_base = None
                     pending_predecessor = None
 
+                # MQ-invariants eta (task 1992): arm the request-liveness ledger
+                # for this freshly-dequeued request.  Single hook site — covers
+                # BOTH the prefetched-consumption branch (req = prefetched) and
+                # the _acquire_next_request() branch above (whose `if req is
+                # None` shutdown sentinel already `break`s the loop, so req is
+                # guaranteed bound and non-None here).  Idempotent: a request
+                # that is somehow already armed (should not happen at a single
+                # hook site, but RequestLedger.on_dequeue is idempotent by
+                # design) keeps its earliest dequeued_at rather than resetting
+                # the age clock.  Observation-only — never resolves/mutates/halts;
+                # see merge_request_ledger.py's module docstring.
+                self._request_ledger.on_dequeue(req, now=time.time())
+
                 self._inflight_req = req  # track for stop() race resolution
                 # ι=1894: stash main_position for this request so
                 # _note_conflict_detected can compute drift later.
