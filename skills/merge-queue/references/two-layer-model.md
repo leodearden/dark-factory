@@ -111,15 +111,15 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `MERGE_BOUNCE_CAP` | merge_queue.py | Max bounce count before thrash-backstop triggers (= 3) |
 | `_aging_key(req)` | merge_queue.py | Sort key: `(merge_first_enqueued_at or enqueued_at, request_id)` |
 | `merge_first_enqueued_at` | merge_queue.py | Write-once field: epoch of first submission to the merge queue |
-| `SuffixConflictGraph` | merge_queue.py | In-memory conflict graph over the unfrozen suffix |
+| `SuffixConflictGraph` | suffix_graph.py | In-memory conflict graph over the unfrozen suffix |
 | `NoLandingsCircuitBreaker` | merge_queue.py | No-landings circuit-breaker decision object (θ=1893) |
 | `_pop_next_pickable()` | merge_queue.py | Select next item using clique-scoped aging (ζ=1891) |
 | `frozen_prefix()` | merge_queue.py | Return ordered `request_id`s in the frozen prefix |
 | `frozen_prefix_tip()` | merge_queue.py | Return the base SHA for next verify dispatch |
 | `check_frozen_prefix_invariant()` | merge_queue.py | §5.3 I1+I2 violations (base-chain integrity) |
 | `two_layer_invariants()` | merge_queue.py | All §5.3 violations (I1–I4 + graph consistency) |
-| `recompute_suffix_conflict_graph()` | merge_queue.py | Recompute the conflict graph; triggers bounce |
-| `_bounce_conflicting_suffix_items()` | merge_queue.py | Graph-time disk-free bounce of the younger conflicting item |
+| `recompute_suffix_conflict_graph()` | merge_queue.py | Worker delegator → `SuffixConflictTracker.recompute()` (suffix_graph.py); recomputes the conflict graph, triggers bounce |
+| `_bounce_conflicting_suffix_items()` | merge_queue.py | Worker delegator → `SuffixConflictTracker.bounce_conflicting_suffix_items()` (suffix_graph.py); graph-time disk-free bounce of the younger conflicting item |
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
 
 ### 7.1 merge_types.py — request/outcome/item/entry types + registries (MQ-refactor task α)
@@ -333,6 +333,46 @@ default literal changed (to `None`).
 | `_clear_verify_host_unreachable()` | merge_liveness.py | Resolve any open unreachability alarm and emit a recovery event on reprobe success |
 | `_acquire_warm_verify_worktree()` | merge_liveness.py | Swap the ephemeral merge worktree for the persistent warm worktree (or the `_spec-` warm lane) |
 | `enforce_persistent_worktree_serial_lane()` | merge_liveness.py | Fail-closed startup guard: per-host in-flight verify count must not exceed 1 |
+
+### 7.6 suffix_graph.py — SuffixConflictTracker (conflict graph + bounce state) (MQ-refactor task δ)
+
+The two-layer suffix-conflict machinery — the `SuffixConflictGraph` immutable conflict-graph
+dataclass and its `EMPTY_SUFFIX_CONFLICT_GRAPH` sentinel — were extracted verbatim, and a NEW
+`SuffixConflictTracker` class that owns the state (`graph` / `signature` / `last_known_main_sha` /
+`bounce_registry`) and logic (`recompute()` / `bounce_conflicting_suffix_items()`) was added, into
+`orchestrator/suffix_graph.py` (task δ of `plans/merge-queue-modularization-invariants-prd.md`).
+`merge_queue.py` re-exports all three names through a single top-level shim import (`from
+orchestrator.suffix_graph import (...)  # noqa: F401  re-export shim`), so existing call sites —
+`from orchestrator.merge_queue import SuffixConflictGraph`, etc. — keep working unchanged.
+
+Unlike α–γ's pure function/type extractions, this module also introduces a NEW owning class.
+`SuffixConflictTracker` takes a live `GitOps` reference plus three narrow accessor callables —
+`lane_buffers`, `frozen_prefix`, `frozen_prefix_tip` — instead of a worker reference, so it is
+fully unit-testable without a `SpeculativeMergeWorker`. `SpeculativeMergeWorker` owns exactly one
+instance (`self._suffix_tracker`, constructed immediately after `self._lane_buffers` in
+`__init__`) and delegates to it via 4 get/set `@property` descriptors that preserve the worker's
+original attribute names (`_suffix_conflict_graph`, `_suffix_conflict_signature`,
+`_last_known_main_sha`, `_bounce_registry`) plus two thin async methods
+(`recompute_suffix_conflict_graph()`, `_bounce_conflicting_suffix_items()`) that just `await` the
+tracker — so `_acquire_next_request()`, `snapshot()`, `_pop_next_pickable()`,
+`two_layer_invariants()`, and the existing conflict-graph/bounce test suites all keep working with
+zero churn.
+
+**Reach-back convention:** identical in spirit to β/γ/λ (§7.2/7.3/7.5) — the two tracker methods
+resolve the three merge_queue-resident constants they read (`MERGE_LANES`, `MERGE_BOUNCE_CAP`,
+`NEEDS_REBASE_REASON_PREFIX`) through function-local deferred `from orchestrator.merge_queue
+import <name>` imports rather than a top-level import, keeping `suffix_graph.py` free of any
+top-level import of `merge_queue` (which would deadlock module load, since merge_queue's shim
+needs this module fully defined first). None of the three constants were moved — they stay in
+`merge_queue.py`.
+
+| Symbol | Location | Description |
+|--------|----------|--------------|
+| `SuffixConflictGraph` | suffix_graph.py | Immutable conflict graph over the unfrozen suffix (moved verbatim from merge_queue.py) |
+| `EMPTY_SUFFIX_CONFLICT_GRAPH` | suffix_graph.py | Sentinel empty `SuffixConflictGraph` for the default/zero-suffix case (moved verbatim) |
+| `SuffixConflictTracker` | suffix_graph.py | Owns `graph` / `signature` / `last_known_main_sha` / `bounce_registry`; constructed with `git_ops` + `lane_buffers`/`frozen_prefix`/`frozen_prefix_tip` callables |
+| `SuffixConflictTracker.recompute()` | suffix_graph.py | Recompute and store the conflict graph over the unfrozen suffix (debounced, fail-open); `SpeculativeMergeWorker.recompute_suffix_conflict_graph()` delegates here |
+| `SuffixConflictTracker.bounce_conflicting_suffix_items()` | suffix_graph.py | Graph-time disk-free bounce of the younger conflicting item (cap/escalation/TOCTOU); `SpeculativeMergeWorker._bounce_conflicting_suffix_items()` delegates here |
 
 ---
 
