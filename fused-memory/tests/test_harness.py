@@ -4572,6 +4572,71 @@ async def test_backlog_iterator_budget_yield_stops_after_one_chunk(
 
 
 @pytest.mark.asyncio
+async def test_project_loop_bounds_iterate_branch_with_cycle_timeout(
+    journal, event_buffer, mock_memory_service, caplog
+):
+    """_project_loop must wrap the iterate branch (BacklogIterator.run) in the
+    same asyncio.wait_for(cycle_timeout_seconds) guard the non-iterate branch
+    already has, so a single wedged chunk is bounded and surfaces as an
+    observable timeout instead of hanging the per-project lock forever.
+
+    Forces the iterate branch via a class-patched BacklogIterator.should_iterate
+    (True) and wedges BacklogIterator.run with an unconditional asyncio.sleep,
+    mirroring the wedge technique in test_timeout_marks_run_failed (~L790). A
+    tiny cycle_timeout_seconds makes the wait_for fire quickly.
+
+    RED before step-6: iterator.run(project_id) is currently awaited
+    unwrapped in _project_loop, so it hangs for the full asyncio.sleep(999)
+    instead of timing out — restore_drained is never called and no
+    'reconciliation.iteration_timed_out' record is logged before the outer
+    test-harness wait_for below cuts the test off.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.cycle_timeout_seconds = 1
+    await _seed_recon_state(event_buffer)
+
+    restore_calls: list[str] = []
+    original_restore = event_buffer.restore_drained
+
+    async def spy_restore(pid):
+        restore_calls.append(pid)
+        return await original_restore(pid)
+
+    event_buffer.restore_drained = spy_restore
+
+    async def hang_forever(*_a, **_k):
+        await asyncio.sleep(999)
+
+    with (
+        patch.object(BacklogIterator, 'should_iterate', new=AsyncMock(return_value=True)),
+        patch.object(BacklogIterator, 'run', new=AsyncMock(side_effect=hang_forever)),
+        caplog.at_level(logging.ERROR, logger='fused_memory.reconciliation.harness'),
+        contextlib.suppress(TimeoutError),
+    ):
+        await asyncio.wait_for(harness._project_loop('test-project'), timeout=2.5)
+
+    # The iterate branch must be bounded the same way the non-iterate branch
+    # is: a TimeoutError from the wrapping wait_for restores the buffer.
+    assert restore_calls, (
+        'Expected buffer.restore_drained to be called after the iterate branch '
+        'timed out, but it was never invoked — iterator.run() is not wrapped in '
+        'asyncio.wait_for(cycle_timeout_seconds).'
+    )
+    assert all(pid == 'test-project' for pid in restore_calls)
+
+    # The timeout must be observable, not silent.
+    timeout_records = [
+        r for r in caplog.records if r.getMessage() == 'reconciliation.iteration_timed_out'
+    ]
+    assert timeout_records, (
+        'Expected a reconciliation.iteration_timed_out log record after the '
+        f'iterate branch timed out, got records: {[r.getMessage() for r in caplog.records]}'
+    )
+    assert timeout_records[0].__dict__.get('project_id') == 'test-project'
+    assert timeout_records[0].__dict__.get('timeout') == 1
+
+
+@pytest.mark.asyncio
 async def test_fetch_filtered_task_tree_short_circuits_on_empty_project_root(
     journal, event_buffer, mock_memory_service
 ):
