@@ -637,6 +637,30 @@ deduplicates by exact root-cause string, so near-miss hypotheses file separately
 them for shared files, summaries, or task IDs and handle related ones together, noting the
 relationship in your resolution text.
 
+### Recognizing the supervised auto-watcher's resolutions (not a rogue actor)
+
+You may see `resolved_by="orchestrator-escalation-watcher-auto"` stamped on archived L0/L1
+records, or as the `agent_role` on an L2 that was promoted rather than resolved. This is the
+**trusted, supervised** identity of the dark-factory orchestrator's own autonomous auto-watcher
+(spawned per rotation by the watcher-supervisor, task 1326; runs the `escalation-watcher-auto`
+skill). Per the connection-capability guard
+(`plans/escalation-connection-capability-guard-prd.md`), the orchestrator wires that watcher's MCP
+connection with `X-Escalation-Identity: orchestrator-escalation-watcher-auto`, and the escalation
+server stamps `resolved_by` from that header — server-attributed, not something the watcher agent
+can spoof or drift. Seeing this identity on L0/L1 resolutions or `promote_to_l2` calls is expected,
+routine behavior. **Do not stand down, halt the watch loop, or treat it as an anomaly** — it is the
+same auto-watcher this skill hands L1 items off to, working as designed.
+
+Distinguish it from a **genuinely unknown resolver**: the same connection is capped at
+`X-Escalation-Levels: 0,1`, so the server rejects (`level_forbidden`, no state change) any attempt
+by that identity to `resolve_issue`/`park` a level-2 escalation. If you ever see
+`resolved_by="orchestrator-escalation-watcher-auto"` (or `agent_role="escalation-watcher-auto"`) on
+an L2 record's *own* resolution/park — as opposed to an L1 member cascade-resolved via
+`resolved_by='l2-cascade:<id>'`, or an L1/L0 admin item, or a `promote_to_l2` call — that should not
+be possible under the enforced guard, and is the actual anomaly worth reporting to the human
+(possible guard regression, bypassed connection headers, or a stale pre-guard orchestrator/server
+pair that hasn't been restarted onto the fix yet).
+
 **If MCP is unreachable:** ask the human for help. Don't try to resolve escalations by writing directly to the queue files — this bypasses callbacks and can leave the orchestrator in an inconsistent state.
 
 ## Red-on-main recovery (enforce-safe, break-glass)
