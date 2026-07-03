@@ -511,6 +511,33 @@ class TestReconciliationConfigTimeouts:
         assert cfg.stage_timeout_seconds == 3600
 
 
+class TestReconciliationConfigBacklogIterationBudget:
+    """Tests for backlog_iteration_budget_seconds — the cumulative per-invocation
+    wall-clock budget for BacklogIterator.run() (task 2040)."""
+
+    def test_default_budget_is_1800(self):
+        assert ReconciliationConfig().backlog_iteration_budget_seconds == 1800
+
+    def test_budget_exceeding_cycle_timeout_rejected(self):
+        # stage_timeout_seconds=1000 keeps the pre-existing agent/judge-cli <=
+        # stage <= cycle checks satisfied (defaults 180/600) so only the new
+        # backlog-budget <= cycle check is exercised.
+        with pytest.raises(ValidationError, match='backlog_iteration_budget_seconds'):
+            ReconciliationConfig(
+                backlog_iteration_budget_seconds=1001,
+                cycle_timeout_seconds=1000,
+                stage_timeout_seconds=1000,
+            )
+
+    def test_budget_within_cycle_timeout_accepted(self):
+        cfg = ReconciliationConfig(
+            backlog_iteration_budget_seconds=500,
+            cycle_timeout_seconds=1000,
+            stage_timeout_seconds=1000,
+        )
+        assert cfg.backlog_iteration_budget_seconds == 500
+
+
 class TestReconciliationConfigDeadLetterFields:
     """Tests for event_dead_letter_max_bytes and event_dead_letter_keep_rotations."""
 
