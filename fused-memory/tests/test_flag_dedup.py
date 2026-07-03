@@ -4932,6 +4932,98 @@ class TestMarkerQuery:
 
 
 # ---------------------------------------------------------------------------
+# _extract_deduped_against_uuids helper (task-2047 step-1 / step-2)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDedupedAgainstUuids:
+    """Unit tests for _extract_deduped_against_uuids(flag) -> list[str].
+
+    Pure, sync, no-I/O helper that extracts the resolvable Mem0 memory
+    UUID(s) a duplicate-detection finding cites as duplicates, from a
+    documented set of candidate flag-dict fields (canonical
+    'deduped_against' plus common aliases the LLM might use instead).
+    """
+
+    def test_reads_canonical_field_sorted_unique(self):
+        """Canonical 'deduped_against' list is returned sorted-unique."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'deduped_against': ['uuid-b', 'uuid-a', 'uuid-b']}
+        assert _extract_deduped_against_uuids(flag) == ['uuid-a', 'uuid-b']
+
+    def test_unions_alias_fields_with_canonical_field(self):
+        """Values from alias fields are unioned together with the canonical field."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {
+            'deduped_against': ['uuid-a'],
+            'duplicate_memory_ids': ['uuid-b'],
+            'duplicate_ids': ['uuid-c'],
+            'memory_ids': ['uuid-d'],
+            'cited_memory_ids': ['uuid-e'],
+        }
+        assert _extract_deduped_against_uuids(flag) == [
+            'uuid-a', 'uuid-b', 'uuid-c', 'uuid-d', 'uuid-e',
+        ]
+
+    def test_accepts_single_str_value_not_wrapped_in_list(self):
+        """A bare str value (not a list) on any candidate field is accepted as a 1-item result."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'deduped_against': 'uuid-solo'}
+        assert _extract_deduped_against_uuids(flag) == ['uuid-solo']
+
+    def test_drops_none_and_blank_entries_and_coerces_non_str_to_str(self):
+        """None/empty/whitespace-only entries are dropped; non-str entries are str-coerced."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'deduped_against': [None, '', '   ', 'uuid-a', 123]}
+        assert _extract_deduped_against_uuids(flag) == ['123', 'uuid-a']
+
+    def test_drops_structured_elements_instead_of_stringifying(self):
+        """A dict or nested-list element inside a candidate field is DROPPED,
+        not str()-coerced into a junk 'UUID' (task-2047 amendment)."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {
+            'deduped_against': [
+                'uuid-a',
+                {'k': 'v'},
+                ['nested', 'list'],
+                3.14,
+                'uuid-b',
+            ],
+        }
+        assert _extract_deduped_against_uuids(flag) == ['uuid-a', 'uuid-b']
+
+    def test_returns_empty_list_when_no_candidate_field_present(self):
+        """No candidate field present at all -> []."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'x',
+        }
+        assert _extract_deduped_against_uuids(flag) == []
+
+    def test_returns_empty_list_when_candidate_fields_are_all_empty(self):
+        """Candidate fields present but every value is empty/None -> []."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'deduped_against': [], 'duplicate_ids': None, 'memory_ids': ''}
+        assert _extract_deduped_against_uuids(flag) == []
+
+    def test_returns_empty_list_for_bare_dict_with_unrelated_keys(self):
+        """A flag dict carrying only unrelated keys -> [] (no KeyError/AttributeError)."""
+        from fused_memory.reconciliation.flag_dedup import _extract_deduped_against_uuids
+
+        flag = {'foo': 'bar', 'baz': [1, 2, 3]}
+        assert _extract_deduped_against_uuids(flag) == []
+
+
+# ---------------------------------------------------------------------------
 # _write_and_confirm_marker helper (step-4 / step-5)
 # ---------------------------------------------------------------------------
 
@@ -5039,6 +5131,83 @@ class TestWriteAndConfirmMarker:
         assert '42' in warning_msgs[0]
         assert 'missing_deliverable' in warning_msgs[0]
         assert 'failed to write marker' in warning_msgs[0]
+
+    async def test_deduped_against_included_in_metadata_when_provided(self, caplog):
+        """deduped_against=[...] is included in the add_memory metadata payload,
+        additive to the existing source/kind/task_id/flag_type/run_id/last_seen_run_id
+        keys (task-2047 Gap 1)."""
+        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
+
+        memory_service = MagicMock()
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        confirm_and_track = AsyncMock(return_value=True)
+        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
+
+        result = await _write_and_confirm_marker(
+            memory_service,
+            project_id='p',
+            run_id='r1',
+            tid='fp:9216e85ac497b68d93043b64684eb049',
+            ftype='duplicate_procedural_knowledge',
+            log=log,
+            confirm_and_track=confirm_and_track,
+            active_miss_warning_template='active-%s-%s',
+            tripped_skip_warning_template='tripped-%s-%s',
+            deduped_against=['uuid-a', 'uuid-b'],
+        )
+
+        assert result is True
+        memory_service.add_memory.assert_called_once()
+        kwargs = memory_service.add_memory.call_args.kwargs
+        _assert_valid_stage1_marker(
+            kwargs,
+            task_id='fp:9216e85ac497b68d93043b64684eb049',
+            flag_type='duplicate_procedural_knowledge',
+            run_id='r1',
+        )
+        assert kwargs['metadata']['deduped_against'] == ['uuid-a', 'uuid-b'], (
+            f"metadata must carry deduped_against; got {kwargs['metadata']!r}"
+        )
+
+    async def test_deduped_against_omitted_from_metadata_when_none_or_empty(self, caplog):
+        """deduped_against=None (or []) must NOT add a 'deduped_against' metadata key —
+        locks the additive/no-regression contract: the payload is otherwise
+        byte-identical to the pre-task-2047 contract (task-2047 Gap 1)."""
+        from fused_memory.reconciliation.flag_dedup import _write_and_confirm_marker
+
+        log = _logging_mod.getLogger('fused_memory.reconciliation.flag_dedup')
+
+        for deduped_against in (None, []):
+            memory_service = MagicMock()
+            memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+            confirm_and_track = AsyncMock(return_value=True)
+
+            await _write_and_confirm_marker(
+                memory_service,
+                project_id='p',
+                run_id='r1',
+                tid='42',
+                ftype='missing_deliverable',
+                log=log,
+                confirm_and_track=confirm_and_track,
+                active_miss_warning_template='active-%s-%s',
+                tripped_skip_warning_template='tripped-%s-%s',
+                deduped_against=deduped_against,
+            )
+
+            kwargs = memory_service.add_memory.call_args.kwargs
+            assert 'deduped_against' not in kwargs['metadata'], (
+                f'deduped_against={deduped_against!r} must not add a metadata key; '
+                f"got metadata={kwargs['metadata']!r}"
+            )
+            assert kwargs['metadata'] == {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': '42',
+                'flag_type': 'missing_deliverable',
+                'run_id': 'r1',
+                'last_seen_run_id': 'r1',
+            }, 'payload must be byte-identical to the pre-change contract when deduped_against is empty/None'
 
 
 # ---------------------------------------------------------------------------
@@ -5683,6 +5852,305 @@ class TestDedupFlagsContentFingerprintPath:
 
 
 # ---------------------------------------------------------------------------
+# task-2047 step-7 — RED: dedup_flags deduped_against enrichment (Gap 1)
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsDedupedAgainstEnrichment:
+    """dedup_flags threads deduped_against UUIDs into fp:-keyed markers ONLY
+    (task-2047 Gap 1): numeric-task_id markers are unaffected by scoping, and
+    a fp: flag with no UUID-bearing fields writes a marker with no
+    deduped_against key (extraction correctly yields empty -> field omitted).
+    """
+
+    @pytest.mark.asyncio
+    async def test_miss_branch_fp_marker_carries_deduped_against(self):
+        """MISS: a content-fingerprint flag carrying deduped_against=['m1','m2']
+        -> the written marker's metadata.deduped_against == ['m1', 'm2'] and
+        metadata.task_id is a canonical fp:+32hex key."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+            is_content_fingerprint_task_id,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge about deploy steps',
+            'deduped_against': ['m1', 'm2'],
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None, 'Test setup: signature must be computable for this flag'
+        expected_fp, expected_ftype = sig
+
+        written_marker = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'kind': 'stage1_flag_marker',
+            'task_id': expected_fp,
+            'flag_type': expected_ftype,
+            'run_id': 'r1',
+        })
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(expected_fp, expected_ftype): [[], [written_marker]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('deduped_against') == ['m1', 'm2'], (
+            f'Expected deduped_against=["m1","m2"]; got {meta.get("deduped_against")!r}'
+        )
+        assert is_content_fingerprint_task_id(meta.get('task_id')), (
+            f"marker task_id {meta.get('task_id')!r} must be a canonical fp:+32hex key"
+        )
+
+    @pytest.mark.asyncio
+    async def test_hit_branch_replacement_fp_marker_carries_deduped_against(self):
+        """HIT: with a prior fp: marker present, the replacement marker write
+        ALSO carries metadata.deduped_against == ['m1', 'm2']."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge about deploy steps',
+            'deduped_against': ['m1', 'm2'],
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        fp_prior = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': fp,
+            'flag_type': ftype,
+            'run_id': 'r1',
+        })
+        fp_prior.id = 'fp-prior-r1'
+        replacement = _make_memory_result({
+            'source': 'stage1_flag_marker',
+            'task_id': fp,
+            'flag_type': ftype,
+            'run_id': 'r2',
+        })
+        replacement.id = 'fp-replacement-r2'
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[fp_prior], [replacement]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r2',
+            flags=[flag],
+        )
+
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('deduped_against') == ['m1', 'm2'], (
+            f'Replacement marker must carry deduped_against; got {meta.get("deduped_against")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_numeric_task_id_flag_scoped_out_no_deduped_against(self):
+        """Scoping: a numeric-task_id flag (task_id=42) carrying a duplicate_ids
+        field must NOT get deduped_against in its marker metadata — enrichment
+        is fp:-only."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {
+            'task_id': 42,
+            'flag_type': 'missing_deliverable',
+            'duplicate_ids': ['m1', 'm2'],
+        }
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={('42', 'missing_deliverable'): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': '42',
+                'flag_type': 'missing_deliverable',
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert 'deduped_against' not in meta, (
+            f'Numeric-task_id marker must NOT carry deduped_against; got metadata={meta!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fp_flag_with_no_uuid_fields_no_deduped_against(self):
+        """fp: flag with no UUID-bearing fields -> marker written with no
+        deduped_against key (extraction correctly returns empty -> field omitted)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge with no cited UUIDs',
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': fp,
+                'flag_type': ftype,
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        await dedup_flags(
+            memory_service=memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        memory_service.add_memory.assert_called_once()
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert 'deduped_against' not in meta, (
+            f'fp: marker with no UUID fields must NOT carry deduped_against; got metadata={meta!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_alias_only_enrichment_logs_observability_notice(self, caplog):
+        """When deduped_against is populated ONLY from an alias field (the
+        canonical 'deduped_against' field is absent), dedup_flags logs an INFO
+        notice so alias-sourced enrichment is observable (task-2047 amendment)."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge about deploy steps, alias only',
+            'duplicate_ids': ['m1', 'm2'],
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': fp,
+                'flag_type': ftype,
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=[flag],
+            )
+
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'sourced only from alias' in m and fp in m and ftype in m for m in info_msgs
+        ), f'Expected an alias-fallback INFO log naming task_id/flag_type; got {info_msgs!r}'
+
+        meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
+        assert meta.get('deduped_against') == ['m1', 'm2'], (
+            f'Alias-sourced enrichment must still be written; got {meta.get("deduped_against")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_canonical_field_present_does_not_log_alias_fallback(self, caplog):
+        """When the canonical 'deduped_against' field is present (non-empty), no
+        alias-fallback observability log fires — the log exists specifically to
+        flag alias-ONLY enrichment (task-2047 amendment)."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_content_fingerprint_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': None,
+            'flag_type': 'duplicate_procedural_knowledge',
+            'description': 'Duplicate procedural knowledge about deploy steps, canonical present',
+            'deduped_against': ['m1', 'm2'],
+        }
+        sig = compute_content_fingerprint_signature(flag)
+        assert sig is not None
+        fp, ftype = sig
+
+        memory_service = AsyncMock()
+        memory_service.search = AsyncMock(side_effect=_make_search_stub(
+            suppression=[[]],
+            marker={(fp, ftype): [[], [_make_memory_result({
+                'source': 'stage1_flag_marker',
+                'task_id': fp,
+                'flag_type': ftype,
+                'run_id': 'r1',
+            })]]},
+        ))
+        memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await dedup_flags(
+                memory_service=memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=[flag],
+            )
+
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert not any('sourced only from alias' in m for m in info_msgs), (
+            f'Canonical-field enrichment must NOT log the alias-fallback notice; got {info_msgs!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task-1656 step-3 — RED: dedup_flags write-guard integration tests
 # ---------------------------------------------------------------------------
 
@@ -6126,6 +6594,98 @@ class TestIsValidMarkerTaskId:
         tid = 'fp:' + 'a' * 31 + 'g'
         assert _is_valid_marker_task_id(tid) is False, (
             f'{tid!r} must be rejected (non-hex char "g" at position 35)'
+        )
+
+
+# ---------------------------------------------------------------------------
+# is_content_fingerprint_task_id helper (task-2047 step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+
+class TestIsContentFingerprintTaskId:
+    """Unit tests for is_content_fingerprint_task_id(tid) -> bool.
+
+    Unlike _is_valid_marker_task_id (which also accepts numeric and
+    comma-joined tids), this helper is the fp:-ONLY gate: True iff *tid* is
+    a canonical 'fp:' + exactly 32 lowercase hex digits key, False for
+    every other shape (including otherwise-valid numeric/comma-joined
+    marker keys).
+    """
+
+    def test_true_for_canonical_fp_key(self):
+        """A canonical fp:+32-lowercase-hex key (real emitter output) -> True."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _content_fingerprint,
+            is_content_fingerprint_task_id,
+        )
+
+        tid = _content_fingerprint('x')
+        assert is_content_fingerprint_task_id(tid) is True, (
+            f'{tid!r} must be accepted (canonical fp:+32-hex key)'
+        )
+
+    def test_false_for_bare_numeric_tid(self):
+        """A bare numeric tid ('42') is a valid marker key but NOT an fp: key -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('42') is False
+
+    def test_false_for_comma_joined_numerics(self):
+        """A comma-joined numeric tid ('12,15') is a valid marker key but NOT an fp: key -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('12,15') is False
+
+    def test_false_for_empty_string(self):
+        """Empty string -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('') is False
+
+    def test_false_for_fp_prefix_with_no_hex(self):
+        """'fp:' alone (no hex digits) -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('fp:') is False
+
+    def test_false_for_fp_too_short_hex(self):
+        """'fp:' + 30 hex chars (too short) -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('fp:' + 'a' * 30) is False
+
+    def test_false_for_fp_too_long_hex(self):
+        """'fp:' + 64 hex chars (too long) -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('fp:' + 'a' * 64) is False
+
+    def test_false_for_fp_uppercase_hex(self):
+        """'fp:' + uppercase hex (real emitter only produces lowercase) -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('fp:' + 'A' * 32) is False
+
+    def test_false_for_arbitrary_string(self):
+        """An arbitrary non-fp: string -> False."""
+        from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+
+        assert is_content_fingerprint_task_id('not-a-marker-key-at-all') is False
+
+    def test_anti_drift_roundtrip_with_content_fingerprint(self):
+        """is_content_fingerprint_task_id(_content_fingerprint(<desc>)) must be True
+        for any non-blank description — ties the gate to the real emitter's output
+        so accept/emit drift is caught as a test failure."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _content_fingerprint,
+            is_content_fingerprint_task_id,
+        )
+
+        description = 'Any non-blank description for anti-drift validation'
+        fp = _content_fingerprint(description)
+        assert is_content_fingerprint_task_id(fp) is True, (
+            f'_content_fingerprint output {fp!r} must be accepted by '
+            f'is_content_fingerprint_task_id (anti-drift invariant)'
         )
 
 

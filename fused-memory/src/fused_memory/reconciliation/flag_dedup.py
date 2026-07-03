@@ -235,6 +235,9 @@ Public API
   — async, generic batch entry point; computes each flag's signature and
   delegates to ``acknowledge_flag_marker`` per flag; best-effort (one flag
   failing never aborts the batch); returns the summed count.
+- ``is_content_fingerprint_task_id(tid)`` — cheap, sync, no I/O; the fp:-only
+  gate used to scope Gap 1/2 enrichment and sweep behaviour to fingerprint
+  markers (task-2047).
 """
 from __future__ import annotations
 
@@ -583,6 +586,89 @@ async def filter_suppressed(
     return [f for f in flags if _keep(f)]
 
 
+# --------------------------------------------------------------------------- #
+# Deduped-against UUID extraction (task-2047 Gap 1)
+# --------------------------------------------------------------------------- #
+
+#: Candidate flag-dict fields consulted by :func:`_extract_deduped_against_uuids`
+#: for the resolvable Mem0 memory UUID(s) a duplicate-detection finding cites.
+#: The canonical field is ``'deduped_against'`` — the field
+#: ``prompts/stage1.py`` instructs the LLM to emit for duplicate-detection
+#: findings (e.g. ``duplicate_procedural_knowledge``).  The remaining entries
+#: are tolerated aliases: ``items_flagged`` entries are free-form LLM-emitted
+#: dicts with no fixture pinning the exact field name in practice, so a small
+#: union-of-candidates keeps extraction robust to shape drift.  Order only
+#: affects readability here — extraction UNIONS values across every field.
+#: This is a CONSCIOUS robustness/precision tradeoff: a generic alias (e.g.
+#: ``'memory_ids'``) could in principle mean something other than "duplicate
+#: of" on a producer's flag. To keep false-positive enrichment observable,
+#: ``dedup_flags`` logs at INFO whenever a marker's ``deduped_against`` is
+#: populated entirely from an alias rather than the canonical field.
+_DEDUPED_AGAINST_FLAG_FIELDS: tuple[str, ...] = (
+    'deduped_against',
+    'duplicate_memory_ids',
+    'duplicate_ids',
+    'memory_ids',
+    'cited_memory_ids',
+)
+
+
+def _extract_deduped_against_uuids(flag: dict[str, Any]) -> list[str]:
+    """Return the sorted-unique memory UUID(s) *flag* cites as duplicates.
+
+    Reads :data:`_DEDUPED_AGAINST_FLAG_FIELDS` in order and UNIONS every
+    value found across all of them (a flag may carry more than one such
+    field; all are honoured, not just the first present). For each field's
+    value:
+
+    - A bare ``str`` is treated as a single-item list (task-2047 step-1(c)).
+    - A ``list`` is iterated element-by-element.
+    - Any other shape (e.g. ``None``, ``int``, ``dict``) is skipped rather
+      than raising, since ``flag`` is a free-form LLM-emitted dict.
+
+    Each list element is type-checked before coercion: only ``str`` and
+    ``int`` elements are accepted (e.g. an int ``123`` becomes ``'123'``);
+    any other element shape (``dict``, nested ``list``, ``float``, ``bool``,
+    etc.) is DROPPED rather than stringified, since ``str()`` on a
+    dict/list would otherwise mint a junk 'UUID' like ``"{'k': 'v'}"``
+    (task-2047 amendment).  Accepted elements are then stripped; blank
+    results (empty string or whitespace-only) are also dropped.
+
+    Returns ``[]`` when no candidate field is present, when every present
+    field is empty, or when *flag* carries none of the candidate fields at
+    all — never raises.
+
+    Pure, sync, no I/O.
+    """
+    collected: set[str] = set()
+    for field in _DEDUPED_AGAINST_FLAG_FIELDS:
+        value = flag.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            candidates: list[Any] = [value]
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            # Unexpected shape for this field — skip rather than raise; the
+            # flag is a free-form LLM-emitted dict and other fields may still
+            # yield a usable value.
+            continue
+        for item in candidates:
+            if item is None:
+                continue
+            if not isinstance(item, (str, int)):
+                # Structured/garbage element (dict, nested list, float, ...)
+                # — drop rather than str()-coerce so it can't pollute
+                # metadata.deduped_against with a non-UUID string.
+                continue
+            s = str(item).strip()
+            if not s:
+                continue
+            collected.add(s)
+    return sorted(collected)
+
+
 async def _write_and_confirm_marker(
     memory_service: Any,
     *,
@@ -594,6 +680,7 @@ async def _write_and_confirm_marker(
     confirm_and_track,  # async callable: (response_memory_ids, active_miss_warning_msg, tripped_skip_warning_msg, *, tid, ftype) -> bool
     active_miss_warning_template: str,
     tripped_skip_warning_template: str,
+    deduped_against: list[str] | None = None,
 ) -> bool:
     """Write a stage1_flag_marker memory and confirm it is findable.
 
@@ -604,6 +691,13 @@ async def _write_and_confirm_marker(
                   'task_id':tid, 'flag_type':ftype,
                   'run_id':run_id, 'last_seen_run_id':run_id}``
     - ``_source='stage1_flag_dedup'`` sentinel
+
+    ``deduped_against`` (task-2047 Gap 1) is an OPTIONAL additive field: when
+    a non-empty list of resolvable memory UUIDs is passed, it is included as
+    ``metadata['deduped_against']``.  When ``None`` or empty (the default),
+    no such key is added and the payload is byte-identical to the pre-2047
+    contract — this keeps the numeric-task_id marker path (and every
+    existing payload assertion) unchanged.
 
     **Validation guard (defense-in-depth):** before calling ``add_memory``,
     ``tid`` is checked by :func:`_is_valid_marker_task_id`.  Under normal
@@ -648,19 +742,22 @@ async def _write_and_confirm_marker(
             tid, ftype,
         )
         return False
+    metadata: dict[str, Any] = {
+        'source': 'stage1_flag_marker',
+        'kind': 'stage1_flag_marker',
+        'task_id': tid,
+        'flag_type': ftype,
+        'run_id': run_id,
+        'last_seen_run_id': run_id,
+    }
+    if deduped_against:
+        metadata['deduped_against'] = list(deduped_against)
     try:
         response = await memory_service.add_memory(
             content=f'Stage 1 flag marker: task={tid} type={ftype} from run={run_id}',
             category='observations_and_summaries',
             project_id=project_id,
-            metadata={
-                'source': 'stage1_flag_marker',
-                'kind': 'stage1_flag_marker',
-                'task_id': tid,
-                'flag_type': ftype,
-                'run_id': run_id,
-                'last_seen_run_id': run_id,
-            },
+            metadata=metadata,
             causation_id=run_id,
             _source='stage1_flag_dedup',
         )
@@ -724,6 +821,14 @@ async def dedup_flags(
     empty string (i.e. any falsy value), the literal sentinel ``'unknown'``
     is used instead.  Downstream consumers (Stage 2 prompt, observability
     dashboards) can grep for ``'unknown'`` to detect malformed markers.
+
+    Deduped-against enrichment (task-2047 Gap 1): for ``fp:``-keyed markers
+    ONLY (per :func:`is_content_fingerprint_task_id`), the resolvable memory
+    UUID(s) the flag cites as duplicates are extracted via
+    :func:`_extract_deduped_against_uuids` and threaded into both the HIT and
+    MISS ``_write_and_confirm_marker`` calls as ``deduped_against``.  Numeric
+    and comma-joined markers always pass ``None`` — they are already
+    resolvable anchors and their payload is unchanged.
 
     Returns the (possibly annotated) flag list.
     """
@@ -860,6 +965,31 @@ async def dedup_flags(
             )
             result.append(flag)
             continue
+        # Gap-1 enrichment (task-2047): scoped to fp:-keyed markers only — numeric
+        # and comma-joined tids are already resolvable anchors and must not change
+        # payload (see design decision in plan.json). Computed once per occurrence,
+        # ahead of the in-batch memoization check below, so both the HIT and MISS
+        # _write_and_confirm_marker call sites share the identical value.
+        deduped_against = (
+            _extract_deduped_against_uuids(flag)
+            if is_content_fingerprint_task_id(tid)
+            else None
+        )
+        if deduped_against and not flag.get('deduped_against'):
+            # Observability (task-2047 amendment): _DEDUPED_AGAINST_FLAG_FIELDS
+            # unions several undocumented alias fields alongside the canonical
+            # 'deduped_against' contract (prompts/stage1.py only instructs the
+            # LLM to emit the canonical field). When enrichment is sourced
+            # entirely from an alias — meaning the canonical field was absent
+            # or empty — log it so a false-positive enrichment (an alias that
+            # means something other than "duplicates", e.g. "all memories
+            # examined") is observable rather than silently trusted.
+            logger.info(
+                'flag_dedup: deduped_against enrichment for task_id %r flag_type %s'
+                ' sourced only from alias field(s), not the canonical'
+                ' "deduped_against" field — verify producer output shape',
+                tid, ftype,
+            )
         # In-batch signature memoization (task-1978): the SAME (task_id, flag_type)
         # signature can be emitted multiple times in ONE items_flagged list within a
         # single dedup_flags call (e.g. a task genuinely re-evaluated multiple times
@@ -943,6 +1073,7 @@ async def dedup_flags(
                     ' memory_ids gate failed —'
                     ' skipping prior deletion'
                 ),
+                deduped_against=deduped_against,
             )
 
             # (3) Delete ALL priors only if the new marker was confirmed FINDABLE
@@ -1027,6 +1158,7 @@ async def dedup_flags(
                     ' memory_ids gate failed —'
                     ' recurring flag will not be detected next cycle'
                 ),
+                deduped_against=deduped_against,
             )
         # Record this signature's resolved outcome (task-1978) so any later
         # same-signature occurrence in this call hits the in-batch memo branch
@@ -1283,6 +1415,27 @@ def _is_valid_marker_task_id(tid: str) -> bool:
     # Numeric / comma-joined branch (existing convention, unchanged).
     components = tid.split(',')
     return all(part.strip().isdigit() for part in components)
+
+
+def is_content_fingerprint_task_id(tid: str) -> bool:
+    """Return True iff *tid* is a canonical content-fingerprint marker key.
+
+    This is the fp:-ONLY gate: ``'fp:'`` followed by exactly
+    :data:`_CONTENT_FP_HEXLEN` (32) lowercase hex digits — the single shape
+    emitted by :func:`_content_fingerprint`.  Unlike
+    :func:`_is_valid_marker_task_id` (which ALSO accepts bare numeric and
+    comma-joined tids as valid marker keys), this helper rejects every shape
+    other than the canonical fp: key, including otherwise-valid numeric and
+    comma-joined marker keys.
+
+    Public (no leading underscore) because it is imported by
+    ``task_knowledge_sync`` (task-2047 Gap 2) to scope the cross-cycle
+    fingerprint-marker sweep to fp:-keyed markers only, leaving numeric
+    markers on the existing 14-day age-only GC.
+
+    Pure, sync, no I/O.
+    """
+    return bool(tid) and bool(_CONTENT_FP_RE.fullmatch(tid))
 
 
 def _content_fingerprint(description: str) -> str:

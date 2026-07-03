@@ -6277,6 +6277,176 @@ class TestSweepStaleFlagMarkers:
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) >= 1
 
+    # ----------------------------------------------------------------- #
+    # Cross-cycle fp: sweep (task-2047 Gap 2)
+    # ----------------------------------------------------------------- #
+
+    @pytest.mark.asyncio
+    async def test_fp_marker_predating_run_window_deleted_numeric_and_same_cycle_fp_kept(self):
+        """Cross-cycle fp: sweep (task-2047 Gap 2): an fp:-keyed marker whose
+        created_at predates run_window_start is swept even though it is far
+        younger than the 14-day age cutoff — "predates the current cycle" is
+        operationalized as created_at < run_window_start.
+
+        Scoped to fp: markers only: a NUMERIC marker with the identical stale
+        created_at is KEPT (numeric task_ids are resolvable anchors and their
+        task-1654 cross-cycle dedup must not regress).
+
+        An fp: marker created AFTER run_window_start (i.e. rewritten this
+        cycle by the dedup HIT path) is KEPT — this is what preserves
+        task-1654 dedup for actively-recurring findings within a cycle.
+        """
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
+            _sweep_stale_flag_markers,
+        )
+
+        run_window_start = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        fixed_now = run_window_start + timedelta(minutes=30)
+        fp_stale = _content_fingerprint('cross-cycle-stale-finding')
+        fp_fresh = _content_fingerprint('same-cycle-fresh-finding')
+        members = [
+            {
+                'id': 'fp-predates-cycle',
+                'created_at': (run_window_start - timedelta(minutes=5)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': fp_stale},
+            },
+            {
+                'id': 'fp-this-cycle',
+                'created_at': (run_window_start + timedelta(minutes=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': fp_fresh},
+            },
+            {
+                'id': 'numeric-predates-cycle',
+                'created_at': (run_window_start - timedelta(minutes=5)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '42'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_flag_markers(
+            memory_service, 'reify', run_id='r1',
+            now=fixed_now, run_window_start=run_window_start,
+        )
+
+        assert result == 1
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'fp-predates-cycle'}
+        for call in memory_service.delete_memory.call_args_list:
+            assert call.kwargs.get('_source') == _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE
+
+    @pytest.mark.asyncio
+    async def test_fp_marker_age_path_still_applies_with_run_window_start_set(self):
+        """The pre-existing 14-day age-GC path must remain intact for fp:
+        markers even when run_window_start is supplied — task-2047 Gap 2 adds
+        an OR'd predicate, it does not replace the existing age check."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        run_window_start = fixed_now - timedelta(minutes=10)
+        fp_old = _content_fingerprint('ancient-finding')
+        members = [
+            {
+                'id': 'fp-ancient',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': fp_old},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_flag_markers(
+            memory_service, 'reify', run_id='r1',
+            now=fixed_now, run_window_start=run_window_start,
+        )
+
+        assert result == 1
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'fp-ancient'}
+
+    @pytest.mark.asyncio
+    async def test_run_window_start_none_is_backward_compatible_age_only(self):
+        """When run_window_start is None (the default — e.g. assemble_payload
+        could not compute a journal started_at), an fp: marker that would be
+        swept by the cross-cycle predicate if a run window WERE supplied, but
+        is well within the 14-day age cutoff, must be KEPT — identical to the
+        pre-task-2047 age-only behavior (backward compatibility)."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        fp_recent = _content_fingerprint('recent-but-prior-cycle-finding')
+        members = [
+            {
+                'id': 'fp-recent-prior-cycle',
+                'created_at': (fixed_now - timedelta(minutes=30)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': fp_recent},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now, run_window_start=None,
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fp_marker_missing_or_unparseable_created_at_kept_with_run_window_start(self):
+        """An fp: marker with a missing or unparseable created_at must be KEPT
+        even when run_window_start is supplied — the existing missing/
+        unparseable created_at safety posture (never delete undatable markers)
+        must hold for the new cross-cycle predicate exactly as it does for the
+        age path."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        run_window_start = fixed_now - timedelta(minutes=10)
+        fp_a = _content_fingerprint('undatable-a')
+        fp_b = _content_fingerprint('undatable-b')
+        members = [
+            {
+                'id': 'fp-missing-created-at',
+                'created_at': None,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': fp_a},
+            },
+            {
+                'id': 'fp-unparseable-created-at',
+                'created_at': 'not-a-date',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': fp_b},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_flag_markers(
+            memory_service, 'reify', run_id='r1',
+            now=fixed_now, run_window_start=run_window_start,
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
 
 class TestComputeStaleFlags:
     """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
@@ -7226,7 +7396,117 @@ class TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat:
             )
 
         assert report.stats.get('stale_flag_markers_gc_swept') == 3
-        mock_sweep.assert_awaited_once_with(mock_deps['memory_service'], 'reify', 'test-run')
+        # BaseStage.run is fully mocked here (assemble_payload never executes), so
+        # self._run_window_start stays at its unset default — the sweep call must
+        # forward run_window_start=None (task-2047 step-12).
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run', run_window_start=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sweep_call_forwards_run_window_start_stashed_by_assemble_payload(self, mock_deps):
+        """run() forwards whatever run_window_start assemble_payload stashed on
+        self._run_window_start into the _sweep_stale_flag_markers call (task-2047
+        step-12). Since assemble_payload only executes inside the REAL
+        BaseStage.run(), the stash is simulated here via a BaseStage.run
+        replacement whose side effect mimics what assemble_payload does."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+        stashed_value = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+
+        async def _fake_super_run(*args, **kwargs):
+            # Simulates assemble_payload stashing run_window_start during the
+            # real BaseStage.run() -> assemble_payload() call chain.
+            stage._run_window_start = stashed_value
+            return base_report
+
+        with (
+            patch.object(BaseStage, 'run', new=_fake_super_run),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_stale_flag_markers',
+                new=AM(return_value=1),
+            ) as mock_sweep,
+        ):
+            await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run', run_window_start=stashed_value,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_window_start_reset_to_none_at_top_of_run_prevents_leak(self, mock_deps):
+        """A PRIOR run's stashed _run_window_start must not leak into a new
+        run() call whose (mocked) super().run() does not set a fresh value —
+        proves the reset-at-top-of-run() contract (task-2047 step-12)."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+        # Pre-seed a stale value as if left over from a PRIOR run() call.
+        stage._run_window_start = datetime(2020, 1, 1, tzinfo=UTC)
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_stale_flag_markers',
+                new=AM(return_value=0),
+            ) as mock_sweep,
+        ):
+            await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        # The mocked super().run() never touches _run_window_start, so the ONLY
+        # way the sweep call can see run_window_start=None (rather than the
+        # pre-seeded 2020 date) is if run() resets self._run_window_start = None
+        # BEFORE calling super().run().
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run', run_window_start=None,
+        )
 
     @pytest.mark.asyncio
     async def test_stale_flag_markers_gc_swept_stat_explicit_zero(self, mock_deps):
