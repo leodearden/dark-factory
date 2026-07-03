@@ -2373,3 +2373,128 @@ async def test_on_task_done_echo_suppressed_flag_in_journal_action(
     assert completion_rows[0]['detail'].get('echo_suppressed') is expected_suppressed, (
         f'Expected echo_suppressed={expected_suppressed}, got detail: {completion_rows[0]["detail"]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# First-done-transition provenance echo (task 2049)
+#
+# task_before is the PRE-transition snapshot: task_interceptor.py's
+# _apply_status_transition captures it BEFORE metadata.done_provenance is
+# persisted, so on a FIRST done-transition task_before never carries
+# provenance and no authoritative resolution memory exists yet either (task
+# 1984's guard correctly doesn't fire). Previously the fast-path echo fell
+# straight through to the raw, often pre-fix `description`. _on_task_done
+# must re-fetch the live task (self.taskmaster.get_task) to observe the
+# just-persisted done_provenance and prefer it.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'provenance, expected_contains',
+    [
+        pytest.param(
+            {'note': 'Refactored dispatch; added retry guard'},
+            ['Refactored dispatch; added retry guard'],
+            id='note_only',
+        ),
+        pytest.param(
+            {'kind': 'merged', 'commit': 'deadbeef123'},
+            ['deadbeef123'],
+            id='commit_only',
+        ),
+        pytest.param(
+            {'note': 'Added retry logic', 'commit': 'abc123'},
+            ['Added retry logic', 'abc123'],
+            id='note_and_commit',
+        ),
+    ],
+)
+async def test_on_task_done_first_transition_echoes_provenance_not_description(
+    reconciler, mock_memory_service, mock_taskmaster, provenance, expected_contains,
+):
+    """A FIRST done-transition has no authoritative memory yet, so before task
+    2049 the fast-path echo fell through to the raw, potentially stale
+    `description`. task_before here carries NO done_provenance (the
+    pre-transition snapshot); _on_task_done must re-fetch the live task to see
+    the just-landed done_provenance and prefer it over description/details."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '361', 'title': 'Autopilot task', 'status': 'done',
+        'metadata': {'done_provenance': provenance},
+    })
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE pre-fix bug statement',
+            'details': 'stale details',
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content') or ''
+    for substr in expected_contains:
+        assert substr in content, f'Expected {substr!r} in {content!r}'
+    assert 'STALE pre-fix bug statement' not in content, (
+        f'Expected the stale description NOT to appear, got: {content!r}'
+    )
+    assert 'stale details' not in content, (
+        f'Expected the stale details NOT to appear, got: {content!r}'
+    )
+
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_used_provenance') is True
+    assert metadata.get('source') == 'targeted_reconciliation'
+
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_authoritative_memory_wins_over_provenance(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """When an authoritative resolution/superseding memory already exists,
+    task 1984's title-only suppression must still win even though fresh
+    done_provenance is also available for the re-fetch: the provenance
+    preference (task 2049) only applies inside the existing `not
+    has_authoritative` branch, so there is no interaction regression between
+    the two features."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {'metadata': {'task_id': '361', 'supersedes': 'x'}},
+    ])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '361', 'title': 'Autopilot task', 'status': 'done',
+        'metadata': {'done_provenance': {'note': 'Should not appear'}},
+    })
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE pre-fix bug statement',
+            'details': 'stale details',
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content')
+    assert content == "Task 'Autopilot task' completed.", (
+        f'Expected title-only completion fact, got: {content!r}'
+    )
+
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_suppressed_stale_description') is True
+    assert 'echo_used_provenance' not in metadata, (
+        f'authoritative suppression must win over provenance preference, got metadata: {metadata}'
+    )
+
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
