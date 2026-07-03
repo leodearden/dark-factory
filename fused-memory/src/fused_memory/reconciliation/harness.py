@@ -1629,8 +1629,10 @@ class ReconciliationHarness:
                 tier = await self._select_tier(project_id)
                 iterator = BacklogIterator(self.config, self.journal, self.buffer, self)
                 heartbeat_task = asyncio.create_task(self._heartbeat_loop(project_id))
+                use_iterator = False
                 try:
-                    if await iterator.should_iterate(project_id):
+                    use_iterator = await iterator.should_iterate(project_id)
+                    if use_iterator:
                         # task 2040: symmetric outer bound with the else branch below.
                         # NOT redundant with the per-chunk wait_for(cycle_timeout_seconds)
                         # that already wraps run_full_cycle inside BacklogIterator.run —
@@ -1651,15 +1653,26 @@ class ReconciliationHarness:
                             timeout=self.config.cycle_timeout_seconds,
                         )
                 except TimeoutError:
+                    # task 2040: name the event for the branch that actually timed
+                    # out — conflating the two here previously meant an else-branch
+                    # (full cycle) timeout was logged as 'iteration_timed_out' and an
+                    # iterate-branch timeout was logged as "Full cycle timed out",
+                    # which misleads anyone grepping logs/metrics for either failure
+                    # mode.
+                    branch = 'iterate' if use_iterator else 'full_cycle'
                     logger.error(
-                        f'Full cycle timed out after '
+                        f'{"Backlog iteration" if use_iterator else "Full cycle"} '
+                        f'timed out after '
                         f'{self.config.cycle_timeout_seconds}s for {project_id}'
                     )
                     logger.error(
-                        'reconciliation.iteration_timed_out',
+                        'reconciliation.iteration_timed_out'
+                        if use_iterator
+                        else 'reconciliation.full_cycle_timed_out',
                         extra={
                             'project_id': project_id,
                             'timeout': self.config.cycle_timeout_seconds,
+                            'branch': branch,
                         },
                     )
                     await self.buffer.restore_drained(project_id)
