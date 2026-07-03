@@ -444,6 +444,53 @@ class TestDispatchErrorChokepoint:
 
         assert len(calls) == 0, 'CancelledError must never reach the chokepoint'
 
+    async def test_dispatch_error_with_abandoned_request_drops_silently(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """An abandoned/detached request (its Future already cancelled by
+        the waiter) that then hits a dispatch error must be dropped
+        silently by _resolve_or_drop_abandoned — no InvalidStateError from
+        calling set_result on an already-cancelled Future — while resource
+        release (worktree cleanup + speculation slot) still proceeds
+        normally, since release_resources is independent of the Future's
+        abandonment state.
+        """
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        req, item = await _make_real_merged_item(
+            git_ops, config, 'task/disp-abandoned', 'disp_abandoned.py', 'x = 1\n',
+            speculative=True,
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+        calls = _spy_on_resolve_and_release(worker)
+
+        async def _raising_dispatch(_item: Any) -> Any:
+            raise Exception('boom')
+
+        worker._dispatch_item = _raising_dispatch  # type: ignore[method-assign]
+
+        # Simulate the waiter detaching before the dispatch error fires.
+        assert req.result.cancel()
+        depth0 = worker._speculation_slot._value
+
+        await _drive_verifier_loop_fill(worker, item)
+
+        assert len(calls) == 1, (
+            f'Expected exactly one _resolve_and_release call, got {len(calls)}'
+        )
+        assert req.result.cancelled(), (
+            'abandoned Future must remain cancelled, not overwritten '
+            '(no InvalidStateError from set_result on a cancelled Future)'
+        )
+        assert worker._speculation_slot._value == depth0 + 1, (
+            'resource release must still proceed for an abandoned waiter (no leak)'
+        )
+        assert item.merge_wt is not None and not item.merge_wt.exists(), (
+            'merge worktree must still be cleaned up for an abandoned waiter'
+        )
+        assert item.merge_wt not in worker._owned_merge_worktrees
+        assert worker._n_failed is True
+
 
 # ---------------------------------------------------------------------------
 # step-5 RED / step-6 GREEN: PASSTHROUGH-FINALIZE path (fill-loop ~7144 +
@@ -537,6 +584,44 @@ class TestPassthroughFinalizeErrorChokepoint:
             'the chokepoint must perform NO release when release_resources=False '
             '— the raising _finalize_inflight stub never ran its real finally'
         )
+
+    @pytest.mark.parametrize(
+        'driver', [_drive_verifier_loop_fill, _drive_verifier_loop_blocking_get],
+        ids=['fill', 'blocking_get'],
+    )
+    async def test_passthrough_finalize_cancelled_error_propagates_and_skips_chokepoint(
+        self, git_ops: GitOps, git_repo: Path, config: OrchestratorConfig, driver: Any,
+    ) -> None:
+        """CancelledError from _finalize_inflight (passthrough path) must
+        propagate out of _verifier_loop untouched; the chokepoint must
+        never see it.  Mirrors TestDispatchErrorChokepoint
+        .test_dispatch_cancelled_error_propagates_and_skips_chokepoint for
+        the passthrough-finalize except-clause ordering (``except
+        (CancelledError, KeyboardInterrupt): raise`` ahead of ``except
+        BaseException``) on both the fill-loop and blocking-get sites.
+        """
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        req = _make_request(
+            f'pt-cancel-{driver.__name__}', f'task/pt-cancel-{driver.__name__}',
+            git_repo, config,
+        )
+        item, entry = _make_decided_item_and_entry(req, was_speculative=True)
+        calls = _spy_on_resolve_and_release(worker)
+
+        async def _passthrough_dispatch(_item: Any) -> Any:
+            return entry
+
+        async def _cancelling_finalize(_entry: Any) -> Any:
+            raise asyncio.CancelledError()
+
+        worker._dispatch_item = _passthrough_dispatch  # type: ignore[method-assign]
+        worker._finalize_inflight = _cancelling_finalize  # type: ignore[method-assign]
+
+        with pytest.raises(asyncio.CancelledError):
+            await driver(worker, item)
+
+        assert len(calls) == 0, 'CancelledError must never reach the chokepoint'
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +732,67 @@ class TestFinalizeHeadErrorChokepoint:
         # returns cleanly (no exception propagated out of _verifier_loop, or
         # _drive_verifier_loop_fill's asyncio.wait_for would have raised).
         assert not worker._inflight
+
+    async def test_finalize_head_cancelled_error_propagates_and_skips_chokepoint(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """CancelledError from _finalize_inflight while finalizing the
+        _inflight head must propagate out of _verifier_loop untouched; the
+        chokepoint must never see it.  Mirrors TestDispatchErrorChokepoint
+        .test_dispatch_cancelled_error_propagates_and_skips_chokepoint for
+        the finalize-head except-clause ordering.
+        """
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _req, item = await _make_real_merged_item(
+            git_ops, config, 'task/fh-head-cancel', 'fh_head_cancel.py', 'x = 1\n',
+            speculative=True,
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        async def _noop() -> None:
+            return None
+
+        verify_task = asyncio.ensure_future(_noop())
+        await verify_task  # dummy completed/awaitable task, per the plan
+
+        entry = InflightEntry(
+            item=item,
+            lease=MagicMock(),
+            verify_task=verify_task,
+            merge_wt=item.merge_wt,
+            was_speculative=True,
+            phase='finalizing',
+        )
+
+        async def _dispatch_returns_entry(_item: Any) -> Any:
+            return entry
+
+        async def _cancelling_finalize(_entry: Any) -> Any:
+            raise asyncio.CancelledError()
+
+        worker._dispatch_item = _dispatch_returns_entry  # type: ignore[method-assign]
+        worker._finalize_inflight = _cancelling_finalize  # type: ignore[method-assign]
+
+        class _StubAllocator:
+            """free_host_count()==0 so DISPATCH-FILL proceeds straight to
+            FINALIZE-HEAD, mirroring the sibling fault-injection test.
+            """
+
+            @staticmethod
+            def free_host_count() -> int:
+                return 0
+
+        worker._ensure_host_allocator = (  # type: ignore[method-assign]
+            lambda _config: _StubAllocator()
+        )
+
+        calls = _spy_on_resolve_and_release(worker)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _drive_verifier_loop_fill(worker, item)
+
+        assert len(calls) == 0, 'CancelledError must never reach the chokepoint'
 
 
 # ---------------------------------------------------------------------------
