@@ -808,6 +808,14 @@ async def dedup_flags(
     is used instead.  Downstream consumers (Stage 2 prompt, observability
     dashboards) can grep for ``'unknown'`` to detect malformed markers.
 
+    Deduped-against enrichment (task-2047 Gap 1): for ``fp:``-keyed markers
+    ONLY (per :func:`is_content_fingerprint_task_id`), the resolvable memory
+    UUID(s) the flag cites as duplicates are extracted via
+    :func:`_extract_deduped_against_uuids` and threaded into both the HIT and
+    MISS ``_write_and_confirm_marker`` calls as ``deduped_against``.  Numeric
+    and comma-joined markers always pass ``None`` — they are already
+    resolvable anchors and their payload is unchanged.
+
     Returns the (possibly annotated) flag list.
     """
     # --- Authoritative suppression gate (task-1186) ---
@@ -943,6 +951,16 @@ async def dedup_flags(
             )
             result.append(flag)
             continue
+        # Gap-1 enrichment (task-2047): scoped to fp:-keyed markers only — numeric
+        # and comma-joined tids are already resolvable anchors and must not change
+        # payload (see design decision in plan.json). Computed once per occurrence,
+        # ahead of the in-batch memoization check below, so both the HIT and MISS
+        # _write_and_confirm_marker call sites share the identical value.
+        deduped_against = (
+            _extract_deduped_against_uuids(flag)
+            if is_content_fingerprint_task_id(tid)
+            else None
+        )
         # In-batch signature memoization (task-1978): the SAME (task_id, flag_type)
         # signature can be emitted multiple times in ONE items_flagged list within a
         # single dedup_flags call (e.g. a task genuinely re-evaluated multiple times
@@ -1026,6 +1044,7 @@ async def dedup_flags(
                     ' memory_ids gate failed —'
                     ' skipping prior deletion'
                 ),
+                deduped_against=deduped_against,
             )
 
             # (3) Delete ALL priors only if the new marker was confirmed FINDABLE
@@ -1110,6 +1129,7 @@ async def dedup_flags(
                     ' memory_ids gate failed —'
                     ' recurring flag will not be detected next cycle'
                 ),
+                deduped_against=deduped_against,
             )
         # Record this signature's resolved outcome (task-1978) so any later
         # same-signature occurrence in this call hits the in-batch memo branch
