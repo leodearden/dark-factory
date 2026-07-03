@@ -5277,6 +5277,56 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ),
         }
 
+    def _check_request_liveness(self, now: float, *, threshold_s: float | None = None) -> None:
+        """Sweep the request-liveness ledger and alarm on any entry stuck past threshold.
+
+        Synchronous and clock-injectable (``now``/``threshold_s``) — mirrors
+        :meth:`_maybe_log_queue_heartbeat`'s clock-injection convention so
+        tests can drive the stuck boundary deterministically without real
+        time.
+
+        MQ-invariants eta (task 1992): OBSERVATION + ESCALATION ONLY (PRD
+        design decision 4) — never resolves a Future, never mutates
+        ``_queue``/``_inflight``, never halts the pipeline.  See
+        ``merge_request_ledger.py``'s module docstring for the ledger
+        lifecycle this sweeps, and
+        :func:`orchestrator.merge_request_ledger._alarm_merge_request_stuck`
+        for the dedup'd-escalation contract.
+
+        ``threshold_s`` defaults to ``None``, resolved in-body to 1.5 ×
+        :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` (~4.5h — comfortably
+        past the cold-verify ceiling, so anything still unresolved past it is
+        definitively stuck).  Resolved via the same deferred reach-back
+        import used throughout ``merge_liveness.py`` so a test's
+        string-path monkeypatch of
+        ``orchestrator.merge_queue.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``
+        stays effective.
+        """
+        if threshold_s is None:
+            from orchestrator.merge_queue import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+
+            threshold_s = 1.5 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+
+        stuck_list = self._request_ledger.stuck_entries(now, threshold_s)
+        if not stuck_list:
+            return
+
+        phase_by_request_id = {
+            entry['request_id']: entry['state'] for entry in self.snapshot()['entries']
+        }
+
+        for stuck in stuck_list:
+            phase = phase_by_request_id.get(stuck.request_id, 'unowned')
+            stuck = dataclasses.replace(stuck, phase=phase)
+            logger.warning(
+                'merge request stuck: request_id=%s task=%s branch=%s age=%.0fs '
+                'phase=%s — dequeued but never resolved (silent-hang failure mode)',
+                stuck.request_id, stuck.task_id, stuck.branch, stuck.age_secs, stuck.phase,
+            )
+            _alarm_merge_request_stuck(
+                self._escalation_queue, stuck, event_store=self._event_store,
+            )
+
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
         """Emit a queue-depth heartbeat log line and event if conditions are met.
 
