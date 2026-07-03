@@ -73,6 +73,34 @@ def test_merge_drift_logger_name_is_merge_queue() -> None:
 
 
 @pytest.mark.asyncio
+async def test_maybe_run_drift_check_guards_against_non_positive_every_n() -> None:
+    """0 or negative verify_drift_check_every_n_lands must degrade to a no-op.
+
+    ``OrchestratorConfig`` enforces ``ge=1`` at construction (see
+    test_config.py::test_orchestrator_config_verify_drift_check_every_n_lands_rejects_zero),
+    but ``req.config`` is frequently a ``MagicMock``/hand-built stand-in in
+    tests (as elsewhere in this file), so the function itself must not rely
+    solely on that upstream validation — a 0-or-negative value must not raise
+    ``ZeroDivisionError`` via ``worker._drift_land_count % every_n``.
+    """
+    from orchestrator.merge_drift import _maybe_run_drift_check
+
+    git_ops = MagicMock()
+    req = MagicMock()
+    req.config.enabled_verify_runners = ['laptop']
+    req.config.verify_drift_check_every_n_lands = 0
+
+    worker = MagicMock()
+    worker._drift_land_count = 0
+    worker._drift_check_tasks = set()
+
+    await _maybe_run_drift_check(worker, git_ops, req, 'commit-sha')
+
+    assert worker._drift_land_count == 0, 'land count must not advance on the disabled path'
+    assert len(worker._drift_check_tasks) == 0, 'no drift-check task should be scheduled'
+
+
+@pytest.mark.asyncio
 class TestReachBackRouting:
     """Reach-back / string-path monkeypatch routing contract.
 

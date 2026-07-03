@@ -231,7 +231,10 @@ async def _maybe_run_drift_check(
     otherwise is a no-op.
 
     Cadence: every ``config.verify_drift_check_every_n_lands`` successful lands.
-    No-op when ``config.enabled_verify_runners`` is empty (Lever C off).
+    No-op when ``config.enabled_verify_runners`` is empty (Lever C off) or when
+    ``verify_drift_check_every_n_lands`` is 0 or negative (guards against
+    ``ZeroDivisionError`` for a mocked/hand-built config that bypasses
+    ``OrchestratorConfig``'s ``ge=1`` field validation).
 
     State is tracked in worker-level attrs ``_drift_land_count`` (incremented
     here) and ``_runner_quarantine`` (propagated from :func:`_run_drift_check`).
@@ -253,6 +256,14 @@ async def _maybe_run_drift_check(
     if not req.config.enabled_verify_runners:
         return
     every_n = req.config.verify_drift_check_every_n_lands
+    if every_n <= 0:
+        # OrchestratorConfig enforces ge=1 at construction, but req.config is
+        # frequently a MagicMock/hand-built stand-in in tests (and could in
+        # principle be mutated post-construction) — guard here too so a
+        # misconfigured/mocked 0-or-negative value degrades to "disabled"
+        # instead of raising ZeroDivisionError on every land.  Mirrors the
+        # every_n > 0 guard in _safety_valve_due (merge_liveness.py).
+        return
     worker._drift_land_count += 1
     if worker._drift_land_count % every_n == 0:
         _coro = _run_drift_check(
