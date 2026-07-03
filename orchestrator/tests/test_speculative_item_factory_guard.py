@@ -41,9 +41,62 @@ _BACKUP_GLOBS = ('*.tmp.*', '*.py.tmp.*', '*.orig', '*.rej', '*.bak', '*.swp', '
 # ``dataclasses.replace(item, base_sha=...)`` and do not construct at all.
 # Bump a count (or add a file) ONLY for a genuine new factory site — never to
 # silence a hand-rebuild that should be ``dataclasses.replace`` instead.
+#
+# Deliberately a per-file *count*, not just a set of filenames: every
+# whitelisted site already lives in this one file, so a bare set-of-files
+# check would be permanently satisfied and blind to a new construction
+# landing in that same file — including a reintroduced hand-rebuild at one
+# of the two former CAS sites, which is exactly the task-1928 failure mode
+# this guard exists to catch. ``SpeculativeItem.__post_init__`` (I2)
+# validates *shape* but not *provenance*: a hand-rebuild can drop a field
+# that isn't part of any I2 invariant (e.g. counts_against_cap) while still
+# producing a shape-valid item, so it would sail through __post_init__
+# undetected. The count is what makes that rebuild visible; it is expected
+# to require a deliberate bump for genuine new sites, not something to
+# relax away.
 _EXPECTED_FACTORY_SITES = {
     'orchestrator/src/orchestrator/merge_queue.py': 15,
 }
+
+
+def _strip_line_comment(code: str) -> str:
+    """Return ``code`` with a trailing ``#`` comment removed.
+
+    Tracks single/double-quote state so a ``#`` inside a string literal
+    (e.g. an f-string log message built before a real call on the same
+    line) is not mistaken for a comment marker — unlike a naive
+    ``code.split('#', 1)[0]``, which would truncate at that in-string ``#``
+    and silently drop a real construction from the inventory.
+    """
+    quote: str | None = None
+    for i, ch in enumerate(code):
+        if quote is not None:
+            if ch == quote and code[i - 1] != '\\':
+                quote = None
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch == '#':
+            return code[:i]
+    return code
+
+
+def test_strip_line_comment_handles_hash_inside_string_literal() -> None:
+    """Regression for the naive ``code.split('#', 1)[0]`` heuristic this
+    replaced: a ``#`` inside a string literal must not truncate the line
+    before a real construction later on it (that heuristic would have
+    silently dropped the construction from the inventory)."""
+    line = 'logger.info("issue #42"); x = SpeculativeItem(request=req)  # spec-factory'
+    stripped = _strip_line_comment(line)
+    assert 'SpeculativeItem(' in stripped
+    assert '# spec-factory' not in stripped
+
+
+def test_strip_line_comment_strips_plain_trailing_comment() -> None:
+    assert _strip_line_comment('foo()  # a comment') == 'foo()  '
+
+
+def test_strip_line_comment_passthrough_when_no_comment() -> None:
+    assert _strip_line_comment('foo(bar, baz)') == 'foo(bar, baz)'
 
 
 def _real_construction_hits(repo_root: Path) -> list[str]:
@@ -72,7 +125,7 @@ def _real_construction_hits(repo_root: Path) -> list[str]:
         # Drop pure-comment mentions: keep only hits where the construction
         # token precedes any '#'. Production constructor lines have no '#'
         # before the call; a comment like "# build a SpeculativeItem(...)" does.
-        code_before_comment = code.split('#', 1)[0]
+        code_before_comment = _strip_line_comment(code)
         if 'SpeculativeItem(' in code_before_comment:
             hits.append(f'{path}:{lineno}:{code.strip()}')
     return hits
