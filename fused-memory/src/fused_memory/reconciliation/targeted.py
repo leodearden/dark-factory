@@ -22,6 +22,11 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.task_filter import (
+    ACTIVE_TASK_STATUSES,
+    extract_batch_plan_task_ids,
+    is_batch_plan_framing,
+)
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
@@ -245,6 +250,83 @@ class TargetedReconciler:
             logger.error(f'Targeted reconciliation failed: {e}')
             return {'error': str(e), 'task_id': task_id}
 
+    async def _should_withhold_batch_promotion(
+        self,
+        ep_uuid: str,
+        project_id: str,
+        project_root: str,
+        statuses_cache: dict,
+    ) -> bool:
+        """Return True when ep_uuid is a batch-plan episode with a still-active sibling.
+
+        Fetches the episode's original content and, when it matches the
+        is_batch_plan_framing batch-plan shape (task 2022 — e.g. "Merge-queue
+        ... queued together as df 1985-2002"), extracts its enumerated task ids
+        (extract_batch_plan_task_ids) and withholds promotion (returns True)
+        while ANY of them is still in ACTIVE_TASK_STATUSES. Without this gate,
+        completing any ONE enumerated sibling would promote the whole episode
+        and re-surface every other still-aspirational sibling's edges into
+        default factual search (task 2033).
+
+        Non-batch / non-string content promotes exactly as before this task
+        (returns False) — the common path, and also what a content-fetch
+        failure degrades to (fail-open: a transient Graphiti hiccup must not
+        regress ordinary per-task promotion).
+
+        statuses_cache is a plain dict used as a lazy, promotion-block-scoped
+        cache (populated with key 'statuses' -> {...} | None on first use, empty
+        before): the taskmaster status fetch happens at most once per
+        _on_task_done call, shared across every candidate episode evaluated in
+        that call, and is skipped entirely when no candidate is batch-shaped.
+        A fetch failure OR a non-dict/malformed response both cache None, which
+        conservatively withholds every confirmed-batch candidate for the rest of
+        this block — self-healing, since promotion re-runs on the next related
+        task-done transition. (The malformed-response case is deliberately
+        treated the same as an exception rather than coerced to {}: silently
+        coercing to {} would make every enumerated id look "absent" — and
+        therefore non-blocking — which fails open exactly when we don't actually
+        know the statuses.)
+        """
+        try:
+            content = await self.memory.get_episode_content(ep_uuid, project_id)
+        except Exception as e:
+            logger.warning(f'get_episode_content failed for planned episode {ep_uuid}: {e}')
+            content = None
+
+        if not (isinstance(content, str) and is_batch_plan_framing(content)):
+            return False
+
+        batch_ids = extract_batch_plan_task_ids(content)
+        if not batch_ids:
+            return False
+
+        if 'statuses' not in statuses_cache:
+            try:
+                raw = await self.taskmaster.get_statuses(project_root=project_root)
+                if isinstance(raw, dict):
+                    statuses_cache['statuses'] = raw
+                else:
+                    logger.warning(
+                        f'get_statuses returned non-dict ({type(raw).__name__}) while '
+                        f'gating batch-plan promotion for episode {ep_uuid}; treating as '
+                        f'unknown and withholding (conservative)'
+                    )
+                    statuses_cache['statuses'] = None
+            except Exception as e:
+                logger.warning(
+                    f'get_statuses failed while gating batch-plan promotion for '
+                    f'episode {ep_uuid}: {e}; withholding (conservative)'
+                )
+                statuses_cache['statuses'] = None
+
+        statuses = statuses_cache['statuses']
+        if statuses is None:
+            # Confirmed batch-plan episode but status fetch failed this cycle —
+            # withhold conservatively rather than risk promoting a still-active batch.
+            return True
+
+        return any(statuses.get(str(t)) in ACTIVE_TASK_STATUSES for t in batch_ids)
+
     async def _on_task_done(
         self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
     ) -> dict:
@@ -338,6 +420,21 @@ class TargetedReconciler:
         # 1.5. Promote planned episodes related to this completed task.
         #      Now that the task is done, aspirational edges become factual —
         #      remove them from the planned registry so they appear in normal search.
+        #      Exception (task 2033): a batch-plan episode is withheld while any of
+        #      its enumerated sibling tasks is still active — otherwise completing
+        #      ANY ONE sibling would promote the whole episode and re-surface every
+        #      other still-aspirational sibling's edges into default search. See
+        #      _should_withhold_batch_promotion.
+        #
+        #      Known limitation (search-recall dependency): a withheld batch episode
+        #      is only re-evaluated on a task-done event whose title+description
+        #      semantically surface it in the bounded `planned_related` search just
+        #      below. If the last sibling to go terminal doesn't search-match the
+        #      episode, the now-all-terminal episode isn't re-checked by that event
+        #      and stays withheld until some later, differently-worded task-done
+        #      event happens to match it — there is no periodic/fallback sweep that
+        #      re-evaluates lingering withheld episodes independent of search
+        #      recall. Acceptable for this task's scope; flagged as a follow-up.
         if self.planned_episode_registry is not None:
             try:
                 planned_related = await self.memory.search(
@@ -353,16 +450,43 @@ class TargetedReconciler:
                     if r.metadata.get('planned')
                     for ep in r.provenance
                 }
+                statuses_cache: dict = {}
+                promoted_count = 0
+                withheld_count = 0
+                # One get_episode_content round-trip per candidate episode below —
+                # an N+1-style pattern where the reconciliation hot path previously
+                # did zero content fetches. Bounded by the limit=10 planned search
+                # above (ep_uuids can exceed 10 since provenance is flattened across
+                # results, but stays small in practice); accepted for correctness,
+                # not batched/short-circuited further since most task-done events
+                # have zero batch-plan candidates and the taskmaster status fetch
+                # is already cached once per block via statuses_cache.
                 for ep_uuid in ep_uuids:
+                    if await self._should_withhold_batch_promotion(
+                        ep_uuid, project_id, project_root, statuses_cache
+                    ):
+                        withheld_count += 1
+                        continue
                     await self.planned_episode_registry.promote(ep_uuid)
-                if ep_uuids:
+                    promoted_count += 1
+                if promoted_count:
                     result['actions'].append({
                         'type': 'planned_episodes_promoted',
-                        'count': len(ep_uuids),
+                        'count': promoted_count,
                     })
                     await self.journal.add_run_action(
                         run_id, 'write', 'registry', 'promote',
-                        {'task_id': task_id, 'promoted_count': len(ep_uuids)},
+                        {'task_id': task_id, 'promoted_count': promoted_count},
+                        causation_id=run_id,
+                    )
+                if withheld_count:
+                    result['actions'].append({
+                        'type': 'planned_episodes_withheld',
+                        'count': withheld_count,
+                    })
+                    await self.journal.add_run_action(
+                        run_id, 'write', 'registry', 'withhold',
+                        {'task_id': task_id, 'withheld_count': withheld_count},
                         causation_id=run_id,
                     )
             except Exception as e:

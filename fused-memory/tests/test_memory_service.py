@@ -1544,6 +1544,41 @@ class TestGetEpisodes:
         )
 
 
+class TestGetEpisodeContent:
+    """Tests for MemoryService.get_episode_content() (task 2033).
+
+    Thin passthrough to graphiti.get_episode_by_uuid that extracts just the
+    episode's content string. Backs the reconciliation promotion-time
+    batch-plan gate, which needs the original episode text (not just edge
+    fact text, which is all MemoryResult carries) to run
+    is_batch_plan_framing on.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_episode_content_string(self, service):
+        service.graphiti.get_episode_by_uuid = AsyncMock(
+            return_value=types.SimpleNamespace(
+                content='Merge-queue batch queued as df 1985-2002'
+            )
+        )
+
+        result = await service.get_episode_content('ep-x', 'proj')
+
+        assert result == 'Merge-queue batch queued as df 1985-2002'
+        service.graphiti.get_episode_by_uuid.assert_awaited_once_with(
+            'ep-x', group_id='proj'
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_episode_returns_none(self, service):
+        """When graphiti returns None (episode not found), return None rather than raising."""
+        service.graphiti.get_episode_by_uuid = AsyncMock(return_value=None)
+
+        result = await service.get_episode_content('ep-missing', 'proj')
+
+        assert result is None
+
+
 class TestGetEntity:
     # ------------------------------------------------------------------
     # baseline success regression test

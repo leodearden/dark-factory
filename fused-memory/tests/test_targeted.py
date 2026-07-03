@@ -697,6 +697,253 @@ class TestPlannedEpisodePromotion:
         assert 'error' not in result
 
 
+class TestBatchPlanPromotionGate:
+    """task 2033: _on_task_done withholds promotion of a batch-plan episode
+    (per is_batch_plan_framing, task 2022) while any of its enumerated
+    sibling task ids is still active, and promotes it once every enumerated
+    sibling is terminal (done/cancelled). Non-batch episodes are unaffected —
+    they promote exactly as TestPlannedEpisodePromotion already covers.
+    """
+
+    @pytest.fixture
+    def reconciler_with_registry(self, reconciler):
+        """Reconciler with a mocked planned_episode_registry (same pattern as
+        TestPlannedEpisodePromotion.reconciler_with_registry)."""
+        from unittest.mock import AsyncMock, MagicMock
+        mock_registry = MagicMock()
+        mock_registry.promote = AsyncMock()
+        reconciler.planned_episode_registry = mock_registry
+        return reconciler
+
+    @pytest.mark.asyncio
+    async def test_withhold_when_sibling_still_active(
+        self, reconciler_with_registry, mock_memory_service, mock_taskmaster
+    ):
+        """A batch-plan episode is withheld from promotion while ANY enumerated
+        sibling task (1986..2002) is still active, even though sibling 1985
+        (the one that just completed) is done."""
+        batch_ep_uuid = 'batch-ep-1985-2002'
+        planned_result = MemoryResult(
+            id='edge-planned-batch',
+            content='Merge-queue batch queued together as df 1985-2002',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=[batch_ep_uuid],
+            metadata={'planned': True},
+        )
+
+        # First search call (exclude planned) returns []; second (include_planned=True)
+        # returns the planned batch edge — same two-phase pattern as
+        # TestPlannedEpisodePromotion.
+        call_results = [[], [planned_result]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            return call_results[idx] if idx < len(call_results) else []
+
+        mock_memory_service.search = mock_search
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value='Merge-queue batch queued together as df 1985-2002'
+        )
+        statuses = {'1985': 'done'}
+        for tid in range(1986, 2003):
+            statuses[str(tid)] = 'pending'
+        mock_taskmaster.get_statuses = AsyncMock(return_value=statuses)
+
+        result = await reconciler_with_registry.reconcile_task(
+            task_id='1985', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1985', 'title': 'Merge-queue modularization', 'status': 'in-progress'},
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_not_called()
+        assert any(a.get('type') == 'planned_episodes_withheld' for a in result.get('actions', [])), (
+            f'Expected a planned_episodes_withheld action while siblings 1986-2002 are '
+            f'still active, got actions={result.get("actions")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_promote_when_all_siblings_terminal(
+        self, reconciler_with_registry, mock_memory_service, mock_taskmaster
+    ):
+        """Once every enumerated sibling is terminal (done, with one cancelled mixed
+        in), the batch-plan episode promotes exactly like a non-batch episode."""
+        batch_ep_uuid = 'batch-ep-1985-2002'
+        planned_result = MemoryResult(
+            id='edge-planned-batch',
+            content='Merge-queue batch queued together as df 1985-2002',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=[batch_ep_uuid],
+            metadata={'planned': True},
+        )
+
+        call_results = [[], [planned_result]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            return call_results[idx] if idx < len(call_results) else []
+
+        mock_memory_service.search = mock_search
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value='Merge-queue batch queued together as df 1985-2002'
+        )
+        statuses = {str(tid): 'done' for tid in range(1985, 2003)}
+        statuses['1990'] = 'cancelled'  # mixed-terminal — still not active
+        mock_taskmaster.get_statuses = AsyncMock(return_value=statuses)
+
+        result = await reconciler_with_registry.reconcile_task(
+            task_id='2002', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '2002', 'title': 'Merge-queue modularization', 'status': 'in-progress'},
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_called_once_with(
+            batch_ep_uuid
+        )
+        assert not any(a.get('type') == 'planned_episodes_withheld' for a in result.get('actions', [])), (
+            f'Did not expect a planned_episodes_withheld action once all siblings are '
+            f'terminal, got actions={result.get("actions")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_batch_content_promotes_without_status_fetch(
+        self, reconciler_with_registry, mock_memory_service, mock_taskmaster
+    ):
+        """Non-batch episode content promotes exactly as before the gate, and the
+        status fetch (taskmaster.get_statuses) is never triggered for it — this is
+        the regression guard for TestPlannedEpisodePromotion's existing coverage."""
+        ep_uuid = 'plan-ep-abc'
+        planned_result = MemoryResult(
+            id='edge-planned-1',
+            content='PRD: CostStore extends AgentResult',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=[ep_uuid],
+            metadata={'planned': True},
+        )
+
+        call_results = [[], [planned_result]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            return call_results[idx] if idx < len(call_results) else []
+
+        mock_memory_service.search = mock_search
+        mock_memory_service.get_episode_content = AsyncMock(return_value='Implemented CostStore')
+        mock_taskmaster.get_statuses = AsyncMock(return_value={})
+
+        result = await reconciler_with_registry.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1', 'title': 'CostStore', 'status': 'in-progress'},
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_called_once_with(ep_uuid)
+        mock_taskmaster.get_statuses.assert_not_awaited()
+        assert not any(a.get('type') == 'planned_episodes_withheld' for a in result.get('actions', [])), (
+            f'Non-batch content must never withhold, got actions={result.get("actions")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_content_fetch_failure_fails_open_and_promotes(
+        self, reconciler_with_registry, mock_memory_service, mock_taskmaster
+    ):
+        """A get_episode_content failure degrades to content=None, which is
+        indistinguishable from non-batch content — the episode promotes exactly
+        like the pre-2033 common path (fail-open), and get_statuses is never
+        reached since batch-shape was never confirmed."""
+        ep_uuid = 'plan-ep-transient-failure'
+        planned_result = MemoryResult(
+            id='edge-planned-transient',
+            content='PRD: some future feature',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=[ep_uuid],
+            metadata={'planned': True},
+        )
+
+        call_results = [[], [planned_result]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            return call_results[idx] if idx < len(call_results) else []
+
+        mock_memory_service.search = mock_search
+        mock_memory_service.get_episode_content = AsyncMock(
+            side_effect=RuntimeError('Graphiti timeout')
+        )
+
+        result = await reconciler_with_registry.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1', 'title': 'Some feature', 'status': 'in-progress'},
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_called_once_with(ep_uuid)
+        mock_taskmaster.get_statuses.assert_not_awaited()
+        assert not any(a.get('type') == 'planned_episodes_withheld' for a in result.get('actions', [])), (
+            f'Content-fetch failure must fail open (promote), got actions={result.get("actions")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_status_fetch_failure_fails_conservative_and_withholds(
+        self, reconciler_with_registry, mock_memory_service, mock_taskmaster
+    ):
+        """Once an episode is confirmed batch-shaped, a get_statuses failure caches
+        None and withholds conservatively — the opposite fail direction from a
+        content-fetch failure, since here we know the episode is batch-plan-shaped
+        but cannot determine whether its siblings are terminal."""
+        batch_ep_uuid = 'batch-ep-1985-2002'
+        planned_result = MemoryResult(
+            id='edge-planned-batch',
+            content='Merge-queue batch queued together as df 1985-2002',
+            category=None,
+            source_store=SourceStore.graphiti,
+            relevance_score=0.9,
+            provenance=[batch_ep_uuid],
+            metadata={'planned': True},
+        )
+
+        call_results = [[], [planned_result]]
+        call_index = {'n': 0}
+
+        async def mock_search(**kwargs):
+            idx = call_index['n']
+            call_index['n'] += 1
+            return call_results[idx] if idx < len(call_results) else []
+
+        mock_memory_service.search = mock_search
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value='Merge-queue batch queued together as df 1985-2002'
+        )
+        mock_taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('taskmaster unavailable'))
+
+        result = await reconciler_with_registry.reconcile_task(
+            task_id='1985', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1985', 'title': 'Merge-queue modularization', 'status': 'in-progress'},
+        )
+
+        reconciler_with_registry.planned_episode_registry.promote.assert_not_called()
+        assert any(a.get('type') == 'planned_episodes_withheld' for a in result.get('actions', [])), (
+            f'get_statuses failure on a confirmed batch episode must withhold '
+            f'conservatively, got actions={result.get("actions")!r}'
+        )
+
+
 # ── task-1136: route _on_task_blocked metadata write through TaskInterceptor ──
 
 
