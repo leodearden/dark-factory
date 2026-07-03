@@ -164,6 +164,52 @@ def is_batch_plan_framing(text: str) -> bool:
     return len(TASK_ID_TOKEN_RE.findall(text)) >= 3
 
 
+# Degenerate-input guard for extract_batch_plan_task_ids: a mis-detected or
+# malformed range (e.g. '10000000-99999999') would otherwise materialize a
+# multi-million-element set on the reconciliation promotion hot path (task
+# 2033). Real task-id batches span tens of ids, so this cap is comfortably
+# above any legitimate batch; a range wider than the cap contributes only its
+# two endpoints instead of the full inclusive span.
+_MAX_BATCH_RANGE_SPAN = 1000
+
+
+def extract_batch_plan_task_ids(text: str) -> set[int]:
+    """Extract the concrete set of enumerated task ids from batch-plan text.
+
+    Reuses the same TASK_ID_RANGE_RE / TASK_ID_TOKEN_RE regexes that
+    is_batch_plan_framing uses to detect the batch-plan shape, so extraction
+    and detection stay in lockstep. Intended to be called only after
+    is_batch_plan_framing(text) has already returned True for the same text
+    (task 2033's promotion-time gate: a batch-plan episode is withheld from
+    promotion while any id in this set is still active).
+
+    For each task-id range match (e.g. '1985-2002' or '1985 to 2002'), the
+    two endpoints are expanded to the full inclusive set of ids — UNLESS the
+    span exceeds _MAX_BATCH_RANGE_SPAN, in which case only the two endpoints
+    are added (see _MAX_BATCH_RANGE_SPAN docstring above). Every standalone
+    multi-digit token in the text (including ones inside a matched range) is
+    also added. Returns the union of both passes.
+
+    Pure: no I/O, no side effects.
+    """
+    ids: set[int] = set()
+
+    for match in TASK_ID_RANGE_RE.finditer(text):
+        lo_str, hi_str = TASK_ID_TOKEN_RE.findall(match.group(0))[:2]
+        lo, hi = int(lo_str), int(hi_str)
+        if lo > hi:
+            lo, hi = hi, lo
+        if hi - lo <= _MAX_BATCH_RANGE_SPAN:
+            ids.update(range(lo, hi + 1))
+        else:
+            ids.update({lo, hi})
+
+    for token in TASK_ID_TOKEN_RE.findall(text):
+        ids.add(int(token))
+
+    return ids
+
+
 # --------------------------------------------------------------------------- #
 # Status constants
 # --------------------------------------------------------------------------- #
