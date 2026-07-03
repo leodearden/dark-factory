@@ -42,7 +42,9 @@ cold claims, reap I2 composed with I1, and the cold (no-harness) fallback.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -55,7 +57,7 @@ from escalation.server import create_server
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import _run
 from orchestrator.harness import Harness
-from orchestrator.warm_lane_pool import LaneState
+from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 
 # ---------------------------------------------------------------------------
 # Repo fixture helpers — copied/adapted per codebase convention (NOT
@@ -79,7 +81,12 @@ async def _add_seed_script(repo: Path, *, exit_code: int = 0) -> None:
     """Commit a seed-warm-lane.sh stub into repo/scripts/.
 
     On exit_code == 0: creates ``<lane>/target/seeded.bin`` (orchestration-
-    observable seededness). On non-zero: exits with that code immediately
+    observable seededness) AND records the full received argv, one
+    positional arg per line, to ``<lane>/target/seed-argv.txt``. Recording
+    argv pins the actual invocation contract (``<base_target> <lane_dir>
+    <mode>`` — see ``GitOps._seed_warm_lane``) so a test can assert on the
+    mode flag the script received, not merely on the fact that *some* seed
+    ran and populated target/. On non-zero: exits with that code immediately
     (no target/ created) — models a faulting seed for the fail-soft case.
     """
     scripts_dir = repo / 'scripts'
@@ -90,6 +97,7 @@ async def _add_seed_script(repo: Path, *, exit_code: int = 0) -> None:
             '#!/usr/bin/env bash\n'
             'mkdir -p "$2/target"\n'
             'echo "seeded" > "$2/target/seeded.bin"\n'
+            'printf "%s\\n" "$@" > "$2/target/seed-argv.txt"\n'
         )
     else:
         seed.write_text(
@@ -185,6 +193,98 @@ async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Shared fixture + I1 snapshot/assert helpers — most scenarios below need the
+# SAME repo+harness+server+pool shape (committed seed stub,
+# max_concurrent_tasks=3 real FREE lanes). Extracted once here rather than
+# repeated per test class. Two scenarios deliberately build their own
+# repo/harness inline instead of using this fixture, because they are NOT
+# the shared shape: the fail-soft cold-claim case (no seed script committed)
+# and the no-harness cold-fallback case (no harness wired at all).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WarmGate:
+    """A repo + harness + server sharing one real GitOps/WarmLanePool."""
+
+    repo: Path
+    harness: Harness
+    server: Any
+    pool: WarmLanePool
+
+
+@pytest.fixture
+def warm_gate(tmp_path: Path) -> WarmGate:
+    """Build the shared WarmGate shape: committed seed stub, K=3 FREE lanes.
+
+    Uses ``asyncio.run`` for the async repo setup rather than an async
+    fixture, mirroring ``ig_git_repo`` in test_warm_lane_integration_gate.py
+    — this fixture itself runs synchronously, before pytest-asyncio's own
+    event loop for the (async) test function is created.
+    """
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_repo(repo))
+    asyncio.run(_add_seed_script(repo))
+    config = _make_config(repo, max_concurrent_tasks=3)
+    harness, server = _build_harness_and_server(config, tmp_path)
+    pool = harness.git_ops.warm_lane_pool
+    assert pool is not None, 'setup: warm_lane_pool must be enabled'
+    return WarmGate(repo=repo, harness=harness, server=server, pool=pool)
+
+
+def _free_count(pool: WarmLanePool) -> int:
+    return sum(1 for s in pool._lanes.values() if s == LaneState.FREE)
+
+
+@dataclass(frozen=True)
+class _I1Snapshot:
+    free: int
+    assignments: Any
+    dispatched: frozenset[str]
+
+
+def _snapshot_i1(gate: WarmGate) -> _I1Snapshot:
+    return _I1Snapshot(
+        free=_free_count(gate.pool),
+        assignments=gate.pool.assignments_snapshot(),
+        dispatched=frozenset(gate.harness.scheduler._dispatched),
+    )
+
+
+def _assert_i1_unchanged(gate: WarmGate, before: _I1Snapshot, *, where: str) -> None:
+    """Assert the WarmLanePool + scheduler dispatch capacity are unperturbed.
+
+    The FREE-count and assignments_snapshot() checks are the load-bearing
+    regression signal here: they run against the ONE real GitOps/WarmLanePool
+    instance the whole flow shares, so a genuine isolation leak (e.g. the
+    interactive path accidentally touching a _lane-* slot) would flip them.
+
+    The scheduler._dispatched check is comparatively weak as a regression
+    catcher — ``harness.scheduler`` is a MagicMock (see ``_build_harness``)
+    and the interactive claim/release/reap path structurally never
+    references the scheduler, so this equality cannot itself catch a real
+    production regression. It is asserted anyway, uniformly at every call
+    site (claim, release, AND reap), to document the PRD Contract's I1
+    corollary — "dispatch capacity is unperturbed" — consistently across
+    the whole gate rather than in some scenarios and not others.
+    """
+    free_now = _free_count(gate.pool)
+    assert free_now == before.free, (
+        f'I1 VIOLATION at {where}: FREE lane count changed '
+        f'(before={before.free}, after={free_now})'
+    )
+    assert gate.pool.assignments_snapshot() == before.assignments, (
+        f'I1 VIOLATION at {where}: assignments_snapshot() changed'
+    )
+    dispatched_now = frozenset(gate.harness.scheduler._dispatched)
+    assert dispatched_now == before.dispatched, (
+        f'I1 VIOLATION at {where}: scheduler._dispatched changed '
+        f'(before={set(before.dispatched)}, after={set(dispatched_now)})'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step-01/02: I1 isolation across claim→release THROUGH the β verbs, with a
 # real WarmLanePool + a seeded scheduler._dispatched set live on the harness.
 # ---------------------------------------------------------------------------
@@ -200,51 +300,30 @@ class TestIsolationInvariantI1:
     """
 
     async def test_pool_and_dispatch_capacity_unchanged_across_claim_release(
-        self, tmp_path: Path,
+        self, warm_gate: WarmGate,
     ) -> None:
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
-        await _add_seed_script(repo)
-        config = _make_config(repo, max_concurrent_tasks=3)
-        harness, server = _build_harness_and_server(config, tmp_path)
-        pool = harness.git_ops.warm_lane_pool
-        assert pool is not None, 'setup: warm_lane_pool must be enabled'
-
-        def _free_count() -> int:
-            return sum(1 for s in pool._lanes.values() if s == LaneState.FREE)
-
-        free_before = _free_count()
+        gate = warm_gate
+        free_before = _free_count(gate.pool)
         assert free_before == 3, f'setup: expected 3 FREE lanes, got {free_before}'
-        assignments_before = pool.assignments_snapshot()
-        dispatched_before = set(harness.scheduler._dispatched)
+        before = _snapshot_i1(gate)
 
         claim = await _call_tool(
-            server, 'claim_warm_worktree', slug='iso', project_root=str(repo),
+            gate.server, 'claim_warm_worktree', slug='iso', project_root=str(gate.repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
 
         # I1 must hold immediately AFTER claim.
-        assert _free_count() == free_before, (
-            f'I1 VIOLATION: claim_warm_worktree changed the FREE lane count '
-            f'(before={free_before}, after={_free_count()})'
-        )
-        assert pool.assignments_snapshot() == assignments_before, (
-            'I1 VIOLATION: claim_warm_worktree perturbed assignments_snapshot()'
-        )
-        assert harness.scheduler._dispatched == dispatched_before, (
-            'I1 VIOLATION: claim_warm_worktree perturbed scheduler._dispatched'
-        )
+        _assert_i1_unchanged(gate, before, where='after claim_warm_worktree')
         claim_path = Path(claim['path'])
-        assert pool.is_lane(claim_path) is False, (
+        assert gate.pool.is_lane(claim_path) is False, (
             'I1 VIOLATION: the interactive worktree path is registered as a pool lane'
         )
-        assert pool.state(claim_path) is None, (
+        assert gate.pool.state(claim_path) is None, (
             'I1 VIOLATION: the pool reports a LaneState for the interactive '
             'worktree path'
         )
         lane_dirs = sorted(
-            p.name for p in harness.git_ops.worktree_base.iterdir()
+            p.name for p in gate.harness.git_ops.worktree_base.iterdir()
             if p.name.startswith('_lane-')
         )
         assert lane_dirs == [], (
@@ -255,22 +334,13 @@ class TestIsolationInvariantI1:
         )
 
         rel = await _call_tool(
-            server, 'release_warm_worktree',
-            path_or_branch=claim['path'], project_root=str(repo),
+            gate.server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(gate.repo),
         )
         assert rel['removed'] is True, f'expected removed=True, got: {rel}'
 
         # I1 must hold again AFTER release.
-        assert _free_count() == free_before, (
-            f'I1 VIOLATION: release_warm_worktree changed the FREE lane count '
-            f'(before={free_before}, after={_free_count()})'
-        )
-        assert pool.assignments_snapshot() == assignments_before, (
-            'I1 VIOLATION: release_warm_worktree perturbed assignments_snapshot()'
-        )
-        assert harness.scheduler._dispatched == dispatched_before, (
-            'I1 VIOLATION: release_warm_worktree perturbed scheduler._dispatched'
-        )
+        _assert_i1_unchanged(gate, before, where='after release_warm_worktree')
 
 
 # ---------------------------------------------------------------------------
@@ -286,16 +356,11 @@ class TestClaimReleaseRoundtrip:
     which asserts pool isolation rather than the roundtrip observable).
     """
 
-    async def test_claim_registers_release_removes(self, tmp_path: Path) -> None:
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
-        await _add_seed_script(repo)
-        config = _make_config(repo, max_concurrent_tasks=3)
-        _harness, server = _build_harness_and_server(config, tmp_path)
+    async def test_claim_registers_release_removes(self, warm_gate: WarmGate) -> None:
+        gate = warm_gate
 
         claim = await _call_tool(
-            server, 'claim_warm_worktree', slug='rt', project_root=str(repo),
+            gate.server, 'claim_warm_worktree', slug='rt', project_root=str(gate.repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
         assert set(claim.keys()) >= {'path', 'branch', 'warm', 'base_ref'}, (
@@ -305,18 +370,18 @@ class TestClaimReleaseRoundtrip:
             f"expected branch == 'task/rt', got {claim['branch']!r}"
         )
         claimed_path = str(Path(claim['path']).resolve())
-        registered = await _registered_worktree_paths(repo)
+        registered = await _registered_worktree_paths(gate.repo)
         assert claimed_path in registered, (
             f'expected {claimed_path} to be a registered git worktree; got: {registered}'
         )
 
         rel = await _call_tool(
-            server, 'release_warm_worktree',
-            path_or_branch=claim['path'], project_root=str(repo),
+            gate.server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(gate.repo),
         )
         assert rel['removed'] is True, f'expected removed=True, got: {rel}'
 
-        registered_after = await _registered_worktree_paths(repo)
+        registered_after = await _registered_worktree_paths(gate.repo)
         assert claimed_path not in registered_after, (
             f'expected {claimed_path} gone from `git worktree list` after release; '
             f'got: {registered_after}'
@@ -333,24 +398,22 @@ class TestClaimReleaseRoundtrip:
 class TestSeedInvocationFreshCheckout:
     """Proves claim_warm_worktree's underlying create_interactive_worktree
     invokes _seed_warm_lane in '--fresh-checkout' mode: a committed seed
-    stub CoW-seeds target/ (warm=True), while an absent seed script degrades
-    fail-soft (warm=False, no error, worktree retained) rather than raising
-    or losing the worktree. Does NOT assert any recompile/timing/warmth
-    magnitude (reify-side, out of scope — see module docstring's G6 note).
+    stub CoW-seeds target/ (warm=True) AND records the mode flag it actually
+    received (asserted below, so a regression to the wrong mode or a
+    reordered/dropped argument would be caught — not just the fact that
+    *some* seed ran), while an absent seed script degrades fail-soft
+    (warm=False, no error, worktree retained) rather than raising or losing
+    the worktree. Does NOT assert any recompile/timing/warmth magnitude
+    (reify-side, out of scope — see module docstring's G6 note).
     """
 
     async def test_committed_seed_script_populates_target_seeded_bin(
-        self, tmp_path: Path,
+        self, warm_gate: WarmGate,
     ) -> None:
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
-        await _add_seed_script(repo)
-        config = _make_config(repo, max_concurrent_tasks=3)
-        _harness, server = _build_harness_and_server(config, tmp_path)
+        gate = warm_gate
 
         claim = await _call_tool(
-            server, 'claim_warm_worktree', slug='warm', project_root=str(repo),
+            gate.server, 'claim_warm_worktree', slug='warm', project_root=str(gate.repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
         assert claim['warm'] is True, (
@@ -360,6 +423,21 @@ class TestSeedInvocationFreshCheckout:
         assert seeded.exists(), (
             f'expected target/seeded.bin to exist after a --fresh-checkout CoW '
             f'seed run invoked via claim_warm_worktree, got no file at {seeded}'
+        )
+
+        # Pin the invocation contract itself (<base_target> <lane_dir>
+        # <mode> — see GitOps._seed_warm_lane), not just target/'s
+        # existence: the recorded argv's last positional arg must be the
+        # '--fresh-checkout' mode flag.
+        argv_file = Path(claim['path']) / 'target' / 'seed-argv.txt'
+        argv = argv_file.read_text().splitlines()
+        assert len(argv) == 3, (
+            f'expected 3 recorded positional args (base_target, lane_dir, '
+            f'mode), got: {argv!r}'
+        )
+        assert argv[-1] == '--fresh-checkout', (
+            f"expected the seed script's mode arg (last positional) to be "
+            f"'--fresh-checkout', got argv={argv!r}"
         )
 
     async def test_absent_seed_script_is_fail_soft_cold(self, tmp_path: Path) -> None:
@@ -400,34 +478,26 @@ class TestSeedInvocationFreshCheckout:
 class TestReapI2ViaHarnessPass:
     """I2: harness._run_interactive_worktree_reaper_pass() reclaims a stale
     _iact-* worktree claimed via the β verb, preserves a within-TTL live
-    one, and — composing with I1 — never perturbs WarmLanePool state while
-    doing so (the reaper structurally only ever touches the _iact-* band).
+    one, and — composing with I1 — never perturbs WarmLanePool state OR
+    scheduler dispatch capacity while doing so (the reaper structurally only
+    ever touches the _iact-* band). Asserted via the same
+    ``_assert_i1_unchanged`` helper used by the claim/release scenarios, so
+    the I1 invariant is checked identically (pool AND scheduler._dispatched)
+    regardless of whether it is claim, release, or reap that ran.
     """
 
     async def test_stale_reaped_live_preserved_pool_untouched(
-        self, tmp_path: Path,
+        self, warm_gate: WarmGate,
     ) -> None:
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
-        await _add_seed_script(repo)
-        config = _make_config(repo, max_concurrent_tasks=3)
-        harness, server = _build_harness_and_server(config, tmp_path)
-        pool = harness.git_ops.warm_lane_pool
-        assert pool is not None, 'setup: warm_lane_pool must be enabled'
-
-        def _free_count() -> int:
-            return sum(1 for s in pool._lanes.values() if s == LaneState.FREE)
-
-        free_before = _free_count()
-        assignments_before = pool.assignments_snapshot()
+        gate = warm_gate
+        before = _snapshot_i1(gate)
 
         stale_claim = await _call_tool(
-            server, 'claim_warm_worktree', slug='stale', project_root=str(repo),
+            gate.server, 'claim_warm_worktree', slug='stale', project_root=str(gate.repo),
         )
         assert 'error' not in stale_claim, f'setup: stale claim failed: {stale_claim}'
         live_claim = await _call_tool(
-            server, 'claim_warm_worktree', slug='live', project_root=str(repo),
+            gate.server, 'claim_warm_worktree', slug='live', project_root=str(gate.repo),
         )
         assert 'error' not in live_claim, f'setup: live claim failed: {live_claim}'
 
@@ -447,12 +517,12 @@ class TestReapI2ViaHarnessPass:
         _backdate_stamp(
             stale_path,
             datetime.now(UTC)
-            - timedelta(seconds=harness.config.git.interactive_worktree_ttl + 3600),
+            - timedelta(seconds=gate.harness.config.git.interactive_worktree_ttl + 3600),
         )
 
-        await harness._run_interactive_worktree_reaper_pass()
+        await gate.harness._run_interactive_worktree_reaper_pass()
 
-        registered = await _registered_worktree_paths(repo)
+        registered = await _registered_worktree_paths(gate.repo)
         assert str(stale_path.resolve()) not in registered, (
             f'expected the stale interactive worktree to be reaped; '
             f'registered: {registered}'
@@ -462,14 +532,9 @@ class TestReapI2ViaHarnessPass:
             f'registered: {registered}'
         )
 
-        # I1 ∧ I2 composition: the reap must never perturb the pool.
-        assert _free_count() == free_before, (
-            f'I1/I2 VIOLATION: the reaper changed the FREE lane count '
-            f'(before={free_before}, after={_free_count()})'
-        )
-        assert pool.assignments_snapshot() == assignments_before, (
-            'I1/I2 VIOLATION: the reaper perturbed assignments_snapshot()'
-        )
+        # I1 ∧ I2 composition: the reap must never perturb the pool OR the
+        # scheduler's dispatch capacity.
+        _assert_i1_unchanged(gate, before, where='after the reaper pass')
 
 
 # ---------------------------------------------------------------------------
@@ -520,78 +585,54 @@ class TestInteractiveWarmWorktreeIntegrationGate:
     """
 
     async def test_full_claim_release_reap_preserves_isolation(
-        self, tmp_path: Path,
+        self, warm_gate: WarmGate,
     ) -> None:
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
-        await _add_seed_script(repo)
-        config = _make_config(repo, max_concurrent_tasks=3)
-        harness, server = _build_harness_and_server(config, tmp_path)
-        pool = harness.git_ops.warm_lane_pool
-        assert pool is not None, 'setup: warm_lane_pool must be enabled'
-
-        def _free_count() -> int:
-            return sum(1 for s in pool._lanes.values() if s == LaneState.FREE)
-
-        free_before = _free_count()
+        gate = warm_gate
+        free_before = _free_count(gate.pool)
         assert free_before == 3, f'setup: expected 3 FREE lanes, got {free_before}'
-        assignments_before = pool.assignments_snapshot()
-        dispatched_before = set(harness.scheduler._dispatched)
-
-        def _assert_i1_holds(where: str) -> None:
-            assert _free_count() == free_before, (
-                f'I1 VIOLATION at {where}: FREE lane count changed '
-                f'(before={free_before}, after={_free_count()})'
-            )
-            assert pool.assignments_snapshot() == assignments_before, (
-                f'I1 VIOLATION at {where}: assignments_snapshot() changed'
-            )
-            assert harness.scheduler._dispatched == dispatched_before, (
-                f'I1 VIOLATION at {where}: scheduler._dispatched changed'
-            )
+        before = _snapshot_i1(gate)
 
         # ── Phase 1 (β claim) ──────────────────────────────────────────
         claim = await _call_tool(
-            server, 'claim_warm_worktree', slug='gate', project_root=str(repo),
+            gate.server, 'claim_warm_worktree', slug='gate', project_root=str(gate.repo),
         )
         assert 'error' not in claim, f'setup: claim failed: {claim}'
         assert claim['warm'] is True, (
             f"expected warm is True (committed seed script ran), got {claim['warm']!r}"
         )
         claim_path = Path(claim['path'])
-        assert pool.is_lane(claim_path) is False, (
+        assert gate.pool.is_lane(claim_path) is False, (
             'I1 VIOLATION: the interactive worktree path is registered as a pool lane'
         )
         lane_dirs = sorted(
-            p.name for p in harness.git_ops.worktree_base.iterdir()
+            p.name for p in gate.harness.git_ops.worktree_base.iterdir()
             if p.name.startswith('_lane-')
         )
         assert lane_dirs == [], (
             f'I1 VIOLATION: a _lane-* dir was created on disk: {lane_dirs}'
         )
-        _assert_i1_holds('after phase 1 claim')
+        _assert_i1_unchanged(gate, before, where='after phase 1 claim')
 
         # ── Phase 2 (β release) ────────────────────────────────────────
         rel = await _call_tool(
-            server, 'release_warm_worktree',
-            path_or_branch=claim['path'], project_root=str(repo),
+            gate.server, 'release_warm_worktree',
+            path_or_branch=claim['path'], project_root=str(gate.repo),
         )
         assert rel['removed'] is True, f'expected removed=True, got: {rel}'
-        registered_after_release = await _registered_worktree_paths(repo)
+        registered_after_release = await _registered_worktree_paths(gate.repo)
         assert str(claim_path.resolve()) not in registered_after_release, (
             f'expected {claim_path} gone from `git worktree list` after release; '
             f'got: {registered_after_release}'
         )
-        _assert_i1_holds('after phase 2 release')
+        _assert_i1_unchanged(gate, before, where='after phase 2 release')
 
         # ── Phase 3 (δ reap, I2) ───────────────────────────────────────
         stale_claim = await _call_tool(
-            server, 'claim_warm_worktree', slug='gate-stale', project_root=str(repo),
+            gate.server, 'claim_warm_worktree', slug='gate-stale', project_root=str(gate.repo),
         )
         assert 'error' not in stale_claim, f'setup: gate-stale claim failed: {stale_claim}'
         live_claim = await _call_tool(
-            server, 'claim_warm_worktree', slug='gate-live', project_root=str(repo),
+            gate.server, 'claim_warm_worktree', slug='gate-live', project_root=str(gate.repo),
         )
         assert 'error' not in live_claim, f'setup: gate-live claim failed: {live_claim}'
 
@@ -609,12 +650,12 @@ class TestInteractiveWarmWorktreeIntegrationGate:
         _backdate_stamp(
             stale_path,
             datetime.now(UTC)
-            - timedelta(seconds=harness.config.git.interactive_worktree_ttl + 3600),
+            - timedelta(seconds=gate.harness.config.git.interactive_worktree_ttl + 3600),
         )
 
-        await harness._run_interactive_worktree_reaper_pass()
+        await gate.harness._run_interactive_worktree_reaper_pass()
 
-        registered_after_reap = await _registered_worktree_paths(repo)
+        registered_after_reap = await _registered_worktree_paths(gate.repo)
         assert str(stale_path.resolve()) not in registered_after_reap, (
             f'expected gate-stale to be reaped; registered: {registered_after_reap}'
         )
@@ -622,5 +663,8 @@ class TestInteractiveWarmWorktreeIntegrationGate:
             f'expected gate-live to be preserved; registered: {registered_after_reap}'
         )
 
-        # ── Final re-assertion: I1 held across the ENTIRE flow ──────────
-        _assert_i1_holds('at the end of the full claim/release/reap flow')
+        # ── Final re-assertion: I1 (pool AND scheduler dispatch capacity)
+        # held immediately after phase 3's reap, and across the ENTIRE flow.
+        _assert_i1_unchanged(
+            gate, before, where='after phase 3 reap (end of the full claim/release/reap flow)',
+        )
