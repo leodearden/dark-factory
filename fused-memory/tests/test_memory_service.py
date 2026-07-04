@@ -2288,6 +2288,10 @@ class TestDedupEpisodeNodes:
     step-3: core behavior — merges deprecated dups into the canonical
             survivor, de-dupes repeated names to a single lookup, no-ops on
             None/empty/<2 matches, skips nodes with empty/missing name.
+
+    step-5: best-effort resilience — a merge_entities failure for one
+            duplicate/name does not propagate and does not stop subsequent
+            duplicates/names from being processed.
     """
 
     @pytest.mark.asyncio
@@ -2414,6 +2418,79 @@ class TestDedupEpisodeNodes:
 
         assert merged == 0
         service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
+
+    # step-5: best-effort resilience
+
+    @pytest.mark.asyncio
+    async def test_merge_failure_is_swallowed_and_second_merge_still_attempted(
+        self, service, caplog,
+    ):
+        """A merge_entities failure for the first duplicate is swallowed; the
+        second duplicate is still attempted; only successful merges count."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'canon', 'created_at': 100, 'edge_count': 5},
+            {'uuid': 'd1', 'created_at': 200, 'edge_count': 2},
+            {'uuid': 'd2', 'created_at': 300, 'edge_count': 1},
+        ])
+        service.graphiti.merge_entities = AsyncMock(
+            side_effect=[RuntimeError('lock contention'), {}],
+        )
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='orchestrator-reify.service')])
+
+        with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
+            merged = await service._dedup_episode_nodes(result, group_id='test')
+
+        assert merged == 1, 'Only the second (successful) merge should count'
+        assert service.graphiti.merge_entities.await_count == 2, (
+            'The second duplicate must still be attempted after the first fails'
+        )
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records, 'Expected an exception/error log for the failed merge'
+
+    @pytest.mark.asyncio
+    async def test_merge_failure_for_one_name_does_not_block_next_name(
+        self, service, caplog,
+    ):
+        """When the first name's merge raises, the second name is still processed."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        async def fake_find_duplicates(name, *, group_id):
+            if name == 'ServiceA':
+                return [
+                    {'uuid': 'canon-a', 'created_at': 100, 'edge_count': 5},
+                    {'uuid': 'dup-a', 'created_at': 200, 'edge_count': 1},
+                ]
+            return [
+                {'uuid': 'canon-b', 'created_at': 100, 'edge_count': 5},
+                {'uuid': 'dup-b', 'created_at': 200, 'edge_count': 1},
+            ]
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
+
+        async def fake_merge(dep_uuid, survivor, *, group_id):
+            if dep_uuid == 'dup-a':
+                raise RuntimeError('transient write timeout')
+            return {}
+
+        service.graphiti.merge_entities = AsyncMock(side_effect=fake_merge)
+
+        result = MockAddEpisodeResult(nodes=[
+            MockNode(name='ServiceA'),
+            MockNode(name='ServiceB'),
+        ])
+
+        with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
+            merged = await service._dedup_episode_nodes(result, group_id='test')
+
+        assert merged == 1, 'Only the ServiceB duplicate merge should succeed'
+        assert service.graphiti.find_duplicate_entity_nodes.await_count == 2, (
+            'Both names must be looked up even though the first name\'s merge failed'
+        )
+        calls = [c[0][0] for c in service.graphiti.merge_entities.call_args_list]
+        assert calls == ['dup-a', 'dup-b'], 'Both duplicate merges must be attempted'
 
 
 # ---------------------------------------------------------------------------
