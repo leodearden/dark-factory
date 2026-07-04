@@ -182,16 +182,25 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     allowed_df_fragments = {
         "Dark Factory Orchestrator",
         "/home/leo/src/dark-factory/orchestrator/config.yaml",
-        "orchestrator-dark-factory.service",
     }
     allowed_reify_fragments = {
         "Reify Orchestrator",
         "/home/leo/src/reify/orchestrator.yaml",
-        "orchestrator-reify.service",
     }
+    # The ORCH_UNIT line must match EXACTLY, not merely contain the unit's
+    # basename — a fragment-only "in" check would also wave through an
+    # unrelated line that happens to embed the basename (e.g. a new
+    # After=/Requires= referencing the unit), masking real structural drift.
+    expected_df_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-dark-factory.service"
+    expected_reify_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-reify.service"
 
     unexpected: list[tuple[int, str, str]] = []
     for lineno, dl, rl in diff_lines:
+        if (
+            dl.strip() == expected_df_orch_unit_line
+            and rl.strip() == expected_reify_orch_unit_line
+        ):
+            continue
         df_ok = any(frag in dl for frag in allowed_df_fragments)
         reify_ok = any(frag in rl for frag in allowed_reify_fragments)
         if not (df_ok and reify_ok):
@@ -456,13 +465,9 @@ def test_orchestrator_service_sets_own_orch_unit(
     content = service_path.read_text(encoding="utf-8")
     expected_line = f"Environment=ORCH_UNIT={service_path.name}"
 
-    assert expected_line in content.splitlines(), (
-        f"{service_path.name} must set `{expected_line}`"
-    )
-
     sections = _parse_sections(content)
     service_text = "\n".join(sections.get("Service", []))
     assert expected_line in service_text.splitlines(), (
-        f"`{expected_line}` must live in the [Service] section of {service_path.name} "
+        f"{service_path.name} must set `{expected_line}` in its [Service] section "
         "(systemd only honours Environment= under [Service])"
     )
