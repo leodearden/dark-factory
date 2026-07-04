@@ -42,6 +42,17 @@ _BACKUP_GLOBS = ('*.tmp.*', '*.py.tmp.*', '*.orig', '*.rej', '*.bak', '*.swp', '
 # Bump a count (or add a file) ONLY for a genuine new factory site — never to
 # silence a hand-rebuild that should be ``dataclasses.replace`` instead.
 #
+# Count dropped 15 -> 9 (task 2058) tracking task 1995's MQ-refactor: a new
+# shared ``classify_and_merge`` guard pipeline, adopted in both
+# ``_merger_loop`` and ``_do_merge``, replaced most of the per-branch
+# hand-built constructions that used to live directly in ``_merger_loop``.
+# That collapsed the verifier-queue-put sites there from 9 to 4 and folded
+# one of the six factory-return sites into a shared helper (5 remain), for a
+# net 6-site reduction (9 puts + 6 returns -> 4 puts + 5 returns), all still
+# shape-consistent per __post_init__ (I2). Confirmed by diffing
+# `git grep -n 'SpeculativeItem(' -- orchestrator/src/orchestrator/merge_queue.py`
+# across the task/1995 merge (parents 01ec4eb8d8 and d5b8bcea0d).
+#
 # Deliberately a per-file *count*, not just a set of filenames: every
 # whitelisted site already lives in this one file, so a bare set-of-files
 # check would be permanently satisfied and blind to a new construction
@@ -55,7 +66,7 @@ _BACKUP_GLOBS = ('*.tmp.*', '*.py.tmp.*', '*.orig', '*.rej', '*.bak', '*.swp', '
 # to require a deliberate bump for genuine new sites, not something to
 # relax away.
 _EXPECTED_FACTORY_SITES = {
-    'orchestrator/src/orchestrator/merge_queue.py': 15,
+    'orchestrator/src/orchestrator/merge_queue.py': 9,
 }
 
 
