@@ -1893,6 +1893,22 @@ class OrchestratorConfig(BaseSettings):
     main_tip_sweep_enabled: bool = Field(default=True)
     main_tip_sweep_interval_secs: float = Field(default=1800.0)
 
+    # Periodic deterministic-strand reconciliation sweep (task 2074).
+    # Defensive/non-blocking background recovery sweep for deterministic
+    # gate/deploy tasks (metadata.task_kind == 'deterministic') that were
+    # stranded BLOCKED by a past occurrence — e.g. a cross-unit deploy that
+    # severed the orchestrator's own fused-memory connection, leaving
+    # before_done_ran_at stamped but no verify/gate/provenance stamp AND an
+    # empty escalation queue (task 2059).  Also re-validates already-OPEN
+    # deterministic-deploy infra_issue escalations against live systemd unit
+    # state, auto-resolving when the stated failure is now contradicted by a
+    # healthy unit.  This is the recovery subsystem that task 2066 explicitly
+    # scoped OUT (2066 only prevented NEW strands inside DeterministicRunner).
+    # Auto-on, zero manual wiring — mirrors main_tip_sweep_enabled's
+    # operator kill-switch convention.
+    deterministic_recon_sweep_enabled: bool = Field(default=True)
+    deterministic_recon_sweep_interval_secs: float = Field(default=900.0)
+
     # Warm-lane auto-GC cadence loop (task 1926).
     # Periodic unconditional invocation of scripts/warm-lane-gc.sh reclaim to
     # bound FREE _lane-*/_spec-* target/ re-accretion.  gc.sh only resets FREE
