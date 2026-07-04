@@ -76,3 +76,39 @@ class TestRetrieveEpisodesOrdering:
         # The timestamped episodes precede it in non-increasing order.
         created_ats = [ep.created_at for ep in result[:-1]]
         assert created_ats == sorted(created_ats, reverse=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('empty_value', [None, []])
+    async def test_retrieve_episodes_returns_empty_list_when_no_episodes(
+        self, mock_config, make_backend, empty_value
+    ):
+        backend = make_backend(mock_config)
+        with patch(
+            'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
+            AsyncMock(return_value=empty_value),
+        ):
+            result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=5)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_retrieve_episodes_last_n_exceeds_available_returns_all_descending(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        episodes = [
+            _episode('uuid-mar', datetime(2026, 3, 10, tzinfo=UTC)),
+            _episode('uuid-jun', datetime(2026, 6, 22, tzinfo=UTC)),
+            _episode('uuid-feb', datetime(2026, 2, 1, tzinfo=UTC)),
+        ]
+        with patch(
+            'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
+            AsyncMock(return_value=episodes),
+        ):
+            # last_n (10) exceeds the number of available episodes (3).
+            result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=10)
+
+        assert len(result) == 3
+        assert [ep.uuid for ep in result] == ['uuid-jun', 'uuid-mar', 'uuid-feb']
+        created_ats = [ep.created_at for ep in result]
+        assert created_ats == sorted(created_ats, reverse=True)
