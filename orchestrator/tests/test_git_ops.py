@@ -1436,6 +1436,10 @@ class TestAdvanceMainCasRetrySha:
         assert outcome.advanced_sha == merge.merge_commit
         assert outcome.rebased_from is None
         assert outcome.rebased_onto is None
+        assert not hasattr(git_ops, '_last_advanced_sha'), (
+            'the _last_advanced_sha side channel must be retired — '
+            'advanced_sha rides the returned AdvanceOutcome only'
+        )
 
     async def test_advance_main_returns_outcome_object_after_cas_retry(
         self, git_ops: GitOps,
@@ -1506,6 +1510,18 @@ class TestAdvanceMainCasRetrySha:
         assert outcome.advanced_sha != pre_rebase_sha
         assert outcome.rebased_from == original_main_sha
         assert outcome.rebased_onto == moved_main_sha
+        assert not hasattr(git_ops, '_last_advanced_sha'), (
+            'the _last_advanced_sha side channel must be retired — '
+            'advanced_sha rides the returned AdvanceOutcome only'
+        )
+        assert not hasattr(git_ops, '_rebased_from'), (
+            'the _rebased_from side channel must be retired — '
+            'rebased_from rides the returned AdvanceOutcome only'
+        )
+        assert not hasattr(git_ops, '_rebased_onto'), (
+            'the _rebased_onto side channel must be retired — '
+            'rebased_onto rides the returned AdvanceOutcome only'
+        )
 
         await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
 
