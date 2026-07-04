@@ -50,7 +50,7 @@ class TestRetrieveEpisodesOrdering:
         # (a) exactly last_n returned
         assert len(result) == 3
         # (b) selection correctness — the 3 largest created_at, not the first 3 fetched
-        assert {ep.uuid for ep in result} == {'uuid-jun', 'uuid-may', 'uuid-mar'}
+        assert {ep.uuid for ep in result} == {'uuid-jun', 'uuid-may', 'uuid-apr'}
         # (c) strictly non-increasing created_at order
         created_ats = [ep.created_at for ep in result]
         assert created_ats == sorted(created_ats, reverse=True)

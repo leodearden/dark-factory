@@ -427,16 +427,22 @@ class GraphitiBackend:
         last_n: int = 10,
         reference_time: datetime | None = None,
     ) -> list[Any]:
-        """Retrieve recent episodes by group."""
+        """Retrieve recent episodes by group, ordered by created_at (most recent first) and truncated to last_n.
+
+        EpisodicNode.get_by_group_ids truncates via ``ORDER BY uuid DESC LIMIT``,
+        which is unrelated to recency, so we fetch the group's full episode set
+        (limit=None) and sort/truncate by created_at ourselves.
+        """
         driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
         try:
             episodes = await asyncio.wait_for(
                 EpisodicNode.get_by_group_ids(
-                    driver, group_ids, limit=last_n
+                    driver, group_ids, limit=None
                 ),
                 timeout=self._read_timeout,
             )
-            return episodes or []
+            episodes = sorted(episodes or [], key=lambda ep: ep.created_at, reverse=True)
+            return episodes[:last_n]
         except TimeoutError:
             logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
             return []
