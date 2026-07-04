@@ -506,6 +506,120 @@ class TestWarmLaneBaseTargetPath:
 
 
 # ===========================================================================
+# Task 2061 step-1: RED — _seed_rc_to_unavailable + _warm_lane_base_resolvable
+# ===========================================================================
+
+
+class TestSeedRcToUnavailable:
+    """_seed_rc_to_unavailable(rc) — shared seed-exit-code discriminant.
+
+    DRYs the 4 inline ``DISK_PRESSURE if rc == 75 else FAULT`` sites in
+    acquire_warm_lane; task 2061 adds the rc==76 BASE_ABSENT branch (reify
+    seed exit-76 is DORMANT — no shipped seed-warm-lane.sh emits it yet).
+    """
+
+    def test_75_is_disk_pressure(self):
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(75) is WarmLaneUnavailable.DISK_PRESSURE
+
+    def test_76_is_base_absent(self):
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT
+
+    def test_1_is_fault(self):
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(1) is WarmLaneUnavailable.FAULT
+
+    def test_127_is_fault(self):
+        """127 is the command-not-found / unexpected-exception sentinel — generic FAULT."""
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
+
+
+class TestWarmLaneBaseResolvable:
+    """GitOps._warm_lane_base_resolvable() — tri-state warm-base health probe.
+
+    Resolves the base with the SAME D8 rule as _seed_warm_lane (git_ops.py
+    ~1619-1623: ``base.parent / base.readlink()``, NOT ``Path.resolve()``) so
+    the gate's verdict matches what a real seed invocation would experience.
+    """
+
+    def _config_with_base(self, base_target_dir: str) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+            warm_lane_base_target_dir=base_target_dir,
+        )
+
+    def test_present_nonempty_dir_is_ok(self, wl_git_repo: Path, tmp_path: Path):
+        from orchestrator.git_ops import WarmBaseHealth
+        base = tmp_path / 'base'
+        base.mkdir()
+        (base / 'sentinel').write_text('x\n')
+        git_ops = GitOps(self._config_with_base(str(base)), wl_git_repo, warm_lane_pool_size=1)
+
+        assert git_ops._warm_lane_base_resolvable() is WarmBaseHealth.OK
+
+    def test_missing_dir_is_absent(self, wl_git_repo: Path, tmp_path: Path):
+        from orchestrator.git_ops import WarmBaseHealth
+        base = tmp_path / 'does_not_exist'
+        git_ops = GitOps(self._config_with_base(str(base)), wl_git_repo, warm_lane_pool_size=1)
+
+        assert git_ops._warm_lane_base_resolvable() is WarmBaseHealth.ABSENT
+
+    def test_present_empty_dir_is_absent(self, wl_git_repo: Path, tmp_path: Path):
+        from orchestrator.git_ops import WarmBaseHealth
+        base = tmp_path / 'empty_base'
+        base.mkdir()
+        git_ops = GitOps(self._config_with_base(str(base)), wl_git_repo, warm_lane_pool_size=1)
+
+        assert git_ops._warm_lane_base_resolvable() is WarmBaseHealth.ABSENT
+
+    def test_symlink_to_present_gen_dir_is_ok(self, wl_git_repo: Path, tmp_path: Path):
+        from orchestrator.git_ops import WarmBaseHealth
+        base_dir = tmp_path / 'bases'
+        base_dir.mkdir()
+        gen_dir = base_dir / '.gen.0'
+        gen_dir.mkdir()
+        (gen_dir / 'sentinel').write_text('x\n')
+        target_symlink = base_dir / 'target'
+        target_symlink.symlink_to('.gen.0')  # relative sibling, matches reify
+        git_ops = GitOps(
+            self._config_with_base(str(target_symlink)), wl_git_repo, warm_lane_pool_size=1,
+        )
+
+        assert git_ops._warm_lane_base_resolvable() is WarmBaseHealth.OK
+
+    def test_symlink_to_missing_gen_dir_is_absent(self, wl_git_repo: Path, tmp_path: Path):
+        """Proves the D8 base.parent / base.readlink() join (NOT Path.resolve())."""
+        from orchestrator.git_ops import WarmBaseHealth
+        base_dir = tmp_path / 'bases'
+        base_dir.mkdir()
+        target_symlink = base_dir / 'target'
+        target_symlink.symlink_to('.gen.0')  # .gen.0 does NOT exist
+        git_ops = GitOps(
+            self._config_with_base(str(target_symlink)), wl_git_repo, warm_lane_pool_size=1,
+        )
+
+        assert git_ops._warm_lane_base_resolvable() is WarmBaseHealth.ABSENT
+
+    def test_non_dir_base_is_indeterminate(self, wl_git_repo: Path, tmp_path: Path):
+        """A base path that is a regular FILE raises on iterdir() → INDETERMINATE
+        (fail-safe: a transient stat/readlink hiccup must never masquerade as a
+        genuine outage and trip the host-wide hard-down latch)."""
+        from orchestrator.git_ops import WarmBaseHealth
+        base = tmp_path / 'not_a_dir'
+        base.write_text('this is a file, not a directory\n')
+        git_ops = GitOps(self._config_with_base(str(base)), wl_git_repo, warm_lane_pool_size=1)
+
+        assert git_ops._warm_lane_base_resolvable() is WarmBaseHealth.INDETERMINATE
+
+
+# ===========================================================================
 # Step-5: RED — GitOps._seed_warm_lane
 # ===========================================================================
 
