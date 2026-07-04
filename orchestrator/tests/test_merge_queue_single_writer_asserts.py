@@ -32,17 +32,30 @@ lane-buffer mutation call sites.
                 — that ``_verifier_loop`` calls instead of mutating the deque
                 inline, each asserting ownership via ``self._verifier_task``
                 before mutating. RED because these methods do not exist yet.
+
+  step-07 RED — suite-wide enablement + end-to-end no-false-positive
+                conformance. (a) asserts that ``merge_queue._DEBUG_ASSERTS``
+                is ``True`` with no per-test monkeypatching in effect,
+                proving conftest.py turns the discipline on for the whole
+                suite (RED until step-08 GREEN). (b) drives a REAL
+                ``worker.run()`` (merger + verifier loops) through two
+                independent real branches to resolution with the flag
+                forced on, proving the steps 04/06 wiring never raises a
+                false-positive ``AssertionError`` against the production
+                coroutines.
 """
 
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator import merge_queue
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
@@ -72,6 +85,45 @@ def config(tmp_path, git_config: GitConfig) -> OrchestratorConfig:
 @pytest.fixture
 def git_ops(git_config: GitConfig, tmp_path) -> GitOps:
     return GitOps(git_config, tmp_path)
+
+
+# ── step-07 fixtures: a REAL git repo ───────────────────────────────────────
+#
+# Only the end-to-end conformance test needs one — the lane-buffer/_inflight
+# choke-point tests above are pure in-memory operations that never shell out
+# to git, so they keep using the bare-tmp_path git_ops/config fixtures above.
+
+
+async def _setup_e2e_repo(repo: Path) -> None:
+    """Initialise a minimal real git repo with one initial commit on main.
+
+    Mirrors test_merge_queue.py's module-level ``_setup_repo``.
+    """
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+@pytest.fixture
+def e2e_git_repo(tmp_path: Path) -> Path:
+    """Real initialised git repo for the step-07 end-to-end conformance test."""
+    repo = tmp_path / 'e2e-repo'
+    repo.mkdir()
+    asyncio.run(_setup_e2e_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def e2e_git_ops(git_config: GitConfig, e2e_git_repo: Path) -> GitOps:
+    return GitOps(git_config, e2e_git_repo)
+
+
+@pytest.fixture
+def e2e_config(e2e_git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
+    return OrchestratorConfig(project_root=e2e_git_repo, git=git_config)
 
 
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
@@ -342,3 +394,130 @@ class TestAssertSingleWriterInflightWiring:
         assert popped is entry
         worker._inflight_append(object())
         worker._inflight_clear()  # must not raise
+
+
+# ── step-07 RED: suite-wide enablement + end-to-end no-false-positive ───────
+# conformance ────────────────────────────────────────────────────────────────
+
+
+async def _make_branch_with_file(
+    git_ops: GitOps, branch_name: str, filename: str, content: str,
+) -> Path:
+    """Create a worktree branch with one committed file; return its path.
+
+    Mirrors the identically-named helper in test_merge_queue.py — only the
+    step-07 end-to-end conformance test needs a real branch.
+    """
+    worktree = (await git_ops.create_worktree(branch_name)).path
+    (worktree / filename).write_text(content)
+    await git_ops.commit(worktree, f'Add {filename}')
+    return worktree
+
+
+def _make_e2e_request(
+    task_id: str, branch: str, worktree: Path, config: OrchestratorConfig,
+) -> MergeRequest:
+    """Build a MergeRequest against a real worktree for the step-07 e2e test.
+
+    Must be called from within an async context (asyncio.get_running_loop()).
+    """
+    return MergeRequest(
+        task_id=task_id,
+        branch=branch,
+        worktree=worktree,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        lane='normal',
+    )
+
+
+@pytest.mark.asyncio
+class TestDebugAssertsSuiteWideAndConformance:
+    """step-07 (task 1999 I7): suite-wide enablement + real-pipeline conformance.
+
+    (a) The whole test suite must run with ``ORCH_DEBUG_ASSERTS`` enabled —
+        proves conftest.py turns the single-writer discipline asserts on for
+        every test, not just this file's own explicitly-monkeypatched cases
+        above.
+    (b) A real end-to-end merge — two independent real branches pushed
+        through a LIVE ``worker.run()`` (merger + verifier loops) to
+        resolution — must complete cleanly with the debug asserts forced ON,
+        proving the production merger/verifier coroutines only ever mutate
+        ``_lane_buffers``/``_inflight`` from their own recorded owner task
+        (``self._merger_task`` / ``self._verifier_task``) — i.e. the steps
+        04/06 wiring produces no false-positive ``AssertionError`` under a
+        real run.
+
+    RED (part a only) until step-08 GREEN sets
+    ``os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')`` in conftest.py (plus
+    a belt-and-braces direct assignment pinning
+    ``merge_queue._DEBUG_ASSERTS = True``, to defeat any import-order race).
+    """
+
+    async def test_suite_wide_debug_asserts_enabled(self) -> None:
+        """(a) conftest.py must enable ORCH_DEBUG_ASSERTS suite-wide.
+
+        RED: nothing sets ORCH_DEBUG_ASSERTS today, so the module flag —
+        seeded once at import from the env var — is False.
+        """
+        assert merge_queue._DEBUG_ASSERTS is True, (
+            'Expected merge_queue._DEBUG_ASSERTS is True suite-wide (conftest.py '
+            'should set ORCH_DEBUG_ASSERTS=1 before importing orchestrator, per '
+            f'task 1999 I7 / PRD Open Q3) but got {merge_queue._DEBUG_ASSERTS!r} — '
+            'the single-writer discipline asserts wired in steps 04/06 are not '
+            'being exercised by the suite.'
+        )
+
+    async def test_real_pipeline_no_false_positive_with_asserts_on(
+        self,
+        e2e_git_ops: GitOps,
+        e2e_config: OrchestratorConfig,
+        monkeypatch,
+    ) -> None:
+        """(b) Two real requests flow through a live worker to resolution, asserts ON.
+
+        Forces ``merge_queue._DEBUG_ASSERTS = True`` directly so this
+        assertion holds regardless of part (a)'s conftest wiring, then drives
+        the REAL merger + verifier loops via ``worker.run()`` — the same
+        real-pipeline shape as
+        ``TestSpeculativeMergeWorker.test_speculative_basic_throughput`` in
+        test_merge_queue.py.  No ``AssertionError`` may propagate from either
+        request's resolution, and both must reach a terminal ``'done'``
+        outcome.
+        """
+        monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
+
+        wt_n = await _make_branch_with_file(
+            e2e_git_ops, 'sw-e2e-n', 'file_sw_e2e_n.py', 'n = 1\n',
+        )
+        wt_n1 = await _make_branch_with_file(
+            e2e_git_ops, 'sw-e2e-n1', 'file_sw_e2e_n1.py', 'n1 = 2\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(e2e_git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            AsyncMock(return_value=MagicMock(passed=True, summary='')),
+        ):
+            req_n = _make_e2e_request('sw-e2e-n', 'sw-e2e-n', wt_n, e2e_config)
+            req_n1 = _make_e2e_request('sw-e2e-n1', 'sw-e2e-n1', wt_n1, e2e_config)
+
+            # Submit both before the worker processes them, matching
+            # test_speculative_basic_throughput's real-pipeline shape.
+            await queue.put(req_n)
+            await queue.put(req_n1)
+
+            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
+            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+
+        assert outcome_n.status == 'done', f'N failed: {outcome_n}'
+        assert outcome_n1.status == 'done', f'N+1 failed: {outcome_n1}'
+
+        await worker.stop()
+        await worker_task
