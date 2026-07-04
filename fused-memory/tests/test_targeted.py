@@ -2171,10 +2171,12 @@ def test_format_outcome_echo_truncates_long_note():
     long_note = 'N' * 600
 
     note_only = _format_outcome_echo({'note': long_note})
+    assert note_only is not None
     assert note_only == long_note[:500]
     assert len(note_only) == 500
 
     note_and_commit = _format_outcome_echo({'note': long_note, 'commit': 'abc123def'})
+    assert note_and_commit is not None
     assert note_and_commit == f'{long_note[:500]} (commit abc123def)'
     assert note_and_commit.startswith(long_note[:500])
     assert note_and_commit.endswith(' (commit abc123def)')
