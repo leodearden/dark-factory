@@ -1116,7 +1116,7 @@ requires-dist = [
     { name = "graphiti-core", extras = ["falkordb"], specifier = ">=0.28.1" },
     { name = "mcp", specifier = ">=1.9.4" },
     { name = "mem0ai", specifier = ">=1.0.10" },
-    { name = "openai", specifier = ">=1.90.0" },
+    { name = "openai", specifier = ">=1.91.0" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "pyyaml", specifier = ">=6.0" },
