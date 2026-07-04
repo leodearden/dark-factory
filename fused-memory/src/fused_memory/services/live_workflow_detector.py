@@ -37,6 +37,23 @@ that *this* task is live.  The per-task ``worktree_registered`` and
 evidence still marks the task live.  ``status=None`` (the default) preserves the
 prior, status-blind behavior.
 
+**Blocked deterministic tasks.** Callers may also pass ``task_kind`` (the task's
+``metadata.task_kind``).  Deliberately, ``'blocked'`` is NOT added to
+``ORCH_LIVE_INELIGIBLE_STATUSES`` wholesale — a normal blocked task may
+auto-unblock and be legitimately mid-pipeline, so the project-wide orchestrator
+lock remains real per-task evidence for it (task 2031).  However, a
+**deterministic** task (``task_kind == 'deterministic'``) never acquires a
+worktree/branch — it is routed to ``DeterministicRunner`` instead — so for a
+*blocked deterministic* task the bare orchestrator lock is not task-specific
+evidence either.  ``detect_live_workflow`` therefore also forces
+``orchestrator_live`` to ``False`` when ``status == 'blocked' AND task_kind ==
+'deterministic'`` (see :func:`_orchestrator_signal_ineligible`).  This is a
+compound condition, not a status addition: non-deterministic blocked tasks
+(``task_kind`` absent or not ``'deterministic'``) keep the signal.  The
+per-task ``worktree_registered``/``recent_commit`` signals remain unaffected,
+so a blocked deterministic task that somehow did acquire a worktree is still
+live.
+
 The legitimate stranded case (orchestrator down, no worktree, no recent commits)
 has all three signals False, so recon still escalates it.
 
@@ -73,8 +90,15 @@ _GIT_TIMEOUT: int = 10
 # auto-unblock), 'review'/'merge-deferred' (in the verify/review/merge
 # pipeline), and 'pending'/'in-progress' (dispatch-eligible or active) — for
 # those statuses a live orchestrator legitimately means "don't race the
-# pipeline."
+# pipeline."  A blocked *deterministic* task is handled separately by
+# `_orchestrator_signal_ineligible` below — see its docstring — rather than by
+# adding 'blocked' here, since that would wrongly suppress normal blocked tasks.
 ORCH_LIVE_INELIGIBLE_STATUSES: frozenset[str] = frozenset({'deferred', 'done', 'cancelled'})
+
+# task_kind value used by the orchestrator/scheduler for deterministic tasks
+# (DeterministicRunner-routed: no worktree/branch is ever acquired). Mirrors
+# Scheduler._is_deterministic's metadata.task_kind == 'deterministic' check.
+DETERMINISTIC_TASK_KIND: str = 'deterministic'
 
 
 @dataclass(frozen=True)
@@ -107,6 +131,7 @@ def detect_live_workflow(
     max_commit_age_hours: float = DEFAULT_MAX_COMMIT_AGE_HOURS,
     branch_prefix: str = DEFAULT_BRANCH_PREFIX,
     status: str | None = None,
+    task_kind: str | None = None,
     _orchestrator_live: bool | None = None,
 ) -> WorkflowLiveness:
     """Detect whether a live workflow is active for *task_id*.
@@ -128,6 +153,15 @@ def detect_live_workflow(
             ``is_orchestrator_live_for`` are consulted.  ``None`` (default)
             leaves the orchestrator_live computation unaffected — fully
             backward compatible.
+        task_kind: The task's ``metadata.task_kind``, when known.  When
+            ``status == 'blocked'`` and ``task_kind == DETERMINISTIC_TASK_KIND``,
+            the project-wide ``orchestrator_live`` signal is also forced to
+            ``False`` — a deterministic task never acquires a worktree/branch,
+            so the bare project lock is not task-specific evidence for it while
+            blocked.  See :func:`_orchestrator_signal_ineligible`.  ``None``
+            (default) leaves the orchestrator_live computation unaffected for
+            non-deterministic (or unknown-kind) tasks — fully backward
+            compatible.
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
@@ -135,7 +169,8 @@ def detect_live_workflow(
             ``None`` (default) triggers a fresh ``is_orchestrator_live_for``
             call.  Tests monkeypatch the module attribute directly; this
             parameter is only for performance hoisting, not test isolation.
-            Ignored when *status* is in :data:`ORCH_LIVE_INELIGIBLE_STATUSES`.
+            Ignored when :func:`_orchestrator_signal_ineligible` returns True
+            for the given *status*/*task_kind* pair.
 
     Returns:
         A :class:`WorkflowLiveness` dataclass with all signals populated.
@@ -151,10 +186,12 @@ def detect_live_workflow(
     # orchestrator process holds an active lock for this project_root, regardless
     # of which task it is currently dispatching).  Pre-computed callers may pass
     # it via _orchestrator_live to avoid redundant per-task subprocess calls.
-    # Statuses that are never actively dispatched (see
-    # ORCH_LIVE_INELIGIBLE_STATUSES) force this signal False — the project-wide
-    # lock is not evidence of liveness for a task that will never be dispatched.
-    if status is not None and status in ORCH_LIVE_INELIGIBLE_STATUSES:
+    # Ineligible status/task_kind combinations (see
+    # _orchestrator_signal_ineligible) force this signal False — the
+    # project-wide lock is not evidence of liveness for a task that will never
+    # be dispatched (or, for blocked deterministic tasks, never acquires a
+    # worktree/branch of its own).
+    if _orchestrator_signal_ineligible(status, task_kind):
         orchestrator_live = False
     else:
         orchestrator_live = (
@@ -191,6 +228,33 @@ def is_workflow_live_for_task(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _orchestrator_signal_ineligible(status: str | None, task_kind: str | None) -> bool:
+    """Return True when the project-wide ``orchestrator_live`` signal must be
+    forced False for this *status*/*task_kind* combination.
+
+    Two independent rules are centralized here:
+
+    1. ``status`` is a member of :data:`ORCH_LIVE_INELIGIBLE_STATUSES`
+       (``deferred``, ``done``, ``cancelled``) — statuses that are never
+       actively dispatched, so the project-wide lock is not evidence for this
+       task (task 2031).
+    2. ``status == 'blocked' and task_kind == DETERMINISTIC_TASK_KIND`` — a
+       blocked deterministic task, which never acquires a worktree/branch (it
+       is routed to ``DeterministicRunner`` instead), so the bare project lock
+       is not task-specific evidence for it either (task 2067).
+
+    ``'blocked'`` is deliberately NOT added to ``ORCH_LIVE_INELIGIBLE_STATUSES``
+    wholesale: a normal blocked task (``task_kind`` absent or not
+    ``'deterministic'``) may auto-unblock and be legitimately mid-pipeline, so
+    the project-wide orchestrator lock remains real per-task evidence for it.
+    Hence the compound (status AND task_kind) condition for rule 2, rather than
+    an unconditional status addition.
+    """
+    if status is not None and status in ORCH_LIVE_INELIGIBLE_STATUSES:
+        return True
+    return status == 'blocked' and task_kind == DETERMINISTIC_TASK_KIND
 
 
 def _check_worktree_registered(project_root: str, branch: str) -> bool:
