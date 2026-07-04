@@ -49,6 +49,55 @@ class TestCheckOpenaiResponsesApi:
         which ships openai.resources.responses — so the check is a no-op."""
         assert check_openai_responses_api() is None
 
+    def test_raises_actionable_error_when_version_below_floor(self, monkeypatch):
+        """Module presence alone isn't enough: openai in [1.66.0, 1.91.0) ships
+        the submodule but is still below graphiti-core's declared floor, so
+        the version-floor guard must fire the same actionable error (review
+        hardening, task 2053)."""
+        import openai
+
+        monkeypatch.setattr(openai, '__version__', '1.80.0')
+
+        with pytest.raises(RuntimeError) as exc_info:
+            check_openai_responses_api()
+
+        message = str(exc_info.value).lower()
+        assert 'openai.resources.responses' in message
+        assert 'uv sync' in message
+        assert '1.80.0' in str(exc_info.value)
+
+    def test_does_not_raise_for_prerelease_version_at_floor(self, monkeypatch):
+        """A prerelease suffix (e.g. 'rc1') must not defeat the floor parse:
+        1.91.0rc1 parses to (1, 91, 0), which is not below the floor."""
+        import openai
+
+        monkeypatch.setattr(openai, '__version__', '1.91.0rc1')
+
+        assert check_openai_responses_api() is None
+
+    def test_raises_actionable_error_when_find_spec_raises(self, monkeypatch):
+        """If resolving the submodule spec itself raises (e.g. a broken parent
+        openai/openai.resources import), that must be converted into the same
+        actionable RuntimeError rather than escaping as a raw
+        Import/ModuleNotFoundError that buries the remediation (review
+        hardening, task 2053)."""
+
+        real_find_spec = importlib.util.find_spec
+
+        def fake_find_spec(name, *args, **kwargs):
+            if name == 'openai.resources.responses':
+                raise ModuleNotFoundError("No module named 'openai.resources'")
+            return real_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, 'find_spec', fake_find_spec)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            check_openai_responses_api()
+
+        message = str(exc_info.value).lower()
+        assert 'openai.resources.responses' in message
+        assert 'uv sync' in message
+
 
 class TestGraphitiBackendInitializePreflightWiring:
     """Wiring test: initialize() must invoke the preflight before touching FalkorDB."""

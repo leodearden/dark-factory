@@ -28,6 +28,32 @@ from fused_memory.utils.async_utils import propagate_cancellations
 logger = logging.getLogger(__name__)
 
 
+_MIN_OPENAI_VERSION: tuple[int, ...] = (1, 91, 0)
+_MIN_OPENAI_VERSION_STR = '1.91.0'
+
+
+def _leading_version_tuple(version_str: str) -> tuple[int, ...]:
+    """Parse the leading run of dotted integer components of a version string.
+
+    E.g. ``'1.91.0'`` -> ``(1, 91, 0)``; ``'1.91.0rc1'`` -> ``(1, 91, 0)``.
+    Returns an empty tuple when no leading numeric component can be found
+    (e.g. ``'?'``) — callers should treat that as inconclusive rather than
+    a failure, since it means the version string couldn't be parsed, not
+    that the version is actually too low.
+    """
+    parts: list[int] = []
+    for chunk in version_str.split('.'):
+        digits = ''
+        for char in chunk:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
 def check_openai_responses_api() -> None:
     """Raise if the installed openai SDK lacks the Responses API surface.
 
@@ -38,21 +64,52 @@ def check_openai_responses_api() -> None:
     deep inside Graphiti write-path LLM extraction, where the durable queue
     treats it as non-retriable and dead-letters silently after exhausting
     retries (task 2053). Fail fast at startup instead, with an actionable
-    message, rather than a future SDK release that also removes/renames the
-    surface.
+    message.
+
+    Two independent guards feed the same actionable error (review
+    hardening, task 2053):
+
+    - Module presence (``importlib.util.find_spec``): catches openai <1.66
+      (module never existed) and any future openai release that
+      renames/removes the surface. If resolving the submodule spec itself
+      raises — e.g. a broken parent ``openai``/``openai.resources`` import —
+      that is also treated as "missing" rather than letting a raw
+      Import/ModuleNotFoundError escape and bury the actionable message.
+    - Version floor (``openai.__version__ >= 1.91.0``): catches the narrow
+      window [1.66.0, 1.91.0) where the submodule exists but graphiti-core's
+      declared floor is still violated. Best-effort: an unparseable version
+      string is treated as inconclusive, not a failure — module presence
+      remains the authoritative guard.
     """
-    if importlib.util.find_spec('openai.resources.responses') is not None:
-        return
+    try:
+        module_present = importlib.util.find_spec('openai.resources.responses') is not None
+    except (ImportError, ModuleNotFoundError):
+        module_present = False
+
     import openai
 
     installed_version = getattr(openai, '__version__', '?')
+    parsed_version = _leading_version_tuple(installed_version)
+    version_too_old = bool(parsed_version) and parsed_version < _MIN_OPENAI_VERSION
+
+    if module_present and not version_too_old:
+        return
+
+    if not module_present:
+        reason = "is missing the module 'openai.resources.responses'"
+    else:
+        reason = (
+            f"provides 'openai.resources.responses' but at version {installed_version}, "
+            "below graphiti-core's required floor"
+        )
+
     raise RuntimeError(
-        f"Installed openai {installed_version} is missing the module "
-        "'openai.resources.responses', which graphiti-core's OpenAIClient "
-        "requires (client.responses.create). This module was added in "
-        "openai 1.66.0; graphiti-core 0.28.2 requires openai>=1.91.0. "
-        "Run `uv sync` in fused-memory and restart the service to install "
-        "a compatible openai version. (task 2053)"
+        f"Installed openai {installed_version} {reason}, which graphiti-core's "
+        "OpenAIClient requires (client.responses.create). This module was "
+        f"added in openai 1.66.0; graphiti-core 0.28.2 requires "
+        f"openai>={_MIN_OPENAI_VERSION_STR}. Run `uv sync` in fused-memory "
+        "and restart the service to install a compatible openai version. "
+        "(task 2053)"
     )
 
 
