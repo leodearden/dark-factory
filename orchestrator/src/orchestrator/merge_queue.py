@@ -113,6 +113,7 @@ from orchestrator.merge_speculation_controller import (  # noqa: F401  re-export
 from orchestrator.merge_types import (  # noqa: F401  re-export shim
     _INFLIGHT_MERGE_ETA_ESTIMATE_SECS,
     Decided,
+    DecidedItem,
     GroupMergeRequest,
     InflightEntry,
     InFlightMergeRegistry,
@@ -125,6 +126,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     MergeOutcome,
     MergeReadyPredicate,
     MergeRequest,
+    RealMergeItem,
     SoloVerifyResult,
     SpeculativeItem,
     TerminalOutcomeRecord,
@@ -134,6 +136,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     WaiterRecord,
     _HostUnavailability,
     _InFlightEntry,
+    item_merge_wt,
 )
 from orchestrator.overlap_footprint import (  # noqa: F401  re-export seam for δ/ζ consumers
     DEFAULT_OVERLAP_DETECTOR,
@@ -6917,10 +6920,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                         'raised unexpectedly — members may remain stranded',
                                         req.train_id,
                                     )
-                        await self._verifier_queue.put(SpeculativeItem(
-                            request=req, merge_result=None, merge_wt=None,
+                        await self._verifier_queue.put(DecidedItem(
+                            request=req,
                             base_sha=actual_main, speculative=False,
-                            skip_verify=False, immediate_outcome=outcome,
+                            immediate_outcome=outcome,
                             started_monotonic=t0,
                         ))
                         # Train is put with speculative=False so the verifier
@@ -6952,10 +6955,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         _abandon = self._abandon_outcome(req.task_id, prior_timeouts)
                         _already = self._oob_deliver(req, _abandon, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
-                            request=req, merge_result=None, merge_wt=None,
+                        await self._verifier_queue.put(DecidedItem(
+                            request=req,
                             base_sha=actual_main, speculative=speculative,
-                            skip_verify=False,
                             immediate_outcome=_abandon,
                             already_delivered=_already,
                             started_monotonic=t0,
@@ -6995,10 +6997,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # _warn_if_verify_base_not_frozen_tip returns
                         # immediately when item.merge_result is None (:5228).
                         # So this divergence has no observable effect.
-                        await self._verifier_queue.put(SpeculativeItem(
-                            request=req, merge_result=None, merge_wt=None,
+                        await self._verifier_queue.put(DecidedItem(
+                            request=req,
                             base_sha=base_for_merge, speculative=speculative,
-                            skip_verify=False,
                             immediate_outcome=result.outcome,
                             already_delivered=_already,
                             failure_diagnostic=result.outcome.failure_diagnostic,
@@ -7024,11 +7025,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await self._merge_ahead_cap.acquire()
                     try:
                         self._register_owned_merge_worktree(merge_result.merge_worktree)
-                        await self._verifier_queue.put(SpeculativeItem(
+                        await self._verifier_queue.put(RealMergeItem(
                             request=req, merge_result=merge_result,
                             merge_wt=merge_result.merge_worktree,
                             base_sha=base_for_merge, speculative=speculative,
-                            skip_verify=False,  # task-1724: always run merge-gate verify
                             started_monotonic=t0,
                             merged_branch_tip=branch_head,  # γ2: branch tip at merge time
                             counts_against_cap=counts_against_cap,
@@ -7767,10 +7767,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         if isinstance(result, MergedOk):
             self._register_owned_merge_worktree(result.merge_wt)
-            return SpeculativeItem(
+            return RealMergeItem(
                 request=req, merge_result=result.merge_result,
                 merge_wt=result.merge_wt,
-                base_sha=actual_main, speculative=False, skip_verify=False,
+                base_sha=actual_main, speculative=False,
                 merged_branch_tip=result.branch_tip,  # γ2: parity with merger loop
                 started_monotonic=started_monotonic,
             )
@@ -7830,10 +7830,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # verification would let semantically-unverified main commits
                 # land on the protected branch.  Always verify.
                 self._register_owned_merge_worktree(retry.merge_wt)
-                return SpeculativeItem(
+                return RealMergeItem(
                     request=req, merge_result=retry.merge_result,
                     merge_wt=retry.merge_wt,
-                    base_sha=retry_main, speculative=False, skip_verify=False,
+                    base_sha=retry_main, speculative=False,
                     merged_branch_tip=retry.branch_tip,  # γ2: parity with merger loop
                     started_monotonic=started_monotonic,
                 )
@@ -7848,9 +7848,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             first_diag = result.outcome.failure_diagnostic
             retry_diag = retry.outcome.failure_diagnostic
             if first_diag is None or retry_diag is None:
-                return SpeculativeItem(
-                    request=req, merge_result=None, merge_wt=None,
-                    base_sha=retry_main, speculative=False, skip_verify=False,
+                return DecidedItem(
+                    request=req,
+                    base_sha=retry_main, speculative=False,
                     immediate_outcome=retry.outcome,
                     failure_diagnostic=retry_diag,
                     started_monotonic=started_monotonic,
