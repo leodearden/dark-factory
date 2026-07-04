@@ -734,6 +734,72 @@ class TestAcquireWarmLaneBaseAbsent:
 
 
 # ===========================================================================
+# Task 2061 step-5: RED — create_worktree raises WarmLanePoolHardDown
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestCreateWorktreeWarmLanePoolHardDown:
+    """create_worktree() raises WarmLanePoolHardDown when the warm base is
+    absent — mirrors test_create_worktree_raises_warm_lane_disk_pressure
+    (test_warm_lane_disk_guard.py). A HOST-SCOPED pool condition must
+    requeue (fail-open, inv.6), never escalate a per-task blocked+L1.
+    """
+
+    def _config_with_base(self, base_target_dir: str) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+            warm_lane_base_target_dir=base_target_dir,
+        )
+
+    async def test_create_worktree_raises_warm_lane_pool_hard_down(
+        self, wl_git_repo: Path,
+    ):
+        from orchestrator.git_ops import WarmLanePoolHardDown
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        config = self._config_with_base(str(wl_git_repo / 'does_not_exist_base'))
+        git_ops = GitOps(config, wl_git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLanePoolHardDown):
+            await git_ops.create_worktree('A')
+
+    async def test_hard_down_lane_not_seeded_and_stays_free(
+        self, wl_git_repo: Path,
+    ):
+        """No lane target was seeded (no worktree-add/seed ran); pool lane FREE."""
+        from orchestrator.git_ops import WarmLanePoolHardDown
+        from orchestrator.warm_lane_pool import LaneState
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        config = self._config_with_base(str(wl_git_repo / 'does_not_exist_base'))
+        git_ops = GitOps(config, wl_git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLanePoolHardDown):
+            await git_ops.create_worktree('A')
+
+        lane = git_ops.worktree_base / '_lane-0'
+        assert not (lane / 'target' / 'seeded.bin').exists(), (
+            'seeded.bin must not exist — seed must not run before hard-down blocks'
+        )
+        assert not lane.exists(), 'Lane dir must not be created'
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+            'Lane must stay FREE — no ASSIGNED leak'
+        )
+
+    def test_warm_lane_pool_hard_down_is_a_warm_lane_requeue(self):
+        from orchestrator.git_ops import WarmLanePoolHardDown, WarmLaneRequeue
+
+        assert issubclass(WarmLanePoolHardDown, WarmLaneRequeue)
+
+
+# ===========================================================================
 # Step-5: RED — GitOps._seed_warm_lane
 # ===========================================================================
 
