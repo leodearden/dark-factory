@@ -147,6 +147,23 @@ def _serialize_temporal(
     }
 
 
+def _created_at_to_utc_iso(created_at: datetime | None) -> str | None:
+    """Serialize an episode's created_at to canonical UTC ISO-8601, or None.
+
+    str(created_at) preserves the stored UTC offset (and uses a space
+    separator), so emitted-string order can diverge from instant order
+    when episodes carry differing offsets. Normalizing to UTC ISO-8601
+    makes the emitted strings sort lexically iff the instants do. Naive
+    (tzinfo-less) values are assumed to already be UTC, matching
+    retrieve_episodes' own naive-datetime handling.
+    """
+    if created_at is None:
+        return None
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    return created_at.astimezone(UTC).isoformat()
+
+
 def _node_to_dict(n: Any) -> dict:
     """Normalize a Graphiti node into get_entity's node dict shape.
 
@@ -1581,7 +1598,7 @@ class MemoryService:
                 'uuid': getattr(ep, 'uuid', None),
                 'name': getattr(ep, 'name', None),
                 'content': getattr(ep, 'content', None),
-                'created_at': str(_ca) if (_ca := getattr(ep, 'created_at', None)) is not None else None,
+                'created_at': _created_at_to_utc_iso(getattr(ep, 'created_at', None)),
                 'source': getattr(ep, 'source', None),
                 'group_id': getattr(ep, 'group_id', None),
             }
