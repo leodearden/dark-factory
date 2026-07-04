@@ -620,6 +620,106 @@ class TestWarmLaneBaseResolvable:
 
 
 # ===========================================================================
+# Task 2061 step-3: RED — GitOps.acquire_warm_lane pre-acquire base-health gate
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneBaseAbsent:
+    """Integration: acquire_warm_lane() is gated by _warm_lane_base_resolvable().
+
+    Mirrors TestAcquireWarmLaneDiskGuard (test_warm_lane_disk_guard.py) — an
+    absent CoW seed base is a HOST-SCOPED pool condition, so it must
+    short-circuit acquire_warm_lane BEFORE any lane is touched (no
+    worktree-add, no seed invocation), returning BASE_ABSENT — NOT FAULT —
+    so the caller requeues (fail-open, inv.6) instead of escalating a
+    per-task blocked+L1.
+    """
+
+    def _config_with_base(self, base_target_dir: str) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+            warm_lane_base_target_dir=base_target_dir,
+        )
+
+    async def test_absent_base_returns_base_absent(
+        self, wl_git_repo: Path,
+    ):
+        """Absent warm_lane_base_target_dir ⇒ BASE_ABSENT (NOT FAULT)."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        config = self._config_with_base(str(wl_git_repo / 'does_not_exist_base'))
+        git_ops = GitOps(config, wl_git_repo, warm_lane_pool_size=1)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert result is WarmLaneUnavailable.BASE_ABSENT, (
+            f'Expected BASE_ABSENT; got {result!r}'
+        )
+
+    async def test_absent_base_lane_dir_not_created(
+        self, wl_git_repo: Path,
+    ):
+        """BASE_ABSENT path: no worktree-add or seed ran (lane dir absent)."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        config = self._config_with_base(str(wl_git_repo / 'does_not_exist_base'))
+        git_ops = GitOps(config, wl_git_repo, warm_lane_pool_size=1)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert not (git_ops.worktree_base / '_lane-0').exists(), (
+            'Lane dir must not be created when base is absent'
+        )
+
+    async def test_absent_base_lane_stays_free(
+        self, wl_git_repo: Path,
+    ):
+        """BASE_ABSENT path: pool lane stays FREE — no ASSIGNED leak."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        config = self._config_with_base(str(wl_git_repo / 'does_not_exist_base'))
+        git_ops = GitOps(config, wl_git_repo, warm_lane_pool_size=1)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(
+            git_ops.worktree_base / '_lane-0'
+        ) == LaneState.FREE, 'Lane-0 must stay FREE when base is absent'
+
+    async def test_healthy_base_control_returns_worktree_info_unchanged(
+        self, wl_git_repo: Path, tmp_path: Path,
+    ):
+        """GREEN control: base present+non-empty ⇒ acquire proceeds exactly as today."""
+        await _add_seed_and_debug_port_scripts(wl_git_repo)
+        healthy_base = tmp_path / 'healthy_base'
+        healthy_base.mkdir()
+        (healthy_base / 'sentinel').write_text('x\n')
+        config = self._config_with_base(str(healthy_base))
+        git_ops = GitOps(config, wl_git_repo, warm_lane_pool_size=1)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Healthy base must return WorktreeInfo unchanged; got {result!r}'
+        )
+        assert result.path == git_ops.worktree_base / '_lane-0'
+
+
+# ===========================================================================
 # Step-5: RED — GitOps._seed_warm_lane
 # ===========================================================================
 
