@@ -32,6 +32,8 @@ from fused_memory.reconciliation.cli_stage_runner import (
     generate_summary_nonce,
 )
 from fused_memory.reconciliation.flag_dedup import (
+    _content_fingerprint,
+    _normalize_content_description,
     acknowledge_resolved_flags,
     compute_flag_signature,
     filter_blocked_snapshot_findings,
@@ -3338,6 +3340,30 @@ def _inject_flag_id(flag: dict) -> dict:
     if 'memory_id' in flag:
         return {**flag, 'flag_id': flag['memory_id']}
     return flag
+
+
+def _flag_content_fingerprint(item: dict) -> str | None:
+    """Return a normalized-content fingerprint for *item*, or ``None``.
+
+    Cross-channel dedup key (task-2078) for the recon_report_systemic poll in
+    :meth:`TaskKnowledgeSync.assemble_payload`. ``finding_id`` is never
+    available on the Mem0 side (a flag_for_stage2 marker's metadata carries
+    only task_id/flag_type/run_id), so content is the only reliable join key
+    between a Stage 1 / mem0_active_query item (keyed on ``content``) and a
+    polled recon_report_systemic finding (keyed on ``description``).
+
+    Text is read as ``item.get('content') or item.get('description') or ''``
+    so either field name resolves to the same fingerprint for identical text
+    — the cross-channel equality the dedup relies on. Returns ``None`` when
+    the normalized text is blank (mirrors
+    :func:`compute_content_fingerprint_signature`'s non-blank gate).
+
+    Pure, sync, no I/O.
+    """
+    text = item.get('content') or item.get('description') or ''
+    if not _normalize_content_description(text):
+        return None
+    return _content_fingerprint(text)
 
 
 def _format_flagged(
