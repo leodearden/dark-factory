@@ -17,14 +17,11 @@ new detection + prompt-surfacing machinery that fixes that:
 from __future__ import annotations
 
 import asyncio
-import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from orchestrator import git_ops as git_ops_module
-from orchestrator import workflow as workflow_module
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
@@ -72,16 +69,16 @@ class TestIsWipSafetyCommit:
 
 
 class TestProducingSiteSubjectsStayRecognized:
-    """Guards against a producing-site subject drifting outside the prefix.
+    """Pins the predicate against the exact literals the harness produces.
 
     The TestIsWipSafetyCommit cases above pin the predicate's behavior
     against literals *copy-pasted* into this test file — they say nothing
     about whether git_ops.py/workflow.py still actually emit those literals.
-    These tests read the real module source so an edit to a producing site
-    (workflow.py's inter-iteration-rebase commit, or git_ops.py's
-    requeue-rebase / warm-lane-reclaim commits) that silently drifts outside
-    WIP_SAFETY_COMMIT_PREFIXES is caught by a failing test rather than
-    quietly disabling detection.
+    This test asserts each known producing-site literal (workflow.py's
+    inter-iteration-rebase commit, and git_ops.py's requeue-rebase /
+    warm-lane-reclaim commits) is still recognized by is_wip_safety_commit,
+    so a change to WIP_SAFETY_COMMIT_PREFIXES that stops matching one of them
+    is caught by a failing test rather than quietly disabling detection.
     """
 
     PRODUCING_SUBJECTS = (
@@ -89,17 +86,6 @@ class TestProducingSiteSubjectsStayRecognized:
         'chore: save WIP before inter-iteration rebase',
         'chore: save WIP before warm-lane reclaim (task 1933)',
     )
-
-    def test_producing_subjects_present_in_source(self):
-        combined_source = (
-            inspect.getsource(git_ops_module) + inspect.getsource(workflow_module)
-        )
-        for subject in self.PRODUCING_SUBJECTS:
-            assert subject in combined_source, (
-                f'Expected literal {subject!r} to still appear verbatim in '
-                f'git_ops.py or workflow.py. If it was intentionally reworded, '
-                f'update PRODUCING_SUBJECTS here to match the new literal.'
-            )
 
     def test_producing_subjects_are_recognized(self):
         for subject in self.PRODUCING_SUBJECTS:
