@@ -385,7 +385,12 @@ class MemoryService:
         uuid) via ``merge_entities``.
 
         Modelled on ``_dedup_episode_edges``; handles None / empty result the
-        same way.
+        same way. Each merge is best-effort (mirrors
+        ``_restore_superseded_dependency_edges``): a transient backend error
+        merging one duplicate must not fail an already-committed episode
+        write, and must not stop subsequent duplicates/names from being
+        processed. Unmerged duplicates simply survive to be healed the next
+        time an episode touches that name.
 
         Args:
             result: The value returned by ``add_episode`` (typically an
@@ -394,8 +399,8 @@ class MemoryService:
                     gracefully.
 
         Returns:
-            Number of duplicate nodes merged into their canonical survivor
-            (0 when nothing to do).
+            Number of duplicate nodes successfully merged into their
+            canonical survivor (0 when nothing to do).
         """
         if result is None:
             return 0
@@ -414,17 +419,37 @@ class MemoryService:
             names.append(name)
 
         merged = 0
+        failed = 0
         for name in names:
             matches = await self.graphiti.find_duplicate_entity_nodes(name, group_id=group_id)
             if len(matches) < 2:
                 continue
             survivor = matches[0]['uuid']
             for dup in matches[1:]:
-                await self.graphiti.merge_entities(dup['uuid'], survivor, group_id=group_id)
-                merged += 1
+                dup_uuid = dup['uuid']
+                try:
+                    await self.graphiti.merge_entities(dup_uuid, survivor, group_id=group_id)
+                    merged += 1
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    # Best-effort: a transient backend error (lock contention,
+                    # write timeout) must not fail an already-committed episode
+                    # write.  Log and continue so the episode reports success.
+                    logger.exception(
+                        'Failed to merge exact-name duplicate node %s -> %s after '
+                        'add_episode; will retry on next episode',
+                        dup_uuid, survivor,
+                    )
+                    failed += 1
 
         if merged > 0:
             logger.info('Merged %d exact-name duplicate node(s) after add_episode', merged)
+        if failed > 0:
+            logger.warning(
+                'Failed to merge %d exact-name duplicate node(s) after add_episode',
+                failed,
+            )
         return merged
 
     async def _restore_superseded_dependency_edges(
