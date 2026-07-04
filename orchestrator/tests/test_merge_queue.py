@@ -21707,7 +21707,7 @@ class TestSnapshotInflightCollection:
 
         RED: InflightEntry has no started_at field (TypeError on construction).
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import InflightEntry
         from orchestrator.verify_runner import HostLease
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -21777,7 +21777,6 @@ class TestSnapshotInflightCollection:
         RED (step-3): current snapshot reads _verify_item for verify_in_progress,
         producing a phantom non-None entry when _verify_item is never cleared.
         """
-        from orchestrator.merge_queue import SpeculativeItem
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
@@ -21814,7 +21813,7 @@ class TestSnapshotInflightCollection:
         RED (step-3): verify_in_progress reads _verify_item (singular), so it is
         None when _verify_item is not set, even if _inflight is non-empty.
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import InflightEntry
         from orchestrator.verify_runner import HostLease
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -21967,7 +21966,7 @@ class TestHeartbeatOccupancy:
         """
         import json as _json
 
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import InflightEntry
         from orchestrator.verify_runner import HostAllocator, HostLease
 
         db_path = tmp_path / 'occ.db'
@@ -22078,7 +22077,7 @@ class TestEntryPhaseDuringFinalize:
         RED: _finalize_inflight sets self._verify_phase='finalizing' but NOT entry.phase,
         so entry.phase stays 'verifying' (stale dispatch-time value).
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import InflightEntry
         from orchestrator.verify_runner import HostLease
 
         branch = 'ep-finalize-a'
