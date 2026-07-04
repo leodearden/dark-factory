@@ -2153,6 +2153,9 @@ class MemoryService:
                 total_entities = len(targets)
                 if not dry_run:
                     all_edges = await self.graphiti.get_all_valid_edges(group_id=project_id)
+            elif entity_uuids is not None:
+                # entity_uuids == [] — explicit zero-count no-op, no backend calls.
+                pass
             elif force:
                 all_entities = await self.graphiti.list_entity_nodes(group_id=project_id)
                 targets = [
