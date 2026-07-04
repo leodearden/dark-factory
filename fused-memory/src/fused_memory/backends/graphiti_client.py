@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import importlib.util
 import logging
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -25,6 +26,34 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.utils.async_utils import propagate_cancellations
 
 logger = logging.getLogger(__name__)
+
+
+def check_openai_responses_api() -> None:
+    """Raise if the installed openai SDK lacks the Responses API surface.
+
+    graphiti-core's OpenAIClient calls ``client.responses.create(...)``,
+    which lazily resolves ``openai.resources.responses`` — a submodule
+    introduced in openai 1.66.0 (graphiti-core 0.28.2 hard-requires
+    openai>=1.91.0). An incompatible openai raises ``ModuleNotFoundError``
+    deep inside Graphiti write-path LLM extraction, where the durable queue
+    treats it as non-retriable and dead-letters silently after exhausting
+    retries (task 2053). Fail fast at startup instead, with an actionable
+    message, rather than a future SDK release that also removes/renames the
+    surface.
+    """
+    if importlib.util.find_spec('openai.resources.responses') is not None:
+        return
+    import openai
+
+    installed_version = getattr(openai, '__version__', '?')
+    raise RuntimeError(
+        f"Installed openai {installed_version} is missing the module "
+        "'openai.resources.responses', which graphiti-core's OpenAIClient "
+        "requires (client.responses.create). This module was added in "
+        "openai 1.66.0; graphiti-core 0.28.2 requires openai>=1.91.0. "
+        "Run `uv sync` in fused-memory and restart the service to install "
+        "a compatible openai version. (task 2053)"
+    )
 
 
 class EdgeDict(TypedDict):
