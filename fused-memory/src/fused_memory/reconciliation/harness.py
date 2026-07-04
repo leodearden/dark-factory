@@ -2487,6 +2487,27 @@ class ReconciliationHarness:
             )
             if isinstance(t, dict) and t.get('id') is not None
         }
+        # Task 2067: {str(task_id): task_kind} map, built the same way as
+        # status_by_id above (same source tasks, same coverage caveat). Lets the
+        # live-workflow gate below also drop the project-wide orchestrator_live
+        # signal for a BLOCKED cited task that is deterministic (never acquires a
+        # worktree/branch of its own — routed to DeterministicRunner), which
+        # status_by_id alone cannot express since 'blocked' is deliberately not
+        # in ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
+        # auto-unblock mid-pipeline).
+        task_kind_by_id: dict[str, str | None] = {
+            str(t.get('id')): (
+                t.get('metadata').get('task_kind')
+                if isinstance(t.get('metadata'), dict)
+                else None
+            )
+            for t in (
+                list(remediation_tree.active_tasks)
+                + list(remediation_tree.done_tasks)
+                + list(remediation_tree.cancelled_tasks)
+            )
+            if isinstance(t, dict) and t.get('id') is not None
+        }
 
         current_stage_name: str | None = None
         stages = self._make_stages()
@@ -2626,6 +2647,11 @@ class ReconciliationHarness:
                         # (deferred/done/cancelled, via status_by_id above) drop the
                         # project-wide orchestrator_live signal, so a deferred task stuck
                         # behind an unrelated live orchestrator still escalates.
+                        # Task 2067: extends this to a BLOCKED cited task that is
+                        # deterministic (via task_kind_by_id above) — it never
+                        # acquires a worktree/branch of its own, so the bare
+                        # orchestrator lock is not task-specific evidence for it
+                        # either, and a stranded deterministic deploy still escalates.
                         affected_ids = _derive_affected_ids(finding)
                         # For liveness, iterate only cited task ids.
                         # _derive_affected_ids mixes in entity canonical_names,
@@ -2642,7 +2668,9 @@ class ReconciliationHarness:
                         for tid in cited_task_ids:
                             try:
                                 if is_workflow_live_for_task(
-                                    tid, project_root, status=status_by_id.get(tid)
+                                    tid, project_root,
+                                    status=status_by_id.get(tid),
+                                    task_kind=task_kind_by_id.get(tid),
                                 ):
                                     any_live = True
                                     break
