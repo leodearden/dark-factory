@@ -439,9 +439,11 @@ class DeterministicRunner:
 
         Retries the ``before_done_verified_at``/``before_done_verified_pid``
         stamp (treating a ``False`` return from ``update_task`` as transient)
-        until it lands, then attempts the ``done`` write, within a bounded,
-        paced ``_writeback_max_attempts``/``_writeback_backoff_base`` budget.
-        Never re-runs the deploy script (I1 once-only — this helper only
+        until it lands, then retries the ``done`` write (catching a transient/
+        ``RuntimeError`` from ``set_task_status``'s own exhausted retry) —
+        both within the SAME bounded, paced ``_writeback_max_attempts``/
+        ``_writeback_backoff_base`` budget, without re-stamping and without
+        re-running the deploy script (I1 once-only — this helper only
         persists an already-completed deploy's outcome).
 
         Returns:
@@ -479,17 +481,33 @@ class DeterministicRunner:
                 'pid=%s unit=%s — setting done',
                 task_id, pid, target_unit,
             )
-            await self.scheduler.set_task_status(
-                task_id,
-                'done',
-                done_provenance={
-                    'kind': 'deterministic-deploy',
-                    'pid': pid,
-                    'active_enter_timestamp': active_enter_timestamp,
-                    'unit': target_unit,
-                },
-            )
-            return WorkflowOutcome.DONE
+            try:
+                await self.scheduler.set_task_status(
+                    task_id,
+                    'done',
+                    done_provenance={
+                        'kind': 'deterministic-deploy',
+                        'pid': pid,
+                        'active_enter_timestamp': active_enter_timestamp,
+                        'unit': target_unit,
+                    },
+                )
+                return WorkflowOutcome.DONE
+            except Exception as exc:
+                # set_task_status already exhausted its own transient retry
+                # budget (Scheduler._TRANSIENT_RETRIES) before raising — the
+                # connection may still be severed.  Retry the done-write
+                # within the SAME writeback budget rather than letting this
+                # propagate out of run() (stamped stays True — no re-stamp).
+                logger.warning(
+                    'DeterministicRunner: task %s done-write failed (attempt %d/%d): '
+                    '%s: %s — connection may still be severed; retrying',
+                    task_id, attempt + 1, self._writeback_max_attempts,
+                    type(exc).__name__, exc,
+                )
+                if attempt + 1 < self._writeback_max_attempts:
+                    await self._sleeper(self._writeback_backoff_base * (2 ** attempt))
+                continue
 
         # Loop exhaustion — the durable-escalation fallback is added in step-6.
         return WorkflowOutcome.BLOCKED
