@@ -11884,14 +11884,22 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         # Project-wide orchestrator lock reports live...
         monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
 
-        # ...and both git-derived signals are False for every branch (no worktree
-        # registered, unparseable "commit timestamp" => recent_commit fail-safe
-        # False), so orchestrator_live is the ONLY signal in play for both tasks.
+        # ...and both git-derived signals are False for every branch: no worktree
+        # registered (porcelain lists only the main worktree), and the
+        # commit-timestamp `git log` call exits non-zero (branch not found) so
+        # recent_commit is explicitly False via the returncode guard rather than
+        # via an unparseable-timestamp fallback. Mirrors the per-command dispatch
+        # in test_blocked_deterministic_does_not_suppress_worktree_signal
+        # (test_live_workflow_detector.py).
         def _no_git_signals(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout='worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n',
+                    stderr='',
+                )
             return subprocess.CompletedProcess(
-                args=args, returncode=0,
-                stdout='worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n',
-                stderr='',
+                args=args, returncode=1, stdout='', stderr='',
             )
 
         stage = make_configured_task_knowledge_sync_stage(
