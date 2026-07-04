@@ -55,7 +55,7 @@ _BACKUP_GLOBS = ('*.tmp.*', '*.py.tmp.*', '*.orig', '*.rej', '*.bak', '*.swp', '
 # to require a deliberate bump for genuine new sites, not something to
 # relax away.
 _EXPECTED_FACTORY_SITES = {
-    'orchestrator/src/orchestrator/merge_queue.py': 15,
+    'orchestrator/src/orchestrator/merge_queue.py': 9,
 }
 
 
