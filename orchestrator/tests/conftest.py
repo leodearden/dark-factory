@@ -5,6 +5,7 @@ uniquely-named sibling module — so they can be imported from test files
 without conflicting with sibling subprojects' conftests under
 `sys.modules['conftest']`.
 """
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -29,9 +30,15 @@ _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
+# Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
+# Must be set BEFORE any `orchestrator.merge_queue` import so the module-level
+# `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
+os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
+
 from _orch_helpers import drain_async_mock_coroutines, pydantic_spec  # noqa: E402
 from shared.config_models import UsageCapConfig  # noqa: E402
 
+from orchestrator import merge_queue  # noqa: E402
 from orchestrator.config import (  # noqa: E402
     EscalationConfig,
     FusedMemoryConfig,
@@ -40,6 +47,12 @@ from orchestrator.config import (  # noqa: E402
     ReviewConfig,
     SandboxConfig,
 )
+
+# Belt-and-braces direct assignment: defeats any import-order race where
+# orchestrator.merge_queue was imported (by another conftest/plugin) before
+# the os.environ.setdefault above took effect, which would have frozen its
+# module-level _DEBUG_ASSERTS seed at False.
+merge_queue._DEBUG_ASSERTS = True
 
 
 @pytest_asyncio.fixture(autouse=True)
