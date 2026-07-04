@@ -11281,13 +11281,22 @@ class TestGroupMergeRequestTrainVerifyRole:
 class TestMergeFailureDiagnostic:
     """Merge-failure diagnostic enrichment: base SHA, label, ref-resolution, git stderr."""
 
-    async def test_remerge_ghost_branch_sets_failure_diagnostic(
+    async def test_remerge_unknown_branch_intercepted_before_diagnostic(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """_remerge on a non-existent branch populates failure_diagnostic on the outcome.
+        """_remerge on a non-existent branch is intercepted by the shared
+        branch-presence guard and returns 'unknown_branch' before ever
+        attempting the merge — so it never reaches the merge-failure path and
+        carries no failure_diagnostic.
 
-        The 'task/ghost' ref does not exist → git fatal + branch_ref_in_worktree=<unresolved>.
-        This is the smoking-gun for the 2026-05-28 'not something we can merge' incident.
+        The 'task/ghost' ref does not exist — this is the smoking-gun for the
+        2026-05-28 'not something we can merge' incident.  MQ-refactor kappa
+        (task 1995) routes _remerge through the shared classify_and_merge
+        guard pipeline, so it now agrees with the Merger loop (see
+        test_merger_loop_unknown_branch_intercepted_before_diagnostic): this
+        scenario is caught by the branch-presence guard and classified as a
+        clean 'unknown_branch' terminal outcome instead of falling through to
+        a raw merge_to_main failure enriched with a failure_diagnostic.
         """
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
@@ -11297,28 +11306,12 @@ class TestMergeFailureDiagnostic:
 
         outcome = item.immediate_outcome
         assert outcome is not None
-        assert outcome.status == 'blocked'
+        assert outcome.status == 'unknown_branch', f'got {outcome}'
+        assert 'ghost' in outcome.reason
 
-        # failure_diagnostic must be populated with all four keys
-        assert outcome.failure_diagnostic is not None, (
-            'failure_diagnostic must be set on blocked outcome from _remerge'
-        )
-        diag = outcome.failure_diagnostic
-        assert len(diag['base_sha']) == 40, f'base_sha must be 40-char hex: {diag["base_sha"]!r}'
-        assert all(c in '0123456789abcdef' for c in diag['base_sha'])
-        assert diag['base_label'] == 'main_head'
-        assert diag['branch_ref_in_worktree'] == '<unresolved>'
-        assert isinstance(diag['git_stderr'], str) and diag['git_stderr'], (
-            'git_stderr must be a non-empty string'
-        )
-
-        # item.failure_diagnostic must mirror outcome.failure_diagnostic
-        assert item.failure_diagnostic == diag
-
-        # rendered labels must appear in reason for backward compat
-        assert 'base_sha=' in outcome.reason
-        assert 'base_label=main_head' in outcome.reason
-        assert 'branch_ref_in_worktree=<unresolved>' in outcome.reason
+        # guard short-circuits before the merge-failure path — no diagnostic
+        assert outcome.failure_diagnostic is None
+        assert item.failure_diagnostic is None
 
     async def test_merger_loop_unknown_branch_intercepted_before_diagnostic(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -11331,8 +11324,10 @@ class TestMergeFailureDiagnostic:
         Historical context: this is the 2026-05-28 'not something we can merge'
         misroute scenario (a request for a branch that never existed here).  It
         used to surface as blocked + failure_diagnostic[branch_ref_in_worktree=
-        '<unresolved>']; that diagnostic-enrichment path is still covered for
-        the _remerge case by test_remerge_ghost_branch_sets_failure_diagnostic.
+        '<unresolved>']; since MQ-refactor kappa (task 1995) routed _remerge
+        through the same shared classify_and_merge guard pipeline, _remerge now
+        agrees with this guard-first behaviour too — see
+        test_remerge_unknown_branch_intercepted_before_diagnostic.
         """
         # Real worktree (non-main HEAD) so the already-merged check would pass,
         # but the request branch 'ghost-m' has no refs/heads/task/ghost-m ref.
@@ -12484,7 +12479,15 @@ class TestSpeculationRaceRetry:
 
         Verifies:
         - merge_to_main called exactly twice
-        - 2nd call's base_sha == actual main at test time
+        - 2nd call's base_sha is None (MQ-refactor kappa / task 1995:
+          classify_and_merge only threads an explicit base_sha through to
+          merge_to_main for speculative merges; _remerge always calls it with
+          speculative=False, including on the race-retry, so merge_to_main
+          resolves "current main" itself rather than being handed the
+          separately pre-read retry_main SHA)
+        - the resulting item still carries base_sha == the freshly-read main
+          SHA (bookkeeping value), so the retry demonstrably targeted current
+          main even though it wasn't threaded into the mocked call
         - returned item has no immediate_outcome (flowing, not blocked)
         - _verify_and_advance returns True and resolves outcome.status == 'done'
         - caplog contains 'merge_retry_after_speculation_race'
@@ -12525,9 +12528,18 @@ class TestSpeculationRaceRetry:
         # merge_to_main must have been called exactly twice
         assert call_count == 2, f'Expected 2 calls to merge_to_main, got {call_count}'
 
-        # 2nd call's base_sha must be the actual main SHA (freshly read inside _remerge)
-        assert call_base_shas[1] == actual_main, (
-            f'2nd merge_to_main base_sha {call_base_shas[1]!r} != actual main {actual_main!r}'
+        # 2nd call's base_sha is None: classify_and_merge (speculative=False)
+        # never threads an explicit base_sha through to merge_to_main — it
+        # relies on merge_to_main's own "current main HEAD" resolution.
+        assert call_base_shas[1] is None, (
+            f'2nd merge_to_main base_sha {call_base_shas[1]!r}; expected None '
+            f'(non-speculative classify_and_merge calls never pass an '
+            f'explicit base_sha to merge_to_main)'
+        )
+        # The item's own base_sha bookkeeping field still reflects the fresh
+        # main read the retry was driven against.
+        assert item.base_sha == actual_main, (
+            f'item.base_sha {item.base_sha!r} != actual main {actual_main!r}'
         )
 
         # item must be flowing (no immediate_outcome), merge succeeded
