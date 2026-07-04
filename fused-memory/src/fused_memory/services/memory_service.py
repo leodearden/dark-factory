@@ -81,6 +81,20 @@ def _is_dependency_fact(fact: str | None) -> bool:
 # sync with the per-stage _STAGE1_CYCLE_SUMMARY_RECON_POOL /
 # _STAGE2_CYCLE_SUMMARY_RECON_POOL constants in reconciliation/stages/*.py —
 # a drift-guard test asserts the equality.
+#
+# Importing those constants directly here (instead of duplicating the
+# strings) was considered during task 2077 amendment review and confirmed —
+# empirically, not just by inspection — to create a real circular import:
+# fused_memory.reconciliation.stages.memory_consolidator imports
+# task_knowledge_sync, which imports fused_memory.services.
+# live_workflow_detector; fused_memory/services/__init__.py imports this
+# module (memory_service) first, before anything else. So an entry point
+# that imports memory_consolidator before fused_memory.services has been
+# touched raises "ImportError: cannot import name
+# '_STAGE1_CYCLE_SUMMARY_RECON_POOL' from partially initialized module ...
+# (most likely due to a circular import)". services.memory_service is a
+# lower layer than reconciliation.stages.*; keep the duplicated map plus the
+# drift-guard test rather than inverting that dependency direction.
 _CYCLE_SUMMARY_STAGE_TO_RECON_POOL: dict[str, str] = {
     'memory_consolidator': 'stage1_cycle_summary',
     'task_knowledge_sync': 'stage2_cycle_summary',
