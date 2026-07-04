@@ -148,6 +148,13 @@ _WRITEBACK_BACKOFF_BASE: float = 2.0
 # 5s comfortably covers a normal kernel-mediated reap while staying bounded.
 _REAP_GRACE_SECS: float = 5.0
 
+# Task 2090: outer wall-clock backstop around the cross-unit `run_fn` call in
+# run().  This is a pure safety margin ON TOP OF before_done['timeout_secs'] —
+# it must never fire before the inner script-runner timeout in the normal
+# case, so 30s is deliberately generous (covers process-group teardown +
+# reap_grace_secs with room to spare) rather than tight.
+_RUN_TIMEOUT_GRACE_SECS: float = 30.0
+
 
 class DeterministicRunner:
     """Per-slot runner for deterministic gate tasks.
@@ -178,6 +185,11 @@ class DeterministicRunner:
             whole-process-group SIGKILL on timeout (task 2090).  Defaults to
             ``_REAP_GRACE_SECS``.  Injected in tests so an unkillable-process
             test doesn't actually wait.
+        run_timeout_grace_secs: Extra margin (seconds), added to
+            ``before_done['timeout_secs']``, for the outer wall-clock guard
+            around the cross-unit ``run_fn`` call in ``run()`` (task 2090).
+            Defaults to ``_RUN_TIMEOUT_GRACE_SECS``.  Injected in tests so a
+            stuck-run_fn test doesn't actually wait.
     """
 
     def __init__(
@@ -192,6 +204,7 @@ class DeterministicRunner:
         writeback_backoff_base=_WRITEBACK_BACKOFF_BASE,
         sleeper=None,
         reap_grace_secs=_REAP_GRACE_SECS,
+        run_timeout_grace_secs=_RUN_TIMEOUT_GRACE_SECS,
     ):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
@@ -203,6 +216,7 @@ class DeterministicRunner:
         self._writeback_backoff_base = writeback_backoff_base
         self._sleeper = sleeper or asyncio.sleep
         self._reap_grace_secs = reap_grace_secs
+        self._run_timeout_grace_secs = run_timeout_grace_secs
 
     # ------------------------------------------------------------------
     # Default injectable seam implementations
@@ -1102,9 +1116,50 @@ class DeterministicRunner:
                 inspect_fn = self._unit_inspector or self._default_inspect_unit
                 baseline = await inspect_fn(target_unit)
 
-                # Run the deploy script to completion (blocking, cross-unit)
+                # Run the deploy script to completion (blocking, cross-unit).
+                # Task 2090 Layer B: wrap the call in an outer wall-clock guard
+                # that is UNCONDITIONAL — it does not depend on run_fn (or the
+                # subprocess it spawns) ever dying.  Layer A hardens the
+                # DEFAULT script_runner's own timeout handling, but an
+                # injected/custom seam could still hang forever or raise
+                # something unexpected; either way run() must reach
+                # _file_infra_issue_and_block rather than stranding the task
+                # with before_done_ran_at stamped and zero escalations filed
+                # (the exact task-2087 evidence).  The outer bound is strictly
+                # greater than before_done['timeout_secs'] so a well-behaved
+                # seam always flows through the rc!=0 path below first — this
+                # is a pure backstop, not a replacement for it.
                 run_fn = self._script_runner or self._default_run_script
-                rc, out = await run_fn(before_done)
+                outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
+                try:
+                    rc, out = await asyncio.wait_for(run_fn(before_done), timeout=outer_timeout)
+                except TimeoutError:
+                    timeout_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Deploy run_fn exceeded the outer guard timeout ({outer_timeout}s = '
+                        f"before_done['timeout_secs'] + run_timeout_grace_secs).",
+                        'The subprocess may be detached/unkillable — check the unit out-of-band '
+                        '(e.g. systemctl --user status, ps) before taking further action.',
+                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy run_fn timed out (subprocess hung): {target_unit}',
+                        detail=timeout_detail,
+                    )
+                except Exception as exc:
+                    error_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Deploy run_fn raised an unexpected error: {exc!r}',
+                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy run_fn failed (unexpected error): {target_unit}',
+                        detail=error_detail,
+                    )
 
                 if rc != 0:
                     # B7a: script failed — file infra_issue escalation, set blocked (B7a)
