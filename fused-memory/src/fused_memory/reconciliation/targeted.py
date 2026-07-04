@@ -431,7 +431,7 @@ class TargetedReconciler:
                     if description:
                         content += f" {description}"
                     details = task.get('details', '')
-                    if details:
+                    if isinstance(details, str) and details:
                         content += f"\nDetails: {_truncate_clean(details, 500)}"
 
             write_metadata: dict[str, Any] = {

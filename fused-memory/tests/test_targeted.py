@@ -2693,6 +2693,39 @@ async def test_on_task_done_legacy_details_fallback_truncates_cleanly(
 
 
 @pytest.mark.asyncio
+async def test_on_task_done_legacy_details_fallback_skips_non_str_details(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """A non-str `details` (e.g. a list slipping through task metadata) must
+    not crash _truncate_clean's len()/slicing/.isspace() chain. Mirroring
+    _format_outcome_echo's isinstance guard on `note`, the fallback simply
+    omits the Details section instead of propagating a TypeError."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '361', 'title': 'Autopilot task', 'status': 'done',
+        'metadata': {},
+    })
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'details': ['not', 'a', 'string'],
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    content = calls[0].kwargs.get('content') or ''
+    assert '\nDetails: ' not in content, (
+        f'Expected no Details section for non-str details, got: {content!r}'
+    )
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
 async def test_on_task_done_authoritative_memory_wins_over_provenance(
     reconciler, mock_memory_service, mock_taskmaster,
 ):
