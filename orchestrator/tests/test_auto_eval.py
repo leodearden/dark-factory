@@ -421,3 +421,69 @@ async def test_auto_eval_back_link_forwards_merge_mode(tmp_path: Path, monkeypat
     assert blob.get('memory_hints') == ['hint-A'], (
         f"Sibling memory_hints must survive in written blob; got: {blob}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Supersede prior auto-eval redo siblings on repeated re-block (task 2075)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_supersedes_prior_redo_siblings(tmp_path: Path):
+    f = _make(project_root=tmp_path / 'proj')
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-1',
+            'status': 'deferred',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-2',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    submitted = [c for c in f.submit_calls if c[0] == 'submit_task']
+    status_calls = [c for c in f.submit_calls if c[0] == 'set_task_status']
+    cancelled = [c for c in status_calls if c[1].get('status') == 'cancelled']
+    flipped = [c for c in status_calls if c[1].get('status') == 'pending']
+
+    assert len(submitted) == 1
+    assert {c[1].get('id') for c in cancelled} == {'redo-old-1', 'redo-old-2'}
+    # The new redo's own deferred → pending flip must still fire.
+    assert len(flipped) == 1
+    assert flipped[0][1].get('id') == 'redo-1'
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert len(emit_calls) == 1
+    data = emit_calls[0].kwargs['data']
+    assert set(data['superseded_redo_ids']) == {'redo-old-1', 'redo-old-2'}
+
+
+@pytest.mark.asyncio
+async def test_no_supersede_when_no_prior_redos(tmp_path: Path):
+    """Regression guard: happy path unchanged when there are no prior redos."""
+    f = _make(project_root=tmp_path / 'proj')
+    # _make's default scheduler.get_tasks stub returns [] (no prior siblings).
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    status_calls = [c for c in f.submit_calls if c[0] == 'set_task_status']
+    cancelled = [c for c in status_calls if c[1].get('status') == 'cancelled']
+    flipped = [c for c in status_calls if c[1].get('status') == 'pending']
+
+    assert cancelled == []
+    assert len(flipped) == 1
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert len(emit_calls) == 1
+    assert emit_calls[0].kwargs['data']['superseded_redo_ids'] == []
