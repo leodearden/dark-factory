@@ -4,8 +4,16 @@ Retires the task-1928 field-drop bug class structurally: SpeculativeItem and
 InflightEntry validate their own shape at construction time instead of relying
 on every call site to hand-build a consistent set of fields.
 
-step-1  RED  — SpeculativeItem XOR / merge_wt-iff-merge_result / already_delivered
-step-3  RED  — InflightEntry passthrough_outcome shadow invariant
+Task ο (2000) supersedes the original XOR / merge_wt-iff-merge_result /
+already_delivered ValueError tests: SpeculativeItem is now a
+``RealMergeItem | DecidedItem`` union alias, so the illegal states those
+tests used to construct-then-reject are UNREPRESENTABLE — attempting to pass
+a cross-variant field is a TypeError (unknown kwarg) at construction time,
+not a post-hoc ValueError from __post_init__. See
+TestRealMergeItemUnrepresentability / TestDecidedItemUnrepresentability.
+
+step-1  RED  — [ο] union unrepresentability (supersedes SpeculativeItem XOR / merge_wt-iff / already_delivered)
+step-3  RED  — InflightEntry passthrough_outcome shadow invariant (retargeted to isinstance(item, DecidedItem))
 step-7  RED  — InflightStatus str-compatible Enum
 """
 
@@ -18,98 +26,113 @@ import pytest
 
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_queue import (
+    DecidedItem,
     InflightEntry,
     InflightVerifyResult,
     MergeOutcome,
+    RealMergeItem,
     SpeculativeItem,
 )
 
-# ── step-1: SpeculativeItem shape validation ─────────────────────────────────
+# ── ο: RealMergeItem / DecidedItem unrepresentability (supersedes step-1 XOR/merge_wt/already_delivered) ──
 
 
 def _real_kwargs() -> dict:
-    """Minimal well-formed REAL SpeculativeItem kwargs (merge_result+merge_wt set)."""
+    """Minimal well-formed RealMergeItem kwargs."""
     return dict(
         request=MagicMock(),
         merge_result=MergeResult(success=True, merge_commit='deadbeef'),
         merge_wt=Path('/fake/merge-wt'),
         base_sha='aabbccdd',
         speculative=False,
-        skip_verify=False,
     )
 
 
 def _decided_kwargs() -> dict:
-    """Minimal well-formed DECIDED SpeculativeItem kwargs (immediate_outcome set)."""
+    """Minimal well-formed DecidedItem kwargs."""
     return dict(
         request=MagicMock(),
-        merge_result=None,
-        merge_wt=None,
         base_sha='aabbccdd',
         speculative=False,
-        skip_verify=False,
         immediate_outcome=MergeOutcome('blocked', reason='test'),
     )
 
 
-class TestSpeculativeItemXorInvariant:
-    """Exactly one of {merge_result, immediate_outcome} may be non-None."""
+class TestRealMergeItemUnrepresentability:
+    """A RealMergeItem cannot carry any DECIDED-only field: passing one is a
+    TypeError (unknown kwarg) at construction time, never a runtime shape
+    check — the illegal state cannot be built at all."""
 
-    def test_both_set_raises(self) -> None:
+    def test_immediate_outcome_kwarg_raises_type_error(self) -> None:
         kwargs = _real_kwargs()
         kwargs['immediate_outcome'] = MergeOutcome('conflict')
-        with pytest.raises(ValueError):
-            SpeculativeItem(**kwargs)
+        with pytest.raises(TypeError):
+            RealMergeItem(**kwargs)
 
-    def test_both_none_raises(self) -> None:
+    def test_already_delivered_kwarg_raises_type_error(self) -> None:
         kwargs = _real_kwargs()
-        kwargs['merge_result'] = None
-        kwargs['merge_wt'] = None
-        with pytest.raises(ValueError):
-            SpeculativeItem(**kwargs)
+        kwargs['already_delivered'] = True
+        with pytest.raises(TypeError):
+            RealMergeItem(**kwargs)
+
+    def test_lacks_decided_only_attributes(self) -> None:
+        item = RealMergeItem(**_real_kwargs())
+        assert not hasattr(item, 'immediate_outcome')
+        assert not hasattr(item, 'already_delivered')
+        assert not hasattr(item, 'failure_diagnostic')
 
     def test_real_shape_constructs(self) -> None:
-        item = SpeculativeItem(**_real_kwargs())
+        item = RealMergeItem(**_real_kwargs())
         assert item.merge_result is not None
-        assert item.immediate_outcome is None
+        assert item.merge_wt is not None
+
+
+class TestDecidedItemUnrepresentability:
+    """A DecidedItem cannot carry any REAL-only field: passing one is a
+    TypeError (unknown kwarg) at construction time, never a runtime shape
+    check — the illegal state cannot be built at all."""
+
+    def test_merge_result_kwarg_raises_type_error(self) -> None:
+        kwargs = _decided_kwargs()
+        kwargs['merge_result'] = MergeResult(success=True, merge_commit='deadbeef')
+        with pytest.raises(TypeError):
+            DecidedItem(**kwargs)
+
+    def test_merge_wt_kwarg_raises_type_error(self) -> None:
+        kwargs = _decided_kwargs()
+        kwargs['merge_wt'] = Path('/fake/merge-wt')
+        with pytest.raises(TypeError):
+            DecidedItem(**kwargs)
+
+    def test_lacks_real_only_attributes(self) -> None:
+        item = DecidedItem(**_decided_kwargs())
+        assert not hasattr(item, 'merge_result')
+        assert not hasattr(item, 'merge_wt')
+        assert not hasattr(item, 'merged_branch_tip')
+        assert not hasattr(item, 'counts_against_cap')
 
     def test_decided_shape_constructs(self) -> None:
-        item = SpeculativeItem(**_decided_kwargs())
+        item = DecidedItem(**_decided_kwargs())
         assert item.immediate_outcome is not None
-        assert item.merge_result is None
 
 
-class TestSpeculativeItemMergeWtInvariant:
-    """merge_wt is not None iff merge_result is not None."""
+class TestSpeculativeItemUnionAlias:
+    """SpeculativeItem is a RealMergeItem | DecidedItem union alias,
+    importable unchanged from both merge_types and the merge_queue shim."""
 
-    def test_merge_result_without_merge_wt_raises(self) -> None:
-        kwargs = _real_kwargs()
-        kwargs['merge_wt'] = None
-        with pytest.raises(ValueError):
-            SpeculativeItem(**kwargs)
+    def test_isinstance_real_against_union(self) -> None:
+        assert isinstance(RealMergeItem(**_real_kwargs()), SpeculativeItem)
 
-    def test_merge_wt_without_merge_result_raises(self) -> None:
-        kwargs = _decided_kwargs()
-        kwargs['immediate_outcome'] = None
-        kwargs['merge_wt'] = Path('/fake/merge-wt')
-        with pytest.raises(ValueError):
-            SpeculativeItem(**kwargs)
+    def test_isinstance_decided_against_union(self) -> None:
+        assert isinstance(DecidedItem(**_decided_kwargs()), SpeculativeItem)
 
-
-class TestSpeculativeItemAlreadyDeliveredInvariant:
-    """already_delivered=True requires immediate_outcome to be set."""
-
-    def test_already_delivered_without_immediate_outcome_raises(self) -> None:
-        kwargs = _real_kwargs()
-        kwargs['already_delivered'] = True
-        with pytest.raises(ValueError):
-            SpeculativeItem(**kwargs)
-
-    def test_already_delivered_with_immediate_outcome_constructs(self) -> None:
-        kwargs = _decided_kwargs()
-        kwargs['already_delivered'] = True
-        item = SpeculativeItem(**kwargs)
-        assert item.already_delivered is True
+    def test_importable_from_merge_types(self) -> None:
+        from orchestrator.merge_types import DecidedItem as mt_DecidedItem
+        from orchestrator.merge_types import RealMergeItem as mt_RealMergeItem
+        from orchestrator.merge_types import SpeculativeItem as mt_SpeculativeItem
+        assert mt_SpeculativeItem is SpeculativeItem
+        assert mt_RealMergeItem is RealMergeItem
+        assert mt_DecidedItem is DecidedItem
 
 
 # ── step-3: InflightEntry passthrough_outcome shadow invariant ───────────────
@@ -130,23 +153,23 @@ def _entry_kwargs(item: SpeculativeItem, **overrides: object) -> dict:
 
 
 class TestInflightEntryPassthroughInvariant:
-    """passthrough_outcome is not None => item.immediate_outcome is not None."""
+    """passthrough_outcome is not None => item is a DecidedItem."""
 
     def test_passthrough_outcome_wrapping_real_item_raises(self) -> None:
-        real_item = SpeculativeItem(**_real_kwargs())
+        real_item = RealMergeItem(**_real_kwargs())
         with pytest.raises(ValueError):
             InflightEntry(**_entry_kwargs(real_item, passthrough_outcome=MergeOutcome('conflict')))
 
     def test_passthrough_outcome_wrapping_decided_item_constructs(self) -> None:
-        decided_item = SpeculativeItem(**_decided_kwargs())
+        decided_item = DecidedItem(**_decided_kwargs())
         entry = InflightEntry(
             **_entry_kwargs(decided_item, passthrough_outcome=decided_item.immediate_outcome),
         )
         assert entry.passthrough_outcome is decided_item.immediate_outcome
 
     def test_no_passthrough_outcome_wrapping_any_item_constructs(self) -> None:
-        real_item = SpeculativeItem(**_real_kwargs())
-        decided_item = SpeculativeItem(**_decided_kwargs())
+        real_item = RealMergeItem(**_real_kwargs())
+        decided_item = DecidedItem(**_decided_kwargs())
         InflightEntry(**_entry_kwargs(real_item, passthrough_outcome=None))
         InflightEntry(**_entry_kwargs(decided_item, passthrough_outcome=None))
 
