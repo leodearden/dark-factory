@@ -285,6 +285,27 @@ def _deterministic_deploy_health_verdict(inspect_result: dict | None) -> str:
     wall-clock ActiveEnterTimestamp comparison is deliberately avoided; the
     escalation still routes through the existing watcher/human path for final
     adjudication).  None-safe: a missing/malformed result is 'unconfirmed'.
+
+    CAVEAT (task 2074 amendment): this is a pure liveness check, NOT a
+    freshness check — it does not confirm that *this* deploy's restart is
+    what made the unit active, only that the unit is up right now.  For a
+    long-lived/always-on service unit (the common case — e.g.
+    'fused-memory.service'), the verdict is near-constant 'healthy'
+    regardless of whether the triggering restart actually took effect,
+    because the unit was probably already active before the deploy ran too.
+    DeterministicRunner's own in-run verify path avoids this ambiguity by
+    comparing a freshly-observed ActiveEnterTimestampMonotonic against a
+    baseline captured immediately before the restart — but that baseline is
+    a local variable, never persisted to task metadata, so it does not exist
+    for a task stranded by a PAST run (this sweep's Source-A recovery case,
+    e.g. task 2059) and a retroactive freshness comparison is not possible
+    without touching deterministic_runner.py to persist one going forward
+    (out of scope for task 2074). Callers (Source A's stranded_blocked/resume
+    filing and Source B's auto-resolve) accept this weaker signal: it is
+    still strictly better than the prior silent-strand status quo, and both
+    paths RE-FILE/resolve an escalation rather than flipping task status
+    directly, so a wrong verdict surfaces via the normal escalation/watcher
+    machinery rather than silently corrupting state.
     """
     if not inspect_result:
         return 'unconfirmed'
@@ -895,7 +916,7 @@ class Harness:
         # Injectable unit-inspector seam (mirrors DeterministicRunner's
         # constructor-injected unit_inspector); None uses the module-level
         # default _recon_inspect_unit.  Injected in tests to avoid real systemd.
-        self._recon_unit_inspector = None
+        self._recon_unit_inspector: Callable[[str], Awaitable[dict]] | None = None
 
         # No-landings circuit-breaker — θ=1893, PRD §5.5.
         # Pure detection logic lives in merge_queue.NoLandingsCircuitBreaker;
@@ -2880,12 +2901,44 @@ Output JSON matching the schema. Every task must appear in the output.
             # the L1 and let resolution drive the status change.  The /unblock
             # blocked-park protection (pending-escalation check above) is also
             # preserved — an open L1 of any category prevents re-filing.
+            #
+            # task_kind == 'deterministic' tasks are excluded here (task 2074
+            # amendment) and delegated exclusively to
+            # _recover_stranded_deterministic_task via the deterministic-recon
+            # sweep.  Rationale: this generic backstop and that sweep write to
+            # the SAME queue and dedup on the SAME get_by_task(tid,
+            # status='pending') check, so whichever fires first wins — and the
+            # escalation-watcher-auto's `stranded_blocked` routing
+            # (skills/escalation-watcher-auto/SKILL.md) auto-resumes ANY
+            # category='stranded_blocked' L1 once its predicate holds,
+            # regardless of the filer's suggested_action or role.  If this
+            # generic reaper won the race for a deterministic-deploy task
+            # whose target unit is actually down, it would file
+            # stranded_blocked/manual_intervention — which still gets
+            # auto-resumed the same as a health-verified 'resume', silently
+            # bypassing the live-systemd-health check that is the entire
+            # point of the task-2074 sweep.  Excluding deterministic tasks
+            # here means only the health-aware sweep ever files their first
+            # escalation, so an unhealthy unit correctly gets
+            # infra_issue/manual_intervention instead.
+            #
+            # The active-workflow guards below (`tid not in
+            # self._escalation_events`, `not self._workflow_cancel_recent`)
+            # are intentionally NOT reimplemented in the deterministic sweep:
+            # task_kind='deterministic' tasks never enter the LLM/workflow
+            # pipeline (no worktree, no branch, no agent — see
+            # DeterministicRunner), so their tid can never appear in
+            # `_escalation_events` or `_workflow_cancel_at`.  Both guards
+            # would be vacuously true for every deterministic task, so
+            # omitting them from the sweep is a no-op simplification, not a
+            # missing safety check.
             if (
                 self.config.stranded_blocked_escalate_enabled
                 and self._escalation_queue is not None
                 and tid not in self._escalation_events       # no active workflow
                 and not self._workflow_cancel_recent(tid)     # not a recent cancel/park
                 and not self._escalation_queue.get_by_task(tid, status='pending')
+                and metadata.get('task_kind') != 'deterministic'
             ):
                 from escalation.models import Escalation
 
@@ -6827,7 +6880,10 @@ Output JSON matching the schema. Every task must appear in the output.
         (nothing to inspect).  Otherwise awaits the injected
         ``self._recon_unit_inspector`` (falling back to the module-level
         ``_recon_inspect_unit`` default) and classifies the result via
-        ``_deterministic_deploy_health_verdict``.
+        ``_deterministic_deploy_health_verdict`` — see that function's
+        docstring for the important CAVEAT: 'healthy' is a liveness signal,
+        not proof that *this* deploy is what brought the unit up, and for an
+        always-on service unit it is near-constant 'healthy'.
         """
         before_done = (metadata or {}).get('before_done')
         target_unit = before_done.get('target_unit') if isinstance(before_done, dict) else None
@@ -6997,17 +7053,35 @@ Output JSON matching the schema. Every task must appear in the output.
         falling back to ``scheduler.get_task`` for an escalation whose task
         wasn't in the blocked set.
 
-        A and B are mutually exclusive per task by construction (A requires
-        an empty pending queue; B requires an open escalation), so a single
-        pass never double-handles one task.  Both loops are per-item
-        fail-soft: one bad task/escalation is logged and does not abort the
-        rest of the pass.
+        A and B are mutually exclusive per task ACROSS passes by construction
+        (A requires an empty pending queue; B requires an open escalation) —
+        once A files an escalation for a tid, the queue is non-empty so A
+        will not re-fire for it on a later pass; B then owns re-validation
+        and self-heals when the unit recovers.
+
+        WITHIN a single pass, Source B's ``get_pending()`` re-globs the queue
+        directory and so CAN observe an escalation Source A just filed a few
+        lines above (task 2074 amendment — this was previously only true
+        "by accident": an A-filed 'stranded_blocked' escalation isn't
+        'infra_issue' so B's category filter skips it, and an A-filed
+        'infra_issue' one re-verifies to the same 'unconfirmed' verdict
+        within one pass, so re-observing it was a no-op in practice but not
+        by any enforced invariant).  To make the exclusion literally true
+        rather than an implementation-detail coincidence, this method tracks
+        every tid Source A recovered this pass in ``recovered_this_pass`` and
+        the Source-B loop skips any escalation for one of those tids
+        outright — so no task is EVER handled by both sources in the same
+        pass, regardless of category/role filtering or verdict stability.
+
+        Both loops are per-item fail-soft: one bad task/escalation is logged
+        and does not abort the rest of the pass.
         """
         if self._escalation_queue is None:
             return
 
         tasks = await self.scheduler.get_tasks(statuses=['blocked'])
         task_by_id: dict[str, dict] = {}
+        recovered_this_pass: set[str] = set()
         for task in tasks:
             tid = str(task.get('id', ''))
             if not tid:
@@ -7022,6 +7096,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 if self._escalation_queue.get_by_task(tid, status='pending'):
                     continue
                 await self._recover_stranded_deterministic_task(tid, task, metadata)
+                recovered_this_pass.add(tid)
             except Exception as exc:
                 logger.error(
                     'Deterministic-recon-sweep: Source-A recovery failed for '
@@ -7030,6 +7105,8 @@ Output JSON matching the schema. Every task must appear in the output.
                 )
 
         for esc in self._escalation_queue.get_pending():
+            if esc.task_id in recovered_this_pass:
+                continue
             try:
                 task = task_by_id.get(esc.task_id)
                 if task is None:
