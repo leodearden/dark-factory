@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import WIP_SAFETY_COMMIT_PREFIXES, GitOps, _run, is_wip_safety_commit
@@ -326,3 +327,85 @@ class TestDetectTipWipCommits:
         result = await workflow._detect_tip_wip_commits()
 
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: BriefingAssembler.build_implementer_prompt wip_notice rendering
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def briefing(tmp_path: Path) -> BriefingAssembler:
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    return BriefingAssembler(config)
+
+
+@pytest.fixture
+def minimal_plan() -> dict:
+    return {
+        'task_id': '2051',
+        'title': 'T',
+        'analysis': 'A',
+        'prerequisites': [],
+        'steps': [{'id': 'step-1', 'status': 'pending'}],
+    }
+
+
+@pytest.mark.asyncio
+class TestBuildImplementerPromptWipNotice:
+    async def test_wip_notice_renders_header_sha_and_mark_step_done(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        wip_notice = [
+            {'sha': 'abcdef1234567890', 'subject': 'chore: save WIP before requeue rebase'},
+        ]
+
+        prompt = await briefing.build_implementer_prompt(
+            minimal_plan, [], context='', wip_notice=wip_notice,
+        )
+
+        assert 'Verify Before Re-Implementing' in prompt
+        assert 'abcdef123456' in prompt
+        assert 'mark_step_done' in prompt
+
+    async def test_wip_notice_none_omits_section(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        prompt = await briefing.build_implementer_prompt(
+            minimal_plan, [], context='', wip_notice=None,
+        )
+
+        assert 'Verify Before Re-Implementing' not in prompt
+
+    async def test_wip_notice_empty_list_omits_section(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        prompt = await briefing.build_implementer_prompt(
+            minimal_plan, [], context='', wip_notice=[],
+        )
+
+        assert 'Verify Before Re-Implementing' not in prompt
+
+    async def test_rebase_notice_still_renders_independently_of_wip_notice(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        rebase_notice = {
+            'old_base': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            'new_base': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+            'changed_files': ['foo.py'],
+        }
+
+        prompt = await briefing.build_implementer_prompt(
+            minimal_plan, [], context='', rebase_notice=rebase_notice, wip_notice=None,
+        )
+
+        assert 'Rebase Notice' in prompt
+        assert 'Verify Before Re-Implementing' not in prompt
