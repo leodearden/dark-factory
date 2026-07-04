@@ -573,6 +573,9 @@ class MemoryService:
         await self._dedup_episode_edges(result, group_id=payload['group_id'])
         # Post-write restore: undo false dependency-edge supersessions
         await self._restore_superseded_dependency_edges(result, group_id=payload['group_id'])
+        # Post-write node dedup: merge exact-name duplicate entity nodes that
+        # graphiti_core ingestion failed to reuse
+        await self._dedup_episode_nodes(result, group_id=payload['group_id'])
 
         # Register planning episodes so they can be filtered from search results
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
