@@ -82,10 +82,17 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      (B7a).
    - Re-inspect and verify a fresh ``MainPID`` (>0, non-sentinel) and a
      strictly-later ``ActiveEnterTimestampMonotonic`` (B7b).
-   - If ``always_escalates=False``: stamp ``before_done_verified_at`` (the
-     positive proof the resume path requires), then set task to ``done`` with
+   - If ``always_escalates=False``: hand off to ``_writeback_deploy_success``
+     (task 2066), which stamps ``before_done_verified_at`` (the positive proof
+     the resume path requires) and then sets the task to ``done`` with
      ``done_provenance.kind='deterministic-deploy'`` carrying the fresh PID
-     and timestamp (B6); return DONE.
+     and timestamp (B6).  Both writes are patiently retried — bounded and
+     paced — because the deploy script may itself have severed the
+     orchestrator's own fused-memory/MCP connection (e.g. it restarted the
+     service backing that connection); a plain retry recovers once the
+     connection auto-reconnects.  If the writeback budget is exhausted
+     first, files a durable local ``infra_issue`` escalation and returns
+     BLOCKED instead of silently stranding the task with an empty queue.
    - If ``always_escalates=True``: fall through to gate (act-then-ask).
 
 3. **Pure gate** (``before_done=None``, ``always_escalates=True``):
