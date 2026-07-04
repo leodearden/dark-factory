@@ -2931,9 +2931,27 @@ class TaskKnowledgeSync(BaseStage):
         # finding from Stage 2 through this path.  Deduped against
         # combined_flags (Stage 1 + Mem0 channels) by compute_flag_signature so
         # a finding that also survived the primary channel is not double-rendered.
+        #
+        # Content-fingerprint fallback (task-2078): compute_flag_signature
+        # requires BOTH task_id and flag_type to produce a signature. A
+        # systemic_pattern finding frequently has task_id=None (no single
+        # owning task), and a legacy flag_for_stage2 marker can omit
+        # flag_type — in either case the signature is None on at least one
+        # side, existing_signatures misses the match, and the SAME finding
+        # renders twice: once as mem0_active_query (carries flag_id, drives
+        # FIX C deletion + stage1_mem0_flags_processed) and once as a
+        # flag_id-less recon_report_systemic duplicate processed as a
+        # separate no-op — causing the per-cycle narrative summary and the
+        # structured stats block to disagree (incident: flag 2d2ad790).
+        # existing_content_fps closes this gap using the normalized-content
+        # fingerprint as an additional, additive join key.
         existing_signatures = {
             sig for flag in combined_flags
             if (sig := compute_flag_signature(flag)) is not None
+        }
+        existing_content_fps = {
+            fp for flag in combined_flags
+            if (fp := _flag_content_fingerprint(flag)) is not None
         }
         polled_systemic_findings = _query_recon_report_findings(
             self._recon_report_state, self._current_run_id
@@ -2941,7 +2959,10 @@ class TaskKnowledgeSync(BaseStage):
         appended = 0
         for finding in polled_systemic_findings:
             sig = compute_flag_signature(finding)
-            if sig is not None and sig in existing_signatures:
+            fp = _flag_content_fingerprint({'content': finding.get('description')})
+            if (sig is not None and sig in existing_signatures) or (
+                fp is not None and fp in existing_content_fps
+            ):
                 continue
             combined_flags.append(
                 {
@@ -2954,6 +2975,8 @@ class TaskKnowledgeSync(BaseStage):
             )
             if sig is not None:
                 existing_signatures.add(sig)
+            if fp is not None:
+                existing_content_fps.add(fp)
             appended += 1
         self._recon_report_systemic_polled = appended
 
