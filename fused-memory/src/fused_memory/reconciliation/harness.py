@@ -924,7 +924,7 @@ class ReconciliationHarness:
                 'source': 'stage1_status_correction',
             }
             content = (
-                f'Stage 1 status-correction reconciliation (task 1938): the cached '
+                f'Stage 1 status-correction reconciliation: the cached '
                 f'project_status_correction memory diverged from the authoritative '
                 f"get_statuses census: done={live['done']} total={live['total']} "
                 f"active={len(live['active_tasks'])}."
