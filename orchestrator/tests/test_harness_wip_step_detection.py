@@ -18,16 +18,17 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import WIP_SAFETY_COMMIT_PREFIXES, GitOps, _run, is_wip_safety_commit
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # step-1 RED: is_wip_safety_commit predicate + WIP_SAFETY_COMMIT_PREFIXES
@@ -409,3 +410,64 @@ class TestBuildImplementerPromptWipNotice:
 
         assert 'Rebase Notice' in prompt
         assert 'Verify Before Re-Implementing' not in prompt
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED: _execute_iterations forwards the detected wip_notice
+# ---------------------------------------------------------------------------
+#
+# Reproduces the cross-dispatch requeue-WIP-at-HEAD scenario: a real WIP
+# safety-commit is already at HEAD when the workflow's FIRST iteration runs
+# (execute_iterations == 0, so no inter-iteration rebase fires) — this is the
+# path that requeue/warm-lane-reclaim commits (not inter-iteration rebase)
+# would produce.
+
+
+@pytest.mark.asyncio
+class TestExecuteIterationsForwardsWipNotice:
+    async def test_wip_notice_forwarded_to_build_implementer_prompt(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'wip.txt').write_text('uncommitted work\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
+        assert wip_sha, 'Setup: expected a real WIP commit at HEAD'
+
+        plan = {
+            'task_id': '42',
+            'title': 'X',
+            'analysis': 'A',
+            'prerequisites': [],
+            'steps': [{'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None}],
+        }
+        artifacts.write_plan(plan)
+        artifacts.stamp_plan_provenance(workflow.session_id)
+        workflow.plan = artifacts.read_plan()
+
+        def _mark_step_done_side_effect(*args, **kwargs):
+            artifacts.update_step_status('step-1', 'done', 'impl-commit-sha')
+            return AgentResult(success=True, output='')
+
+        workflow.briefing.build_implementer_prompt = AsyncMock(return_value='impl')
+        workflow._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+        workflow._get_head_commit = AsyncMock(return_value='head-sha')  # type: ignore[method-assign]
+        workflow._invoke = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_mark_step_done_side_effect,
+        )
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.briefing.build_implementer_prompt.await_count == 1
+        call_kwargs = workflow.briefing.build_implementer_prompt.call_args.kwargs
+        assert call_kwargs.get('wip_notice'), (
+            f'Expected non-empty wip_notice kwarg, got {call_kwargs}'
+        )
+        surfaced_shas = {n['sha'] for n in call_kwargs['wip_notice']}
+        assert wip_sha in surfaced_shas, (
+            f'Expected WIP commit {wip_sha} in surfaced wip_notice, got {surfaced_shas}'
+        )
