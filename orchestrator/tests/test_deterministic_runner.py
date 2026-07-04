@@ -71,7 +71,7 @@ def _deploy_task(
     args: list | None = None,
     env: dict | None = None,
     cwd: str = '/tmp',
-    timeout_secs: int = 30,
+    timeout_secs: int | float = 30,
     before_done_ran_at: str | None = None,
     before_done_verified_at: str | None = None,
     before_done_verified_pid: int | None = None,
