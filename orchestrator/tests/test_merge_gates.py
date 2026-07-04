@@ -26,6 +26,7 @@ mirroring task α's test_merge_types.py:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -507,3 +508,164 @@ class TestGateFunctionsReachBack:
         assert verdict.emit_subtype == 'post_merge_pyright_broken'
         assert verdict.reason is not None
         assert verdict.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+class TestFinalizeDrivesRegistry:
+    """_finalize_advanced_merge iterates POST_ADVANCE_GATES (task λ).
+
+    RED against the still-inline body: ``test_finalize_runs_registered_gate``
+    and ``test_finalize_logs_gate_names_per_landing`` fail today because the
+    inline _finalize_advanced_merge never reads POST_ADVANCE_GATES at all.
+    The remaining two tests pin the existing equivalence-block / γ2-chain
+    behavior so it survives the coming registry-driven rewrite unchanged.
+    """
+
+    def _make_finalize_args(self, **overrides: object) -> dict:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops._last_advanced_sha = 'finalize-registry-sha'
+        req = MagicMock()
+        req.task_id = 'task-finalize-registry'
+        req.branch = 'br-finalize-registry'
+        req.worktree = MagicMock()
+        req.config = MagicMock()
+        req.module_configs = []
+        defaults: dict = dict(
+            git_ops=git_ops,
+            req=req,
+            event_store=None,
+            merge_commit_fallback='fallback-sha',
+            base_sha='base-sha',
+            started_monotonic=0.0,
+            cas_retries={},
+            timeouts={},
+            enospc_retries={},
+        )
+        defaults.update(overrides)
+        return defaults
+
+    async def test_finalize_runs_registered_gate(self, monkeypatch) -> None:
+        """Headline signal: a gate appended to POST_ADVANCE_GATES runs during
+        _finalize_advanced_merge WITHOUT any edit to _finalize's body."""
+        import orchestrator.merge_gates as merge_gates
+        from orchestrator.merge_gates import Gate, GateVerdict, _finalize_advanced_merge
+
+        spy_run = AsyncMock(return_value=GateVerdict.ok())
+        monkeypatch.setattr(
+            merge_gates, 'POST_ADVANCE_GATES',
+            [*merge_gates.POST_ADVANCE_GATES, Gate('noop-probe', spy_run)],
+        )
+
+        clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
+        args = self._make_finalize_args()
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=clean_pyright),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(**args)
+
+        spy_run.assert_awaited_once()
+        assert outcome.status == 'done'
+        args['git_ops'].push_main.assert_awaited_once()
+
+    async def test_finalize_logs_gate_names_per_landing(self, caplog) -> None:
+        from orchestrator.merge_gates import _finalize_advanced_merge
+
+        clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
+        args = self._make_finalize_args()
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=clean_pyright),
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            await _finalize_advanced_merge(**args)
+
+        matching = [
+            r for r in caplog.records
+            if 'post-advance gates run:' in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f'expected exactly one gate-names INFO line, got {len(matching)}: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        assert 'equivalence' in matching[0].getMessage()
+        assert 'pyright' in matching[0].getMessage()
+
+    async def test_finalize_equivalence_block_via_registry(self, caplog) -> None:
+        from orchestrator.merge_gates import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        args = self._make_finalize_args(chain_ctx=None)
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=['f.py']),
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            outcome = await _finalize_advanced_merge(**args)
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+        assert outcome.merge_sha == args['git_ops']._last_advanced_sha
+        args['git_ops'].push_main.assert_not_awaited()
+
+        gate_lines = [
+            r.getMessage() for r in caplog.records
+            if 'post-advance gates run:' in r.getMessage()
+        ]
+        assert len(gate_lines) == 1, (
+            f'expected exactly one gate-names INFO line, got: {gate_lines}'
+        )
+        assert 'equivalence' in gate_lines[0]
+        assert 'pyright' not in gate_lines[0]
+
+    async def test_finalize_gamma2_chain_via_registry(self) -> None:
+        from orchestrator.merge_gates import _GenerationChainContext, _finalize_advanced_merge
+        from orchestrator.merge_types import MergeOutcome
+
+        chain_ctx = _GenerationChainContext(
+            queue=MagicMock(), counts={}, max_auto_generations=3,
+        )
+        chained_outcome = MergeOutcome('superseded', merge_sha='chained-sha')
+        event_store = MagicMock()
+        args = self._make_finalize_args(
+            chain_ctx=chain_ctx, merged_branch_tip='trusted-tip', event_store=event_store,
+        )
+
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=['f.py']),
+            ),
+            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch(
+                'orchestrator.merge_queue._maybe_auto_chain_generation',
+                AsyncMock(return_value=chained_outcome),
+            ) as maybe_chain_mock,
+        ):
+            outcome = await _finalize_advanced_merge(**args)
+
+        assert outcome is chained_outcome
+        maybe_chain_mock.assert_awaited_once()
+
+        emitted = [call.kwargs['data']['outcome'] for call in event_store.emit.call_args_list]
+        assert emitted == ['post_merge_equivalence_failed', 'post_merge_generation_chained'], (
+            f'expected the equivalence-failed emit before the chained emit, got: {emitted}'
+        )
