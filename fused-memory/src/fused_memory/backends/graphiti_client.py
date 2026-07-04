@@ -765,8 +765,21 @@ class GraphitiBackend:
         each directed edge to appear under both its source and target entity: for a
         directed A→B edge, traversal matches it from A's side (row: A.uuid, e.uuid)
         and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
-        n.uuid differs.  RETURN DISTINCT guards only against self-loop duplicates
-        (A→A edges, where both traversal directions yield identical rows).
+        n.uuid differs.
+
+        Deduplicates by the (entity, edge-element) pair (WITH DISTINCT n, e), not
+        by the (uuid, fact, name) property tuple. FalkorDB does not enforce
+        property uniqueness, and redirect_node_edges (the merge path) copies
+        new.uuid = old.uuid onto redirected edges, so an entity can carry
+        multiple genuinely-distinct RELATES_TO relationships that share one
+        (uuid, fact, name) tuple — a property-tuple RETURN DISTINCT would
+        collapse those into a single row and undercount edge_count.
+        WITH DISTINCT n, e preserves the intended double-attribution (each
+        directed edge appears once under each endpoint entity, as distinct
+        (n, e) pairs) and still collapses the undirected self-loop
+        double-match (A→A edges, where both traversal directions yield the
+        identical (n, e) pair), while no longer collapsing distinct edges
+        that merely share copied properties.
 
         Uses ro_query since no writes are performed.
 
@@ -787,7 +800,8 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity)-[e:RELATES_TO]-() '
             'WHERE e.invalid_at IS NULL '
-            'RETURN DISTINCT n.uuid, e.uuid, e.fact, e.name'
+            'WITH DISTINCT n, e '
+            'RETURN n.uuid, e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher)
         grouped: dict[str, list[EdgeDict]] = {}
