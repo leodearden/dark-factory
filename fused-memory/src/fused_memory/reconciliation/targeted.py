@@ -1256,8 +1256,13 @@ def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) 
       signalling the caller to fall back to the existing description+details
       append (preserves legacy/no-provenance behavior).
 
-    ``note`` is truncated to ``max_note_chars`` to bound the memory write —
-    mirroring the existing ``details[:500]`` cap in the fast-path append.
+    ``note`` is cleanly truncated (word-boundary cut, ``_truncate_clean``) to
+    ``max_note_chars`` to bound the memory write — mirroring the
+    ``details[:500]`` cap in the fast-path append (also cleanly truncated,
+    task 2080). A prior revision used a raw ``note[:max_note_chars]`` slice,
+    which cut mid-word/mid-number (task 2054: "8679,8680" garbled to
+    "8679,868") and, in the note+commit branch, glued the ``" (commit
+    <sha>)"`` suffix directly onto that broken fragment.
     """
     if not isinstance(provenance, dict):
         return None
@@ -1266,9 +1271,9 @@ def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) 
     note = raw_note.strip() if isinstance(raw_note, str) else ''
     commit = raw_commit.strip() if isinstance(raw_commit, str) else ''
     if note and commit:
-        return f'{note[:max_note_chars]} (commit {commit})'
+        return f'{_truncate_clean(note, max_note_chars)} (commit {commit})'
     if note:
-        return note[:max_note_chars]
+        return _truncate_clean(note, max_note_chars)
     if commit:
         return f'Landed in commit {commit}.'
     return None
