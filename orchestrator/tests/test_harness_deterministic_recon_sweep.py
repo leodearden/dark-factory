@@ -32,7 +32,13 @@ This file covers:
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from _orch_helpers import _init_harness_state_for_test
+
 from orchestrator.config import OrchestratorConfig
+from orchestrator.harness import Harness, _deterministic_deploy_health_verdict
 
 # ---------------------------------------------------------------------------
 # step-1: Config field presence and defaults
@@ -45,3 +51,85 @@ def test_config_defaults_deterministic_recon_sweep() -> None:
     config = OrchestratorConfig()
     assert config.deterministic_recon_sweep_enabled is True
     assert config.deterministic_recon_sweep_interval_secs == 900.0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_recon_harness() -> Harness:
+    """Build a minimal bare Harness for deterministic-recon-sweep tests."""
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    h.config = OrchestratorConfig()
+    h.scheduler = MagicMock()
+    h._escalation_queue = MagicMock()
+    h._escalation_queue.make_id = MagicMock(return_value='esc-recon-1')
+    h._recon_unit_inspector = None
+    h._deterministic_recon_sweep_task = None
+    return h
+
+
+# ---------------------------------------------------------------------------
+# step-3: pure health-verdict fn + Harness._revalidate_deterministic_deploy_health
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicDeployHealthVerdict:
+    """step-3: harness._deterministic_deploy_health_verdict pure function."""
+
+    def test_healthy_when_pid_positive_and_active(self) -> None:
+        result = _deterministic_deploy_health_verdict({'MainPID': 1234, 'ActiveState': 'active'})
+        assert result == 'healthy'
+
+    def test_unconfirmed_when_pid_zero(self) -> None:
+        result = _deterministic_deploy_health_verdict({'MainPID': 0, 'ActiveState': 'active'})
+        assert result == 'unconfirmed'
+
+    def test_unconfirmed_when_not_active(self) -> None:
+        result = _deterministic_deploy_health_verdict({'MainPID': 1234, 'ActiveState': 'failed'})
+        assert result == 'unconfirmed'
+
+    def test_unconfirmed_when_inspect_result_is_none(self) -> None:
+        assert _deterministic_deploy_health_verdict(None) == 'unconfirmed'
+
+    def test_unconfirmed_when_inspect_result_is_empty(self) -> None:
+        assert _deterministic_deploy_health_verdict({}) == 'unconfirmed'
+
+
+class TestRevalidateDeployHealth:
+    """step-3: Harness._revalidate_deterministic_deploy_health."""
+
+    @pytest.mark.asyncio
+    async def test_revalidate_calls_injected_inspector_and_returns_verdict(self) -> None:
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(
+            return_value={'MainPID': 4321, 'ActiveState': 'active'}
+        )
+        metadata = {'before_done': {'target_unit': 'fused-memory.service'}}
+
+        verdict = await h._revalidate_deterministic_deploy_health(metadata)
+
+        assert verdict == 'healthy'
+        h._recon_unit_inspector.assert_awaited_once_with('fused-memory.service')
+
+    @pytest.mark.asyncio
+    async def test_revalidate_unconfirmed_when_no_before_done(self) -> None:
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock()
+
+        verdict = await h._revalidate_deterministic_deploy_health({})
+
+        assert verdict == 'unconfirmed'
+        h._recon_unit_inspector.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_revalidate_unconfirmed_when_no_target_unit(self) -> None:
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock()
+
+        verdict = await h._revalidate_deterministic_deploy_health({'before_done': {}})
+
+        assert verdict == 'unconfirmed'
+        h._recon_unit_inspector.assert_not_awaited()
