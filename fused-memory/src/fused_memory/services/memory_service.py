@@ -1550,6 +1550,25 @@ class MemoryService:
         return {'uuid': edge_uuid, 'name': name, 'fact': fact}
 
     # ------------------------------------------------------------------
+    # Read: get_entity_by_uuid (topological direct-UUID diagnostic — task 2086)
+    # ------------------------------------------------------------------
+
+    async def get_entity_by_uuid(self, entity_uuid: str, project_id: str) -> dict:
+        """Fetch a single Entity node by UUID from Graphiti (topological readback).
+
+        Unlike get_entity (name-based, with fuzzy fallback and a semantic edge
+        gather), this is a direct UUID lookup with no edge gather — intended as
+        a diagnostic for confirming node identity without the fuzzy/semantic
+        matching that can mask duplicate-node pathology.
+
+        Returns {uuid, name, summary} on success.  Raises NodeNotFoundError on
+        miss.  group_id is mapped from project_id to match the Graphiti storage
+        convention.
+        """
+        name, summary = await self.graphiti.get_node_text(entity_uuid, group_id=project_id)
+        return {'uuid': entity_uuid, 'name': name, 'summary': summary}
+
+    # ------------------------------------------------------------------
     # Read: get_memory (thin dispatcher for cite_memory — task β)
     # ------------------------------------------------------------------
 

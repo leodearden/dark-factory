@@ -15,6 +15,7 @@ import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 
+from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
@@ -1093,6 +1094,78 @@ def create_mcp_server(
                 agent_id=agent_id,
                 session_id=session_id,
                 params={'name': name},
+                success=False,
+                error=str(e),
+            )
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def get_entity_by_uuid(
+        entity_uuid: str,
+        project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Read-only topological diagnostic — look up an Entity node directly by its UUID.
+
+        Unlike get_entity (name-based, with fuzzy fallback and a semantic
+        edge-gather), this does a direct UUID readback with no edge gather:
+        just the node's own {uuid, name, summary}. Use this when you already
+        have the node UUID (e.g. from a prior search/get_entity result) and
+        want to confirm its identity without the fuzzy/semantic matching that
+        can mask duplicate-node pathology.
+
+        Args:
+            entity_uuid: UUID of the Entity node to look up
+            project_id: Project scope (required)
+            agent_id: Which agent is reading (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := validate_project_id(project_id):
+            return err
+        try:
+            result = await memory_service.get_entity_by_uuid(
+                entity_uuid=entity_uuid, project_id=project_id
+            )
+            await _log_read(
+                operation='get_entity_by_uuid',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'entity_uuid': entity_uuid},
+                result_summary={
+                    'found': True,
+                    'name': result.get('name'),
+                    'has_summary': bool(result.get('summary')),
+                },
+            )
+            return result
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except NodeNotFoundError as e:
+            # Expected diagnostic outcome, not a backend failure — this tool
+            # exists specifically to confirm whether a node exists. Log it
+            # as a successful read that resolved to "not found" so read-op
+            # error metrics stay reserved for genuine backend errors.
+            await _log_read(
+                operation='get_entity_by_uuid',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'entity_uuid': entity_uuid},
+                result_summary={'found': False},
+            )
+            return {'error': str(e), 'error_type': type(e).__name__}
+        except Exception as e:
+            logger.exception(f'get_entity_by_uuid error: {e}')
+            await _log_read(
+                operation='get_entity_by_uuid',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'entity_uuid': entity_uuid},
                 success=False,
                 error=str(e),
             )
