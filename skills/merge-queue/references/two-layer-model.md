@@ -121,6 +121,7 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `recompute_suffix_conflict_graph()` | merge_queue.py | Worker delegator → `SuffixConflictTracker.recompute()` (suffix_graph.py); recomputes the conflict graph, triggers bounce |
 | `_bounce_conflicting_suffix_items()` | merge_queue.py | Worker delegator → `SuffixConflictTracker.bounce_conflicting_suffix_items()` (suffix_graph.py); graph-time disk-free bounce of the younger conflicting item |
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
+| `classify_and_merge()` | merge_queue.py | Shared pre-merge guard + merge + drop-guard pipeline (branch-presence → already-merged → merge → conflict/non-conflict-failure → drop-guard), returning `MergedOk \| Decided`; `MergeWorker._do_merge`, `SpeculativeMergeWorker._merger_loop`, and `SpeculativeMergeWorker._remerge` all delegate to it instead of each running its own duplicated inline copy (MQ-refactor task κ, task 1995) |
 
 ### 7.1 merge_types.py — request/outcome/item/entry types + registries (MQ-refactor task α)
 
@@ -136,6 +137,8 @@ sites — `from orchestrator.merge_queue import MergeRequest`, etc. — keep wor
 | `GroupMergeRequest` | merge_types.py | `MergeRequest` subclass for an atomic linear-stacked train merge |
 | `MergeOutcome` | merge_types.py | Result delivered to the caller via the request's Future |
 | `SpeculativeItem` | merge_types.py | Internal message from the Merger coroutine to the Verifier coroutine |
+| `MergedOk` | merge_types.py | `classify_and_merge`'s REAL-arm return value (mirrors `SpeculativeItem`'s REAL/DECIDED split): `merge_result` + `merge_wt` + `branch_tip` for a merge that actually happened (MQ-refactor task κ, task 1995) |
+| `Decided` | merge_types.py | `classify_and_merge`'s DECIDED-arm return value: a terminal `MergeOutcome` (+ the failed `MergeResult`, when one was attempted) (MQ-refactor task κ, task 1995) |
 | `InflightEntry` | merge_types.py | An in-flight verify entry held in `SpeculativeMergeWorker._inflight` |
 | `InflightVerifyResult` | merge_types.py | Result returned by `SpeculativeMergeWorker._run_inflight_verify` |
 | `SoloVerifyResult` | merge_types.py | Result of verifying a single train member's delta in isolation |
