@@ -61,6 +61,26 @@ PushResult = Literal['pushed', 'noop', 'rejected', 'error']
 RecoverResult = Literal['rewound', 'cas_failed', 'error']
 
 
+# Single source of truth for the WIP safety-commit subject prefix produced by
+# _inter_iteration_rebase (workflow.py), and the requeue-rebase /
+# warm-lane-reclaim paths below (commit() call sites in this module). Any
+# code that mints a new "save WIP before X" safety-commit must share this
+# prefix so is_wip_safety_commit() (and therefore TaskWorkflow.
+# _detect_tip_wip_commits) keeps recognizing it.
+WIP_SAFETY_COMMIT_PREFIXES = ('chore: save WIP before ',)
+
+
+def is_wip_safety_commit(subject: str) -> bool:
+    """Return True if ``subject`` is one of the harness's WIP safety-commits.
+
+    These are auto-commits the harness makes to snapshot uncommitted work
+    before a rebase/requeue/reclaim operation. They can land a still-pending
+    plan step's complete implementation at branch HEAD before mark_step_done
+    is called for that step — see TaskWorkflow._detect_tip_wip_commits.
+    """
+    return subject.strip().startswith(WIP_SAFETY_COMMIT_PREFIXES)
+
+
 class TrainMembership(TypedDict, total=False):
     """Train metadata passed from task.metadata.train.
 
