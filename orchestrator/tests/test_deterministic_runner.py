@@ -774,6 +774,56 @@ class TestCrossUnitWritebackResilience:
         # (d) I1 — the deploy script is NEVER re-run, even across writeback retries.
         script_runner.assert_awaited_once()
 
+    async def test_done_write_retried_past_transient_set_task_status_error(self, tmp_path: Path):
+        """A transient RuntimeError from set_task_status('done', ...) is retried
+        within budget rather than propagating out of run() (task 2066)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        # before_done_verified_at stamps fine (connection alive for that write);
+        # the FIRST done-write hits a transient RuntimeError (connection severed
+        # mid-writeback), the second succeeds (connection recovered).
+        scheduler.set_task_status = AsyncMock(
+            side_effect=[RuntimeError('transient: fused-memory unavailable'), None]
+        )
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=5,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE, (
+            'A transient set_task_status RuntimeError must be retried within '
+            'budget, not propagate out of run()'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if len(c.args) > 1 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) >= 2, (
+            f'Expected set_task_status to be retried at least twice for the '
+            f'done write; got {len(done_calls)} call(s)'
+        )
+        script_runner.assert_awaited_once()
+        assert queue.get_by_task('2066') == [], (
+            'No escalation should be filed when the writeback recovers within budget'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Default seam: _default_run_script env merge
