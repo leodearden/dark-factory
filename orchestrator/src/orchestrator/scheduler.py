@@ -2306,9 +2306,14 @@ class Scheduler:
         masquerades as a genuine outage.
 
         State machine:
-          - health == 'ok' and latched → resolve (fire resolve callback,
-            clear all three latch fields).  This is the natural clear when
-            ``GitOps.refresh_warm_base`` (git_ops.py ~1659) rebuilds the base.
+          - health == 'ok' and latched → resolve: clear all three latch
+            fields FIRST, then best-effort fire the resolve callback
+            (try/except-wrapped) — same ordering as the disabled/probe-None
+            branch below, so dispatch is guaranteed to resume even if the
+            resolve callback raises (reviewer_comprehensive
+            robustness_state_machine, task 2061 amendment pass).  This is
+            the natural clear when ``GitOps.refresh_warm_base``
+            (git_ops.py ~1659) rebuilds the base.
           - health != 'absent' (ok-while-unlatched, or indeterminate) → no-op.
           - health == 'absent' and not latched → engage: stamp
             ``_warm_base_hard_down_since = now``, fire ONE warn notice.
@@ -2368,11 +2373,21 @@ class Scheduler:
 
         if health == 'ok':
             if self._warm_base_hard_down:
-                if self._on_warm_base_resolve is not None:
-                    await self._on_warm_base_resolve()
+                # Clear the latch FIRST — mirrors the disabled/probe-None
+                # branch above — so dispatch is guaranteed to resume even if
+                # the resolve callback raises (reviewer_comprehensive
+                # robustness_state_machine, task 2061 amendment pass).
                 self._warm_base_hard_down = False
                 self._warm_base_hard_down_since = None
                 self._warm_base_l2_promoted = False
+                if self._on_warm_base_resolve is not None:
+                    try:
+                        await self._on_warm_base_resolve()
+                    except Exception:
+                        logger.warning(
+                            'warm-base resolve on probe-recovery raised',
+                            exc_info=True,
+                        )
             return
 
         if health != 'absent':
