@@ -365,3 +365,101 @@ class TestRevalidateOpenDeterministicEscalation:
         await h._revalidate_open_deterministic_escalation(esc, {'id': 'tid'}, metadata)
 
         h._escalation_queue.resolve.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# step-11: Harness._run_deterministic_recon_sweep — single testable pass
+# ---------------------------------------------------------------------------
+
+
+class TestRunDeterministicReconSweep:
+    """step-11: single-pass orchestration of Source A + Source B."""
+
+    @pytest.mark.asyncio
+    async def test_source_a_recovers_absent_escalation_strand(self) -> None:
+        h = _make_recon_harness()
+        metadata = _strand_metadata()
+        task = {'id': 'tid-a', 'status': 'blocked', 'metadata': metadata}
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])
+        h._escalation_queue.get_pending = MagicMock(return_value=[])
+        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        await h._run_deterministic_recon_sweep()
+
+        h._recover_stranded_deterministic_task.assert_awaited_once_with(
+            'tid-a', task, metadata
+        )
+        h._revalidate_open_deterministic_escalation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_source_b_revalidates_open_escalation_not_source_a(self) -> None:
+        h = _make_recon_harness()
+        metadata = _strand_metadata()
+        task = {'id': 'tid-b', 'status': 'blocked', 'metadata': metadata}
+        esc = _make_esc(
+            category='infra_issue', agent_role='orchestrator-deterministic', task_id='tid-b',
+        )
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[esc])
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])
+        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        await h._run_deterministic_recon_sweep()
+
+        h._recover_stranded_deterministic_task.assert_not_awaited()
+        h._revalidate_open_deterministic_escalation.assert_awaited_once_with(
+            esc, task, metadata
+        )
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_deterministic_and_done_tasks(self) -> None:
+        h = _make_recon_harness()
+        normal_task = {
+            'id': 'tid-normal', 'status': 'blocked', 'metadata': {'task_kind': 'normal'},
+        }
+        done_task = {'id': 'tid-done', 'status': 'done', 'metadata': _strand_metadata()}
+        h.scheduler.get_tasks = AsyncMock(return_value=[normal_task, done_task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])
+        h._escalation_queue.get_pending = MagicMock(return_value=[])
+        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        await h._run_deterministic_recon_sweep()
+
+        h._recover_stranded_deterministic_task.assert_not_awaited()
+        h._revalidate_open_deterministic_escalation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_escalation_queue(self) -> None:
+        h = _make_recon_harness()
+        h._escalation_queue = None
+        h.scheduler.get_tasks = AsyncMock(side_effect=AssertionError('should not be called'))
+
+        await h._run_deterministic_recon_sweep()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_per_item_fail_soft(self) -> None:
+        h = _make_recon_harness()
+        metadata = _strand_metadata()
+        bad_task = {'id': 'tid-bad', 'status': 'blocked', 'metadata': metadata}
+        good_task = {'id': 'tid-good', 'status': 'blocked', 'metadata': metadata}
+        h.scheduler.get_tasks = AsyncMock(return_value=[bad_task, good_task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])
+        h._escalation_queue.get_pending = MagicMock(return_value=[])
+
+        calls: list[str] = []
+
+        async def _recover(tid, task, meta):
+            calls.append(tid)
+            if tid == 'tid-bad':
+                raise RuntimeError('boom')
+
+        h._recover_stranded_deterministic_task = _recover  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        await h._run_deterministic_recon_sweep()  # must not raise
+
+        assert calls == ['tid-bad', 'tid-good']
