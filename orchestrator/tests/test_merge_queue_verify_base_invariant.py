@@ -3,11 +3,16 @@
 Covers:
   step-01 RED — _verify_base_frozen_tip_violations() composed into
                 two_layer_invariants(): a frozen entry whose base_sha is not
-                the expected frozen-tip base produces a DISTINCTLY-worded
-                violation (surfaced by both two_layer_invariants() directly
-                and snapshot()['two_layer_invariants']); a HEALTHY multi-entry
-                chained frozen prefix produces NO such violation (guards
-                against a naive "every entry == newest tip" implementation).
+                the expected frozen-tip base produces a violation, verified
+                structurally (via a direct call to the helper, then asserting
+                two_layer_invariants() and snapshot()['two_layer_invariants']
+                compose that same output) rather than by matching violation
+                message wording — the two checks are intentionally worded
+                distinctly (see merge_queue.py docstrings) but that wording is
+                cosmetic and free to change without breaking these tests. A
+                HEALTHY multi-entry chained frozen prefix produces NO such
+                violation (guards against a naive "every entry == newest tip"
+                implementation).
 
 See _warn_if_verify_base_not_frozen_tip (merge_queue.py) for the log-only
 dispatch-time guard this promotes to snapshot granularity, and
@@ -17,7 +22,6 @@ check_frozen_prefix_invariant for the base-chain math this mirrors.
 from __future__ import annotations
 
 import asyncio
-import re
 from pathlib import Path
 from typing import Literal
 
@@ -160,22 +164,6 @@ def _make_inflight_entry(
     )
 
 
-def _verify_base_violations(violations: list[str], rid: str) -> list[str]:
-    """Filter *violations* to ones with the DISTINCT verify-base/frozen-tip wording naming *rid*.
-
-    Matches /verify.?base/ (case-insensitive) AND 'frozen' AND the rid — a
-    pattern the pre-existing 'frozen-prefix base-chain broken' string does not
-    satisfy (no 'verify-base' wording), so a non-empty result here proves the
-    NEW sub-check fired rather than the pre-existing base-chain check.
-    """
-    return [
-        v for v in violations
-        if re.search(r'verify.?base', v, re.IGNORECASE)
-        and 'frozen' in v.lower()
-        and rid in v
-    ]
-
-
 # ── step-01 RED: _verify_base_frozen_tip_violations() composed into two_layer_invariants ──
 
 
@@ -190,11 +178,17 @@ class TestVerifyBaseFrozenTipPromotion:
     async def test_stale_verify_base_produces_distinct_violation(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """A frozen head entry whose base_sha is NOT main_sha → distinct verify-base violation.
+        """A frozen head entry whose base_sha is NOT main_sha → dedicated verify-base violation.
 
-        Surfaced both directly via two_layer_invariants() and via
-        snapshot()['two_layer_invariants'] (which reads _last_known_main_sha,
-        per λ=1895's real-main-not-frozen-tip convention).
+        Asserts a STRUCTURAL signal that the new sub-check fired — calling
+        :meth:`_verify_base_frozen_tip_violations` directly — rather than
+        inferring it from violation-message wording (regex-matching prose is
+        fragile: it breaks on a legitimate reword and would pass even if the
+        wrong check produced the matching words). :meth:`two_layer_invariants`
+        and ``snapshot()['two_layer_invariants']`` (which reads
+        _last_known_main_sha, per λ=1895's real-main-not-frozen-tip
+        convention) are each checked to COMPOSE that same helper output
+        verbatim, proving the wiring rather than the wording.
         """
         worker = _make_worker(git_ops)
         main_sha = 'M0'
@@ -205,24 +199,33 @@ class TestVerifyBaseFrozenTipPromotion:
         worker._inflight.append(_make_inflight_entry(item, verifying=True))
         rid = item.request.request_id
 
-        violations = worker.two_layer_invariants(main_sha)
-        new_violations = _verify_base_violations(violations, rid)
-        assert new_violations, (
-            f'expected a distinct verify-base/frozen-tip violation naming {rid!r}, '
-            f'got: {violations}'
+        # Structural signal: call the dedicated helper directly instead of
+        # grepping combined output for wording that "looks like" the new check.
+        direct_violations = worker._verify_base_frozen_tip_violations(main_sha)
+        assert direct_violations, (
+            f'expected _verify_base_frozen_tip_violations() to flag {rid!r} directly, '
+            f'got: {direct_violations}'
         )
-        assert not any('base-chain broken' in v for v in new_violations), (
-            'the new verify-base violation must be distinctly worded from the '
-            f'pre-existing base-chain check, got: {new_violations}'
+        assert all(rid in v for v in direct_violations), (
+            f'expected every violation to name {rid!r}, got: {direct_violations}'
         )
 
-        # snapshot()['two_layer_invariants'] must surface the same violation —
+        # two_layer_invariants() must compose the helper's own output verbatim —
+        # a behavioral proof that sub-check (iii) is wired in, independent of
+        # whatever wording either check happens to use.
+        violations = worker.two_layer_invariants(main_sha)
+        assert all(v in violations for v in direct_violations), (
+            f'expected two_layer_invariants() to include every violation returned by '
+            f'_verify_base_frozen_tip_violations(), got: {violations}'
+        )
+
+        # snapshot()['two_layer_invariants'] must surface the same violation(s) —
         # set _last_known_main_sha so snapshot() computes against real main.
         worker._last_known_main_sha = main_sha
         snap_violations = worker.snapshot()['two_layer_invariants']
-        assert _verify_base_violations(snap_violations, rid), (
+        assert all(v in snap_violations for v in direct_violations), (
             f'expected snapshot()["two_layer_invariants"] to surface the same '
-            f'verify-base violation, got: {snap_violations}'
+            f'verify-base violation(s), got: {snap_violations}'
         )
 
     async def test_healthy_chained_prefix_has_no_verify_base_violation(
@@ -247,6 +250,13 @@ class TestVerifyBaseFrozenTipPromotion:
         )
         worker._inflight.append(_make_inflight_entry(item_0, verifying=True))
         worker._inflight.append(_make_inflight_entry(item_1, verifying=True))
+
+        # Direct call isolates the dedicated helper from the other two
+        # sub-checks composed into two_layer_invariants() below.
+        assert worker._verify_base_frozen_tip_violations(main_sha) == [], (
+            'expected _verify_base_frozen_tip_violations() to report no violations '
+            'for a healthy chained frozen prefix'
+        )
 
         violations = worker.two_layer_invariants(main_sha)
         assert violations == [], (
