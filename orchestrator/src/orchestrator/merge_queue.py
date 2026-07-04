@@ -536,7 +536,7 @@ _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
 """``advance_main`` result codes that can trigger a WIP halt.
 
 Shared between :class:`SpeculativeMergeWorker` and the retired serial
-worker's test-local reference (``tests/_serial_merge_worker.py``) to avoid
+worker's test-local reference (see :class:`_TrainMergeHost`) to avoid
 silent divergence: if the set of halt-triggering results ever changes,
 updating this single constant propagates to both automatically."""
 
@@ -756,7 +756,7 @@ async def _run_post_merge_verify(
     """Run post-merge verification for a single task.
 
     Shared by :class:`SpeculativeMergeWorker` and the retired serial worker's
-    test-local reference (``tests/_serial_merge_worker.py``).
+    test-local reference (see :class:`_TrainMergeHost`).
 
     Returns ``None`` when verification passes; returns a ``MergeOutcome``
     (and cleans up *merge_wt*) when it fails via a controlled path (disk
@@ -2223,6 +2223,11 @@ class _TrainMergeHost(Protocol):
     so ``_do_train_merge`` stays reusable by that fixture without a
     production-side dependency on test code.
 
+    This is the CANONICAL note on the retired serial worker's test-local
+    reference; other docstrings/comments in this module that mention it
+    point back here instead of repeating the file path, so there is a single
+    place to update if the fixture is ever moved or renamed.
+
     The surface is intentionally narrow — only the state that the shared
     train-merge pipeline actually touches.  Adding new attributes here does
     NOT require touching ``_WipHaltMixin``; both implementers already
@@ -2364,7 +2369,7 @@ async def classify_and_merge(
     """Shared pre-merge guard + merge + drop-guard pipeline (MQ-refactor kappa).
 
     Covers the EQUIVALENCE-MATRIX CORE common to the retired serial worker's
-    test-local reference (``tests/_serial_merge_worker.MergeWorker._do_merge``),
+    test-local reference (``_do_merge``; see :class:`_TrainMergeHost`),
     ``SpeculativeMergeWorker._merger_loop``, and
     ``SpeculativeMergeWorker._remerge``: branch-presence guard →
     already-merged detection → merge → conflict / non-conflict-failure →
@@ -2568,7 +2573,8 @@ async def _do_train_merge(
     req: GroupMergeRequest,
 ) -> MergeOutcome:
     """Atomic train-merge pipeline shared by SpeculativeMergeWorker and the
-    retired serial worker's test-local reference (tests/_serial_merge_worker.py).
+    retired serial worker's test-local reference (see :class:`_TrainMergeHost`,
+    the ``worker`` parameter's type above).
 
     BEHAVIOUR-ADDING (task 1596): trains now inherit the full shared post-merge
     core at PARITY with the test-local MergeWorker reference's ``_do_merge`` —
@@ -3004,8 +3010,8 @@ class _WipHaltMixin:
 
     Provides the halt-owner methods that :class:`SpeculativeMergeWorker` (the
     sole production implementer) exposes as public API to ``workflow.py`` and
-    ``harness.py``.  The retired serial worker's test-local reference
-    (``tests/_serial_merge_worker.py``) also subclasses this mixin.
+    ``harness.py``.  The retired serial worker's test-local reference (see
+    :class:`_TrainMergeHost`) also subclasses this mixin.
 
     Per-lane halt state: each lane in MERGE_LANES has an independent
     asyncio.Event (set = not halted; cleared = halted) and an optional owner
@@ -4042,9 +4048,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         #       per verify and already exempt from prune/find_inflight
         #       (git_ops.py:2075) — guard in _register_owned_merge_worktree keeps
         #       it out.
-        #   (b) The retired serial worker's test-local reference
-        #       (tests/_serial_merge_worker.py) holds ≤1 worktree whose build
-        #       activity refreshes mtime — out of ledger scope.
+        #   (b) The retired serial worker's test-local reference (see
+        #       _TrainMergeHost) holds ≤1 worktree whose build activity
+        #       refreshes mtime — out of ledger scope.
         #   (c) Cold-shadow (_run_cold_shadow_verify :7670) and drift-check
         #       (_run_drift_check :7912) _merge-* creators are short-lived local
         #       executions — out of ledger scope.
