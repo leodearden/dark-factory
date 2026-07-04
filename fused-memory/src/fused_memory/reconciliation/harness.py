@@ -2497,8 +2497,8 @@ class ReconciliationHarness:
         # auto-unblock mid-pipeline).
         task_kind_by_id: dict[str, str | None] = {
             str(t.get('id')): (
-                t.get('metadata').get('task_kind')
-                if isinstance(t.get('metadata'), dict)
+                _metadata.get('task_kind')
+                if isinstance(_metadata := t.get('metadata'), dict)
                 else None
             )
             for t in (
