@@ -416,6 +416,53 @@ def _extract_cause_hint(output: str) -> str:
     return meaningful[0].strip()[:200]
 
 
+# Shared-venv mutation signatures (task 2048): a concurrent `uv sync` from
+# another orchestrator process on the shared .venv can transiently
+# remove-then-readd packages WHILE a consumer is mid-pytest against it (a
+# non-atomic install window).  Grounded in task 2045's observation: an
+# identical `pytest -n auto` that had just passed failed with a pytest usage
+# error naming -n/--dist/--max-worker-restart (the xdist plugin vanished),
+# `python -c "import xdist"` raised ModuleNotFoundError, and `python -m pip`
+# reported "No module named pip".  Checked BEFORE _CLASSIFY_PATTERNS in
+# _classify_failure so these harness-infrastructure-absence signatures are
+# never misattributed as a code regression (compile_error /
+# pytest_internalerror / test_failure).  Deliberately narrow: application
+# code does not normally emit these exact xdist/pip-absence strings, so a
+# genuine code failure is not silently relabelled environmental.
+_ENV_TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
+    # pytest usage error (rc=4) when the xdist plugin vanished mid-run:
+    # "pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0"
+    # Anchored to the literal "pytest: error: unrecognized arguments:" prefix
+    # that argparse emits for pytest's own CLI (prog='pytest') rather than a
+    # bare "unrecognized arguments:" substring, so an unrelated tool's usage
+    # error that happens to mention -n/--dist/--max-worker-restart cannot
+    # false-positive into env_transient — the same inverse-misattribution
+    # hazard the pip pattern below is hardened against with its word-boundary
+    # lookahead.
+    re.compile(
+        r'^.*pytest: error: unrecognized arguments:.*(?:-n\b|--dist\b|--max-worker-restart\b).*$',
+        re.MULTILINE,
+    ),
+    # `python -m pip` when pip itself vanished from the venv.  The trailing
+    # negative lookahead (?![\w-]) requires 'pip' to be followed by a
+    # non-word, non-hyphen boundary so a ModuleNotFoundError whose module
+    # name merely STARTS with 'pip' (pipeline, pipx, pipenv, pip_audit,
+    # pip-tools) does not false-positive into env_transient — that would be
+    # the exact inverse misattribution this feature forbids (a genuine
+    # import/code regression silently relabelled environmental, auto-retried,
+    # and archive-denied).  Grounded positives (task 2045's unquoted runpy
+    # line '<executable>: No module named pip' and the quoted 'pip'/"pip"
+    # forms) still match since the boundary follows the closing quote (or
+    # end of line) in each case.
+    re.compile(r'''No module named ['"]?pip['"]?(?![\w-])''', re.MULTILINE),
+    # `import xdist` / `import pytest_xdist` when the plugin vanished.
+    re.compile(
+        r'''ModuleNotFoundError: No module named ['"](xdist|pytest_xdist)['"]''',
+        re.MULTILINE,
+    ),
+]
+
+
 # Compiled regex patterns for _classify_failure — hoisted to module scope so
 # re.compile() runs once at import time rather than on every call.
 # Order matters: rustc diagnostic codes (error[E0308]) appear before plain
@@ -478,15 +525,16 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
     Uses a pattern ladder (first match wins):
     1. ``rc == 0``                              → ``'passed'``
     2. ``timed_out``                            → ``'infra_timeout'``
-    3. ``error[E\\d+]:``                        → ``'compile_error'``
-    4. ``compile error``                         → ``'compile_error'``
-    5. ``error: <cargo CLI prefix>``             → ``'cargo_cli_error'`` (allowlist of cargo CLI prefixes; rustc top-level ``error: aborting…`` / ``error: could not compile`` fall through)
-    6. ``INTERNALERROR>``                        → ``'pytest_internalerror'`` (checked BEFORE FAILED so a worker-death run with collateral FAILED lines classifies as infra, not drift)
-    7. ``… FAILED``                              → ``'test_failure'``
-    8. ``npm (ERR!|error)``                      → ``'npm_error'``
-    9. ``flock:``                                → ``'flock_error'``
-    10. ``tree-sitter generate``                 → ``'tree_sitter_generate_error'``
-    11. fallback (rc != 0)                       → ``'unknown_test_failure'``
+    3. xdist/pip absence (shared-venv mutation) → ``'env_transient'`` (checked BEFORE every other output pattern — see ``_ENV_TRANSIENT_PATTERNS`` — so a concurrent ``uv sync`` window that killed xdist/pip mid-run is never misattributed as a code regression)
+    4. ``error[E\\d+]:``                        → ``'compile_error'``
+    5. ``compile error``                         → ``'compile_error'``
+    6. ``error: <cargo CLI prefix>``             → ``'cargo_cli_error'`` (allowlist of cargo CLI prefixes; rustc top-level ``error: aborting…`` / ``error: could not compile`` fall through)
+    7. ``INTERNALERROR>``                        → ``'pytest_internalerror'`` (checked BEFORE FAILED so a worker-death run with collateral FAILED lines classifies as infra, not drift)
+    8. ``… FAILED``                              → ``'test_failure'``
+    9. ``npm (ERR!|error)``                      → ``'npm_error'``
+    10. ``flock:``                                → ``'flock_error'``
+    11. ``tree-sitter generate``                 → ``'tree_sitter_generate_error'``
+    12. fallback (rc != 0)                       → ``'unknown_test_failure'``
 
     The ``timed_out`` flag wins over any output pattern because the root
     cause is the wall-clock limit, not the command output.
@@ -495,6 +543,10 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
         return 'passed'
     if timed_out:
         return 'infra_timeout'
+
+    for env_pattern in _ENV_TRANSIENT_PATTERNS:
+        if env_pattern.search(output):
+            return 'env_transient'
 
     for pattern, category in _CLASSIFY_PATTERNS:
         if pattern.search(output):
@@ -520,9 +572,11 @@ def _classify_failure(output: str, rc: int, timed_out: bool) -> str:
 # pytest_internalerror is an infra crash (xdist worker killed by os._exit); it is
 # non-deterministic and does NOT warrant human triage — the sweep already retries it.
 # test_failure is handled by the debugger (self-correcting); compile_error likewise.
+# env_transient is a shared-venv mutation transient (task 2048) — infra, not
+# human triage; run_verification already retries it via _force_serial_pytest.
 _ARCHIVE_DENY_LIST = frozenset({
     'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
-    'pytest_internalerror',
+    'pytest_internalerror', 'env_transient',
 })
 
 # Ordered from highest to lowest severity; used by ``_worst_category``.
@@ -535,6 +589,7 @@ _CATEGORY_PRIORITY: list[str] = [
     'flock_error',
     'npm_error',
     'pytest_internalerror',   # above test_failure: an infra crash, not a test drift
+    'env_transient',          # shared-venv mutation transient; also infra, not test drift
     'test_failure',
     'unknown_test_failure',
     'passed',
@@ -554,6 +609,9 @@ PREEXISTING_BREAK_SKIP_CATEGORIES: frozenset[str] = frozenset({
     # pytest_internalerror: xdist worker was killed by os._exit — non-deterministic,
     # so re-probing main is not a reliable signal.  The sweep already retries it.
     'pytest_internalerror',
+    # env_transient: shared-venv mutation from a concurrent `uv sync` (task 2048) —
+    # non-deterministic to re-probe on main; the sweep already retries it.
+    'env_transient',
 })
 
 # Process-wide cache for main-probe results: avoids redundant worktree-add +
@@ -597,6 +655,98 @@ def _should_archive_category(category: str) -> bool:
     if category == 'unknown_test_failure':
         return True
     return category.endswith('_error')
+
+
+# Matches a pytest invocation up to (but not including) the next shell chain
+# operator (&&, ||, ;) or end of string — the span _force_serial_pytest
+# rewrites.  Word-bounded so it doesn't match inside 'pytest_xdist' etc.
+_PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
+
+
+def _force_serial_pytest(cmd: str | None) -> str | None:
+    """Rewrite every ``pytest`` invocation in *cmd* to run serially.
+
+    Appends `` -p no:xdist -o addopts=''`` immediately after each ``pytest``
+    invocation's arguments (before the next ``&&``/``||``/``;`` or end of
+    string).  ``-o addopts=''`` clears any pyproject-level ``addopts`` (e.g.
+    ``-n auto``) — this is the exact ``-o addopts=""`` workaround that task
+    2045 proved recovers a shared-venv-mutation transient, reproduced here
+    programmatically rather than gambling on the concurrent ``uv sync``
+    window having closed.  ``-p no:xdist`` is belt-and-suspenders: it
+    disables the xdist plugin outright and is safe even when xdist is
+    already absent from the venv.
+
+    Returns *cmd* unchanged when it is ``None`` or contains no ``pytest``
+    token (e.g. a ``cargo test --workspace`` command).
+
+    Tradeoff: clearing ``addopts`` also drops any per-subproject marker
+    filters baked into pyproject (e.g. ``-m 'not integration'``).  Accepted
+    for a single bounded recovery run whose only purpose is a
+    non-misattributed pass/fail signal — see run_verification's env-recovery
+    retry — and unavoidable at the CLI layer since the subproject's addopts
+    contents aren't visible to this string rewrite.
+    """
+    if cmd is None:
+        return cmd
+    if not _PYTEST_INVOCATION_RE.search(cmd):
+        return cmd
+
+    def _rewrite(m: re.Match[str]) -> str:
+        segment = m.group(0)
+        stripped = segment.rstrip()
+        trailing = segment[len(stripped):]
+        return f"{stripped} -p no:xdist -o addopts=''{trailing}"
+
+    return _PYTEST_INVOCATION_RE.sub(_rewrite, cmd)
+
+
+def _summarize_checks(
+    test_rc: int, test_out: str, test_timed_out: bool,
+    lint_rc: int, lint_out: str, lint_timed_out: bool,
+    type_rc: int, type_out: str, type_timed_out: bool,
+) -> tuple[bool, str, str, str]:
+    """Classify the three check results into (passed, category, cause_hint, summary).
+
+    Shared by ``run_verification``'s primary post-loop classification and its
+    bounded env-recovery retry (task 2048) so the failure-reclassification
+    logic — worst-category selection via ``_worst_category`` plus cause-hint
+    and summary-parts assembly — lives in exactly one place instead of being
+    duplicated per call site.
+
+    Does NOT compute the ``timed_out`` bookkeeping flag (pure-timeout-retry
+    eligibility / consistency) — that stays with the caller, which alone
+    knows whether this is the first pass (loop-bounded by ``max_retries``) or
+    the env-recovery retry, and overrides the returned ``summary`` with
+    timeout-specific text when its own ``timed_out`` is True.
+    """
+    passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
+    if passed:
+        return True, 'passed', '', 'All checks passed'
+
+    hint_parts = []
+    per_check_categories = []
+    for rc, out, to in (
+        (test_rc, test_out, test_timed_out),
+        (lint_rc, lint_out, lint_timed_out),
+        (type_rc, type_out, type_timed_out),
+    ):
+        if rc != 0:
+            h = _extract_cause_hint(out)
+            if h:
+                hint_parts.append(h)
+            per_check_categories.append(_classify_failure(out, rc, to))
+    cause_hint = ' | '.join(hint_parts)
+    category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
+
+    parts = []
+    if test_rc != 0:
+        parts.append('tests failed')
+    if lint_rc != 0:
+        parts.append('lint issues')
+    if type_rc != 0:
+        parts.append('type errors')
+    summary = f'Failures: {", ".join(parts)}'
+    return passed, category, cause_hint, summary
 
 
 def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> dict:
@@ -2528,39 +2678,73 @@ async def run_verification(
     # (no real non-timeout failure mixed in).
     timed_out = (not passed) and pure_timeout_failure
 
-    # Build summary
+    # Build summary/category/cause_hint (shared with the env-recovery retry
+    # below via _summarize_checks — see task 2048 code_duplication fix).
+    passed, category, cause_hint, summary = _summarize_checks(
+        test_rc, test_out, test_timed_out,
+        lint_rc, lint_out, lint_timed_out,
+        type_rc, type_out, type_timed_out,
+    )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
-    else:
-        parts = []
-        if test_rc != 0:
-            parts.append('tests failed')
-        if lint_rc != 0:
-            parts.append('lint issues')
-        if type_rc != 0:
-            parts.append('type errors')
-        summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
-    # Build cause_hint from each failing check's output; join with ' | '.
-    # Also classify each failing check and pick the worst category.
-    if passed:
-        cause_hint = ''
-        category = 'passed'
-    else:
-        hint_parts = []
-        per_check_categories = []
-        for rc, out, to in (
-            (test_rc, test_out, test_timed_out),
-            (lint_rc, lint_out, lint_timed_out),
-            (type_rc, type_out, type_timed_out),
-        ):
-            if rc != 0:
-                h = _extract_cause_hint(out)
-                if h:
-                    hint_parts.append(h)
-                per_check_categories.append(_classify_failure(out, rc, to))
-        cause_hint = ' | '.join(hint_parts)
-        category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
+    # Bounded env-recovery retry: a shared-venv-mutation transient (a
+    # concurrent `uv sync` elsewhere vanishing xdist/pip mid-run) is an infra
+    # transient, not a code regression. Auto-recover with a single
+    # forced-serial retry of the test command — mirrors the pure-timeout
+    # retry loop above, but is gated on `category` rather than a timeout
+    # flag, and only re-runs the test command since lint/type do not
+    # exercise xdist/pip. Recovery passing means the env recovered -> GREEN;
+    # recovery still hitting env_transient means it stays environmental
+    # (NOT misattributed to test_failure/unknown_test_failure); recovery
+    # surfacing a different category means that real signal is reported.
+    if category == 'env_transient' and test_cmd is not None:
+        logger.warning(
+            'Verification hit an environmental shared-venv transient '
+            '(vanished xdist/pip); retrying test command once, forced serial '
+            '(this clears all pyproject addopts, including any marker '
+            'filters, for the recovery run — see _force_serial_pytest)'
+        )
+        recovered_test_cmd = _force_serial_pytest(test_cmd)
+        (
+            test_rc, test_out, test_timed_out, test_started_at, test_duration,
+        ) = await _run_or_skip_timed(
+            recovered_test_cmd, label='test', current_attempt=current_attempt_id,
+        )
+        test_cmd = recovered_test_cmd
+
+        # Recompute pure-timeout consistency for the recovery run: lint/type
+        # are unchanged from the first pass (only the test leg was re-run),
+        # so this mirrors the loop's pure_timeout_failure formula above with
+        # the refreshed test_rc/test_timed_out.  Without this, a recovery run
+        # that itself hits the wall-clock timeout would leave the stale
+        # timed_out=False from the first pass while category flips to
+        # 'infra_timeout' — an inconsistent VerifyResult that both wrongly
+        # marks the worktree warm (the "not result.timed_out" check below)
+        # and hides the timeout from callers that special-case
+        # result.timed_out (merge_queue.py, workflow.py).
+        passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
+        any_timed_out = test_timed_out or lint_timed_out or type_timed_out
+        pure_timeout_failure = (
+            not passed
+            and any_timed_out
+            and (test_rc == 0 or test_timed_out)
+            and (lint_rc == 0 or lint_timed_out)
+            and (type_rc == 0 or type_timed_out)
+        )
+        timed_out = (not passed) and pure_timeout_failure
+
+        passed, category, cause_hint, summary = _summarize_checks(
+            test_rc, test_out, test_timed_out,
+            lint_rc, lint_out, lint_timed_out,
+            type_rc, type_out, type_timed_out,
+        )
+        if timed_out:
+            # Distinct wording from the first-pass timeout summary: this
+            # timeout happened on the single bounded env-recovery retry, not
+            # the pure-timeout retry loop, so "after {max_retries} retries"
+            # would misdescribe it.
+            summary = 'Verification timed out during env-recovery retry'
 
     # Hoist runs list so both the merge-path and task-path branches can use it.
     runs = [
@@ -3254,20 +3438,23 @@ async def run_main_tip_sweep(
           - ``get_main_sha()`` raises or returns an empty string.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during sweep setup.
-          - ``run_full_verification`` returns ``category=='pytest_internalerror'``
-            on either the first pass or the retry (infra crash, not drift).
+          - ``run_full_verification`` returns ``category`` in
+            ``{'pytest_internalerror', 'env_transient'}`` on either the first
+            pass or the retry (infra crash / shared-venv-mutation transient,
+            not drift).
         The harness treats ``None`` as "no signal — retry next tick" and does
         NOT mark the SHA as swept, so the same tip is retried on the next interval.
 
-    Retry-on-flake: when the first ``run_full_verification`` call fails (and is
-    NOT a pytest INTERNALERROR), the function re-runs it ONCE in the same pinned
-    worktree (idempotent; no second ``git worktree add``).  **The retry reuses
-    first-pass worktree state by design** — no cleanup of temp files, partially-
-    written DBs, or caches is performed before the re-run.  This is intentional:
-    the purpose is a fast flake-vs-drift heuristic, not a hermetic isolation
-    guarantee.  A first run that fails partway may leave residue that makes the
-    retry non-representative in either direction; the single-retry bound and the
-    two-failure-escalates rule limit the blast radius.
+    Retry-on-flake: when the first ``run_full_verification`` call fails (and its
+    category is NOT one of the infra sentinels above), the function re-runs it
+    ONCE in the same pinned worktree (idempotent; no second ``git worktree
+    add``).  **The retry reuses first-pass worktree state by design** — no
+    cleanup of temp files, partially-written DBs, or caches is performed before
+    the re-run.  This is intentional: the purpose is a fast flake-vs-drift
+    heuristic, not a hermetic isolation guarantee.  A first run that fails
+    partway may leave residue that makes the retry non-representative in either
+    direction; the single-retry bound and the two-failure-escalates rule limit
+    the blast radius.
 
     - Retry PASSES → emit a WARNING, append a record to
       ``verify._suppressed_flake_records`` (durable in-process audit trail), and
@@ -3276,7 +3463,8 @@ async def run_main_tip_sweep(
       intermittent regression** introduced by a merge.
     - Retry FAILS → return ``(main_sha, retry_result)`` so deterministic drift
       still escalates.
-    - Retry hits pytest INTERNALERROR → return ``None`` (infra, retry next tick).
+    - Retry hits pytest INTERNALERROR or env_transient → return ``None``
+      (infra, retry next tick).
 
     Cleanup: scoped ``git worktree remove --force <tmp_path>`` + ``shutil.rmtree``
     always runs in a ``finally`` block.  NO broad ``git worktree prune`` (DD5
@@ -3337,14 +3525,18 @@ async def run_main_tip_sweep(
         result = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
 
         # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
-        # xdist worker was killed by os._exit).  Treat it as an infra failure — return
-        # the None sentinel so the harness retries next tick and files no false-positive
-        # drift L1.  The finally block's worktree cleanup still runs.
-        if result.category == 'pytest_internalerror':
+        # xdist worker was killed by os._exit).  env_transient means a concurrent
+        # `uv sync` elsewhere transiently mutated the shared venv mid-run (vanished
+        # xdist/pip).  Both are infra failures, not drift — return the None sentinel
+        # so the harness retries next tick and files no false-positive drift L1.
+        # The finally block's worktree cleanup still runs.
+        if result.category in {'pytest_internalerror', 'env_transient'}:
             logger.warning(
-                'run_main_tip_sweep: pytest INTERNALERROR in first-pass sweep — '
+                'run_main_tip_sweep: %s in first-pass sweep — '
                 'treating as infra crash, not drift (retrying next tick); '
                 'cause_hint=%r',
+                'pytest INTERNALERROR' if result.category == 'pytest_internalerror'
+                else 'environmental shared-venv transient (env_transient)',
                 result.cause_hint,
             )
             return None
@@ -3366,12 +3558,15 @@ async def run_main_tip_sweep(
             )
             retry = await run_full_verification(tmp_path, config)  # type: ignore[arg-type]
 
-            if retry.category == 'pytest_internalerror':
+            if retry.category in {'pytest_internalerror', 'env_transient'}:
                 logger.warning(
-                    'run_main_tip_sweep: retry at %s hit pytest INTERNALERROR — '
+                    'run_main_tip_sweep: retry at %s hit %s — '
                     'treating as infra crash, not drift (retrying next tick); '
                     'cause_hint=%r',
-                    _sha_prefix, retry.cause_hint,
+                    _sha_prefix,
+                    'pytest INTERNALERROR' if retry.category == 'pytest_internalerror'
+                    else 'an environmental shared-venv transient (env_transient)',
+                    retry.cause_hint,
                 )
                 return None
 
