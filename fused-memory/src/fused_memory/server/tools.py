@@ -326,6 +326,7 @@ Management:
 - delete_episode: Remove a Graphiti episode (with optional cascade)
 - update_edge: Update an existing Graphiti edge's fact text directly (no LLM pipeline)
 - refresh_entity_summary: Rebuild an entity node's summary from its valid edges (accepts entity_uuid or entity_name)
+- set_entity_summary: Overwrite an entity node's summary with explicit text (empty clears); bypasses edge-derivation — use to force-clear baked-in stale narrative
 - merge_entities: Consolidate two duplicate entity nodes (redirects edges, deletes deprecated)
 - delete_entity: Delete an entity node by UUID (DETACH DELETE; guards on active edges unless force=True; refreshes neighbour summaries)
 - get_status: Health check for all backends
@@ -1416,6 +1417,73 @@ def create_mcp_server(
             raise
         except Exception as e:
             logger.exception(f'refresh_entity_summary error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
+    async def set_entity_summary(
+        project_id: str,
+        summary: str | None = None,
+        entity_uuid: str | None = None,
+        entity_name: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Overwrite a Graphiti entity node's summary with explicit text, verbatim.
+
+        Unlike refresh_entity_summary (which regenerates the summary from the
+        entity's currently-valid edges), this tool writes *summary* exactly as
+        given — it never reads or derives from edges. Pass an empty string to
+        clear the summary entirely. Use this to force-clear baked-in stale
+        narrative text that edge-derived regeneration cannot remove (e.g. when
+        the stale sentence is itself still carried by a valid edge fact).
+
+        Accepts either *entity_uuid* (the canonical FalkorDB node UUID) or
+        *entity_name* (exact entity name — resolved to a UUID automatically).
+        When both are supplied, entity_uuid takes precedence. At least one must
+        be provided, and summary must be provided (may be '').
+
+        Args:
+            project_id: Project scope (required)
+            summary: Exact text to write as the new summary verbatim (required; '' clears it)
+            entity_uuid: UUID of the Graphiti Entity node to overwrite (optional when
+                entity_name is provided)
+            entity_name: Exact name of the Entity node to resolve and overwrite
+                (optional when entity_uuid is provided)
+            agent_id: Which agent is calling (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := validate_project_id(project_id):
+            return err
+        if summary is None:
+            return {
+                'error': 'summary must be provided',
+                'error_type': 'ValidationError',
+            }
+        if not entity_uuid and not entity_name:
+            return {
+                'error': 'Either entity_uuid or entity_name must be provided',
+                'error_type': 'ValidationError',
+            }
+        try:
+            causation_id, source, _ = _extract_causation(metadata, agent_id)
+            return await memory_service.set_entity_summary(
+                entity_uuid=entity_uuid or None,
+                entity_name=entity_name or None,
+                summary=summary,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'set_entity_summary error: {e}')
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
