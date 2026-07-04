@@ -23,6 +23,10 @@ ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrat
 # Replicate PATH so verify subprocesses find their toolchain (a user service gets a minimal PATH).
 Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 Environment=LANG=en_US.UTF-8
+# Own-unit self-identification: lets DeterministicRunner detect a self-target
+# restart-all deploy and schedule a detached self-restart instead of taking
+# the blocking cross-unit path that would SIGTERM this process mid-deploy.
+Environment=ORCH_UNIT=orchestrator-solar-challenge-platform.service
 
 Restart=on-failure
 RestartSec=10

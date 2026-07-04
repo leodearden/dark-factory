@@ -177,7 +177,8 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
         if dl != rl:
             diff_lines.append((i + 1, dl, rl))
 
-    # Classify each diff — must be either a Description or an ExecStart (--config) line
+    # Classify each diff — must be either a Description, an ExecStart (--config)
+    # line, or the self-identifying ORCH_UNIT line (each unit names itself).
     allowed_df_fragments = {
         "Dark Factory Orchestrator",
         "/home/leo/src/dark-factory/orchestrator/config.yaml",
@@ -186,9 +187,20 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
         "Reify Orchestrator",
         "/home/leo/src/reify/orchestrator.yaml",
     }
+    # The ORCH_UNIT line must match EXACTLY, not merely contain the unit's
+    # basename — a fragment-only "in" check would also wave through an
+    # unrelated line that happens to embed the basename (e.g. a new
+    # After=/Requires= referencing the unit), masking real structural drift.
+    expected_df_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-dark-factory.service"
+    expected_reify_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-reify.service"
 
     unexpected: list[tuple[int, str, str]] = []
     for lineno, dl, rl in diff_lines:
+        if (
+            dl.strip() == expected_df_orch_unit_line
+            and rl.strip() == expected_reify_orch_unit_line
+        ):
+            continue
         df_ok = any(frag in dl for frag in allowed_df_fragments)
         reify_ok = any(frag in rl for frag in allowed_reify_fragments)
         if not (df_ok and reify_ok):
@@ -196,7 +208,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
 
     assert not unexpected, (
         "Unexpected differences between df and reify service files "
-        "(only Description and --config path should differ):\n"
+        "(only Description, --config path, and ORCH_UNIT should differ):\n"
         + "\n".join(f"  line {n}:\n    df:    {d!r}\n    reify: {r!r}" for n, d, r in unexpected)
     )
 
@@ -390,4 +402,72 @@ def test_start_limit_directives_under_unit_section(
     assert "StartLimitBurst" not in service_text, (
         f"StartLimitBurst must NOT be under [Service] in {service_path.name} "
         "(systemd >=230 only honours it under [Unit])"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ORCH_UNIT self-identification (task 2064 — 2004 self-kill root-cause fix)
+# ---------------------------------------------------------------------------
+#
+# DeterministicRunner._default_resolve_own_unit() (orchestrator/src/orchestrator/
+# deterministic_runner.py) resolves the orchestrator's own systemd unit purely
+# from the ORCH_UNIT env var, failing open to '' when unset. An empty own-unit
+# means self_target is False for EVERY target_unit, so a fleet restart-all
+# self-restart deploy takes the blocking cross-unit path and SIGTERMs its own
+# deploy script mid-run instead of scheduling a detached self-restart. Every
+# orchestrator unit template must set ORCH_UNIT=<its own basename> so the
+# runner can detect a self-target deploy.
+
+ALL_ORCHESTRATOR_SERVICE_FILES = sorted(
+    (REPO_ROOT / "scripts").glob("orchestrator-*.service")
+)
+
+_EXPECTED_ORCHESTRATOR_SERVICE_BASENAMES = {
+    "orchestrator-dark-factory.service",
+    "orchestrator-reify.service",
+    "orchestrator-solar-challenge-platform.service",
+    "orchestrator-my-solar-challenge.service",
+    "orchestrator-autopilot-video.service",
+    "orchestrator-watchdog.service",
+}
+
+
+def test_orchestrator_service_glob_covers_all_known_units() -> None:
+    """Coverage guard: the glob must be non-empty and include all six known units.
+
+    A wrong CWD or other glob mishap would silently shrink the parametrized
+    ORCH_UNIT lint below to zero cases — a zero-case parametrize collects no
+    tests and reports no failure, which would mask a missing requirement
+    instead of catching it.
+    """
+    discovered = {p.name for p in ALL_ORCHESTRATOR_SERVICE_FILES}
+    assert discovered, "glob discovered no orchestrator-*.service templates"
+    missing = _EXPECTED_ORCHESTRATOR_SERVICE_BASENAMES - discovered
+    assert not missing, f"glob is missing known orchestrator unit templates: {missing}"
+
+
+@pytest.mark.parametrize(
+    "service_path",
+    ALL_ORCHESTRATOR_SERVICE_FILES,
+    ids=lambda p: p.name,
+)
+def test_orchestrator_service_sets_own_orch_unit(
+    service_path: pathlib.Path,
+) -> None:
+    """Every orchestrator unit template must self-identify via ORCH_UNIT=<own basename>.
+
+    The value must equal the unit's OWN basename (self-target detection
+    compares this string against `before_done.target_unit`), and the line
+    must live in [Service] — systemd only honours Environment= there; under
+    [Unit]/[Install] it is silently ignored (same failure class as the
+    StartLimit directives guarded above).
+    """
+    content = service_path.read_text(encoding="utf-8")
+    expected_line = f"Environment=ORCH_UNIT={service_path.name}"
+
+    sections = _parse_sections(content)
+    service_text = "\n".join(sections.get("Service", []))
+    assert expected_line in service_text.splitlines(), (
+        f"{service_path.name} must set `{expected_line}` in its [Service] section "
+        "(systemd only honours Environment= under [Service])"
     )

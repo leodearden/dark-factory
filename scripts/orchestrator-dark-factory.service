@@ -35,6 +35,10 @@ ExecStart=/home/leo/.local/bin/uv run --frozen --project orchestrator orchestrat
 # fused-memory.service, which also keeps secrets out of the unit file.
 Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/usr/local/cuda-12.6/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 Environment=LANG=en_US.UTF-8
+# Own-unit self-identification: lets DeterministicRunner detect a self-target
+# restart-all deploy and schedule a detached self-restart instead of taking
+# the blocking cross-unit path that would SIGTERM this process mid-deploy.
+Environment=ORCH_UNIT=orchestrator-dark-factory.service
 
 # Auto-restart on crash; back off up to 60s.
 Restart=on-failure
