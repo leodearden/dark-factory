@@ -256,7 +256,10 @@ class TestAssemblePayloadReconReportChannel:
         return Watermark(project_id='autopilot_video')
 
     def _systemic_finding(
-        self, *, task_id='452', flag_type='live_workflow_recurrence_counter_needed'
+        self,
+        *,
+        task_id: str | None = '452',
+        flag_type: str | None = 'live_workflow_recurrence_counter_needed',
     ):
         return {
             'finding_id': 'rr-finding-1',
