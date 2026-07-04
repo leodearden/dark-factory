@@ -164,6 +164,20 @@ class AmbiguousEntityError(Exception):
     """
 
 
+def _as_sortable_utc(created_at: datetime | None) -> datetime:
+    """Coerce an episode's created_at to a tz-aware UTC datetime for sorting.
+
+    Naive (tzinfo-less) datetimes are assumed to already be UTC rather than
+    raising on naive-vs-aware comparison; None sorts as the minimum possible
+    value (oldest/unknown), landing last in a descending sort.
+    """
+    if created_at is None:
+        return datetime.min.replace(tzinfo=UTC)
+    if created_at.tzinfo is None:
+        return created_at.replace(tzinfo=UTC)
+    return created_at.astimezone(UTC)
+
+
 class _MultiTenantFalkorDriver(FalkorDriver):
     """FalkorDriver that suppresses auto-indexing.
 
@@ -460,7 +474,7 @@ class GraphitiBackend:
                 # which is not guaranteed reproducible across executions and can
                 # read as non-monotonic to a strict-descending observer.
                 key=lambda ep: (
-                    getattr(ep, 'created_at', None) or datetime.min.replace(tzinfo=UTC),
+                    _as_sortable_utc(getattr(ep, 'created_at', None)),
                     getattr(ep, 'uuid', None) or '',
                 ),
                 reverse=True,
