@@ -177,14 +177,17 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
         if dl != rl:
             diff_lines.append((i + 1, dl, rl))
 
-    # Classify each diff — must be either a Description or an ExecStart (--config) line
+    # Classify each diff — must be either a Description, an ExecStart (--config)
+    # line, or the self-identifying ORCH_UNIT line (each unit names itself).
     allowed_df_fragments = {
         "Dark Factory Orchestrator",
         "/home/leo/src/dark-factory/orchestrator/config.yaml",
+        "orchestrator-dark-factory.service",
     }
     allowed_reify_fragments = {
         "Reify Orchestrator",
         "/home/leo/src/reify/orchestrator.yaml",
+        "orchestrator-reify.service",
     }
 
     unexpected: list[tuple[int, str, str]] = []
@@ -196,7 +199,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
 
     assert not unexpected, (
         "Unexpected differences between df and reify service files "
-        "(only Description and --config path should differ):\n"
+        "(only Description, --config path, and ORCH_UNIT should differ):\n"
         + "\n".join(f"  line {n}:\n    df:    {d!r}\n    reify: {r!r}" for n, d, r in unexpected)
     )
 

@@ -3,4 +3,7 @@ Description=Probe escalation MCP ports; restart unresponsive orchestrator
 
 [Service]
 Type=oneshot
+# Own-unit self-identification: harmless here (this oneshot never runs a
+# DeterministicRunner), kept for uniformity with the other orchestrator units.
+Environment=ORCH_UNIT=orchestrator-watchdog.service
 ExecStart=/home/leo/src/dark-factory/scripts/orchestrator-watchdog.py
