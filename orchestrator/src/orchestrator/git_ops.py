@@ -3828,6 +3828,33 @@ class GitOps:
         )
         return rc == 0 and bool(output.strip())
 
+    async def get_commit_subjects(
+        self, worktree: Path, base_sha: str,
+    ) -> list[tuple[str, str]]:
+        """Return HEAD-first (sha, subject) pairs for ``base_sha..HEAD``.
+
+        Uses the ``\\x1f`` unit separator (rather than a space or colon) to
+        split each log line, since commit subjects may themselves contain
+        colons or arbitrary punctuation.  Returns ``[]`` on any git error or
+        an empty range (``base_sha == HEAD``) — never raises.
+
+        Used by ``TaskWorkflow._detect_tip_wip_commits`` to scan for
+        WIP safety-commits sitting at branch HEAD.
+        """
+        rc, out, _ = await _run(
+            ['git', 'log', '--format=%H\x1f%s', f'{base_sha}..HEAD'],
+            cwd=worktree,
+        )
+        if rc != 0 or not out.strip():
+            return []
+        pairs = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            sha, _, subject = line.partition('\x1f')
+            pairs.append((sha, subject))
+        return pairs
+
     async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
         """Return list of files changed between two commits."""
         _, output, _ = await _run(
