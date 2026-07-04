@@ -74,3 +74,36 @@ class TestRetrieveEpisodesTieBreaker:
         # (c) created_at values remain non-increasing overall.
         created_ats = [created_at_by_uuid[u] for u in order_from_b_first]
         assert created_ats == sorted(created_ats, reverse=True)
+
+
+class TestRetrieveEpisodesNaiveDatetimeRobustness:
+    """retrieve_episodes must not crash when a naive datetime is mixed with aware ones."""
+
+    @pytest.mark.asyncio
+    async def test_naive_datetime_does_not_crash_and_sorts_as_utc(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        episodes = [
+            _episode('uuid-aware-early', datetime(2026, 1, 1, tzinfo=UTC)),
+            # Naive (tzinfo-less) — must be treated as UTC for ordering purposes.
+            _episode('uuid-naive-mid', datetime(2026, 3, 1)),
+            _episode('uuid-aware-late', datetime(2026, 6, 1, tzinfo=UTC)),
+            _episode('uuid-none', None),
+        ]
+        with patch(
+            'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
+            AsyncMock(return_value=episodes),
+        ):
+            # Must not raise TypeError from comparing a naive datetime against
+            # timezone-aware ones in the sort key.
+            result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=len(episodes))
+
+        assert len(result) == len(episodes)
+        # The naive value lands at its correct chronological position (treated
+        # as UTC, so it sorts between the Jan and June aware episodes), and the
+        # None-created_at episode still sorts last (preserving 2055's behavior).
+        assert [ep.uuid for ep in result] == [
+            'uuid-aware-late',
+            'uuid-naive-mid',
+            'uuid-aware-early',
+            'uuid-none',
+        ]
