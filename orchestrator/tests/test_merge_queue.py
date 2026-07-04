@@ -1,4 +1,16 @@
-"""Tests for merge queue: MergeWorker, CAS update-ref, ghost-loop detection."""
+"""Tests for merge queue: MergeWorker, CAS update-ref, ghost-loop detection.
+
+``MergeWorker`` here is the retired serial worker's test-local reference
+(imported from ``_serial_merge_worker``; see
+:class:`orchestrator.merge_queue._TrainMergeHost` for the retirement note),
+not a production class. Parametrizations over
+``[MergeWorker, SpeculativeMergeWorker]`` exercise the shared production
+helpers (``classify_and_merge``, ``_do_train_merge``,
+``_run_post_merge_verify``, ``_finalize_advanced_merge``, CAS advance) that
+both the fixture and the sole production worker call — they are legacy
+shared-helper regression coverage, not a production serial code path under
+test.
+"""
 
 from __future__ import annotations
 
