@@ -2411,8 +2411,8 @@ class TestDedupEpisodeNodes:
 
         result = MockAddEpisodeResult(nodes=[
             MockNode(name=''),
-            MockNode(name=None),
-            types.SimpleNamespace(),  # no .name attribute at all
+            MockNode(name=None),  # type: ignore[arg-type]  # deliberately invalid: exercises falsy-name skip
+            types.SimpleNamespace(),  # type: ignore[arg-type]  # no .name attribute at all
         ])
         merged = await service._dedup_episode_nodes(result, group_id='test')
 
