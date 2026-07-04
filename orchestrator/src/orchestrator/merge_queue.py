@@ -6069,6 +6069,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._merge_ahead_cap.release()
 
         # Drain per-lane buffers (items already removed from _queue by the merger)
+        # Intentionally mutates _lane_buffers directly (not via
+        # _buffer_owned_request/_pop_next_pickable) from the stop coroutine —
+        # a legitimate non-owner drain covered by _assert_single_writer's
+        # not-self._running gate (task 1999 I7), not a wiring omission.
         for lane in MERGE_LANES:
             while self._lane_buffers[lane]:
                 req = self._lane_buffers[lane].popleft()
@@ -6161,6 +6165,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     await self._host_allocator.cancel_and_release(_ie.lease)
             if _ie.was_speculative:
                 self._speculation_slot.release()
+        # Intentionally mutates _inflight directly (not via _inflight_clear())
+        # from the stop coroutine — a legitimate non-owner drain covered by
+        # _assert_single_writer's not-self._running gate (task 1999 I7), not
+        # a wiring omission.
         self._inflight.clear()
 
         # Drain _redispatch: items pending re-dispatch after a cascade.
@@ -7193,6 +7201,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # Verifier coroutine
     # ------------------------------------------------------------------
 
+    def _inflight_append(self, entry: InflightEntry) -> None:
+        """Append *entry* to ``self._inflight`` (verifier-owned single-writer choke point).
+
+        Thin wrapper (task 1999 / MQ-invariants ξ, I7) asserting ownership
+        via ``self._verifier_task`` before mutating — the single choke point
+        every ``_verifier_loop`` append site routes through, mirroring
+        ``_buffer_owned_request`` on the merger side.
+        """
+        self._assert_single_writer(self._verifier_task, '_inflight')
+        self._inflight.append(entry)
+
+    def _inflight_popleft(self) -> InflightEntry:
+        """Pop and return the head of ``self._inflight`` (verifier-owned single-writer choke point).
+
+        See :meth:`_inflight_append`.
+        """
+        self._assert_single_writer(self._verifier_task, '_inflight')
+        return self._inflight.popleft()
+
+    def _inflight_clear(self) -> None:
+        """Clear ``self._inflight`` (verifier-owned single-writer choke point).
+
+        See :meth:`_inflight_append`.  NOT used by :meth:`stop`'s shutdown
+        drain, which intentionally mutates ``self._inflight`` directly from
+        the stop coroutine (a non-owner task) — see the comment at that call
+        site.
+        """
+        self._assert_single_writer(self._verifier_task, '_inflight')
+        self._inflight.clear()
+
     async def _verifier_loop(self) -> None:
         """Verify and CAS-advance for each SpeculativeItem from the Merger.
 
@@ -7315,7 +7353,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if item is None:
                     # Shutdown sentinel: drain remaining in-flight entries, then exit.
                     while self._inflight:
-                        head = self._inflight.popleft()
+                        head = self._inflight_popleft()
                         await self._finalize_inflight(head)
                     return
 
@@ -7375,7 +7413,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                     continue  # don't append to _inflight; fetch next item
 
-                self._inflight.append(entry)
+                self._inflight_append(entry)
 
                 # Continue filling only if another slot is free (real verify entries
                 # consume a host slot, so check free_host_count).
@@ -7392,7 +7430,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             # ── (b) FINALIZE-HEAD ──────────────────────────────────────────────
             if self._inflight:
-                head = self._inflight.popleft()
+                head = self._inflight_popleft()
                 _head_advanced = False
                 try:
                     _head_advanced = await self._finalize_inflight(head)
@@ -7424,7 +7462,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if not _head_advanced and self._inflight:
                     _allocator = self._host_allocator
                     _downstream = list(self._inflight)
-                    self._inflight.clear()
+                    self._inflight_clear()
 
                     # Detect whether the head failure was due to operator halt
                     # (REQUEUED sentinel).  In that case downstream tasks will
@@ -7629,7 +7667,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # The fill loop will block for the next item if a host slot is
                 # free (multi-host overlap) OR break immediately (single-host,
                 # free_host_count()==0) → FINALIZE-HEAD processes the head.
-                self._inflight.append(entry)
+                self._inflight_append(entry)
                 continue  # restart outer loop
 
     async def _build_merge_failure_diagnostic(
