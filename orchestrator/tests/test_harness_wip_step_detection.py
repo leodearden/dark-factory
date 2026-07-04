@@ -17,11 +17,14 @@ new detection + prompt-surfacing machinery that fixes that:
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from orchestrator import git_ops as git_ops_module
+from orchestrator import workflow as workflow_module
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
@@ -67,9 +70,44 @@ class TestIsWipSafetyCommit:
     def test_rejects_near_miss_subject(self):
         assert is_wip_safety_commit('chore: save the world') is False
 
-    def test_prefixes_tuple_matches_producing_literal(self):
-        """WIP_SAFETY_COMMIT_PREFIXES is the single source of truth for the prefix."""
-        assert WIP_SAFETY_COMMIT_PREFIXES == ('chore: save WIP before ',)
+
+class TestProducingSiteSubjectsStayRecognized:
+    """Guards against a producing-site subject drifting outside the prefix.
+
+    The TestIsWipSafetyCommit cases above pin the predicate's behavior
+    against literals *copy-pasted* into this test file — they say nothing
+    about whether git_ops.py/workflow.py still actually emit those literals.
+    These tests read the real module source so an edit to a producing site
+    (workflow.py's inter-iteration-rebase commit, or git_ops.py's
+    requeue-rebase / warm-lane-reclaim commits) that silently drifts outside
+    WIP_SAFETY_COMMIT_PREFIXES is caught by a failing test rather than
+    quietly disabling detection.
+    """
+
+    PRODUCING_SUBJECTS = (
+        'chore: save WIP before requeue rebase',
+        'chore: save WIP before inter-iteration rebase',
+        'chore: save WIP before warm-lane reclaim (task 1933)',
+    )
+
+    def test_producing_subjects_present_in_source(self):
+        combined_source = (
+            inspect.getsource(git_ops_module) + inspect.getsource(workflow_module)
+        )
+        for subject in self.PRODUCING_SUBJECTS:
+            assert subject in combined_source, (
+                f'Expected literal {subject!r} to still appear verbatim in '
+                f'git_ops.py or workflow.py. If it was intentionally reworded, '
+                f'update PRODUCING_SUBJECTS here to match the new literal.'
+            )
+
+    def test_producing_subjects_are_recognized(self):
+        for subject in self.PRODUCING_SUBJECTS:
+            assert is_wip_safety_commit(subject) is True, (
+                f'{subject!r} no longer starts with {WIP_SAFETY_COMMIT_PREFIXES!r} '
+                f'— TaskWorkflow._detect_tip_wip_commits would silently stop '
+                f'recognizing this producing site.'
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +309,37 @@ class TestDetectTipWipCommits:
 
         assert result == []
 
+    async def test_wip_commit_recorded_with_abbreviated_sha_is_deduped(
+        self, config, git_ops, task_assignment,
+    ):
+        """A done step recorded with the 12-char SHA shown in the prompt notice
+        (rather than the full SHA `git log` produces) must still dedup.
+
+        build_implementer_prompt's wip_section displays `sha[:12]` and asks
+        the implementer to pass "the WIP commit's SHA" to mark_step_done — an
+        implementer may reasonably copy exactly what it saw. Exact-string
+        dedup would never match the full SHA against that abbreviated form,
+        re-surfacing the same already-attributed commit forever.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'wip.txt').write_text('uncommitted work\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
+        assert wip_sha
+
+        workflow.plan = {
+            'task_id': '42',
+            'prerequisites': [],
+            'steps': [{'id': 'step-1', 'status': 'done', 'commit': wip_sha[:12]}],
+        }
+
+        result = await workflow._detect_tip_wip_commits()
+
+        assert result == []
+
     async def test_wip_commit_not_at_tip_returns_empty(self, config, git_ops, task_assignment):
         """A normal commit on top of a WIP commit means the WIP is no longer at HEAD."""
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
@@ -282,6 +351,62 @@ class TestDetectTipWipCommits:
         await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
         (wt / 'real.txt').write_text('real work\n')
         await git_ops.commit(wt, 'feat: GREEN — real implementation')
+
+        result = await workflow._detect_tip_wip_commits()
+
+        assert result == []
+
+    async def test_multiple_stacked_wip_commits_returned_head_first(
+        self, config, git_ops, task_assignment,
+    ):
+        """A contiguous run of 2+ WIP safety-commits at HEAD are all surfaced.
+
+        Exercises the walk-and-stop loop with a non-trivial "collect the
+        rest" (2 commits) before hitting the boundary, distinct from the
+        single-commit case covered by test_wip_commit_at_head_is_detected.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'real.txt').write_text('real work\n')
+        await git_ops.commit(wt, 'feat: GREEN — real implementation')
+
+        (wt / 'wip1.txt').write_text('uncommitted work 1\n')
+        wip1_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
+        (wt / 'wip2.txt').write_text('uncommitted work 2\n')
+        wip2_sha = await git_ops.commit(
+            wt, 'chore: save WIP before inter-iteration rebase',
+        )
+        assert wip1_sha and wip2_sha
+
+        result = await workflow._detect_tip_wip_commits()
+
+        assert result == [
+            {'sha': wip2_sha, 'subject': 'chore: save WIP before inter-iteration rebase'},
+            {'sha': wip1_sha, 'subject': 'chore: save WIP before requeue rebase'},
+        ]
+
+    async def test_get_commit_subjects_error_returns_empty(
+        self, config, git_ops, task_assignment,
+    ):
+        """A git failure inside get_commit_subjects must not propagate.
+
+        Exercises the defensive `except Exception: return []` wrapper, which
+        was previously untested.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'wip.txt').write_text('uncommitted work\n')
+        await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
+
+        workflow.git_ops.get_commit_subjects = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('boom'),
+        )
 
         result = await workflow._detect_tip_wip_commits()
 
