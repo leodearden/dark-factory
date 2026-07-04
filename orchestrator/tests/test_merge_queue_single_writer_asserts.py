@@ -23,8 +23,15 @@ RED until step-04 GREEN adds ``merge_queue._DEBUG_ASSERTS`` +
 ``SpeculativeMergeWorker._assert_single_writer`` and wires it at the two
 lane-buffer mutation call sites.
 
-This step only covers the merger-owned lane buffers. The verifier-owned
-``_inflight`` choke points are added to this same file by step-05/06.
+  step-05 RED — the verifier-owned ``_inflight`` choke points. Unlike the
+                lane-buffer side, the real ``_inflight.append`` /
+                ``.popleft`` / ``.clear`` call sites are inlined directly in
+                ``_verifier_loop`` (no pre-existing dedicated methods), so
+                step-06 GREEN introduces thin wrapper choke-point methods —
+                ``_inflight_append`` / ``_inflight_popleft`` / ``_inflight_clear``
+                — that ``_verifier_loop`` calls instead of mutating the deque
+                inline, each asserting ownership via ``self._verifier_task``
+                before mutating. RED because these methods do not exist yet.
 """
 
 from __future__ import annotations
@@ -212,3 +219,126 @@ class TestAssertSingleWriterLaneBufferWiring:
         worker._buffer_owned_request(req)  # must not raise
         popped = worker._pop_next_pickable()  # must not raise
         assert popped is req
+
+
+# ── step-05 RED: _assert_single_writer semantics at the _inflight sites ─────
+
+
+@pytest.mark.asyncio
+class TestAssertSingleWriterInflightWiring:
+    """``_assert_single_writer`` at the verifier-owned ``_inflight`` choke points (task 1999 I7).
+
+    RED until step-06 GREEN adds ``_inflight_append`` / ``_inflight_popleft`` /
+    ``_inflight_clear`` — thin wrapper choke-point methods that assert
+    ownership via ``self._verifier_task`` before mutating ``self._inflight``
+    — and rewires ``_verifier_loop`` to call them instead of mutating the
+    deque inline.
+    """
+
+    async def test_flag_off_is_noop_for_append_pop_and_clear(
+        self, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """(1) Flag OFF: a foreign verifier task never raises — zero-overhead no-op."""
+        monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', False)
+        worker = _make_worker(git_ops)
+        worker._running = True
+        worker._verifier_task = await _make_foreign_task()
+
+        entry = object()
+        worker._inflight_append(entry)  # must not raise
+        popped = worker._inflight_popleft()  # must not raise
+        assert popped is entry
+        worker._inflight_append(object())
+        worker._inflight_clear()  # must not raise
+        assert len(worker._inflight) == 0
+
+    async def test_flag_on_foreign_owner_raises_on_append(
+        self, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """(2) Flag ON + running + foreign verifier task: append raises, naming the structure."""
+        monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
+        worker = _make_worker(git_ops)
+        worker._running = True
+        worker._verifier_task = await _make_foreign_task()
+
+        with pytest.raises(AssertionError, match='_inflight'):
+            worker._inflight_append(object())
+
+    async def test_flag_on_foreign_owner_raises_on_popleft(
+        self, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """(2) Flag ON + running + foreign verifier task: popleft raises, naming the structure.
+
+        Seeds the deque directly (bypassing ``_inflight_append``) so the
+        append and popleft choke points are exercised independently.
+        """
+        worker = _make_worker(git_ops)
+        worker._inflight.append(object())
+
+        monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
+        worker._running = True
+        worker._verifier_task = await _make_foreign_task()
+
+        with pytest.raises(AssertionError, match='_inflight'):
+            worker._inflight_popleft()
+
+    async def test_flag_on_foreign_owner_raises_on_clear(
+        self, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """(2) Flag ON + running + foreign verifier task: clear raises, naming the structure."""
+        worker = _make_worker(git_ops)
+        worker._inflight.append(object())
+
+        monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
+        worker._running = True
+        worker._verifier_task = await _make_foreign_task()
+
+        with pytest.raises(AssertionError, match='_inflight'):
+            worker._inflight_clear()
+
+    async def test_flag_on_owner_task_none_is_noop(
+        self, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """(3) Flag ON but no owner task recorded yet: no-op (direct-call / unstarted-loop)."""
+        monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
+        worker = _make_worker(git_ops)
+        worker._running = True
+        worker._verifier_task = None
+
+        entry = object()
+        worker._inflight_append(entry)  # must not raise
+        popped = worker._inflight_popleft()  # must not raise
+        assert popped is entry
+        worker._inflight_append(object())
+        worker._inflight_clear()  # must not raise
+
+    async def test_flag_on_not_running_is_noop(
+        self, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """(4) Flag ON but worker stopped: no-op regardless of owner (matches stop()'s drain)."""
+        monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
+        worker = _make_worker(git_ops)
+        worker._inflight.append(object())
+        worker._verifier_task = await _make_foreign_task()
+        worker._running = False
+
+        popped = worker._inflight_popleft()  # must not raise
+        assert popped is not None
+        worker._inflight_append(object())
+        worker._inflight_clear()  # must not raise
+
+    async def test_flag_on_owner_is_current_task_is_noop(
+        self, git_ops: GitOps, monkeypatch,
+    ) -> None:
+        """(5) Flag ON + running + the CALLER is the recorded owner: no-op."""
+        monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
+        worker = _make_worker(git_ops)
+        worker._running = True
+        worker._verifier_task = asyncio.current_task()
+
+        entry = object()
+        worker._inflight_append(entry)  # must not raise
+        popped = worker._inflight_popleft()  # must not raise
+        assert popped is entry
+        worker._inflight_append(object())
+        worker._inflight_clear()  # must not raise
