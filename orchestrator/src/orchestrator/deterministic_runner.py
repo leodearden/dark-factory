@@ -109,8 +109,10 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -139,6 +141,13 @@ logger = logging.getLogger(__name__)
 _WRITEBACK_MAX_ATTEMPTS: int = 6
 _WRITEBACK_BACKOFF_BASE: float = 2.0
 
+# Task 2090: bound the reap after a whole-process-group SIGKILL on a
+# before_done subprocess timeout.  A process stuck in an uninterruptible
+# state (or one that otherwise ignores SIGKILL) must never be allowed to hang
+# `_terminate_process_tree` — and therefore `_default_run_script` — forever.
+# 5s comfortably covers a normal kernel-mediated reap while staying bounded.
+_REAP_GRACE_SECS: float = 5.0
+
 
 class DeterministicRunner:
     """Per-slot runner for deterministic gate tasks.
@@ -165,6 +174,10 @@ class DeterministicRunner:
         sleeper: Optional async callable ``(seconds: float) -> None`` used to
             pace writeback retries.  Defaults to ``asyncio.sleep``.  Injected
             in tests so retries don't actually sleep.
+        reap_grace_secs: Bound (seconds) on reaping a subprocess after a
+            whole-process-group SIGKILL on timeout (task 2090).  Defaults to
+            ``_REAP_GRACE_SECS``.  Injected in tests so an unkillable-process
+            test doesn't actually wait.
     """
 
     def __init__(
@@ -178,6 +191,7 @@ class DeterministicRunner:
         writeback_max_attempts=_WRITEBACK_MAX_ATTEMPTS,
         writeback_backoff_base=_WRITEBACK_BACKOFF_BASE,
         sleeper=None,
+        reap_grace_secs=_REAP_GRACE_SECS,
     ):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
@@ -188,6 +202,7 @@ class DeterministicRunner:
         self._writeback_max_attempts = writeback_max_attempts
         self._writeback_backoff_base = writeback_backoff_base
         self._sleeper = sleeper or asyncio.sleep
+        self._reap_grace_secs = reap_grace_secs
 
     # ------------------------------------------------------------------
     # Default injectable seam implementations
@@ -372,15 +387,67 @@ class DeterministicRunner:
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
             tail = (stdout or b'').decode(errors='replace')[-2000:]
             return proc.returncode or 0, tail
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
+            # Task 2090: the deploy script may spawn grandchildren (e.g.
+            # restart-fused-memory.sh --drain forking systemctl/curl/journalctl/
+            # sleep/the restarted daemon) that inherit the write end of the
+            # merged stdout pipe above.  Killing only this direct child leaves
+            # them alive holding the pipe open — asyncio's Process.wait() is
+            # itself gated on that pipe reaching EOF, so even the cleanup
+            # below could hang forever without a process-group-wide kill.
+            # start_new_session=True (above) makes this process its own
+            # session/group leader so the WHOLE tree can be torn down together.
+            await self._terminate_process_tree(proc)
             return 1, f'<script timed out after {timeout_secs}s>'
+
+    async def _terminate_process_tree(self, proc: asyncio.subprocess.Process) -> None:
+        """Kill *proc*'s entire process group and bound the reap (task 2090).
+
+        ``proc`` must have been spawned with ``start_new_session=True`` so its
+        process group is its own — NOT the orchestrator's — otherwise
+        ``os.killpg`` would SIGKILL the orchestrator itself.
+
+        Tries a whole-group SIGKILL first, which reaches any grandchildren
+        (e.g. a backgrounded ``systemctl``/``curl``/``sleep``) still holding
+        the inherited stdout pipe open — releasing that pipe is required for
+        asyncio's ``Process.wait()`` to resolve at all, since it internally
+        waits for every pipe transport to reach EOF, not just for the direct
+        child to be reaped.  If the process has already exited (or the group
+        lookup otherwise fails), falls back to a direct ``proc.kill()``.  Both
+        kill attempts tolerate an already-dead process — this helper must
+        NEVER raise, so a timeout branch can always return cleanly even if the
+        process is already gone.
+
+        The reap itself is bounded by ``self._reap_grace_secs`` so a process
+        stuck in an uninterruptible state cannot hang this helper (and
+        therefore ``_default_run_script``) forever.
+        """
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            logger.debug(
+                'DeterministicRunner: killpg(%s) failed (%s: %s) — falling back '
+                'to direct kill()',
+                proc.pid, type(exc).__name__, exc,
+            )
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)
+        except TimeoutError:
+            logger.warning(
+                'DeterministicRunner: process %s did not exit within '
+                'reap_grace_secs=%s after termination signal — abandoning reap '
+                '(process may be unkillable)',
+                proc.pid, self._reap_grace_secs,
+            )
 
     async def _file_infra_issue_and_block(
         self,
