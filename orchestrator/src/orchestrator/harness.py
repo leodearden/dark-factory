@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, TypeGuard, cast
+from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
@@ -55,7 +55,6 @@ from orchestrator.worktree_identity import identities_match, read_worktree_title
 if TYPE_CHECKING:
     from orchestrator.merge_queue import (
         BreakerTrip,
-        MergeWorker,
         SpeculativeMergeWorker,
         TrainCallbackFactory,
     )
@@ -837,7 +836,7 @@ class Harness:
         # every TaskWorkflow so the MCP coalesce gate sees workflow-path merges.
         from orchestrator.merge_queue import InFlightMergeRegistry
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
-        self._merge_worker: MergeWorker | SpeculativeMergeWorker | None = None
+        self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
         # Durable journal for in-flight merge requests (task 1772).
         # Persisted at data/orchestrator/merge_queue.json; recovered on restart
@@ -3485,12 +3484,7 @@ Output JSON matching the schema. Every task must appear in the output.
         if self._merge_worker is None:
             return
 
-        # Runtime worker is always SpeculativeMergeWorker (the only type
-        # instantiated in _start_merge_worker); snapshot() lives on it, not on
-        # the legacy MergeWorker arm of the union annotation.  cast with a
-        # string forward-ref keeps this runtime-safe (the import is
-        # TYPE_CHECKING-only) while satisfying pyright.
-        worker = cast('SpeculativeMergeWorker', self._merge_worker)
+        worker = self._merge_worker
         snapshot = worker.snapshot()
         metrics = snapshot.get('metrics')
         if metrics is None:
@@ -5082,8 +5076,10 @@ Output JSON matching the schema. Every task must appear in the output.
     async def _start_merge_worker(self) -> None:
         """Start the merge queue worker as a background asyncio task.
 
-        Uses SpeculativeMergeWorker (two-coroutine pipeline) by default.
-        MergeWorker (serial) is preserved but deprecated.
+        Uses SpeculativeMergeWorker (two-coroutine pipeline) — the sole
+        production merge worker (MQ-refactor task ν retired the legacy serial
+        MergeWorker; its readable-reference role now lives as a test-local
+        fixture in ``tests/_serial_merge_worker.py``).
 
         Also builds and stores the StaleServiceRestartCoordinator and wires
         its note_merge method as the merge worker's on_merge_landed callback.
@@ -5354,7 +5350,7 @@ Output JSON matching the schema. Every task must appear in the output.
         if self._merge_worker is None:
             return True
         try:
-            worker = cast('SpeculativeMergeWorker', self._merge_worker)
+            worker = self._merge_worker
             depth = worker.snapshot().get('depth', 1)
         except Exception:
             logger.warning(
