@@ -2165,6 +2165,42 @@ def test_truncate_clean_ignores_early_whitespace_min_retention_guard():
     assert len(result) == 500
 
 
+def test_truncate_clean_word_boundary_well_past_half_budget_retains_chunk():
+    """A last-whitespace index that is comfortably past budget // 2 -- but
+    nowhere near the edge of the window, unlike the near-boundary word-cut
+    test above -- still takes the word-boundary branch (backs up to that
+    whitespace) rather than falling through to a hard cut at the budget."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    # budget = limit - 1 = 499, so budget // 2 == 249; the space at index 300
+    # is well past that threshold without hugging the window's edge.
+    text = ('A' * 300) + ' ' + ('B' * 300)
+    result = _truncate_clean(text, 500)
+
+    assert result == ('A' * 300) + '…'
+    assert 'B' not in result
+    assert len(result) < 500
+
+
+def test_truncate_clean_rstrips_trailing_whitespace_before_ellipsis():
+    """Multiple consecutive whitespace chars ending at the word-boundary cut
+    point leave the head (`text[:last_ws]`) still ending in whitespace --
+    rstrip() must trim that before the ellipsis is appended, so the result
+    never reads as "...word    …" and its length can land strictly under
+    the limit rather than exactly at it."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    # Three consecutive spaces at indices 300-302; index 302 is the last
+    # whitespace in the text[:499] window for limit=500, so head = text[:302]
+    # still carries two of those spaces for rstrip() to remove.
+    text = ('A' * 300) + '   ' + ('B' * 300)
+    result = _truncate_clean(text, 500)
+
+    assert result == ('A' * 300) + '…'
+    assert not result.endswith(' …')
+    assert len(result) < 500
+
+
 # ---------------------------------------------------------------------------
 # _format_outcome_echo truth table (task 2049)
 #

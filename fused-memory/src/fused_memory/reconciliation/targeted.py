@@ -1228,10 +1228,12 @@ def _truncate_clean(text: str, limit: int) -> str:
         return text
     budget = limit - 1
     window = text[:budget]
-    last_ws = -1
-    for i, ch in enumerate(window):
-        if ch.isspace():
-            last_ws = i
+    # Only the LAST whitespace in the window matters, so scan backwards and
+    # stop at the first match instead of a full forward pass over `window`.
+    last_ws = next(
+        (i for i in range(len(window) - 1, -1, -1) if window[i].isspace()),
+        -1,
+    )
     head = text[:last_ws] if last_ws > budget // 2 else text[:budget]
     return head.rstrip() + '…'
 
