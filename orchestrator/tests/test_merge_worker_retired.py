@@ -52,3 +52,28 @@ def test_serial_reference_fixture_available() -> None:
 
     assert MergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS == 2
     assert MergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES == 1
+
+
+def test_merge_worker_absent_from_production() -> None:
+    """The serial class is gone from production — moved, not vanished.
+
+    Structural runtime invariant (not a docstring/annotation meta-test):
+    grep showing no MergeWorker class in orchestrator/src is the task's
+    headline user-observable signal; this guard turns it into a durable
+    regression barrier against re-introduction.
+    """
+    assert not hasattr(mq, 'MergeWorker'), (
+        'MergeWorker must be removed from the production orchestrator.merge_queue '
+        'module — the serial reference now lives only in tests/_serial_merge_worker.py'
+    )
+
+    import _serial_merge_worker
+
+    assert _serial_merge_worker.MergeWorker is not None, (
+        'the serial reference must still exist as a test-local fixture — '
+        'it moved, it did not vanish'
+    )
+
+    # Smoke: harness.py must still import cleanly after the union/import
+    # simplification (TYPE_CHECKING import, annotation, casts, docstring).
+    import orchestrator.harness  # noqa: F401
