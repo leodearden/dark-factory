@@ -6815,6 +6815,103 @@ Output JSON matching the schema. Every task must appear in the output.
         result = await inspect_fn(target_unit)
         return _deterministic_deploy_health_verdict(result)
 
+    async def _recover_stranded_deterministic_task(
+        self, tid: str, task: dict, metadata: dict,
+    ) -> None:
+        """Recover a task-2059-shaped stranded deterministic task (Source A).
+
+        Dedup-guarded: skips (logging) when a pending escalation already
+        exists for *tid* — self-dedupes across sweep passes once filed.
+        Re-validates live systemd health for the deploy's target unit and
+        RE-FILES a single L1 escalation — this method NEVER calls
+        ``set_task_status`` (RE-FILE-NEVER-FLIP discipline, mirroring the
+        stranded-blocked-reaper backstop):
+
+          - ``healthy``     -> category='stranded_blocked', suggested_action='resume'.
+            The existing auto-resume watcher resolves this, driving
+            blocked->pending->re-dispatch->DeterministicRunner's resume path
+            (case-(b): "escalation resolved -> resume, no re-run").
+          - ``unconfirmed`` -> category='infra_issue', suggested_action='manual_intervention'.
+            A human must inspect the unit before the task can be resumed.
+        """
+        if self._escalation_queue is None:
+            return
+        if self._escalation_queue.get_by_task(tid, status='pending'):
+            logger.info(
+                'Deterministic-recon-sweep: task %s already has a pending '
+                'escalation — skipping strand recovery (dedup)',
+                tid,
+            )
+            return
+
+        verdict = await self._revalidate_deterministic_deploy_health(metadata)
+        before_done = metadata.get('before_done') or {}
+        target_unit = before_done.get('target_unit', 'unknown')
+
+        if verdict == 'healthy':
+            category = 'stranded_blocked'
+            suggested_action = 'resume'
+            guidance = (
+                f'Live unit {target_unit} is healthy (MainPID>0, ActiveState=active) '
+                f'— the deploy demonstrably succeeded and only the post-deploy '
+                f'writeback failed.  Resolve this L1 (suggested_action=resume) to '
+                f're-pend the task; the existing auto-resume watcher and '
+                f'DeterministicRunner resume path drive it to done with NO re-run.'
+            )
+        else:
+            category = 'infra_issue'
+            suggested_action = 'manual_intervention'
+            guidance = (
+                f'Live unit {target_unit} state could not be confirmed healthy '
+                f'(unit down/failed/unknown) — a human must inspect the unit '
+                f'before this task can be safely resumed or re-triaged.'
+            )
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        description = (task or {}).get('description', '')
+        summary = (
+            f'Deterministic strand recovery: task {tid} blocked with '
+            f'before_done_ran_at stamped and no open escalation — target unit '
+            f'{target_unit} is {verdict}.'
+        )[:200]
+        detail = '\n\n'.join(filter(None, [
+            description,
+            f'Target unit: {target_unit}',
+            f'Live health verdict: {verdict}',
+            guidance,
+        ]))
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(tid),
+            task_id=tid,
+            agent_role='harness-deterministic-recon-sweep',
+            severity='blocking',
+            category=category,
+            summary=summary,
+            detail=detail,
+            suggested_action=suggested_action,
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=tid,
+                data={
+                    'escalation_id': esc.id,
+                    'category': category,
+                    'severity': 'blocking',
+                    'level': 1,
+                    'reason': 'deterministic-recon-sweep-strand-recovery',
+                },
+            )
+        logger.warning(
+            'Deterministic-recon-sweep: task %s stranded (verdict=%s) — filed '
+            'L1 %s (category=%s, suggested_action=%s, no status change)',
+            tid, verdict, esc.id, category, suggested_action,
+        )
+
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
         # Increment before the event-set logic so the counter reflects every submission.
