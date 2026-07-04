@@ -1099,6 +1099,60 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def get_entity_by_uuid(
+        entity_uuid: str,
+        project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Read-only topological diagnostic — look up an Entity node directly by its UUID.
+
+        Unlike get_entity (name-based, with fuzzy fallback and a semantic
+        edge-gather), this does a direct UUID readback with no edge gather:
+        just the node's own {uuid, name, summary}. Use this when you already
+        have the node UUID (e.g. from a prior search/get_entity result) and
+        want to confirm its identity without the fuzzy/semantic matching that
+        can mask duplicate-node pathology.
+
+        Args:
+            entity_uuid: UUID of the Entity node to look up
+            project_id: Project scope (required)
+            agent_id: Which agent is reading (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        if err := validate_project_id(project_id):
+            return err
+        try:
+            result = await memory_service.get_entity_by_uuid(
+                entity_uuid=entity_uuid, project_id=project_id
+            )
+            await _log_read(
+                operation='get_entity_by_uuid',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'entity_uuid': entity_uuid},
+                result_summary={'found': True},
+            )
+            return result
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'get_entity_by_uuid error: {e}')
+            await _log_read(
+                operation='get_entity_by_uuid',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'entity_uuid': entity_uuid},
+                success=False,
+                error=str(e),
+            )
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     async def get_episodes(
         project_id: str,
         last_n: int = 10,
