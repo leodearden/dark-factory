@@ -1071,3 +1071,118 @@ class TestPasserLandPath:
                 f'Expected delete_solo_branch for all-pass member {m.member_id} '
                 f'solo_branch={m.solo_branch}, got: {delete_calls!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# task 1997 step-7: landed SHA sourced from AdvanceOutcome, not the
+# git_ops._last_advanced_sha getattr side channel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLandedShaFromAdvanceOutcome:
+    """The SHA passed to scheduler.mark_done for a landed passer must come
+    from the AdvanceOutcome returned by advance_main (outcome.advanced_sha),
+    not the git_ops._last_advanced_sha getattr side channel (task 1997 /
+    MQ-refactor μ).
+
+    RED: production still reads
+    getattr(self.git_ops, '_last_advanced_sha', None) or r.merge_sha at
+    workflow.py:6395 — since git_ops here is a bare MagicMock, that getattr
+    auto-vivifies a child Mock (never None), so mark_done's sha= kwarg is
+    that auto-vivified Mock instance rather than outcome.advanced_sha or
+    the r.merge_sha fallback.
+    """
+
+    def _fixture(self) -> _Fixture:
+        f = _make(
+            task_id='103',
+            metadata={'train': {'id': 'T-outcome-sha', 'order': 2,
+                                'members': ['101', '102', '103']}},
+        )
+        f.wf.event_store = MagicMock()
+        f.wf.git_ops = f.git_ops
+        f.git_ops.get_main_sha = AsyncMock(return_value='sha-main-init')
+        f.git_ops.delete_solo_branch = AsyncMock()
+        return f
+
+    async def test_landed_sha_uses_outcome_advanced_sha(self) -> None:
+        """advanced_sha populated → mark_done's sha= is the post-rebase SHA,
+        not the passer's pre-advance merge_sha nor a getattr side channel."""
+        f = self._fixture()
+        members = _train_members(train_id='T-outcome-sha', tip_id='103')
+        passer = _solo_pass_full('103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_fail('102'),
+            passer,
+        ])
+        REBASED_SHA = 'rebased-onto-sha'
+        f.git_ops.advance_main = AsyncMock(
+            return_value=AdvanceOutcome('advanced', advanced_sha=REBASED_SHA)
+        )
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-outcome-sha', members)
+
+        calls = {c.args[0]: c.kwargs for c in f.scheduler.mark_done.await_args_list}
+        assert '103' in calls, f'Expected mark_done for 103, got: {calls!r}'
+        assert calls['103']['sha'] == REBASED_SHA, (
+            f"Expected mark_done sha={REBASED_SHA!r} (from outcome.advanced_sha), "
+            f"got sha={calls['103'].get('sha')!r}"
+        )
+
+    async def test_landed_sha_falls_back_to_merge_sha_when_advanced_sha_none(self) -> None:
+        """advanced_sha=None (no rebase) → mark_done's sha= falls back to r.merge_sha."""
+        f = self._fixture()
+        members = _train_members(train_id='T-outcome-sha-fb', tip_id='103')
+        passer = _solo_pass_full('103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            _solo_fail('102'),
+            passer,
+        ])
+        f.git_ops.advance_main = AsyncMock(
+            return_value=AdvanceOutcome('advanced', advanced_sha=None)
+        )
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-outcome-sha-fb', members)
+
+        calls = {c.args[0]: c.kwargs for c in f.scheduler.mark_done.await_args_list}
+        assert '103' in calls, f'Expected mark_done for 103, got: {calls!r}'
+        assert calls['103']['sha'] == passer.merge_sha, (
+            f"Expected mark_done sha={passer.merge_sha!r} (fallback to r.merge_sha), "
+            f"got sha={calls['103'].get('sha')!r}"
+        )
+
+    async def test_advance_main_raises_leaves_member_parked(self) -> None:
+        """advance_main raising leaves the member parked: no mark_done call for
+        it, and processing continues for the remaining passers (no early abort).
+        """
+        f = self._fixture()
+        members = _train_members(train_id='T-outcome-sha-exc', tip_id='103')
+        passer_102 = _solo_pass_full('102')
+        passer_103 = _solo_pass_full('103')
+        f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+            _solo_fail('101'),
+            passer_102,
+            passer_103,
+        ])
+        f.git_ops.advance_main = AsyncMock(side_effect=[
+            RuntimeError('advance_main boom'),
+            AdvanceOutcome('advanced', advanced_sha='sha-103-landed'),
+        ])
+
+        tagged = _make_tagged_result()
+        await f.wf._attribute_train_failure(tagged, 'T-outcome-sha-exc', members)
+
+        called_ids = {c.args[0] for c in f.scheduler.mark_done.await_args_list}
+        assert '102' not in called_ids, (
+            f'Expected NO mark_done for 102 (advance_main raised, member parked); '
+            f'got: {f.scheduler.mark_done.await_args_list}'
+        )
+        assert '103' in called_ids, (
+            f'Expected mark_done for 103 (unaffected by the 102 advance_main raise); '
+            f'got: {f.scheduler.mark_done.await_args_list}'
+        )
