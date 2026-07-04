@@ -427,16 +427,36 @@ class GraphitiBackend:
         last_n: int = 10,
         reference_time: datetime | None = None,
     ) -> list[Any]:
-        """Retrieve recent episodes by group."""
+        """Retrieve recent episodes by group, ordered by created_at (most recent first) and truncated to last_n.
+
+        EpisodicNode.get_by_group_ids truncates via ``ORDER BY uuid DESC LIMIT``,
+        which is unrelated to recency, so we fetch the group's full episode set
+        (limit=None) and sort/truncate by created_at ourselves.
+        """
         driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
         try:
+            # Tradeoff: limit=None fetches the group's ENTIRE episode set on every
+            # call (no Cypher LIMIT), then we sort/truncate in Python. This is what
+            # makes the created_at ordering correct given that get_by_group_ids'
+            # own ORDER BY uuid DESC LIMIT truncates on the wrong key before we'd
+            # ever see the data. Acceptable today because episode reads are a cold
+            # path and per-project episode counts are bounded (reconciliation GC;
+            # last_n is separately capped at 1000 in tools.py). If per-group episode
+            # volume grows large, revisit with a created_at-indexed Cypher query
+            # (``ORDER BY e.created_at DESC LIMIT $limit``) to push the bound into
+            # the DB instead of transferring+sorting the full set here.
             episodes = await asyncio.wait_for(
                 EpisodicNode.get_by_group_ids(
-                    driver, group_ids, limit=last_n
+                    driver, group_ids, limit=None
                 ),
                 timeout=self._read_timeout,
             )
-            return episodes or []
+            episodes = sorted(
+                episodes or [],
+                key=lambda ep: getattr(ep, 'created_at', None) or datetime.min.replace(tzinfo=UTC),
+                reverse=True,
+            )
+            return episodes[:last_n]
         except TimeoutError:
             logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
             return []
