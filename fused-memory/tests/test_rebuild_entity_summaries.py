@@ -1188,6 +1188,120 @@ class TestMemoryServiceRebuildEntitySummaries:
 
 
 # ---------------------------------------------------------------------------
+# task-2076: MemoryService.rebuild_entity_summaries(entity_uuids=...) — targeted
+# force-regenerate path that bypasses staleness detection entirely.
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesEntityUuids:
+    """entity_uuids targets exactly the listed entities, bypassing staleness detection."""
+
+    @pytest.mark.asyncio
+    async def test_targets_only_listed_entity_bypassing_detection(self, mock_config):
+        """entity_uuids=['u1'] force-regenerates ONLY u1; detection is never consulted.
+
+        u1's baked summary contains a stale line not backed by any valid edge
+        ('baked stale line') alongside a line that IS backed by a valid edge
+        ('valid fact'). The targeted rebuild must regenerate strictly from the
+        valid edges, dropping the baked stale line, and must never dispatch u2
+        (the _uuid_dispatch mapping below omits u2, so any u2 call would raise).
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'baked stale line\nvalid fact'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'ok'},
+        ])
+        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+            'u1': [{'uuid': 'e1', 'fact': 'valid fact', 'name': 'r'}],
+            'u2': [{'uuid': 'e2', 'fact': 'ok', 'name': 'r'}],
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+            'u1': {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'baked stale line\nvalid fact',
+                   'new_summary': 'valid fact', 'edge_count': 1},
+        }))
+
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=['u1'])
+
+        assert result['total_entities'] == 1
+        assert result['stale_entities'] == 1
+        assert result['rebuilt'] == 1
+        # force-style target selection: list_entity_nodes is consulted (not detect_stale_*)
+        svc.graphiti.list_entity_nodes.assert_awaited_once()
+        # Baked stale line is dropped — the rebuilt summary reflects only the valid edge.
+        assert result['details'][0]['new_summary'] == 'valid fact'
+
+    @pytest.mark.asyncio
+    async def test_uuid_absent_from_graph_reported_not_found(self, mock_config):
+        """A requested UUID absent from the graph is reported in details with
+        status='not_found' and is never dispatched to rebuild_entity_from_edges,
+        while a matched UUID in the same request still rebuilds normally.
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 's'},
+        ])
+        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+            'u1': [{'uuid': 'e1', 'fact': 's', 'name': 'r'}],
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+            'u1': {'uuid': 'u1', 'name': 'Alice', 'old_summary': 's', 'new_summary': 's', 'edge_count': 1},
+        }))
+
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=['u1', 'u-missing'])
+
+        assert svc.graphiti.rebuild_entity_from_edges.await_count == 1
+        assert result['rebuilt'] == 1
+        not_found_entries = [d for d in result['details'] if d['status'] == 'not_found']
+        assert len(not_found_entries) == 1
+        assert not_found_entries[0]['uuid'] == 'u-missing'
+        assert result['total_entities'] == 1
+
+    @pytest.mark.asyncio
+    async def test_dry_run_targeted_skips_without_rebuilding(self, mock_config):
+        """entity_uuids + dry_run=True reports the target as skipped_dry_run and
+        never fetches edges or rebuilds — detection is bypassed but nothing is written.
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 's'},
+        ])
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock()
+        svc.graphiti.get_all_valid_edges = AsyncMock()
+
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=['u1'], dry_run=True)
+
+        svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
+        assert result['skipped'] == 1
+        assert result['rebuilt'] == 0
+        assert result['details'][0]['status'] == 'skipped_dry_run'
+        # No edge fetch needed for dry_run — the targeted path must not pay for it.
+        svc.graphiti.get_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_entity_uuids_is_zero_count_noop(self, mock_config):
+        """entity_uuids=[] is an explicit zero-count no-op — no backend calls at all.
+
+        Distinguishes [] (targeting nothing) from None (not targeting, existing
+        force/dry_run behavior unchanged).
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.list_entity_nodes = AsyncMock()
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock()
+
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=[])
+
+        assert result == {
+            'total_entities': 0,
+            'stale_entities': 0,
+            'rebuilt': 0,
+            'skipped': 0,
+            'errors': 0,
+            'details': [],
+        }
+        svc.graphiti.list_entity_nodes.assert_not_awaited()
+        svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # step-5: MCP tool rebuild_entity_summaries
 # ---------------------------------------------------------------------------
 
@@ -1231,6 +1345,17 @@ class TestRebuildEntitySummariesMcpTool:
         call_kwargs = mock_service.rebuild_entity_summaries.call_args[1]
         assert call_kwargs.get('project_id') == 'dark_factory'
         assert call_kwargs.get('dry_run') is True
+
+    @pytest.mark.asyncio
+    async def test_forwards_entity_uuids_to_service(self, mcp_server, mock_service):
+        """Tool forwards entity_uuids through to memory_service.rebuild_entity_summaries."""
+        await mcp_server._tool_manager.call_tool(
+            'rebuild_entity_summaries',
+            {'project_id': 'know_live', 'entity_uuids': ['cd0e25fd-7a71-481a-9d86-27bb4341168b']},
+        )
+        mock_service.rebuild_entity_summaries.assert_awaited_once()
+        call_kwargs = mock_service.rebuild_entity_summaries.call_args[1]
+        assert call_kwargs.get('entity_uuids') == ['cd0e25fd-7a71-481a-9d86-27bb4341168b']
 
     @pytest.mark.asyncio
     async def test_invalid_project_id_returns_error(self, mcp_server, mock_service):

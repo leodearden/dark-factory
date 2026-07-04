@@ -1614,6 +1614,7 @@ def create_mcp_server(
         session_id: str | None = None,
         metadata: dict | None = None,
         ctx: Context | None = None,
+        entity_uuids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Batch-rebuild Graphiti entity summaries from their current valid edges.
 
@@ -1627,6 +1628,14 @@ def create_mcp_server(
         any changes.  Use ``force=True`` to rebuild every entity regardless of
         detected staleness.
 
+        Pass ``entity_uuids`` to force-regenerate exactly those entities from
+        their currently-valid edges, bypassing staleness detection entirely
+        (takes precedence over ``force``). This clears baked-in stale summary
+        narrative that detection does not catch — e.g. a known-stale entity
+        found via ``get_entity``. Unknown UUIDs are reported in ``details``
+        with ``status='not_found'`` rather than raising. An empty list is a
+        zero-count no-op (no backend calls).
+
         Args:
             project_id: Project scope (required)
             force: Rebuild every entity regardless of staleness (default: false)
@@ -1634,6 +1643,8 @@ def create_mcp_server(
             agent_id: Which agent is calling (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
+            entity_uuids: When provided (non-empty), target exactly these entity
+                UUIDs, bypassing staleness detection (optional)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
@@ -1648,6 +1659,7 @@ def create_mcp_server(
                 session_id=session_id,
                 causation_id=causation_id,
                 _source=source,
+                entity_uuids=entity_uuids,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
