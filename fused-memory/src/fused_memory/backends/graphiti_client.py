@@ -453,7 +453,16 @@ class GraphitiBackend:
             )
             episodes = sorted(
                 episodes or [],
-                key=lambda ep: getattr(ep, 'created_at', None) or datetime.min.replace(tzinfo=UTC),
+                # Secondary key (uuid) makes this a total order: get_by_group_ids
+                # truncates via ORDER BY uuid DESC, so without a tie-breaker,
+                # episodes sharing created_at (batch/rapid co-ingestion, or
+                # reduced-precision storage) fall back to that upstream order,
+                # which is not guaranteed reproducible across executions and can
+                # read as non-monotonic to a strict-descending observer.
+                key=lambda ep: (
+                    getattr(ep, 'created_at', None) or datetime.min.replace(tzinfo=UTC),
+                    getattr(ep, 'uuid', None) or '',
+                ),
                 reverse=True,
             )
             return episodes[:last_n]
