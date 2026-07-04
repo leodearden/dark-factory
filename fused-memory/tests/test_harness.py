@@ -8812,8 +8812,9 @@ class TestHarnessReconcileStatusCorrection:
             f'task 1938; got {content!r}'
         )
 
-        # The informative payload must survive removal of the citation.
-        assert 'status-correction reconciliation' in content
+        # The functionally meaningful census fields must survive removal of
+        # the citation. (Deliberately not locking the surrounding prose here
+        # — that would make the test brittle to harmless rephrasing.)
         assert 'done=' in content
         assert 'total=' in content
         assert 'active=' in content

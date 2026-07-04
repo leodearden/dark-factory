@@ -845,7 +845,7 @@ class ReconciliationHarness:
         self, project_id: str, statuses: dict[str, str]
     ) -> dict | None:
         """Diff the cached Mem0 project_status_correction memory against the
-        live get_statuses census and supersede it on divergence (task 1938).
+        live get_statuses census and supersede it on divergence.
 
         Reuses the `statuses` census already fetched for task_count_verification
         in run_full_cycle — no extra get_statuses round-trip.  Fail-open at every
