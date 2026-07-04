@@ -2505,6 +2505,10 @@ class TestExecuteGraphitiWriteWithDedup:
 
     step-10: _execute_graphiti_write returns normally when add_episode
              returns None (no edges to dedup, no crash)
+
+    task 2073 step-7: _execute_graphiti_write also invokes the node-dedup
+             sweep (_dedup_episode_nodes) with the add_episode result and
+             group_id, alongside the existing edge-dedup/restore sweeps.
     """
 
     @pytest.mark.asyncio
@@ -2601,6 +2605,33 @@ class TestExecuteGraphitiWriteWithDedup:
         service.graphiti.update_edge.assert_called_once_with(
             'dep-edge-1', group_id='test', clear_invalid_at=True
         )
+
+    @pytest.mark.asyncio
+    async def test_execute_graphiti_write_calls_node_dedup_sweep(self, service):
+        """task 2073 step-7: the node-dedup sweep is invoked with the
+        add_episode result and group_id, alongside the edge-dedup/restore
+        sweeps already wired into _execute_graphiti_write."""
+        from unittest.mock import AsyncMock
+
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        mock_result = MockAddEpisodeResult(nodes=[MockNode(name='Reify')])
+
+        service.graphiti.add_episode = AsyncMock(return_value=mock_result)
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+        service._dedup_episode_nodes = AsyncMock(return_value=0)
+
+        payload = {
+            'name': 'ep_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        service._dedup_episode_nodes.assert_awaited_once()
+        assert service._dedup_episode_nodes.call_args == ((mock_result,), {'group_id': 'test'})
 
 
 # ---------------------------------------------------------------------------
