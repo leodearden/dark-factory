@@ -636,6 +636,50 @@ class TestFinalizeDrivesRegistry:
         assert 'equivalence' in gate_lines[0]
         assert 'pyright' not in gate_lines[0]
 
+    async def test_finalize_pyright_block_via_registry(self, caplog) -> None:
+        """Second-gate-in-chain path: equivalence passes, pyright blocks.
+
+        This is the case the registry refactor changes the most — a
+        terminal built from a gate WITHOUT an on_blocked hook, reached only
+        after a prior gate in the chain has already run and passed.
+        """
+        from orchestrator.merge_gates import (
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        broken_pyright = MagicMock(
+            broken=True, failing_subprojects=['pkg'], detail='pyright-detail',
+        )
+        args = self._make_finalize_args(chain_ctx=None)
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=broken_pyright),
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            outcome = await _finalize_advanced_merge(**args)
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)
+        assert outcome.merge_sha == args['git_ops']._last_advanced_sha
+        args['git_ops'].push_main.assert_not_awaited()
+
+        gate_lines = [
+            r.getMessage() for r in caplog.records
+            if 'post-advance gates run:' in r.getMessage()
+        ]
+        assert len(gate_lines) == 1, (
+            f'expected exactly one gate-names INFO line, got: {gate_lines}'
+        )
+        assert 'equivalence' in gate_lines[0]
+        assert 'pyright' in gate_lines[0]
+
     async def test_finalize_gamma2_chain_via_registry(self) -> None:
         from orchestrator.merge_gates import _finalize_advanced_merge, _GenerationChainContext
         from orchestrator.merge_types import MergeOutcome
