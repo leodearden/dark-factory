@@ -2227,33 +2227,69 @@ def test_format_outcome_echo_truth_table(provenance, expected_contains):
 
 
 def test_format_outcome_echo_truncates_long_note():
-    """`note[:max_note_chars]` caps the echoed note at 500 chars, and in the
-    note+commit branch the cap is applied to the note BEFORE the
-    ``" (commit <sha>)"`` suffix is appended -- so the suffix must still
-    appear, intact, after a note longer than the cap.
+    """``_truncate_clean(note, max_note_chars)`` caps the echoed note at 500
+    chars, and in the note+commit branch the cap is applied to the note
+    BEFORE the ``" (commit <sha>)"`` suffix is appended -- so the suffix must
+    still appear, intact, after a note longer than the cap.
 
-    Task 2049 amendment: the truth table above never supplied a note longer
-    than 500 chars, so neither the cap itself nor this ordering (truncate
-    first, then append the commit suffix) was exercised -- a future off-by-one
-    or an accidentally removed ``[:max_note_chars]`` slice would have shipped
-    silently. Exact-equality assertions are used here (rather than the truth
-    table's `in` containment checks) because a repeated-character note would
-    make a containment check on a truncated substring vacuously true.
+    Task 2080 rewrite: this note ('N' * 600) has no whitespace at all, so the
+    clean-truncation contract falls back to its hard-cut path -- a single-char
+    ellipsis ('…', U+2026) replaces the previous raw ``note[:500]`` cut, and
+    the result is exactly 500 chars long (the ellipsis is counted within the
+    cap, so the bound is unchanged). Exact-equality assertions are used here
+    (rather than the truth table's `in` containment checks) because a
+    repeated-character note would make a containment check on a truncated
+    substring vacuously true.
     """
     from fused_memory.reconciliation.targeted import _format_outcome_echo
 
     long_note = 'N' * 600
+    expected_truncated = ('N' * 499) + '…'
 
     note_only = _format_outcome_echo({'note': long_note})
     assert note_only is not None
-    assert note_only == long_note[:500]
+    assert note_only == expected_truncated
     assert len(note_only) == 500
 
     note_and_commit = _format_outcome_echo({'note': long_note, 'commit': 'abc123def'})
     assert note_and_commit is not None
-    assert note_and_commit == f'{long_note[:500]} (commit abc123def)'
-    assert note_and_commit.startswith(long_note[:500])
+    assert note_and_commit == f'{expected_truncated} (commit abc123def)'
+    assert note_and_commit.startswith(expected_truncated)
     assert note_and_commit.endswith(' (commit abc123def)')
+
+
+def test_format_outcome_echo_no_mid_number_splice_regression():
+    """Task 2054 regression: a note whose old raw ``text[:500]`` cut landed
+    mid-number (the reported case chopped "8679,8680" down to "8679,868")
+    must not glue that broken fragment directly onto the trailing
+    ``" (commit <sha>)"`` suffix.
+
+    This reproduces the boundary with realistic surrounding prose (spaces
+    throughout, mirroring dense CSV-like note text) so the word-boundary
+    truncation actually backs up to a clean cut instead of hard-cutting mid-
+    token: the fixture is constructed so the OLD ``note[:500]`` slice ends
+    exactly in "...8679,868" (asserted below), pinning that this fixture
+    still reproduces the original garble if the clean truncation regresses.
+    """
+    from fused_memory.reconciliation.targeted import _format_outcome_echo
+
+    padding = 'lorem ipsum dolor sit ' * 30
+    token = '8679,8680'
+    t0 = 492  # the old text[:500] slice ends mid-token: "...8679,868"
+    note = padding[:t0] + token + padding[t0:t0 + 200]
+    assert note[:500].endswith('8679,868'), 'fixture no longer reproduces the mid-token boundary'
+
+    echo = _format_outcome_echo({'note': note, 'commit': 'abc123def'})
+    assert echo is not None
+    assert '8679,868 (commit' not in echo, (
+        f'mid-number fragment glued directly onto commit suffix: {echo!r}'
+    )
+    assert '8679' not in echo, f'token leaked into truncated echo: {echo!r}'
+    note_part, sep, commit_part = echo.rpartition(' (commit ')
+    assert sep, f'expected " (commit " suffix marker in {echo!r}'
+    assert note_part.endswith('…'), f'note portion must end with an ellipsis: {echo!r}'
+    assert commit_part == 'abc123def)'
+    assert echo.endswith(' (commit abc123def)')
 
 
 @pytest.mark.asyncio
