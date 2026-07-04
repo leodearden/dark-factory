@@ -2094,11 +2094,13 @@ class MemoryService:
         session_id: str | None = None,
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
+        entity_uuids: list[str] | None = None,
     ) -> dict:
         """Batch-rebuild Entity node summaries from their current valid edges.
 
         Orchestrates the rebuild pipeline:
-        1. Target selection — detect_stale_with_edges (force=False) or
+        1. Target selection — entity_uuids (targeted, bypasses detection) takes
+           precedence over detect_stale_with_edges (force=False) or
            list_entity_nodes (force=True).
         2. Fan-out — asyncio.Semaphore(20) + asyncio.gather(return_exceptions=True)
            calling graphiti.rebuild_entity_from_edges for each target.
@@ -2115,6 +2117,9 @@ class MemoryService:
             session_id: Session context (optional).
             causation_id: Reconciliation causation ID (optional).
             _source: Source label for journal entry.
+            entity_uuids: When provided (non-empty), force-regenerate exactly
+                these entities from their currently-valid edges, bypassing
+                staleness detection entirely (takes precedence over force).
 
         Returns:
             Dict with keys: total_entities, stale_entities, rebuilt, skipped,
@@ -2130,7 +2135,19 @@ class MemoryService:
             all_edges: dict[str, list] = {}
             total_entities: int = 0
 
-            if force:
+            if entity_uuids is not None and len(entity_uuids) > 0:
+                requested = list(dict.fromkeys(entity_uuids))  # dedupe, preserve order
+                all_entities = await self.graphiti.list_entity_nodes(group_id=project_id)
+                by_uuid = {e['uuid']: e for e in all_entities}
+                targets = [
+                    {'uuid': u, 'name': by_uuid[u]['name'], 'old_summary': by_uuid[u]['summary']}
+                    for u in requested
+                    if u in by_uuid
+                ]
+                total_entities = len(targets)
+                if not dry_run:
+                    all_edges = await self.graphiti.get_all_valid_edges(group_id=project_id)
+            elif force:
                 all_entities = await self.graphiti.list_entity_nodes(group_id=project_id)
                 targets = [
                     {'uuid': e['uuid'], 'name': e['name'], 'old_summary': e['summary']}
@@ -2258,7 +2275,7 @@ class MemoryService:
                         project_id=project_id,
                         agent_id=agent_id,
                         session_id=session_id,
-                        params={'force': force, 'dry_run': dry_run},
+                        params={'force': force, 'dry_run': dry_run, 'entity_uuids': entity_uuids},
                         result_summary={
                             'total_entities': result.get('total_entities', 0),
                             'stale_entities': result.get('stale_entities', 0),
