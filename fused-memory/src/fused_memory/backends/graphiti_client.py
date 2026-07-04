@@ -1158,6 +1158,50 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    async def find_duplicate_entity_nodes(self, name: str, *, group_id: str) -> list[dict]:
+        """Return every Entity node sharing an exact name, canonical-ordered.
+
+        Sibling to resolve_entity_by_name / get_nodes_by_exact_name: same
+        `MATCH (n:Entity {name: $name})` exact, case-sensitive match shape,
+        but scoped to surfacing exact-name DUPLICATES for the post-write
+        node-dedup sweep (MemoryService._dedup_episode_nodes) rather than
+        resolving a single canonical node. Results are ordered
+        canonical-first — most valid edges, then oldest created_at, then
+        uuid — so callers can treat matches[0] as the merge survivor and
+        matches[1:] as the deprecated duplicates to fold into it.
+
+        Uses ro_query since no writes are performed.
+
+        Args:
+            name: Exact name of the Entity node(s) to look up.
+            group_id: Project graph to query.
+
+        Returns:
+            List of dicts with keys: uuid, created_at, edge_count — ordered
+            canonical (survivor) first. Empty list when no entity matches;
+            a single-element list when the name is unique (no duplicate).
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity {name: $name}) '
+            'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+            'WITH n, count(DISTINCT e) AS edge_count '
+            'RETURN n.uuid, n.created_at, edge_count '
+            'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
+        )
+        result = await graph.ro_query(cypher, {'name': name})
+        return [
+            {
+                'uuid': row[0],
+                'created_at': row[1],
+                'edge_count': row[2],
+            }
+            for row in (result.result_set or [])
+        ]
+
     @staticmethod
     def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
         """Build a normalised edge dict, coercing NULL fact/name to empty string.
