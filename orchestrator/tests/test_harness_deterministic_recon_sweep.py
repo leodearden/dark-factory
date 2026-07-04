@@ -32,7 +32,8 @@ This file covers:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
@@ -463,3 +464,141 @@ class TestRunDeterministicReconSweep:
         await h._run_deterministic_recon_sweep()  # must not raise
 
         assert calls == ['tid-bad', 'tid-good']
+
+
+# ---------------------------------------------------------------------------
+# step-13: start/stop/loop lifecycle wiring
+# ---------------------------------------------------------------------------
+
+
+def _make_lifecycle_harness(*, enabled: bool = True) -> Harness:
+    """Build a minimal Harness for deterministic-recon-sweep lifecycle tests."""
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    config = OrchestratorConfig()
+    config = config.model_copy(update={'deterministic_recon_sweep_enabled': enabled})
+    h.config = config
+    h._deterministic_recon_sweep_task = None
+    h._recon_unit_inspector = None
+    return h
+
+
+class TestDeterministicReconSweepLifecycle:
+    """step-13: _start/_stop_deterministic_recon_sweep lifecycle wiring."""
+
+    def test_start_deterministic_recon_sweep_creates_task(self) -> None:
+        """When deterministic_recon_sweep_enabled=True, _start_deterministic_recon_sweep
+        creates an asyncio.Task named 'deterministic-recon-sweep' and stores it."""
+        h = _make_lifecycle_harness(enabled=True)
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = False
+        mock_task.get_name.return_value = 'deterministic-recon-sweep'
+
+        def _create_task(coro, *, name=None):
+            coro.close()
+            return mock_task
+
+        with patch('orchestrator.harness.asyncio.create_task', side_effect=_create_task) as mock_ct:
+            h._start_deterministic_recon_sweep()
+
+        assert h._deterministic_recon_sweep_task is mock_task
+        _, kwargs = mock_ct.call_args
+        assert kwargs.get('name') == 'deterministic-recon-sweep', (
+            f'Expected task name deterministic-recon-sweep, got {kwargs.get("name")!r}'
+        )
+
+    def test_start_deterministic_recon_sweep_disabled(self) -> None:
+        """When deterministic_recon_sweep_enabled=False, the start call is a no-op."""
+        h = _make_lifecycle_harness(enabled=False)
+        with patch('orchestrator.harness.asyncio.create_task') as mock_ct:
+            h._start_deterministic_recon_sweep()
+            mock_ct.assert_not_called()
+        assert h._deterministic_recon_sweep_task is None
+
+    def test_start_deterministic_recon_sweep_idempotent(self) -> None:
+        """A live (not-done) existing task is not replaced by a second start call."""
+        h = _make_lifecycle_harness(enabled=True)
+        live_task = MagicMock(spec=asyncio.Task)
+        live_task.done.return_value = False
+        h._deterministic_recon_sweep_task = live_task
+
+        with patch('orchestrator.harness.asyncio.create_task') as mock_ct:
+            h._start_deterministic_recon_sweep()
+            mock_ct.assert_not_called()
+
+        assert h._deterministic_recon_sweep_task is live_task
+
+    @pytest.mark.asyncio
+    async def test_stop_deterministic_recon_sweep_cancels(self) -> None:
+        """After _start_, _stop_deterministic_recon_sweep cancels the task and
+        resets h._deterministic_recon_sweep_task to None."""
+        h = _make_lifecycle_harness(enabled=True)
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = False
+
+        def _create_task(coro, *, name=None):
+            coro.close()
+            return mock_task
+
+        with patch('orchestrator.harness.asyncio.create_task', side_effect=_create_task):
+            h._start_deterministic_recon_sweep()
+
+        assert h._deterministic_recon_sweep_task is mock_task
+
+        mock_task.cancel.return_value = True
+
+        async def _await_cancelled():
+            raise asyncio.CancelledError()
+
+        mock_task.__await__ = lambda self: _await_cancelled().__await__()
+
+        await h._stop_deterministic_recon_sweep()
+
+        mock_task.cancel.assert_called_once()
+        assert h._deterministic_recon_sweep_task is None
+
+
+class TestDeterministicReconSweepLoopFailureHandling:
+    """step-13: the sweep loop logs a bounded summary and backs off on failure,
+    mirroring _main_tip_sweep_loop's task-1907 bounded-failure discipline."""
+
+    @pytest.mark.asyncio
+    async def test_loop_failure_is_bounded_and_backs_off_not_spin(self) -> None:
+        """A pass that fails immediately must back off (no tight-spin) and log a
+        bounded summary via logger.error — NOT logger.exception."""
+        h = _make_lifecycle_harness(enabled=True)
+        # Interval 0 so the top-of-loop sleep returns immediately: without the
+        # backoff guarantee, a failing pass would spin without yielding.
+        h.config = h.config.model_copy(update={'deterministic_recon_sweep_interval_secs': 0.0})
+
+        calls = {'n': 0}
+
+        async def _failing_pass() -> None:
+            calls['n'] += 1
+            raise RuntimeError('sweep boom')
+
+        h._run_deterministic_recon_sweep = _failing_pass  # type: ignore[method-assign]
+
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def _tracking_sleep(delay: float, *a, **k):
+            sleeps.append(delay)
+            # Stop the loop after a couple of failing iterations so the test
+            # terminates deterministically without relying on wall-clock.
+            if calls['n'] >= 2:
+                raise asyncio.CancelledError()
+            return await real_sleep(0)
+
+        with patch('orchestrator.harness.asyncio.sleep', side_effect=_tracking_sleep), \
+                patch('orchestrator.harness.logger') as mock_logger, \
+                pytest.raises(asyncio.CancelledError):
+            await h._deterministic_recon_sweep_loop()
+
+        # logger.exception must NOT be used (pathological-traceback footgun).
+        mock_logger.exception.assert_not_called()
+        # A bounded one-line summary is logged via logger.error per failure.
+        assert mock_logger.error.call_count >= 1, 'expected bounded logger.error summary'
+        # The backoff sleep (60.0s) was requested after a failure — proving the
+        # loop yields a real quiescent gap instead of tight-spinning.
+        assert 60.0 in sleeps, f'expected a 60s backoff sleep, got {sleeps!r}'
