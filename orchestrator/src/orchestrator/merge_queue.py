@@ -3390,96 +3390,26 @@ class MergeWorker(_WipHaltMixin):
             )
             return self._abandon_outcome(req.task_id, prior_timeouts)
 
-        # 0. Branch-presence guard: a missing branch ref resolves terminally
-        # (unknown_branch on a never-existed ref — typically a mis-routed
-        # merge_request — or already_merged when the ref was cleaned up after
-        # merge).  Runs before the rev-parse HEAD below so a misroute can't be
-        # born as a bare merge_dequeued (phantom in_flight on the dashboard).
-        # Pass req.worktree so _classify_branch_presence can distinguish a
-        # genuine misroute (no unmerged commits) from a lost-ref-but-work-present
-        # scenario where the worktree HEAD carries commits beyond main.
-        guard = await _classify_branch_presence(
-            self._git_ops, self._event_store, req.task_id, req.branch, t0,
-            worktree=req.worktree,
-        )
-        if guard is not None:
-            return guard
-
-        # 1. Already-merged detection (ghost-loop fix)
-        _, branch_head, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
-        )
+        # Guard + merge + drop-guard pipeline (MQ-refactor kappa): shared with
+        # SpeculativeMergeWorker's _merger_loop/_remerge.  main_sha is read
+        # here (not just inside classify_and_merge) because it is also
+        # needed below for advance_main's expected_main and
+        # _finalize_advanced_merge's base_sha — classify_and_merge reads its
+        # own actual_main for the already-merged check (benign double-read;
+        # advance_main's CAS tolerates any drift between the two reads).
         main_sha = await self._git_ops.get_main_sha()
-        # Use snapshot_tip when set: it is the ref THIS request intends to
-        # merge, which is drift-proof vs a shared or hijacked lane whose
-        # worktree HEAD may have been rebased to an orphaned lineage after
-        # snapshotting.  Workflow-path requests leave snapshot_tip=None and
-        # retain the existing worktree-HEAD basis (back-compat).
-        effective_tip = req.snapshot_tip or branch_head.strip()
-        if await self._git_ops.is_ancestor(effective_tip, main_sha):
-            # Guard: if worktree has uncommitted changes, an agent may
-            # have started work — don't skip.
-            if await self._git_ops.has_uncommitted_work(req.worktree):
-                logger.warning(
-                    f'Task {req.task_id}: branch is ancestor of main but '
-                    f'worktree has uncommitted changes — not skipping merge'
-                )
-            else:
-                logger.info(
-                    f'Task {req.task_id}: branch already on main — skipping merge'
-                )
-                _emit_merge_attempt(self._event_store, req.task_id, 'already_merged', duration_ms=_elapsed_ms(t0))
-                return MergeOutcome('already_merged')
-
-        # 2. Merge in a temporary worktree
-        merge_result = await self._git_ops.merge_to_main(
-            req.worktree, req.branch,
+        result = await classify_and_merge(
+            self, req, main_sha, speculative=False, started_monotonic=t0,
         )
-
-        # 3. Conflict → reject immediately (caller resolves outside queue)
-        if merge_result.conflicts:
-            logger.info(f'Task {req.task_id}: merge conflicts detected')
-            _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(t0))
-            if merge_result.merge_worktree:
-                await self._git_ops.cleanup_merge_worktree(
-                    merge_result.merge_worktree,
-                )
-            return MergeOutcome(
-                'conflict', conflict_details=merge_result.details,
-            )
-
-        if not merge_result.success:
-            if merge_result.merge_worktree:
-                await self._git_ops.cleanup_merge_worktree(
-                    merge_result.merge_worktree,
-                )
-            return MergeOutcome('blocked', reason=merge_result.details)
-
-        # 3b. Drop-guard: every file the task planned must survive the merge.
-        # Catches "accept origin" conflict resolutions that silently drop
-        # planned work from the task branch.
+        if isinstance(result, Decided):
+            return result.outcome
+        merge_result = result.merge_result
+        branch_head = result.branch_tip
+        # classify_and_merge only returns MergedOk after its own drop-guard
+        # step asserted merge_commit is set, and after rev-parsing branch
+        # HEAD successfully — both are guaranteed non-None here.
         assert merge_result.merge_commit is not None
-        drop_result = await _check_plan_targets_in_tree(
-            merge_result.merge_commit, req.worktree, self._git_ops, main_sha,
-            task_id=req.task_id,
-        )
-        dropped = drop_result.dropped
-        if dropped:
-            if merge_result.merge_worktree:
-                await self._git_ops.cleanup_merge_worktree(
-                    merge_result.merge_worktree,
-                )
-            logger.warning(
-                f'Task {req.task_id}: merge dropped plan targets: {dropped}'
-            )
-            _emit_merge_attempt(self._event_store, req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
-            reason = (
-                f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: '
-                f'{", ".join(dropped)}. '
-                f'Conflict resolution likely dropped planned work. '
-                f'Review the merge commit and restore missing files.'
-            )
-            return MergeOutcome('blocked', reason=reason)
+        assert branch_head is not None
 
         # 4. Verify — task-1724: unconditional, skip_verify path removed
         merge_wt = merge_result.merge_worktree
@@ -3489,7 +3419,7 @@ class MergeWorker(_WipHaltMixin):
         # per-worker verify counter and compute the safety-valve predicate so
         # every Nth verifying attempt runs a from-scratch cold verify in a
         # throwaway worktree (PRD §10 invariant 6).
-        # merge_result.merge_commit is non-None (asserted at line 4044 above).
+        # merge_result.merge_commit is non-None (asserted above).
         self._verify_attempt_count += 1
         _due = _safety_valve_due(
             self._verify_attempt_count,
