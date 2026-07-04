@@ -3951,6 +3951,120 @@ class TestReconPoolAutoTagInjection:
         assert call_kwargs['metadata']['recon_pool'] == 'caller_val'
 
 
+class TestReconPoolAutoTagMissingStageWarning:
+    """metadata.stage is itself LLM-supplied (see the reconciliation
+    stage1/stage2 prompts), so a missing/unknown stage means recon_pool
+    could not be derived server-side either — the same prompt-compliance
+    failure task 2077 targets, just shifted from the recon_pool field to the
+    stage field. A WARNING makes these writes observable instead of silently
+    relying on whatever (if anything) the caller passed for recon_pool
+    (amendment review, task 2077).
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_stage_logs_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={'kind': 'cycle_summary', 'run_id': 'run-x'},
+                causation_id='run-x',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for a cycle_summary with missing stage, '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+        record = warning_records[0]
+        message = record.message.lower()
+        assert 'cycle_summary' in message and 'stage' in message, (
+            f'Expected the WARNING to name the missing/unknown-stage condition, '
+            f'got: {record.message!r}'
+        )
+        assert record.stage is None
+        assert record.caller_recon_pool is None
+        assert record.causation_id == 'run-x'
+        assert record.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_unknown_stage_logs_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'unknown_stage',
+                    'recon_pool': 'caller_val',
+                    'run_id': 'run-x',
+                },
+                causation_id='run-x',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for a cycle_summary with an unknown stage, '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+        record = warning_records[0]
+        assert record.stage == 'unknown_stage'
+        assert record.caller_recon_pool == 'caller_val'
+
+    @pytest.mark.asyncio
+    async def test_known_stage_no_warning(self, service, caplog):
+        """Happy path (known stage) must not trigger the missing-stage WARNING."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    'run_id': 'run-x',
+                },
+                causation_id='run-x',
+            )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING when stage is known, got: '
+            f'{[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_cycle_summary_kind_no_warning_even_without_stage(self, service, caplog):
+        """Only kind == 'cycle_summary' writes are subject to this warning."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Always use type hints',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={'kind': 'note'},
+            )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING for a non-cycle_summary kind, got: '
+            f'{[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_metadata_no_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Always use type hints',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+            )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING when no metadata is supplied, got: '
+            f'{[r.message for r in warning_records]}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Step 3: TRACK B.1 service clear_invalid_at RED tests
 # ---------------------------------------------------------------------------

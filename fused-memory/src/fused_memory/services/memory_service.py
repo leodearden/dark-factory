@@ -963,6 +963,26 @@ class MemoryService:
         inferred_recon_pool = _infer_recon_pool(meta)
         if inferred_recon_pool is not None:
             meta['recon_pool'] = inferred_recon_pool
+        elif meta.get('kind') == 'cycle_summary':
+            # metadata.stage is itself LLM-supplied (see the reconciliation
+            # stage1/stage2 prompts), so a missing/unknown stage means
+            # recon_pool could not be derived server-side either — the same
+            # prompt-compliance failure this task targets, just shifted from
+            # the recon_pool field to the stage field (amendment review,
+            # task 2077). Log so these writes are observable rather than
+            # silently relying on whatever (if anything) the caller passed —
+            # an untagged cycle_summary is invisible to the pool-cap trim and
+            # ops prune script and will regrow unbounded.
+            logger.warning(
+                'MemoryService.add_memory: cycle_summary write with missing/unknown '
+                'metadata.stage — recon_pool could not be inferred server-side',
+                extra={
+                    'project_id': project_id,
+                    'stage': meta.get('stage'),
+                    'caller_recon_pool': meta.get('recon_pool'),
+                    'causation_id': causation_id,
+                },
+            )
 
         write_graphiti = (
             resolved_category in GRAPHITI_PRIMARY or dual_write
