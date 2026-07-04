@@ -2092,6 +2092,116 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
 
 
 # ---------------------------------------------------------------------------
+# _truncate_clean unit tests (task 2080)
+#
+# _format_outcome_echo's `note[:max_note_chars]` slice (and _on_task_done's
+# identical `details[:500]` append) cut on a raw character count with no
+# regard for word/token boundaries, so a long note is silently garbled mid
+# word/number (e.g. task 2054: "8679,8680" chopped to "8679,868") and, in the
+# note+commit branch, the " (commit <sha>)" suffix is glued directly onto
+# that broken fragment. _truncate_clean is the shared pure helper that
+# replaces both raw slices with a clean, word-boundary-aware truncation.
+
+
+def test_truncate_clean_returns_short_text_unchanged():
+    """Text at or under the limit is returned verbatim -- no ellipsis
+    appended -- so every existing short-note/short-details case is
+    unaffected."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    short = 'x' * 20
+    assert _truncate_clean(short, 500) == short
+    assert '…' not in _truncate_clean(short, 500)
+    # Boundary case: exactly at the limit is still "unchanged", not truncated.
+    exact = 'y' * 500
+    assert _truncate_clean(exact, 500) == exact
+
+
+def test_truncate_clean_cuts_on_word_boundary():
+    """A long text with whitespace near the cutoff backs up to that boundary
+    instead of slicing through the trailing word -- the dropped word must
+    not appear as a broken fragment glued to the ellipsis."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    # Index 495 is the last whitespace char within text[:499] (the budget
+    # for limit=500); the word 'ZZZZZZZZZZ' starts right after it and would
+    # be chopped to 'ZZZ' by a naive text[:500] slice.
+    text = ('A' * 495) + ' ' + ('Z' * 10)
+    result = _truncate_clean(text, 500)
+
+    assert result.endswith('…')
+    assert len(result) <= 500
+    # The boundary word must be dropped whole, not split mid-token.
+    assert 'Z' not in result
+    assert 'ZZZ…' not in result
+    assert result == ('A' * 495) + '…'
+
+
+def test_truncate_clean_hard_cuts_when_no_whitespace_in_window():
+    """No whitespace anywhere in the truncation window -- falls back to a
+    hard cut at (limit - 1) chars plus the ellipsis, still honoring the
+    cap."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    long_text = 'N' * 600
+    result = _truncate_clean(long_text, 500)
+
+    assert result == ('N' * 499) + '…'
+    assert len(result) == 500
+
+
+def test_truncate_clean_ignores_early_whitespace_min_retention_guard():
+    """Whitespace that sits very early in the window is NOT used as the cut
+    point when backing up to it would discard more than half the budget --
+    that would collapse a 500-char budget down to a couple of characters."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    text = 'ab ' + ('N' * 600)
+    result = _truncate_clean(text, 500)
+
+    # Must NOT back up to the space at index 2 (would keep only 'ab').
+    assert not result.startswith('ab…')
+    assert result == text[:499] + '…'
+    assert len(result) == 500
+
+
+def test_truncate_clean_word_boundary_well_past_half_budget_retains_chunk():
+    """A last-whitespace index that is comfortably past budget // 2 -- but
+    nowhere near the edge of the window, unlike the near-boundary word-cut
+    test above -- still takes the word-boundary branch (backs up to that
+    whitespace) rather than falling through to a hard cut at the budget."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    # budget = limit - 1 = 499, so budget // 2 == 249; the space at index 300
+    # is well past that threshold without hugging the window's edge.
+    text = ('A' * 300) + ' ' + ('B' * 300)
+    result = _truncate_clean(text, 500)
+
+    assert result == ('A' * 300) + '…'
+    assert 'B' not in result
+    assert len(result) < 500
+
+
+def test_truncate_clean_rstrips_trailing_whitespace_before_ellipsis():
+    """Multiple consecutive whitespace chars ending at the word-boundary cut
+    point leave the head (`text[:last_ws]`) still ending in whitespace --
+    rstrip() must trim that before the ellipsis is appended, so the result
+    never reads as "...word    …" and its length can land strictly under
+    the limit rather than exactly at it."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    # Three consecutive spaces at indices 300-302; index 302 is the last
+    # whitespace in the text[:499] window for limit=500, so head = text[:302]
+    # still carries two of those spaces for rstrip() to remove.
+    text = ('A' * 300) + '   ' + ('B' * 300)
+    result = _truncate_clean(text, 500)
+
+    assert result == ('A' * 300) + '…'
+    assert not result.endswith(' …')
+    assert len(result) < 500
+
+
+# ---------------------------------------------------------------------------
 # _format_outcome_echo truth table (task 2049)
 #
 # _on_task_done's fast-path completion echo currently appends the task's raw
@@ -2153,33 +2263,69 @@ def test_format_outcome_echo_truth_table(provenance, expected_contains):
 
 
 def test_format_outcome_echo_truncates_long_note():
-    """`note[:max_note_chars]` caps the echoed note at 500 chars, and in the
-    note+commit branch the cap is applied to the note BEFORE the
-    ``" (commit <sha>)"`` suffix is appended -- so the suffix must still
-    appear, intact, after a note longer than the cap.
+    """``_truncate_clean(note, max_note_chars)`` caps the echoed note at 500
+    chars, and in the note+commit branch the cap is applied to the note
+    BEFORE the ``" (commit <sha>)"`` suffix is appended -- so the suffix must
+    still appear, intact, after a note longer than the cap.
 
-    Task 2049 amendment: the truth table above never supplied a note longer
-    than 500 chars, so neither the cap itself nor this ordering (truncate
-    first, then append the commit suffix) was exercised -- a future off-by-one
-    or an accidentally removed ``[:max_note_chars]`` slice would have shipped
-    silently. Exact-equality assertions are used here (rather than the truth
-    table's `in` containment checks) because a repeated-character note would
-    make a containment check on a truncated substring vacuously true.
+    Task 2080 rewrite: this note ('N' * 600) has no whitespace at all, so the
+    clean-truncation contract falls back to its hard-cut path -- a single-char
+    ellipsis ('…', U+2026) replaces the previous raw ``note[:500]`` cut, and
+    the result is exactly 500 chars long (the ellipsis is counted within the
+    cap, so the bound is unchanged). Exact-equality assertions are used here
+    (rather than the truth table's `in` containment checks) because a
+    repeated-character note would make a containment check on a truncated
+    substring vacuously true.
     """
     from fused_memory.reconciliation.targeted import _format_outcome_echo
 
     long_note = 'N' * 600
+    expected_truncated = ('N' * 499) + '…'
 
     note_only = _format_outcome_echo({'note': long_note})
     assert note_only is not None
-    assert note_only == long_note[:500]
+    assert note_only == expected_truncated
     assert len(note_only) == 500
 
     note_and_commit = _format_outcome_echo({'note': long_note, 'commit': 'abc123def'})
     assert note_and_commit is not None
-    assert note_and_commit == f'{long_note[:500]} (commit abc123def)'
-    assert note_and_commit.startswith(long_note[:500])
+    assert note_and_commit == f'{expected_truncated} (commit abc123def)'
+    assert note_and_commit.startswith(expected_truncated)
     assert note_and_commit.endswith(' (commit abc123def)')
+
+
+def test_format_outcome_echo_no_mid_number_splice_regression():
+    """Task 2054 regression: a note whose old raw ``text[:500]`` cut landed
+    mid-number (the reported case chopped "8679,8680" down to "8679,868")
+    must not glue that broken fragment directly onto the trailing
+    ``" (commit <sha>)"`` suffix.
+
+    This reproduces the boundary with realistic surrounding prose (spaces
+    throughout, mirroring dense CSV-like note text) so the word-boundary
+    truncation actually backs up to a clean cut instead of hard-cutting mid-
+    token: the fixture is constructed so the OLD ``note[:500]`` slice ends
+    exactly in "...8679,868" (asserted below), pinning that this fixture
+    still reproduces the original garble if the clean truncation regresses.
+    """
+    from fused_memory.reconciliation.targeted import _format_outcome_echo
+
+    padding = 'lorem ipsum dolor sit ' * 30
+    token = '8679,8680'
+    t0 = 492  # the old text[:500] slice ends mid-token: "...8679,868"
+    note = padding[:t0] + token + padding[t0:t0 + 200]
+    assert note[:500].endswith('8679,868'), 'fixture no longer reproduces the mid-token boundary'
+
+    echo = _format_outcome_echo({'note': note, 'commit': 'abc123def'})
+    assert echo is not None
+    assert '8679,868 (commit' not in echo, (
+        f'mid-number fragment glued directly onto commit suffix: {echo!r}'
+    )
+    assert '8679' not in echo, f'token leaked into truncated echo: {echo!r}'
+    note_part, sep, commit_part = echo.rpartition(' (commit ')
+    assert sep, f'expected " (commit " suffix marker in {echo!r}'
+    assert note_part.endswith('…'), f'note portion must end with an ellipsis: {echo!r}'
+    assert commit_part == 'abc123def)'
+    assert echo.endswith(' (commit abc123def)')
 
 
 @pytest.mark.asyncio
@@ -2481,6 +2627,101 @@ async def test_on_task_done_first_transition_echoes_provenance_not_description(
     assert metadata.get('echo_used_provenance') is True
     assert metadata.get('source') == 'targeted_reconciliation'
 
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+# ---------------------------------------------------------------------------
+# Legacy details-fallback clean truncation (task 2080)
+#
+# When no usable done_provenance exists (_format_outcome_echo returns None),
+# _on_task_done falls back to appending the raw description + `details`.
+# `details` was previously hard-cut with a raw `details[:500]` slice -- the
+# same naive-character-count bug fixed in _format_outcome_echo's note
+# branches. This pins the legacy fallback to the same clean, word-boundary
+# truncation contract (_truncate_clean).
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_legacy_details_fallback_truncates_cleanly(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """No usable done_provenance (metadata={}) forces the description+details
+    fallback. `details` is long enough, with a word straddling the old
+    raw-slice boundary, that a naive `details[:500]` cut would glue a broken
+    trailing fragment ('ZZZZ...') onto the memory write; the clean
+    truncation must instead back up to the word boundary and end with a
+    single ellipsis, dropping the trailing word whole."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '361', 'title': 'Autopilot task', 'status': 'done',
+        'metadata': {},
+    })
+
+    long_details = ('A' * 495) + ' ' + ('Z' * 50)
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'details': long_details,
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content') or ''
+
+    assert '\nDetails: ' in content, f'Expected a Details section, got: {content!r}'
+    details_part = content.split('\nDetails: ', 1)[1]
+
+    assert details_part.endswith('…'), (
+        f'Expected the Details portion to end with an ellipsis, got: {details_part!r}'
+    )
+    assert len(details_part) <= 500
+    # A raw details[:500] slice would have cut mid-word, leaving a partial
+    # 'Z' fragment glued onto the end -- the clean cut must drop the whole
+    # trailing word instead of leaking any of it.
+    assert 'Z' not in content, (
+        f'Expected the mid-word fragment NOT to leak into the echo, got: {content!r}'
+    )
+    assert details_part == ('A' * 495) + '…'
+
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_legacy_details_fallback_skips_non_str_details(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """A non-str `details` (e.g. a list slipping through task metadata) must
+    not crash _truncate_clean's len()/slicing/.isspace() chain. Mirroring
+    _format_outcome_echo's isinstance guard on `note`, the fallback simply
+    omits the Details section instead of propagating a TypeError."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '361', 'title': 'Autopilot task', 'status': 'done',
+        'metadata': {},
+    })
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'details': ['not', 'a', 'string'],
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    content = calls[0].kwargs.get('content') or ''
+    assert '\nDetails: ' not in content, (
+        f'Expected no Details section for non-str details, got: {content!r}'
+    )
     assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
 
 

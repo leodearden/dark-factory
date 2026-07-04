@@ -431,8 +431,8 @@ class TargetedReconciler:
                     if description:
                         content += f" {description}"
                     details = task.get('details', '')
-                    if details:
-                        content += f"\nDetails: {details[:500]}"
+                    if isinstance(details, str) and details:
+                        content += f"\nDetails: {_truncate_clean(details, 500)}"
 
             write_metadata: dict[str, Any] = {
                 'source': _ECHO_SOURCE,
@@ -1202,6 +1202,42 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     return bool(metadata.get(_STAGE2_SUPPRESS_KEY))
 
 
+def _truncate_clean(text: str, limit: int) -> str:
+    """Truncate ``text`` to at most ``limit`` chars without splitting a word.
+
+    Task 2080: a naive ``text[:limit]`` slice (the previous behavior of both
+    ``_format_outcome_echo``'s note cap and ``_on_task_done``'s legacy
+    ``details[:500]`` append) cuts at a raw character count with no regard
+    for word/token boundaries — e.g. a dense CSV-like note's "8679,8680" was
+    silently garbled to "8679,868", and in the note+commit echo the
+    " (commit <sha>)" suffix then glued directly onto that broken fragment.
+
+    Contract:
+    - ``text`` at or under ``limit`` is returned unchanged (no ellipsis).
+    - Otherwise, one char of the budget is reserved for a trailing ellipsis
+      ('…', U+2026) and the cut backs up to the last whitespace boundary
+      within that budget — but ONLY when doing so retains more than half the
+      budget. This avoids collapsing the result to a handful of characters
+      when whitespace is sparse or sits only very early in the window; in
+      that case (or when there is no whitespace at all) it falls back to a
+      hard cut at the budget.
+
+    The result length is always <= ``limit``.
+    """
+    if len(text) <= limit:
+        return text
+    budget = limit - 1
+    window = text[:budget]
+    # Only the LAST whitespace in the window matters, so scan backwards and
+    # stop at the first match instead of a full forward pass over `window`.
+    last_ws = next(
+        (i for i in range(len(window) - 1, -1, -1) if window[i].isspace()),
+        -1,
+    )
+    head = text[:last_ws] if last_ws > budget // 2 else text[:budget]
+    return head.rstrip() + '…'
+
+
 def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) -> str | None:
     """Format ``done_provenance`` into a landed-outcome completion echo, or None.
 
@@ -1222,8 +1258,13 @@ def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) 
       signalling the caller to fall back to the existing description+details
       append (preserves legacy/no-provenance behavior).
 
-    ``note`` is truncated to ``max_note_chars`` to bound the memory write —
-    mirroring the existing ``details[:500]`` cap in the fast-path append.
+    ``note`` is cleanly truncated (word-boundary cut, ``_truncate_clean``) to
+    ``max_note_chars`` to bound the memory write — mirroring the
+    ``details[:500]`` cap in the fast-path append (also cleanly truncated,
+    task 2080). A prior revision used a raw ``note[:max_note_chars]`` slice,
+    which cut mid-word/mid-number (task 2054: "8679,8680" garbled to
+    "8679,868") and, in the note+commit branch, glued the ``" (commit
+    <sha>)"`` suffix directly onto that broken fragment.
     """
     if not isinstance(provenance, dict):
         return None
@@ -1232,9 +1273,9 @@ def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) 
     note = raw_note.strip() if isinstance(raw_note, str) else ''
     commit = raw_commit.strip() if isinstance(raw_commit, str) else ''
     if note and commit:
-        return f'{note[:max_note_chars]} (commit {commit})'
+        return f'{_truncate_clean(note, max_note_chars)} (commit {commit})'
     if note:
-        return note[:max_note_chars]
+        return _truncate_clean(note, max_note_chars)
     if commit:
         return f'Landed in commit {commit}.'
     return None
