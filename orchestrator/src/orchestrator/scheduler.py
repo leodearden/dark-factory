@@ -2321,10 +2321,38 @@ class Scheduler:
         exception from a callback propagates to the caller's try/except
         (mirrors the starvation watchdog's call-site wrapping) so a
         watchdog/callback failure can never abort a tick or gate dispatch.
+
+        Disabled / probe-not-installed early-return: ``warm_base_hard_down.
+        enabled`` is a green-tier hot-reloadable field (config.py:2595), and
+        the ``acquire_next`` host-wide halt (``if self._warm_base_hard_down:
+        return None``, ~3287) is deliberately NOT gated on ``cfg.enabled`` —
+        so if this early-return left an already-engaged latch intact, an
+        operator disabling the watchdog mid-incident to escape it would
+        instead permanently wedge ALL dispatch host-wide (the only other
+        reset lives in the ``health == 'ok'`` branch above, which becomes
+        unreachable once the probe is no longer consulted).  So when the
+        latch is engaged, this branch RELEASES it — clearing all three latch
+        fields first (guaranteeing dispatch resumes even if the resolve
+        callback below raises), then best-effort firing ``_on_warm_base_
+        resolve`` (try/except-wrapped) to clear any open notice/L2
+        escalations.  When the latch is NOT engaged, this stays a pure
+        no-op — no resolve is fired for an incident that never happened.
         """
         cfg = self.config.warm_base_hard_down
 
         if not cfg.enabled or self._warm_base_health_probe is None:
+            if self._warm_base_hard_down:
+                self._warm_base_hard_down = False
+                self._warm_base_hard_down_since = None
+                self._warm_base_l2_promoted = False
+                if self._on_warm_base_resolve is not None:
+                    try:
+                        await self._on_warm_base_resolve()
+                    except Exception:
+                        logger.warning(
+                            'warm-base resolve on watchdog-disable raised',
+                            exc_info=True,
+                        )
             return
 
         try:
