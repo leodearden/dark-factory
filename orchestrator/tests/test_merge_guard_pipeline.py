@@ -32,11 +32,12 @@ convention (see test_merge_queue_resource_audit.py's module docstring).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
 import time
 from pathlib import Path
 from typing import Literal
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _orch_helpers import make_placeholder_future
@@ -697,3 +698,198 @@ class TestClassifyAndMergeSerialWorker:
 
         if result.merge_wt:
             await git_ops.cleanup_merge_worktree(result.merge_wt)
+
+
+# ---------------------------------------------------------------------------
+# step-9: parameterized PATH-EQUIVALENCE — the user-observable signal.
+#
+# For each scenario, the SAME real-git situation is built twice (once per
+# path) and driven through the MERGER path (SpeculativeMergeWorker.run() via
+# the queue) and the REMERGE path (SpeculativeMergeWorker._remerge() driven
+# directly). Both must land on the same MergeOutcome.status and emit the
+# same ordered merge_attempt subtypes. RED until step-10 wires _remerge
+# through classify_and_merge — today's un-refactored _remerge has no
+# branch-presence / already-merged / drop-guard checks.
+# ---------------------------------------------------------------------------
+
+
+_EQUIVALENCE_SCENARIOS = [
+    'missing_branch', 'already_merged', 'conflict', 'drop_guard', 'non_conflict_failure',
+]
+
+
+@pytest.mark.asyncio
+class TestPathEquivalence:
+    """Direct comparison of the merger-loop path vs. the _remerge path
+    (step-9, task 1995)."""
+
+    @pytest.mark.parametrize('scenario', _EQUIVALENCE_SCENARIOS)
+    async def test_merger_and_remerge_paths_agree(
+        self,
+        scenario: str,
+        git_ops: GitOps,
+        git_repo: Path,
+        config: OrchestratorConfig,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        fake_results: dict[str, MergeResult] = {}
+
+        if scenario == 'missing_branch':
+            # git_repo as worktree: HEAD == main's own tip (trivially an
+            # ancestor), so the worktree-HEAD fallback does not kick in and
+            # the branch falls through to unknown_branch on both paths.
+            merger_req = _make_request(
+                'eq-missing-merger', 'eq-missing-branch-merger', git_repo, config,
+            )
+            remerge_req = _make_request(
+                'eq-missing-remerge', 'eq-missing-branch-remerge', git_repo, config,
+            )
+
+        elif scenario == 'already_merged':
+            async def _make_merged_branch(name: str) -> Path:
+                wt = await _make_branch_with_file(git_ops, name, f'{name}.py', 'x = 1\n')
+                mr = await git_ops.merge_to_main(wt, name)
+                assert mr.success
+                assert mr.merge_commit is not None
+                await git_ops.advance_main(
+                    mr.merge_commit, mr.merge_worktree, branch=name, max_attempts=1,
+                )
+                if mr.merge_worktree:
+                    await git_ops.cleanup_merge_worktree(mr.merge_worktree)
+                return wt
+
+            wt_m = await _make_merged_branch('eq-am-merger')
+            wt_r = await _make_merged_branch('eq-am-remerge')
+            merger_req = _make_request('eq-am-merger', 'eq-am-merger', wt_m, config)
+            remerge_req = _make_request('eq-am-remerge', 'eq-am-remerge', wt_r, config)
+
+        elif scenario == 'conflict':
+            async def _make_conflicting_branch(name: str, content: str) -> Path:
+                wt = (await git_ops.create_worktree(name)).path
+                (git_ops.project_root / 'README.md').write_text(f'# Main {content}\n')
+                await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+                await _run(
+                    ['git', 'commit', '-m', f'Main change {content}'],
+                    cwd=git_ops.project_root,
+                )
+                (wt / 'README.md').write_text(f'# Task {content}\n')
+                await git_ops.commit(wt, f'Task change {content}')
+                return wt
+
+            wt_m = await _make_conflicting_branch('eq-conflict-merger', 'merger')
+            wt_r = await _make_conflicting_branch('eq-conflict-remerge', 'remerge')
+            merger_req = _make_request('eq-conflict-merger', 'eq-conflict-merger', wt_m, config)
+            remerge_req = _make_request('eq-conflict-remerge', 'eq-conflict-remerge', wt_r, config)
+
+        elif scenario == 'drop_guard':
+            async def _make_drop_guard_branch(name: str) -> tuple[Path, str]:
+                wt = (await git_ops.create_worktree(name)).path
+                (wt / 'retained.py').write_text('retained = 1\n')
+                await git_ops.commit(wt, 'Add retained')
+                rc, pre_drop_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+                assert rc == 0
+                pre_drop_sha = pre_drop_sha.strip()
+                (wt / 'dropped.py').write_text('dropped = 1\n')
+                await git_ops.commit(wt, 'Add dropped')
+                artifacts = TaskArtifacts(wt)
+                artifacts.init(name, 'Drop guard eq', 'desc')
+                artifacts.write_plan({
+                    'files': ['retained.py', 'dropped.py'], 'modules': [], 'steps': [],
+                })
+                return wt, pre_drop_sha
+
+            wt_m, sha_m = await _make_drop_guard_branch('eq-drop-merger')
+            wt_r, sha_r = await _make_drop_guard_branch('eq-drop-remerge')
+            merger_req = _make_request('eq-drop-merger', 'eq-drop-merger', wt_m, config)
+            remerge_req = _make_request('eq-drop-remerge', 'eq-drop-remerge', wt_r, config)
+            fake_results = {
+                'eq-drop-merger': MergeResult(
+                    success=True, merge_commit=sha_m, pre_merge_sha=sha_m, merge_worktree=None,
+                ),
+                'eq-drop-remerge': MergeResult(
+                    success=True, merge_commit=sha_r, pre_merge_sha=sha_r, merge_worktree=None,
+                ),
+            }
+
+        elif scenario == 'non_conflict_failure':
+            wt_m = await _make_branch_with_file(git_ops, 'eq-fail-merger', 'f.py', 'x = 1\n')
+            wt_r = await _make_branch_with_file(git_ops, 'eq-fail-remerge', 'f.py', 'x = 1\n')
+            merger_req = _make_request('eq-fail-merger', 'eq-fail-merger', wt_m, config)
+            remerge_req = _make_request('eq-fail-remerge', 'eq-fail-remerge', wt_r, config)
+            fake_results = {
+                'eq-fail-merger': MergeResult(success=False, conflicts=False, details='boom-equivalence'),
+                'eq-fail-remerge': MergeResult(success=False, conflicts=False, details='boom-equivalence'),
+            }
+        else:
+            raise AssertionError(f'unknown scenario {scenario!r}')
+
+        if fake_results:
+            real_merge_to_main = git_ops.merge_to_main
+
+            async def _dispatch_merge_to_main(wt, br, base_sha=None):
+                if br in fake_results:
+                    return fake_results[br]
+                return await real_merge_to_main(wt, br, base_sha=base_sha)
+
+            monkeypatch.setattr(git_ops, 'merge_to_main', _dispatch_merge_to_main)
+
+        # ── Drive the MERGER path ───────────────────────────────────────────
+        es_merger = _make_event_store(tmp_path / 'merger')
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker1 = SpeculativeMergeWorker(git_ops, queue, event_store=es_merger)
+        # Neutralise the eta/1892 suffix-conflict-graph pre-dequeue bounce
+        # (_acquire_next_request -> recompute_suffix_conflict_graph ->
+        # _bounce_conflicting_suffix_items): it dry-run-detects a conflict
+        # against main BEFORE the item is even dequeued and reroutes it to a
+        # rebase/escalate outcome, which is an orthogonal, already-shipped
+        # feature (task 1892) — not part of classify_and_merge's equivalence
+        # contract this test targets. Without this, the 'conflict' scenario's
+        # merger-path outcome is decided by that pre-flight bounce instead of
+        # classify_and_merge's own conflict branch.
+        monkeypatch.setattr(
+            worker1, 'recompute_suffix_conflict_graph',
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            worker1, '_bounce_conflicting_suffix_items',
+            AsyncMock(return_value=None),
+        )
+        worker1_task = asyncio.create_task(worker1.run())
+        await queue.put(merger_req)
+        merger_outcome = await asyncio.wait_for(merger_req.result, timeout=30)
+        await worker1.stop()
+        await worker1_task
+
+        # ── Drive the REMERGE path ──────────────────────────────────────────
+        es_remerge = _make_event_store(tmp_path / 'remerge')
+        queue2: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker2 = SpeculativeMergeWorker(git_ops, queue2, event_store=es_remerge)
+        item = await worker2._remerge(remerge_req, time.monotonic())
+
+        # A flowing (non-decided) item means _remerge merged successfully
+        # without hitting any guard.  None is a deliberately distinct
+        # sentinel from any real MergeOutcome.status string, so a scenario
+        # where the merger path decided a terminal status but _remerge
+        # merged straight through fails the comparison below exactly as
+        # intended (that mismatch IS the equivalence gap step-10 closes).
+        remerge_status = item.immediate_outcome.status if item.immediate_outcome else None
+
+        merger_subtypes = _merge_attempt_subtypes(es_merger.db_path)
+        remerge_subtypes = _merge_attempt_subtypes(es_remerge.db_path)
+
+        try:
+            assert remerge_status == merger_outcome.status, (
+                f'scenario={scenario}: merger status={merger_outcome.status!r} '
+                f'vs remerge status={remerge_status!r}'
+            )
+            assert remerge_subtypes == merger_subtypes, (
+                f'scenario={scenario}: merger merge_attempt subtypes='
+                f'{merger_subtypes} vs remerge subtypes={remerge_subtypes}'
+            )
+        finally:
+            # Best-effort cleanup of any merge worktree the remerge path
+            # created (relevant when it merged straight through).
+            if item.merge_wt:
+                with contextlib.suppress(Exception):
+                    await git_ops.cleanup_merge_worktree(item.merge_wt)
