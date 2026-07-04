@@ -1308,6 +1308,53 @@ class GraphitiBackend:
             'edge_count': len(edges),
         }
 
+    async def set_entity_summary(
+        self,
+        node_uuid: str,
+        summary: str,
+        *,
+        group_id: str,
+    ) -> dict[str, Any]:
+        """Overwrite an Entity node's summary with explicit text, verbatim.
+
+        Unlike ``refresh_entity_summary`` (which regenerates the summary by
+        deduplicating and joining the entity's currently-valid edge facts),
+        this method writes ``summary`` exactly as given — it never reads or
+        derives from edges. An empty string clears the summary entirely.
+
+        This is the operator/reconciliation escape hatch for stale narrative
+        text that edge-derived regeneration cannot remove (e.g. when the
+        stale sentence is itself still carried by a valid edge fact).
+
+        Validates that the node exists via ``get_node_text`` (which raises
+        NodeNotFoundError for a missing UUID) before writing, so a bad UUID
+        fails loudly instead of silently matching zero rows.
+
+        Args:
+            node_uuid: UUID of the Entity node to overwrite.
+            summary: Exact text to write as the new summary. May be '' to clear.
+            group_id: Project graph to target.
+
+        Returns:
+            Dict with keys: uuid, name, old_summary, new_summary.
+
+        Raises:
+            NodeNotFoundError: if no node with that UUID exists.
+            RuntimeError: if the backend is not initialized.
+        """
+        name, old_summary = await self.get_node_text(node_uuid, group_id=group_id)
+        await self.update_node_summary(node_uuid, summary, group_id=group_id)
+        logger.info(
+            'set_entity_summary: node=%s name=%r old_len=%d new_len=%d',
+            node_uuid, name, len(old_summary or ''), len(summary),
+        )
+        return {
+            'uuid': node_uuid,
+            'name': name,
+            'old_summary': old_summary,
+            'new_summary': summary,
+        }
+
     async def list_entity_nodes(self, *, group_id: str) -> list[dict]:
         """Return all Entity nodes (uuid, name, summary) for a given group_id.
 
