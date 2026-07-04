@@ -323,7 +323,7 @@ def test_gate_verdict_value_type() -> None:
     assert ok.reason is None
     # ...but direct attribute assignment raises.
     with pytest.raises(dataclasses.FrozenInstanceError):
-        ok.reason = 'mutated'
+        ok.reason = 'mutated'  # type: ignore[misc]
 
 
 def test_gate_and_context_construct() -> None:
@@ -637,7 +637,7 @@ class TestFinalizeDrivesRegistry:
         assert 'pyright' not in gate_lines[0]
 
     async def test_finalize_gamma2_chain_via_registry(self) -> None:
-        from orchestrator.merge_gates import _GenerationChainContext, _finalize_advanced_merge
+        from orchestrator.merge_gates import _finalize_advanced_merge, _GenerationChainContext
         from orchestrator.merge_types import MergeOutcome
 
         chain_ctx = _GenerationChainContext(
