@@ -55,6 +55,21 @@ class TestGetEntityByUuidService:
         with pytest.raises(NodeNotFoundError):
             await service.get_entity_by_uuid('node-uuid-missing', project_id='test')
 
+    @pytest.mark.asyncio
+    async def test_group_id_matches_project_id_for_non_default_project(self, service):
+        """group_id passed to the backend must equal the caller's project_id.
+
+        Documents the scoping guarantee: a lookup scoped to one project_id
+        must query that project's group_id, not a default/fallback one —
+        otherwise this diagnostic could silently leak nodes across projects.
+        """
+        service.graphiti.get_node_text = AsyncMock(return_value=('Other', 'other summary'))
+        result = await service.get_entity_by_uuid('node-uuid-3', project_id='other_project')
+        service.graphiti.get_node_text.assert_awaited_once_with(
+            'node-uuid-3', group_id='other_project'
+        )
+        assert result == {'uuid': 'node-uuid-3', 'name': 'Other', 'summary': 'other summary'}
+
 
 class TestGetEntityByUuidTool:
     """MCP tool get_entity_by_uuid — registration, delegation, and error handling."""
