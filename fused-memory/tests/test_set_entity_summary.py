@@ -392,3 +392,32 @@ class TestSetEntitySummaryMcpTool:
         desc = tool.description or ''
         assert 'entity_uuid' in desc
         assert 'entity_name' in desc
+
+
+# ---------------------------------------------------------------------------
+# step-7: DISALLOW_MEMORY_WRITES list in cli_stage_runner.py
+# ---------------------------------------------------------------------------
+
+
+class TestDisallowListForSetEntitySummary:
+    """set_entity_summary must be in DISALLOW_MEMORY_WRITES (not in STAGE1_DISALLOWED).
+
+    Mirrors TestDisallowListForRefreshEntitySummary (test_refresh_entity_summary.py).
+    """
+
+    def test_set_entity_summary_in_disallow_memory_writes(self):
+        """'mcp__fused-memory__set_entity_summary' must be in DISALLOW_MEMORY_WRITES
+        so Stage 3 (read-only) cannot call it."""
+        from fused_memory.reconciliation.cli_stage_runner import DISALLOW_MEMORY_WRITES
+        assert 'mcp__fused-memory__set_entity_summary' in DISALLOW_MEMORY_WRITES
+
+    def test_set_entity_summary_not_in_stage1_disallowed(self):
+        """Stage 1 must be able to call set_entity_summary (not in STAGE1_DISALLOWED)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
+        assert 'mcp__fused-memory__set_entity_summary' not in STAGE1_DISALLOWED
+
+    def test_set_entity_summary_in_stage3_disallowed(self):
+        """Stage 3 must NOT be able to call set_entity_summary (in STAGE3_DISALLOWED via
+        DISALLOW_MEMORY_WRITES)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+        assert 'mcp__fused-memory__set_entity_summary' in STAGE3_DISALLOWED
