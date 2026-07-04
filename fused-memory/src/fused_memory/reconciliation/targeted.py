@@ -327,6 +327,53 @@ class TargetedReconciler:
 
         return any(statuses.get(str(t)) in ACTIVE_TASK_STATUSES for t in batch_ids)
 
+    async def _fetch_done_provenance(
+        self, task_id: str, project_root: str, task_before_task: dict,
+    ) -> dict | None:
+        """Return the current-transition ``metadata.done_provenance``, or None.
+
+        Task 2049: ``task_before_task`` (already ``_extract_task``-normalized)
+        is the PRE-transition snapshot — task_interceptor.py's
+        ``_apply_status_transition`` captures it BEFORE ``done_provenance`` is
+        persisted — so on a first done-transition it never carries provenance.
+        Prefer it anyway (cheap, and correct for any caller that already has
+        it), then fall back to re-fetching the live task, which reliably
+        observes the just-persisted provenance: the persist happens inside the
+        write-lock, before the fire-and-forget ``reconcile_task`` is scheduled.
+
+        Amendment: the snapshot is only trusted when it is actually usable
+        (``_format_outcome_echo`` would produce a non-None echo from it).
+        A snapshot provenance that is present but empty/unusable (e.g. ``{}``
+        or ``{'kind': ...}`` with no ``note``/``commit``) would otherwise pin
+        the caller to it and skip the live re-fetch, even though the live task
+        may since have gained a usable value — the only production caller
+        never populates the pre-transition snapshot's ``done_provenance``, so
+        this only matters for future replay/trigger callers.
+        """
+        metadata = task_before_task.get('metadata') if isinstance(task_before_task, dict) else None
+        if isinstance(metadata, dict):
+            provenance = metadata.get('done_provenance')
+            if isinstance(provenance, dict) and _format_outcome_echo(provenance) is not None:
+                return provenance
+
+        try:
+            fresh = await self.taskmaster.get_task(task_id, project_root=project_root)
+        except Exception as e:
+            logger.warning(
+                f'done_provenance re-fetch failed for task {task_id}: {e}; '
+                'echoing description (fail-open)'
+            )
+            return None
+        fresh_task = _extract_task(fresh) if isinstance(fresh, dict) else fresh
+        if not isinstance(fresh_task, dict):
+            return None
+        fresh_metadata = fresh_task.get('metadata')
+        if isinstance(fresh_metadata, dict):
+            provenance = fresh_metadata.get('done_provenance')
+            if isinstance(provenance, dict):
+                return provenance
+        return None
+
     async def _on_task_done(
         self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
     ) -> dict:
@@ -367,12 +414,25 @@ class TargetedReconciler:
             )
 
             content = f"Task '{title}' completed."
+            used_provenance = False
             if not has_authoritative:
-                if description:
-                    content += f" {description}"
-                details = task.get('details', '')
-                if details:
-                    content += f"\nDetails: {details[:500]}"
+                # Task 2049: prefer the landed-outcome done_provenance over the
+                # raw description — on a first done-transition `description` is
+                # usually the pre-fix bug/problem statement, so echoing it
+                # verbatim reads as if the bug is still open. Fall back to the
+                # legacy description+details append when no usable provenance
+                # exists (legacy tasks / a failed provenance write).
+                provenance = await self._fetch_done_provenance(task_id, project_root, task)
+                outcome = _format_outcome_echo(provenance)
+                if outcome:
+                    content += f" {outcome}"
+                    used_provenance = True
+                else:
+                    if description:
+                        content += f" {description}"
+                    details = task.get('details', '')
+                    if details:
+                        content += f"\nDetails: {details[:500]}"
 
             write_metadata: dict[str, Any] = {
                 'source': _ECHO_SOURCE,
@@ -381,6 +441,8 @@ class TargetedReconciler:
             }
             if has_authoritative:
                 write_metadata['echo_suppressed_stale_description'] = True
+            if used_provenance:
+                write_metadata['echo_used_provenance'] = True
 
             written = await self._fenced_add_memory(
                 content=content,
@@ -398,6 +460,7 @@ class TargetedReconciler:
                     'type': 'completion_fast',
                     'deferred': not written,
                     'echo_suppressed': has_authoritative,
+                    'echo_used_provenance': used_provenance,
                 },
                 causation_id=run_id,
             )
@@ -1137,3 +1200,41 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     if metadata.get('supersedes'):
         return True
     return bool(metadata.get(_STAGE2_SUPPRESS_KEY))
+
+
+def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) -> str | None:
+    """Format ``done_provenance`` into a landed-outcome completion echo, or None.
+
+    Task 2049: on a FIRST done-transition, no authoritative resolution memory
+    exists yet (task 1984's ``_is_authoritative_resolution`` guard correctly
+    doesn't fire), so `_on_task_done`'s fast path previously appended the raw
+    task ``description`` — usually the pre-fix bug/problem statement — making
+    a fresh completion echo read as if the bug were still open. This formats
+    the ``metadata.done_provenance`` dict (``{kind?, commit?, note?}`` — see
+    task_interceptor.py ``_validate_done_provenance``) into a one-line echo of
+    the actual landed outcome instead:
+
+    - ``note`` and ``commit`` both present -> ``"<note> (commit <commit>)"``;
+    - ``note`` only -> the note text;
+    - ``commit`` only (e.g. ``kind='merged'`` with no note) -> a generic
+      ``"Landed in commit <commit>."`` reference;
+    - neither usable (missing, empty/whitespace-only, or non-string) -> None,
+      signalling the caller to fall back to the existing description+details
+      append (preserves legacy/no-provenance behavior).
+
+    ``note`` is truncated to ``max_note_chars`` to bound the memory write —
+    mirroring the existing ``details[:500]`` cap in the fast-path append.
+    """
+    if not isinstance(provenance, dict):
+        return None
+    raw_note = provenance.get('note')
+    raw_commit = provenance.get('commit')
+    note = raw_note.strip() if isinstance(raw_note, str) else ''
+    commit = raw_commit.strip() if isinstance(raw_commit, str) else ''
+    if note and commit:
+        return f'{note[:max_note_chars]} (commit {commit})'
+    if note:
+        return note[:max_note_chars]
+    if commit:
+        return f'Landed in commit {commit}.'
+    return None

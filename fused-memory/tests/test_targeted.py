@@ -2091,6 +2091,97 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     assert _is_authoritative_resolution(metadata) is expected
 
 
+# ---------------------------------------------------------------------------
+# _format_outcome_echo truth table (task 2049)
+#
+# _on_task_done's fast-path completion echo currently appends the task's raw
+# `description` verbatim whenever no authoritative resolution memory exists
+# yet (task 1984's guard correctly doesn't fire on a FIRST done-transition).
+# `description` is usually the pre-fix bug/problem statement, so a fresh echo
+# reads as if the bug is still open. _format_outcome_echo is the pure
+# formatter that prefers the landed-outcome `done_provenance` (note and/or
+# commit) over that raw description; it returns None when no usable
+# provenance exists so the caller can fall back to the existing behavior.
+
+
+@pytest.mark.parametrize(
+    'provenance, expected_contains',
+    [
+        pytest.param(
+            {'note': 'Refactored dispatch; added guard'},
+            ['Refactored dispatch; added guard'],
+            id='note_only',
+        ),
+        pytest.param(
+            {'kind': 'merged', 'commit': 'abc123def'},
+            ['abc123def'],
+            id='commit_only_no_note',
+        ),
+        pytest.param(
+            {'note': 'Added retry', 'commit': 'abc123'},
+            ['Added retry', 'abc123'],
+            id='note_and_commit',
+        ),
+        pytest.param({}, None, id='empty_dict'),
+        pytest.param(None, None, id='none_provenance'),
+        pytest.param({'kind': 'found_on_main'}, None, id='kind_only_no_note_or_commit'),
+        pytest.param({'note': 123}, None, id='non_str_note'),
+        pytest.param({'commit': 456}, None, id='non_str_commit'),
+        pytest.param({'note': '   '}, None, id='whitespace_only_note'),
+    ],
+)
+def test_format_outcome_echo_truth_table(provenance, expected_contains):
+    """Pure formatter: prefer note, include commit, else commit-only ref, else None.
+
+    Mirrors test_is_authoritative_resolution_truth_table's truth-table pattern
+    (task 1984) for the new _format_outcome_echo helper (task 2049): the
+    completion echo should describe the landed outcome (done_provenance) —
+    note text and/or commit — rather than a raw, potentially stale task
+    description. Malformed/empty/non-string provenance must degrade to None
+    so the caller falls back to the existing description-append behavior
+    (legacy tasks / a failed provenance write must not lose their echo).
+    """
+    from fused_memory.reconciliation.targeted import _format_outcome_echo
+
+    result = _format_outcome_echo(provenance)
+    if expected_contains is None:
+        assert result is None, f'Expected None, got: {result!r}'
+    else:
+        assert result is not None
+        for substr in expected_contains:
+            assert substr in result, f'Expected {substr!r} in {result!r}'
+
+
+def test_format_outcome_echo_truncates_long_note():
+    """`note[:max_note_chars]` caps the echoed note at 500 chars, and in the
+    note+commit branch the cap is applied to the note BEFORE the
+    ``" (commit <sha>)"`` suffix is appended -- so the suffix must still
+    appear, intact, after a note longer than the cap.
+
+    Task 2049 amendment: the truth table above never supplied a note longer
+    than 500 chars, so neither the cap itself nor this ordering (truncate
+    first, then append the commit suffix) was exercised -- a future off-by-one
+    or an accidentally removed ``[:max_note_chars]`` slice would have shipped
+    silently. Exact-equality assertions are used here (rather than the truth
+    table's `in` containment checks) because a repeated-character note would
+    make a containment check on a truncated substring vacuously true.
+    """
+    from fused_memory.reconciliation.targeted import _format_outcome_echo
+
+    long_note = 'N' * 600
+
+    note_only = _format_outcome_echo({'note': long_note})
+    assert note_only is not None
+    assert note_only == long_note[:500]
+    assert len(note_only) == 500
+
+    note_and_commit = _format_outcome_echo({'note': long_note, 'commit': 'abc123def'})
+    assert note_and_commit is not None
+    assert note_and_commit == f'{long_note[:500]} (commit abc123def)'
+    assert note_and_commit.startswith(long_note[:500])
+    assert note_and_commit.endswith(' (commit abc123def)')
+
+
 @pytest.mark.asyncio
 async def test_on_task_done_suppresses_stale_description_when_authoritative_memory_exists(
     reconciler, mock_memory_service,
@@ -2312,3 +2403,340 @@ async def test_on_task_done_echo_suppressed_flag_in_journal_action(
     assert completion_rows[0]['detail'].get('echo_suppressed') is expected_suppressed, (
         f'Expected echo_suppressed={expected_suppressed}, got detail: {completion_rows[0]["detail"]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# First-done-transition provenance echo (task 2049)
+#
+# task_before is the PRE-transition snapshot: task_interceptor.py's
+# _apply_status_transition captures it BEFORE metadata.done_provenance is
+# persisted, so on a FIRST done-transition task_before never carries
+# provenance and no authoritative resolution memory exists yet either (task
+# 1984's guard correctly doesn't fire). Previously the fast-path echo fell
+# straight through to the raw, often pre-fix `description`. _on_task_done
+# must re-fetch the live task (self.taskmaster.get_task) to observe the
+# just-persisted done_provenance and prefer it.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'provenance, expected_contains',
+    [
+        pytest.param(
+            {'note': 'Refactored dispatch; added retry guard'},
+            ['Refactored dispatch; added retry guard'],
+            id='note_only',
+        ),
+        pytest.param(
+            {'kind': 'merged', 'commit': 'deadbeef123'},
+            ['deadbeef123'],
+            id='commit_only',
+        ),
+        pytest.param(
+            {'note': 'Added retry logic', 'commit': 'abc123'},
+            ['Added retry logic', 'abc123'],
+            id='note_and_commit',
+        ),
+    ],
+)
+async def test_on_task_done_first_transition_echoes_provenance_not_description(
+    reconciler, mock_memory_service, mock_taskmaster, provenance, expected_contains,
+):
+    """A FIRST done-transition has no authoritative memory yet, so before task
+    2049 the fast-path echo fell through to the raw, potentially stale
+    `description`. task_before here carries NO done_provenance (the
+    pre-transition snapshot); _on_task_done must re-fetch the live task to see
+    the just-landed done_provenance and prefer it over description/details."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '361', 'title': 'Autopilot task', 'status': 'done',
+        'metadata': {'done_provenance': provenance},
+    })
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE pre-fix bug statement',
+            'details': 'stale details',
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content') or ''
+    for substr in expected_contains:
+        assert substr in content, f'Expected {substr!r} in {content!r}'
+    assert 'STALE pre-fix bug statement' not in content, (
+        f'Expected the stale description NOT to appear, got: {content!r}'
+    )
+    assert 'stale details' not in content, (
+        f'Expected the stale details NOT to appear, got: {content!r}'
+    )
+
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_used_provenance') is True
+    assert metadata.get('source') == 'targeted_reconciliation'
+
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_authoritative_memory_wins_over_provenance(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """When an authoritative resolution/superseding memory already exists,
+    task 1984's title-only suppression must still win even though fresh
+    done_provenance is also available for the re-fetch: the provenance
+    preference (task 2049) only applies inside the existing `not
+    has_authoritative` branch, so there is no interaction regression between
+    the two features."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {'metadata': {'task_id': '361', 'supersedes': 'x'}},
+    ])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '361', 'title': 'Autopilot task', 'status': 'done',
+        'metadata': {'done_provenance': {'note': 'Should not appear'}},
+    })
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE pre-fix bug statement',
+            'details': 'stale details',
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content')
+    assert content == "Task 'Autopilot task' completed.", (
+        f'Expected title-only completion fact, got: {content!r}'
+    )
+
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_suppressed_stale_description') is True
+    assert 'echo_used_provenance' not in metadata, (
+        f'authoritative suppression must win over provenance preference, got metadata: {metadata}'
+    )
+
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'get_task_return, expected_used_provenance',
+    [
+        pytest.param(
+            {
+                'id': '9', 'title': 'T',
+                'metadata': {'done_provenance': {'note': 'Landed cleanly'}},
+            },
+            True,
+            id='provenance_note_present',
+        ),
+        pytest.param(
+            {'id': '9', 'title': 'T', 'metadata': {}},
+            False,
+            id='no_done_provenance',
+        ),
+    ],
+)
+async def test_on_task_done_completion_journal_has_echo_used_provenance(
+    reconciler, mock_memory_service, mock_taskmaster, journal,
+    get_task_return, expected_used_provenance,
+):
+    """The journal audit row for the fast-path completion write must carry a
+    queryable echo_used_provenance flag mirroring task 1984's echo_suppressed
+    convention, so operators can query which first-transition echoes
+    described the landed outcome vs. fell back to the raw description."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value=get_task_return)
+
+    await reconciler.reconcile_task(
+        task_id='9', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '9', 'title': 'T', 'status': 'in-progress', 'description': 'Nine description'},
+    )
+
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    completion_rows = [
+        a for a in actions
+        if a['operation'] == 'add_memory' and a['detail'].get('type') == 'completion_fast'
+    ]
+    assert len(completion_rows) == 1, (
+        f'Expected exactly one completion_fast journal row, got: {completion_rows}'
+    )
+    assert completion_rows[0]['detail'].get('echo_used_provenance') is expected_used_provenance, (
+        f'Expected echo_used_provenance={expected_used_provenance}, '
+        f'got detail: {completion_rows[0]["detail"]}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'get_task_kwargs',
+    [
+        pytest.param({'side_effect': RuntimeError('tm down')}, id='refetch_raises'),
+        pytest.param(
+            {'return_value': {'id': '7', 'title': 'T', 'metadata': {}}},
+            id='refetch_no_provenance',
+        ),
+    ],
+)
+async def test_on_task_done_provenance_refetch_fails_open(
+    reconciler, mock_memory_service, mock_taskmaster, journal, get_task_kwargs,
+):
+    """A hiccup while re-fetching the live task for done_provenance (or simply
+    finding none) must never drop the fast-path completion echo — it must fail
+    open to the existing raw-description behavior, exactly as if no provenance
+    existed. Before task 2049 step-8 hardens `_fetch_done_provenance`, an
+    unguarded re-fetch let a RuntimeError from `self.taskmaster.get_task`
+    propagate out into `_on_task_done`'s broad outer except, which logs a
+    warning and skips the completion write entirely — silently dropping the
+    fast-path echo instead of merely losing the provenance preference."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(**get_task_kwargs)
+
+    result = await reconciler.reconcile_task(
+        task_id='7', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={'id': '7', 'title': 'T', 'status': 'in-progress', 'description': 'DESC text'},
+    )
+
+    # (a) the fast-path completion fact WAS written despite the re-fetch hiccup
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1, 'Expected a fast-path add_memory call despite the provenance re-fetch failing'
+    first_call = calls[0]
+
+    # (b) fail-open preserves the current description-appended behavior
+    content = first_call.kwargs.get('content')
+    assert content is not None and 'DESC text' in content, (
+        f'Expected fail-open content to still contain the description, got: {content!r}'
+    )
+
+    # (c) no truthy echo_used_provenance on fail-open
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert not metadata.get('echo_used_provenance'), (
+        f'fail-open write must not carry a truthy echo_used_provenance, got metadata: {metadata}'
+    )
+
+    # (d) completion-fact audit action is preserved
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+    # (e) the journal row reflects echo_used_provenance False, mirroring
+    # test_on_task_done_fails_open_when_metadata_query_raises's journal check.
+    runs = await journal.get_recent_runs('test-project', limit=1)
+    assert len(runs) == 1
+    actions = await journal.get_run_actions(runs[0].id)
+    completion_rows = [
+        a for a in actions
+        if a['operation'] == 'add_memory' and a['detail'].get('type') == 'completion_fast'
+    ]
+    assert len(completion_rows) == 1, (
+        f'Expected exactly one completion_fast journal row, got: {completion_rows}'
+    )
+    assert completion_rows[0]['detail'].get('echo_used_provenance') is False, (
+        f'Expected echo_used_provenance=False on the fail-open path, '
+        f'got detail: {completion_rows[0]["detail"]}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# _fetch_done_provenance snapshot-usability gate (task 2049 amendment)
+#
+# `_fetch_done_provenance` prefers `task_before`'s own snapshot metadata over
+# a live re-fetch when the snapshot already carries usable `done_provenance`
+# (cheap: no round-trip). It must only take that shortcut when the snapshot
+# is actually usable (`_format_outcome_echo` can format it into an echo) --
+# an empty or note/commit-less snapshot must fall through to the live
+# re-fetch instead of pinning the caller to a value that degrades to None.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'snapshot_provenance',
+    [
+        pytest.param({}, id='empty_dict_snapshot'),
+        pytest.param({'kind': 'found_on_main'}, id='unusable_snapshot_no_note_or_commit'),
+    ],
+)
+async def test_on_task_done_refetches_when_snapshot_provenance_unusable(
+    reconciler, mock_memory_service, mock_taskmaster, snapshot_provenance,
+):
+    """An unusable (empty, or note/commit-less) `task_before` snapshot
+    `done_provenance` must not short-circuit `_fetch_done_provenance` -- the
+    live re-fetch must still run and its usable provenance must be preferred.
+
+    The current production caller never populates the pre-transition
+    snapshot's `done_provenance` (task_interceptor.py captures `task_before`
+    before persisting it), so this only guards a future replay/trigger caller
+    that hands in a stale-but-present empty/unusable value; previously,
+    `_format_outcome_echo` would have silently degraded that pinned value to
+    None, losing the provenance preference rather than crashing."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '42', 'title': 'T', 'status': 'done',
+        'metadata': {'done_provenance': {'note': 'Fresh landed note'}},
+    })
+
+    await reconciler.reconcile_task(
+        task_id='42', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '42',
+            'title': 'T',
+            'status': 'in-progress',
+            'description': 'DESC text',
+            'metadata': {'done_provenance': snapshot_provenance},
+        },
+    )
+
+    # the live re-fetch happened instead of short-circuiting on the unusable snapshot
+    mock_taskmaster.get_task.assert_awaited_once()
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    content = calls[0].kwargs.get('content')
+    assert content is not None and 'Fresh landed note' in content, (
+        f'Expected the live re-fetch provenance to be used, got: {content!r}'
+    )
+    metadata = calls[0].kwargs.get('metadata') or {}
+    assert metadata.get('echo_used_provenance') is True
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_skips_refetch_when_snapshot_provenance_usable(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """When `task_before`'s own metadata already carries a usable
+    `done_provenance`, `_fetch_done_provenance` still short-circuits without a
+    live re-fetch: the amendment's usability gate
+    (`_format_outcome_echo(provenance) is not None`) only widens the re-fetch
+    trigger to unusable snapshots -- it must not regress the cheap
+    already-have-it path into an unconditional re-fetch."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+
+    await reconciler.reconcile_task(
+        task_id='42', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '42',
+            'title': 'T',
+            'status': 'in-progress',
+            'description': 'DESC text',
+            'metadata': {'done_provenance': {'note': 'Snapshot note'}},
+        },
+    )
+
+    mock_taskmaster.get_task.assert_not_called()
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    content = calls[0].kwargs.get('content')
+    assert content is not None and 'Snapshot note' in content
