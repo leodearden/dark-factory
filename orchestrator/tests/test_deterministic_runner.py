@@ -1217,6 +1217,127 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
 
 # ---------------------------------------------------------------------------
+# Task 2090 — Layer B: outer wall-clock guard around the cross-unit run_fn call
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneRunFnOuterGuard:
+    """DeterministicRunner — Layer B: run() must never hang on a stuck run_fn.
+
+    Layer A hardens the DEFAULT script runner's own timeout handling. Layer B
+    is the unconditional backstop around the run_fn CALL SITE in run() itself:
+    even if an injected/custom script_runner seam hangs forever or raises an
+    unexpected exception, run() must still reach _file_infra_issue_and_block
+    and return BLOCKED — it must never strand the task with an empty
+    escalation queue (the exact task-2087 evidence: before_done_ran_at
+    stamped, zero escalations filed, task stuck in-progress forever).
+    """
+
+    async def test_run_fn_hang_files_infra_issue_and_blocks(self, tmp_path: Path):
+        """A run_fn that hangs forever must still produce a BLOCKED outcome
+        and exactly one L2 infra_issue escalation (Layer B outer guard).
+
+        RED today: run() has no outer timeout around ``await run_fn(before_done)``.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='300', target_unit='orchestrator-reify.service', timeout_secs=0,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        # Hang tripwire: if the outer guard regresses, fail loudly instead of
+        # stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('300', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+        assert 'orchestrator-reify.service' in esc.detail, (
+            f'target_unit must appear in detail: {esc.detail!r}'
+        )
+        assert any(
+            phrase in esc.detail.lower()
+            for phrase in ('timed out', 'timeout', 'hung', 'exceeded')
+        ), f'detail must mention the timeout/hang: {esc.detail!r}'
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, (
+            'before_done_ran_at must already be stamped (I1) before the outer '
+            'guard fires — the deploy must never be re-run on resume'
+        )
+
+    async def test_run_fn_unexpected_exception_files_infra_issue_and_blocks(
+        self, tmp_path: Path,
+    ):
+        """A run_fn that raises an unexpected exception must NOT propagate —
+        run() must route to _file_infra_issue_and_block and return BLOCKED.
+
+        RED today: run() propagates the RuntimeError uncaught.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='301', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _boom(_before_done):
+            raise RuntimeError('spawn exploded')
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_boom,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('301', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
 # Step-3: B7a — script rc ≠ 0 failure (RED until step-4 implements the path)
 # ---------------------------------------------------------------------------
 
