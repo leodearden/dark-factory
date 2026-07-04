@@ -111,11 +111,22 @@ def test_strip_line_comment_passthrough_when_no_comment() -> None:
     assert _strip_line_comment('foo(bar, baz)') == 'foo(bar, baz)'
 
 
+def _is_match_case_pattern(code: str) -> bool:
+    """Return True if ``code`` is a ``case Token():`` structural-pattern arm.
+
+    A ``match``/``case`` pattern like ``case RealMergeItem():`` (see
+    ``item_merge_wt``'s exhaustive match) tests the value's type — it calls no
+    constructor at runtime — so it must not be miscounted as a construction
+    site alongside real ``Token(...)`` calls.
+    """
+    return code.lstrip().startswith('case ')
+
+
 def _real_construction_hits(repo_root: Path, token: str) -> list[str]:
     """Return ``path:lineno:code`` git-grep hits that are actual ``token(``
     constructions, excluding lines where the token only appears inside a
     trailing comment (so a comment/docstring mention is not miscounted as a
-    construction)."""
+    construction) or as a ``case token():`` structural-pattern match arm."""
     result = subprocess.run(
         ['git', 'grep', '-n', f'{token}(', '--', _SCOPED_PATH],
         cwd=repo_root,
@@ -138,6 +149,8 @@ def _real_construction_hits(repo_root: Path, token: str) -> list[str]:
         # token precedes any '#'. Production constructor lines have no '#'
         # before the call; a comment like "# build a token(...)" does.
         code_before_comment = _strip_line_comment(code)
+        if _is_match_case_pattern(code_before_comment):
+            continue
         if f'{token}(' in code_before_comment:
             hits.append(f'{path}:{lineno}:{code.strip()}')
     return hits
