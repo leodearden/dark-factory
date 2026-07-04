@@ -340,11 +340,20 @@ class TargetedReconciler:
         it), then fall back to re-fetching the live task, which reliably
         observes the just-persisted provenance: the persist happens inside the
         write-lock, before the fire-and-forget ``reconcile_task`` is scheduled.
+
+        Amendment: the snapshot is only trusted when it is actually usable
+        (``_format_outcome_echo`` would produce a non-None echo from it).
+        A snapshot provenance that is present but empty/unusable (e.g. ``{}``
+        or ``{'kind': ...}`` with no ``note``/``commit``) would otherwise pin
+        the caller to it and skip the live re-fetch, even though the live task
+        may since have gained a usable value — the only production caller
+        never populates the pre-transition snapshot's ``done_provenance``, so
+        this only matters for future replay/trigger callers.
         """
         metadata = task_before_task.get('metadata') if isinstance(task_before_task, dict) else None
         if isinstance(metadata, dict):
             provenance = metadata.get('done_provenance')
-            if isinstance(provenance, dict):
+            if isinstance(provenance, dict) and _format_outcome_echo(provenance) is not None:
                 return provenance
 
         try:
