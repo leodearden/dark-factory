@@ -690,6 +690,98 @@ class TestReconReportReaper:
         assert 'r1' not in state._run_desc_index
         assert 'r1' not in state._run_finding_index
 
+    def test_partial_eviction_of_one_run_does_not_affect_concurrent_run(self):
+        """Evicting a completed stage of run r1 while r1 is still live must
+        not touch a concurrently-live run r2's dedup indices (task-2088).
+
+        The run-quiescence release path pops indices via ``pop(rid, None)``
+        keyed by run_id; this pins that the release is correctly scoped to
+        the evicting run and never leaks across a sibling run_id that is
+        live at the same time.
+        """
+        state, t = self._make_state(ttl=300)
+
+        # r1: Stage 1 completes (becomes eviction-eligible); Stage 2 starts
+        # and stays in-progress, keeping r1 live.
+        state.start_report('r1', 'memory_consolidator', 'dark_factory')
+        r1_first = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='r1 obs',
+            suggested_action='a',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert 'finding_id' in r1_first, f'r1 Stage 1 add_finding failed: {r1_first}'
+        r1_finding_id = r1_first['finding_id']
+        state.complete('r1', 'r1 stage 1 done')
+        state.start_report('r1', 'task_knowledge_sync', 'dark_factory')
+
+        # r2: a wholly separate, concurrently-live run filing under the SAME
+        # signature — proves the indices are keyed per-run_id, not shared.
+        state.start_report('r2', 'memory_consolidator', 'dark_factory')
+        r2_first = state.add_finding(
+            run_id='r2',
+            severity='moderate',
+            category='task_stale',
+            description='r2 obs',
+            suggested_action='a',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert 'finding_id' in r2_first, f'r2 Stage 1 add_finding failed: {r2_first}'
+        r2_finding_id = r2_first['finding_id']
+        # r2's Stage 1 is left in-progress (no complete()) so r2 is also live
+        # and its entry is not itself eviction-eligible this tick.
+
+        # Advance past TTL and evict — only r1's completed Stage 1 qualifies.
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+        assert state.get_assembled_report('r1', 'memory_consolidator') is None
+
+        # r2's sig index, finding index, and dedup behavior must be entirely
+        # unaffected by r1's partial eviction.
+        assert state._run_sig_index.get('r2', {}).get(
+            ('2077', 'cycle_summary_prune_rerun_needed_post_2077')
+        ) == r2_finding_id
+        assert state._resolve_finding('r2', r2_finding_id) is not None
+        r2_dup = state.add_finding(
+            run_id='r2',
+            severity='moderate',
+            category='task_stale',
+            description='different description, same signature',
+            suggested_action='a',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert r2_dup.get('error') == 'duplicate_finding', (
+            f'Expected r2 dedup unaffected by r1 eviction, got: {r2_dup}'
+        )
+        assert r2_dup['existing_finding_id'] == r2_finding_id
+
+        # r1's own dedup key must also have survived its partial eviction
+        # (covered by the sibling test above; spot-checked here too so this
+        # test stands alone as a complete cross-run regression guard).
+        r1_dup = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='different description, same signature',
+            suggested_action='a',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert r1_dup.get('error') == 'duplicate_finding', (
+            f'Expected r1 dedup to survive its own partial eviction, got: {r1_dup}'
+        )
+        assert r1_dup['existing_finding_id'] == r1_finding_id
+
 
 # ---------------------------------------------------------------------------
 # step-15: FastMCP server factory — RED until step-16
