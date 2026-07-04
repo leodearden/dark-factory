@@ -97,7 +97,10 @@ def _infer_recon_pool(meta: dict) -> str | None:
     """
     if meta.get('kind') != 'cycle_summary':
         return None
-    return _CYCLE_SUMMARY_STAGE_TO_RECON_POOL.get(meta.get('stage'))
+    stage = meta.get('stage')
+    if not isinstance(stage, str):
+        return None
+    return _CYCLE_SUMMARY_STAGE_TO_RECON_POOL.get(stage)
 
 
 class MemoryNotFoundError(Exception):
