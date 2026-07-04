@@ -4800,6 +4800,40 @@ Output JSON matching the schema. Every task must appear in the output.
             block_reason='deterministic_gate' if outcome == WorkflowOutcome.BLOCKED else '',
         )
 
+    async def _find_prior_auto_eval_redos(self, original_id: str) -> list[str]:
+        """Find active auto-eval redo siblings spawned from ``original_id``.
+
+        Used by ``_maybe_auto_eval`` to supersede stale redo attempts before
+        dispatching a new one, so at most one live redo per ``spawned_from``
+        survives at a time. Best-effort: fails open to ``[]`` on any error
+        since this is housekeeping/dedupe, not a dispatch-blocking check.
+        """
+        try:
+            tasks = await self.scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
+            prior_ids: list[str] = []
+            for t in tasks:
+                if not isinstance(t, dict):
+                    continue
+                meta = t.get('metadata') or {}
+                if not isinstance(meta, dict):
+                    continue
+                if not meta.get('auto_eval_redo'):
+                    continue
+                if str(meta.get('spawned_from') or '') != str(original_id):
+                    continue
+                tid = str(t.get('id'))
+                if tid == str(original_id):
+                    continue
+                prior_ids.append(tid)
+            return prior_ids
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Task %s: auto-eval prior-redo lookup failed (%s) — '
+                'skipping supersede',
+                original_id, exc,
+            )
+            return []
+
     async def _maybe_auto_eval(
         self, assignment, report: TaskReport,
     ) -> None:
