@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -56,7 +57,7 @@ import pytest
 from orchestrator import merge_queue
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_queue import InflightEntry, MergeRequest, SpeculativeMergeWorker
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 #
@@ -136,7 +137,9 @@ def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
 
 
-def _make_req(config: OrchestratorConfig, tmp_path, *, lane: str = 'normal') -> MergeRequest:
+def _make_req(
+    config: OrchestratorConfig, tmp_path, *, lane: Literal['normal', 'high'] = 'normal',
+) -> MergeRequest:
     """Build a minimal MergeRequest with a fresh event-loop future.
 
     Must be called from within an async context (asyncio.get_running_loop()).
@@ -170,6 +173,21 @@ async def _make_foreign_task() -> asyncio.Task:  # type: ignore[type-arg]
     task = asyncio.ensure_future(_noop())
     await task
     return task
+
+
+def _sentinel_entry() -> InflightEntry:
+    """Opaque, identity-only stand-in for a real ``InflightEntry``.
+
+    The ``_inflight`` choke-point tests below exercise pure queue mechanics
+    (raises vs. no-op, ``is``-identity of whatever gets popped) and never
+    inspect an entry's fields, so a bare ``object()`` is enough at runtime.
+    ``cast`` tells the type checker to treat it as an ``InflightEntry``
+    without constructing an irrelevant ``SpeculativeItem``/``MergeResult``
+    graph — contrast with test_merge_queue_verify_base_invariant.py's
+    ``_make_inflight_entry``, which builds a real one because that test's
+    assertions inspect ``base_sha``/``merge_commit``.
+    """
+    return cast(InflightEntry, object())
 
 
 # ── step-03 RED: _assert_single_writer semantics at the lane-buffer sites ───
@@ -296,11 +314,11 @@ class TestAssertSingleWriterInflightWiring:
         worker._running = True
         worker._verifier_task = await _make_foreign_task()
 
-        entry = object()
+        entry = _sentinel_entry()
         worker._inflight_append(entry)  # must not raise
         popped = worker._inflight_popleft()  # must not raise
         assert popped is entry
-        worker._inflight_append(object())
+        worker._inflight_append(_sentinel_entry())
         worker._inflight_clear()  # must not raise
         assert len(worker._inflight) == 0
 
@@ -314,7 +332,7 @@ class TestAssertSingleWriterInflightWiring:
         worker._verifier_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_inflight'):
-            worker._inflight_append(object())
+            worker._inflight_append(_sentinel_entry())
 
     async def test_flag_on_foreign_owner_raises_on_popleft(
         self, git_ops: GitOps, monkeypatch,
@@ -325,7 +343,7 @@ class TestAssertSingleWriterInflightWiring:
         append and popleft choke points are exercised independently.
         """
         worker = _make_worker(git_ops)
-        worker._inflight.append(object())
+        worker._inflight.append(_sentinel_entry())
 
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker._running = True
@@ -339,7 +357,7 @@ class TestAssertSingleWriterInflightWiring:
     ) -> None:
         """(2) Flag ON + running + foreign verifier task: clear raises, naming the structure."""
         worker = _make_worker(git_ops)
-        worker._inflight.append(object())
+        worker._inflight.append(_sentinel_entry())
 
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker._running = True
@@ -357,11 +375,11 @@ class TestAssertSingleWriterInflightWiring:
         worker._running = True
         worker._verifier_task = None
 
-        entry = object()
+        entry = _sentinel_entry()
         worker._inflight_append(entry)  # must not raise
         popped = worker._inflight_popleft()  # must not raise
         assert popped is entry
-        worker._inflight_append(object())
+        worker._inflight_append(_sentinel_entry())
         worker._inflight_clear()  # must not raise
 
     async def test_flag_on_not_running_is_noop(
@@ -370,13 +388,13 @@ class TestAssertSingleWriterInflightWiring:
         """(4) Flag ON but worker stopped: no-op regardless of owner (matches stop()'s drain)."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._inflight.append(object())
+        worker._inflight.append(_sentinel_entry())
         worker._verifier_task = await _make_foreign_task()
         worker._running = False
 
         popped = worker._inflight_popleft()  # must not raise
         assert popped is not None
-        worker._inflight_append(object())
+        worker._inflight_append(_sentinel_entry())
         worker._inflight_clear()  # must not raise
 
     async def test_flag_on_owner_is_current_task_is_noop(
@@ -388,11 +406,11 @@ class TestAssertSingleWriterInflightWiring:
         worker._running = True
         worker._verifier_task = asyncio.current_task()
 
-        entry = object()
+        entry = _sentinel_entry()
         worker._inflight_append(entry)  # must not raise
         popped = worker._inflight_popleft()  # must not raise
         assert popped is entry
-        worker._inflight_append(object())
+        worker._inflight_append(_sentinel_entry())
         worker._inflight_clear()  # must not raise
 
 
