@@ -1255,6 +1255,51 @@ class TestRebuildEntitySummariesEntityUuids:
         assert not_found_entries[0]['uuid'] == 'u-missing'
         assert result['total_entities'] == 1
 
+    @pytest.mark.asyncio
+    async def test_dry_run_targeted_skips_without_rebuilding(self, mock_config):
+        """entity_uuids + dry_run=True reports the target as skipped_dry_run and
+        never fetches edges or rebuilds — detection is bypassed but nothing is written.
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 's'},
+        ])
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock()
+        svc.graphiti.get_all_valid_edges = AsyncMock()
+
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=['u1'], dry_run=True)
+
+        svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
+        assert result['skipped'] == 1
+        assert result['rebuilt'] == 0
+        assert result['details'][0]['status'] == 'skipped_dry_run'
+        # No edge fetch needed for dry_run — the targeted path must not pay for it.
+        svc.graphiti.get_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_entity_uuids_is_zero_count_noop(self, mock_config):
+        """entity_uuids=[] is an explicit zero-count no-op — no backend calls at all.
+
+        Distinguishes [] (targeting nothing) from None (not targeting, existing
+        force/dry_run behavior unchanged).
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.list_entity_nodes = AsyncMock()
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock()
+
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=[])
+
+        assert result == {
+            'total_entities': 0,
+            'stale_entities': 0,
+            'rebuilt': 0,
+            'skipped': 0,
+            'errors': 0,
+            'details': [],
+        }
+        svc.graphiti.list_entity_nodes.assert_not_awaited()
+        svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # step-5: MCP tool rebuild_entity_summaries
