@@ -106,6 +106,119 @@ class TestQueryReconReportFindings:
 
 
 # ---------------------------------------------------------------------------
+# _flag_content_fingerprint — cross-channel content-fingerprint dedup key
+# (task-2078). RED until task_knowledge_sync defines the helper.
+# ---------------------------------------------------------------------------
+
+
+class TestFlagContentFingerprint:
+    """Tests for _flag_content_fingerprint(item: dict) -> str | None.
+
+    Pure helper used to cross-channel-dedup a polled recon_report_systemic
+    finding (keyed on ``description``) against combined_flags items already
+    assembled from Stage 1 structured output or a surviving Mem0
+    active-query flag (both keyed on ``content``) — finding_id is never
+    available on the Mem0 side, so a normalized-content fingerprint is the
+    only reliable join key across the two channels.
+    """
+
+    def test_content_key_returns_content_fingerprint(self):
+        """(a) An item with a `content` key returns
+        flag_dedup._content_fingerprint(content)."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        text = 'live workflow recurrence counter needed for task 452'
+
+        assert _flag_content_fingerprint({'content': text}) == _content_fingerprint(text)
+
+    def test_description_only_key_returns_fingerprint_of_description(self):
+        """(b) An item with only a `description` key (no `content`) returns
+        the fingerprint of that description."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        text = 'systemic pattern: repeated live workflow recurrence for task 452'
+
+        assert _flag_content_fingerprint({'description': text}) == _content_fingerprint(text)
+
+    @pytest.mark.parametrize(
+        'item',
+        [
+            {},
+            {'content': ''},
+            {'content': '   '},
+            {'description': ''},
+            {'description': '   \n\t  '},
+            {'content': None, 'description': None},
+        ],
+        ids=[
+            'missing_both',
+            'blank_content',
+            'whitespace_content',
+            'blank_description',
+            'whitespace_description',
+            'explicit_none_values',
+        ],
+    )
+    def test_blank_or_missing_text_returns_none(self, item):
+        """(c) blank / whitespace-only / missing text returns None (mirrors
+        compute_content_fingerprint_signature's non-blank gate)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        assert _flag_content_fingerprint(item) is None
+
+    def test_cross_channel_equality_content_vs_description(self):
+        """(d) CROSS-CHANNEL EQUALITY — a mem0-style item {'content': X} and a
+        recon-style item {'description': X} with identical text X produce the
+        SAME fingerprint. This is the join property the cross-channel dedup
+        in assemble_payload relies on."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        text = 'live workflow recurrence counter needed for task 452'
+        mem0_style = {'_source': 'mem0_active_query', 'content': text}
+        recon_style = {'_source': 'recon_report_systemic', 'description': text}
+
+        fp_mem0 = _flag_content_fingerprint(mem0_style)
+        fp_recon = _flag_content_fingerprint(recon_style)
+
+        assert fp_mem0 is not None
+        assert fp_mem0 == fp_recon
+
+    def test_different_text_produces_different_fingerprint(self):
+        """(e) items with different text produce different fingerprints."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        fp1 = _flag_content_fingerprint({'content': 'finding text A'})
+        fp2 = _flag_content_fingerprint({'content': 'finding text B'})
+
+        assert fp1 != fp2
+
+    def test_non_string_content_is_coerced_not_raised(self):
+        """Defensive: a truthy non-string value under `content` (e.g. an int
+        accidentally placed there) must not raise AttributeError out of
+        _normalize_content_description's `.split()` call — it is coerced to
+        `str` first, mirroring compute_content_fingerprint_signature's
+        `str(ftype)` coercion pattern."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        assert _flag_content_fingerprint({'content': 452}) == _content_fingerprint('452')
+
+
+# ---------------------------------------------------------------------------
 # assemble_payload integration — recon_report channel reaches Stage 2 even
 # when the Mem0 channel is suppressed (task-1966 step-12)
 #
@@ -156,7 +269,10 @@ class TestAssemblePayloadReconReportChannel:
         return Watermark(project_id='autopilot_video')
 
     def _systemic_finding(
-        self, *, task_id='452', flag_type='live_workflow_recurrence_counter_needed'
+        self,
+        *,
+        task_id: str | None = '452',
+        flag_type: str | None = 'live_workflow_recurrence_counter_needed',
     ):
         return {
             'finding_id': 'rr-finding-1',
@@ -267,3 +383,117 @@ class TestAssemblePayloadReconReportChannel:
 
         assert payload.count('live_workflow_recurrence_counter_needed') == 1
         assert stage._recon_report_systemic_polled == 0
+
+    @pytest.mark.asyncio
+    async def test_dual_path_divergence_task_id_none_deduped_by_content_fingerprint(
+        self, mock_deps, watermark
+    ):
+        """Task-2078 regression (stage1_mem0_flags_processed counter
+        divergence): a systemic_pattern finding with task_id=None makes
+        compute_flag_signature(finding) return None (task_id is required),
+        so the signature-only dedup cannot match it against the surviving
+        Mem0 flag it duplicates — even though the Mem0 flag itself DOES
+        carry a (task_id, flag_type) signature. Same underlying finding text
+        must still render only once, via the content-fingerprint fallback."""
+        text = 'live workflow recurrence counter needed for task 452'
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='mem0-marker-1',
+                content=text,
+                metadata={
+                    'flag_for_stage2': True,
+                    'task_id': '452',
+                    'flag_type': 'systemic_counter_gap',
+                    'run_id': 'test-run',
+                },
+                created_at=None,
+            ),
+        ]
+        stage = _make_configured_stage(
+            mock_deps, project_id='autopilot_video', project_root='/home/leo/src/autopilot-video'
+        )
+        # task_id=None -> compute_flag_signature(finding) is None regardless
+        # of flag_type, so the existing signature-only dedup misses this
+        # cross-channel duplicate (RED on current code).
+        finding = self._systemic_finding(task_id=None, flag_type='systemic_counter_gap')
+        stage._recon_report_state = _FakeReconReportState(findings=[finding])
+        stage1_report = self._stage1_report(items_flagged=[])  # Stage 1 channel empty
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        assert payload.count(text) == 1
+        assert stage._recon_report_systemic_polled == 0
+
+    @pytest.mark.asyncio
+    async def test_dual_path_divergence_legacy_marker_missing_flag_type(
+        self, mock_deps, watermark
+    ):
+        """Task-2078 regression, legacy-marker variant: a flag_for_stage2
+        marker written before flag_type surfacing (task-1966 amendment) omits
+        `flag_type` from its metadata, so the surviving Mem0 flag built from
+        it also has flag_type=None. compute_flag_signature requires BOTH
+        task_id and flag_type, so it returns None for both the Mem0 flag AND
+        a same-content finding with flag_type=None — the signature-only dedup
+        cannot join them despite task_id='452' matching on both sides. Same
+        finding text must still render only once via the content fingerprint."""
+        text = 'live workflow recurrence counter needed for task 452'
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='mem0-marker-2',
+                content=text,
+                metadata={
+                    'flag_for_stage2': True,
+                    'task_id': '452',
+                    'run_id': 'test-run',
+                    # flag_type intentionally omitted: legacy marker shape.
+                },
+                created_at=None,
+            ),
+        ]
+        stage = _make_configured_stage(
+            mock_deps, project_id='autopilot_video', project_root='/home/leo/src/autopilot-video'
+        )
+        finding = self._systemic_finding(flag_type=None)  # task_id defaults to '452'
+        stage._recon_report_state = _FakeReconReportState(findings=[finding])
+        stage1_report = self._stage1_report(items_flagged=[])  # Stage 1 channel empty
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        assert payload.count(text) == 1
+        assert stage._recon_report_systemic_polled == 0
+
+    @pytest.mark.asyncio
+    async def test_distinct_finding_still_delivered_alongside_unrelated_mem0_flag(
+        self, mock_deps, watermark
+    ):
+        """No-over-dedup boundary (must stay green after the fix): a
+        recon_report_systemic finding whose content matches no item already
+        in combined_flags — neither by signature nor by content fingerprint
+        — is still rendered, even when an unrelated surviving Mem0 flag is
+        present. Guards against a content-fingerprint dedup that is too
+        aggressive and starts swallowing genuinely-distinct findings, which
+        would violate task-1966's recon_report delivery guarantee."""
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='mem0-marker-3',
+                content='unrelated existing mem0 flag content for task 111',
+                metadata={
+                    'flag_for_stage2': True,
+                    'task_id': '111',
+                    'flag_type': 'unrelated_flag_type',
+                    'run_id': 'test-run',
+                },
+                created_at=None,
+            ),
+        ]
+        stage = _make_configured_stage(
+            mock_deps, project_id='autopilot_video', project_root='/home/leo/src/autopilot-video'
+        )
+        finding = self._systemic_finding()  # distinct task_id/flag_type/content
+        stage._recon_report_state = _FakeReconReportState(findings=[finding])
+        stage1_report = self._stage1_report(items_flagged=[])  # Stage 1 channel empty
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        assert 'live workflow recurrence counter needed for task 452' in payload
+        assert stage._recon_report_systemic_polled == 1

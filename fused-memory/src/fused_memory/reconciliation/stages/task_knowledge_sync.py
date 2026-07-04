@@ -32,6 +32,8 @@ from fused_memory.reconciliation.cli_stage_runner import (
     generate_summary_nonce,
 )
 from fused_memory.reconciliation.flag_dedup import (
+    _content_fingerprint,
+    _normalize_content_description,
     acknowledge_resolved_flags,
     compute_flag_signature,
     filter_blocked_snapshot_findings,
@@ -2929,9 +2931,27 @@ class TaskKnowledgeSync(BaseStage):
         # finding from Stage 2 through this path.  Deduped against
         # combined_flags (Stage 1 + Mem0 channels) by compute_flag_signature so
         # a finding that also survived the primary channel is not double-rendered.
+        #
+        # Content-fingerprint fallback (task-2078): compute_flag_signature
+        # requires BOTH task_id and flag_type to produce a signature. A
+        # systemic_pattern finding frequently has task_id=None (no single
+        # owning task), and a legacy flag_for_stage2 marker can omit
+        # flag_type — in either case the signature is None on at least one
+        # side, existing_signatures misses the match, and the SAME finding
+        # renders twice: once as mem0_active_query (carries flag_id, drives
+        # FIX C deletion + stage1_mem0_flags_processed) and once as a
+        # flag_id-less recon_report_systemic duplicate processed as a
+        # separate no-op — causing the per-cycle narrative summary and the
+        # structured stats block to disagree (incident: flag 2d2ad790).
+        # existing_content_fps closes this gap using the normalized-content
+        # fingerprint as an additional, additive join key.
         existing_signatures = {
             sig for flag in combined_flags
             if (sig := compute_flag_signature(flag)) is not None
+        }
+        existing_content_fps = {
+            fp for flag in combined_flags
+            if (fp := _flag_content_fingerprint(flag)) is not None
         }
         polled_systemic_findings = _query_recon_report_findings(
             self._recon_report_state, self._current_run_id
@@ -2939,7 +2959,14 @@ class TaskKnowledgeSync(BaseStage):
         appended = 0
         for finding in polled_systemic_findings:
             sig = compute_flag_signature(finding)
-            if sig is not None and sig in existing_signatures:
+            # Findings carry only 'description' (never 'content'), so passing
+            # finding directly is equivalent to the description-only lookup:
+            # _flag_content_fingerprint's content-or-description fallback
+            # resolves it the same way either way.
+            fp = _flag_content_fingerprint(finding)
+            if (sig is not None and sig in existing_signatures) or (
+                fp is not None and fp in existing_content_fps
+            ):
                 continue
             combined_flags.append(
                 {
@@ -2952,6 +2979,8 @@ class TaskKnowledgeSync(BaseStage):
             )
             if sig is not None:
                 existing_signatures.add(sig)
+            if fp is not None:
+                existing_content_fps.add(fp)
             appended += 1
         self._recon_report_systemic_polled = appended
 
@@ -3338,6 +3367,44 @@ def _inject_flag_id(flag: dict) -> dict:
     if 'memory_id' in flag:
         return {**flag, 'flag_id': flag['memory_id']}
     return flag
+
+
+def _flag_content_fingerprint(item: dict) -> str | None:
+    """Return a normalized-content fingerprint for *item*, or ``None``.
+
+    Cross-channel dedup key (task-2078) for the recon_report_systemic poll in
+    :meth:`TaskKnowledgeSync.assemble_payload`. ``finding_id`` is never
+    available on the Mem0 side (a flag_for_stage2 marker's metadata carries
+    only task_id/flag_type/run_id), so content is the only reliable join key
+    between a Stage 1 / mem0_active_query item (keyed on ``content``) and a
+    polled recon_report_systemic finding (keyed on ``description``).
+
+    Deliberately NOT a call site of
+    :func:`~fused_memory.reconciliation.flag_dedup.compute_content_fingerprint_signature`:
+    that helper is gated on ``task_id``/``cited_tasks`` being absent and
+    returns a ``(fp, flag_type)`` tuple for marker write/match in
+    ``dedup_flags``, whereas this helper is ungated (any item with non-blank
+    text qualifies, regardless of task_id) and returns the bare ``fp`` for a
+    same-cycle payload-assembly join. Both delegate to the same underlying
+    :func:`~fused_memory.reconciliation.flag_dedup._content_fingerprint` /
+    :func:`~fused_memory.reconciliation.flag_dedup._normalize_content_description`
+    primitives — if that normalization contract ever changes, cross-check
+    both call sites so the two dedup keys don't silently drift apart.
+
+    Text is read as ``item.get('content') or item.get('description') or ''``
+    so either field name resolves to the same fingerprint for identical text
+    — the cross-channel equality the dedup relies on. Coerced to ``str`` in
+    case a caller places a truthy non-string value (e.g. an int) under
+    either key, so normalization never raises AttributeError. Returns
+    ``None`` when the normalized text is blank (mirrors
+    :func:`compute_content_fingerprint_signature`'s non-blank gate).
+
+    Pure, sync, no I/O.
+    """
+    text = str(item.get('content') or item.get('description') or '')
+    if not _normalize_content_description(text):
+        return None
+    return _content_fingerprint(text)
 
 
 def _format_flagged(
