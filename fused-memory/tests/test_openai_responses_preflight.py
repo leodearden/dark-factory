@@ -79,3 +79,33 @@ class TestGraphitiBackendInitializePreflightWiring:
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='PREFLIGHT_SENTINEL'):
             await backend.initialize()
+
+    @pytest.mark.asyncio
+    async def test_initialize_skips_preflight_when_api_key_missing(
+        self, mock_config, monkeypatch,
+    ):
+        """When the openai provider is configured but has no api_key, no
+        OpenAIClient is ever constructed (llm_client stays None) — so the
+        preflight, which only guards the path that actually constructs
+        OpenAIClient, must not run either (review fix, task 2053: it
+        previously ran unconditionally on the openai-provider branch, before
+        the api_key check)."""
+        import fused_memory.backends.graphiti_client as graphiti_client_module
+
+        mock_config.llm.providers.openai.api_key = ''
+
+        mock_preflight = MagicMock(side_effect=RuntimeError('PREFLIGHT_SENTINEL'))
+        monkeypatch.setattr(
+            graphiti_client_module, 'check_openai_responses_api', mock_preflight,
+        )
+        monkeypatch.setattr(
+            graphiti_client_module, '_MultiTenantFalkorDriver', MagicMock(),
+        )
+        monkeypatch.setattr(
+            graphiti_client_module, 'Graphiti', MagicMock(return_value=AsyncMock()),
+        )
+
+        backend = GraphitiBackend(mock_config)
+        await backend.initialize()  # must complete without the sentinel firing
+
+        mock_preflight.assert_not_called()

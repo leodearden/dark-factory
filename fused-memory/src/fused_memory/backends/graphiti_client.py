@@ -194,9 +194,9 @@ class GraphitiBackend:
         # --- LLM client ---
         llm_client = None
         if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
-            check_openai_responses_api()
             api_key = cfg.llm.providers.openai.api_key
             if api_key:
+                check_openai_responses_api()
                 llm_config = GraphitiLLMConfig(
                     api_key=api_key,
                     model=cfg.llm.model,
