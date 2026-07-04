@@ -8764,9 +8764,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # immediate_outcome items (trains / already-decided) are NOT halted here;
         # they fall through to the passthrough branch so they resolve in order.
         if self._operator_halt.is_set() and isinstance(item, RealMergeItem):
-            if item.merge_wt is not None:
-                with contextlib.suppress(BaseException):
-                    await self._cleanup_owned_merge_worktree(item.merge_wt)
+            # merge_wt is a required non-Optional Path on RealMergeItem — no
+            # None/truthy guard needed here (task ο).
+            with contextlib.suppress(BaseException):
+                await self._cleanup_owned_merge_worktree(item.merge_wt)
             self._queue.put_nowait(req)
             # MQ-invariants eta (task 1992): Future left deliberately pending —
             # remove the ledger entry so this parked request never ages out;
@@ -8888,8 +8889,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._remerging_item = req
                 self._verify_item = item
                 self._verify_phase = 'remerging'
-                if item.merge_wt:
-                    await self._cleanup_owned_merge_worktree(item.merge_wt)
+                # merge_wt is a required non-Optional Path on RealMergeItem — no
+                # truthy guard needed here (task ο).
+                await self._cleanup_owned_merge_worktree(item.merge_wt)
                 self._emit_speculative(
                     EventType.speculative_discard, req.task_id,
                     reason=remerge_reason,
