@@ -8758,6 +8758,68 @@ class TestHarnessReconcileStatusCorrection:
         assert sorted(result['new']['active_tasks']) == live_active
 
     @pytest.mark.asyncio
+    async def test_superseded_content_carries_no_internal_task_citation(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """The corrected memory `content` is persisted via add_memory into
+        whatever project is currently being reconciled — including projects
+        other than dark_factory. It must not embed a dark_factory-internal
+        task citation like '(task 1938)', which would leak a meaningless
+        reference into an unrelated project's memory store (observed on
+        solar_challenge_platform, runs 29e421f7 and e4ad94a4).
+
+        step-1 (RED): harness.py:927 still contains '(task 1938)'.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        cached_memory = {
+            'id': 'stale-memory-id',
+            'created_at': '2026-06-30T00:00:00+00:00',
+            'metadata': {
+                'kind': 'project_status_correction',
+                'task_count_done': 1,
+                'task_count_total': 5,
+                'active_tasks': [2, 3, 4, 5],
+            },
+        }
+        statuses = {
+            '1': 'done',
+            '2': 'done',
+            '3': 'pending',
+            '4': 'pending',
+            '5': 'pending',
+        }
+        harness.memory.get_memories_by_metadata = AsyncMock(return_value=[cached_memory])
+        harness.memory.add_memory = AsyncMock(return_value={'status': 'created'})
+        harness.memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+
+        result = await harness._reconcile_status_correction(
+            'solar_challenge_platform', statuses
+        )
+        assert result is not None
+        assert result['diverged'] is True
+
+        harness.memory.add_memory.assert_awaited_once()
+        content = harness.memory.add_memory.call_args.kwargs['content']
+
+        import re
+        assert re.search(r'\(task\s*\d+\)', content, re.IGNORECASE) is None, (
+            f'Corrected memory content must not embed a hardcoded internal '
+            f'task citation; got {content!r}'
+        )
+        assert '1938' not in content, (
+            f"Corrected memory content must not cite dark_factory's internal "
+            f'task 1938; got {content!r}'
+        )
+
+        # The functionally meaningful census fields must survive removal of
+        # the citation. (Deliberately not locking the surrounding prose here
+        # — that would make the test brittle to harmless rephrasing.)
+        assert 'done=' in content
+        assert 'total=' in content
+        assert 'active=' in content
+
+    @pytest.mark.asyncio
     async def test_query_exception_fails_open(
         self, journal, event_buffer, mock_memory_service, caplog
     ):
