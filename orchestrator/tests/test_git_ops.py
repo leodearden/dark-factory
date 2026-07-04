@@ -1279,12 +1279,13 @@ class TestMergeConflicts:
 class TestAdvanceMainCasRetrySha:
     """Regression: advance_main must expose the post-rebase SHA when CAS retry rebases."""
 
-    async def test_last_advanced_sha_is_post_rebase_after_cas_retry(
+    async def test_advanced_sha_is_post_rebase_after_cas_retry(
         self, git_ops: GitOps,
     ):
         """When advance_main rebases the merge worktree onto a moved main,
-        ``_last_advanced_sha`` must hold the post-rebase SHA (the one actually
-        on main), not the original pre-rebase ``MergeResult.merge_commit``.
+        ``outcome.advanced_sha`` must hold the post-rebase SHA (the one
+        actually on main), not the original pre-rebase
+        ``MergeResult.merge_commit``.
 
         The pre-rebase SHA is what merge_queue used to forward to
         ``set_task_status('done', done_provenance={'kind':'merged', 'commit':...})``;
@@ -1340,7 +1341,7 @@ class TestAdvanceMainCasRetrySha:
              advanced_sha, git_ops.config.main_branch],
             cwd=git_ops.project_root,
         )
-        assert rc == 0, f'_last_advanced_sha {advanced_sha} must be on main'
+        assert rc == 0, f'outcome.advanced_sha {advanced_sha} must be on main'
 
         # And the pre-rebase SHA is NOT on main (the bug we're guarding
         # against — passing this to done_provenance fails fused-memory's
@@ -1354,14 +1355,18 @@ class TestAdvanceMainCasRetrySha:
             f'pre-rebase SHA {pre_rebase_sha} should NOT be on main; '
             f'if it is, the test is no longer exercising the rebase path'
         )
+        assert not hasattr(git_ops, '_last_advanced_sha'), (
+            'the _last_advanced_sha side channel must be retired — '
+            'advanced_sha rides the returned AdvanceOutcome only'
+        )
 
         await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
 
-    async def test_last_advanced_sha_equals_input_when_no_rebase_needed(
+    async def test_advanced_sha_equals_input_when_no_rebase_needed(
         self, git_ops: GitOps,
     ):
-        """When no CAS retry is needed, ``_last_advanced_sha`` matches the input
-        merge_sha — fast-forward case, both SHAs are on main.
+        """When no CAS retry is needed, ``outcome.advanced_sha`` matches the
+        input merge_sha — fast-forward case, both SHAs are on main.
         """
         wt = await git_ops.create_worktree('ff-only')
         (wt.path / 'x.py').write_text('x = 1\n')
@@ -1371,12 +1376,21 @@ class TestAdvanceMainCasRetrySha:
         outcome = await git_ops.advance_main(merge.merge_commit)
         assert outcome.result == 'advanced'
         assert outcome.advanced_sha == merge.merge_commit
+        assert not hasattr(git_ops, '_last_advanced_sha'), (
+            'the _last_advanced_sha side channel must be retired — '
+            'advanced_sha rides the returned AdvanceOutcome only'
+        )
 
     # -- AdvanceOutcome value-object contract (task 1997 / MQ-refactor μ) --
     #
     # advance_main returns an AdvanceOutcome value object (step-2). The
     # three side-channel attributes (_last_advanced_sha/_rebased_from/
-    # _rebased_onto) are a transitional bridge retired in step-10.
+    # _rebased_onto) are a transitional bridge retired in step-10. The
+    # fast-forward and CAS-retry-advanced scenarios are already covered
+    # above (test_advanced_sha_equals_input_when_no_rebase_needed and
+    # test_advanced_sha_is_post_rebase_after_cas_retry); only the
+    # reverify_on_rebase path — not exercised by either of those — gets a
+    # dedicated test here.
 
     async def _prepare_cas_retry_landing(
         self, git_ops: GitOps,
@@ -1384,11 +1398,12 @@ class TestAdvanceMainCasRetrySha:
         """Land branch A, then prepare branch B's merge worktree pinned to
         the ORIGINAL (pre-A) main so a subsequent ``advance_main(merge_b...)``
         call must rebase B to land it (the CAS-retry path). Mirrors the setup
-        in ``test_last_advanced_sha_is_post_rebase_after_cas_retry`` above.
+        in ``test_advanced_sha_is_post_rebase_after_cas_retry`` above.
 
         Returns ``(merge_b, original_main_sha)``; the caller drives the
-        actual ``advance_main`` call (and its assertions) since (b) and (c)
-        exercise this scenario with different arguments.
+        actual ``advance_main`` call and its assertions (the
+        reverify_on_rebase scenario below exercises this with
+        ``reverify_on_rebase=True``).
         """
         _, original_main_sha, _ = await _run(
             ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
@@ -1413,67 +1428,6 @@ class TestAdvanceMainCasRetrySha:
         )
         assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
         return merge_b, original_main_sha
-
-    async def test_advance_main_returns_outcome_object_on_fast_forward(
-        self, git_ops: GitOps,
-    ):
-        """advance_main returns an AdvanceOutcome value object; when no CAS
-        retry is needed, advanced_sha equals the input merge_sha and the
-        rebase-only fields (rebased_from/rebased_onto) are None.
-        """
-        from orchestrator.git_ops import AdvanceOutcome
-
-        wt = await git_ops.create_worktree('ff-outcome')
-        (wt.path / 'y.py').write_text('y = 1\n')
-        await git_ops.commit(wt.path, 'Add y')
-        merge = await git_ops.merge_to_main(wt.path, 'ff-outcome')
-        assert merge.success and merge.merge_commit
-
-        outcome = await git_ops.advance_main(merge.merge_commit)
-
-        assert isinstance(outcome, AdvanceOutcome)
-        assert outcome.result == 'advanced'
-        assert outcome.advanced_sha == merge.merge_commit
-        assert outcome.rebased_from is None
-        assert outcome.rebased_onto is None
-        assert not hasattr(git_ops, '_last_advanced_sha'), (
-            'the _last_advanced_sha side channel must be retired — '
-            'advanced_sha rides the returned AdvanceOutcome only'
-        )
-
-    async def test_advance_main_returns_outcome_object_after_cas_retry(
-        self, git_ops: GitOps,
-    ):
-        """On the CAS-retry rebase path, the returned AdvanceOutcome's
-        advanced_sha is the post-rebase SHA that is actually on main — not
-        the stale pre-rebase ``MergeResult.merge_commit``.
-        """
-        from orchestrator.git_ops import AdvanceOutcome
-
-        merge_b, _original_main_sha = await self._prepare_cas_retry_landing(git_ops)
-        pre_rebase_sha = merge_b.merge_commit
-        assert pre_rebase_sha is not None
-        assert merge_b.merge_worktree is not None
-
-        outcome = await git_ops.advance_main(
-            pre_rebase_sha,
-            merge_worktree=merge_b.merge_worktree,
-            branch='cas-b-outcome',
-        )
-
-        assert isinstance(outcome, AdvanceOutcome)
-        assert outcome.result == 'advanced'
-        assert outcome.advanced_sha is not None
-        assert outcome.advanced_sha != pre_rebase_sha
-
-        rc, _, _ = await _run(
-            ['git', 'merge-base', '--is-ancestor',
-             outcome.advanced_sha, git_ops.config.main_branch],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0, f'outcome.advanced_sha {outcome.advanced_sha} must be on main'
-
-        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
 
     async def test_advance_main_returns_outcome_object_with_reverify_on_rebase(
         self, git_ops: GitOps,
