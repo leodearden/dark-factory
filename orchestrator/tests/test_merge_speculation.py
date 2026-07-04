@@ -1536,8 +1536,16 @@ class TestSpecLaneFinalizeTerminalRelease:
         vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
         entry = _build_entry(item, vr, merge_wt=fake_lane)
 
-        # Always return 'rebased_pending_reverify' to spin the gate-retry loop
-        mock_git_ops.advance_main.return_value = AdvanceOutcome('rebased_pending_reverify')
+        # Always return 'rebased_pending_reverify' to spin the gate-retry loop.
+        # SHA fields must be populated: _finalize_inflight now sources them from
+        # the return value, not the (still-present, but no longer read) helper
+        # side-channel attrs (task 1997 step-6).
+        mock_git_ops.advance_main.return_value = AdvanceOutcome(
+            'rebased_pending_reverify',
+            advanced_sha='aa' * 20,
+            rebased_from='bb' * 20,
+            rebased_onto='cc' * 20,
+        )
 
         with patch(
             'orchestrator.merge_queue._reverify_rebased_tree',

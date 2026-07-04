@@ -7079,6 +7079,15 @@ class TestSpeculativeGateReverifyConsumesAdvanceOutcome:
             outcome = await asyncio.wait_for(req.result, timeout=30)
 
         assert outcome.status == 'blocked', f'expected blocked; got {outcome!r}'
+        # Discriminate the intended second-call 'not_descendant' failure from
+        # the run()-loop's catch-all handler swallowing a stray AssertionError
+        # (merge_queue.py's _verifier_loop wraps _finalize_inflight in a
+        # try/except BaseException and resolves 'blocked' either way) — the
+        # reason must reflect the deliberate terminal code, not the backstop.
+        assert 'not_descendant' in (outcome.reason or ''), (
+            f'expected the deliberate not_descendant failure, not a swallowed '
+            f'AssertionError; got reason={outcome.reason!r}'
+        )
         assert captured_reverify_kwargs == {
             'rebased_from': REBASED_FROM,
             'rebased_onto': REBASED_ONTO,

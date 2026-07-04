@@ -8642,16 +8642,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # rebased_pending_reverify are included in retries_per_landing (see
                     # _note_merge_retry docstring for the rationale).
                     self._note_merge_retry()
-                    rebased_sha = getattr(self._git_ops, '_last_advanced_sha', None)
-                    rebased_from = getattr(self._git_ops, '_rebased_from', None)
-                    rebased_onto = getattr(self._git_ops, '_rebased_onto', None)
+                    # advance_main always populates all three fields when it
+                    # constructs AdvanceOutcome('rebased_pending_reverify', ...),
+                    # but they're typed str | None on the dataclass; narrow
+                    # explicitly for pyright (task 1996 explicit-guard style)
+                    # rather than re-adding a verbose per-field diagnostic.
+                    rebased_sha = adv_outcome.advanced_sha
+                    rebased_from = adv_outcome.rebased_from
+                    rebased_onto = adv_outcome.rebased_onto
                     if rebased_sha is None or rebased_from is None or rebased_onto is None:
                         raise AssertionError(
-                            f'advance_main returned rebased_pending_reverify but '
-                            f'side-channel attributes are not all set (task '
-                            f'{req.task_id}): _last_advanced_sha={rebased_sha!r}, '
-                            f'_rebased_from={rebased_from!r}, '
-                            f'_rebased_onto={rebased_onto!r}'
+                            f'advance_main returned rebased_pending_reverify '
+                            f'without SHA fields (task {req.task_id})'
                         )
 
                     self._verify_phase = 'gate_reverify'
