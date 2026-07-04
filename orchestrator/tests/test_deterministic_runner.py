@@ -824,6 +824,80 @@ class TestCrossUnitWritebackResilience:
             'No escalation should be filed when the writeback recovers within budget'
         )
 
+    async def test_persistent_severed_connection_files_durable_escalation(self, tmp_path: Path):
+        """A PERSISTENTLY severed connection (never recovers in-window) files a
+        durable infra_issue escalation instead of silently stranding the task
+        with an empty queue — the direct EVIDENCE regression guard (task 2059/2066)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            # Connection never recovers in-window for the verified stamp.
+            return 'before_done_verified_at' not in metadata
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=3,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        # (a) durable, connection-independent escalation filed — the queue is
+        # never empty, unlike the EVIDENCE failure on task 2059.
+        pending = queue.get_by_task('2066')
+        assert pending, 'Budget exhaustion must file a durable escalation, not leave the queue empty'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+        assert 'orchestrator-reify.service' in esc.detail
+        assert 'severed' in esc.detail.lower() or 'connection' in esc.detail.lower(), (
+            f'Detail must explain the self-severed-connection/writeback-stranding '
+            f'cause: {esc.detail!r}'
+        )
+
+        # (b) outcome is BLOCKED, never a propagated raw exception.
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # (c) before_done_ran_at was stamped pre-deploy (I1 crash-safe stamp).
+        ran_at_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert ran_at_calls, 'before_done_ran_at must be stamped before the deploy runs'
+
+        # (d) bounded attempts — no infinite loop.
+        verified_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and 'before_done_verified_at' in c.args[1]
+        ]
+        assert len(verified_calls) == 3, (
+            f'Expected exactly writeback_max_attempts (3) verified-stamp attempts; '
+            f'got {len(verified_calls)}'
+        )
+        assert sleeper.await_count == 2, (
+            f'Expected exactly writeback_max_attempts-1 (2) sleeps; got {sleeper.await_count}'
+        )
+
+        # (e) the deploy script is never re-run.
+        script_runner.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # Default seam: _default_run_script env merge
