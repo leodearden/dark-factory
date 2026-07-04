@@ -285,6 +285,20 @@ def wl_git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_repo(repo))
+    # Task 2061: pre-create the DEFAULT derived warm-lane base
+    # (<repo>/.worktrees/_merge-verify/target, non-empty) so the
+    # acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK
+    # for the many tests in this file that use the default (unoverridden)
+    # warm_lane_base_target_dir — these tests exercise OTHER acquire_warm_lane
+    # behavior (create/reset/reuse/release/...) via stub seed scripts that
+    # ignore the base path entirely, so they never cared about the base's
+    # on-disk presence before this gate existed. Tests that specifically
+    # exercise base-absence/health use their own explicit
+    # warm_lane_base_target_dir override (see TestWarmLaneBaseResolvable,
+    # TestAcquireWarmLaneBaseAbsent) and are unaffected by this default.
+    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
+    default_base.mkdir(parents=True, exist_ok=True)
+    (default_base / '.keep').write_text('warm base sentinel\n')
     return repo
 
 

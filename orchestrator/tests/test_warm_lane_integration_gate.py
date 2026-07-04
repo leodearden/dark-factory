@@ -66,6 +66,16 @@ def ig_git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_repo(repo))
+    # Task 2061: pre-create the DEFAULT derived warm-lane base
+    # (<repo>/.worktrees/_merge-verify/target, non-empty) so the
+    # acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK
+    # for this file's tests, which exercise OTHER acquire_warm_lane/
+    # create_worktree behavior (recycle/exhausted/fault/disk-pressure/omega)
+    # via stub scripts that ignore the base path entirely — mirrors the same
+    # fix in test_warm_lane_pool.py's wl_git_repo fixture.
+    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
+    default_base.mkdir(parents=True, exist_ok=True)
+    (default_base / '.keep').write_text('warm base sentinel\n')
     return repo
 
 
