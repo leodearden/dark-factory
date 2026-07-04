@@ -375,14 +375,30 @@ class TestGetAllValidEdges:
         assert result['node-2'] == [{'uuid': 'e3', 'fact': 'factC', 'name': 'edge3'}]
 
     @pytest.mark.asyncio
-    async def test_cypher_uses_return_distinct(self, mock_config, make_backend, make_graph_mock):
-        """Cypher query passed to ro_query contains 'RETURN DISTINCT'."""
+    async def test_cypher_dedups_by_edge_identity(self, mock_config, make_backend, make_graph_mock):
+        """Query dedupes by (entity, edge-element) identity, not property tuple.
+
+        FalkorDB does not enforce property uniqueness, and redirect_node_edges
+        copies new.uuid = old.uuid on merge, so an entity can carry multiple
+        genuinely-distinct RELATES_TO elements sharing one (uuid, fact, name)
+        tuple. `RETURN DISTINCT n.uuid, e.uuid, e.fact, e.name` collapses those
+        distinct elements into a single row, undercounting edge_count.
+        `WITH DISTINCT n, e` dedupes by the (entity, edge-element) pair itself:
+        it still preserves the intended double-attribution (a directed edge
+        appears once under each endpoint entity, as distinct (n, e) pairs) and
+        still collapses the undirected self-loop double-match, while no longer
+        collapsing genuinely-distinct edges that share copied properties.
+        """
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        cypher = graph.ro_query.call_args.args[0]
-        assert 'RETURN DISTINCT' in cypher
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
+        cypher = extract_cypher(call_args)
+        assert 'WITH DISTINCT n, e' in cypher, f"Cypher must dedupe by (entity, edge) identity: {cypher}"
+        assert 'RETURN DISTINCT' not in cypher, f"Cypher must not dedupe by property tuple: {cypher}"
+        assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
     @pytest.mark.asyncio
     async def test_empty_graph_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
@@ -460,14 +476,16 @@ class TestGetAllValidEdges:
     async def test_identical_rows_produce_duplicate_entries(self, mock_config, make_backend, make_graph_mock):
         """Python grouping loop does no dedup — identical rows produce duplicate list entries.
 
-        RETURN DISTINCT in the Cypher query is the sole guard against duplicate
-        rows (it guards specifically against self-loop duplicates where A→A edges
-        yield two identical rows under the undirected MATCH).  If the database
-        ever returns identical rows the Python layer faithfully appends both,
-        producing duplicate entries in the result list.  This test documents and
-        locks in that contract so it is never accidentally 'fixed' at the Python
-        layer (which would silently change behaviour for the legitimate self-loop
-        case that RETURN DISTINCT already handles).
+        WITH DISTINCT n, e in the Cypher query is the sole guard against
+        duplicate rows (it guards specifically against self-loop duplicates
+        where A→A edges yield two identical rows under the undirected MATCH).
+        If the database ever returns identical rows the Python layer faithfully
+        appends both, producing duplicate entries in the result list.  This test
+        documents and locks in that contract so it is never accidentally 'fixed'
+        at the Python layer (which would silently change behaviour for the
+        legitimate self-loop case that WITH DISTINCT n, e already handles, and
+        would re-introduce the edge_count undercount for genuinely-distinct
+        edges that share a copied property tuple).
         """
         backend = make_backend(mock_config)
         rows = [
