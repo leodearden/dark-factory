@@ -343,6 +343,16 @@ finally block.  Used by _buffer_owned_request._on_terminal to distinguish a
 graceful-stop / crash path (keep in journal for recovery) from a deterministic
 terminal failure (remove — not retried on restart)."""
 
+_DEBUG_ASSERTS: bool = os.environ.get('ORCH_DEBUG_ASSERTS', '') == '1'
+"""Module-level single-writer debug-assert flag (task 1999 / MQ-invariants ξ, I7).
+
+Seeded from the ``ORCH_DEBUG_ASSERTS`` env var at import time; gates
+:meth:`SpeculativeMergeWorker._assert_single_writer`.  Read as a module
+global (not re-read from ``os.environ`` per call) so tests/conftest can flip
+it via ``monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)`` without
+import-order fragility.  Off by default: zero production overhead beyond a
+single module-bool branch at each call site."""
+
 
 def _normalize_lane(lane: str) -> str:
     """Map an unrecognised lane value to 'normal' (defensive; prevents starvation)."""
@@ -4416,6 +4426,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
     # ── lane-buffer helpers ───────────────────────────────────────────────
 
+    def _assert_single_writer(self, expected_task: asyncio.Task | None, structure: str) -> None:  # type: ignore[type-arg]
+        """Raise if *structure* is being mutated from a coroutine other than *expected_task*.
+
+        Debug-only single-writer discipline check (task 1999 / MQ-invariants
+        ξ, I7) for ``_lane_buffers`` (owner: ``self._merger_task``) and
+        ``_inflight`` (owner: ``self._verifier_task``) — see each attribute's
+        own "Accessed only from the ... coroutine" comment.  A no-op in all
+        of these cases (checked in order, cheapest first):
+
+          * :data:`_DEBUG_ASSERTS` is off (production default) — single
+            module-bool branch, effectively zero overhead.
+          * *expected_task* is ``None`` — no loop has started yet (e.g. the
+            hundreds of direct-call unit tests that construct a bare worker
+            and call a mutation method without ever running ``_spawn_loop``).
+          * ``not self._running`` — :meth:`stop` sets this False BEFORE its
+            own shutdown drains of both structures from the stop coroutine
+            (a legitimate non-owner mutation), so this gate exempts them.
+
+        Otherwise raises :class:`AssertionError` when
+        ``asyncio.current_task()`` is not *expected_task*.
+        """
+        if not _DEBUG_ASSERTS or expected_task is None or not self._running:
+            return
+        cur = asyncio.current_task()
+        if cur is not expected_task:
+            raise AssertionError(
+                f'{structure} mutated from non-owner coroutine {cur!r}; '
+                f'single-writer discipline requires owner {expected_task!r}'
+            )
+
     def _buffer_owned_request(self, item: MergeRequest) -> None:
         """Append *item* to its lane buffer and record it in the durable journal.
 
@@ -4428,6 +4468,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         journal never stalls the merge pipeline.
         """
         lane = _normalize_lane(item.lane)
+        self._assert_single_writer(self._merger_task, '_lane_buffers')
         self._lane_buffers[lane].append(item)
 
         if self._merge_store is not None:
@@ -4550,10 +4591,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if not any(_aging_key(buf[j]) < key_x
                            for j, item in enumerate(buf)
                            if item.request_id in neighbors):
+                    self._assert_single_writer(self._merger_task, '_lane_buffers')
                     del buf[i]
                     return x
             # Defensive fallback (unreachable: the aging-minimal item is always
             # minimal by the above criterion, so the loop always returns).
+            self._assert_single_writer(self._merger_task, '_lane_buffers')
             return buf.popleft()
         return None
 
