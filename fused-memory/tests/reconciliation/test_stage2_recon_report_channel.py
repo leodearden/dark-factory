@@ -367,3 +367,117 @@ class TestAssemblePayloadReconReportChannel:
 
         assert payload.count('live_workflow_recurrence_counter_needed') == 1
         assert stage._recon_report_systemic_polled == 0
+
+    @pytest.mark.asyncio
+    async def test_dual_path_divergence_task_id_none_deduped_by_content_fingerprint(
+        self, mock_deps, watermark
+    ):
+        """Task-2078 regression (stage1_mem0_flags_processed counter
+        divergence): a systemic_pattern finding with task_id=None makes
+        compute_flag_signature(finding) return None (task_id is required),
+        so the signature-only dedup cannot match it against the surviving
+        Mem0 flag it duplicates — even though the Mem0 flag itself DOES
+        carry a (task_id, flag_type) signature. Same underlying finding text
+        must still render only once, via the content-fingerprint fallback."""
+        text = 'live workflow recurrence counter needed for task 452'
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='mem0-marker-1',
+                content=text,
+                metadata={
+                    'flag_for_stage2': True,
+                    'task_id': '452',
+                    'flag_type': 'systemic_counter_gap',
+                    'run_id': 'test-run',
+                },
+                created_at=None,
+            ),
+        ]
+        stage = _make_configured_stage(
+            mock_deps, project_id='autopilot_video', project_root='/home/leo/src/autopilot-video'
+        )
+        # task_id=None -> compute_flag_signature(finding) is None regardless
+        # of flag_type, so the existing signature-only dedup misses this
+        # cross-channel duplicate (RED on current code).
+        finding = self._systemic_finding(task_id=None, flag_type='systemic_counter_gap')
+        stage._recon_report_state = _FakeReconReportState(findings=[finding])
+        stage1_report = self._stage1_report(items_flagged=[])  # Stage 1 channel empty
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        assert payload.count(text) == 1
+        assert stage._recon_report_systemic_polled == 0
+
+    @pytest.mark.asyncio
+    async def test_dual_path_divergence_legacy_marker_missing_flag_type(
+        self, mock_deps, watermark
+    ):
+        """Task-2078 regression, legacy-marker variant: a flag_for_stage2
+        marker written before flag_type surfacing (task-1966 amendment) omits
+        `flag_type` from its metadata, so the surviving Mem0 flag built from
+        it also has flag_type=None. compute_flag_signature requires BOTH
+        task_id and flag_type, so it returns None for both the Mem0 flag AND
+        a same-content finding with flag_type=None — the signature-only dedup
+        cannot join them despite task_id='452' matching on both sides. Same
+        finding text must still render only once via the content fingerprint."""
+        text = 'live workflow recurrence counter needed for task 452'
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='mem0-marker-2',
+                content=text,
+                metadata={
+                    'flag_for_stage2': True,
+                    'task_id': '452',
+                    'run_id': 'test-run',
+                    # flag_type intentionally omitted: legacy marker shape.
+                },
+                created_at=None,
+            ),
+        ]
+        stage = _make_configured_stage(
+            mock_deps, project_id='autopilot_video', project_root='/home/leo/src/autopilot-video'
+        )
+        finding = self._systemic_finding(flag_type=None)  # task_id defaults to '452'
+        stage._recon_report_state = _FakeReconReportState(findings=[finding])
+        stage1_report = self._stage1_report(items_flagged=[])  # Stage 1 channel empty
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        assert payload.count(text) == 1
+        assert stage._recon_report_systemic_polled == 0
+
+    @pytest.mark.asyncio
+    async def test_distinct_finding_still_delivered_alongside_unrelated_mem0_flag(
+        self, mock_deps, watermark
+    ):
+        """No-over-dedup boundary (must stay green after the fix): a
+        recon_report_systemic finding whose content matches no item already
+        in combined_flags — neither by signature nor by content fingerprint
+        — is still rendered, even when an unrelated surviving Mem0 flag is
+        present. Guards against a content-fingerprint dedup that is too
+        aggressive and starts swallowing genuinely-distinct findings, which
+        would violate task-1966's recon_report delivery guarantee."""
+        mock_deps['memory_service'].search.return_value = [
+            SimpleNamespace(
+                id='mem0-marker-3',
+                content='unrelated existing mem0 flag content for task 111',
+                metadata={
+                    'flag_for_stage2': True,
+                    'task_id': '111',
+                    'flag_type': 'unrelated_flag_type',
+                    'run_id': 'test-run',
+                },
+                created_at=None,
+            ),
+        ]
+        stage = _make_configured_stage(
+            mock_deps, project_id='autopilot_video', project_root='/home/leo/src/autopilot-video'
+        )
+        finding = self._systemic_finding()  # distinct task_id/flag_type/content
+        stage._recon_report_state = _FakeReconReportState(findings=[finding])
+        stage1_report = self._stage1_report(items_flagged=[])  # Stage 1 channel empty
+
+        payload = await stage.assemble_payload([], watermark, [stage1_report])
+
+        assert 'live workflow recurrence counter needed for task 452' in payload
+        assert stage._recon_report_systemic_polled == 1
