@@ -293,6 +293,92 @@ class TestRunVerificationEnvRecovery:
             f"containing -o addopts='', got {pytest_invocations!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_env_transient_recovery_logs_addopts_clearing_note(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Amendment regression (reviewer_comprehensive robustness_false_signal,
+        verify.py:637): _force_serial_pytest's `-o addopts=''` clears ALL
+        pyproject addopts, not just `-n auto` — including any marker filters
+        (e.g. `-m 'not integration'`) — so the single recovery run can
+        exercise a materially different test selection than the original.
+        At minimum this must be observable in the log so an operator
+        investigating a recovery-path result knows a broader test selection
+        may have run.
+        """
+        import logging
+
+        config = self._make_config(tmp_path)
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' in cmd and "-o addopts=''" not in cmd:
+                return 4, _XDIST_VANISHED_OUTPUT, False
+            return 0, '', False
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
+        ):
+            result = await verify.run_verification(tmp_path, config)
+
+        assert result.passed is True
+        addopts_warnings = [
+            r for r in caplog.records
+            if 'shared-venv transient' in r.getMessage() and 'addopts' in r.getMessage()
+        ]
+        assert addopts_warnings, (
+            f'Expected the recovery WARNING to mention addopts/marker-filter '
+            f'clearing; got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_transient_recovery_retry_itself_times_out(
+        self, tmp_path: Path,
+    ):
+        """Case C: the env-recovery retry itself hits the wall-clock timeout.
+
+        Amendment regression (reviewer_comprehensive robustness_stale_state,
+        verify.py:2681): the recovery block recomputed `passed`/`category`/
+        `cause_hint`/`summary` from the retried test result but NOT
+        `timed_out` (set once, before the recovery run, from the first
+        pass).  Before the fix this left an inconsistent VerifyResult —
+        category='infra_timeout' but timed_out=False — which both (a) wrongly
+        marked the worktree warm (`not result.timed_out` at the warm-marking
+        check) despite the recovery run having timed out, and (b) hid the
+        timeout from callers that special-case `result.timed_out`
+        (merge_queue.py, workflow.py).
+        """
+        (tmp_path / '.task').mkdir()
+        config = self._make_config(tmp_path)
+        invoked_cmds: list[str] = []
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            invoked_cmds.append(cmd)
+            if "-o addopts=''" in cmd:
+                return 1, f'Command timed out after {timeout}s: {cmd}', True
+            if 'pytest' in cmd:
+                return 4, _XDIST_VANISHED_OUTPUT, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(tmp_path, config)
+
+        assert result.passed is False
+        assert result.category == 'infra_timeout'
+        assert result.timed_out is True, (
+            f'Expected timed_out=True to stay consistent with category='
+            f'{result.category!r} after the recovery retry itself timed out '
+            f'(got timed_out={result.timed_out!r})'
+        )
+        assert not (tmp_path / '.task' / 'verify_warmed').exists(), (
+            'A recovery run that times out must not mark the worktree warm'
+        )
+        pytest_invocations = [c for c in invoked_cmds if 'pytest' in c]
+        assert len(pytest_invocations) == 2, (
+            f'Expected exactly 2 pytest invocations (original + one bounded '
+            f'recovery retry), got {len(pytest_invocations)}: {pytest_invocations!r}'
+        )
+
 
 class TestRunMainTipSweepEnvTransient:
     """step-9: run_main_tip_sweep treats env_transient exactly like
@@ -468,3 +554,48 @@ class TestClassifyFailurePipWordBoundary:
         the word-boundary fix."""
         output = 'ModuleNotFoundError: No module named "pip"\n'
         assert self._classify(output, rc=1, timed_out=False) == 'env_transient'
+
+
+class TestClassifyFailureXdistUsageErrorPytestScoped:
+    """Amendment regression guard for reviewer_comprehensive
+    misclassification_risk at verify.py:427.
+
+    The original xdist usage-error pattern
+    (``^.*unrecognized arguments:.*(?:-n\\b|--dist\\b|--max-worker-restart\\b).*$``)
+    matched ANY line containing 'unrecognized arguments:' followed by
+    -n/--dist/--max-worker-restart — not just pytest's own argparse usage
+    error. A different CLI tool emitting a similarly shaped
+    'unrecognized arguments: -n ...' line would have been swept into
+    'env_transient', auto-retried via _force_serial_pytest, and kept off the
+    archive deny-list — the same inverse-misattribution hazard the pip
+    pattern's word-boundary fix (TestClassifyFailurePipWordBoundary) guards
+    against. RED before the fix: the non-pytest sample below matched
+    env_transient; the fix anchors the pattern to the literal
+    'pytest: error: unrecognized arguments:' prefix argparse emits for
+    pytest's own CLI (prog='pytest').
+    """
+
+    def _classify(self, output: str, rc: int, timed_out: bool) -> str:
+        return verify._classify_failure(output, rc, timed_out)
+
+    def test_non_pytest_unrecognized_arguments_not_env_transient(self):
+        """A different CLI tool's usage error must not be swept into
+        env_transient, even though it shares the same -n/--dist/
+        --max-worker-restart flag vocabulary as the grounded pytest
+        signature — the '{prog}: error: ...' prefix names a different,
+        unrelated tool, so this is a genuine CLI usage failure to surface
+        for human triage, not the xdist-vanished signature."""
+        output = (
+            'usage: sometool [options]\n'
+            'sometool: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
+        )
+        assert self._classify(output, rc=4, timed_out=False) == 'unknown_test_failure'
+
+    def test_pytest_usage_error_still_env_transient_after_scoping(self):
+        """The grounded task-2045 pytest usage error must still classify as
+        env_transient after anchoring to the 'pytest: error:' prefix."""
+        output = (
+            'usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+            'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
+        )
+        assert self._classify(output, rc=4, timed_out=False) == 'env_transient'

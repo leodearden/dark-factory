@@ -432,8 +432,15 @@ def _extract_cause_hint(output: str) -> str:
 _ENV_TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
     # pytest usage error (rc=4) when the xdist plugin vanished mid-run:
     # "pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0"
+    # Anchored to the literal "pytest: error: unrecognized arguments:" prefix
+    # that argparse emits for pytest's own CLI (prog='pytest') rather than a
+    # bare "unrecognized arguments:" substring, so an unrelated tool's usage
+    # error that happens to mention -n/--dist/--max-worker-restart cannot
+    # false-positive into env_transient — the same inverse-misattribution
+    # hazard the pip pattern below is hardened against with its word-boundary
+    # lookahead.
     re.compile(
-        r'^.*unrecognized arguments:.*(?:-n\b|--dist\b|--max-worker-restart\b).*$',
+        r'^.*pytest: error: unrecognized arguments:.*(?:-n\b|--dist\b|--max-worker-restart\b).*$',
         re.MULTILINE,
     ),
     # `python -m pip` when pip itself vanished from the venv.  The trailing
@@ -691,6 +698,55 @@ def _force_serial_pytest(cmd: str | None) -> str | None:
         return f"{stripped} -p no:xdist -o addopts=''{trailing}"
 
     return _PYTEST_INVOCATION_RE.sub(_rewrite, cmd)
+
+
+def _summarize_checks(
+    test_rc: int, test_out: str, test_timed_out: bool,
+    lint_rc: int, lint_out: str, lint_timed_out: bool,
+    type_rc: int, type_out: str, type_timed_out: bool,
+) -> tuple[bool, str, str, str]:
+    """Classify the three check results into (passed, category, cause_hint, summary).
+
+    Shared by ``run_verification``'s primary post-loop classification and its
+    bounded env-recovery retry (task 2048) so the failure-reclassification
+    logic — worst-category selection via ``_worst_category`` plus cause-hint
+    and summary-parts assembly — lives in exactly one place instead of being
+    duplicated per call site.
+
+    Does NOT compute the ``timed_out`` bookkeeping flag (pure-timeout-retry
+    eligibility / consistency) — that stays with the caller, which alone
+    knows whether this is the first pass (loop-bounded by ``max_retries``) or
+    the env-recovery retry, and overrides the returned ``summary`` with
+    timeout-specific text when its own ``timed_out`` is True.
+    """
+    passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
+    if passed:
+        return True, 'passed', '', 'All checks passed'
+
+    hint_parts = []
+    per_check_categories = []
+    for rc, out, to in (
+        (test_rc, test_out, test_timed_out),
+        (lint_rc, lint_out, lint_timed_out),
+        (type_rc, type_out, type_timed_out),
+    ):
+        if rc != 0:
+            h = _extract_cause_hint(out)
+            if h:
+                hint_parts.append(h)
+            per_check_categories.append(_classify_failure(out, rc, to))
+    cause_hint = ' | '.join(hint_parts)
+    category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
+
+    parts = []
+    if test_rc != 0:
+        parts.append('tests failed')
+    if lint_rc != 0:
+        parts.append('lint issues')
+    if type_rc != 0:
+        parts.append('type errors')
+    summary = f'Failures: {", ".join(parts)}'
+    return passed, category, cause_hint, summary
 
 
 def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> dict:
@@ -2622,39 +2678,15 @@ async def run_verification(
     # (no real non-timeout failure mixed in).
     timed_out = (not passed) and pure_timeout_failure
 
-    # Build summary
+    # Build summary/category/cause_hint (shared with the env-recovery retry
+    # below via _summarize_checks — see task 2048 code_duplication fix).
+    passed, category, cause_hint, summary = _summarize_checks(
+        test_rc, test_out, test_timed_out,
+        lint_rc, lint_out, lint_timed_out,
+        type_rc, type_out, type_timed_out,
+    )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
-    else:
-        parts = []
-        if test_rc != 0:
-            parts.append('tests failed')
-        if lint_rc != 0:
-            parts.append('lint issues')
-        if type_rc != 0:
-            parts.append('type errors')
-        summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
-
-    # Build cause_hint from each failing check's output; join with ' | '.
-    # Also classify each failing check and pick the worst category.
-    if passed:
-        cause_hint = ''
-        category = 'passed'
-    else:
-        hint_parts = []
-        per_check_categories = []
-        for rc, out, to in (
-            (test_rc, test_out, test_timed_out),
-            (lint_rc, lint_out, lint_timed_out),
-            (type_rc, type_out, type_timed_out),
-        ):
-            if rc != 0:
-                h = _extract_cause_hint(out)
-                if h:
-                    hint_parts.append(h)
-                per_check_categories.append(_classify_failure(out, rc, to))
-        cause_hint = ' | '.join(hint_parts)
-        category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
     # Bounded env-recovery retry: a shared-venv-mutation transient (a
     # concurrent `uv sync` elsewhere vanishing xdist/pip mid-run) is an infra
@@ -2669,7 +2701,9 @@ async def run_verification(
     if category == 'env_transient' and test_cmd is not None:
         logger.warning(
             'Verification hit an environmental shared-venv transient '
-            '(vanished xdist/pip); retrying test command once, forced serial'
+            '(vanished xdist/pip); retrying test command once, forced serial '
+            '(this clears all pyproject addopts, including any marker '
+            'filters, for the recovery run — see _force_serial_pytest)'
         )
         recovered_test_cmd = _force_serial_pytest(test_cmd)
         (
@@ -2678,34 +2712,39 @@ async def run_verification(
             recovered_test_cmd, label='test', current_attempt=current_attempt_id,
         )
         test_cmd = recovered_test_cmd
+
+        # Recompute pure-timeout consistency for the recovery run: lint/type
+        # are unchanged from the first pass (only the test leg was re-run),
+        # so this mirrors the loop's pure_timeout_failure formula above with
+        # the refreshed test_rc/test_timed_out.  Without this, a recovery run
+        # that itself hits the wall-clock timeout would leave the stale
+        # timed_out=False from the first pass while category flips to
+        # 'infra_timeout' — an inconsistent VerifyResult that both wrongly
+        # marks the worktree warm (the "not result.timed_out" check below)
+        # and hides the timeout from callers that special-case
+        # result.timed_out (merge_queue.py, workflow.py).
         passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
-        if passed:
-            cause_hint = ''
-            category = 'passed'
-            summary = 'All checks passed'
-        else:
-            hint_parts = []
-            per_check_categories = []
-            for rc, out, to in (
-                (test_rc, test_out, test_timed_out),
-                (lint_rc, lint_out, lint_timed_out),
-                (type_rc, type_out, type_timed_out),
-            ):
-                if rc != 0:
-                    h = _extract_cause_hint(out)
-                    if h:
-                        hint_parts.append(h)
-                    per_check_categories.append(_classify_failure(out, rc, to))
-            cause_hint = ' | '.join(hint_parts)
-            category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
-            parts = []
-            if test_rc != 0:
-                parts.append('tests failed')
-            if lint_rc != 0:
-                parts.append('lint issues')
-            if type_rc != 0:
-                parts.append('type errors')
-            summary = f'Failures: {", ".join(parts)}'
+        any_timed_out = test_timed_out or lint_timed_out or type_timed_out
+        pure_timeout_failure = (
+            not passed
+            and any_timed_out
+            and (test_rc == 0 or test_timed_out)
+            and (lint_rc == 0 or lint_timed_out)
+            and (type_rc == 0 or type_timed_out)
+        )
+        timed_out = (not passed) and pure_timeout_failure
+
+        passed, category, cause_hint, summary = _summarize_checks(
+            test_rc, test_out, test_timed_out,
+            lint_rc, lint_out, lint_timed_out,
+            type_rc, type_out, type_timed_out,
+        )
+        if timed_out:
+            # Distinct wording from the first-pass timeout summary: this
+            # timeout happened on the single bounded env-recovery retry, not
+            # the pure-timeout retry loop, so "after {max_retries} retries"
+            # would misdescribe it.
+            summary = 'Verification timed out during env-recovery retry'
 
     # Hoist runs list so both the merge-path and task-path branches can use it.
     runs = [
