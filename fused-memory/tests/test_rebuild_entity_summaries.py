@@ -1188,6 +1188,49 @@ class TestMemoryServiceRebuildEntitySummaries:
 
 
 # ---------------------------------------------------------------------------
+# task-2076: MemoryService.rebuild_entity_summaries(entity_uuids=...) — targeted
+# force-regenerate path that bypasses staleness detection entirely.
+# ---------------------------------------------------------------------------
+
+class TestRebuildEntitySummariesEntityUuids:
+    """entity_uuids targets exactly the listed entities, bypassing staleness detection."""
+
+    @pytest.mark.asyncio
+    async def test_targets_only_listed_entity_bypassing_detection(self, mock_config):
+        """entity_uuids=['u1'] force-regenerates ONLY u1; detection is never consulted.
+
+        u1's baked summary contains a stale line not backed by any valid edge
+        ('baked stale line') alongside a line that IS backed by a valid edge
+        ('valid fact'). The targeted rebuild must regenerate strictly from the
+        valid edges, dropping the baked stale line, and must never dispatch u2
+        (the _uuid_dispatch mapping below omits u2, so any u2 call would raise).
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 'baked stale line\nvalid fact'},
+            {'uuid': 'u2', 'name': 'Bob', 'summary': 'ok'},
+        ])
+        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+            'u1': [{'uuid': 'e1', 'fact': 'valid fact', 'name': 'r'}],
+            'u2': [{'uuid': 'e2', 'fact': 'ok', 'name': 'r'}],
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+            'u1': {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'baked stale line\nvalid fact',
+                   'new_summary': 'valid fact', 'edge_count': 1},
+        }))
+
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=['u1'])
+
+        assert result['total_entities'] == 1
+        assert result['stale_entities'] == 1
+        assert result['rebuilt'] == 1
+        # force-style target selection: list_entity_nodes is consulted (not detect_stale_*)
+        svc.graphiti.list_entity_nodes.assert_awaited_once()
+        # Baked stale line is dropped — the rebuilt summary reflects only the valid edge.
+        assert result['details'][0]['new_summary'] == 'valid fact'
+
+
+# ---------------------------------------------------------------------------
 # step-5: MCP tool rebuild_entity_summaries
 # ---------------------------------------------------------------------------
 
