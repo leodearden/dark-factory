@@ -371,6 +371,62 @@ class MemoryService:
         logger.info('Deduplicating %d edge(s) after add_episode', len(duplicates))
         return await self.graphiti.bulk_remove_edges(duplicates, group_id=group_id)
 
+    async def _dedup_episode_nodes(self, result: Any, *, group_id: str) -> int:
+        """Merge exact-name duplicate entity nodes minted within a single add_episode call.
+
+        graphiti_core's ingestion-time entity resolution (resolve_extracted_nodes)
+        only resolves each extracted node against candidates surfaced by hybrid
+        embedding+BM25 search — there is no guaranteed exact-name Cypher lookup.
+        When that search misses an existing canonical node, ingestion mints a
+        brand-new node even though a node with the exact same name already
+        exists. This sweep re-checks each entity name this episode touched via
+        ``find_duplicate_entity_nodes`` and merges any duplicates it finds into
+        the canonical survivor (most valid edges, then oldest, then lowest
+        uuid) via ``merge_entities``.
+
+        Modelled on ``_dedup_episode_edges``; handles None / empty result the
+        same way.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                    AddEpisodeResults object with a ``nodes`` attribute).
+                    Handles ``None`` and objects with empty/missing nodes
+                    gracefully.
+
+        Returns:
+            Number of duplicate nodes merged into their canonical survivor
+            (0 when nothing to do).
+        """
+        if result is None:
+            return 0
+
+        nodes = getattr(result, 'nodes', None) or []
+        if not nodes:
+            return 0
+
+        names: list[str] = []
+        seen: set[str] = set()
+        for node in nodes:
+            name = getattr(node, 'name', '') or ''
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+
+        merged = 0
+        for name in names:
+            matches = await self.graphiti.find_duplicate_entity_nodes(name, group_id=group_id)
+            if len(matches) < 2:
+                continue
+            survivor = matches[0]['uuid']
+            for dup in matches[1:]:
+                await self.graphiti.merge_entities(dup['uuid'], survivor, group_id=group_id)
+                merged += 1
+
+        if merged > 0:
+            logger.info('Merged %d exact-name duplicate node(s) after add_episode', merged)
+        return merged
+
     async def _restore_superseded_dependency_edges(
         self, result: Any, *, group_id: str
     ) -> int:
