@@ -6972,6 +6972,67 @@ Output JSON matching the schema. Every task must appear in the output.
             esc.id, esc.task_id, target_unit,
         )
 
+    async def _run_deterministic_recon_sweep(self) -> None:
+        """Single testable pass of the deterministic-strand reconciliation sweep.
+
+        Source A: enumerate blocked tasks and recover any absent-escalation
+        strand (task-2059 shape) via ``_recover_stranded_deterministic_task``.
+
+        Source B: enumerate all pending escalations and re-validate any open
+        deterministic-deploy ``infra_issue`` escalation via
+        ``_revalidate_open_deterministic_escalation`` (a no-op for anything
+        that doesn't match).  Reuses Source A's task map as a fast path,
+        falling back to ``scheduler.get_task`` for an escalation whose task
+        wasn't in the blocked set.
+
+        A and B are mutually exclusive per task by construction (A requires
+        an empty pending queue; B requires an open escalation) — see the
+        design decision on the class-level plan.  Both loops are per-item
+        fail-soft: one bad task/escalation is logged and does not abort the
+        rest of the pass.
+        """
+        if self._escalation_queue is None:
+            return
+
+        tasks = await self.scheduler.get_tasks(statuses=['blocked'])
+        task_by_id: dict[str, dict] = {}
+        for task in tasks:
+            tid = str(task.get('id', ''))
+            if not tid:
+                continue
+            task_by_id[tid] = task
+            if task.get('status') != 'blocked':
+                continue
+            metadata = task.get('metadata') or {}
+            if not _is_stranded_deterministic_shape(metadata):
+                continue
+            try:
+                if self._escalation_queue.get_by_task(tid, status='pending'):
+                    continue
+                await self._recover_stranded_deterministic_task(tid, task, metadata)
+            except Exception as exc:
+                logger.error(
+                    'Deterministic-recon-sweep: Source-A recovery failed for '
+                    'task %s: %s: %s',
+                    tid, type(exc).__name__, exc,
+                )
+
+        for esc in self._escalation_queue.get_pending():
+            try:
+                task = task_by_id.get(esc.task_id)
+                if task is None:
+                    task = await self.scheduler.get_task(esc.task_id)
+                if task is None:
+                    continue
+                metadata = task.get('metadata') or {}
+                await self._revalidate_open_deterministic_escalation(esc, task, metadata)
+            except Exception as exc:
+                logger.error(
+                    'Deterministic-recon-sweep: Source-B revalidation failed '
+                    'for escalation %s: %s: %s',
+                    esc.id, type(exc).__name__, exc,
+                )
+
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
         # Increment before the event-set logic so the counter reflects every submission.
