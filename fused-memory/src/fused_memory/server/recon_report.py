@@ -855,8 +855,13 @@ class ReconReportState:
     def tick(self) -> int:
         """Sweep completed entries past TTL.  Returns count evicted.
 
-        Each evicted entry's own report memory (``_state``, ``_active``) is
-        freed immediately — that part of the contract is unchanged.
+        Each evicted entry's own ``_state``/``_active`` lookup slots are
+        removed immediately — that part of the contract is unchanged. This is
+        NOT the same as the ``_ReportEntry`` object being garbage-collected
+        immediately: while its run is still live, ``_run_finding_index``
+        keeps a reference to the evicted entry (see below) so its findings
+        stay citable, and the object only becomes unreachable once the run's
+        indices are popped at quiescence.
 
         The three shared run-level dedup indices (``_run_sig_index`` /
         ``_run_desc_index`` / ``_run_finding_index``) are RUN-QUIESCENCE
@@ -884,6 +889,26 @@ class ReconReportState:
         here; see test_eviction_partial_run_canonical_stage_cleared and the
         sibling tests in TestReconReportReaper for the regression this
         guards against.
+
+        Quiescence is computed ONCE per tick() call — the set of run_ids
+        still present in ``_state`` after all of this sweep's deletions —
+        rather than via a per-evicted-entry ``any()`` scan over ``_state``.
+        The latter is O(evicted × remaining _state size) and becomes
+        quadratic when many entries across many runs age out in the same
+        sweep; computing the surviving run_id set once and then doing an O(1)
+        membership check per evicted run_id is O(evicted + remaining).
+
+        Retention caveat: reaching quiescence requires every ``(run_id, *)``
+        entry to individually hit completed_at + TTL. An in-progress entry
+        never expires on its own — it is immortal by design (PRD §9.4; see
+        test_inprogress_not_evicted_by_ttl) — so a stalled or crashed stage
+        that never calls complete() pins that run_id's three indices, and
+        every already-evicted sibling entry object kept reachable through
+        ``_run_finding_index``, for as long as the process keeps running.
+        There is currently no separate max-lifetime sweep for in-progress
+        entries to bound this. This is an accepted tradeoff for task-2088
+        (worst case is bounded by process restart, not memory exhaustion
+        under normal operation), not a defect this task fixes.
         """
         now = self._clock()
         to_evict = [
@@ -892,20 +917,27 @@ class ReconReportState:
             if entry.completed_at is not None
             and now - entry.completed_at > self._ttl_seconds
         ]
+        evicted_run_ids: set[str] = set()
         for key in to_evict:
             rid, stage = key
             del self._state[key]
+            evicted_run_ids.add(rid)
             # Remove _active pointer only if it still points at this stage
             if self._active.get(rid) == stage:
                 del self._active[rid]
+        if evicted_run_ids:
             # Run-quiescence gate (task-2088) — see the tick() docstring above.
-            # Release this run's three shared indices only once no (rid, *)
-            # entry remains in _state, i.e. the run is fully quiescent.
-            run_still_live = any(r == rid for (r, _s) in self._state)
-            if not run_still_live:
-                self._run_sig_index.pop(rid, None)
-                self._run_finding_index.pop(rid, None)
-                self._run_desc_index.pop(rid, None)
+            # Compute the set of run_ids with a surviving _state entry ONCE,
+            # after all of this sweep's deletions, instead of rescanning
+            # _state per evicted entry. A run_id that evicted this tick and
+            # has no surviving entry is fully quiescent — release its three
+            # shared indices wholesale.
+            live_run_ids = {r for (r, _s) in self._state}
+            for rid in evicted_run_ids:
+                if rid not in live_run_ids:
+                    self._run_sig_index.pop(rid, None)
+                    self._run_finding_index.pop(rid, None)
+                    self._run_desc_index.pop(rid, None)
         if to_evict:
             logger.debug('recon_report reaper evicted %d entries', len(to_evict))
         return len(to_evict)
