@@ -106,6 +106,106 @@ class TestQueryReconReportFindings:
 
 
 # ---------------------------------------------------------------------------
+# _flag_content_fingerprint — cross-channel content-fingerprint dedup key
+# (task-2078). RED until task_knowledge_sync defines the helper.
+# ---------------------------------------------------------------------------
+
+
+class TestFlagContentFingerprint:
+    """Tests for _flag_content_fingerprint(item: dict) -> str | None.
+
+    Pure helper used to cross-channel-dedup a polled recon_report_systemic
+    finding (keyed on ``description``) against combined_flags items already
+    assembled from Stage 1 structured output or a surviving Mem0
+    active-query flag (both keyed on ``content``) — finding_id is never
+    available on the Mem0 side, so a normalized-content fingerprint is the
+    only reliable join key across the two channels.
+    """
+
+    def test_content_key_returns_content_fingerprint(self):
+        """(a) An item with a `content` key returns
+        flag_dedup._content_fingerprint(content)."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        text = 'live workflow recurrence counter needed for task 452'
+
+        assert _flag_content_fingerprint({'content': text}) == _content_fingerprint(text)
+
+    def test_description_only_key_returns_fingerprint_of_description(self):
+        """(b) An item with only a `description` key (no `content`) returns
+        the fingerprint of that description."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        text = 'systemic pattern: repeated live workflow recurrence for task 452'
+
+        assert _flag_content_fingerprint({'description': text}) == _content_fingerprint(text)
+
+    @pytest.mark.parametrize(
+        'item',
+        [
+            {},
+            {'content': ''},
+            {'content': '   '},
+            {'description': ''},
+            {'description': '   \n\t  '},
+            {'content': None, 'description': None},
+        ],
+        ids=[
+            'missing_both',
+            'blank_content',
+            'whitespace_content',
+            'blank_description',
+            'whitespace_description',
+            'explicit_none_values',
+        ],
+    )
+    def test_blank_or_missing_text_returns_none(self, item):
+        """(c) blank / whitespace-only / missing text returns None (mirrors
+        compute_content_fingerprint_signature's non-blank gate)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        assert _flag_content_fingerprint(item) is None
+
+    def test_cross_channel_equality_content_vs_description(self):
+        """(d) CROSS-CHANNEL EQUALITY — a mem0-style item {'content': X} and a
+        recon-style item {'description': X} with identical text X produce the
+        SAME fingerprint. This is the join property the cross-channel dedup
+        in assemble_payload relies on."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        text = 'live workflow recurrence counter needed for task 452'
+        mem0_style = {'_source': 'mem0_active_query', 'content': text}
+        recon_style = {'_source': 'recon_report_systemic', 'description': text}
+
+        fp_mem0 = _flag_content_fingerprint(mem0_style)
+        fp_recon = _flag_content_fingerprint(recon_style)
+
+        assert fp_mem0 is not None
+        assert fp_mem0 == fp_recon
+
+    def test_different_text_produces_different_fingerprint(self):
+        """(e) items with different text produce different fingerprints."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        fp1 = _flag_content_fingerprint({'content': 'finding text A'})
+        fp2 = _flag_content_fingerprint({'content': 'finding text B'})
+
+        assert fp1 != fp2
+
+
+# ---------------------------------------------------------------------------
 # assemble_payload integration — recon_report channel reaches Stage 2 even
 # when the Mem0 channel is suppressed (task-1966 step-12)
 #
