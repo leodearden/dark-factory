@@ -3794,6 +3794,69 @@ class TestIsDependencyFact:
         assert _is_dependency_fact(None) is False  # type: ignore[arg-type]
 
 
+class TestReconPoolAutoTag:
+    """Module-level _infer_recon_pool helper + _CYCLE_SUMMARY_STAGE_TO_RECON_POOL map.
+
+    recon_pool is the only key the pool-cap trim and prune script filter on
+    (reconciliation/summary_pool.py, scripts/prune_recon_cycle_summaries.py).
+    _infer_recon_pool derives it server-side from metadata.stage for
+    kind == 'cycle_summary' writes only, so tagging no longer depends on LLM
+    prompt compliance (task 2077).
+    """
+
+    def test_memory_consolidator_stage_maps_to_stage1_pool(self):
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'cycle_summary', 'stage': 'memory_consolidator'}
+        assert _infer_recon_pool(meta) == 'stage1_cycle_summary'
+
+    def test_task_knowledge_sync_stage_maps_to_stage2_pool(self):
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'cycle_summary', 'stage': 'task_knowledge_sync'}
+        assert _infer_recon_pool(meta) == 'stage2_cycle_summary'
+
+    def test_missing_stage_returns_none(self):
+        """stage absent -> cannot infer; add_memory must leave any caller recon_pool alone."""
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'cycle_summary'}
+        assert _infer_recon_pool(meta) is None
+
+    def test_unknown_stage_returns_none(self):
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'cycle_summary', 'stage': 'unknown_stage'}
+        assert _infer_recon_pool(meta) is None
+
+    def test_non_cycle_summary_kind_returns_none(self):
+        """Only kind == 'cycle_summary' writes are touched; other kinds pass through untouched."""
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'note', 'stage': 'memory_consolidator'}
+        assert _infer_recon_pool(meta) is None
+
+    def test_empty_metadata_returns_none(self):
+        from fused_memory.services.memory_service import _infer_recon_pool
+        assert _infer_recon_pool({}) is None
+
+    def test_map_matches_canonical_per_stage_constants(self):
+        """Drift guard: the map's values must equal the per-stage canonical constants
+        that stage1/stage2 themselves emit, so the two copies can't silently diverge."""
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            _STAGE1_CYCLE_SUMMARY_RECON_POOL,
+        )
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+        )
+        from fused_memory.services.memory_service import (
+            _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+        )
+        assert (
+            _CYCLE_SUMMARY_STAGE_TO_RECON_POOL['memory_consolidator']
+            == _STAGE1_CYCLE_SUMMARY_RECON_POOL
+        )
+        assert (
+            _CYCLE_SUMMARY_STAGE_TO_RECON_POOL['task_knowledge_sync']
+            == _STAGE2_CYCLE_SUMMARY_RECON_POOL
+        )
+
+
 # ---------------------------------------------------------------------------
 # Step 3: TRACK B.1 service clear_invalid_at RED tests
 # ---------------------------------------------------------------------------
