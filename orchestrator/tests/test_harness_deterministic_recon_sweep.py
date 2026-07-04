@@ -199,24 +199,26 @@ class TestIsStrandedDeterministicShape:
 
 
 # ---------------------------------------------------------------------------
-# step-7: Harness._recover_stranded_deterministic_task
+# step-7: Harness._recover_stranded_deterministic_task (Source A)
 # ---------------------------------------------------------------------------
 
 
 class TestRecoverStrandedDeterministicTask:
-    """step-7: _recover_stranded_deterministic_task re-files an L1 and NEVER
-    flips task status (RE-FILE-NEVER-FLIP discipline)."""
+    """step-7: RE-FILE-NEVER-FLIP strand recovery for absent-escalation strands."""
 
     @pytest.mark.asyncio
-    async def test_healthy_files_stranded_blocked_resume_escalation(self) -> None:
+    async def test_healthy_verdict_files_stranded_blocked_resume(self) -> None:
         h = _make_recon_harness()
+        h.event_store = MagicMock()
         h._escalation_queue.get_by_task = MagicMock(return_value=[])
         h._recon_unit_inspector = AsyncMock(
             return_value={'MainPID': 4321, 'ActiveState': 'active'}
         )
+        tid = 'task-2059'
+        task = {'id': tid, 'description': 'Deploy fused-memory restart'}
         metadata = _strand_metadata()
 
-        await h._recover_stranded_deterministic_task('tid-1', {'id': 'tid-1'}, metadata)
+        await h._recover_stranded_deterministic_task(tid, task, metadata)
 
         h._escalation_queue.submit.assert_called_once()
         esc = h._escalation_queue.submit.call_args[0][0]
@@ -225,19 +227,22 @@ class TestRecoverStrandedDeterministicTask:
         assert esc.severity == 'blocking'
         assert esc.suggested_action == 'resume'
         assert esc.agent_role == 'harness-deterministic-recon-sweep'
-        assert esc.task_id == 'tid-1'
+        assert esc.task_id == tid
         h.scheduler.set_task_status.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_unconfirmed_files_infra_issue_manual_intervention_escalation(self) -> None:
+    async def test_unconfirmed_verdict_files_infra_issue_manual(self) -> None:
         h = _make_recon_harness()
+        h.event_store = MagicMock()
         h._escalation_queue.get_by_task = MagicMock(return_value=[])
         h._recon_unit_inspector = AsyncMock(
-            return_value={'MainPID': 0, 'ActiveState': 'inactive'}
+            return_value={'MainPID': 0, 'ActiveState': 'failed'}
         )
+        tid = 'task-2059'
+        task = {'id': tid, 'description': 'Deploy fused-memory restart'}
         metadata = _strand_metadata()
 
-        await h._recover_stranded_deterministic_task('tid-2', {'id': 'tid-2'}, metadata)
+        await h._recover_stranded_deterministic_task(tid, task, metadata)
 
         h._escalation_queue.submit.assert_called_once()
         esc = h._escalation_queue.submit.call_args[0][0]
@@ -246,19 +251,21 @@ class TestRecoverStrandedDeterministicTask:
         assert esc.severity == 'blocking'
         assert esc.suggested_action == 'manual_intervention'
         assert esc.agent_role == 'harness-deterministic-recon-sweep'
-        assert esc.task_id == 'tid-2'
         h.scheduler.set_task_status.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_dedup_skips_submit_when_pending_escalation_exists(self) -> None:
+    async def test_dedup_skips_when_pending_escalation_exists(self) -> None:
         h = _make_recon_harness()
+        h.event_store = MagicMock()
         h._escalation_queue.get_by_task = MagicMock(return_value=[MagicMock()])
         h._recon_unit_inspector = AsyncMock(
             return_value={'MainPID': 4321, 'ActiveState': 'active'}
         )
+        tid = 'task-2059'
+        task = {'id': tid, 'description': 'Deploy fused-memory restart'}
         metadata = _strand_metadata()
 
-        await h._recover_stranded_deterministic_task('tid-3', {'id': 'tid-3'}, metadata)
+        await h._recover_stranded_deterministic_task(tid, task, metadata)
 
         h._escalation_queue.submit.assert_not_called()
         h.scheduler.set_task_status.assert_not_called()
