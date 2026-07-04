@@ -6673,8 +6673,9 @@ class TestWipHaltMergeWorker:
         # but stash pop conflicted (returns 'pop_conflict').
         async def _pop_conflict(*args, **kwargs):
             git_ops._last_recovery_branch = 'wip/recovery-recov-sha-20260428T000000'
-            git_ops._last_advanced_sha = 'feedface' * 5  # 40-char fake on-main SHA
-            return AdvanceOutcome('pop_conflict')
+            # advanced_sha threaded via the AdvanceOutcome return value (task
+            # 1997), not the git_ops._last_advanced_sha side channel.
+            return AdvanceOutcome('pop_conflict', advanced_sha='feedface' * 5)
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
@@ -6867,8 +6868,9 @@ class TestWipHaltSpeculativeMergeWorker:
 
         async def _pop_conflict(*args, **kwargs):
             git_ops._last_recovery_branch = 'wip/recovery-srecov-sha-20260428T000000'
-            git_ops._last_advanced_sha = 'cafebabe' * 5
-            return AdvanceOutcome('pop_conflict')
+            # advanced_sha threaded via the AdvanceOutcome return value (task
+            # 1997), not the git_ops._last_advanced_sha side channel.
+            return AdvanceOutcome('pop_conflict', advanced_sha='cafebabe' * 5)
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
@@ -13991,6 +13993,7 @@ class TestFinalizeAdvancedMerge:
                 cas_retries=cas_retries,
                 timeouts=timeouts,
                 enospc_retries=enospc_retries,
+                advanced_sha=git_ops._last_advanced_sha,
             )
 
         assert outcome.status == 'done'
@@ -14595,6 +14598,7 @@ class TestFinalizeAdvancedMerge:
                 cas_retries=cas_retries,
                 timeouts=timeouts,
                 enospc_retries=enospc_retries,
+                advanced_sha=ADVANCED,
             )
 
         assert outcome.status == 'done', f'expected done; got {outcome.status!r}'
@@ -14649,6 +14653,7 @@ class TestFinalizeAdvancedMerge:
                 cas_retries=cas_retries,
                 timeouts=timeouts,
                 enospc_retries=enospc_retries,
+                advanced_sha=ADVANCED,
             )
 
         assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
@@ -14703,6 +14708,7 @@ class TestFinalizeAdvancedMerge:
                 cas_retries=cas_retries,
                 timeouts=timeouts,
                 enospc_retries=enospc_retries,
+                advanced_sha=ADVANCED,
             )
 
         assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
@@ -14776,6 +14782,7 @@ class TestFinalizeAdvancedMerge:
                 timeouts=timeouts,
                 enospc_retries=enospc_retries,
                 merged_branch_tip=None,  # term-2 = None; all three terms collapse
+                advanced_sha=LINEAR_SHA,
             )
 
         assert outcome.status == 'done', (
@@ -14989,6 +14996,7 @@ class TestMapAdvanceFailure:
             git_ops, 'pop_conflict',
             task_id=task_id, merge_commit_fallback='fallback-sha',
             halt=halt, unhalt=unhalt, cas_retries=cas_retries,
+            advanced_sha=git_ops._last_advanced_sha,
         )
 
         assert outcome.status == 'done_wip_recovery'

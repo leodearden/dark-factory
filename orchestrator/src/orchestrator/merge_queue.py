@@ -2880,6 +2880,7 @@ async def _do_train_merge(
             halt=worker.halt_for_wip,
             unhalt=worker.unhalt_wip,
             cas_retries=worker._cas_retries,
+            advanced_sha=adv_outcome.advanced_sha,
         )
         _emit_train_event(
             event_store, EventType.train_derailed,
@@ -2910,6 +2911,7 @@ async def _do_train_merge(
         train_id=req.train_id,
         member_task_ids=req.member_task_ids,
         chain_ctx=None,  # PRD D9: trains never auto-chain
+        advanced_sha=adv_outcome.advanced_sha,
     )
     if outcome.status != 'done':
         # Equivalence or pyright gate fired — main landed but post-merge gates
@@ -3513,6 +3515,7 @@ class MergeWorker(_WipHaltMixin):
                     max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
                 ),
                 merged_branch_tip=branch_head.strip(),
+                advanced_sha=outcome.advanced_sha,
             )
 
         if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
@@ -3528,6 +3531,7 @@ class MergeWorker(_WipHaltMixin):
                 halt=self.halt_for_wip,
                 unhalt=self.unhalt_wip,
                 cas_retries=self._cas_retries,
+                advanced_sha=outcome.advanced_sha,
             )
 
         # result == 'cas_failed' — transient, re-enqueue with limit
@@ -8584,6 +8588,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
                         ),
                         merged_branch_tip=item.merged_branch_tip,
+                        advanced_sha=adv_outcome.advanced_sha,
                     )
                     self._resolve_or_drop_abandoned(req, outcome)
                     if outcome.status == 'done':
@@ -8732,6 +8737,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         halt=self.halt_for_wip,
                         unhalt=self.unhalt_wip,
                         cas_retries=self._cas_retries,
+                        advanced_sha=adv_outcome.advanced_sha,
                     )
                     if not req.result.done():
                         req.result.set_result(outcome)
