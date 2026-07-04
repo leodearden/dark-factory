@@ -411,6 +411,7 @@ If the task spec itself is broken or unworkable, call
         context: str | None = None,
         rebase_notice: dict | None = None,
         task_id: str | None = None,
+        wip_notice: list[dict] | None = None,
     ) -> str:
         """Build prompt for the implementer agent."""
         effective_tid = task_id or plan.get('task_id')
@@ -455,6 +456,30 @@ Your worktree was rebased onto the latest main branch.
 Review any overlap with your plan steps before continuing — file contents may have changed.
 """
 
+        wip_section = ''
+        if wip_notice:
+            commits_list = '\n'.join(
+                f"- `{n['sha'][:12]}` — {n['subject']}" for n in wip_notice
+            )
+            wip_section = f"""
+## Already-Committed WIP — Verify Before Re-Implementing
+
+The harness auto-commits uncommitted work as a safety net before a
+rebase/requeue/reclaim. The commit(s) below landed at branch HEAD this way,
+which means the next pending step's implementation may already be sitting
+there, complete, waiting on `mark_step_done`.
+
+{commits_list}
+
+Before writing any new code:
+
+1. Run `git show <sha>` for each commit above to see what it contains.
+2. Run the next pending step's tests.
+3. If they already pass, call `mark_step_done(step_id, commit_sha)` with the
+   WIP commit's SHA instead of re-implementing the step.
+4. Only write new code if the step is genuinely unsatisfied by this commit.
+"""
+
         return f"""\
 {context}
 
@@ -472,6 +497,7 @@ Review any overlap with your plan steps before continuing — file contents may 
 
 {log_summary}
 {rebase_section}
+{wip_section}
 # Session Startup Protocol
 
 1. Read `.task/plan.json` to see the full plan with current status.

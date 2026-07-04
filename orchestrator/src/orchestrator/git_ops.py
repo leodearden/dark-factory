@@ -61,6 +61,26 @@ PushResult = Literal['pushed', 'noop', 'rejected', 'error']
 RecoverResult = Literal['rewound', 'cas_failed', 'error']
 
 
+# Single source of truth for the WIP safety-commit subject prefix produced by
+# _inter_iteration_rebase (workflow.py), and the requeue-rebase /
+# warm-lane-reclaim paths below (commit() call sites in this module). Any
+# code that mints a new "save WIP before X" safety-commit must share this
+# prefix so is_wip_safety_commit() (and therefore TaskWorkflow.
+# _detect_tip_wip_commits) keeps recognizing it.
+WIP_SAFETY_COMMIT_PREFIXES = ('chore: save WIP before ',)
+
+
+def is_wip_safety_commit(subject: str) -> bool:
+    """Return True if ``subject`` is one of the harness's WIP safety-commits.
+
+    These are auto-commits the harness makes to snapshot uncommitted work
+    before a rebase/requeue/reclaim operation. They can land a still-pending
+    plan step's complete implementation at branch HEAD before mark_step_done
+    is called for that step — see TaskWorkflow._detect_tip_wip_commits.
+    """
+    return subject.strip().startswith(WIP_SAFETY_COMMIT_PREFIXES)
+
+
 class TrainMembership(TypedDict, total=False):
     """Train metadata passed from task.metadata.train.
 
@@ -3807,6 +3827,33 @@ class GitOps:
             cwd=worktree,
         )
         return rc == 0 and bool(output.strip())
+
+    async def get_commit_subjects(
+        self, worktree: Path, base_sha: str,
+    ) -> list[tuple[str, str]]:
+        """Return HEAD-first (sha, subject) pairs for ``base_sha..HEAD``.
+
+        Uses the ``\\x1f`` unit separator (rather than a space or colon) to
+        split each log line, since commit subjects may themselves contain
+        colons or arbitrary punctuation.  Returns ``[]`` on any git error or
+        an empty range (``base_sha == HEAD``) — never raises.
+
+        Used by ``TaskWorkflow._detect_tip_wip_commits`` to scan for
+        WIP safety-commits sitting at branch HEAD.
+        """
+        rc, out, _ = await _run(
+            ['git', 'log', '--format=%H\x1f%s', f'{base_sha}..HEAD'],
+            cwd=worktree,
+        )
+        if rc != 0 or not out.strip():
+            return []
+        pairs = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            sha, _, subject = line.partition('\x1f')
+            pairs.append((sha, subject))
+        return pairs
 
     async def get_changed_files(self, from_sha: str, to_sha: str) -> list[str]:
         """Return list of files changed between two commits."""

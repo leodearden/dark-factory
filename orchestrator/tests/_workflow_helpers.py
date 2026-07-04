@@ -132,6 +132,7 @@ class FakeBriefing:
     async def build_implementer_prompt(
         self, plan: dict, iteration_log: list, context: str | None = None,
         rebase_notice: dict | None = None, task_id: str | None = None,
+        wip_notice: list[dict] | None = None,
     ) -> str:
         return 'Implement the plan'
 

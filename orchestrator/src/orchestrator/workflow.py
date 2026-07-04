@@ -62,6 +62,7 @@ from orchestrator.git_ops import (
     WarmLanePoolExhausted,
     WarmLaneRequeue,
     _run,
+    is_wip_safety_commit,
 )
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 from orchestrator.scheduler import (
@@ -272,6 +273,7 @@ class _BriefingLike(Protocol):
     async def build_implementer_prompt(
         self, plan: dict, iteration_log: list, context: str | None = ...,
         rebase_notice: dict | None = ..., task_id: str | None = ...,
+        wip_notice: list[dict] | None = ...,
     ) -> str: ...
     async def build_amender_prompt(
         self, plan: dict, iteration_log: list[dict],
@@ -4135,6 +4137,8 @@ class TaskWorkflow:
             if corrupted:
                 self._escalate_corruption(corrupted)
 
+            wip_notice = await self._detect_tip_wip_commits()
+
             # Snapshot completed steps before invocation
             completed_before = {
                 s['id']
@@ -4145,7 +4149,7 @@ class TaskWorkflow:
 
             prompt = await self.briefing.build_implementer_prompt(
                 self.plan, iteration_log, rebase_notice=rebase_notice,
-                task_id=self.task_id,
+                task_id=self.task_id, wip_notice=wip_notice,
             )
             result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
 
@@ -4540,6 +4544,64 @@ class TaskWorkflow:
             return None
 
         return verdict
+
+    async def _detect_tip_wip_commits(self) -> list[dict]:
+        """Detect a contiguous run of WIP safety-commits sitting at HEAD.
+
+        Several harness paths auto-commit uncommitted work as a safety net
+        before a rebase/requeue/reclaim (``_inter_iteration_rebase`` here,
+        plus the requeue and warm-lane-reclaim paths in ``git_ops.py``). Any
+        of these can land a still-"pending" plan step's complete
+        implementation at branch HEAD *before* ``mark_step_done`` is called
+        for that step. This surfaces those commits so
+        ``build_implementer_prompt`` can point the implementer at them
+        instead of it re-discovering (and potentially re-implementing) the
+        already-committed work.
+
+        Best-effort and defensive: returns ``[]`` on any missing
+        collaborator (``worktree``/``git_ops``/``artifacts``), unset
+        ``base_commit``, or git error — a false negative here just reverts
+        to today's baseline behavior (no notice), never sinks the
+        iteration loop.
+
+        Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for the
+        contiguous run of WIP safety-commits at HEAD (stops at the first
+        non-WIP commit), excluding any SHA already recorded as the
+        ``commit`` of a done plan step (dedup against ``self.plan``).
+        """
+        if self.worktree is None or self.git_ops is None or self.artifacts is None:
+            return []
+        base = self.artifacts.read_base_commit()
+        if not base:
+            return []
+        try:
+            commits = await self.git_ops.get_commit_subjects(self.worktree, base)
+            run: list[tuple[str, str]] = []
+            for sha, subject in commits:
+                if not is_wip_safety_commit(subject):
+                    break
+                run.append((sha, subject))
+            if not run:
+                return []
+            recorded = {
+                s['commit']
+                for col in ('prerequisites', 'steps')
+                for s in self.plan.get(col, [])
+                if isinstance(s, dict) and s.get('status') == 'done' and s.get('commit')
+            }
+            # Prefix-match rather than exact-match: the prompt shows an
+            # abbreviated 12-char SHA (see build_implementer_prompt's
+            # wip_section), so an implementer may call mark_step_done with
+            # that short form instead of the full SHA from git log. Exact
+            # equality would then never dedup, re-surfacing the same
+            # already-attributed commit on every subsequent iteration.
+            return [
+                {'sha': sha, 'subject': subject}
+                for sha, subject in run
+                if not any(sha.startswith(r) or r.startswith(sha) for r in recorded)
+            ]
+        except Exception:
+            return []
 
     async def _inter_iteration_rebase(
         self, *, event_label: str = 'rebase',
