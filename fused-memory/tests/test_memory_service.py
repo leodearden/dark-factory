@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import types
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1542,6 +1542,71 @@ class TestGetEpisodes:
         assert episodes[0]['created_at'] is None, (
             f"Expected None but got {episodes[0]['created_at']!r} — str(None) bug"
         )
+
+    @pytest.mark.asyncio
+    async def test_non_utc_offset_normalized_to_canonical_utc_iso8601(self, service):
+        """created_at with a non-UTC offset must be normalized, not str()-passthrough."""
+        non_utc = datetime(2026, 5, 1, 9, 30, tzinfo=timezone(timedelta(hours=5)))
+        mock_ep = MagicMock()
+        mock_ep.uuid = 'ep-uuid-1'
+        mock_ep.name = 'test episode'
+        mock_ep.content = 'some content'
+        mock_ep.created_at = non_utc
+        mock_ep.source = None
+        mock_ep.group_id = 'test'
+        service.graphiti.retrieve_episodes = AsyncMock(return_value=[mock_ep])
+
+        episodes = await service.get_episodes(project_id='test')
+
+        created_at = episodes[0]['created_at']
+        assert created_at == non_utc.astimezone(UTC).isoformat()
+        assert 'T' in created_at
+        assert created_at.endswith('+00:00')
+
+    @pytest.mark.asyncio
+    async def test_mixed_offsets_emit_lexically_non_increasing_created_at(self, service):
+        """Emitted created_at strings must sort lexically iff the instants do.
+
+        str(created_at) preserves each episode's stored UTC offset, so two
+        episodes with the same *instant* ordering but different offsets can
+        emit strings that compare out of order (an apparent non-monotonic
+        result on the observed/serialized path). Constructing from explicit
+        UTC instants and then converting to differing display offsets
+        isolates that: the instants are non-increasing by construction, but
+        the raw str() reprs (mismatched offsets) are not lexically
+        non-increasing, while the canonical UTC ISO-8601 reprs are.
+        """
+        later_instant = datetime(2026, 6, 1, 9, 0, tzinfo=UTC)
+        earlier_instant = datetime(2026, 6, 1, 8, 0, tzinfo=UTC)
+        ep1_created = later_instant.astimezone(timezone(timedelta(hours=-3)))
+        ep2_created = earlier_instant.astimezone(timezone(timedelta(hours=5)))
+
+        mock_ep1 = MagicMock()
+        mock_ep1.uuid = 'ep-1'
+        mock_ep1.name = 'e1'
+        mock_ep1.content = 'c1'
+        mock_ep1.created_at = ep1_created
+        mock_ep1.source = None
+        mock_ep1.group_id = 'test'
+
+        mock_ep2 = MagicMock()
+        mock_ep2.uuid = 'ep-2'
+        mock_ep2.name = 'e2'
+        mock_ep2.content = 'c2'
+        mock_ep2.created_at = ep2_created
+        mock_ep2.source = None
+        mock_ep2.group_id = 'test'
+
+        service.graphiti.retrieve_episodes = AsyncMock(return_value=[mock_ep1, mock_ep2])
+
+        episodes = await service.get_episodes(project_id='test')
+
+        created_ats = [ep['created_at'] for ep in episodes]
+        assert created_ats == [
+            later_instant.astimezone(UTC).isoformat(),
+            earlier_instant.astimezone(UTC).isoformat(),
+        ]
+        assert created_ats == sorted(created_ats, reverse=True)
 
 
 class TestGetEpisodeContent:
