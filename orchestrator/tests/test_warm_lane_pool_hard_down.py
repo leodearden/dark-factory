@@ -202,6 +202,58 @@ class TestWarmBaseHardDownWatchdog:
         assert scheduler._warm_base_hard_down is False
 
     @pytest.mark.asyncio
+    async def test_disable_while_latched_releases_latch_and_resumes_dispatch(self):
+        """(a) Disabling the watchdog mid-incident (operator hot-reload) must
+        RELEASE an engaged latch, not wedge it forever.  The acquire_next
+        halt (scheduler.py ~3287) is NOT gated on cfg.enabled, and
+        warm_base_hard_down.enabled is a green-tier hot-reloadable field
+        (config.py:2595) — so if the disabled early-return left the latch
+        set, an operator disabling the watchdog to escape an incident would
+        instead permanently freeze all dispatch host-wide."""
+        scheduler, t = self._make_scheduler(enabled=True)
+        probe, warn, promote, resolve = self._install_callbacks(
+            scheduler, probe_result='absent',
+        )
+
+        await scheduler._apply_warm_base_hard_down_watchdog()
+        assert scheduler._warm_base_hard_down is True
+
+        # Operator hot-reloads config, disabling the watchdog mid-incident.
+        scheduler.config.warm_base_hard_down.enabled = False
+
+        await scheduler._apply_warm_base_hard_down_watchdog()
+
+        assert scheduler._warm_base_hard_down is False
+        assert scheduler._warm_base_hard_down_since is None
+        assert scheduler._warm_base_l2_promoted is False
+        resolve.assert_called_once()
+        # The disabled early-return precedes the probe call — not re-consulted.
+        assert probe.call_count == 1
+
+        # Dispatch must resume past the now-cleared halt.
+        get_tasks_mock = AsyncMock(return_value=[])
+        scheduler.get_tasks = get_tasks_mock
+        result = await scheduler.acquire_next()
+
+        assert result is None  # no tasks — but for an ordinary reason, not the halt
+        get_tasks_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_disable_while_unlatched_is_noop_no_resolve(self):
+        """(b) enabled=False from the start (latch never engaged) must stay a
+        pure no-op — the new clear+resolve is gated on the latch actually
+        being engaged, preserving test_disabled_is_a_noop semantics."""
+        scheduler, t = self._make_scheduler(enabled=False)
+        probe, warn, promote, resolve = self._install_callbacks(
+            scheduler, probe_result='absent',
+        )
+
+        await scheduler._apply_warm_base_hard_down_watchdog()
+
+        resolve.assert_not_called()
+        assert scheduler._warm_base_hard_down is False
+
+    @pytest.mark.asyncio
     async def test_probe_raises_is_swallowed_and_holds_state(self):
         """(8) The probe callback raising must not crash the tick, and must
         leave the latch state unchanged (fail-safe hold)."""
