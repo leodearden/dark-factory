@@ -376,7 +376,7 @@ def test_post_advance_gates_registry_shape() -> None:
     re-exports the identical list object (not a copy)."""
     import orchestrator.merge_gates as merge_gates
     import orchestrator.merge_queue as merge_queue
-    from orchestrator.merge_gates import Gate, POST_ADVANCE_GATES
+    from orchestrator.merge_gates import POST_ADVANCE_GATES, Gate
 
     assert isinstance(POST_ADVANCE_GATES, list)
     assert all(isinstance(g, Gate) for g in POST_ADVANCE_GATES)

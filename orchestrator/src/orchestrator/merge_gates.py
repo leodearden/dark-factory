@@ -27,7 +27,7 @@ import asyncio
 import dataclasses
 import logging
 import posixpath
-from collections.abc import Callable, Collection
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -272,6 +272,207 @@ async def _commit_is_linear(git_ops: GitOps, sha: str) -> bool:
     # Linear commit → ≤1 parent → ≤2 tokens.
     tokens = out.strip().split()
     return len(tokens) <= 2
+
+
+@dataclasses.dataclass(frozen=True)
+class GateVerdict:
+    """Outcome of a single post-advance gate: pass, or block with a reason.
+
+    A 2-state value object — either the gate passed (``passed=True``, every
+    other field ``None``) or it blocked (``passed=False`` with ``reason``,
+    ``merge_sha``, and ``emit_subtype`` all populated).  Construct via the
+    :meth:`ok` / :meth:`block` factories rather than the constructor directly.
+    """
+
+    passed: bool
+    reason: str | None = None
+    merge_sha: str | None = None
+    emit_subtype: str | None = None
+
+    @classmethod
+    def ok(cls) -> GateVerdict:
+        """The gate passed."""
+        return cls(passed=True)
+
+    @classmethod
+    def block(cls, *, reason: str, merge_sha: str | None, emit_subtype: str) -> GateVerdict:
+        """The gate blocked the merge.
+
+        *reason* becomes the terminal ``MergeOutcome.reason``, *merge_sha*
+        its ``merge_sha`` (the merge already landed on main), and
+        *emit_subtype* the ``merge_attempt`` subtype the caller emits.
+        """
+        return cls(passed=False, reason=reason, merge_sha=merge_sha, emit_subtype=emit_subtype)
+
+
+@dataclasses.dataclass(frozen=True)
+class Gate:
+    """A single post-advance gate: a name, a run callable, and an optional
+    failure interceptor.
+
+    *run* takes a :class:`_PostAdvanceContext` and returns a
+    :class:`GateVerdict`.  *on_blocked*, consulted only when *run* blocks,
+    may return a substitute :class:`MergeOutcome` (e.g. the γ2 auto-chain's
+    ``'superseded'``) to short-circuit the default outcome, or ``None`` to
+    fall through to the ``'blocked'`` outcome built from the verdict.
+    ``None`` (the default) means "no interceptor" — a pure registration.
+    """
+
+    name: str
+    run: Callable[[_PostAdvanceContext], Awaitable[GateVerdict]]
+    on_blocked: Callable[[_PostAdvanceContext], Awaitable[MergeOutcome | None]] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _PostAdvanceContext:
+    """Everything a post-advance gate (or its on_blocked hook) needs.
+
+    Bundles the post-``advance_main`` state :func:`_finalize_advanced_merge`
+    computes once — notably ``resolved_merged_tip`` and
+    ``allow_worktree_head_fallback``, each derived via a single git
+    subprocess call — so every gate that consults them shares the same
+    value instead of re-deriving it.
+    """
+
+    git_ops: GitOps
+    req: MergeRequest
+    event_store: EventStore | None
+    advanced_sha: str
+    base_sha: str
+    resolved_merged_tip: str | None
+    allow_worktree_head_fallback: bool
+    started_monotonic: float | None
+    train_id: str | None
+    member_task_ids: list[str] | None
+    chain_ctx: _GenerationChainContext | None
+    merged_branch_tip: str | None
+    log_label: str
+
+
+async def _run_equivalence_gate(ctx: _PostAdvanceContext) -> GateVerdict:
+    """Decision-2 post-merge content-equivalence gate.
+
+    Discoverability note: reaches back through
+    ``orchestrator.merge_queue._check_post_merge_equivalence`` (see the
+    module docstring's reach-back convention) rather than calling the
+    co-located definition directly, so the existing suite's string-path
+    monkeypatches stay effective.
+    """
+    from orchestrator.merge_queue import _check_post_merge_equivalence
+
+    equiv_failed = await _check_post_merge_equivalence(
+        ctx.req.worktree, ctx.advanced_sha, ctx.git_ops, ctx.base_sha,
+        task_id=ctx.req.task_id,
+        merged_tip=ctx.resolved_merged_tip,
+        allow_worktree_head_fallback=ctx.allow_worktree_head_fallback,
+    )
+    if not equiv_failed:
+        return GateVerdict.ok()
+
+    logger.warning(
+        'Task %s%s: post-merge equivalence failed — '
+        'branch HEAD and advanced main %s diverge in: %r',
+        ctx.req.task_id, ctx.log_label, ctx.advanced_sha[:12], equiv_failed,
+    )
+    return GateVerdict.block(
+        reason=(
+            f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
+            f'branch and main diverge in '
+            f'{", ".join(equiv_failed)}. '
+            f'Conflict resolution likely dropped or rewrote '
+            f'work; review {ctx.advanced_sha[:12]} against the '
+            f'task branch tip.'
+        ),
+        merge_sha=ctx.advanced_sha,
+        emit_subtype='post_merge_equivalence_failed',
+    )
+
+
+async def _auto_chain_on_equivalence_blocked(ctx: _PostAdvanceContext) -> MergeOutcome | None:
+    """γ2: on equivalence-gate failure, try to auto-chain a gen-(n+1) request.
+
+    Returns the chained ``'superseded'`` (or bound-exceeded ``'blocked'``)
+    outcome when the kill-switch is on and the branch tip advanced mid-verify;
+    ``None`` when auto-chaining does not apply (no *chain_ctx*, kill-switch
+    off, or the tip genuinely did not advance), so the caller falls through
+    to the default ``'blocked'`` outcome built from the gate's verdict.
+    """
+    from orchestrator.merge_queue import (
+        AUTO_CHAIN_GENERATIONS_ENABLED,
+        _elapsed_ms,
+        _emit_merge_attempt,
+        _maybe_auto_chain_generation,
+    )
+
+    if ctx.chain_ctx is None or not AUTO_CHAIN_GENERATIONS_ENABLED:
+        return None
+
+    chained = await _maybe_auto_chain_generation(
+        ctx.req, ctx.advanced_sha, ctx.git_ops, ctx.event_store,
+        merged_branch_tip=ctx.merged_branch_tip or ctx.resolved_merged_tip,
+        counts=ctx.chain_ctx.counts,
+        queue=ctx.chain_ctx.queue,
+        max_auto_generations=ctx.chain_ctx.max_auto_generations,
+        retention=ctx.chain_ctx.retention,
+    )
+    if chained is None:
+        return None
+
+    _emit_merge_attempt(
+        ctx.event_store, ctx.req.task_id,
+        'post_merge_generation_chained',
+        duration_ms=_elapsed_ms(ctx.started_monotonic),
+        train_id=ctx.train_id,
+        member_task_ids=ctx.member_task_ids,
+    )
+    return chained
+
+
+async def _run_pyright_gate(ctx: _PostAdvanceContext) -> GateVerdict:
+    """Decision-3 post-merge unscoped type-check gate.
+
+    Discoverability note: reaches back through
+    ``orchestrator.merge_queue._check_post_merge_pyright`` rather than
+    calling the co-located definition directly, so the existing suite's
+    string-path monkeypatches stay effective.
+    """
+    from orchestrator.merge_queue import _check_post_merge_pyright
+
+    pyright_result = await _check_post_merge_pyright(
+        ctx.advanced_sha, ctx.git_ops, ctx.req.config, ctx.req.module_configs,
+        task_id=ctx.req.task_id,
+    )
+    if not pyright_result.broken:
+        return GateVerdict.ok()
+
+    logger.warning(
+        'Task %s%s: post-merge unscoped type-check failed for %s on %s',
+        ctx.req.task_id, ctx.log_label,
+        ', '.join(pyright_result.failing_subprojects),
+        ctx.advanced_sha[:12],
+    )
+    return GateVerdict.block(
+        reason=(
+            f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+            f'post-merge unscoped type-check failed for '
+            f'{", ".join(pyright_result.failing_subprojects)} '
+            f'on {ctx.advanced_sha[:12]}. {pyright_result.detail}'
+        ),
+        merge_sha=ctx.advanced_sha,
+        emit_subtype='post_merge_pyright_broken',
+    )
+
+
+POST_ADVANCE_GATES: list[Gate] = [
+    Gate('equivalence', _run_equivalence_gate, on_blocked=_auto_chain_on_equivalence_blocked),
+    Gate('pyright', _run_pyright_gate),
+]
+"""Declarative post-advance gate chain, run in order by
+:func:`_finalize_advanced_merge`.  Registering a new gate is an append to
+this list — "a registration, not surgery" — rather than an edit to
+``_finalize_advanced_merge``'s body.  ``merge_queue`` re-exports this exact
+list object (not a copy) so a test — or a future gate author — can register
+a gate by replacing/monkeypatching this module attribute."""
 
 
 async def _finalize_advanced_merge(
