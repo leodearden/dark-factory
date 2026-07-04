@@ -690,6 +690,92 @@ class TestBeforeDoneCrossUnitDeploy:
 
 
 # ---------------------------------------------------------------------------
+# Task 2066: cross-unit writeback resilience — severed-then-recovered connection
+# (RED until the _writeback_deploy_success helper + constructor seams land)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestCrossUnitWritebackResilience:
+    """DeterministicRunner — cross-unit deploy verify+writeback survives a
+    self-severed fused-memory connection (task 2066).
+
+    The deploy script may restart the very service backing the orchestrator's
+    own fused-memory/MCP connection (e.g. task 2059), severing it for the
+    duration of a `--drain` restart.  These tests simulate that by making
+    scheduler.update_task / scheduler.set_task_status transiently fail before
+    recovering, and assert the runner patiently retries the writeback instead
+    of silently stranding the task (the EVIDENCE failure on task 2059).
+    """
+
+    async def test_verified_stamp_retried_past_transient_connection_failure(self, tmp_path: Path):
+        """update_task is retried past a transient severed connection until the
+        verified stamp durably persists, then done is set with fresh provenance."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        # Connection severed for the verified-stamp write's first two attempts,
+        # recovered on the 3rd (before_done_ran_at's stamp is unaffected — True).
+        verified_call_returns: list[bool] = []
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            if 'before_done_verified_at' in metadata:
+                result = len(verified_call_returns) >= 2
+                verified_call_returns.append(result)
+                return result
+            return True
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=5,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        # (a) update_task retried more than once for the verified stamp, and the
+        # final such call returned True — the stamp durably persisted despite
+        # the transient failure.
+        assert len(verified_call_returns) > 1, (
+            f'Expected the verified-stamp write to be retried; got only '
+            f'{len(verified_call_returns)} attempt(s): {verified_call_returns}'
+        )
+        assert verified_call_returns[-1] is True, (
+            'Final before_done_verified_at update_task call must have returned True'
+        )
+
+        # (b) paced retry — the injected sleeper was awaited at least once.
+        sleeper.assert_awaited()
+
+        # (c) set_task_status awaited with done + fresh provenance; outcome DONE.
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[0] == '2066'
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance is not None, 'done_provenance must be passed as a kwarg'
+        assert provenance['kind'] == 'deterministic-deploy'
+        assert provenance['pid'] == _FRESH_UNIT_STATE['MainPID']
+        assert outcome == WorkflowOutcome.DONE
+
+        # (d) I1 — the deploy script is NEVER re-run, even across writeback retries.
+        script_runner.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Default seam: _default_run_script env merge
 # ---------------------------------------------------------------------------
 
