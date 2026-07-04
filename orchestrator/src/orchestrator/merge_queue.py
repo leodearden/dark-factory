@@ -2368,6 +2368,20 @@ async def classify_and_merge(
       routing ``_do_merge`` through this function reproduces its plain
       ``MergeOutcome('blocked', reason=details)`` byte-identically.
 
+    ``req.snapshot_tip`` (an orthogonal per-request field, not a parameter of
+    this function) is honored uniformly for already-merged detection
+    regardless of caller or ``speculative`` — this is an intentional
+    CONVERGENCE, not a preserved divergence.  Pre-kappa, ``_do_merge``
+    preferred ``snapshot_tip`` over worktree HEAD while ``_merger_loop``'s
+    inline copy used worktree HEAD unconditionally.  Non-speculative
+    ``_merger_loop`` requests CAN carry a ``snapshot_tip`` — e.g. the
+    auto-chain-generation successor built by ``_maybe_auto_chain_generation``
+    (:1669, ``snapshot_tip=current_head``) is enqueued generically and may be
+    dispatched to either worker — so unifying the basis here is a deliberate
+    fix, not an oversight.  See
+    ``test_non_speculative_request_honors_snapshot_tip`` in
+    test_merge_guard_pipeline.py.
+
     The verify-timeout loop-breaker and the ``_request_abandoned`` silent
     dequeue-drop are worker-lifecycle concerns and stay inline at each call
     site — they are not part of this pipeline.
@@ -2385,29 +2399,42 @@ async def classify_and_merge(
     if guard is not None:
         return Decided(guard)
 
-    # 2. Already-merged detection (ghost-loop fix).  snapshot_tip, when set,
-    # is drift-proof vs a worktree HEAD that may have been rebased to an
-    # orphaned lineage after snapshotting; it is a no-op (None) for
-    # speculative requests, which retain the worktree-HEAD basis.
+    # 2. Already-merged detection (ghost-loop fix).  effective_tip prefers
+    # snapshot_tip when set, drift-proof vs a worktree HEAD that may have
+    # been rebased to an orphaned lineage after snapshotting.  This basis is
+    # shared across ALL callers/speculative values — see the docstring's
+    # snapshot_tip paragraph for why that is an intentional convergence.
     rc, branch_head_raw, err = await _run(
         ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
     )
     if rc != 0:
+        logger.warning(
+            'Task %s: rev-parse HEAD failed: %s', req.task_id, err.strip(),
+        )
         return Decided(MergeOutcome(
             'blocked', reason=f'rev-parse HEAD failed: {err.strip()}',
         ))
     branch_head = branch_head_raw.strip()
     actual_main = await git_ops.get_main_sha()
     effective_tip = req.snapshot_tip or branch_head
-    if (
-        await git_ops.is_ancestor(effective_tip, actual_main)
-        and not await git_ops.has_uncommitted_work(req.worktree)
-    ):
-        _emit_merge_attempt(
-            event_store, req.task_id, 'already_merged',
-            duration_ms=_elapsed_ms(started_monotonic),
-        )
-        return Decided(MergeOutcome('already_merged'))
+    if await git_ops.is_ancestor(effective_tip, actual_main):
+        if await git_ops.has_uncommitted_work(req.worktree):
+            # Guard: an agent may have started work since snapshotting —
+            # don't skip the merge just because the tip already landed.
+            logger.warning(
+                'Task %s: branch is ancestor of main but worktree has '
+                'uncommitted changes — not skipping merge', req.task_id,
+            )
+        else:
+            logger.info(
+                'Task %s: branch already on main — skipping merge',
+                req.task_id,
+            )
+            _emit_merge_attempt(
+                event_store, req.task_id, 'already_merged',
+                duration_ms=_elapsed_ms(started_monotonic),
+            )
+            return Decided(MergeOutcome('already_merged'))
 
     # 3. Merge (speculative or normal).  speculative=True is only ever passed
     # for a SpeculativeMergeWorker caller; the isinstance check is a static-
@@ -2430,12 +2457,19 @@ async def classify_and_merge(
     try:
         # 4. Conflict → reject immediately (caller resolves outside queue).
         if merge_result.conflicts:
+            logger.info('Task %s: merge conflicts detected', req.task_id)
             _emit_merge_attempt(
                 event_store, req.task_id, 'conflict',
                 duration_ms=_elapsed_ms(started_monotonic),
             )
             if isinstance(worker, SpeculativeMergeWorker):
                 # ι=1894: record drift = main_position − base at merge-start.
+                # Safe under kappa's unification (now reachable from both
+                # _merger_loop's initial attempt and _remerge's re-attempt
+                # for the same request_id): _note_conflict_detected pops
+                # _drift_base defensively, and conflict is a terminal
+                # outcome, so the two call sites can never both fire for one
+                # request_id — see _note_conflict_detected's docstring.
                 worker._note_conflict_detected(req.request_id)
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
@@ -2478,6 +2512,10 @@ async def classify_and_merge(
         if drop_result.dropped:
             if merge_result.merge_worktree:
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+            logger.warning(
+                'Task %s: merge dropped plan targets: %s',
+                req.task_id, drop_result.dropped,
+            )
             _emit_merge_attempt(
                 event_store, req.task_id, 'dropped_plan_targets',
                 duration_ms=_elapsed_ms(started_monotonic),
@@ -7092,6 +7130,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # is a no-op for the already-merged arm — identical to
                         # the old bare-put that skipped the call entirely.
                         _already = self._oob_deliver(req, result.outcome, speculative=speculative)
+                        # base_sha=base_for_merge is used uniformly for EVERY
+                        # Decided arm here (branch-presence / rev-parse-failure
+                        # / already-merged included) — pre-kappa, those three
+                        # arms used actual_main while only conflict/failure/drop
+                        # used base_for_merge.  Confirmed inert for this
+                        # immediate_outcome (terminal) item: _finalize_inflight's
+                        # PASSTHROUGH branch resolves purely from
+                        # entry.passthrough_outcome and never reads
+                        # item.base_sha (:8381), _dispatch_item's Mechanism-2
+                        # staleness check explicitly excludes
+                        # item.immediate_outcome is not None (:8901), and
+                        # _warn_if_verify_base_not_frozen_tip returns
+                        # immediately when item.merge_result is None (:5228).
+                        # So this divergence has no observable effect.
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
