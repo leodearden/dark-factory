@@ -1229,6 +1229,32 @@ class TestRebuildEntitySummariesEntityUuids:
         # Baked stale line is dropped — the rebuilt summary reflects only the valid edge.
         assert result['details'][0]['new_summary'] == 'valid fact'
 
+    @pytest.mark.asyncio
+    async def test_uuid_absent_from_graph_reported_not_found(self, mock_config):
+        """A requested UUID absent from the graph is reported in details with
+        status='not_found' and is never dispatched to rebuild_entity_from_edges,
+        while a matched UUID in the same request still rebuilds normally.
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+            {'uuid': 'u1', 'name': 'Alice', 'summary': 's'},
+        ])
+        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+            'u1': [{'uuid': 'e1', 'fact': 's', 'name': 'r'}],
+        })
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
+            'u1': {'uuid': 'u1', 'name': 'Alice', 'old_summary': 's', 'new_summary': 's', 'edge_count': 1},
+        }))
+
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=['u1', 'u-missing'])
+
+        assert svc.graphiti.rebuild_entity_from_edges.await_count == 1
+        assert result['rebuilt'] == 1
+        not_found_entries = [d for d in result['details'] if d['status'] == 'not_found']
+        assert len(not_found_entries) == 1
+        assert not_found_entries[0]['uuid'] == 'u-missing'
+        assert result['total_entities'] == 1
+
 
 # ---------------------------------------------------------------------------
 # step-5: MCP tool rebuild_entity_summaries
