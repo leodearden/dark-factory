@@ -14159,8 +14159,8 @@ class TestFinalizeAdvancedMerge:
         git_ops.push_main.assert_not_awaited()
         git_ops.cleanup_merge_worktree.assert_not_awaited()
 
-    async def test_no_last_advanced_sha_uses_fallback(self) -> None:
-        """(d) _last_advanced_sha absent/None → advanced_sha falls back to merge_commit_fallback."""
+    async def test_no_advanced_sha_kwarg_uses_fallback(self) -> None:
+        """(d) advanced_sha kwarg omitted (defaults to None) → falls back to merge_commit_fallback."""
         from orchestrator.merge_queue import _finalize_advanced_merge
 
         git_ops = self._make_git_ops(last_advanced_sha=None)
