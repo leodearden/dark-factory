@@ -15,10 +15,11 @@ no network.
 from __future__ import annotations
 
 import importlib.util
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fused_memory.backends.graphiti_client import check_openai_responses_api
+from fused_memory.backends.graphiti_client import GraphitiBackend, check_openai_responses_api
 
 
 class TestCheckOpenaiResponsesApi:
@@ -47,3 +48,34 @@ class TestCheckOpenaiResponsesApi:
         """In the real environment, graphiti-core hard-requires openai>=1.91.0,
         which ships openai.resources.responses — so the check is a no-op."""
         assert check_openai_responses_api() is None
+
+
+class TestGraphitiBackendInitializePreflightWiring:
+    """Wiring test: initialize() must invoke the preflight before touching FalkorDB."""
+
+    @pytest.mark.asyncio
+    async def test_initialize_runs_preflight_before_falkordb_driver(
+        self, mock_config, monkeypatch,
+    ):
+        """The preflight must run on the OpenAI-LLM path before any FalkorDB
+        driver / Graphiti client construction, so an incompatible openai
+        aborts startup immediately instead of reaching a real connection."""
+        import fused_memory.backends.graphiti_client as graphiti_client_module
+
+        def sentinel_check():
+            raise RuntimeError('PREFLIGHT_SENTINEL')
+
+        monkeypatch.setattr(
+            graphiti_client_module, 'check_openai_responses_api', sentinel_check,
+        )
+        # Guard against the RED run reaching a real FalkorDB connection.
+        monkeypatch.setattr(
+            graphiti_client_module, '_MultiTenantFalkorDriver', MagicMock(),
+        )
+        monkeypatch.setattr(
+            graphiti_client_module, 'Graphiti', MagicMock(return_value=AsyncMock()),
+        )
+
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='PREFLIGHT_SENTINEL'):
+            await backend.initialize()
