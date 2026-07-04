@@ -33,7 +33,7 @@ class TestWarmBaseHardDownWatchdog:
         *,
         enabled: bool = True,
         l2_window_secs: float = 100.0,
-    ) -> tuple['Scheduler', list]:
+    ) -> tuple[Scheduler, list]:
         """Build a Scheduler with the watchdog config tuned small and a mutable clock."""
         t: list[float] = [0.0]
 
@@ -51,7 +51,7 @@ class TestWarmBaseHardDownWatchdog:
         return scheduler, t
 
     def _install_callbacks(
-        self, scheduler: 'Scheduler', *, probe_result: str = 'absent',
+        self, scheduler: Scheduler, *, probe_result: str = 'absent',
     ) -> tuple[AsyncMock, AsyncMock, AsyncMock, AsyncMock]:
         probe = AsyncMock(return_value=probe_result)
         warn = AsyncMock()
