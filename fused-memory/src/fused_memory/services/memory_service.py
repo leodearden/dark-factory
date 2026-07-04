@@ -73,6 +73,33 @@ def _is_dependency_fact(fact: str | None) -> bool:
     return bool(fact) and _DEPENDENCY_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
 
 
+# Canonical stage -> recon_pool map for per-cycle reconciliation summaries
+# (metadata.kind == 'cycle_summary'). recon_pool is the only key the pool-cap
+# trim and ops prune script filter on (reconciliation/summary_pool.py,
+# scripts/prune_recon_cycle_summaries.py), so this map is what makes tagging
+# independent of LLM prompt compliance (task 2077). These values MUST stay in
+# sync with the per-stage _STAGE1_CYCLE_SUMMARY_RECON_POOL /
+# _STAGE2_CYCLE_SUMMARY_RECON_POOL constants in reconciliation/stages/*.py —
+# a drift-guard test asserts the equality.
+_CYCLE_SUMMARY_STAGE_TO_RECON_POOL: dict[str, str] = {
+    'memory_consolidator': 'stage1_cycle_summary',
+    'task_knowledge_sync': 'stage2_cycle_summary',
+}
+
+
+def _infer_recon_pool(meta: dict) -> str | None:
+    """Infer the recon_pool tag for a cycle_summary write from metadata.stage.
+
+    Returns None when meta['kind'] != 'cycle_summary' (non-cycle-summary
+    writes are never touched) or when meta['stage'] is missing/unknown (the
+    pool cannot be inferred; callers must not clobber any caller-supplied
+    recon_pool in that case).
+    """
+    if meta.get('kind') != 'cycle_summary':
+        return None
+    return _CYCLE_SUMMARY_STAGE_TO_RECON_POOL.get(meta.get('stage'))
+
+
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
 
