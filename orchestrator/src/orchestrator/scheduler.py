@@ -1116,6 +1116,40 @@ class Scheduler:
         # when the task finally dispatches.  Signature: (task_id: str) -> None (async)
         # Default None so bare-Scheduler unit tests are unaffected.
         self._on_starvation_resolve: Callable[..., Any] | None = None
+        # --- Warm-base hard-down watchdog state (task 2061) ---
+        # SINGLETON latch — one host-scoped warm-lane CoW seed base, so exactly
+        # one signal/window/L2 (unlike the starvation watchdog's per-task dict/
+        # set above).  True while the base is a definite ABSENT; also HALTS
+        # acquire_next (mirrors the _paused park-stop short-circuit) so no
+        # task is dispatched into a base that cannot seed it.
+        self._warm_base_hard_down: bool = False
+        # Wall-clock timestamp (from _time_source) the latch was engaged —
+        # the anchor for the l2_window_secs bounded-remediation window.  None
+        # while not latched.
+        self._warm_base_hard_down_since: float | None = None
+        # Whether the single born-at-L2 escalation has already been promoted
+        # for the CURRENT latch engagement.  Reset to False whenever the latch
+        # re-engages after a resolve.
+        self._warm_base_l2_promoted: bool = False
+        # Injected async probe installed by the Harness — calls
+        # GitOps._warm_lane_base_resolvable() and returns its WarmBaseHealth
+        # .value ('ok' | 'absent' | 'indeterminate').  Signature: () -> str
+        # (async).  Default None so bare-Scheduler unit tests are unaffected
+        # and the watchdog is a no-op until the Harness wires it up.
+        self._warm_base_health_probe: Callable[..., Any] | None = None
+        # Callback installed by the Harness to file the ONE INFO notice when
+        # the latch engages.  Signature: (*, summary: str, detail: str) -> None
+        # (async).  Default None so bare-Scheduler unit tests are unaffected.
+        self._on_warm_base_warn: Callable[..., Any] | None = None
+        # Callback installed by the Harness to promote the ONE born-at-L2
+        # escalation when the base is still absent past l2_window_secs.
+        # Signature: (*, summary: str, detail: str) -> None (async).  Default
+        # None so bare-Scheduler unit tests are unaffected.
+        self._on_warm_base_promote_l2: Callable[..., Any] | None = None
+        # Callback installed by the Harness to resolve BOTH the notice and any
+        # promoted L2 when the probe reports 'ok' again.  Signature: () -> None
+        # (async).  Default None so bare-Scheduler unit tests are unaffected.
+        self._on_warm_base_resolve: Callable[..., Any] | None = None
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -2252,6 +2286,117 @@ class Scheduler:
         self._starvation_escalated.discard(task_id)
         self._starvation_first_seen.pop(task_id, None)
 
+    async def _apply_warm_base_hard_down_watchdog(self) -> None:
+        """Host-scoped warm-lane CoW base health latch (task 2061).
+
+        Called at the TOP of ``acquire_next`` — before any task/candidate
+        work — via an injected async probe (``_warm_base_health_probe``)
+        because the scheduler is deliberately warm-lane-agnostic and cannot
+        import git_ops directly; this mirrors the ``_on_starvation_warn``
+        injected-callback pattern.  Unlike the starvation watchdog (per-task,
+        keyed by the candidate list), this is a SINGLETON latch: there is
+        exactly one warm-lane seed base per host, so there is exactly one
+        signal, one window, one L2.
+
+        Probe contract: returns one of ``'ok'`` | ``'absent'`` |
+        ``'indeterminate'`` (the ``.value`` of ``git_ops.WarmBaseHealth``,
+        resolved by the Harness-installed probe).  ``'indeterminate'`` (or any
+        unrecognised value) is fail-safe HOLD — it neither engages, clears,
+        nor promotes the latch, so a transient stat/readlink hiccup never
+        masquerades as a genuine outage.
+
+        State machine:
+          - health == 'ok' and latched → resolve (fire resolve callback,
+            clear all three latch fields).  This is the natural clear when
+            ``GitOps.refresh_warm_base`` (git_ops.py ~1659) rebuilds the base.
+          - health != 'absent' (ok-while-unlatched, or indeterminate) → no-op.
+          - health == 'absent' and not latched → engage: stamp
+            ``_warm_base_hard_down_since = now``, fire ONE warn notice.
+          - health == 'absent' and latched and not yet L2-promoted and
+            ``now - since >= cfg.l2_window_secs`` → promote ONE L2 (still-
+            absent past the bounded remediation window is, by construction,
+            the definition of a stuck reify reseed ladder).
+
+        Any exception from the probe is caught here (fail-safe hold); any
+        exception from a callback propagates to the caller's try/except
+        (mirrors the starvation watchdog's call-site wrapping) so a
+        watchdog/callback failure can never abort a tick or gate dispatch.
+        """
+        cfg = self.config.warm_base_hard_down
+
+        if not cfg.enabled or self._warm_base_health_probe is None:
+            return
+
+        try:
+            health = await self._warm_base_health_probe()
+        except Exception:
+            logger.warning(
+                'warm-base hard-down probe raised — holding current latch state',
+                exc_info=True,
+            )
+            return
+
+        now = self._time_source()
+
+        if health == 'ok':
+            if self._warm_base_hard_down:
+                if self._on_warm_base_resolve is not None:
+                    await self._on_warm_base_resolve()
+                self._warm_base_hard_down = False
+                self._warm_base_hard_down_since = None
+                self._warm_base_l2_promoted = False
+            return
+
+        if health != 'absent':
+            # 'indeterminate' or any unrecognised value — fail-safe hold.
+            return
+
+        if not self._warm_base_hard_down:
+            self._warm_base_hard_down = True
+            self._warm_base_hard_down_since = now
+            self._warm_base_l2_promoted = False
+            if self._on_warm_base_warn is not None:
+                summary = (
+                    'WARM_BASE_HARD_DOWN: warm-lane CoW seed base is absent — '
+                    'halting dispatch host-wide (fail-open) until it is restored'
+                )
+                detail = (
+                    'GitOps._warm_lane_base_resolvable() reported ABSENT: the '
+                    'configured warm_lane_base_target_dir (or its resolved D8 '
+                    'gen-dir symlink target) is missing or empty.  Dispatch is '
+                    'halted host-wide until the base is restored — pending '
+                    'tasks remain pending, in-flight warm-lane acquires requeue '
+                    'via WarmLanePoolHardDown.  Run '
+                    'reify/scripts/ensure-warm-base.sh to rebuild the base; '
+                    'this should auto-clear within seconds.  A single L2 '
+                    f'escalation follows if still absent after '
+                    f'{cfg.l2_window_secs:.0f}s.'
+                )
+                await self._on_warm_base_warn(summary=summary, detail=detail)
+            return
+
+        # Already latched & absent — check for L2 promotion (stuck past window).
+        if (
+            not self._warm_base_l2_promoted
+            and self._warm_base_hard_down_since is not None
+            and (now - self._warm_base_hard_down_since) >= cfg.l2_window_secs
+        ):
+            self._warm_base_l2_promoted = True
+            if self._on_warm_base_promote_l2 is not None:
+                summary = (
+                    'WARM_BASE_HARD_DOWN: still absent after '
+                    f'{cfg.l2_window_secs:.0f}s — remediation appears stuck'
+                )
+                detail = (
+                    'The warm-lane CoW seed base has been ABSENT continuously '
+                    f'for at least {cfg.l2_window_secs:.0f}s with no auto-'
+                    'clear, which indicates the reify reseed/build ladder is '
+                    'stuck (a healthy ladder would have advanced the base and '
+                    'cleared this latch via refresh_warm_base already).  '
+                    'Human investigation required.'
+                )
+                await self._on_warm_base_promote_l2(summary=summary, detail=detail)
+
     async def update_task(
         self,
         task_id: str,
@@ -3129,6 +3274,19 @@ class Scheduler:
             logger.debug(
                 'acquire_next() short-circuit: scheduler is paused (reason=%r)',
                 self._pause_reason,
+            )
+            return None
+
+        try:
+            await self._apply_warm_base_hard_down_watchdog()
+        except Exception:
+            logger.warning(
+                'Warm-base hard-down watchdog pass raised — continuing tick normally',
+                exc_info=True,
+            )
+        if self._warm_base_hard_down:
+            logger.debug(
+                'acquire_next() short-circuit: warm-lane base hard-down latch engaged'
             )
             return None
 
