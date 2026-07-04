@@ -858,13 +858,20 @@ class ReconReportState:
             # Remove _active pointer only if it still points at this stage
             if self._active.get(rid) == stage:
                 del self._active[rid]
-            # Clean up run-level indices for evicted findings
-            if rid in self._run_sig_index:
-                for sig, fid in evicted._signature_to_finding.items():
-                    if self._run_sig_index[rid].get(sig) == fid:
-                        del self._run_sig_index[rid][sig]
-                if not self._run_sig_index[rid]:
-                    del self._run_sig_index[rid]
+            # Run-quiescence gate (task-2088): _run_sig_index is keyed for the
+            # WHOLE run across all stages, so releasing it the moment any one
+            # completed stage ages out — while a sibling stage of the same
+            # run is still live — would drop the in-run dedup key mid-run and
+            # let a later stage double-file a signature already reported by
+            # an evicted stage (run 33c324b0 regression). Only release once
+            # no (rid, *) entry remains in _state after this eviction, i.e.
+            # the run is fully quiescent. Wholesale pop (rather than deleting
+            # only *evicted*'s own signature) also correctly reclaims every
+            # evicted stage's contribution in one shot when several same-run
+            # entries evict within the same tick() call.
+            run_still_live = any(r == rid for (r, _s) in self._state)
+            if not run_still_live:
+                self._run_sig_index.pop(rid, None)
             if rid in self._run_finding_index:
                 for f in evicted.findings:
                     self._run_finding_index[rid].pop(f.finding_id, None)
