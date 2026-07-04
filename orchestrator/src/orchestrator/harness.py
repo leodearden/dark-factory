@@ -6998,8 +6998,8 @@ Output JSON matching the schema. Every task must appear in the output.
         wasn't in the blocked set.
 
         A and B are mutually exclusive per task by construction (A requires
-        an empty pending queue; B requires an open escalation) — see the
-        design decision on the class-level plan.  Both loops are per-item
+        an empty pending queue; B requires an open escalation), so a single
+        pass never double-handles one task.  Both loops are per-item
         fail-soft: one bad task/escalation is logged and does not abort the
         rest of the pass.
         """
