@@ -305,6 +305,49 @@ class TestGetValidEdgesForNode:
         backend = make_backend(mock_config)
         await assert_ro_query_only(backend, make_graph_mock, [], 'get_valid_edges_for_node', 'node-uuid-1', group_id='test')
 
+    @pytest.mark.asyncio
+    async def test_cypher_dedups_by_edge_identity_not_property_tuple(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """Query dedupes by edge ELEMENT identity (WITH DISTINCT e), not property tuple.
+
+        FalkorDB does not enforce property uniqueness, and redirect_node_edges
+        copies new.uuid = old.uuid on merge, so an entity can carry multiple
+        genuinely-distinct RELATES_TO elements sharing one (uuid, fact, name)
+        tuple. `RETURN DISTINCT e.uuid, e.fact, e.name` collapses those distinct
+        elements into a single row, undercounting edge_count. `WITH DISTINCT e`
+        dedupes by the edge element itself, so each relationship is counted once.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
+        cypher = extract_cypher(call_args)
+        assert 'WITH DISTINCT e' in cypher, f"Cypher must dedupe by edge element identity: {cypher}"
+        assert 'RETURN DISTINCT' not in cypher, f"Cypher must not dedupe by property tuple: {cypher}"
+        assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
+
+    @pytest.mark.asyncio
+    async def test_identical_property_rows_preserved(self, mock_config, make_backend, make_graph_mock):
+        """Python layer does no dedup — identical-property rows from the DB are both kept.
+
+        Element-identity dedup (WITH DISTINCT e) happens server-side in Cypher;
+        the Python layer must not additionally dedupe by property tuple, or it
+        would re-introduce the undercount for distinct edges that legitimately
+        share a copied (uuid, fact, name) tuple (e.g. after redirect_node_edges).
+        """
+        backend = make_backend(mock_config)
+        rows = [
+            ['edge-1', 'same fact', 'rel'],
+            ['edge-1', 'same fact', 'rel'],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        assert len(result) == 2
+
 
 # ---------------------------------------------------------------------------
 # GraphitiBackend.get_all_valid_edges (bulk fetch)
