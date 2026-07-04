@@ -367,6 +367,32 @@ class MergeResult:
     merge_worktree: Path | None = None
 
 
+class WarmBaseHealth(Enum):
+    """Tri-state health of the warm-lane CoW seed base (task 2061).
+
+    Returned by :meth:`GitOps._warm_lane_base_resolvable`, which resolves the
+    base with the SAME D8 rule as :meth:`GitOps._seed_warm_lane`
+    (``base.parent / base.readlink()``, NOT ``Path.resolve()``) so its verdict
+    matches what a real seed invocation would experience.
+
+    * ``OK`` — the concrete base dir exists and is non-empty; safe to acquire.
+    * ``ABSENT`` — the concrete base dir is provably missing or empty; a
+      real seed would fail its ``cp``.  This is a HOST-SCOPED pool condition
+      (one base serves every lane), so a definite ``ABSENT`` reading drives a
+      single fail-open signal (:class:`WarmLanePoolHardDown` / the scheduler's
+      warm-base hard-down latch) rather than a per-task fault.
+    * ``INDETERMINATE`` — a stat/readlink error occurred while resolving the
+      base (e.g. a torn read racing a concurrent rewrite, an EINTR, a
+      non-directory base).  Treated as fail-safe "hold" by every consumer:
+      never engages, clears, or promotes a hard-down latch, and never blocks
+      an acquire — a transient hiccup must never masquerade as a genuine
+      outage.
+    """
+    OK = 'ok'
+    ABSENT = 'absent'
+    INDETERMINATE = 'indeterminate'
+
+
 class WarmLaneUnavailable(Enum):
     """Discriminated failure result from :meth:`acquire_warm_lane`.
 
@@ -375,6 +401,12 @@ class WarmLaneUnavailable(Enum):
     * ``EXHAUSTED`` — all pool lanes are ASSIGNED; signal backpressure / requeue.
     * ``FAULT`` — seed/worktree-add failure or absent seed script; signal blocked + L1.
     * ``DISK_PRESSURE`` — seed exited 75 (EX_TEMPFAIL); transient infra; requeue.
+    * ``BASE_ABSENT`` — the warm-lane CoW seed base is provably absent/empty
+      (:meth:`GitOps._warm_lane_base_resolvable` returned
+      :attr:`WarmBaseHealth.ABSENT`), detected either by the pre-acquire gate
+      (no lane touched) or via a seed exit-76 (reify contract, DORMANT until
+      a shipped seed-warm-lane.sh emits it).  HOST-SCOPED pool condition —
+      requeue (:class:`WarmLanePoolHardDown`), never a per-task BLOCKED+L1.
     * ``DISABLED`` — pool knob is off (``warm_lane_pool is None``); programming-error
       sentinel returned when :meth:`acquire_warm_lane` is called without first
       checking ``self.warm_lane_pool is not None``.  A disabled pool is NOT
@@ -390,7 +422,29 @@ class WarmLaneUnavailable(Enum):
     EXHAUSTED = 'exhausted'
     FAULT = 'fault'
     DISK_PRESSURE = 'disk_pressure'
+    BASE_ABSENT = 'base_absent'
     DISABLED = 'disabled'
+
+
+def _seed_rc_to_unavailable(rc: int) -> WarmLaneUnavailable:
+    """Discriminate a seed-warm-lane.sh exit code into a WarmLaneUnavailable.
+
+    Shared by every seed-rc call site in :meth:`GitOps.acquire_warm_lane` so
+    the 75/76/other mapping lives in exactly one place.
+
+    * ``75`` (EX_TEMPFAIL) → ``DISK_PRESSURE`` — transient disk pressure.
+    * ``76`` → ``BASE_ABSENT`` — reify contract for "CoW base missing".
+      **DORMANT**: no shipped seed-warm-lane.sh emits 76 today: this branch
+      is inert until a future reify version adopts the exit-76 convention. It
+      is harmless meanwhile (no script exits 76, so it is simply never hit).
+    * anything else (including ``127``, the absent-script / unexpected-
+      exception sentinel) → ``FAULT`` — generic infra fault.
+    """
+    if rc == 75:
+        return WarmLaneUnavailable.DISK_PRESSURE
+    if rc == 76:
+        return WarmLaneUnavailable.BASE_ABSENT
+    return WarmLaneUnavailable.FAULT
 
 
 @dataclass
@@ -2261,10 +2315,7 @@ class GitOps:
                             rc, lane,
                         )
                     await self.warm_lane_pool.release(lane)
-                    return (
-                        WarmLaneUnavailable.DISK_PRESSURE if rc == 75
-                        else WarmLaneUnavailable.FAULT
-                    )
+                    return _seed_rc_to_unavailable(rc)
                 # Falls through to shared tail
 
             elif not await self._is_registered_worktree(lane):
@@ -2339,10 +2390,7 @@ class GitOps:
                             cwd=self.project_root,
                         )
                         await self.warm_lane_pool.release(lane)
-                        return (
-                            WarmLaneUnavailable.DISK_PRESSURE if _co_seed_rc == 75
-                            else WarmLaneUnavailable.FAULT
-                        )
+                        return _seed_rc_to_unavailable(_co_seed_rc)
                     return await self._reuse_warm_lane(lane, full_branch)
 
                 git_add_rc, _, err = await _run(
@@ -2384,10 +2432,7 @@ class GitOps:
                         cwd=self.project_root,
                     )
                     await self.warm_lane_pool.release(lane)
-                    return (
-                        WarmLaneUnavailable.DISK_PRESSURE if seed_rc == 75
-                        else WarmLaneUnavailable.FAULT
-                    )
+                    return _seed_rc_to_unavailable(seed_rc)
             else:
                 # ── Already-registered lane — check on-disk backstop first ─
                 # If the lane still carries THIS task's plan.json (e.g. after a
@@ -2786,10 +2831,7 @@ class GitOps:
                     rc, lane,
                 )
             await self.warm_lane_pool.release(lane)
-            return (
-                WarmLaneUnavailable.DISK_PRESSURE if rc == 75
-                else WarmLaneUnavailable.FAULT
-            )
+            return _seed_rc_to_unavailable(rc)
 
         return None  # success — caller falls through to shared tail
 
@@ -4303,6 +4345,57 @@ class GitOps:
         if self.config.warm_lane_base_target_dir is not None:
             return Path(self.config.warm_lane_base_target_dir)
         return self._merge_verify_artifact_path
+
+    def _warm_lane_base_resolvable(self) -> WarmBaseHealth:
+        """Tri-state health check of the warm-lane CoW seed base (task 2061).
+
+        Resolves :attr:`warm_lane_base_target_path` with the SAME D8 rule as
+        :meth:`_seed_warm_lane` (``base.parent / base.readlink()`` for a
+        symlink base, NOT ``Path.resolve()`` — avoids tmp-prefix
+        canonicalization drift) so this check's verdict matches what a real
+        seed invocation would experience, then checks the concrete gen dir
+        exists and is non-empty.
+
+        Pure filesystem check (is_symlink/readlink/exists/one iterdir-next) —
+        synchronous, no subprocess, no await.  Called directly from the
+        pre-acquire gate in :meth:`acquire_warm_lane` and, via the Harness's
+        injected async probe, once per scheduler tick (see
+        ``Scheduler._apply_warm_base_hard_down_watchdog``).
+
+        The natural clear for a host-scoped hard-down latch built on this
+        probe is :meth:`refresh_warm_base` (git_ops.py ~1659) successfully
+        rebuilding/advancing the base — once it does, this method observes
+        the newly-populated concrete gen dir and returns ``OK`` again.
+
+        Returns:
+            WarmBaseHealth.OK — concrete gen dir exists and is non-empty.
+            WarmBaseHealth.ABSENT — concrete gen dir is missing or empty.
+            WarmBaseHealth.INDETERMINATE — a stat/readlink error occurred
+                (e.g. non-directory base, torn read racing a concurrent
+                rewrite).  Fail-safe: never treated as ABSENT by callers.
+        """
+        try:
+            base_path = self.warm_lane_base_target_path
+            if base_path.is_symlink():
+                # D8: resolve relative-sibling symlink (target -> .gen.N) to
+                # the concrete gen dir — same join _seed_warm_lane uses.
+                gen_dir = base_path.parent / base_path.readlink()
+            else:
+                gen_dir = base_path
+            if not gen_dir.exists():
+                return WarmBaseHealth.ABSENT
+            try:
+                next(gen_dir.iterdir())
+            except StopIteration:
+                return WarmBaseHealth.ABSENT
+            return WarmBaseHealth.OK
+        except OSError:
+            logger.debug(
+                '_warm_lane_base_resolvable: stat/readlink error resolving '
+                'warm base — treating as INDETERMINATE (fail-safe)',
+                exc_info=True,
+            )
+            return WarmBaseHealth.INDETERMINATE
 
     #: Name of the counter file used to persist the verify attempt count across
     #: stateless CLI invocations.  Scope is **per-project-worktree** — the file
