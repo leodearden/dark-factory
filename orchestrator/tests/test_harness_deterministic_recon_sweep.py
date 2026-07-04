@@ -38,7 +38,11 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness, _deterministic_deploy_health_verdict
+from orchestrator.harness import (
+    Harness,
+    _deterministic_deploy_health_verdict,
+    _is_stranded_deterministic_shape,
+)
 
 # ---------------------------------------------------------------------------
 # step-1: Config field presence and defaults
@@ -133,3 +137,62 @@ class TestRevalidateDeployHealth:
 
         assert verdict == 'unconfirmed'
         h._recon_unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# step-5: pure fn _is_stranded_deterministic_shape
+# ---------------------------------------------------------------------------
+
+
+def _strand_metadata(**overrides) -> dict:
+    """Canonical stranded-deterministic-shape metadata (task 2059 EVIDENCE)."""
+    base = {
+        'task_kind': 'deterministic',
+        'before_done': {'target_unit': 'fused-memory.service'},
+        'before_done_ran_at': '2026-07-01T00:00:00+00:00',
+        'before_done_verified_at': None,
+        'gate_escalated_at': None,
+        'done_provenance': None,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestIsStrandedDeterministicShape:
+    """step-5: harness._is_stranded_deterministic_shape pure classifier."""
+
+    def test_true_for_canonical_strand_shape(self) -> None:
+        assert _is_stranded_deterministic_shape(_strand_metadata()) is True
+
+    def test_false_when_task_kind_not_deterministic(self) -> None:
+        assert _is_stranded_deterministic_shape(_strand_metadata(task_kind='normal')) is False
+
+    def test_false_when_before_done_ran_at_missing(self) -> None:
+        assert _is_stranded_deterministic_shape(_strand_metadata(before_done_ran_at=None)) is False
+
+    def test_false_when_before_done_verified_at_present(self) -> None:
+        assert _is_stranded_deterministic_shape(
+            _strand_metadata(before_done_verified_at='2026-07-02T00:00:00+00:00')
+        ) is False
+
+    def test_false_when_gate_escalated_at_present(self) -> None:
+        assert _is_stranded_deterministic_shape(
+            _strand_metadata(gate_escalated_at='2026-07-02T00:00:00+00:00')
+        ) is False
+
+    def test_false_when_done_provenance_present(self) -> None:
+        assert _is_stranded_deterministic_shape(
+            _strand_metadata(done_provenance={'kind': 'deterministic-deploy'})
+        ) is False
+
+    def test_false_when_before_done_is_none(self) -> None:
+        assert _is_stranded_deterministic_shape(_strand_metadata(before_done=None)) is False
+
+    def test_false_when_before_done_lacks_target_unit(self) -> None:
+        assert _is_stranded_deterministic_shape(_strand_metadata(before_done={})) is False
+
+    def test_false_for_empty_metadata(self) -> None:
+        assert _is_stranded_deterministic_shape({}) is False
+
+    def test_false_for_none_metadata(self) -> None:
+        assert _is_stranded_deterministic_shape(None) is False
