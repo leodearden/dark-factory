@@ -401,9 +401,14 @@ class DeterministicRunner:
                 'returning MainPID=0 sentinel',
                 unit, self._inspect_timeout_secs,
             )
-            # MainPID=0 routes through the existing verify-fail path: fresh-PID
-            # verify already treats MainPID=0 as a sentinel failure -> born-at-
-            # L2 escalate + blocked (matching the 2090 hardening pattern).
+            # On the VERIFY leg, MainPID=0 routes through the existing
+            # verify-fail path: fresh-PID verify already treats MainPID=0 as
+            # a sentinel failure -> born-at-L2 escalate + blocked (matching
+            # the 2090 hardening pattern). On the BASELINE leg, MainPID=0
+            # alone would NOT be caught there (only the verify leg checks
+            # pid > 0) — run()'s baseline capture additionally checks
+            # ActiveState=='' to catch a wedged baseline before the deploy
+            # is even attempted.
             return {
                 'MainPID': 0,
                 'ActiveState': '',
@@ -1172,6 +1177,39 @@ class DeterministicRunner:
                 # Capture baseline unit state before the deploy fires
                 inspect_fn = self._unit_inspector or self._default_inspect_unit
                 baseline = await inspect_fn(target_unit)
+
+                # Task 2091 (baseline-leg hardening): a wedged/failed baseline
+                # inspect returns the same MainPID=0/ActiveState='' sentinel
+                # dict used on the verify leg (see _default_inspect_unit's
+                # TimeoutError branch). On the VERIFY leg that sentinel is
+                # already caught by the `pid > 0` half of the freshness check
+                # below. On the BASELINE leg it is NOT: baseline_monotonic
+                # would silently become 0, and `new_monotonic >
+                # baseline_monotonic` is then trivially true for any active
+                # unit — a wedged baseline would be swallowed and a deploy
+                # falsely reported verified even though freshness was never
+                # actually established. ActiveState is the signal: a real
+                # `systemctl show` always populates it (even 'inactive' for a
+                # nonexistent unit); only the timeout sentinel leaves it ''.
+                # Fail closed exactly like the other pre-deploy failure paths
+                # below — before_done_ran_at is already stamped (I1
+                # once-only), so the deploy is NOT attempted on an untrusted
+                # baseline.
+                if not baseline.get('ActiveState'):
+                    baseline_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Baseline inspect failed/wedged before deploy: {baseline!r}',
+                        'Cannot establish a trustworthy pre-deploy baseline — '
+                        'the deploy was NOT attempted (before_done_ran_at is '
+                        'already stamped; I1 once-only — a human must inspect '
+                        'the unit and resolve).',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Baseline inspect failed before deploy: {target_unit}',
+                        detail=baseline_detail,
+                    )
 
                 # Run the deploy script to completion (blocking, cross-unit).
                 # Task 2090 Layer B: wrap the call in an outer wall-clock guard
