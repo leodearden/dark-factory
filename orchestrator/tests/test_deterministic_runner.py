@@ -1107,6 +1107,116 @@ class TestDefaultRunScriptEnv:
 
 
 # ---------------------------------------------------------------------------
+# Task 2090 — Layer A: whole-process-group kill on subprocess timeout
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneSubprocessTimeoutHardening:
+    """DeterministicRunner — Layer A: kill the WHOLE process tree on timeout.
+
+    Guards against the inherited-pipe hang behind task 2087's stranding:
+    restart-fused-memory.sh --drain spawns grandchildren (systemctl restart,
+    curl, journalctl, sleep, the restarted daemon) that inherit the write end
+    of the merged stdout pipe.  Killing only the direct child (pre-2090
+    behavior) leaves the tree alive and the pipe open forever.
+    """
+
+    async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
+        """On timeout, a backgrounded grandchild must be killed too, not just
+        the direct child.
+
+        RED today: current code calls ``proc.kill()`` on the direct child only
+        (no ``start_new_session``, no process-group kill) — the orphaned
+        grandchild survives the timeout branch.
+        """
+        import asyncio
+        import os
+        import time
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        script = tmp_path / 'hang.sh'
+        pidfile = tmp_path / 'grandchild.pid'
+        script.write_text(
+            '#!/bin/sh\n'
+            'sleep 60 &\n'
+            'echo $! > "$1"\n'
+            'sleep 60\n'
+        )
+        script.chmod(0o755)
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': str(script),
+            'args': [str(pidfile)],
+            'cwd': str(tmp_path),
+            'timeout_secs': 1,
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        # Hang tripwire: if the fix regresses into a real hang, fail loudly
+        # instead of stalling the suite.
+        rc, tail = await asyncio.wait_for(
+            runner._default_run_script(before_done), timeout=10,
+        )
+
+        assert rc == 1, f'expected rc=1 on timeout, got {rc}'
+        assert 'timed out' in tail, f'expected a timed-out marker in tail, got {tail!r}'
+
+        grandchild_pid = int(pidfile.read_text().strip())
+        deadline = time.monotonic() + 3.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            await asyncio.sleep(0.05)
+        assert not alive, (
+            f'grandchild pid {grandchild_pid} must be dead after timeout — the '
+            f'WHOLE process group must be killed, not just the direct child'
+        )
+
+    async def test_terminate_process_tree_swallows_process_lookup_error(
+        self, tmp_path: Path,
+    ):
+        """``_terminate_process_tree`` must swallow ProcessLookupError from
+        BOTH the killpg path and the proc.kill() fallback — an already-exited
+        process must never propagate out of the timeout-cleanup helper.
+
+        RED today: ``_terminate_process_tree`` does not exist yet
+        (AttributeError).
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=queue,
+            reap_grace_secs=0.05,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.kill = MagicMock(side_effect=ProcessLookupError('already exited'))
+        mock_proc.wait = AsyncMock(return_value=None)
+
+        with (
+            patch('os.getpgid', side_effect=ProcessLookupError('no such process')),
+            patch('os.killpg', side_effect=ProcessLookupError('no such process')) as mock_killpg,
+        ):
+            await runner._terminate_process_tree(mock_proc)
+
+        mock_killpg.assert_not_called()
+        mock_proc.kill.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Step-3: B7a — script rc ≠ 0 failure (RED until step-4 implements the path)
 # ---------------------------------------------------------------------------
 
