@@ -19,6 +19,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.task_status import ACTIVE_TASK_STATUSES
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -155,6 +156,63 @@ def _make_report(
         block_phase=block_phase,
         cost_usd=0.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Harness._find_prior_auto_eval_redos
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_prior_auto_eval_redos_filters_siblings():
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_tasks = AsyncMock(return_value=[
+        # (a) matching siblings — same spawned_from, auto_eval_redo truthy.
+        {
+            'id': 'redo-A',
+            'status': 'deferred',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-B',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        # (b) non-redo task sharing spawned_from — must be excluded.
+        {
+            'id': 'other',
+            'metadata': {'spawned_from': 'orig-task'},
+        },
+        # (c) redo for a different parent — must be excluded.
+        {
+            'id': 'redo-X',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'someone-else'},
+        },
+        # (d) the original task itself — must be excluded.
+        {
+            'id': 'orig-task',
+            'metadata': {},
+        },
+    ])
+
+    result = await harness._find_prior_auto_eval_redos('orig-task')
+
+    assert set(result) == {'redo-A', 'redo-B'}
+    harness.scheduler.get_tasks.assert_awaited_once_with(
+        statuses=ACTIVE_TASK_STATUSES,
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_prior_auto_eval_redos_fail_open():
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_tasks = AsyncMock(side_effect=RuntimeError('boom'))
+
+    result = await harness._find_prior_auto_eval_redos('orig-task')
+
+    assert result == []
 
 
 @pytest.mark.asyncio
