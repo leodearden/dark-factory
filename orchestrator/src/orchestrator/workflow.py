@@ -4601,6 +4601,10 @@ class TaskWorkflow:
                 if not any(sha.startswith(r) or r.startswith(sha) for r in recorded)
             ]
         except Exception:
+            logger.warning(
+                'WIP-tip detection failed; treating as no WIP commits',
+                exc_info=True,
+            )
             return []
 
     async def _inter_iteration_rebase(
