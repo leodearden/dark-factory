@@ -14037,7 +14037,10 @@ class TestFinalizeAdvancedMerge:
         git_ops = MagicMock()
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
-        git_ops._last_advanced_sha = last_advanced_sha
+        # Test-local stash spot for the value under test — NOT the retired
+        # GitOps._last_advanced_sha side channel (task 1997 retired that;
+        # _finalize_advanced_merge takes advanced_sha as an explicit kwarg).
+        git_ops._stub_advanced_sha = last_advanced_sha
         return git_ops
 
     def _make_req(self) -> MagicMock:
@@ -14077,11 +14080,11 @@ class TestFinalizeAdvancedMerge:
                 cas_retries=cas_retries,
                 timeouts=timeouts,
                 enospc_retries=enospc_retries,
-                advanced_sha=git_ops._last_advanced_sha,
+                advanced_sha=git_ops._stub_advanced_sha,
             )
 
         assert outcome.status == 'done'
-        assert outcome.merge_sha == git_ops._last_advanced_sha
+        assert outcome.merge_sha == git_ops._stub_advanced_sha
         assert outcome.push_status == 'pushed'
         git_ops.push_main.assert_awaited_once()
         assert req.task_id not in cas_retries
@@ -15038,9 +15041,14 @@ class TestMapAdvanceFailure:
     def _make_git_ops(self) -> MagicMock:
         git_ops = MagicMock()
         git_ops.push_main = AsyncMock(return_value='pushed')
+        # _last_recovery_branch/_last_overlap_files are real getattr side
+        # channels _map_advance_failure still reads (out of scope for task
+        # 1997 — see plan). _stub_advanced_sha is just this test's stash
+        # spot for the advanced_sha kwarg value; the retired
+        # _last_advanced_sha side channel is NOT read by production anymore.
         git_ops._last_recovery_branch = 'recovery/branch-abc'
         git_ops._last_overlap_files = ['foo.py', 'bar.py']
-        git_ops._last_advanced_sha = 'adv-sha-123'
+        git_ops._stub_advanced_sha = 'adv-sha-123'
         return git_ops
 
     async def test_wip_overlap_halts_returns_wip_halted(self) -> None:
@@ -15080,13 +15088,13 @@ class TestMapAdvanceFailure:
             git_ops, 'pop_conflict',
             task_id=task_id, merge_commit_fallback='fallback-sha',
             halt=halt, unhalt=unhalt, cas_retries=cas_retries,
-            advanced_sha=git_ops._last_advanced_sha,
+            advanced_sha=git_ops._stub_advanced_sha,
         )
 
         assert outcome.status == 'done_wip_recovery'
         assert outcome.recovery_branch == git_ops._last_recovery_branch
         assert outcome.push_status == 'pushed'
-        assert outcome.merge_sha == git_ops._last_advanced_sha
+        assert outcome.merge_sha == git_ops._stub_advanced_sha
         halt.assert_called_once_with('advance_main: pop_conflict')
         git_ops.push_main.assert_awaited_once()
         unhalt.assert_not_called()  # success path must NOT un-halt
@@ -15328,9 +15336,9 @@ class TestAdvanceMainReverifyOnRebase:
 
     When set, a rebase-then-break inside the for-attempt loop causes
     advance_main to:
-      • expose the rebased SHA via _last_advanced_sha
-      • expose the original expected_main via _rebased_from
-      • expose the rebased-onto SHA via _rebased_onto
+      • expose the rebased SHA via the returned AdvanceOutcome.advanced_sha
+      • expose the original expected_main via AdvanceOutcome.rebased_from
+      • expose the rebased-onto SHA via AdvanceOutcome.rebased_onto
       • return 'rebased_pending_reverify' WITHOUT calling update-ref
 
     The default (flag omitted / False) is unchanged: rebase + advance.
