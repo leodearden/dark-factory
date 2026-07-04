@@ -95,3 +95,169 @@ class TestGraphitiBackendSetEntitySummary:
         backend = GraphitiBackend(mock_config)  # _driver is None
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.set_entity_summary('node-uuid-1', 'text', group_id='test')
+
+
+# ---------------------------------------------------------------------------
+# step-3: MemoryService.set_entity_summary
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryServiceSetEntitySummary:
+    """MemoryService.set_entity_summary() delegates to the graphiti backend.
+
+    Mirrors TestMemoryServiceRefreshEntitySummary + TestMemoryServiceRefreshEntitySummaryJournalFix
+    (test_refresh_entity_summary.py) — same identifier-resolution, validation, and
+    try/finally journal-logging contracts, applied to the direct-overwrite tool.
+    """
+
+    @pytest.fixture
+    def service(self, mock_config):
+        """MemoryService with mocked backends (no real DB needed)."""
+        from fused_memory.services.memory_service import MemoryService
+        svc = MemoryService(mock_config)
+        svc.graphiti = MagicMock()
+        svc.graphiti.set_entity_summary = AsyncMock(
+            return_value={
+                'uuid': 'node-1',
+                'name': 'Alice',
+                'old_summary': 'old',
+                'new_summary': 'Corrected summary.',
+            }
+        )
+        svc.mem0 = MagicMock()
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_graphiti_backend(self, service):
+        """(a) Delegates to graphiti.set_entity_summary(uuid, summary, group_id=...) and
+        returns the backend dict unchanged."""
+        result = await service.set_entity_summary(
+            entity_uuid='node-1',
+            summary='Corrected summary.',
+            project_id='dark_factory',
+        )
+        service.graphiti.set_entity_summary.assert_awaited_once_with(
+            'node-1', 'Corrected summary.', group_id='dark_factory'
+        )
+        assert result == {
+            'uuid': 'node-1',
+            'name': 'Alice',
+            'old_summary': 'old',
+            'new_summary': 'Corrected summary.',
+        }
+
+    @pytest.mark.asyncio
+    async def test_resolves_entity_name_to_uuid(self, service):
+        """(b) entity_name resolves via resolve_entity_by_name, then delegates with the
+        resolved uuid."""
+        service.graphiti.resolve_entity_by_name = AsyncMock(return_value='node-1')
+        result = await service.set_entity_summary(
+            entity_name='Alice',
+            summary='Corrected summary.',
+            project_id='dark_factory',
+        )
+        service.graphiti.resolve_entity_by_name.assert_awaited_once_with('Alice', group_id='dark_factory')
+        service.graphiti.set_entity_summary.assert_awaited_once_with(
+            'node-1', 'Corrected summary.', group_id='dark_factory'
+        )
+        assert result['uuid'] == 'node-1'
+
+    @pytest.mark.asyncio
+    async def test_prefers_uuid_when_both_provided(self, service):
+        """(c) entity_uuid takes precedence when both are supplied — resolve is never awaited."""
+        service.graphiti.resolve_entity_by_name = AsyncMock(return_value='other-node')
+        await service.set_entity_summary(
+            entity_uuid='node-1',
+            entity_name='Alice',
+            summary='Corrected summary.',
+            project_id='dark_factory',
+        )
+        service.graphiti.resolve_entity_by_name.assert_not_awaited()
+        service.graphiti.set_entity_summary.assert_awaited_once_with(
+            'node-1', 'Corrected summary.', group_id='dark_factory'
+        )
+
+    @pytest.mark.asyncio
+    async def test_raises_value_error_when_neither_identifier_provided(self, service):
+        """(d) Raises ValueError when neither entity_uuid nor entity_name is provided."""
+        with pytest.raises(ValueError, match='entity_uuid.*entity_name|entity_name.*entity_uuid'):
+            await service.set_entity_summary(summary='Corrected summary.', project_id='dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_raises_value_error_when_summary_is_none(self, service):
+        """(e) Raises ValueError when summary is None (missing/omitted)."""
+        with pytest.raises(ValueError, match='summary'):
+            await service.set_entity_summary(entity_uuid='node-1', project_id='dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_empty_string_summary_is_allowed(self, service):
+        """(f) An empty-string summary is a valid input — delegates without raising."""
+        service.graphiti.set_entity_summary = AsyncMock(
+            return_value={'uuid': 'node-1', 'name': 'Alice', 'old_summary': 'stale', 'new_summary': ''}
+        )
+        result = await service.set_entity_summary(
+            entity_uuid='node-1', summary='', project_id='dark_factory'
+        )
+        service.graphiti.set_entity_summary.assert_awaited_once_with('node-1', '', group_id='dark_factory')
+        assert result['new_summary'] == ''
+
+    @pytest.mark.asyncio
+    async def test_journal_logs_operation_and_entity_name_param(self, service):
+        """(g) log_write_op is awaited with operation='set_entity_summary', project_id set,
+        and params include entity_name when the name-resolution path is used."""
+        service.graphiti.resolve_entity_by_name = AsyncMock(return_value='node-1')
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        await service.set_entity_summary(
+            entity_name='Alice',
+            summary='Corrected summary.',
+            project_id='dark_factory',
+            agent_id='test-agent',
+        )
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs.get('operation') == 'set_entity_summary'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+        assert call_kwargs['params'].get('entity_name') == 'Alice'
+
+    @pytest.mark.asyncio
+    async def test_journal_failure_does_not_mask_successful_result(self, service):
+        """(h) A journal.log_write_op failure must not mask an otherwise-successful result."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock(side_effect=RuntimeError('journal db is full'))
+        service.set_write_journal(mock_journal)
+        expected = {
+            'uuid': 'node-1',
+            'name': 'Alice',
+            'old_summary': 'old',
+            'new_summary': 'Corrected summary.',
+        }
+        service.graphiti.set_entity_summary = AsyncMock(return_value=expected)
+
+        result = await service.set_entity_summary(
+            entity_uuid='node-1', summary='Corrected summary.', project_id='dark_factory'
+        )
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_backend_failure_still_journals_success_false(self, service):
+        """(h) A backend exception still journals success=False with the error text, and
+        the exception still propagates to the caller."""
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        service.set_write_journal(mock_journal)
+        service.graphiti.set_entity_summary = AsyncMock(side_effect=ValueError('FalkorDB timeout'))
+
+        with pytest.raises(ValueError, match='FalkorDB timeout'):
+            await service.set_entity_summary(
+                entity_uuid='node-1', summary='Corrected summary.', project_id='dark_factory'
+            )
+
+        mock_journal.log_write_op.assert_awaited_once()
+        call_kwargs = mock_journal.log_write_op.call_args[1]
+        assert call_kwargs.get('success') is False
+        assert call_kwargs.get('error') is not None
+        assert 'FalkorDB timeout' in call_kwargs['error']
