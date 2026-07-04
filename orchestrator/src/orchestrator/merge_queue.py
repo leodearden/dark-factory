@@ -4669,9 +4669,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Pure/synchronous.
         """
         for entry in reversed(self._frozen_inflight_entries()):
-            mr = entry.item.merge_result
-            if mr is not None and mr.merge_commit:
-                return mr.merge_commit.strip()
+            if isinstance(entry.item, RealMergeItem) and entry.item.merge_result.merge_commit:
+                return entry.item.merge_result.merge_commit.strip()
         return None
 
     def frozen_prefix_tip(self, main_sha: str) -> str:
@@ -4712,10 +4711,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         expected_base = main_sha.strip()
         for entry in self._frozen_inflight_entries():
             rid = entry.item.request.request_id
-            mr = entry.item.merge_result
-            if mr is None or not mr.merge_commit:
+            if not isinstance(entry.item, RealMergeItem) or not entry.item.merge_result.merge_commit:
                 # No merge_commit — nothing to chain; do not advance.
                 continue
+            mr = entry.item.merge_result
             actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
             yield rid, expected_base, actual_base
             # Advance expected_base for the next entry regardless of whether
@@ -4937,7 +4936,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         return sum(
             1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
-            if _item is not None and _item.counts_against_cap
+            if isinstance(_item, RealMergeItem) and _item.counts_against_cap
         )
 
     def speculation_accounting_violations(self) -> list[str]:
@@ -5109,7 +5108,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Pure/synchronous (no await).  Returns None in all cases.
         """
-        if item.merge_result is None or not item.base_sha:
+        if not isinstance(item, RealMergeItem) or not item.base_sha:
             return  # passthrough / conflict — not a real-verify candidate
         expected_tip = self.frozen_prefix_tip(main_sha)
         if item.base_sha.strip() == expected_tip.strip():
@@ -5372,7 +5371,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 continue
             entries.append(_entry(
                 item.request, 'awaiting_verify',
-                worktree_path=item.merge_wt,
+                worktree_path=item_merge_wt(item),
                 position=len(entries),
             ))
 
@@ -6130,10 +6129,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 except BaseException:
                     _harvested = None
                 if _harvested is not None:
-                    if _harvested.merge_wt is not None:
+                    _harvested_wt = item_merge_wt(_harvested)
+                    if _harvested_wt is not None:
                         with contextlib.suppress(BaseException):
                             await self._cleanup_owned_merge_worktree(
-                                _harvested.merge_wt
+                                _harvested_wt
                             )
                     if not _harvested.request.result.done():
                         _harvested.request.result.set_result(shutdown)
@@ -6149,9 +6149,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             try:
                 item = self._verifier_queue.get_nowait()
                 if item is not None:
-                    if item.merge_wt is not None:
+                    _item_wt = item_merge_wt(item)
+                    if _item_wt is not None:
                         with contextlib.suppress(BaseException):
-                            await self._cleanup_owned_merge_worktree(item.merge_wt)
+                            await self._cleanup_owned_merge_worktree(_item_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
             except asyncio.QueueEmpty:
@@ -6199,9 +6200,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _rd = self._redispatch.popleft()
             if not _rd.request.result.done():
                 _rd.request.result.set_result(shutdown)
-            if _rd.merge_wt is not None:
+            _rd_wt = item_merge_wt(_rd)
+            if _rd_wt is not None:
                 with contextlib.suppress(BaseException):
-                    await self._cleanup_owned_merge_worktree(_rd.merge_wt)
+                    await self._cleanup_owned_merge_worktree(_rd_wt)
 
         # Send sentinels to unblock both loops
         await self._queue.put(None)  # type: ignore[arg-type]
@@ -6227,9 +6229,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             try:
                 item = self._verifier_queue.get_nowait()
                 if item is not None:
-                    if item.merge_wt is not None:
+                    _item_wt = item_merge_wt(item)
+                    if _item_wt is not None:
                         with contextlib.suppress(BaseException):
-                            await self._cleanup_owned_merge_worktree(item.merge_wt)
+                            await self._cleanup_owned_merge_worktree(_item_wt)
                     if not item.request.result.done():
                         item.request.result.set_result(shutdown)
             except asyncio.QueueEmpty:
@@ -7396,9 +7399,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     continue
 
                 if entry is None:
-                    # No host available: put item back on _redispatch.
+                    # No host available: put item back on _redispatch.  Only a
+                    # RealMergeItem ever needs a host lease (passthroughs never
+                    # fail to dispatch), so item is always a RealMergeItem here.
                     # counts_against_cap was already released in _dispatch_item;
                     # clear the flag to prevent a double-release on re-dispatch.
+                    assert isinstance(item, RealMergeItem)
                     item_back = dataclasses.replace(item, counts_against_cap=False)
                     self._redispatch.appendleft(item_back)
                     fill_done = True
@@ -7660,7 +7666,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 if entry is None:
                     # No host (shouldn't happen with empty _inflight on a single-host
-                    # system, but handle defensively: item goes to _redispatch).
+                    # system, but handle defensively: item goes to _redispatch).  Only
+                    # a RealMergeItem ever needs a host lease, so item is always a
+                    # RealMergeItem here (see the DISPATCH-FILL branch above).
+                    assert isinstance(item, RealMergeItem)
                     item_back = dataclasses.replace(item, counts_against_cap=False)
                     self._redispatch.appendleft(item_back)
                     continue
@@ -7868,9 +7877,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'Attempt 2 (retry against main {retry_main[:8]}): '
                 f'{retry.outcome.reason}'
             )
-            return SpeculativeItem(
-                request=req, merge_result=None, merge_wt=None,
-                base_sha=retry_main, speculative=False, skip_verify=False,
+            return DecidedItem(
+                request=req,
+                base_sha=retry_main, speculative=False,
                 immediate_outcome=MergeOutcome(
                     'blocked',
                     reason=combined_reason,
@@ -7884,9 +7893,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Non-retry Decided: branch-presence / already-merged / conflict /
         # non-conflict-failure / drop-guard — classify_and_merge already
         # emitted the matching event(s); just wrap its outcome.
-        return SpeculativeItem(
-            request=req, merge_result=None, merge_wt=None,
-            base_sha=actual_main, speculative=False, skip_verify=False,
+        return DecidedItem(
+            request=req,
+            base_sha=actual_main, speculative=False,
             immediate_outcome=result.outcome,
             failure_diagnostic=result.outcome.failure_diagnostic,
             started_monotonic=started_monotonic,
@@ -7995,7 +8004,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         else:
             item = entry_or_item
             lease = None
-            merge_wt = entry_or_item.merge_wt
+            merge_wt = item_merge_wt(entry_or_item)
             slot_held = entry_or_item.speculative
         req = item.request
 
@@ -8049,7 +8058,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
     async def _run_inflight_verify(
         self,
-        item: SpeculativeItem,
+        item: RealMergeItem,
         lease: Any,  # HostLease
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
@@ -8081,7 +8090,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         req = item.request
         merge_wt = item.merge_wt
         assert merge_wt is not None
-        assert item.merge_result is not None
         merge_commit = item.merge_result.merge_commit
         assert merge_commit is not None
         merge_commit = merge_commit.strip()
