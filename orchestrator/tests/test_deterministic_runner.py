@@ -1262,6 +1262,211 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
 
 # ---------------------------------------------------------------------------
+# Task 2091 — bound _default_inspect_unit's systemctl communicate() call
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestInspectUnitTimeoutHardening:
+    """DeterministicRunner — task 2091: a wedged unit-inspect must not hang.
+
+    Distinct from task 2090's outer run_fn guard (esc-2090-11): this covers
+    the systemctl `communicate()` call inside `_default_inspect_unit`, used
+    on BOTH the baseline inspect and the post-deploy verify inspect. A wedge
+    on the verify leg is caught by the existing `pid > 0` freshness check;
+    a wedge on the baseline leg needs its own guard (see
+    ``test_wedged_baseline_inspect_blocks_without_running_deploy``) since a
+    sentinel baseline would otherwise make the freshness comparison
+    trivially true instead of failing closed.
+    """
+
+    async def test_wedged_inspect_returns_mainpid_zero_sentinel(self, tmp_path: Path):
+        """A wedged systemctl call must time out and return the MainPID=0
+        sentinel directly, killing the stuck subprocess.
+
+        RED today: `_default_inspect_unit` awaits `proc.communicate()` with
+        no timeout — this call hangs forever instead of returning.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=queue,
+            inspect_timeout_secs=0.05,
+            reap_grace_secs=0.05,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        never_resolves = asyncio.Event()
+        mock_proc.communicate = AsyncMock(side_effect=never_resolves.wait)
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=None)
+
+        with patch('asyncio.create_subprocess_exec', AsyncMock(return_value=mock_proc)):
+            # Hang tripwire: if the fix regresses, fail loudly instead of
+            # stalling the suite.
+            result = await asyncio.wait_for(
+                runner._default_inspect_unit('orchestrator-reify.service'), timeout=5,
+            )
+
+        assert result == {
+            'MainPID': 0,
+            'ActiveState': '',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        mock_proc.kill.assert_called_once()
+
+    async def test_wedged_verify_inspect_drives_verify_fail_escalation(
+        self, tmp_path: Path,
+    ):
+        """End-to-end via run(): a wedged verify-leg inspect must produce
+        BLOCKED + exactly 1 pending infra_issue escalation, not a hang —
+        the MainPID=0 sentinel routes through the existing fresh-PID
+        verify-fail path rather than stranding the task.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='500', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        baseline_proc = MagicMock()
+        baseline_proc.communicate = AsyncMock(return_value=(
+            b'MainPID=100\nActiveState=active\n'
+            b'ActiveEnterTimestamp=Mon 2026-06-23 10:00:00 UTC\n'
+            b'ActiveEnterTimestampMonotonic=1000000\n',
+            b'',
+        ))
+
+        wedged_proc = MagicMock()
+        wedged_proc.pid = 12345
+        never_resolves = asyncio.Event()
+        wedged_proc.communicate = AsyncMock(side_effect=never_resolves.wait)
+        wedged_proc.kill = MagicMock()
+        wedged_proc.wait = AsyncMock(return_value=None)
+
+        procs = iter([baseline_proc, wedged_proc])
+
+        async def _fake_create_subprocess_exec(*args, **kwargs):
+            return next(procs)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            script_runner=script_runner,
+            inspect_timeout_secs=0.05,
+            reap_grace_secs=0.05,
+        )
+
+        with patch(
+            'asyncio.create_subprocess_exec', side_effect=_fake_create_subprocess_exec,
+        ):
+            # Hang tripwire: if the fix regresses, fail loudly instead of
+            # stalling the suite.
+            outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('500', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        wedged_proc.kill.assert_called_once()
+
+    async def test_wedged_baseline_inspect_blocks_without_running_deploy(
+        self, tmp_path: Path,
+    ):
+        """A wedged BASELINE-leg inspect must not silently make verification
+        trivially pass.
+
+        The wedged baseline returns the MainPID=0/ActiveState=''/monotonic=0
+        sentinel. The second (would-be verify-leg) subprocess is wired to a
+        REAL fresh post-deploy state (MainPID=200, monotonic=2_000_000) — the
+        exact input that would make the OLD, unguarded freshness comparison
+        (`new_monotonic > baseline_monotonic`, with baseline_monotonic=0)
+        trivially true and the `pid > 0` check also pass, silently reporting
+        a false-positive verified deploy. With the fix, run() must instead
+        block BEFORE the deploy script (run_fn) or the verify-leg inspect are
+        ever reached — so neither script_runner nor the second subprocess
+        should ever be invoked.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='501', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        wedged_proc = MagicMock()
+        wedged_proc.pid = 12345
+        never_resolves = asyncio.Event()
+        wedged_proc.communicate = AsyncMock(side_effect=never_resolves.wait)
+        wedged_proc.kill = MagicMock()
+        wedged_proc.wait = AsyncMock(return_value=None)
+
+        # If the (unfixed) code proceeded past the wedged baseline, this is a
+        # REAL, functioning fresh post-deploy state — not a hang — so the
+        # test can observe the actual (buggy) outcome rather than timing out.
+        verify_proc = MagicMock()
+        verify_proc.communicate = AsyncMock(return_value=(
+            b'MainPID=200\nActiveState=active\n'
+            b'ActiveEnterTimestamp=Mon 2026-06-23 10:01:00 UTC\n'
+            b'ActiveEnterTimestampMonotonic=2000000\n',
+            b'',
+        ))
+
+        procs = iter([wedged_proc, verify_proc])
+
+        async def _fake_create_subprocess_exec(*args, **kwargs):
+            return next(procs)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            script_runner=script_runner,
+            inspect_timeout_secs=0.05,
+            reap_grace_secs=0.05,
+        )
+
+        with patch(
+            'asyncio.create_subprocess_exec', side_effect=_fake_create_subprocess_exec,
+        ):
+            # Hang tripwire: if the fix regresses, fail loudly instead of
+            # stalling the suite.
+            outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('501', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        assert 'Baseline inspect failed' in pending[0].summary
+        wedged_proc.kill.assert_called_once()
+        # The deploy script must NOT run against an untrusted baseline, and
+        # the verify-leg subprocess must never be reached either.
+        script_runner.assert_not_called()
+        assert next(procs, None) is verify_proc, (
+            'verify_proc must be left untouched — run() must bail out before '
+            'the verify-leg inspect is ever invoked'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 2090 — Layer B: outer wall-clock guard around the cross-unit run_fn call
 # ---------------------------------------------------------------------------
 
