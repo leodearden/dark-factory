@@ -645,6 +645,14 @@ class Harness:
         # harness pattern as _on_park_stop_trip / _on_external_dep_block.
         self.scheduler._on_starvation_warn = self._file_starvation_info
         self.scheduler._on_starvation_resolve = self._resolve_starvation_info
+        # Wire the warm-base hard-down watchdog callbacks (task 2061): the
+        # scheduler probes base health once per tick via the injected async
+        # probe and reacts with the three injected callbacks.  Same declare-
+        # in-scheduler / install-in-harness pattern as the starvation watchdog.
+        self.scheduler._warm_base_health_probe = self._probe_warm_base_health
+        self.scheduler._on_warm_base_warn = self._file_warm_base_hard_down_notice
+        self.scheduler._on_warm_base_promote_l2 = self._promote_warm_base_hard_down_l2
+        self.scheduler._on_warm_base_resolve = self._resolve_warm_base_hard_down
         # --- Action-teardown suppression (task 1620, β Pair F / C3.2) ---
         # Counter of task_ids currently undergoing action-teardown (park/restart/abandon).
         # Stamped (incremented) before the status write + kill; decremented in the
@@ -3122,6 +3130,14 @@ Output JSON matching the schema. Every task must appear in the output.
     # Same class-level immutability guarantees as _SCHEDULER_PAUSE_SENTINEL.
     _NO_LANDINGS_SENTINEL: str = '__no_landings_breaker__'
 
+    # Synthetic task_id + agent_role for the warm-base hard-down watchdog
+    # (task 2061).  HOST-SCOPED — one warm-lane CoW seed base, so exactly one
+    # notice and (past the remediation window) one L2, deduped via
+    # get_by_task + agent_role filter.  Same class-level immutability
+    # guarantees as _NO_LANDINGS_SENTINEL.
+    _WARM_BASE_HARD_DOWN_SENTINEL: str = '__warm_base_hard_down__'
+    _WARM_BASE_HARD_DOWN_ROLE: str = 'orchestrator-warm-base-hard-down'
+
     def _file_scheduler_pause_escalation(self, reason: str) -> None:
         """File an L1 escalation when scheduler dispatch is paused.
 
@@ -3329,6 +3345,163 @@ Output JSON matching the schema. Every task must appear in the output.
                 'Starvation watchdog: auto-resolved INFO escalation %s for task %s',
                 esc.id,
                 task_id,
+            )
+
+    async def _probe_warm_base_health(self) -> str:
+        """Bridge GitOps._warm_lane_base_resolvable to the scheduler's
+        injected-callback string contract (task 2061).
+
+        Installed on ``self.scheduler._warm_base_health_probe``.  Returns
+        ``'ok'`` when the warm-lane pool is disabled (``git_ops.warm_lane_pool
+        is None``) — a disabled pool is never "hard-down".  Otherwise
+        delegates to the synchronous ``GitOps._warm_lane_base_resolvable()``
+        (pure filesystem check, no await inside) and returns its
+        ``WarmBaseHealth`` member's ``.value``.
+        """
+        if self.git_ops.warm_lane_pool is None:
+            return 'ok'
+        return self.git_ops._warm_lane_base_resolvable().value
+
+    async def _file_warm_base_hard_down_notice(
+        self, *, summary: str, detail: str,
+    ) -> None:
+        """File a non-blocking INFO escalation for the warm-base hard-down
+        watchdog (task 2061).
+
+        Installed on ``self.scheduler._on_warm_base_warn``.  Mirrors
+        ``_file_no_landings_info_escalation`` (global sentinel task_id, one
+        open INFO at a time, best-effort).
+
+        Deliberately does NOT call ``set_task_status`` or halt anything
+        itself — the scheduler's own ``_warm_base_hard_down`` latch already
+        halts dispatch; this is a pure observation signal.  Deduped: if an
+        open notice already exists (pending, level=0, this role), this is a
+        no-op.  Best-effort: any submit failure is swallowed and logged.
+
+        **Routing note:** ``severity='info', level=0``.  Level-0 INFO is
+        surfaced via the steward's pending-escalation view and external
+        monitors/dashboards/webhooks; it does NOT auto-promote and does NOT
+        additionally halt the scheduler (the watchdog's own latch already did).
+        """
+        if not self._escalation_queue:
+            return
+        try:
+            existing = [
+                e
+                for e in self._escalation_queue.get_by_task(
+                    self._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+                )
+                if e.agent_role == self._WARM_BASE_HARD_DOWN_ROLE and e.level == 0
+            ]
+            if existing:
+                return  # dedup: one open notice at a time
+            from escalation.models import Escalation  # noqa: PLC0415
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._WARM_BASE_HARD_DOWN_SENTINEL),
+                task_id=self._WARM_BASE_HARD_DOWN_SENTINEL,
+                agent_role=self._WARM_BASE_HARD_DOWN_ROLE,
+                severity='info',
+                category='infra_issue',
+                summary=summary[:200],
+                detail=detail,
+                suggested_action='Run reify/scripts/ensure-warm-base.sh',
+                level=0,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning(
+                'Warm-base hard-down: filed INFO escalation %s', esc.id,
+            )
+        except Exception:
+            logger.warning(
+                'Warm-base hard-down: failed to file INFO escalation',
+                exc_info=True,
+            )
+
+    async def _promote_warm_base_hard_down_l2(
+        self, *, summary: str, detail: str,
+    ) -> None:
+        """Promote the ONE born-at-L2 escalation for a warm base stuck ABSENT
+        past the configured remediation window (task 2061).
+
+        Installed on ``self.scheduler._on_warm_base_promote_l2``.  Filed
+        ``severity='critical'`` (∈ ``BORN_AT_L2_SEVERITIES``) and ``level=2``
+        so it routes straight to a human/L2-watcher, bypassing the auto-
+        watcher — the reify reseed ladder is presumed stuck (a healthy ladder
+        would have cleared the notice via ``_resolve_warm_base_hard_down``
+        before the window elapsed).  Deduped: if an open L2 already exists
+        (pending, level=2, this role), this is a no-op.  Best-effort: any
+        submit failure is swallowed and logged.
+        """
+        if not self._escalation_queue:
+            return
+        try:
+            existing = [
+                e
+                for e in self._escalation_queue.get_by_task(
+                    self._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+                )
+                if e.agent_role == self._WARM_BASE_HARD_DOWN_ROLE and e.level == 2
+            ]
+            if existing:
+                return  # dedup: one open L2 at a time
+            from escalation.models import Escalation  # noqa: PLC0415
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._WARM_BASE_HARD_DOWN_SENTINEL),
+                task_id=self._WARM_BASE_HARD_DOWN_SENTINEL,
+                agent_role=self._WARM_BASE_HARD_DOWN_ROLE,
+                severity='critical',
+                category='infra_issue',
+                summary=summary[:200],
+                detail=detail,
+                suggested_action='Run reify/scripts/ensure-warm-base.sh',
+                level=2,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning(
+                'Warm-base hard-down: promoted L2 escalation %s (stuck past window)',
+                esc.id,
+            )
+        except Exception:
+            logger.warning(
+                'Warm-base hard-down: failed to promote L2 escalation',
+                exc_info=True,
+            )
+
+    async def _resolve_warm_base_hard_down(self) -> None:
+        """Resolve both the notice and any promoted L2 for the warm-base
+        hard-down watchdog (task 2061).
+
+        Installed on ``self.scheduler._on_warm_base_resolve``, called when the
+        probe reports the base healthy again.  Mirrors
+        ``_resolve_no_landings_info_escalation`` — resolves ALL pending
+        escalations for the sentinel+role (both the level-0 notice and any
+        level-2 promotion), idempotent (``EscalationQueue.resolve`` is a
+        no-op if already resolved).  Best-effort: no-op when
+        ``_escalation_queue`` is None or resolve raises.
+        """
+        if not self._escalation_queue:
+            return
+        try:
+            pending = [
+                e
+                for e in self._escalation_queue.get_by_task(
+                    self._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+                )
+                if e.agent_role == self._WARM_BASE_HARD_DOWN_ROLE
+            ]
+            for esc in pending:
+                self._escalation_queue.resolve(
+                    esc.id,
+                    'auto-resolved: warm-lane base is healthy again',
+                    resolved_by=self._WARM_BASE_HARD_DOWN_ROLE,
+                )
+                logger.info(
+                    'Warm-base hard-down: auto-resolved escalation %s', esc.id,
+                )
+        except Exception:
+            logger.warning(
+                'Warm-base hard-down: failed to resolve escalation(s)',
+                exc_info=True,
             )
 
     # ── No-landings circuit-breaker helpers (θ=1893, PRD §5.5) ──────────────
