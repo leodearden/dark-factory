@@ -11847,6 +11847,82 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"status; got section:\n{section_body!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_live_workflow_signals_section_drops_orchestrator_signal_for_blocked_deterministic_task(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """A BLOCKED task's ONLY live signal (the project-wide orchestrator lock) is
+        dropped when the task is deterministic (never acquires a worktree/branch —
+        routed to DeterministicRunner), so it is NOT listed under Live-Workflow
+        Signals — while a normal blocked task with the same (orchestrator-only)
+        evidence IS still listed, because it may legitimately auto-unblock and be
+        mid-pipeline (task 2031).
+
+        Drives the REAL (task_kind-aware) detect_live_workflow — does NOT
+        monkeypatch it — to prove the renderer actually threads
+        metadata.task_kind through to the detector rather than just filtering
+        elsewhere.
+        """
+        import subprocess
+
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        blocked_deterministic_id = '561'
+        blocked_normal_id = '742'
+        blocked_deterministic_task = {
+            'id': int(blocked_deterministic_id),
+            'title': 'Blocked deterministic task',
+            'status': 'blocked',
+            'metadata': {'task_kind': 'deterministic'},
+        }
+        blocked_normal_task = {
+            'id': int(blocked_normal_id),
+            'title': 'Blocked normal task',
+            'status': 'blocked',
+        }
+
+        # Project-wide orchestrator lock reports live...
+        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+
+        # ...and both git-derived signals are False for every branch (no worktree
+        # registered, unparseable "commit timestamp" => recent_commit fail-safe
+        # False), so orchestrator_live is the ONLY signal in play for both tasks.
+        def _no_git_signals(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout='worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n',
+                stderr='',
+            )
+
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        stage.filtered_task_tree = self._make_filtered_tree_with_tasks(
+            [blocked_deterministic_task, blocked_normal_task]
+        )
+
+        with patch('subprocess.run', side_effect=_no_git_signals):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Live-Workflow Signals' in payload, (
+            f"Expected '### Live-Workflow Signals' section (the normal blocked task "
+            f"is live via the orchestrator signal); got snippet:\n{payload[-500:]!r}"
+        )
+        section_start = payload.find('### Live-Workflow Signals')
+        section_end = payload.find('\n#', section_start + 1)
+        section_body = payload[section_start:section_end if section_end != -1 else None]
+
+        assert f'task/{blocked_normal_id}' in section_body, (
+            f"Expected normal blocked task 742 (orchestrator signal legitimately "
+            f"fires — may auto-unblock mid-pipeline) listed; got section:\n{section_body!r}"
+        )
+        assert f'task/{blocked_deterministic_id}' not in section_body, (
+            f"Expected blocked deterministic task 561 NOT listed — its only signal "
+            f"(the project-wide orchestrator lock) must be dropped since a "
+            f"deterministic task never acquires a worktree/branch of its own; "
+            f"got section:\n{section_body!r}"
+        )
+
 
 class TestEnforceStage2SummaryPoolCap:
     """_enforce_stage2_summary_pool_cap trims oldest pool members to cap=2."""
