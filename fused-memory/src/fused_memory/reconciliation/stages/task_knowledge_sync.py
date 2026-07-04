@@ -2006,6 +2006,14 @@ def _render_live_workflow_section(
     drop the project-wide orchestrator_live signal for that task while leaving
     its per-task worktree/commit signals unaffected.
 
+    Each task's ``metadata.task_kind`` is also forwarded.  A BLOCKED
+    deterministic task (``task_kind == 'deterministic'``) never acquires a
+    worktree/branch of its own — it is routed to ``DeterministicRunner``
+    instead — so the project-wide orchestrator_live signal is dropped for it
+    too, the same way it is for never-dispatched statuses.  A normal blocked
+    task (``task_kind`` absent or not ``'deterministic'``) is unaffected and
+    keeps the signal, since it may legitimately auto-unblock mid-pipeline.
+
     Args:
         tasks: Task dicts from the active/proactive-sample pool.  Only tasks
             with a parseable ``id`` are inspected (non-int ids are skipped).
@@ -2039,9 +2047,13 @@ def _render_live_workflow_section(
         if raw_id is None:
             continue
         task_id = str(raw_id)
+        raw_metadata = task.get('metadata')
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        task_kind = metadata.get('task_kind')
         try:
             liveness = detect_live_workflow(
-                task_id, project_root, status=task.get('status'), **kwargs
+                task_id, project_root,
+                status=task.get('status'), task_kind=task_kind, **kwargs
             )
         except Exception:
             logger.warning(
