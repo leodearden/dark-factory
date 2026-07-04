@@ -18,11 +18,15 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import WIP_SAFETY_COMMIT_PREFIXES, GitOps, _run, is_wip_safety_commit
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.workflow import TaskWorkflow
 
 # ---------------------------------------------------------------------------
 # step-1 RED: is_wip_safety_commit predicate + WIP_SAFETY_COMMIT_PREFIXES
@@ -157,5 +161,168 @@ class TestGetCommitSubjects:
         head_sha = head_sha.strip()
 
         result = await git_ops.get_commit_subjects(git_repo, head_sha)
+
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: TaskWorkflow._detect_tip_wip_commits
+# ---------------------------------------------------------------------------
+#
+# Real-git _make_workflow pattern, mirroring test_rebase_verify_cost.py /
+# test_verify_phase_rebase.py — real GitOps + a real worktree created via
+# git_ops.create_worktree, heavy collaborators (scheduler/briefing/mcp) mocked.
+
+
+@pytest.fixture
+def task_assignment() -> TaskAssignment:
+    return TaskAssignment(
+        task_id='42',
+        task={
+            'id': '42', 'title': 'X', 'description': '',
+            'status': 'pending', 'metadata': {'files': ['lib']},
+            'dependencies': [],
+        },
+        modules=['lib'],
+    )
+
+
+def _make_workflow(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    assignment: TaskAssignment,
+    worktree: Path,
+) -> tuple[TaskWorkflow, TaskArtifacts]:
+    """Wire a minimal TaskWorkflow with heavy collaborators mocked.
+
+    Mirrors the pattern in test_rebase_verify_cost.py._make_workflow.
+    """
+    workflow = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=MagicMock(),  # type: ignore[arg-type]
+        briefing=MagicMock(),  # type: ignore[arg-type]
+        mcp=MagicMock(),  # type: ignore[arg-type]
+    )
+    workflow.worktree = worktree
+    artifacts = TaskArtifacts(worktree)
+    artifacts.init('42', 'X', 'desc', base_commit='base-sha-old')
+    workflow.artifacts = artifacts
+    workflow.plan = {'task_id': '42', 'steps': [], 'prerequisites': []}
+    return workflow, artifacts
+
+
+@pytest.mark.asyncio
+class TestDetectTipWipCommits:
+    async def test_wip_commit_at_head_is_detected(self, config, git_ops, task_assignment):
+        """A real WIP safety-commit sitting at HEAD is surfaced."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'wip.txt').write_text('uncommitted work\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
+        assert wip_sha, 'Setup: expected a real commit to be made'
+
+        result = await workflow._detect_tip_wip_commits()
+
+        assert result == [
+            {'sha': wip_sha, 'subject': 'chore: save WIP before requeue rebase'},
+        ]
+
+    async def test_normal_commit_at_head_returns_empty(self, config, git_ops, task_assignment):
+        """A normal (non-WIP) commit at HEAD must not be surfaced."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'real.txt').write_text('real work\n')
+        await git_ops.commit(wt, 'feat: GREEN — real implementation')
+
+        result = await workflow._detect_tip_wip_commits()
+
+        assert result == []
+
+    async def test_wip_commit_already_recorded_on_done_step_is_deduped(
+        self, config, git_ops, task_assignment,
+    ):
+        """A WIP commit already attributed to a done plan step is not re-surfaced."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'wip.txt').write_text('uncommitted work\n')
+        wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
+        assert wip_sha
+
+        workflow.plan = {
+            'task_id': '42',
+            'prerequisites': [],
+            'steps': [{'id': 'step-1', 'status': 'done', 'commit': wip_sha}],
+        }
+
+        result = await workflow._detect_tip_wip_commits()
+
+        assert result == []
+
+    async def test_wip_commit_not_at_tip_returns_empty(self, config, git_ops, task_assignment):
+        """A normal commit on top of a WIP commit means the WIP is no longer at HEAD."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'wip.txt').write_text('uncommitted work\n')
+        await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
+        (wt / 'real.txt').write_text('real work\n')
+        await git_ops.commit(wt, 'feat: GREEN — real implementation')
+
+        result = await workflow._detect_tip_wip_commits()
+
+        assert result == []
+
+    async def test_worktree_none_returns_empty(self, config, git_ops, task_assignment):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt_info.path)
+        artifacts.update_base_commit(wt_info.base_commit)
+        workflow.worktree = None
+
+        result = await workflow._detect_tip_wip_commits()
+
+        assert result == []
+
+    async def test_git_ops_none_returns_empty(self, config, git_ops, task_assignment):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt_info.path)
+        artifacts.update_base_commit(wt_info.base_commit)
+        workflow.git_ops = None
+
+        result = await workflow._detect_tip_wip_commits()
+
+        assert result == []
+
+    async def test_base_commit_unset_returns_empty(self, config, git_ops, task_assignment):
+        """artifacts.read_base_commit() falsy (no base_commit stamped) → []."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow = TaskWorkflow(
+            assignment=task_assignment,
+            config=config,
+            git_ops=git_ops,
+            scheduler=MagicMock(),  # type: ignore[arg-type]
+            briefing=MagicMock(),  # type: ignore[arg-type]
+            mcp=MagicMock(),  # type: ignore[arg-type]
+        )
+        workflow.worktree = wt
+        artifacts = TaskArtifacts(wt)
+        artifacts.init('42', 'X', 'desc')  # no base_commit
+        workflow.artifacts = artifacts
+        workflow.plan = {'task_id': '42', 'steps': [], 'prerequisites': []}
+
+        result = await workflow._detect_tip_wip_commits()
 
         assert result == []
