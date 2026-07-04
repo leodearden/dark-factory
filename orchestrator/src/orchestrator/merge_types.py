@@ -826,6 +826,41 @@ class SpeculativeItem:
             )
 
 
+@dataclass
+class MergedOk:
+    """A merge actually happened — returned by ``classify_and_merge`` on success.
+
+    The REAL arm of the classify_and_merge sum type (mirrors SpeculativeItem's
+    REAL-xor-DECIDED shape).  ``branch_tip`` is the rev-parsed HEAD of the
+    source branch captured during the already-merged check, unifying the
+    three separate tip-captures previously duplicated across
+    ``_do_merge``/``_merger_loop``/``_remerge`` into one value that feeds
+    ``merged_branch_tip`` downstream.
+    """
+
+    merge_result: MergeResult
+    merge_wt: Path | None
+    branch_tip: str | None
+
+
+@dataclass
+class Decided:
+    """A terminal MergeOutcome was reached — returned by ``classify_and_merge``
+    on any non-success path (missing branch, already-merged, conflict,
+    non-conflict failure, or drop-guard).
+
+    The DECIDED arm of the classify_and_merge sum type.  ``merge_result`` is
+    populated only for the conflict / non-conflict-failure paths (it carries
+    the failed ``MergeResult`` so ``_remerge``'s speculation-race retry gate
+    can inspect ``.success``/``.conflicts``/``.details``/``.pre_merge_sha``);
+    it is ``None`` for the branch-presence / already-merged / drop-guard
+    paths, which never attempt a merge.
+    """
+
+    outcome: MergeOutcome
+    merge_result: MergeResult | None = None
+
+
 class InflightStatus(StrEnum):
     """Sentinel status values for :class:`InflightEntry` / :class:`InflightVerifyResult`.
 
