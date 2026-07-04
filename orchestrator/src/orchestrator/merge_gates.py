@@ -592,8 +592,15 @@ async def _finalize_advanced_merge(
         verdict = await gate.run(ctx)
         if verdict.passed:
             continue
+        # GateVerdict.block() always populates reason/emit_subtype; the
+        # field type is Optional only because it's shared with the
+        # all-None .ok() case.  Bind to locals and narrow once for pyright.
+        emit_subtype = verdict.emit_subtype
+        reason = verdict.reason
+        assert emit_subtype is not None
+        assert reason is not None
         _emit_merge_attempt(
-            event_store, req.task_id, verdict.emit_subtype,
+            event_store, req.task_id, emit_subtype,
             duration_ms=_elapsed_ms(started_monotonic),
             train_id=train_id,
             member_task_ids=member_task_ids,
@@ -606,7 +613,7 @@ async def _finalize_advanced_merge(
             terminal = await gate.on_blocked(ctx)
         if terminal is None:
             terminal = MergeOutcome(
-                'blocked', merge_sha=verdict.merge_sha, reason=verdict.reason,
+                'blocked', merge_sha=verdict.merge_sha, reason=reason,
             )
         break
 
