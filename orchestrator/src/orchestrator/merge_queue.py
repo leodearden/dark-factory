@@ -3920,8 +3920,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._finalizing_head: InflightEntry | None = None
         # Persistent warm merge-verify worktree: counts verifying attempts so
         # _safety_valve_due can fire the periodic cold-verify (PRD §10 invariant 6).
-        # Only incremented when not item.skip_verify; never reset so the counter
-        # covers the full worker lifetime (cross-submission).
+        # Incremented on every LOCAL-lease verify attempt — task-1724 made verify
+        # unconditional, and the skip_verify field it used to gate against was
+        # retired by task ο (RealMergeItem carries no such escape hatch). Never
+        # reset so the counter covers the full worker lifetime (cross-submission).
         self._verify_attempt_count: int = 0
         # Lever C drift detective: land counter and in-memory quarantine set.
         # _drift_land_count increments on every 'done' land; _runner_quarantine
