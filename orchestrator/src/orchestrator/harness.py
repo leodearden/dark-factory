@@ -313,6 +313,36 @@ async def _recon_inspect_unit(unit: str) -> dict:
     return result
 
 
+def _is_stranded_deterministic_shape(metadata: dict | None) -> bool:
+    """Return True iff *metadata* matches the task-2059 stranded-deterministic shape.
+
+    Metadata-only predicate (the empty-pending-escalation-queue check is I/O
+    and is performed by the caller).  True iff ALL of:
+      - ``task_kind == 'deterministic'``
+      - ``before_done`` is a dict with a truthy ``target_unit``
+      - ``before_done_ran_at`` is truthy (the deploy action ran)
+      - ``before_done_verified_at``, ``gate_escalated_at``, and
+        ``done_provenance`` are ALL falsy (no terminal outcome was ever recorded)
+
+    None/non-dict *metadata* and a non-dict ``before_done`` are treated as
+    non-matching rather than raising.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get('task_kind') != 'deterministic':
+        return False
+    before_done = metadata.get('before_done')
+    if not isinstance(before_done, dict) or not before_done.get('target_unit'):
+        return False
+    if not metadata.get('before_done_ran_at'):
+        return False
+    return not (
+        metadata.get('before_done_verified_at')
+        or metadata.get('gate_escalated_at')
+        or metadata.get('done_provenance')
+    )
+
+
 def _acquire_project_lock(project_root: Path) -> IO:
     """Acquire an exclusive flock on a per-project lockfile.
 
