@@ -4436,6 +4436,19 @@ class GitOps:
             WarmBaseHealth.INDETERMINATE — a stat/readlink error occurred
                 (e.g. non-directory base, torn read racing a concurrent
                 rewrite).  Fail-safe: never treated as ABSENT by callers.
+
+        Deliberately NOT memoized/cached (reviewer_comprehensive performance,
+        task 2061 amendment pass): every call is a small, bounded number of
+        syscalls (a stat/readlink, then at most one ``next(iterdir())`` that
+        stops after its first entry — never a full directory scan or
+        recursive walk), regardless of how large the base directory is. This
+        keeps the check cheap enough to call unconditionally from the
+        per-tick probe (``Scheduler._apply_warm_base_hard_down_watchdog``,
+        once per scheduler tick) and from the pre-acquire gate in
+        :meth:`acquire_warm_lane` (once per lane-acquire attempt) without
+        throttling. Caching would also delay observing a genuine recovery by
+        up to one cache TTL, undermining the "auto-clears within seconds"
+        behaviour documented on the scheduler watchdog above.
         """
         try:
             base_path = self.warm_lane_base_target_path
