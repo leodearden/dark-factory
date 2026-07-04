@@ -26,6 +26,7 @@ mirroring task α's test_merge_types.py:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -287,4 +288,428 @@ def test_merge_queue_reexports_identical_objects() -> None:
         assert mq_obj is mg_obj, (
             f'{name}: orchestrator.merge_queue.{name} and '
             f'orchestrator.merge_gates.{name} must be the identical object'
+        )
+
+
+# --- Declarative post-advance gate chain (MQ-refactor task λ) --------------
+#
+# GateVerdict / Gate / _PostAdvanceContext / POST_ADVANCE_GATES /
+# _run_equivalence_gate / _run_pyright_gate do not exist yet in
+# orchestrator.merge_gates — every test below is RED via ImportError until
+# step-2 lands the building blocks.
+
+
+def test_gate_verdict_value_type() -> None:
+    """GateVerdict is a 2-state frozen value object: ok() | block(...)."""
+    import dataclasses
+
+    from orchestrator.merge_gates import GateVerdict
+
+    ok = GateVerdict.ok()
+    assert ok.passed is True
+    assert ok.reason is None
+    assert ok.merge_sha is None
+    assert ok.emit_subtype is None
+
+    blocked = GateVerdict.block(reason='r', merge_sha='s', emit_subtype='t')
+    assert blocked.passed is False
+    assert blocked.reason == 'r'
+    assert blocked.merge_sha == 's'
+    assert blocked.emit_subtype == 't'
+
+    # Frozen: dataclasses.replace works (produces a new instance)...
+    replaced = dataclasses.replace(ok, reason='changed')
+    assert replaced.reason == 'changed'
+    assert ok.reason is None
+    # ...but direct attribute assignment raises.
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ok.reason = 'mutated'  # type: ignore[misc]
+
+
+def test_gate_and_context_construct() -> None:
+    """Gate defaults on_blocked=None; _PostAdvanceContext bundles the
+    documented fields verbatim (single typed argument for gate callables)."""
+    from orchestrator.merge_gates import Gate, GateVerdict, _PostAdvanceContext
+
+    async def _spy_run(ctx: object) -> GateVerdict:
+        return GateVerdict.ok()
+
+    gate = Gate(name='x', run=_spy_run)
+    assert gate.name == 'x'
+    assert gate.run is _spy_run
+    assert gate.on_blocked is None
+
+    git_ops = MagicMock()
+    req = MagicMock()
+    ctx = _PostAdvanceContext(
+        git_ops=git_ops,
+        req=req,
+        event_store=None,
+        advanced_sha='adv-sha',
+        base_sha='base-sha',
+        resolved_merged_tip='tip-sha',
+        allow_worktree_head_fallback=True,
+        started_monotonic=0.0,
+        train_id=None,
+        member_task_ids=None,
+        chain_ctx=None,
+        merged_branch_tip=None,
+        log_label='',
+    )
+    assert ctx.git_ops is git_ops
+    assert ctx.req is req
+    assert ctx.event_store is None
+    assert ctx.advanced_sha == 'adv-sha'
+    assert ctx.base_sha == 'base-sha'
+    assert ctx.resolved_merged_tip == 'tip-sha'
+    assert ctx.allow_worktree_head_fallback is True
+    assert ctx.started_monotonic == 0.0
+    assert ctx.train_id is None
+    assert ctx.member_task_ids is None
+    assert ctx.chain_ctx is None
+    assert ctx.merged_branch_tip is None
+    assert ctx.log_label == ''
+
+
+def test_post_advance_gates_registry_shape() -> None:
+    """POST_ADVANCE_GATES is [equivalence, pyright], in order; only the
+    equivalence gate carries the γ2 auto-chain on_blocked hook; the shim
+    re-exports the identical list object (not a copy)."""
+    import orchestrator.merge_gates as merge_gates
+    import orchestrator.merge_queue as merge_queue
+    from orchestrator.merge_gates import POST_ADVANCE_GATES, Gate
+
+    assert isinstance(POST_ADVANCE_GATES, list)
+    assert all(isinstance(g, Gate) for g in POST_ADVANCE_GATES)
+    assert [g.name for g in POST_ADVANCE_GATES] == ['equivalence', 'pyright']
+
+    equivalence_gate, pyright_gate = POST_ADVANCE_GATES
+    assert callable(equivalence_gate.run)
+    assert callable(pyright_gate.run)
+    assert equivalence_gate.on_blocked is not None
+    assert callable(equivalence_gate.on_blocked)
+    assert pyright_gate.on_blocked is None
+
+    assert merge_queue.POST_ADVANCE_GATES is merge_gates.POST_ADVANCE_GATES
+
+
+@pytest.mark.asyncio
+class TestGateFunctionsReachBack:
+    """_run_equivalence_gate / _run_pyright_gate unit + reach-back contract.
+
+    Mirrors ``TestReachBackRouting`` above: each block-path test patches the
+    SAME dependency in both namespaces with CONTRASTING values so the
+    assertion is unambiguous about which one governed the verdict.
+    """
+
+    def _make_ctx(self, **overrides: object):
+        from orchestrator.merge_gates import _PostAdvanceContext
+
+        req = MagicMock()
+        req.task_id = 'task-gate-unit'
+        req.worktree = MagicMock()
+        req.config = MagicMock()
+        req.module_configs = []
+        defaults: dict = dict(
+            git_ops=MagicMock(),
+            req=req,
+            event_store=None,
+            advanced_sha='advanced-sha-123',
+            base_sha='base-sha-456',
+            resolved_merged_tip='resolved-tip',
+            allow_worktree_head_fallback=True,
+            started_monotonic=0.0,
+            train_id=None,
+            member_task_ids=None,
+            chain_ctx=None,
+            merged_branch_tip=None,
+            log_label='',
+        )
+        defaults.update(overrides)
+        return _PostAdvanceContext(**defaults)
+
+    async def test_run_equivalence_gate_ok_when_clean(self) -> None:
+        from orchestrator.merge_gates import _run_equivalence_gate
+
+        ctx = self._make_ctx()
+        with patch(
+            'orchestrator.merge_queue._check_post_merge_equivalence',
+            AsyncMock(return_value=[]),
+        ):
+            verdict = await _run_equivalence_gate(ctx)
+
+        assert verdict.passed is True
+
+    async def test_run_equivalence_gate_reachback_governs_block(self) -> None:
+        from orchestrator.merge_gates import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _run_equivalence_gate,
+        )
+
+        ctx = self._make_ctx()
+        with (
+            # Naive-resolution target: clean → would pass if this governed.
+            patch(
+                'orchestrator.merge_gates._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            # Reach-back target: diverged → must govern the verdict.
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=['x.py']),
+            ),
+        ):
+            verdict = await _run_equivalence_gate(ctx)
+
+        assert verdict.passed is False
+        assert verdict.merge_sha == ctx.advanced_sha
+        assert verdict.emit_subtype == 'post_merge_equivalence_failed'
+        assert verdict.reason is not None
+        assert verdict.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+
+    async def test_run_pyright_gate_ok_when_clean(self) -> None:
+        from orchestrator.merge_gates import _run_pyright_gate
+
+        ctx = self._make_ctx()
+        clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+        with patch(
+            'orchestrator.merge_queue._check_post_merge_pyright',
+            AsyncMock(return_value=clean),
+        ):
+            verdict = await _run_pyright_gate(ctx)
+
+        assert verdict.passed is True
+
+    async def test_run_pyright_gate_reachback_governs_block(self) -> None:
+        from orchestrator.merge_gates import (
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            _run_pyright_gate,
+        )
+
+        ctx = self._make_ctx()
+        naive_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+        reachback_broken = MagicMock(broken=True, failing_subprojects=['pkg'], detail='boom')
+        with (
+            # Naive-resolution target: clean → would pass if this governed.
+            patch(
+                'orchestrator.merge_gates._check_post_merge_pyright',
+                AsyncMock(return_value=naive_clean),
+            ),
+            # Reach-back target: broken → must govern the verdict.
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=reachback_broken),
+            ),
+        ):
+            verdict = await _run_pyright_gate(ctx)
+
+        assert verdict.passed is False
+        assert verdict.merge_sha == ctx.advanced_sha
+        assert verdict.emit_subtype == 'post_merge_pyright_broken'
+        assert verdict.reason is not None
+        assert verdict.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+class TestFinalizeDrivesRegistry:
+    """_finalize_advanced_merge iterates POST_ADVANCE_GATES (task λ).
+
+    RED against the still-inline body: ``test_finalize_runs_registered_gate``
+    and ``test_finalize_logs_gate_names_per_landing`` fail today because the
+    inline _finalize_advanced_merge never reads POST_ADVANCE_GATES at all.
+    The remaining two tests pin the existing equivalence-block / γ2-chain
+    behavior so it survives the coming registry-driven rewrite unchanged.
+    """
+
+    def _make_finalize_args(self, **overrides: object) -> dict:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        git_ops.cleanup_merge_worktree = AsyncMock()
+        git_ops._last_advanced_sha = 'finalize-registry-sha'
+        req = MagicMock()
+        req.task_id = 'task-finalize-registry'
+        req.branch = 'br-finalize-registry'
+        req.worktree = MagicMock()
+        req.config = MagicMock()
+        req.module_configs = []
+        defaults: dict = dict(
+            git_ops=git_ops,
+            req=req,
+            event_store=None,
+            merge_commit_fallback='fallback-sha',
+            base_sha='base-sha',
+            started_monotonic=0.0,
+            cas_retries={},
+            timeouts={},
+            enospc_retries={},
+        )
+        defaults.update(overrides)
+        return defaults
+
+    async def test_finalize_runs_registered_gate(self, monkeypatch) -> None:
+        """Headline signal: a gate appended to POST_ADVANCE_GATES runs during
+        _finalize_advanced_merge WITHOUT any edit to _finalize's body."""
+        import orchestrator.merge_gates as merge_gates
+        from orchestrator.merge_gates import Gate, GateVerdict, _finalize_advanced_merge
+
+        spy_run = AsyncMock(return_value=GateVerdict.ok())
+        monkeypatch.setattr(
+            merge_gates, 'POST_ADVANCE_GATES',
+            [*merge_gates.POST_ADVANCE_GATES, Gate('noop-probe', spy_run)],
+        )
+
+        clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
+        args = self._make_finalize_args()
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=clean_pyright),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(**args)
+
+        spy_run.assert_awaited_once()
+        assert outcome.status == 'done'
+        args['git_ops'].push_main.assert_awaited_once()
+
+    async def test_finalize_logs_gate_names_per_landing(self, caplog) -> None:
+        from orchestrator.merge_gates import _finalize_advanced_merge
+
+        clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
+        args = self._make_finalize_args()
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=clean_pyright),
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            await _finalize_advanced_merge(**args)
+
+        matching = [
+            r for r in caplog.records
+            if 'post-advance gates run:' in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f'expected exactly one gate-names INFO line, got {len(matching)}: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        assert 'equivalence' in matching[0].getMessage()
+        assert 'pyright' in matching[0].getMessage()
+
+    async def test_finalize_equivalence_block_via_registry(self, caplog) -> None:
+        from orchestrator.merge_gates import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        args = self._make_finalize_args(chain_ctx=None)
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=['f.py']),
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            outcome = await _finalize_advanced_merge(**args)
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+        assert outcome.merge_sha == args['git_ops']._last_advanced_sha
+        args['git_ops'].push_main.assert_not_awaited()
+
+        gate_lines = [
+            r.getMessage() for r in caplog.records
+            if 'post-advance gates run:' in r.getMessage()
+        ]
+        assert len(gate_lines) == 1, (
+            f'expected exactly one gate-names INFO line, got: {gate_lines}'
+        )
+        assert 'equivalence' in gate_lines[0]
+        assert 'pyright' not in gate_lines[0]
+
+    async def test_finalize_pyright_block_via_registry(self, caplog) -> None:
+        """Second-gate-in-chain path: equivalence passes, pyright blocks.
+
+        This is the case the registry refactor changes the most — a
+        terminal built from a gate WITHOUT an on_blocked hook, reached only
+        after a prior gate in the chain has already run and passed.
+        """
+        from orchestrator.merge_gates import (
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            _finalize_advanced_merge,
+        )
+
+        broken_pyright = MagicMock(
+            broken=True, failing_subprojects=['pkg'], detail='pyright-detail',
+        )
+        args = self._make_finalize_args(chain_ctx=None)
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=broken_pyright),
+            ),
+            caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
+        ):
+            outcome = await _finalize_advanced_merge(**args)
+
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)
+        assert outcome.merge_sha == args['git_ops']._last_advanced_sha
+        args['git_ops'].push_main.assert_not_awaited()
+
+        gate_lines = [
+            r.getMessage() for r in caplog.records
+            if 'post-advance gates run:' in r.getMessage()
+        ]
+        assert len(gate_lines) == 1, (
+            f'expected exactly one gate-names INFO line, got: {gate_lines}'
+        )
+        assert 'equivalence' in gate_lines[0]
+        assert 'pyright' in gate_lines[0]
+
+    async def test_finalize_gamma2_chain_via_registry(self) -> None:
+        from orchestrator.merge_gates import _finalize_advanced_merge, _GenerationChainContext
+        from orchestrator.merge_types import MergeOutcome
+
+        chain_ctx = _GenerationChainContext(
+            queue=MagicMock(), counts={}, max_auto_generations=3,
+        )
+        chained_outcome = MergeOutcome('superseded', merge_sha='chained-sha')
+        event_store = MagicMock()
+        args = self._make_finalize_args(
+            chain_ctx=chain_ctx, merged_branch_tip='trusted-tip', event_store=event_store,
+        )
+
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=['f.py']),
+            ),
+            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch(
+                'orchestrator.merge_queue._maybe_auto_chain_generation',
+                AsyncMock(return_value=chained_outcome),
+            ) as maybe_chain_mock,
+        ):
+            outcome = await _finalize_advanced_merge(**args)
+
+        assert outcome is chained_outcome
+        maybe_chain_mock.assert_awaited_once()
+
+        emitted = [call.kwargs['data']['outcome'] for call in event_store.emit.call_args_list]
+        assert emitted == ['post_merge_equivalence_failed', 'post_merge_generation_chained'], (
+            f'expected the equivalence-failed emit before the chained emit, got: {emitted}'
         )
