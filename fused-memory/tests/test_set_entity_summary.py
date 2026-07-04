@@ -261,3 +261,134 @@ class TestMemoryServiceSetEntitySummary:
         assert call_kwargs.get('success') is False
         assert call_kwargs.get('error') is not None
         assert 'FalkorDB timeout' in call_kwargs['error']
+
+
+# ---------------------------------------------------------------------------
+# step-5: MCP tool set_entity_summary
+# ---------------------------------------------------------------------------
+
+
+class TestSetEntitySummaryMcpTool:
+    """MCP tool set_entity_summary is registered and delegates correctly.
+
+    Mirrors TestRefreshEntitySummaryMcpTool (test_refresh_entity_summary.py).
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        """Mock MemoryService for tool registration."""
+        svc = AsyncMock()
+        svc.set_entity_summary = AsyncMock(
+            return_value={
+                'uuid': 'node-1',
+                'name': 'Alice',
+                'old_summary': 'old text',
+                'new_summary': 'Corrected summary.',
+            }
+        )
+        return svc
+
+    @pytest.fixture
+    def mcp_server(self, mock_service):
+        """MCP server with mock memory service."""
+        from fused_memory.server.tools import create_mcp_server
+        return create_mcp_server(mock_service)
+
+    @staticmethod
+    def _parse(result):
+        """Parse FastMCP TextContent list results into a dict, as the refresh tests do."""
+        import json
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            return json.loads(content)
+        return result
+
+    @pytest.mark.asyncio
+    async def test_tool_is_registered(self, mcp_server):
+        """(a) 'set_entity_summary' is registered as an MCP tool."""
+        tool_names = [t.name for t in await mcp_server.list_tools()]
+        assert 'set_entity_summary' in tool_names
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_memory_service(self, mcp_server, mock_service):
+        """(b) Calling with {entity_uuid, summary, project_id} delegates to
+        memory_service.set_entity_summary with entity_uuid/summary/project_id kwargs."""
+        await mcp_server._tool_manager.call_tool(
+            'set_entity_summary',
+            {'entity_uuid': 'node-1', 'summary': 'Corrected summary.', 'project_id': 'dark_factory'},
+        )
+        mock_service.set_entity_summary.assert_awaited_once()
+        call_kwargs = mock_service.set_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_uuid') == 'node-1'
+        assert call_kwargs.get('summary') == 'Corrected summary.'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_tool_accepts_entity_name(self, mcp_server, mock_service):
+        """(c) entity_name is accepted and passed through."""
+        await mcp_server._tool_manager.call_tool(
+            'set_entity_summary',
+            {'entity_name': 'Alice', 'summary': 'Corrected summary.', 'project_id': 'dark_factory'},
+        )
+        mock_service.set_entity_summary.assert_awaited_once()
+        call_kwargs = mock_service.set_entity_summary.call_args[1]
+        assert call_kwargs.get('entity_name') == 'Alice'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_empty_project_id_returns_error(self, mcp_server, mock_service):
+        """(d) Empty project_id returns a ValidationError dict; service is not awaited."""
+        result = await mcp_server._tool_manager.call_tool(
+            'set_entity_summary',
+            {'entity_uuid': 'node-1', 'summary': 'Corrected summary.', 'project_id': ''},
+        )
+        parsed = self._parse(result)
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.set_entity_summary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_summary_returns_error(self, mcp_server, mock_service):
+        """(e) Missing summary returns a ValidationError dict; service is not awaited."""
+        result = await mcp_server._tool_manager.call_tool(
+            'set_entity_summary',
+            {'entity_uuid': 'node-1', 'project_id': 'dark_factory'},
+        )
+        parsed = self._parse(result)
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.set_entity_summary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_neither_uuid_nor_name_returns_validation_error(self, mcp_server, mock_service):
+        """(f) Neither entity_uuid nor entity_name returns an error dict; service is not awaited."""
+        result = await mcp_server._tool_manager.call_tool(
+            'set_entity_summary',
+            {'summary': 'Corrected summary.', 'project_id': 'dark_factory'},
+        )
+        parsed = self._parse(result)
+        assert 'error' in parsed
+        mock_service.set_entity_summary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_error_dict(self, mcp_server, mock_service):
+        """(g) A service exception is caught and returned as {error, error_type} (not raised)."""
+        mock_service.set_entity_summary = AsyncMock(
+            side_effect=RuntimeError('FalkorDB connection failed')
+        )
+        result = await mcp_server._tool_manager.call_tool(
+            'set_entity_summary',
+            {'entity_uuid': 'node-1', 'summary': 'Corrected summary.', 'project_id': 'dark_factory'},
+        )
+        parsed = self._parse(result)
+        assert 'error' in parsed
+        assert 'FalkorDB connection failed' in parsed['error']
+
+    @pytest.mark.asyncio
+    async def test_tool_description_mentions_uuid_and_name(self, mcp_server):
+        """(h) The tool description mentions both entity_uuid and entity_name."""
+        tools = await mcp_server.list_tools()
+        tool = next(t for t in tools if t.name == 'set_entity_summary')
+        desc = tool.description or ''
+        assert 'entity_uuid' in desc
+        assert 'entity_name' in desc
