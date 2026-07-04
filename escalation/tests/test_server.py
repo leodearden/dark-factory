@@ -2502,13 +2502,11 @@ class TestGetMergeQueue:
         real finalize path via an already-passed InflightEntry (verify_task=None),
         and captures the LIVE phase surfaced by snapshot() at the reverify call.
 
-        task 1997 step-5: the git_ops stub deliberately does NOT set
+        task 1997: the git_ops stub deliberately does NOT set
         _last_advanced_sha/_rebased_from/_rebased_onto — the post-rebase SHAs
-        must be sourced entirely from the AdvanceOutcome return value.  RED:
-        production still reads the getattr side channel (merge_queue.py
-        ~8645-8654) and hits the AssertionError backstop since the stub has
-        no such attributes.  GREEN (step-6): the CAS loop reads
-        adv_outcome.advanced_sha/rebased_from/rebased_onto directly.
+        are sourced entirely from the AdvanceOutcome return value (the getattr
+        side channel is retired; the CAS loop reads
+        adv_outcome.advanced_sha/rebased_from/rebased_onto directly).
         """
         import asyncio
         import types

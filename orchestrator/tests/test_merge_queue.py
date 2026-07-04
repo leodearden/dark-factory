@@ -8828,14 +8828,11 @@ class TestCheckPostMergeEquivalence:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
         try:
-            await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='equiv-ff', max_attempts=1,
             )
-            advanced = (
-                getattr(git_ops, '_last_advanced_sha', None)
-                or merge_result.merge_commit
-            )
+            advanced = outcome.advanced_sha or merge_result.merge_commit
             assert advanced is not None
             failed = await _check_post_merge_equivalence(
                 wt, advanced, git_ops, pre_merge_main, task_id='equiv-ff-test',
@@ -8891,14 +8888,11 @@ class TestCheckPostMergeEquivalence:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
         try:
-            await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='equiv-task-only', max_attempts=1,
             )
-            advanced = (
-                getattr(git_ops, '_last_advanced_sha', None)
-                or merge_result.merge_commit
-            )
+            advanced = outcome.advanced_sha or merge_result.merge_commit
             assert advanced is not None
 
             # Modify .task/ on the branch — should be excluded from the diff.
@@ -8963,14 +8957,11 @@ class TestCheckPostMergeEquivalence:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
         try:
-            await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='lockfile-victim', max_attempts=1,
             )
-            advanced = (
-                getattr(git_ops, '_last_advanced_sha', None)
-                or merge_result.merge_commit
-            )
+            advanced = outcome.advanced_sha or merge_result.merge_commit
             assert advanced is not None
 
             # Sanity: advanced main's Cargo.lock really does differ from the
@@ -9014,14 +9005,11 @@ class TestCheckPostMergeEquivalence:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
         try:
-            await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='spec-equiv', max_attempts=1,
             )
-            advanced = (
-                getattr(git_ops, '_last_advanced_sha', None)
-                or merge_result.merge_commit
-            )
+            advanced = outcome.advanced_sha or merge_result.merge_commit
             clean = await _check_post_merge_equivalence(
                 wt, advanced, git_ops, base_sha, task_id='spec-equiv-clean',
             )
@@ -9086,14 +9074,11 @@ class TestCheckPostMergeEquivalence:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
         try:
-            await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='drifted-worktree-equiv', max_attempts=1,
             )
-            advanced = (
-                getattr(git_ops, '_last_advanced_sha', None)
-                or merge_result.merge_commit
-            )
+            advanced = outcome.advanced_sha or merge_result.merge_commit
             assert advanced is not None
 
             # Rewrite the worktree HEAD to a DIVERGENT commit D (simulates drift)
@@ -9160,14 +9145,11 @@ class TestCheckPostMergeEquivalence:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
         try:
-            await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='suppress-head-read', max_attempts=1,
             )
-            advanced = (
-                getattr(git_ops, '_last_advanced_sha', None)
-                or merge_result.merge_commit
-            )
+            advanced = outcome.advanced_sha or merge_result.merge_commit
             assert advanced is not None
 
             # Drift the worktree HEAD to a DIVERGENT commit (different i.py).
@@ -9963,16 +9945,16 @@ class TestMergedBranchTipCarryThroughRebuild:
             return []  # always clean
 
         # Mock advance_main: first call → 'cas_failed', second → 'advanced'.
-        # On 'advanced', set _last_advanced_sha so _finalize_advanced_merge can
-        # resolve advanced_sha without falling back to merge_commit_fallback.
+        # Populate advanced_sha on the second AdvanceOutcome so
+        # _finalize_advanced_merge can resolve advanced_sha without falling
+        # back to merge_commit_fallback.
         advance_calls = [0]
 
         async def _fake_advance(sha, wt, **kw):
             advance_calls[0] += 1
             if advance_calls[0] == 1:
                 return AdvanceOutcome('cas_failed')
-            git_ops._last_advanced_sha = actual_merge_commit
-            return AdvanceOutcome('advanced')
+            return AdvanceOutcome('advanced', advanced_sha=actual_merge_commit)
 
         passing = MagicMock(passed=True, summary='', timed_out=False)
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
@@ -10200,7 +10182,6 @@ class TestMergedBranchTipCarryThroughRebuild:
             advance_calls[0] += 1
             if advance_calls[0] == 1:
                 return AdvanceOutcome('cas_failed')
-            git_ops._last_advanced_sha = actual_merge_commit
             return AdvanceOutcome('advanced', advanced_sha=actual_merge_commit)
 
         passing = MagicMock(passed=True, summary='', timed_out=False)
@@ -15407,21 +15388,23 @@ class TestAdvanceMainReverifyOnRebase:
                 f'got {current_main[:8]}'
             )
 
-            # Side channels must be set
-            rebased_sha = getattr(git_ops, '_last_advanced_sha', None)
-            assert rebased_sha is not None, '_last_advanced_sha must be set'
-            rebased_from = getattr(git_ops, '_rebased_from', None)
+            # AdvanceOutcome fields must be populated (task 1997: the
+            # _last_advanced_sha/_rebased_from/_rebased_onto side channels
+            # are retired — values ride the returned AdvanceOutcome only).
+            rebased_sha = outcome.advanced_sha
+            assert rebased_sha is not None, 'outcome.advanced_sha must be set'
+            rebased_from = outcome.rebased_from
             assert rebased_from == base_sha, (
-                f'_rebased_from must be original base_sha {base_sha[:8]}, '
+                f'outcome.rebased_from must be original base_sha {base_sha[:8]}, '
                 f'got {rebased_from!r}'
             )
-            rebased_onto = getattr(git_ops, '_rebased_onto', None)
+            rebased_onto = outcome.rebased_onto
             assert rebased_onto == moved_main_sha, (
-                f'_rebased_onto must be moved_main_sha {moved_main_sha[:8]}, '
+                f'outcome.rebased_onto must be moved_main_sha {moved_main_sha[:8]}, '
                 f'got {rebased_onto!r}'
             )
 
-            # _last_advanced_sha must be a descendant of moved_main
+            # outcome.advanced_sha must be a descendant of moved_main
             rc, _, _ = await _run(
                 ['git', 'merge-base', '--is-ancestor', moved_main_sha, rebased_sha],
                 cwd=git_ops.project_root,
@@ -15431,14 +15414,14 @@ class TestAdvanceMainReverifyOnRebase:
                 f'moved_main {moved_main_sha[:8]}'
             )
 
-            # merge_wt HEAD must equal _last_advanced_sha
+            # merge_wt HEAD must equal outcome.advanced_sha
             wt_rc, wt_head, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'], cwd=merge_wt,
             )
             assert wt_rc == 0
             assert wt_head.strip() == rebased_sha, (
                 f'merge_wt HEAD {wt_head.strip()[:8]} must equal '
-                f'_last_advanced_sha {rebased_sha[:8]}'
+                f'outcome.advanced_sha {rebased_sha[:8]}'
             )
         finally:
             await git_ops.cleanup_merge_worktree(merge_wt)

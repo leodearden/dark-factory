@@ -5272,11 +5272,6 @@ class GitOps:
                 cwd=self.project_root,
             )
             rebased_onto = onto_sha.strip()
-            # Transitional bridge (task 1997): keep the side-channel writes
-            # until every reader migrates to the returned AdvanceOutcome.
-            self._last_advanced_sha = merge_sha
-            self._rebased_from = expected_main  # original base provided by caller
-            self._rebased_onto = rebased_onto
             logger.info(
                 'advance_main: reverify_on_rebase — rebased tree parked at '
                 '%s; returning rebased_pending_reverify (no update-ref)',
@@ -5507,16 +5502,15 @@ class GitOps:
                         'WIP preserved on recovery branch: %s',
                         branch or merge_sha[:8], recovery,
                     )
-                    # Main was advanced before the stash pop ran — record the
-                    # actually-on-main SHA so callers handling done_wip_recovery
-                    # can record correct done_provenance.
-                    self._last_advanced_sha = merge_sha
+                    # Main was advanced before the stash pop ran — the
+                    # returned AdvanceOutcome.advanced_sha lets callers
+                    # handling done_wip_recovery record correct
+                    # done_provenance.
                     return AdvanceOutcome('pop_conflict', advanced_sha=merge_sha)
 
-        # Main was advanced — expose the post-rebase SHA so callers can record
-        # done_provenance against the SHA actually on main, not the stale
-        # pre-rebase SHA from MergeResult.merge_commit.
-        self._last_advanced_sha = merge_sha
+        # Main was advanced — the returned AdvanceOutcome.advanced_sha lets
+        # callers record done_provenance against the SHA actually on main,
+        # not the stale pre-rebase SHA from MergeResult.merge_commit.
         return AdvanceOutcome('advanced', advanced_sha=merge_sha)
 
     async def recover_red_main(

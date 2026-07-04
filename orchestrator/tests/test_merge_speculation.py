@@ -1473,22 +1473,13 @@ class TestSpecLaneAbortPathRelease:
 def _make_finalize_test_worker(
     tmp_path: Path,
 ) -> tuple[SpeculativeMergeWorker, MagicMock]:
-    """Build a SpeculativeMergeWorker with async spies for finalize terminal-path tests.
-
-    Sets side-channel attributes needed by the rebased_pending_reverify path
-    (``_last_advanced_sha``, ``_rebased_from``, ``_rebased_onto``) so the gate-
-    retry test can trigger that path without real git I/O.
-    """
+    """Build a SpeculativeMergeWorker with async spies for finalize terminal-path tests."""
     mock_git_ops = MagicMock()
     mock_git_ops.project_root = tmp_path
     mock_git_ops.release_spec_lane = AsyncMock()
     mock_git_ops.cleanup_merge_worktree = AsyncMock()
     mock_git_ops.advance_main = AsyncMock()
     mock_git_ops.get_main_sha = AsyncMock(return_value='deadbeef' * 5)
-    # Side-channel attrs read by the rebased_pending_reverify path
-    mock_git_ops._last_advanced_sha = 'aa' * 20
-    mock_git_ops._rebased_from = 'bb' * 20
-    mock_git_ops._rebased_onto = 'cc' * 20
     worker = SpeculativeMergeWorker(mock_git_ops, asyncio.Queue())
     return worker, mock_git_ops
 
@@ -1537,9 +1528,8 @@ class TestSpecLaneFinalizeTerminalRelease:
         entry = _build_entry(item, vr, merge_wt=fake_lane)
 
         # Always return 'rebased_pending_reverify' to spin the gate-retry loop.
-        # SHA fields must be populated: _finalize_inflight now sources them from
-        # the return value, not the (still-present, but no longer read) helper
-        # side-channel attrs (task 1997 step-6).
+        # SHA fields must be populated: _finalize_inflight sources them from
+        # the return value (task 1997 step-6).
         mock_git_ops.advance_main.return_value = AdvanceOutcome(
             'rebased_pending_reverify',
             advanced_sha='aa' * 20,
@@ -1688,16 +1678,12 @@ class TestSpecLaneFinalizeTerminalRelease:
 
 @pytest.mark.asyncio
 class TestGateReverifyConsumesAdvanceOutcome:
-    """_finalize_inflight's rebased_pending_reverify branch must source the
-    post-rebase SHAs from the AdvanceOutcome return value, not the
+    """_finalize_inflight's rebased_pending_reverify branch sources the
+    post-rebase SHAs from the AdvanceOutcome return value — the
     git_ops._last_advanced_sha/_rebased_from/_rebased_onto getattr side
-    channel (task 1997 / MQ-refactor μ).
-
-    RED: the side channel is deliberately left unset on the stub, so the
-    current getattr-reading production code hits the AssertionError
-    backstop (merge_queue.py ~8648-8655).  GREEN (step-6): the CAS loop
-    reads adv_outcome.advanced_sha/rebased_from/rebased_onto directly, so
-    no AssertionError fires.
+    channel is retired (task 1997 / MQ-refactor μ).  The stub built by
+    _make_finalize_test_worker never sets those attributes, so this pins
+    the retirement: production must not depend on them.
     """
 
     async def test_gate_reverify_consumes_advance_outcome_sha_fields(
@@ -1705,13 +1691,6 @@ class TestGateReverifyConsumesAdvanceOutcome:
     ) -> None:
         cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
         worker, mock_git_ops = _make_finalize_test_worker(tmp_path)
-
-        # Deliberately unset — the return value must carry the SHAs on its
-        # own; per Mock semantics, `del` makes subsequent access raise
-        # AttributeError so getattr(..., default) falls back to default.
-        del mock_git_ops._last_advanced_sha
-        del mock_git_ops._rebased_from
-        del mock_git_ops._rebased_onto
 
         fake_lane = tmp_path / '_spec-0'
         fake_lane.mkdir(parents=True, exist_ok=True)
