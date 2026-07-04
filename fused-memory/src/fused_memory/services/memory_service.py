@@ -371,6 +371,87 @@ class MemoryService:
         logger.info('Deduplicating %d edge(s) after add_episode', len(duplicates))
         return await self.graphiti.bulk_remove_edges(duplicates, group_id=group_id)
 
+    async def _dedup_episode_nodes(self, result: Any, *, group_id: str) -> int:
+        """Merge exact-name duplicate entity nodes minted within a single add_episode call.
+
+        graphiti_core's ingestion-time entity resolution (resolve_extracted_nodes)
+        only resolves each extracted node against candidates surfaced by hybrid
+        embedding+BM25 search — there is no guaranteed exact-name Cypher lookup.
+        When that search misses an existing canonical node, ingestion mints a
+        brand-new node even though a node with the exact same name already
+        exists. This sweep re-checks each entity name this episode touched via
+        ``find_duplicate_entity_nodes`` and merges any duplicates it finds into
+        the canonical survivor (most valid edges, then oldest, then lowest
+        uuid) via ``merge_entities``.
+
+        Modelled on ``_dedup_episode_edges``; handles None / empty result the
+        same way. Each merge is best-effort (mirrors
+        ``_restore_superseded_dependency_edges``): a transient backend error
+        merging one duplicate must not fail an already-committed episode
+        write, and must not stop subsequent duplicates/names from being
+        processed. Unmerged duplicates simply survive to be healed the next
+        time an episode touches that name.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                    AddEpisodeResults object with a ``nodes`` attribute).
+                    Handles ``None`` and objects with empty/missing nodes
+                    gracefully.
+
+        Returns:
+            Number of duplicate nodes successfully merged into their
+            canonical survivor (0 when nothing to do).
+        """
+        if result is None:
+            return 0
+
+        nodes = getattr(result, 'nodes', None) or []
+        if not nodes:
+            return 0
+
+        names: list[str] = []
+        seen: set[str] = set()
+        for node in nodes:
+            name = getattr(node, 'name', '') or ''
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+
+        merged = 0
+        failed = 0
+        for name in names:
+            matches = await self.graphiti.find_duplicate_entity_nodes(name, group_id=group_id)
+            if len(matches) < 2:
+                continue
+            survivor = matches[0]['uuid']
+            for dup in matches[1:]:
+                dup_uuid = dup['uuid']
+                try:
+                    await self.graphiti.merge_entities(dup_uuid, survivor, group_id=group_id)
+                    merged += 1
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    # Best-effort: a transient backend error (lock contention,
+                    # write timeout) must not fail an already-committed episode
+                    # write.  Log and continue so the episode reports success.
+                    logger.exception(
+                        'Failed to merge exact-name duplicate node %s -> %s after '
+                        'add_episode; will retry on next episode',
+                        dup_uuid, survivor,
+                    )
+                    failed += 1
+
+        if merged > 0:
+            logger.info('Merged %d exact-name duplicate node(s) after add_episode', merged)
+        if failed > 0:
+            logger.warning(
+                'Failed to merge %d exact-name duplicate node(s) after add_episode',
+                failed,
+            )
+        return merged
+
     async def _restore_superseded_dependency_edges(
         self, result: Any, *, group_id: str
     ) -> int:
@@ -492,6 +573,9 @@ class MemoryService:
         await self._dedup_episode_edges(result, group_id=payload['group_id'])
         # Post-write restore: undo false dependency-edge supersessions
         await self._restore_superseded_dependency_edges(result, group_id=payload['group_id'])
+        # Post-write node dedup: merge exact-name duplicate entity nodes that
+        # graphiti_core ingestion failed to reuse
+        await self._dedup_episode_nodes(result, group_id=payload['group_id'])
 
         # Register planning episodes so they can be filtered from search results
         if temporal_context == 'planning' and self.planned_episode_registry is not None:

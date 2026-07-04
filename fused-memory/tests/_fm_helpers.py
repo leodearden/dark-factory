@@ -136,10 +136,15 @@ class MockAddEpisodeResult:
     The real AddEpisodeResults class uses 'edges' as the field name.
     We keep 'entity_edges' for backward compat with existing tests that
     construct MockAddEpisodeResult(entity_edges=[...]).
+
+    'nodes' mirrors AddEpisodeResults.nodes (graphiti_core/graphiti.py:111) —
+    the entity nodes this episode touched — consumed by the post-write
+    node-dedup sweep (MemoryService._dedup_episode_nodes).
     """
 
     entity_edges: list[MockEdge] = field(default_factory=list)
     edges: list[MockEdge] = field(default_factory=list)
+    nodes: list[MockNode] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.edges == [] and self.entity_edges:

@@ -13,7 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import extract_cypher, extract_params, make_rebuild_detail
+from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params, make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import GraphitiBackend, NodeNotFoundError
 
@@ -256,6 +256,110 @@ class TestMergeEntities:
         backend.delete_entity_node.assert_awaited_once_with('dep-uuid', group_id='test')
         backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid', group_id='test')
         assert result['surviving_uuid'] == 'sur-uuid'
+
+
+# ---------------------------------------------------------------------------
+# task 2073 step-1/2: GraphitiBackend.find_duplicate_entity_nodes
+# ---------------------------------------------------------------------------
+
+class TestFindDuplicateEntityNodes:
+    """GraphitiBackend.find_duplicate_entity_nodes(name, *, group_id) returns every
+    Entity node sharing an exact name, canonical-ordered (most valid edges, then
+    oldest created_at, then uuid) so the post-write node-dedup sweep can pick
+    matches[0] as the merge survivor."""
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_only(self, mock_config, make_backend, make_graph_mock):
+        """Read-only lookup: awaits graph.ro_query exactly once, never graph.query."""
+        backend = make_backend(mock_config)
+        rows = [
+            ['canon-uuid', 100, 5],
+            ['dup-uuid-1', 200, 2],
+        ]
+        await assert_ro_query_only(
+            backend, make_graph_mock, rows, 'find_duplicate_entity_nodes',
+            'orchestrator-reify.service', group_id='test',
+        )
+
+    @pytest.mark.asyncio
+    async def test_cypher_matches_exact_name_and_counts_valid_edges(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Cypher matches Entity by exact $name param and counts only valid RELATES_TO edges."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.find_duplicate_entity_nodes('Reify', group_id='test')
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert '(n:Entity {name: $name})' in cypher
+        assert 'RELATES_TO' in cypher
+        assert 'invalid_at IS NULL' in cypher
+        assert 'count(DISTINCT e)' in cypher
+        params = extract_params(graph.ro_query.call_args)
+        assert params.get('name') == 'Reify'
+
+    @pytest.mark.asyncio
+    async def test_cypher_orders_canonical_first(self, mock_config, make_backend, make_graph_mock):
+        """ORDER BY ranks highest edge_count first, then oldest created_at, then uuid."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.find_duplicate_entity_nodes('Reify', group_id='test')
+        cypher = extract_cypher(graph.ro_query.call_args)
+        order_idx = cypher.find('ORDER BY')
+        assert order_idx != -1, f'Expected ORDER BY clause in cypher: {cypher}'
+        order_clause = cypher[order_idx:]
+        assert 'edge_count DESC' in order_clause
+        assert 'created_at ASC' in order_clause
+        assert 'uuid ASC' in order_clause
+        # edge_count must be the primary sort key, then created_at, then uuid
+        assert order_clause.find('edge_count') < order_clause.find('created_at') < order_clause.find('uuid')
+
+    @pytest.mark.asyncio
+    async def test_returns_rows_preserving_order(self, mock_config, make_backend, make_graph_mock):
+        """Returns list[dict] with uuid/created_at/edge_count, preserving DB row order."""
+        backend = make_backend(mock_config)
+        rows = [
+            ['canon-uuid', 100, 5],
+            ['dup-uuid-1', 200, 2],
+            ['dup-uuid-2', 300, 1],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.find_duplicate_entity_nodes('Reify', group_id='test')
+        assert result == [
+            {'uuid': 'canon-uuid', 'created_at': 100, 'edge_count': 5},
+            {'uuid': 'dup-uuid-1', 'created_at': 200, 'edge_count': 2},
+            {'uuid': 'dup-uuid-2', 'created_at': 300, 'edge_count': 1},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_when_no_matches(self, mock_config, make_backend, make_graph_mock):
+        """Empty result_set -> []."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.find_duplicate_entity_nodes('Nonexistent', group_id='test')
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_returns_single_element_list_when_one_match(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """A single matching node -> single-element list (no duplicate to merge)."""
+        backend = make_backend(mock_config)
+        rows = [['only-uuid', 100, 0]]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.find_duplicate_entity_nodes('Unique', group_id='test')
+        assert result == [{'uuid': 'only-uuid', 'created_at': 100, 'edge_count': 0}]
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        """Raises RuntimeError when client is not initialized."""
+        backend = GraphitiBackend(mock_config)  # client is None
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.find_duplicate_entity_nodes('Reify', group_id='test')
 
 
 # ---------------------------------------------------------------------------
