@@ -3857,6 +3857,100 @@ class TestReconPoolAutoTag:
         )
 
 
+class TestReconPoolAutoTagInjection:
+    """Integration: add_memory must inject recon_pool into the metadata dict
+    handed to mem0.add for cycle_summary writes, server-side, independent of
+    whether the caller passed recon_pool (task 2077).
+
+    RED until _infer_recon_pool is wired into add_memory (step-4).
+    """
+
+    @pytest.mark.asyncio
+    async def test_stage1_recon_pool_injected(self, service):
+        await service.add_memory(
+            content='Cycle 3 summary: completed steps 1-4',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={
+                'kind': 'cycle_summary',
+                'stage': 'memory_consolidator',
+                'run_id': 'r1',
+            },
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['recon_pool'] == 'stage1_cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_stage2_recon_pool_injected(self, service):
+        await service.add_memory(
+            content='Cycle 3 summary: completed steps 1-4',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={
+                'kind': 'cycle_summary',
+                'stage': 'task_knowledge_sync',
+                'run_id': 'r1',
+            },
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['recon_pool'] == 'stage2_cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_non_cycle_summary_kind_not_tagged(self, service):
+        """metadata.kind != 'cycle_summary' -> recon_pool must not appear at all."""
+        await service.add_memory(
+            content='Always use type hints',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={'kind': 'note'},
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert 'recon_pool' not in call_kwargs['metadata']
+
+    @pytest.mark.asyncio
+    async def test_no_metadata_not_tagged(self, service):
+        """No metadata at all -> recon_pool must not appear."""
+        await service.add_memory(
+            content='Always use type hints',
+            category='observations_and_summaries',
+            project_id='test',
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert 'recon_pool' not in call_kwargs['metadata']
+
+    @pytest.mark.asyncio
+    async def test_authoritative_override_corrects_wrong_caller_value(self, service):
+        """A known stage's derived recon_pool wins over a caller-supplied value."""
+        await service.add_memory(
+            content='Cycle 3 summary: completed steps 1-4',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={
+                'kind': 'cycle_summary',
+                'stage': 'memory_consolidator',
+                'recon_pool': 'WRONG',
+            },
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['recon_pool'] == 'stage1_cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_unknown_stage_preserves_caller_recon_pool(self, service):
+        """Stage unknown -> cannot infer -> caller-supplied recon_pool must survive untouched."""
+        await service.add_memory(
+            content='Cycle 3 summary: completed steps 1-4',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={
+                'kind': 'cycle_summary',
+                'stage': 'unknown',
+                'recon_pool': 'caller_val',
+            },
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['recon_pool'] == 'caller_val'
+
+
 # ---------------------------------------------------------------------------
 # Step 3: TRACK B.1 service clear_invalid_at RED tests
 # ---------------------------------------------------------------------------
