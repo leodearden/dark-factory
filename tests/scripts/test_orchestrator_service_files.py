@@ -391,3 +391,75 @@ def test_start_limit_directives_under_unit_section(
         f"StartLimitBurst must NOT be under [Service] in {service_path.name} "
         "(systemd >=230 only honours it under [Unit])"
     )
+
+
+# ---------------------------------------------------------------------------
+# ORCH_UNIT self-identification (task 2064 — 2004 self-kill root-cause fix)
+# ---------------------------------------------------------------------------
+#
+# DeterministicRunner._default_resolve_own_unit() (orchestrator/src/orchestrator/
+# deterministic_runner.py) resolves the orchestrator's own systemd unit purely
+# from the ORCH_UNIT env var, failing open to '' when unset. An empty own-unit
+# means self_target is False for EVERY target_unit, so a fleet restart-all
+# self-restart deploy takes the blocking cross-unit path and SIGTERMs its own
+# deploy script mid-run instead of scheduling a detached self-restart. Every
+# orchestrator unit template must set ORCH_UNIT=<its own basename> so the
+# runner can detect a self-target deploy.
+
+ALL_ORCHESTRATOR_SERVICE_FILES = sorted(
+    (REPO_ROOT / "scripts").glob("orchestrator-*.service")
+)
+
+_EXPECTED_ORCHESTRATOR_SERVICE_BASENAMES = {
+    "orchestrator-dark-factory.service",
+    "orchestrator-reify.service",
+    "orchestrator-solar-challenge-platform.service",
+    "orchestrator-my-solar-challenge.service",
+    "orchestrator-autopilot-video.service",
+    "orchestrator-watchdog.service",
+}
+
+
+def test_orchestrator_service_glob_covers_all_known_units() -> None:
+    """Coverage guard: the glob must be non-empty and include all six known units.
+
+    A wrong CWD or other glob mishap would silently shrink the parametrized
+    ORCH_UNIT lint below to zero cases — a zero-case parametrize collects no
+    tests and reports no failure, which would mask a missing requirement
+    instead of catching it.
+    """
+    discovered = {p.name for p in ALL_ORCHESTRATOR_SERVICE_FILES}
+    assert discovered, "glob discovered no orchestrator-*.service templates"
+    missing = _EXPECTED_ORCHESTRATOR_SERVICE_BASENAMES - discovered
+    assert not missing, f"glob is missing known orchestrator unit templates: {missing}"
+
+
+@pytest.mark.parametrize(
+    "service_path",
+    ALL_ORCHESTRATOR_SERVICE_FILES,
+    ids=lambda p: p.name,
+)
+def test_orchestrator_service_sets_own_orch_unit(
+    service_path: pathlib.Path,
+) -> None:
+    """Every orchestrator unit template must self-identify via ORCH_UNIT=<own basename>.
+
+    The value must equal the unit's OWN basename (self-target detection
+    compares this string against `before_done.target_unit`), and the line
+    must live in [Service] — systemd only honours Environment= there; under
+    [Unit]/[Install] it is silently ignored (same failure class as the
+    StartLimit directives guarded above).
+    """
+    content = service_path.read_text(encoding="utf-8")
+    expected_line = f"Environment=ORCH_UNIT={service_path.name}"
+
+    assert expected_line in content.splitlines(), (
+        f"{service_path.name} must set `{expected_line}`"
+    )
+
+    sections = _parse_sections(content)
+    service_text = "\n".join(sections.get("Service", []))
+    assert expected_line in service_text.splitlines(), (
+        f"`{expected_line}` must live in the [Service] section of {service_path.name} "
+        "(systemd only honours Environment= under [Service])"
+    )
