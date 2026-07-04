@@ -6393,8 +6393,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             exc_info=True,
                         )
             if adv == 'advanced':
+                # outcome is guaranteed non-None here: 'exception' (the only
+                # code path that sets outcome=None) never equals 'advanced'.
                 landed_sha: str = (
-                    getattr(self.git_ops, '_last_advanced_sha', None) or r.merge_sha
+                    (outcome.advanced_sha if outcome else None) or r.merge_sha
                 )
                 await self.scheduler.mark_done(
                     r.member_id,
