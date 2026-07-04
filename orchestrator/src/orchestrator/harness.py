@@ -126,6 +126,16 @@ _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 # is non-numeric (task 1907).
 _BG_LOOP_FAILURE_BACKOFF_SECS: float = 60.0
 
+# agent_role values eligible for Source-B re-validation (deterministic-recon-sweep,
+# task 2074): the runner's own sentinel role for deploy infra_issue escalations,
+# plus this sweep's own role so a previously-unconfirmed L1 it filed self-heals
+# once the unit recovers.  Any other role (or category != 'infra_issue') is left
+# untouched — in particular milestone_gate escalations are NEVER auto-resolved.
+_DETERMINISTIC_ESCALATION_SENTINEL_ROLES: frozenset[str] = frozenset({
+    'orchestrator-deterministic',
+    'harness-deterministic-recon-sweep',
+})
+
 # Bound on the thread-off load_config() call inside reload_config() (PRD
 # plans/config-hot-reload-prd.md Open Q3). load_config() runs
 # _discover_module_configs, a filesystem walk that can wedge; this keeps a
@@ -6910,6 +6920,56 @@ Output JSON matching the schema. Every task must appear in the output.
             'Deterministic-recon-sweep: task %s stranded (verdict=%s) — filed '
             'L1 %s (category=%s, suggested_action=%s, no status change)',
             tid, verdict, esc.id, category, suggested_action,
+        )
+
+    async def _revalidate_open_deterministic_escalation(
+        self, esc, task: dict, metadata: dict,
+    ) -> None:
+        """Re-validate an OPEN deterministic-deploy ``infra_issue`` escalation (Source B).
+
+        Only touches an escalation that is ALL of:
+          - ``category == 'infra_issue'``
+          - ``agent_role`` in ``_DETERMINISTIC_ESCALATION_SENTINEL_ROLES``
+            (the runner's own sentinel role, or this sweep's own role so a
+            previously-filed 'unconfirmed' L1 can self-heal)
+          - filed against a task matching the stranded-deterministic metadata shape
+
+        ``milestone_gate`` (human-decision) escalations and any non-matching
+        role/category are NEVER touched — checked cheaply before the live
+        unit-inspector call.  When live state now shows 'healthy' —
+        contradicting the escalation's stated "deploy could not be verified"
+        facts — resolves it.  Resolution fires the harness resolve-callback,
+        driving the existing resume -> DeterministicRunner no-re-run path.
+        Unhealthy verdicts are left open (untouched).
+        """
+        if self._escalation_queue is None:
+            return
+        if (
+            esc.category != 'infra_issue'
+            or esc.agent_role not in _DETERMINISTIC_ESCALATION_SENTINEL_ROLES
+        ):
+            return
+        if not _is_stranded_deterministic_shape(metadata):
+            return
+
+        verdict = await self._revalidate_deterministic_deploy_health(metadata)
+        if verdict != 'healthy':
+            return
+
+        before_done = metadata.get('before_done') or {}
+        target_unit = before_done.get('target_unit', 'unknown')
+        resolution = (
+            f'deterministic-recon-sweep: live unit {target_unit} healthy '
+            f'(MainPID>0, ActiveState=active) — deploy verified post-hoc; '
+            f'stated failure is stale.'
+        )
+        self._escalation_queue.resolve(
+            esc.id, resolution, resolved_by='harness-deterministic-recon-sweep',
+        )
+        logger.info(
+            'Deterministic-recon-sweep: re-validated escalation %s for task %s '
+            '— live unit %s healthy, auto-resolved (stale failure)',
+            esc.id, esc.task_id, target_unit,
         )
 
     def _on_escalation(self, escalation) -> None:
