@@ -2188,6 +2188,20 @@ class GitOps:
             state.  ``expected_title=None`` (default) disables the guard and
             all existing callers/tests are unaffected.
 
+        **Pre-acquire base-health gate** (task 2061, runs FIRST — before the ε
+        disk-guard and before :func:`acquire_for`):
+            Calls :meth:`_warm_lane_base_resolvable`.  A definite
+            ``WarmBaseHealth.ABSENT`` short-circuits with
+            ``WarmLaneUnavailable.BASE_ABSENT`` — no lane is touched (no
+            worktree-add, no seed invocation, disk-guard scripts never run).
+            This is a HOST-SCOPED pool condition (one base serves every
+            lane), so :meth:`create_worktree` raises
+            :class:`WarmLanePoolHardDown` for it, and the workflow requeues
+            (fail-open, inv.6) instead of escalating a per-task blocked+L1.
+            ``WarmBaseHealth.INDETERMINATE`` (a transient stat/readlink
+            hiccup) falls through to the normal acquire path — it must never
+            masquerade as a genuine outage.
+
         **ε pre-acquire disk-guard** (``config.warm_lane_disk_guard``, task-1860):
             When the knob is True, runs γ ``warm-lane-disk-guard.sh check`` →
             on exit 75 (EX_TEMPFAIL/disk pressure) invokes δ ``warm-lane-gc.sh
@@ -2210,6 +2224,11 @@ class GitOps:
                 detected persistent pressure (rc=75 after reclaim), OR seed
                 exited 75 (EX_TEMPFAIL); transient disk pressure (caller should
                 requeue with annotation).
+            WarmLaneUnavailable.BASE_ABSENT — pre-acquire base-health gate
+                found the warm-lane CoW seed base provably absent/empty
+                (:meth:`_warm_lane_base_resolvable` returned
+                ``WarmBaseHealth.ABSENT``).  HOST-SCOPED pool condition;
+                caller should requeue (fail-open), never escalate blocked+L1.
             WarmLaneUnavailable.DISABLED — pool knob is off; this is a
                 programming error (callers MUST guard with
                 ``if self.warm_lane_pool is not None`` before calling).
@@ -2230,6 +2249,25 @@ class GitOps:
             # that don't handle it hit an explicit error path rather than
             # infinite requeue.
             return WarmLaneUnavailable.DISABLED
+
+        # Task 2061: pre-acquire base-health gate.  Runs FIRST (before the ε
+        # disk-guard and before acquire_for) so a definite ABSENT short-circuits
+        # without running the disk-guard scripts or touching/assigning any lane.
+        # A base-absent CoW seed base is a HOST-SCOPED pool condition (one base
+        # serves every lane) — create_worktree maps BASE_ABSENT to
+        # WarmLanePoolHardDown so the workflow requeues (fail-open, inv.6)
+        # instead of every dispatched task independently faulting into a
+        # per-task blocked+L1 escalation.  INDETERMINATE (a transient
+        # stat/readlink hiccup) deliberately falls through to the normal
+        # acquire path below — it must never masquerade as a genuine outage.
+        if self._warm_lane_base_resolvable() is WarmBaseHealth.ABSENT:
+            logger.warning(
+                'acquire_warm_lane: warm-lane CoW seed base %s is absent/empty '
+                '— refusing to allocate a lane (host-scoped pool condition); '
+                'run reify/scripts/ensure-warm-base.sh to rebuild it',
+                self.warm_lane_base_target_path,
+            )
+            return WarmLaneUnavailable.BASE_ABSENT
 
         # ε: pre-acquire disk-guard (check → reclaim → recheck → DISK_PRESSURE/exit-75).
         # Running BEFORE acquire_for keeps all idle lanes FREE so δ's reclaim can reset
