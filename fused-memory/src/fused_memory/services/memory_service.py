@@ -1837,6 +1837,95 @@ class MemoryService:
 
         return result
 
+    async def set_entity_summary(
+        self,
+        entity_uuid: str | None = None,
+        summary: str | None = None,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+        entity_name: str | None = None,
+    ) -> dict:
+        """Overwrite a Graphiti entity node's summary with explicit text, verbatim.
+
+        Unlike refresh_entity_summary (which regenerates the summary from the
+        entity's currently-valid edges), this writes *summary* exactly as given —
+        it never reads or derives from edges. An empty string clears the summary
+        entirely. This is the operator/reconciliation escape hatch for stale
+        narrative text that edge-derived regeneration cannot remove.
+
+        Accepts either *entity_uuid* (canonical identifier) or *entity_name*
+        (resolved via an exact name lookup). When both are supplied, entity_uuid
+        takes precedence. Raises ValueError if neither is provided, or if
+        summary is not provided.
+
+        Args:
+            entity_uuid: UUID of the Entity node to overwrite (optional when entity_name is given).
+            summary: Exact text to write as the new summary. May be '' to clear.
+            entity_name: Exact entity name to resolve to a UUID (optional when entity_uuid is given).
+            project_id: Project scope (for journal logging).
+            agent_id: Which agent is calling (optional).
+            session_id: Session context (optional).
+            causation_id: Reconciliation causation ID (optional).
+            _source: Source label for journal entry.
+
+        Returns:
+            Dict from backend: {uuid, name, old_summary, new_summary}.
+
+        Raises:
+            ValueError: if summary is None, or if neither entity_uuid nor entity_name is provided.
+        """
+        if summary is None:
+            raise ValueError('summary must be provided')
+        if entity_uuid is None and entity_name is None:
+            raise ValueError('Either entity_uuid or entity_name must be provided')
+
+        # Resolve entity_name → UUID when UUID is not directly supplied
+        if entity_uuid is None:
+            assert entity_name is not None  # guaranteed by the ValueError check above
+            entity_uuid = await self.graphiti.resolve_entity_by_name(
+                entity_name, group_id=project_id
+            )
+
+        write_op_id = str(uuid_mod.uuid4())
+        success = True
+        error_msg = None
+        result: dict = {}
+        journal_params: dict = {'entity_uuid': entity_uuid}
+        if entity_name is not None:
+            journal_params['entity_name'] = entity_name
+        try:
+            result = await self.graphiti.set_entity_summary(entity_uuid, summary, group_id=project_id)
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            if self._write_journal:
+                try:
+                    await self._write_journal.log_write_op(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        source=_source,
+                        operation='set_entity_summary',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params=journal_params,
+                        result_summary=result if success else None,
+                        success=success,
+                        error=error_msg,
+                    )
+                except Exception as journal_exc:
+                    logger.warning(
+                        'set_entity_summary: journal log_write_op failed: %s',
+                        journal_exc,
+                    )
+
+        return result
+
     async def rebuild_entity_summaries(
         self,
         project_id: str = 'main',
