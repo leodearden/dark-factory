@@ -18,7 +18,7 @@ import pytest
 from _orch_helpers import make_placeholder_future, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.git_ops import MergeResult
+from orchestrator.git_ops import AdvanceOutcome, MergeResult
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
@@ -47,7 +47,9 @@ def _make_git_ops_mock() -> MagicMock:
         )
     )
     git_ops.cleanup_merge_worktree = AsyncMock()
-    git_ops.advance_main = AsyncMock(return_value='advanced')
+    git_ops.advance_main = AsyncMock(
+        return_value=AdvanceOutcome('advanced', advanced_sha='aaaa1111merge')
+    )
     return git_ops
 
 

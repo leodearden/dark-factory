@@ -175,14 +175,11 @@ class TestCheckPostMergePyrightBehavioral:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
         try:
-            await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='pyright-clean', max_attempts=1,
             )
-            advanced_sha = (
-                getattr(git_ops, '_last_advanced_sha', None)
-                or merge_result.merge_commit
-            )
+            advanced_sha = outcome.advanced_sha or merge_result.merge_commit
             assert advanced_sha is not None
 
             mc = _make_module_config()
@@ -210,14 +207,11 @@ class TestCheckPostMergePyrightBehavioral:
         assert merge_result.merge_commit is not None
         assert merge_result.merge_worktree is not None
         try:
-            await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 merge_result.merge_commit, merge_result.merge_worktree,
                 branch='pyright-broken', max_attempts=1,
             )
-            advanced_sha = (
-                getattr(git_ops, '_last_advanced_sha', None)
-                or merge_result.merge_commit
-            )
+            advanced_sha = outcome.advanced_sha or merge_result.merge_commit
             assert advanced_sha is not None
 
             mc = _make_module_config(prefix='subpkg')

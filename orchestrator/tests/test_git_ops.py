@@ -13,6 +13,7 @@ from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     GitOps,
+    MergeResult,
     ScrubOutcome,
     ScrubResult,
     TrainStackResult,
@@ -687,7 +688,7 @@ class TestWorktreeLifecycle:
         assert not (git_ops.project_root / 'merged.py').exists()
 
         # Advance main and verify
-        assert await git_ops.advance_main(result.merge_commit) == 'advanced'
+        assert (await git_ops.advance_main(result.merge_commit)).result == 'advanced'
         _, content, _ = await _run(
             ['git', 'show', 'main:merged.py'], cwd=git_ops.project_root,
         )
@@ -721,7 +722,7 @@ class TestWorktreeLifecycle:
         _, orphan_sha, _ = await _run(
             ['git', 'rev-parse', 'HEAD'], cwd=worktree_info.path,
         )
-        assert await git_ops.advance_main(orphan_sha) == 'not_descendant'
+        assert (await git_ops.advance_main(orphan_sha)).result == 'not_descendant'
 
     async def test_get_current_branch(self, git_ops: GitOps):
         worktree_info = await git_ops.create_worktree('feature-7')
@@ -1030,7 +1031,7 @@ class TestWorktreeLifecycle:
 
         # Advance main so the merge commit lands
         advanced = await git_ops.advance_main(result.merge_commit)
-        assert advanced == 'advanced'
+        assert advanced.result == 'advanced'
 
         # The orphan_work.py file must now be on main (content merged correctly)
         rc, content, err = await _run(
@@ -1278,12 +1279,13 @@ class TestMergeConflicts:
 class TestAdvanceMainCasRetrySha:
     """Regression: advance_main must expose the post-rebase SHA when CAS retry rebases."""
 
-    async def test_last_advanced_sha_is_post_rebase_after_cas_retry(
+    async def test_advanced_sha_is_post_rebase_after_cas_retry(
         self, git_ops: GitOps,
     ):
         """When advance_main rebases the merge worktree onto a moved main,
-        ``_last_advanced_sha`` must hold the post-rebase SHA (the one actually
-        on main), not the original pre-rebase ``MergeResult.merge_commit``.
+        ``outcome.advanced_sha`` must hold the post-rebase SHA (the one
+        actually on main), not the original pre-rebase
+        ``MergeResult.merge_commit``.
 
         The pre-rebase SHA is what merge_queue used to forward to
         ``set_task_status('done', done_provenance={'kind':'merged', 'commit':...})``;
@@ -1311,7 +1313,7 @@ class TestAdvanceMainCasRetrySha:
         # Land A first — main now has A's merge commit.
         merge_a = await git_ops.merge_to_main(wt_a.path, 'cas-a')
         assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
-        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+        assert (await git_ops.advance_main(merge_a.merge_commit)).result == 'advanced'
         await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
 
         # Merge B with merge worktree pinned to the ORIGINAL main — so B's
@@ -1323,15 +1325,15 @@ class TestAdvanceMainCasRetrySha:
         assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
         pre_rebase_sha = merge_b.merge_commit
 
-        result = await git_ops.advance_main(
+        outcome = await git_ops.advance_main(
             pre_rebase_sha,
             merge_worktree=merge_b.merge_worktree,
             branch='cas-b',
         )
-        assert result == 'advanced'
+        assert outcome.result == 'advanced'
 
-        # Side channel exposes a SHA that's actually on main.
-        advanced_sha = git_ops._last_advanced_sha
+        # Returned outcome exposes a SHA that's actually on main.
+        advanced_sha = outcome.advanced_sha
         assert advanced_sha is not None
 
         rc, _, _ = await _run(
@@ -1339,7 +1341,7 @@ class TestAdvanceMainCasRetrySha:
              advanced_sha, git_ops.config.main_branch],
             cwd=git_ops.project_root,
         )
-        assert rc == 0, f'_last_advanced_sha {advanced_sha} must be on main'
+        assert rc == 0, f'outcome.advanced_sha {advanced_sha} must be on main'
 
         # And the pre-rebase SHA is NOT on main (the bug we're guarding
         # against — passing this to done_provenance fails fused-memory's
@@ -1353,22 +1355,129 @@ class TestAdvanceMainCasRetrySha:
             f'pre-rebase SHA {pre_rebase_sha} should NOT be on main; '
             f'if it is, the test is no longer exercising the rebase path'
         )
+        assert not hasattr(git_ops, '_last_advanced_sha'), (
+            'the _last_advanced_sha side channel must be retired — '
+            'advanced_sha rides the returned AdvanceOutcome only'
+        )
 
         await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
 
-    async def test_last_advanced_sha_equals_input_when_no_rebase_needed(
+    async def test_advanced_sha_equals_input_when_no_rebase_needed(
         self, git_ops: GitOps,
     ):
-        """When no CAS retry is needed, ``_last_advanced_sha`` matches the input
-        merge_sha — fast-forward case, both SHAs are on main.
+        """When no CAS retry is needed, ``outcome.advanced_sha`` matches the
+        input merge_sha — fast-forward case, both SHAs are on main.
         """
         wt = await git_ops.create_worktree('ff-only')
         (wt.path / 'x.py').write_text('x = 1\n')
         await git_ops.commit(wt.path, 'Add x')
         merge = await git_ops.merge_to_main(wt.path, 'ff-only')
         assert merge.success and merge.merge_commit
-        assert await git_ops.advance_main(merge.merge_commit) == 'advanced'
-        assert git_ops._last_advanced_sha == merge.merge_commit
+        outcome = await git_ops.advance_main(merge.merge_commit)
+        assert outcome.result == 'advanced'
+        assert outcome.advanced_sha == merge.merge_commit
+        assert not hasattr(git_ops, '_last_advanced_sha'), (
+            'the _last_advanced_sha side channel must be retired — '
+            'advanced_sha rides the returned AdvanceOutcome only'
+        )
+
+    # -- AdvanceOutcome value-object contract (task 1997 / MQ-refactor μ) --
+    #
+    # advance_main returns an AdvanceOutcome value object (step-2). The
+    # three side-channel attributes (_last_advanced_sha/_rebased_from/
+    # _rebased_onto) are a transitional bridge retired in step-10. The
+    # fast-forward and CAS-retry-advanced scenarios are already covered
+    # above (test_advanced_sha_equals_input_when_no_rebase_needed and
+    # test_advanced_sha_is_post_rebase_after_cas_retry); only the
+    # reverify_on_rebase path — not exercised by either of those — gets a
+    # dedicated test here.
+
+    async def _prepare_cas_retry_landing(
+        self, git_ops: GitOps,
+    ) -> tuple[MergeResult, str]:
+        """Land branch A, then prepare branch B's merge worktree pinned to
+        the ORIGINAL (pre-A) main so a subsequent ``advance_main(merge_b...)``
+        call must rebase B to land it (the CAS-retry path). Mirrors the setup
+        in ``test_advanced_sha_is_post_rebase_after_cas_retry`` above.
+
+        Returns ``(merge_b, original_main_sha)``; the caller drives the
+        actual ``advance_main`` call and its assertions (the
+        reverify_on_rebase scenario below exercises this with
+        ``reverify_on_rebase=True``).
+        """
+        _, original_main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        original_main_sha = original_main_sha.strip()
+
+        wt_a = await git_ops.create_worktree('cas-a-outcome')
+        (wt_a.path / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt_a.path, 'Add a')
+
+        wt_b = await git_ops.create_worktree('cas-b-outcome')
+        (wt_b.path / 'b.py').write_text('b = 1\n')
+        await git_ops.commit(wt_b.path, 'Add b')
+
+        merge_a = await git_ops.merge_to_main(wt_a.path, 'cas-a-outcome')
+        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
+        assert (await git_ops.advance_main(merge_a.merge_commit)).result == 'advanced'
+        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
+
+        merge_b = await git_ops.merge_to_main(
+            wt_b.path, 'cas-b-outcome', base_sha=original_main_sha,
+        )
+        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
+        return merge_b, original_main_sha
+
+    async def test_advance_main_returns_outcome_object_with_reverify_on_rebase(
+        self, git_ops: GitOps,
+    ):
+        """With reverify_on_rebase=True, a CAS-retry rebase returns
+        'rebased_pending_reverify' with advanced_sha (post-rebase),
+        rebased_from (original base) and rebased_onto (moved main) all
+        populated on the returned object — no update-ref performed.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+
+        merge_b, original_main_sha = await self._prepare_cas_retry_landing(git_ops)
+        pre_rebase_sha = merge_b.merge_commit
+        assert pre_rebase_sha is not None
+        assert merge_b.merge_worktree is not None
+
+        _, moved_main_sha, _ = await _run(
+            ['git', 'rev-parse', git_ops.config.main_branch],
+            cwd=git_ops.project_root,
+        )
+        moved_main_sha = moved_main_sha.strip()
+
+        outcome = await git_ops.advance_main(
+            pre_rebase_sha,
+            merge_worktree=merge_b.merge_worktree,
+            branch='cas-b-outcome',
+            expected_main=original_main_sha,
+            reverify_on_rebase=True,
+        )
+
+        assert isinstance(outcome, AdvanceOutcome)
+        assert outcome.result == 'rebased_pending_reverify'
+        assert outcome.advanced_sha is not None
+        assert outcome.advanced_sha != pre_rebase_sha
+        assert outcome.rebased_from == original_main_sha
+        assert outcome.rebased_onto == moved_main_sha
+        assert not hasattr(git_ops, '_last_advanced_sha'), (
+            'the _last_advanced_sha side channel must be retired — '
+            'advanced_sha rides the returned AdvanceOutcome only'
+        )
+        assert not hasattr(git_ops, '_rebased_from'), (
+            'the _rebased_from side channel must be retired — '
+            'rebased_from rides the returned AdvanceOutcome only'
+        )
+        assert not hasattr(git_ops, '_rebased_onto'), (
+            'the _rebased_onto side channel must be retired — '
+            'rebased_onto rides the returned AdvanceOutcome only'
+        )
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
 
 
 # -- Shared helpers for re-merge-fallback tests --------------------------------
@@ -1414,7 +1523,7 @@ async def _build_remerge_scenario(
 
     merge_a = await git_ops.merge_to_main(wt_a.path, branch_a)
     assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
-    assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+    assert (await git_ops.advance_main(merge_a.merge_commit)).result == 'advanced'
     await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
 
     return merge_b, verified_tip, wt_b
@@ -1468,7 +1577,7 @@ class TestAdvanceMainRemergePin:
                 branch='pin-b',
             )
 
-        assert result == 'advanced', f'Expected advanced, got {result!r}'
+        assert result.result == 'advanced', f'Expected advanced, got {result!r}'
 
         # KEY assertion: stale.py must NOT be in main — the advance must have
         # used M^2, not the moved live ref (which includes stale.py).
@@ -1525,7 +1634,7 @@ class TestAdvanceMainDivergenceWarning:
                 branch='div-b',
             )
 
-        assert result == 'advanced'
+        assert result.result == 'advanced'
 
         # A WARNING must record both the verified tip and the live ref tip.
         divergence_warnings = [
@@ -1565,7 +1674,7 @@ class TestAdvanceMainDivergenceWarning:
                 branch='nodiv-b',
             )
 
-        assert result == 'advanced'
+        assert result.result == 'advanced'
 
         # No divergence WARNING: live ref == M^2, nothing moved.
         divergence_warnings = [
@@ -1625,7 +1734,7 @@ class TestWorkingTreeSync:
     async def test_advance_syncs_working_tree(self, git_ops: GitOps):
         """Merged file appears in the working tree after advance_main."""
         result = await self._merge_and_advance(git_ops, 'sync-basic', 'synced.py', 'synced = True\n')
-        assert result == 'advanced'
+        assert result.result == 'advanced'
         assert (git_ops.project_root / 'synced.py').exists()
         assert 'synced = True' in (git_ops.project_root / 'synced.py').read_text()
 
@@ -1635,7 +1744,7 @@ class TestWorkingTreeSync:
         (git_ops.project_root / 'README.md').write_text('# work in progress\n')
 
         result = await self._merge_and_advance(git_ops, 'stash-restore', 'merged.py', 'merged = True\n')
-        assert result == 'advanced'
+        assert result.result == 'advanced'
 
         # Merged file should be in working tree
         assert (git_ops.project_root / 'merged.py').exists()
@@ -1662,7 +1771,7 @@ class TestWorkingTreeSync:
 
         result = await git_ops.advance_main(merge_result.merge_commit)
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        assert result == 'wip_overlap'
+        assert result.result == 'wip_overlap'
 
         # Main ref should NOT have moved
         _, main_after, _ = await _run(
@@ -1697,7 +1806,7 @@ class TestWorkingTreeSync:
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
         # Overlap detected before stash — staged README.md overlaps merge diff
-        assert result == 'wip_overlap'
+        assert result.result == 'wip_overlap'
 
     async def test_pop_conflict_recovery_via_mock(self, git_ops: GitOps):
         """When stash pop fails, advance_main creates recovery branch and returns 'pop_conflict'."""
@@ -1725,7 +1834,7 @@ class TestWorkingTreeSync:
             result = await git_ops.advance_main(merge_result.merge_commit)
 
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        assert result == 'pop_conflict'
+        assert result.result == 'pop_conflict'
 
         # Recovery branch should be recorded
         assert hasattr(git_ops, '_last_recovery_branch')
@@ -1756,7 +1865,7 @@ class TestWorkingTreeSync:
         with patch('orchestrator.git_ops._run', side_effect=mock_run):
             result1 = await git_ops.advance_main(merge1.merge_commit)
         await git_ops.cleanup_merge_worktree(merge1.merge_worktree)
-        assert result1 == 'pop_conflict'
+        assert result1.result == 'pop_conflict'
 
         # Working tree should be clean after recovery (read-tree reset)
         _, unstaged, _ = await _run(
@@ -1779,7 +1888,7 @@ class TestWorkingTreeSync:
 
         result2 = await git_ops.advance_main(merge2.merge_commit)
         await git_ops.cleanup_merge_worktree(merge2.merge_worktree)
-        assert result2 == 'advanced'
+        assert result2.result == 'advanced'
 
         # Both files should be on main
         _, content, _ = await _run(
@@ -1807,7 +1916,7 @@ class TestWorkingTreeSync:
 
         result = await git_ops.advance_main(merge_result.merge_commit)
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        assert result == 'advanced'
+        assert result.result == 'advanced'
 
         # Merged file appears on main
         _, content, _ = await _run(
@@ -1822,7 +1931,7 @@ class TestWorkingTreeSync:
     async def test_advance_no_stash_when_clean(self, git_ops: GitOps):
         """Clean working tree: no stash, but read-tree still syncs files."""
         result = await self._merge_and_advance(git_ops, 'clean-sync', 'clean.py', 'clean = True\n')
-        assert result == 'advanced'
+        assert result.result == 'advanced'
         assert (git_ops.project_root / 'clean.py').exists()
 
         # No stash entries should exist
@@ -1854,7 +1963,7 @@ class TestWorkingTreeSync:
 
         result = await git_ops.advance_main(merge_result.merge_commit)
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        assert result == 'advanced'
+        assert result.result == 'advanced'
 
         # File should NOT appear in working tree (we're on other-branch)
         assert not (git_ops.project_root / 'should_not_appear.py').exists()
@@ -1896,7 +2005,7 @@ class TestWorkingTreeSync:
             result = await git_ops.advance_main(merge_result.merge_commit)
 
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        assert result == 'stash_failed'
+        assert result.result == 'stash_failed'
 
         # Main ref should NOT have moved
         _, main_after, _ = await _run(
@@ -1927,7 +2036,7 @@ class TestWorkingTreeSync:
             expected_main='0000000000000000000000000000000000000000',
         )
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        assert result == 'cas_failed'
+        assert result.result == 'cas_failed'
 
         # Dirty tracked file should be restored (stash popped)
         assert '# WIP edit' in (git_ops.project_root / 'README.md').read_text()
@@ -1972,7 +2081,7 @@ class TestWorkingTreeSync:
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
         # Sync path: merge DID advance, WIP conflicted — must still be 'pop_conflict'
-        assert result == 'pop_conflict'
+        assert result.result == 'pop_conflict'
 
         # Tree must be fully clean (recovery helper ran read-tree reset)
         unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
@@ -2019,7 +2128,7 @@ class TestWorkingTreeSync:
             )
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
-        assert result == 'pop_conflict_no_advance'
+        assert result.result == 'pop_conflict_no_advance'
 
         # Recovery branch must have been created and recorded
         assert hasattr(git_ops, '_last_recovery_branch')
@@ -2071,7 +2180,7 @@ class TestWorkingTreeSync:
         # Step 3: advance_main must detect UU state and halt without touching main
         result = await git_ops.advance_main(merge_result.merge_commit)
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        assert result == 'unmerged_state'
+        assert result.result == 'unmerged_state'
 
         # Main ref must NOT have moved
         _, main_after, _ = await _run(
@@ -2158,7 +2267,7 @@ class TestWorkingTreeSync:
             )
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
-        assert result == 'unmerged_state'
+        assert result.result == 'unmerged_state'
 
         # Decisive narrowing: the guard returned before the working-tree protection
         # block had any chance to invoke git stash push.
@@ -2231,7 +2340,7 @@ class TestWorkingTreeSync:
             )
         await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
-        assert result1 == 'pop_conflict_no_advance', f'Expected pop_conflict_no_advance, got {result1}'
+        assert result1.result == 'pop_conflict_no_advance', f'Expected pop_conflict_no_advance, got {result1}'
 
         # Tree must be fully clean now (recovery helper ran read-tree reset)
         unmerged = await git_ops._detect_unmerged_paths(git_ops.project_root)
@@ -2250,11 +2359,11 @@ class TestWorkingTreeSync:
             await git_ops.cleanup_merge_worktree(merge_result2.merge_worktree)
 
         # Must NOT cascade to stash_failed or unmerged_state
-        assert result2 not in ('stash_failed', 'unmerged_state'), (
+        assert result2.result not in ('stash_failed', 'unmerged_state'), (
             f'Cascade failure: second advance returned {result2!r} '
             f'(tree was not cleaned by recovery helper)'
         )
-        assert result2 == 'advanced', (
+        assert result2.result == 'advanced', (
             f'Unexpected result: {result2!r} (fully controlled path: no CAS injection, '
             f'no mocks, no dirty WIP \u2014 cas_failed indicates an environmental regression)'
         )
@@ -2292,7 +2401,7 @@ class TestWorkingTreeSync:
         if merge_result.merge_worktree:
             await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
-        assert result == 'advanced'
+        assert result.result == 'advanced'
 
         # Find the mark call and update-ref call in the recorded sequence
         mark_indices = [
@@ -2343,7 +2452,7 @@ class TestWorkingTreeSync:
         if merge_result.merge_worktree:
             await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
-        assert result == 'advanced'
+        assert result.result == 'advanced'
         # No shell invocation via sh -c
         assert not any(c[:2] == ['sh', '-c'] for c in recorded), (
             f'Unexpected sh -c call with feature off; recorded: {recorded}'
@@ -2380,7 +2489,7 @@ class TestWorkingTreeSync:
             result1 = await mark_ops.advance_main(merge1.merge_commit)
         if merge1.merge_worktree:
             await mark_ops.cleanup_merge_worktree(merge1.merge_worktree)
-        assert result1 == 'advanced'
+        assert result1.result == 'advanced'
 
         # Count marks from first advance
         marks_first = sum(1 for c in all_recorded if c == ['sh', '-c', mark_cmd])
@@ -2398,7 +2507,7 @@ class TestWorkingTreeSync:
             result2 = await mark_ops.advance_main(merge2.merge_commit)
         if merge2.merge_worktree:
             await mark_ops.cleanup_merge_worktree(merge2.merge_worktree)
-        assert result2 == 'advanced'
+        assert result2.result == 'advanced'
 
         marks_second = sum(1 for c in all_recorded if c == ['sh', '-c', mark_cmd])
 
@@ -2455,7 +2564,7 @@ class TestWorkingTreeSync:
         if merge_result.merge_worktree:
             await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
-        assert result == 'cas_failed', f'Expected cas_failed, got {result!r}'
+        assert result.result == 'cas_failed', f'Expected cas_failed, got {result!r}'
 
         commands = [cmd for cmd, _ in recorded]
         mark_indices = [i for i, c in enumerate(commands) if c == ['sh', '-c', mark_cmd]]
@@ -2522,7 +2631,7 @@ class TestWorkingTreeSync:
         if merge_result.merge_worktree:
             await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
-        assert result == 'advanced', f'Expected advanced, got {result!r}'
+        assert result.result == 'advanced', f'Expected advanced, got {result!r}'
 
         commands = [cmd for cmd, _ in recorded]
         # mark must have fired on the success path
@@ -2572,7 +2681,7 @@ class TestWorkingTreeSync:
             await mark_ops.cleanup_merge_worktree(merge_result.merge_worktree)
 
         # A failed mark must not abort the advance
-        assert result == 'advanced', (
+        assert result.result == 'advanced', (
             f'Mark failure must not abort advance_main; got {result!r}'
         )
         # update-ref was still called despite the failed mark
@@ -3691,7 +3800,7 @@ class TestFindMergeMarker:
         assert result.merge_worktree is not None
 
         adv = await git_ops.advance_main(result.merge_commit)
-        assert adv == 'advanced'
+        assert adv.result == 'advanced'
 
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
         await git_ops.cleanup_worktree(wt_info.path, tid)
@@ -3750,7 +3859,7 @@ class TestFindMergeMarker:
         assert result.merge_worktree is not None
 
         adv = await git_ops.advance_main(result.merge_commit)
-        assert adv == 'advanced'
+        assert adv.result == 'advanced'
 
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
         await git_ops.cleanup_worktree(wt_info.path, tid)
@@ -3809,7 +3918,7 @@ class TestFindMergeMarker:
         assert result1.merge_worktree is not None
 
         adv1 = await git_ops.advance_main(result1.merge_commit)
-        assert adv1 == 'advanced'
+        assert adv1.result == 'advanced'
 
         await git_ops.cleanup_merge_worktree(result1.merge_worktree)
         await git_ops.cleanup_worktree(wt_info.path, tid)
@@ -3827,7 +3936,7 @@ class TestFindMergeMarker:
         assert result2.merge_worktree is not None
 
         adv2 = await git_ops.advance_main(result2.merge_commit)
-        assert adv2 == 'advanced'
+        assert adv2.result == 'advanced'
 
         await git_ops.cleanup_merge_worktree(result2.merge_worktree)
         await git_ops.cleanup_worktree(wt_info2.path, tid)
@@ -3875,7 +3984,7 @@ class TestMergeSubjectContract:
         assert result.merge_worktree is not None
 
         adv = await git_ops.advance_main(result.merge_commit)
-        assert adv == 'advanced'
+        assert adv.result == 'advanced'
 
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
         await git_ops.cleanup_worktree(wt_info.path, tid)

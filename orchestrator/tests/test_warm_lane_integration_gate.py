@@ -1047,7 +1047,7 @@ async def _assert_merge_phase(
     )
     assert result.merge_worktree is not None
     advance = await git_ops.advance_main(result.merge_commit)
-    assert advance == 'advanced', (
+    assert advance.result == 'advanced', (
         f'advance_main must return "advanced", got {advance!r}'
     )
     rc_show, show_out, _ = await _run(

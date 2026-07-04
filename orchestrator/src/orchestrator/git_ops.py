@@ -53,6 +53,28 @@ AdvanceResult = Literal[
 ]
 
 
+@dataclass(frozen=True)
+class AdvanceOutcome:
+    """Value object returned by :meth:`GitOps.advance_main`.
+
+    result: the :data:`AdvanceResult` code — same literal values and retry
+        semantics as before; this is BEHAVIOR-PRESERVING, only the carrier
+        changed from a bare literal to a field.
+    advanced_sha: the SHA actually placed on main (or parked, for
+        ``'rebased_pending_reverify'``).  Populated on ``'advanced'``,
+        ``'pop_conflict'``, and ``'rebased_pending_reverify'``; ``None`` on
+        every other (failure) result.
+    rebased_from: the original base SHA the caller expected main to be at
+        (``expected_main``), populated only on ``'rebased_pending_reverify'``.
+    rebased_onto: the current main SHA the merge commit was rebased onto,
+        populated only on ``'rebased_pending_reverify'``.
+    """
+    result: AdvanceResult
+    advanced_sha: str | None = None
+    rebased_from: str | None = None
+    rebased_onto: str | None = None
+
+
 PushResult = Literal['pushed', 'noop', 'rejected', 'error']
 
 
@@ -5039,7 +5061,7 @@ class GitOps:
         max_attempts: int = 3,
         expected_main: str | None = None,
         reverify_on_rebase: bool = False,
-    ) -> AdvanceResult:
+    ) -> AdvanceOutcome:
         """Advance main branch ref to *merge_sha* atomically.
 
         Uses ``update-ref`` to advance the ref, then syncs the working tree
@@ -5048,7 +5070,8 @@ class GitOps:
         survives and merge conflicts become visible markers rather than silent
         reverts (see incident ``0ea23cb5c``).
 
-        Returns an :data:`AdvanceResult` literal:
+        Returns an :class:`AdvanceOutcome` value object whose ``result`` field
+        is an :data:`AdvanceResult` literal:
 
         * ``'advanced'`` — success.
         * ``'cas_failed'`` — CAS ``update-ref`` failed (transient; caller
@@ -5076,7 +5099,7 @@ class GitOps:
         When *expected_main* is provided, the final ``update-ref`` uses a
         compare-and-swap: ``git update-ref refs/heads/main <new> <old>``.
         If main has moved (external actor), update-ref fails atomically
-        and this method returns ``'cas_failed'``.
+        and this method returns an outcome with ``result == 'cas_failed'``.
 
         IMPORTANT: This method is the LAST checkpoint before code reaches
         main.  update-ref bypasses most git hooks (including pre-commit),
@@ -5087,11 +5110,14 @@ class GitOps:
         CAS so reify-style projects record the move as SANCTIONED rather
         than UNSANCTIONED.  See also task 7 for the same stale assumption.
 
-        On a successful 'advanced' return, ``self._last_advanced_sha`` holds
+        On a successful ``'advanced'`` outcome, ``outcome.advanced_sha`` holds
         the SHA actually placed on main.  When CAS retry rebases the merge
         commit, the post-rebase SHA is captured here — callers must read
-        this side channel for done_provenance instead of the pre-rebase
-        ``MergeResult.merge_commit`` (which is stale after a rebase).
+        this field for done_provenance instead of the pre-rebase
+        ``MergeResult.merge_commit`` (which is stale after a rebase).  On a
+        ``'rebased_pending_reverify'`` outcome, ``outcome.rebased_from`` and
+        ``outcome.rebased_onto`` are also populated (original base / moved
+        main respectively).
         """
         full_branch = (
             (await self.resolve_queued_branch_ref(branch) or f'{self.config.branch_prefix}{branch}')
@@ -5121,7 +5147,7 @@ class GitOps:
                 )
             except RuntimeError as e:
                 logger.error(str(e))
-                return 'contaminated'
+                return AdvanceOutcome('contaminated')
 
             rc, _, _ = await _run(
                 ['git', 'merge-base', '--is-ancestor',
@@ -5136,7 +5162,7 @@ class GitOps:
                     f'Cannot fast-forward: {merge_sha[:8]} is not a descendant '
                     f'of {self.config.main_branch} (no merge worktree for retry)'
                 )
-                return 'not_descendant'
+                return AdvanceOutcome('not_descendant')
 
             logger.info(
                 f'advance_main attempt {attempt + 1}/{max_attempts}: '
@@ -5208,7 +5234,7 @@ class GitOps:
                 logger.warning(
                     f'Re-merge failed (true conflict): {merge_out}\n{merge_err}'
                 )
-                return 'not_descendant'
+                return AdvanceOutcome('not_descendant')
 
             scrub_result = await scrub_task_dir_from_tree(
                 merge_worktree, f'advance_main-retry({attempt + 1})',
@@ -5232,7 +5258,7 @@ class GitOps:
                 f'{merge_sha[:8]} is not a descendant of '
                 f'{self.config.main_branch}'
             )
-            return 'not_descendant'
+            return AdvanceOutcome('not_descendant')
 
         # ── Reverify-on-rebase gate ──────────────────────────────────
         # When reverify_on_rebase is set and a rebase (or re-merge) occurred,
@@ -5241,19 +5267,22 @@ class GitOps:
         # intervening delta with the branch-touched file set; if overlapping it
         # must re-verify the rebased tree before calling advance_main again.
         if reverify_on_rebase and rebased:
-            self._last_advanced_sha = merge_sha
-            self._rebased_from = expected_main  # original base provided by caller
             _, onto_sha, _ = await _run(
                 ['git', 'rev-parse', self.config.main_branch],
                 cwd=self.project_root,
             )
-            self._rebased_onto = onto_sha.strip()
+            rebased_onto = onto_sha.strip()
             logger.info(
                 'advance_main: reverify_on_rebase — rebased tree parked at '
                 '%s; returning rebased_pending_reverify (no update-ref)',
                 merge_sha[:8],
             )
-            return 'rebased_pending_reverify'
+            return AdvanceOutcome(
+                'rebased_pending_reverify',
+                advanced_sha=merge_sha,
+                rebased_from=expected_main,
+                rebased_onto=rebased_onto,
+            )
 
         # ── Pre-advance unmerged state guard ────────────────────────
         # Belt-and-braces: reject immediately if project_root already has
@@ -5271,7 +5300,7 @@ class GitOps:
                 len(_unmerged_entry_paths),
                 ', '.join(_unmerged_entry_paths[:10]),
             )
-            return 'unmerged_state'
+            return AdvanceOutcome('unmerged_state')
 
         # ── Working-tree protection ──────────────────────────────────
         # When project_root has main checked out, update-ref will desync
@@ -5337,7 +5366,7 @@ class GitOps:
                             len(overlap), branch or merge_sha[:8],
                             ', '.join(sorted(overlap)[:10]),
                         )
-                        return 'wip_overlap'
+                        return AdvanceOutcome('wip_overlap')
 
                 # Only stash if there are tracked dirty files.  Untracked-only
                 # (??) entries survive read-tree without conflict — stashing
@@ -5354,7 +5383,7 @@ class GitOps:
                             '— halting merge to prevent code loss. error=%s',
                             stash_err,
                         )
-                        return 'stash_failed'
+                        return AdvanceOutcome('stash_failed')
                     did_stash = True
                     logger.info('Stashed uncommitted changes before advance_main')
 
@@ -5436,14 +5465,14 @@ class GitOps:
                         'Halting — manual intervention required.',
                         branch or merge_sha[:8], recovery,
                     )
-                    return 'pop_conflict_no_advance'
+                    return AdvanceOutcome('pop_conflict_no_advance')
             if expected_main is not None:
                 logger.warning(
                     f'CAS update-ref failed (expected {expected_main[:8]}): {err}'
                 )
             else:
                 logger.error(f'update-ref failed: {err}')
-            return 'cas_failed'
+            return AdvanceOutcome('cas_failed')
 
         logger.info(f'Advanced {self.config.main_branch} to {merge_sha[:8]}')
 
@@ -5473,17 +5502,16 @@ class GitOps:
                         'WIP preserved on recovery branch: %s',
                         branch or merge_sha[:8], recovery,
                     )
-                    # Main was advanced before the stash pop ran — record the
-                    # actually-on-main SHA so callers handling done_wip_recovery
-                    # can record correct done_provenance.
-                    self._last_advanced_sha = merge_sha
-                    return 'pop_conflict'
+                    # Main was advanced before the stash pop ran — the
+                    # returned AdvanceOutcome.advanced_sha lets callers
+                    # handling done_wip_recovery record correct
+                    # done_provenance.
+                    return AdvanceOutcome('pop_conflict', advanced_sha=merge_sha)
 
-        # Main was advanced — expose the post-rebase SHA so callers can record
-        # done_provenance against the SHA actually on main, not the stale
-        # pre-rebase SHA from MergeResult.merge_commit.
-        self._last_advanced_sha = merge_sha
-        return 'advanced'
+        # Main was advanced — the returned AdvanceOutcome.advanced_sha lets
+        # callers record done_provenance against the SHA actually on main,
+        # not the stale pre-rebase SHA from MergeResult.merge_commit.
+        return AdvanceOutcome('advanced', advanced_sha=merge_sha)
 
     async def recover_red_main(
         self,

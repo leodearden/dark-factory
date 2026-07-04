@@ -46,7 +46,7 @@ import contextlib
 import logging
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -61,7 +61,13 @@ from test_merge_queue_concurrent_verify import (  # noqa: F401
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
 from orchestrator.event_store import EventStore, EventType  # noqa: F401
-from orchestrator.git_ops import GitOps, WorktreeInfo, _run  # noqa: F401
+from orchestrator.git_ops import (  # noqa: F401
+    AdvanceOutcome,
+    AdvanceResult,
+    GitOps,
+    WorktreeInfo,
+    _run,
+)
 from orchestrator.merge_queue import (  # noqa: F401
     InflightEntry,
     InflightVerifyResult,
@@ -1033,7 +1039,7 @@ def _make_b9_worker(tmp_path: Path) -> tuple[SpeculativeMergeWorker, MagicMock]:
     )
     mock_git_ops.release_spec_lane = AsyncMock()
     mock_git_ops.cleanup_merge_worktree = AsyncMock()
-    mock_git_ops.advance_main = AsyncMock(return_value='advanced')
+    mock_git_ops.advance_main = AsyncMock(return_value=AdvanceOutcome('advanced'))
 
     worker = SpeculativeMergeWorker(mock_git_ops, asyncio.Queue())
     worker._host_allocator = None  # skip lease release in finally
@@ -1467,22 +1473,13 @@ class TestSpecLaneAbortPathRelease:
 def _make_finalize_test_worker(
     tmp_path: Path,
 ) -> tuple[SpeculativeMergeWorker, MagicMock]:
-    """Build a SpeculativeMergeWorker with async spies for finalize terminal-path tests.
-
-    Sets side-channel attributes needed by the rebased_pending_reverify path
-    (``_last_advanced_sha``, ``_rebased_from``, ``_rebased_onto``) so the gate-
-    retry test can trigger that path without real git I/O.
-    """
+    """Build a SpeculativeMergeWorker with async spies for finalize terminal-path tests."""
     mock_git_ops = MagicMock()
     mock_git_ops.project_root = tmp_path
     mock_git_ops.release_spec_lane = AsyncMock()
     mock_git_ops.cleanup_merge_worktree = AsyncMock()
     mock_git_ops.advance_main = AsyncMock()
     mock_git_ops.get_main_sha = AsyncMock(return_value='deadbeef' * 5)
-    # Side-channel attrs read by the rebased_pending_reverify path
-    mock_git_ops._last_advanced_sha = 'aa' * 20
-    mock_git_ops._rebased_from = 'bb' * 20
-    mock_git_ops._rebased_onto = 'cc' * 20
     worker = SpeculativeMergeWorker(mock_git_ops, asyncio.Queue())
     return worker, mock_git_ops
 
@@ -1530,8 +1527,15 @@ class TestSpecLaneFinalizeTerminalRelease:
         vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
         entry = _build_entry(item, vr, merge_wt=fake_lane)
 
-        # Always return 'rebased_pending_reverify' to spin the gate-retry loop
-        mock_git_ops.advance_main.return_value = 'rebased_pending_reverify'
+        # Always return 'rebased_pending_reverify' to spin the gate-retry loop.
+        # SHA fields must be populated: _finalize_inflight sources them from
+        # the return value (task 1997 step-6).
+        mock_git_ops.advance_main.return_value = AdvanceOutcome(
+            'rebased_pending_reverify',
+            advanced_sha='aa' * 20,
+            rebased_from='bb' * 20,
+            rebased_onto='cc' * 20,
+        )
 
         with patch(
             'orchestrator.merge_queue._reverify_rebased_tree',
@@ -1576,7 +1580,7 @@ class TestSpecLaneFinalizeTerminalRelease:
             # Cancel req.result DURING advance_main so _request_abandoned is
             # True in the CAS loop but False at the pre-loop short-circuit (8099).
             req.result.cancel()
-            return 'wip_overlap'
+            return AdvanceOutcome('wip_overlap')
 
         mock_git_ops.advance_main.side_effect = _advance_and_cancel
 
@@ -1611,8 +1615,12 @@ class TestSpecLaneFinalizeTerminalRelease:
         vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
         entry = _build_entry(item, vr, merge_wt=fake_lane)
 
-        # 'merge_conflict' is not in _HALT_ADVANCE_RESULTS and not 'cas_failed'
-        mock_git_ops.advance_main.return_value = 'merge_conflict'
+        # 'merge_conflict' is not in _HALT_ADVANCE_RESULTS and not 'cas_failed' — an
+        # intentionally out-of-domain sentinel exercising the unhandled-code branch,
+        # not a real AdvanceResult member (hence the cast).
+        mock_git_ops.advance_main.return_value = AdvanceOutcome(
+            cast(AdvanceResult, 'merge_conflict')
+        )
 
         with patch(
             'orchestrator.merge_queue._map_advance_failure',
@@ -1649,7 +1657,7 @@ class TestSpecLaneFinalizeTerminalRelease:
         entry = _build_entry(item, vr, merge_wt=fake_lane)
 
         # Always return 'cas_failed' to spin the CAS-retry loop
-        mock_git_ops.advance_main.return_value = 'cas_failed'
+        mock_git_ops.advance_main.return_value = AdvanceOutcome('cas_failed')
 
         await worker._finalize_inflight(entry)
 
@@ -1660,6 +1668,98 @@ class TestSpecLaneFinalizeTerminalRelease:
         assert fake_lane not in cleaned, (
             'cas-retry-exhausted path must call release_spec_lane, '
             'not cleanup_merge_worktree on warm _spec- lane'
+        )
+
+
+# ===========================================================================
+# task 1997 step-5: rebased_pending_reverify consumes AdvanceOutcome fields
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestGateReverifyConsumesAdvanceOutcome:
+    """_finalize_inflight's rebased_pending_reverify branch sources the
+    post-rebase SHAs from the AdvanceOutcome return value — the
+    git_ops._last_advanced_sha/_rebased_from/_rebased_onto getattr side
+    channel is retired (task 1997 / MQ-refactor μ).  The stub built by
+    _make_finalize_test_worker never sets those attributes, so this pins
+    the retirement: production must not depend on them.
+    """
+
+    async def test_gate_reverify_consumes_advance_outcome_sha_fields(
+        self, tmp_path: Path,
+    ) -> None:
+        cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
+        worker, mock_git_ops = _make_finalize_test_worker(tmp_path)
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        item.request.task_id = 'task-gate-reverify-sha'
+
+        vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
+        entry = _build_entry(item, vr, merge_wt=fake_lane)
+
+        REBASED_SHA = 'ab' * 20
+        REBASED_FROM = 'ba' * 20
+        REBASED_ONTO = 'cd' * 20
+
+        advance_calls: list[tuple[tuple, dict]] = []
+
+        async def _advance_side_effect(*args, **kwargs):
+            advance_calls.append((args, kwargs))
+            if len(advance_calls) == 1:
+                return AdvanceOutcome(
+                    'rebased_pending_reverify',
+                    advanced_sha=REBASED_SHA,
+                    rebased_from=REBASED_FROM,
+                    rebased_onto=REBASED_ONTO,
+                )
+            # Second call (post-rebuild): terminal failure — sidesteps the
+            # success-path gate machinery, which is not this test's concern.
+            return AdvanceOutcome('not_descendant')
+
+        mock_git_ops.advance_main.side_effect = _advance_side_effect
+
+        captured_reverify_kwargs: dict = {}
+
+        async def _fake_reverify_rebased_tree(
+            git_ops, req, merge_wt, *, rebased_from, rebased_onto, merge_sha, **kwargs,
+        ):
+            captured_reverify_kwargs.update(
+                rebased_from=rebased_from, rebased_onto=rebased_onto, merge_sha=merge_sha,
+            )
+            return None  # gate clears — disjoint/green re-verify
+
+        with patch(
+            'orchestrator.merge_queue._reverify_rebased_tree',
+            new=_fake_reverify_rebased_tree,
+        ):
+            await worker._finalize_inflight(entry)
+
+        assert captured_reverify_kwargs == {
+            'rebased_from': REBASED_FROM,
+            'rebased_onto': REBASED_ONTO,
+            'merge_sha': REBASED_SHA,
+        }, (
+            f'_reverify_rebased_tree must be called with the AdvanceOutcome '
+            f'fields, not the (unset) getattr side channel; got '
+            f'{captured_reverify_kwargs!r}'
+        )
+        assert len(advance_calls) == 2, (
+            f'advance_main must be retried after the gate clears; got '
+            f'{len(advance_calls)} call(s)'
+        )
+        second_args, second_kwargs = advance_calls[1]
+        assert second_args[0] == REBASED_SHA, (
+            f'second advance_main call must retry with current_sha sourced '
+            f'from adv_outcome.advanced_sha; got {second_args[0]!r}'
+        )
+        assert second_kwargs['expected_main'] == REBASED_ONTO, (
+            f'second advance_main call must use item.base_sha rebuilt from '
+            f'rebased_onto (task 1990 replace-only rebuild); got '
+            f'{second_kwargs.get("expected_main")!r}'
         )
 
 
@@ -2051,7 +2151,7 @@ class TestLateArrivalCleanCAS:
                 merge_sha, merge_worktree, branch=branch, **kwargs,
             )
             if branch:
-                advance_outcomes[branch] = str(result)
+                advance_outcomes[branch] = result.result
             return result
 
         git_ops.advance_main = _spy_advance_main  # type: ignore[method-assign]
@@ -2993,7 +3093,7 @@ class TestLateArrivalSubmissionOrderCAS:
             advance_call_log.append({
                 'branch': branch,
                 'expected_main': kwargs.get('expected_main'),
-                'result': str(result),
+                'result': result.result,
             })
             return result
 

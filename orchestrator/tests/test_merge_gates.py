@@ -162,7 +162,9 @@ class TestReachBackRouting:
         git_ops = MagicMock()
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
-        git_ops._last_advanced_sha = 'abc123def'
+        # NOTE (task 1997): the post-rebase SHA is threaded via the explicit
+        # advanced_sha= kwarg below, NOT the git_ops._last_advanced_sha side
+        # channel — deliberately left unset here.
         req = MagicMock()
         req.task_id = 'task-finalize-reachback'
         req.branch = 'br-finalize-reachback'
@@ -207,6 +209,7 @@ class TestReachBackRouting:
                 timeouts=timeouts,
                 enospc_retries=enospc_retries,
                 merged_branch_tip='trusted-tip',
+                advanced_sha='abc123def',
             )
 
         assert outcome.status == 'done', (
@@ -525,7 +528,10 @@ class TestFinalizeDrivesRegistry:
         git_ops = MagicMock()
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
-        git_ops._last_advanced_sha = 'finalize-registry-sha'
+        # NOTE (task 1997): the post-rebase SHA is threaded via the explicit
+        # advanced_sha= kwarg below, NOT the git_ops._last_advanced_sha side
+        # channel — deliberately left unset here so these tests pin the
+        # post-migration contract.
         req = MagicMock()
         req.task_id = 'task-finalize-registry'
         req.branch = 'br-finalize-registry'
@@ -542,6 +548,7 @@ class TestFinalizeDrivesRegistry:
             cas_retries={},
             timeouts={},
             enospc_retries={},
+            advanced_sha='finalize-registry-sha',
         )
         defaults.update(overrides)
         return defaults
@@ -623,7 +630,7 @@ class TestFinalizeDrivesRegistry:
 
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
-        assert outcome.merge_sha == args['git_ops']._last_advanced_sha
+        assert outcome.merge_sha == args['advanced_sha']
         args['git_ops'].push_main.assert_not_awaited()
 
         gate_lines = [
@@ -667,7 +674,7 @@ class TestFinalizeDrivesRegistry:
 
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)
-        assert outcome.merge_sha == args['git_ops']._last_advanced_sha
+        assert outcome.merge_sha == args['advanced_sha']
         args['git_ops'].push_main.assert_not_awaited()
 
         gate_lines = [
@@ -713,3 +720,82 @@ class TestFinalizeDrivesRegistry:
         assert emitted == ['post_merge_equivalence_failed', 'post_merge_generation_chained'], (
             f'expected the equivalence-failed emit before the chained emit, got: {emitted}'
         )
+
+    async def test_finalize_merge_sha_falls_back_to_merge_commit_fallback_when_advanced_sha_none(
+        self,
+    ) -> None:
+        """advanced_sha=None (e.g. no rebase occurred) falls back to
+        merge_commit_fallback for outcome.merge_sha — the other half of the
+        advanced_sha contract pinned above (populated case)."""
+        from orchestrator.merge_gates import _finalize_advanced_merge
+
+        clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
+        args = self._make_finalize_args(advanced_sha=None)
+        with (
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=clean_pyright),
+            ),
+        ):
+            outcome = await _finalize_advanced_merge(**args)
+
+        assert outcome.status == 'done'
+        assert outcome.merge_sha == args['merge_commit_fallback']
+
+
+@pytest.mark.asyncio
+class TestMapAdvanceFailurePopConflictAdvancedSha:
+    """_map_advance_failure's pop_conflict branch threads advanced_sha
+    (task 1997 / MQ-refactor μ) instead of reading the
+    git_ops._last_advanced_sha getattr side channel.
+
+    RED: _map_advance_failure does not yet accept an advanced_sha kwarg —
+    every test below fails with a TypeError until step-4 lands it.
+    """
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        # Deliberately do NOT set _last_advanced_sha — the mapper must
+        # source the SHA from the advanced_sha kwarg, not the side channel.
+        return git_ops
+
+    async def test_pop_conflict_merge_sha_uses_advanced_sha_kwarg(self) -> None:
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+
+        outcome = await _map_advance_failure(
+            git_ops, 'pop_conflict',
+            task_id='task-map-adv-sha',
+            merge_commit_fallback='fallback-sha',
+            halt=MagicMock(),
+            unhalt=MagicMock(),
+            cas_retries={},
+            advanced_sha='post-rebase-sha',
+        )
+
+        assert outcome.status == 'done_wip_recovery'
+        assert outcome.merge_sha == 'post-rebase-sha'
+
+    async def test_pop_conflict_merge_sha_falls_back_to_merge_commit_fallback(self) -> None:
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+
+        outcome = await _map_advance_failure(
+            git_ops, 'pop_conflict',
+            task_id='task-map-adv-fallback',
+            merge_commit_fallback='fallback-sha',
+            halt=MagicMock(),
+            unhalt=MagicMock(),
+            cas_retries={},
+            advanced_sha=None,
+        )
+
+        assert outcome.status == 'done_wip_recovery'
+        assert outcome.merge_sha == 'fallback-sha'

@@ -29,7 +29,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, TrainMembership, _run
+from orchestrator.git_ops import AdvanceOutcome, GitOps, TrainMembership, _run
 from orchestrator.merge_queue import (
     ABANDONED_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
@@ -2396,9 +2396,9 @@ class TestGate09TrainWipOverlapHalt:
 
         _OVERLAP_FILES = ["crate_a/src/lib.rs"]
 
-        async def _wip_overlap_advance(*args: Any, **kwargs: Any) -> str:
+        async def _wip_overlap_advance(*args: Any, **kwargs: Any) -> AdvanceOutcome:
             git_ops._last_overlap_files = _OVERLAP_FILES
-            return "wip_overlap"
+            return AdvanceOutcome("wip_overlap")
 
         with (
             patch(

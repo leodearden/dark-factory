@@ -491,6 +491,7 @@ async def _finalize_advanced_merge(
     member_task_ids: list[str] | None = None,
     chain_ctx: _GenerationChainContext | None = None,
     merged_branch_tip: str | None = None,
+    advanced_sha: str | None = None,
 ) -> MergeOutcome:
     """Post-advance success block shared by MergeWorker and SpeculativeMergeWorker.
 
@@ -522,6 +523,12 @@ async def _finalize_advanced_merge(
     On a clean ``'done'`` landing, chain_ctx.counts pops the branch key
     (resetting the lineage counter).  Passing ``None`` (the default)
     preserves all existing behaviour — trains pass ``None`` (PRD D9).
+
+    *advanced_sha* is the post-rebase SHA actually placed on main, threaded
+    from :class:`~orchestrator.git_ops.AdvanceOutcome`.advanced_sha (task
+    1997) — callers must pass ``outcome.advanced_sha`` from the
+    ``advance_main`` call that preceded this one.  ``None`` (e.g. no rebase
+    occurred) falls back to *merge_commit_fallback*.
     """
     from orchestrator.merge_queue import (
         _commit_is_linear,
@@ -536,7 +543,7 @@ async def _finalize_advanced_merge(
     # Use the post-rebase SHA actually placed on main (advance_main
     # rebases on CAS retry; merge_commit_fallback is the stale
     # pre-rebase SHA and would fail done_provenance ancestor check).
-    advanced_sha = getattr(git_ops, '_last_advanced_sha', None) or merge_commit_fallback
+    advanced_sha = advanced_sha or merge_commit_fallback
 
     # Resolve the branch tip that was actually merged (second parent of the
     # --no-ff merge commit).  Preferred over the live worktree HEAD so the
@@ -657,6 +664,7 @@ async def _map_advance_failure(
     halt: Callable[[str], None],
     unhalt: Callable[[str], None],
     cas_retries: dict[str, int],
+    advanced_sha: str | None = None,
 ) -> MergeOutcome:
     """Advance-failure result → MergeOutcome mapping shared by both workers.
 
@@ -677,6 +685,11 @@ async def _map_advance_failure(
     *cas_retries* is mutated for the terminal result codes (popped) but
     NOT for ``wip_overlap`` (which is a recoverable halt, not a terminal
     outcome).
+
+    *advanced_sha* is the post-rebase SHA actually placed on main, threaded
+    from :class:`~orchestrator.git_ops.AdvanceOutcome`.advanced_sha (task
+    1997) — only consulted on the ``pop_conflict`` branch (main did land in
+    that case).  ``None`` falls back to *merge_commit_fallback*.
     """
     if result in ('wip_overlap', 'pop_conflict'):
         halt(f'advance_main: {result}')
@@ -693,9 +706,7 @@ async def _map_advance_failure(
                 # Main IS on the post-rebase SHA — propagate it so workflow's
                 # _handle_wip_recovery → set_task_status('done') has valid
                 # done_provenance (otherwise the call hits "kind required").
-                advanced_sha = (
-                    getattr(git_ops, '_last_advanced_sha', None) or merge_commit_fallback
-                )
+                advanced_sha = advanced_sha or merge_commit_fallback
                 return MergeOutcome(
                     'done_wip_recovery',
                     reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',

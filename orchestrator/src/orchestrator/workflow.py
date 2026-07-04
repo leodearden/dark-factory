@@ -6352,13 +6352,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 continue
             try:
                 expected_main = await self.git_ops.get_main_sha()
-                adv = await self.git_ops.advance_main(
+                outcome = await self.git_ops.advance_main(
                     r.merge_sha,
                     r.solo_wt,
                     branch=None,
                     expected_main=expected_main,
                     reverify_on_rebase=False,
                 )
+                adv = outcome.result
             except Exception as exc:  # noqa: BLE001
                 # advance_main raised (unexpected); leave member parked for
                 # re-dispatch and continue processing the remaining passers.
@@ -6368,6 +6369,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     self.task_id, train_id, r.member_id, exc,
                 )
                 adv = 'exception'
+                outcome = None
             finally:
                 # Always clean up the solo worktree and branch after the
                 # advance attempt — regardless of outcome, neither is needed
@@ -6391,8 +6393,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             exc_info=True,
                         )
             if adv == 'advanced':
+                # outcome is guaranteed non-None here: 'exception' (the only
+                # code path that sets outcome=None) never equals 'advanced'.
                 landed_sha: str = (
-                    getattr(self.git_ops, '_last_advanced_sha', None) or r.merge_sha
+                    (outcome.advanced_sha if outcome else None) or r.merge_sha
                 )
                 await self.scheduler.mark_done(
                     r.member_id,
