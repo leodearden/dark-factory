@@ -4136,6 +4136,8 @@ class TaskWorkflow:
             if corrupted:
                 self._escalate_corruption(corrupted)
 
+            wip_notice = await self._detect_tip_wip_commits()
+
             # Snapshot completed steps before invocation
             completed_before = {
                 s['id']
@@ -4146,7 +4148,7 @@ class TaskWorkflow:
 
             prompt = await self.briefing.build_implementer_prompt(
                 self.plan, iteration_log, rebase_notice=rebase_notice,
-                task_id=self.task_id,
+                task_id=self.task_id, wip_notice=wip_notice,
             )
             result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
 
