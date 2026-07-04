@@ -38,9 +38,11 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
+    DecidedItem,
     InflightEntry,
     MergeOutcome,
     MergeRequest,
+    RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
 )
@@ -143,19 +145,22 @@ def _make_fake_item(
     Must be called from an async context (for MergeRequest.result future).
     """
     req = _make_req(task_id, f'task/{task_id}', config, git_repo)
-    fake_merge_result = MergeResult(
-        success=True,
-        merge_commit=merge_commit,
-    ) if merge_commit is not None else None
-    item = SpeculativeItem(
-        request=req,
-        merge_result=fake_merge_result,
-        merge_wt=Path('/fake/merge-wt') if fake_merge_result is not None else None,
-        base_sha=base_sha,
-        speculative=False,
-        skip_verify=False,
-        immediate_outcome=None if fake_merge_result is not None else MergeOutcome('conflict'),
-    )
+    item: SpeculativeItem
+    if merge_commit is not None:
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(success=True, merge_commit=merge_commit),
+            merge_wt=Path('/fake/merge-wt'),
+            base_sha=base_sha,
+            speculative=False,
+        )
+    else:
+        item = DecidedItem(
+            request=req,
+            immediate_outcome=MergeOutcome('conflict'),
+            base_sha=base_sha,
+            speculative=False,
+        )
     return req, item
 
 

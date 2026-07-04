@@ -539,7 +539,7 @@ class TestOperatorHaltRequeueNoFalseAlarm:
     ) -> None:
         from orchestrator.merge_queue import (
             InflightStatus,
-            SpeculativeItem,
+            RealMergeItem,
             SpeculativeMergeWorker,
         )
 
@@ -554,13 +554,12 @@ class TestOperatorHaltRequeueNoFalseAlarm:
         t0 = 1_000_000.0
         worker._request_ledger.on_dequeue(req, now=t0)
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=MagicMock(),
             merge_wt=tmp_path / 'merge_wt',
             base_sha='deadbeef',
             speculative=False,
-            skip_verify=False,
         )
 
         worker._operator_halt.set()

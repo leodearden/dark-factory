@@ -1003,7 +1003,7 @@ class TestRunInflightVerifyRunnerUnavailableReason:
 
     async def test_reason_captured_from_exception_message(self, tmp_path):
         """REMOTE lease RunnerUnavailable → reason field holds the exception message."""
-        from orchestrator.merge_queue import SpeculativeItem, SpeculativeMergeWorker
+        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
         error_msg = 'ssh: Could not resolve hostname leo-laptop'
@@ -1012,7 +1012,7 @@ class TestRunInflightVerifyRunnerUnavailableReason:
         q: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
 
-        # Minimal SpeculativeItem: only the fields asserted in _run_inflight_verify
+        # Minimal RealMergeItem: only the fields asserted in _run_inflight_verify
         merge_wt_path = tmp_path / 'merge-wt'
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
@@ -1020,13 +1020,12 @@ class TestRunInflightVerifyRunnerUnavailableReason:
         config = _make_config()
         req = _make_merge_request(config, task_files=[], worktree=tmp_path)
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_wt_path,
             base_sha='base123',
             speculative=False,
-            skip_verify=False,
         )
 
         # REMOTE lease — bypasses local warm-swap path
@@ -1383,7 +1382,7 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
             InflightStatus,
             InflightVerifyResult,
             MergeRequest,
-            SpeculativeItem,
+            RealMergeItem,
         )
         from orchestrator.verify_runner import HostLease
 
@@ -1407,13 +1406,12 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         merge_result = MagicMock()
         merge_result.merge_commit = 'deadbeefdeadbeef1234'
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=MagicMock(),
             base_sha='base123',
             speculative=False,
-            skip_verify=False,
         )
 
         async def _fake_ru_verify():

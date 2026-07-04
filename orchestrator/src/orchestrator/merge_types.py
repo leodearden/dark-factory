@@ -18,7 +18,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from orchestrator.git_ops import MergeResult
 from orchestrator.verify import VerifyResult
@@ -780,50 +780,76 @@ class SoloVerifyResult:
 
 
 @dataclass
-class SpeculativeItem:
-    """Internal message passed from Merger coroutine to Verifier coroutine.
+class RealMergeItem:
+    """Internal message passed from Merger coroutine to Verifier coroutine:
+    a merge actually happened and needs verification + CAS-advance of main.
 
-    Holds everything the Verifier needs to run verification and CAS-advance
-    main, or to immediately resolve a Future (for conflict/already_merged).
+    The REAL arm of the MQ-refactor ο item union (mirrors ``classify_and_merge``'s
+    :class:`MergedOk`).  Structurally disjoint from :class:`DecidedItem` — this
+    class has no ``immediate_outcome``/``already_delivered``/``failure_diagnostic``
+    fields, so the task-1990 I2 "REAL xor DECIDED" __post_init__ check retires
+    into type structure: the illegal shape can no longer be constructed.
     """
 
     request: MergeRequest
-    merge_result: MergeResult | None  # None means already_merged or conflict
-    merge_wt: Path | None             # Merge worktree (if merge succeeded)
+    merge_result: MergeResult          # the successful merge result
+    merge_wt: Path                     # Merge worktree
     base_sha: str                      # main SHA at merge time (actual or speculative)
     speculative: bool                  # True → merged against pending N's SHA
-    skip_verify: bool                  # Retained but always False for single-task items (task-1724); trains still set True
-    immediate_outcome: MergeOutcome | None = None  # Set for conflict/already_merged
-    already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
-    failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
     counts_against_cap: bool = False  # True for non-speculative, non-train successful merges (Mechanism 1)
 
-    def __post_init__(self) -> None:
-        """Enforce the I2 shape invariants (task 1990 / MQ-invariants ε).
 
-        A SpeculativeItem is either REAL (a merge actually happened; carries
-        merge_result + merge_wt) or DECIDED (conflict/already_merged/skip;
-        carries immediate_outcome) — never both, never neither.  Structurally
-        retires the task-1928 bug class where a hand-rebuilt item silently
-        dropped a field into an inconsistent shape.
-        """
-        if (self.merge_result is None) == (self.immediate_outcome is None):
-            raise ValueError(
-                'SpeculativeItem requires exactly one of merge_result or '
-                f'immediate_outcome to be set (REAL xor DECIDED); got '
-                f'merge_result={self.merge_result!r}, immediate_outcome={self.immediate_outcome!r}',
-            )
-        if (self.merge_wt is not None) != (self.merge_result is not None):
-            raise ValueError(
-                'SpeculativeItem.merge_wt must be set iff merge_result is set; got '
-                f'merge_wt={self.merge_wt!r}, merge_result={self.merge_result!r}',
-            )
-        if self.already_delivered and self.immediate_outcome is None:
-            raise ValueError(
-                'SpeculativeItem.already_delivered=True requires immediate_outcome to be set',
-            )
+@dataclass
+class DecidedItem:
+    """Internal message passed from Merger coroutine to Verifier coroutine:
+    a terminal MergeOutcome was already decided — delivered as a passthrough
+    (no real verify task) in submission order.
+
+    The DECIDED arm of the MQ-refactor ο item union (mirrors
+    ``classify_and_merge``'s :class:`Decided`).  Structurally disjoint from
+    :class:`RealMergeItem` — this class has no
+    ``merge_result``/``merge_wt``/``merged_branch_tip``/``counts_against_cap``
+    fields, so the task-1990 I2 "REAL xor DECIDED" __post_init__ check retires
+    into type structure: the illegal shape can no longer be constructed.
+    """
+
+    request: MergeRequest
+    immediate_outcome: MergeOutcome    # conflict / already_merged / train-handoff / retry outcome
+    base_sha: str                      # main SHA at merge time (actual or speculative)
+    speculative: bool                  # True → merged against pending N's SHA
+    started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
+    already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
+    failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
+
+
+SpeculativeItem: TypeAlias = RealMergeItem | DecidedItem
+"""Union of the two pipeline-item variants passed from Merger to Verifier
+(task ο / MQ-refactor).  Retained under its original task-1990 name so every
+existing ``item: SpeculativeItem`` annotation and ``isinstance(item,
+SpeculativeItem)`` check keeps working unchanged — only the CONSTRUCTORS
+changed, from the single product dataclass to :class:`RealMergeItem` /
+:class:`DecidedItem`."""
+
+
+def item_merge_wt(item: SpeculativeItem) -> Path | None:
+    """Return the merge worktree owned by *item*, if any.
+
+    Centralizes the "clean up the owned worktree, if this item has one"
+    pattern shared by the various cleanup/drain call sites: a
+    :class:`RealMergeItem` always owns a merge worktree; a
+    :class:`DecidedItem` never does (it short-circuited before any merge
+    worktree existed).  The ``assert_never`` fallthrough makes pyright flag
+    any future third variant that isn't handled here.
+    """
+    match item:
+        case RealMergeItem():
+            return item.merge_wt
+        case DecidedItem():
+            return None
+        case _:
+            assert_never(item)
 
 
 @dataclass
@@ -936,13 +962,13 @@ class InflightEntry:
 
         A passthrough entry (immediate-outcome delivery, no real verify) must
         wrap a DECIDED item — i.e. passthrough_outcome is set only when the
-        wrapped item's own immediate_outcome is also set.
+        wrapped item is a :class:`DecidedItem` (task ο).
         """
-        if self.passthrough_outcome is not None and self.item.immediate_outcome is None:
+        if self.passthrough_outcome is not None and not isinstance(self.item, DecidedItem):
             raise ValueError(
-                'InflightEntry.passthrough_outcome requires item.immediate_outcome '
-                f'to be set; got passthrough_outcome={self.passthrough_outcome!r} on '
-                f'an item with immediate_outcome=None (merge_result={self.item.merge_result!r})',
+                'InflightEntry.passthrough_outcome requires item to be a DecidedItem; got '
+                f'passthrough_outcome={self.passthrough_outcome!r} on an item of type '
+                f'{type(self.item).__name__}',
             )
 
 

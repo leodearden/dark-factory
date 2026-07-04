@@ -29,11 +29,11 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
+    DecidedItem,
     InflightEntry,
     InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
-    SpeculativeItem,
     SpeculativeMergeWorker,
 )
 from orchestrator.verify_runner import HostLease
@@ -102,15 +102,12 @@ def _make_req(
     )
 
 
-def _make_item(req: MergeRequest) -> SpeculativeItem:
-    return SpeculativeItem(
+def _make_item(req: MergeRequest) -> DecidedItem:
+    return DecidedItem(
         request=req,
-        merge_result=None,
-        merge_wt=None,
+        immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         base_sha='abc123',
         speculative=False,
-        skip_verify=False,
-        immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
     )
 
 
@@ -417,7 +414,7 @@ class TestFinalizingHeadLifecycle:
         content: str,
     ):
         """Build a real merged item so _finalize_inflight's merge_result path works."""
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
 
         # Create branch with file
         worktree = (await git_ops.create_worktree(branch)).path
@@ -437,14 +434,14 @@ class TestFinalizingHeadLifecycle:
         )
         merge_result = await git_ops.merge_to_main(worktree, branch)
         assert merge_result.success
+        assert merge_result.merge_worktree is not None
         base_sha = await git_ops.get_main_sha()
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
         return req, item
 

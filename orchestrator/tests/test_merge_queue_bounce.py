@@ -24,11 +24,13 @@ from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
+    DecidedItem,
     GroupMergeRequest,
     InflightEntry,
     MergeBounceRegistry,
     MergeOutcome,
     MergeRequest,
+    RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
     SuffixConflictGraph,
@@ -166,23 +168,26 @@ def _make_fake_item(
     real git operations. Must be called from an async context (for the future).
     """
     req = _make_req(task_id, f'task/{task_id}', config, git_repo)
-    fake_merge_result = (
-        MergeResult(
+    item: SpeculativeItem
+    if merge_commit is not None:
+        fake_merge_result = MergeResult(
             success=True,
             merge_commit=merge_commit,
         )
-        if merge_commit is not None
-        else None
-    )
-    item = SpeculativeItem(
-        request=req,
-        merge_result=fake_merge_result,
-        merge_wt=Path('/fake/merge-wt') if fake_merge_result is not None else None,
-        base_sha=base_sha,
-        speculative=False,
-        skip_verify=False,
-        immediate_outcome=None if fake_merge_result is not None else MergeOutcome('conflict'),
-    )
+        item = RealMergeItem(
+            request=req,
+            merge_result=fake_merge_result,
+            merge_wt=Path('/fake/merge-wt'),
+            base_sha=base_sha,
+            speculative=False,
+        )
+    else:
+        item = DecidedItem(
+            request=req,
+            immediate_outcome=MergeOutcome('conflict'),
+            base_sha=base_sha,
+            speculative=False,
+        )
     return req, item
 
 

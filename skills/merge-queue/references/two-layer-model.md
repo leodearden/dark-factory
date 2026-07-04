@@ -136,7 +136,10 @@ sites — `from orchestrator.merge_queue import MergeRequest`, etc. — keep wor
 | `MergeRequest` | merge_types.py | A request to merge a task branch into main |
 | `GroupMergeRequest` | merge_types.py | `MergeRequest` subclass for an atomic linear-stacked train merge |
 | `MergeOutcome` | merge_types.py | Result delivered to the caller via the request's Future |
-| `SpeculativeItem` | merge_types.py | Internal message from the Merger coroutine to the Verifier coroutine |
+| `RealMergeItem` | merge_types.py | REAL arm of the Merger→Verifier item union: a merge actually happened (`merge_result` + `merge_wt` required, no `immediate_outcome`) (MQ-refactor task ο, task 2000) |
+| `DecidedItem` | merge_types.py | DECIDED arm of the Merger→Verifier item union: a terminal `MergeOutcome` was already decided, delivered as a passthrough (`immediate_outcome` required, no `merge_result`/`merge_wt`) (MQ-refactor task ο, task 2000) |
+| `SpeculativeItem` | merge_types.py | `TypeAlias` for `RealMergeItem \| DecidedItem` — retained name for existing annotations/`isinstance` checks; no longer a constructible dataclass itself (MQ-refactor task ο, task 2000) |
+| `item_merge_wt` | merge_types.py | Helper returning the owned merge worktree for a `RealMergeItem` or `None` for a `DecidedItem`, via an `assert_never`-exhaustive match (MQ-refactor task ο, task 2000) |
 | `MergedOk` | merge_types.py | `classify_and_merge`'s REAL-arm return value (mirrors `SpeculativeItem`'s REAL/DECIDED split): `merge_result` + `merge_wt` + `branch_tip` for a merge that actually happened (MQ-refactor task κ, task 1995) |
 | `Decided` | merge_types.py | `classify_and_merge`'s DECIDED-arm return value: a terminal `MergeOutcome` (+ the failed `MergeResult`, when one was attempted) (MQ-refactor task κ, task 1995) |
 | `InflightEntry` | merge_types.py | An in-flight verify entry held in `SpeculativeMergeWorker._inflight` |

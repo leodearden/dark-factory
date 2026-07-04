@@ -50,11 +50,13 @@ from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     Decided,
+    DecidedItem,
     DropGuardResult,
     MergedOk,
     MergeOutcome,
     MergeRequest,
     SpeculativeMergeWorker,
+    item_merge_wt,
 )
 
 # ---------------------------------------------------------------------------
@@ -873,7 +875,7 @@ class TestPathEquivalence:
         # where the merger path decided a terminal status but _remerge
         # merged straight through fails the comparison below exactly as
         # intended (that mismatch IS the equivalence gap step-10 closes).
-        remerge_status = item.immediate_outcome.status if item.immediate_outcome else None
+        remerge_status = item.immediate_outcome.status if isinstance(item, DecidedItem) else None
 
         merger_subtypes = _merge_attempt_subtypes(es_merger.db_path)
         remerge_subtypes = _merge_attempt_subtypes(es_remerge.db_path)
@@ -889,7 +891,9 @@ class TestPathEquivalence:
             )
         finally:
             # Best-effort cleanup of any merge worktree the remerge path
-            # created (relevant when it merged straight through).
-            if item.merge_wt:
+            # created (relevant when it merged straight through).  item_merge_wt
+            # returns None for a DecidedItem (task ο union split).
+            _item_wt = item_merge_wt(item)
+            if _item_wt is not None:
                 with contextlib.suppress(Exception):
-                    await git_ops.cleanup_merge_worktree(item.merge_wt)
+                    await git_ops.cleanup_merge_worktree(_item_wt)

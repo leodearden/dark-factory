@@ -51,11 +51,13 @@ from orchestrator.merge_queue import (
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     WORKTREE_MISSING_REASON_PREFIX,
+    DecidedItem,
     DropGuardResult,
     GroupMergeRequest,
     InFlightMergeRegistry,
     MergeOutcome,
     MergeRequest,
+    RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
     SuffixConflictGraph,
@@ -69,6 +71,7 @@ from orchestrator.merge_queue import (
     _is_speculation_race,
     _verify_hit_enospc,
     coalesce_or_enqueue_merge_request,
+    item_merge_wt,
     register_and_enqueue_merge_request,
 )
 from orchestrator.verify import VerifyResult
@@ -3329,17 +3332,17 @@ class TestSpeculativeMergeWorker:
         dummy_wt1 = git_ops.project_root / '.worktrees' / 'dummy1'
         dummy_wt2 = git_ops.project_root / '.worktrees' / 'dummy2'
 
-        item1 = SpeculativeItem(
+        item1 = RealMergeItem(
             request=req1,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=dummy_wt1),
             merge_wt=dummy_wt1,
-            base_sha='aaa', speculative=False, skip_verify=False,
+            base_sha='aaa', speculative=False,
         )
-        item2 = SpeculativeItem(
+        item2 = RealMergeItem(
             request=req2,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=dummy_wt2),
             merge_wt=dummy_wt2,
-            base_sha='bbb', speculative=False, skip_verify=False,
+            base_sha='bbb', speculative=False,
         )
         await worker._verifier_queue.put(item1)
         await worker._verifier_queue.put(item2)
@@ -4197,8 +4200,8 @@ class TestSpeculativeMergeWorker:
         )
         n_items = [i for i in items if isinstance(i, SpeculativeItem) and i.request is req_n]
         assert len(n_items) == 1, f'Expected one SpeculativeItem for req_n, got: {n_items}'
-        assert n_items[0].already_delivered is False, (
-            'N (clean) rides the verifier FIFO; verifier owns its resolution'
+        assert isinstance(n_items[0], RealMergeItem), (
+            'N (clean) rides the verifier FIFO as a real merge item; verifier owns its resolution'
         )
         assert not req_n.result.done(), (
             "N's result must remain pending until the verifier drains it"
@@ -4306,9 +4309,9 @@ class TestSpeculativeMergeWorker:
         # Leave req.result PENDING — the OOB caller owns delivery; the verifier
         # must respect the already_delivered flag and skip set_result.
 
-        token = SpeculativeItem(
-            request=req, merge_result=None, merge_wt=None,
-            base_sha='deadbeef', speculative=False, skip_verify=False,
+        token = DecidedItem(
+            request=req,
+            base_sha='deadbeef', speculative=False,
             immediate_outcome=MergeOutcome('conflict'),
             already_delivered=True,
         )
@@ -4344,9 +4347,9 @@ class TestSpeculativeMergeWorker:
         conflict_outcome = MergeOutcome('conflict')
         req1.result.set_result(conflict_outcome)
 
-        token1 = SpeculativeItem(
-            request=req1, merge_result=None, merge_wt=None,
-            base_sha='deadbeef', speculative=False, skip_verify=False,
+        token1 = DecidedItem(
+            request=req1,
+            base_sha='deadbeef', speculative=False,
             immediate_outcome=conflict_outcome,
             already_delivered=True,
         )
@@ -4354,9 +4357,9 @@ class TestSpeculativeMergeWorker:
         # Token2: speculative — will be discarded+re-merged because n_failed=True
         req2 = _make_request('vot-b2', 'vot-b2', git_ops.project_root, config)
         remerge_outcome = MergeOutcome('done', merge_sha='a' * 40)
-        remerged_item = SpeculativeItem(
-            request=req2, merge_result=None, merge_wt=None,
-            base_sha='newbase', speculative=False, skip_verify=False,
+        remerged_item = DecidedItem(
+            request=req2,
+            base_sha='newbase', speculative=False,
             immediate_outcome=remerge_outcome,
             already_delivered=False,
         )
@@ -4372,11 +4375,11 @@ class TestSpeculativeMergeWorker:
         # so a dummy worktree path (established pattern elsewhere in this file)
         # is a safe filler.
         dummy_wt2 = git_ops.project_root / '.worktrees' / 'vot-b2-stale'
-        token2 = SpeculativeItem(
+        token2 = RealMergeItem(
             request=req2,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=dummy_wt2),
             merge_wt=dummy_wt2,
-            base_sha='stalebase', speculative=True, skip_verify=False,
+            base_sha='stalebase', speculative=True,
         )
 
         await worker._verifier_queue.put(token1)
@@ -4407,9 +4410,9 @@ class TestSpeculativeMergeWorker:
         conflict_outcome = MergeOutcome('conflict', conflict_details='# conflict\n')
         req.result.set_result(conflict_outcome)
 
-        token = SpeculativeItem(
-            request=req, merge_result=None, merge_wt=None,
-            base_sha='deadbeef', speculative=False, skip_verify=False,
+        token = DecidedItem(
+            request=req,
+            base_sha='deadbeef', speculative=False,
             immediate_outcome=conflict_outcome,
             already_delivered=True,
         )
@@ -4473,11 +4476,13 @@ class TestSpeculativeMergeWorker:
         )
         item = worker._verifier_queue.get_nowait()
         assert item is not None
+        assert isinstance(item, DecidedItem), (
+            'Train item must be a DecidedItem (verifier owns resolution for all train outcomes)'
+        )
         assert item.already_delivered is False, (
-            'Train SpeculativeItem must have already_delivered=False '
+            'Train DecidedItem must have already_delivered=False '
             '(verifier owns resolution for all train outcomes)'
         )
-        assert item.immediate_outcome is not None
         assert item.immediate_outcome.status == 'done', (
             f'immediate_outcome.status must be done, got: {item.immediate_outcome.status!r}'
         )
@@ -5879,13 +5884,10 @@ class TestSpeculativeItemDefaults:
         from unittest.mock import MagicMock
 
         from orchestrator.merge_queue import _elapsed_ms
-        item = SpeculativeItem(
+        item = DecidedItem(
             request=MagicMock(),
-            merge_result=None,
-            merge_wt=None,
             base_sha='',
             speculative=False,
-            skip_verify=False,
             immediate_outcome=MergeOutcome('blocked'),
         )
         assert item.started_monotonic is None
@@ -5902,13 +5904,10 @@ class TestSpeculativeItemDefaults:
         """
         from unittest.mock import MagicMock
 
-        item = SpeculativeItem(
+        item = DecidedItem(
             request=MagicMock(),
-            merge_result=None,
-            merge_wt=None,
             base_sha='',
             speculative=False,
-            skip_verify=False,
             immediate_outcome=MergeOutcome('blocked'),
         )
         assert item.already_delivered is False
@@ -6988,8 +6987,8 @@ class TestWipHaltSpeculativeMergeWorker:
         # Build a real flowing item BEFORE the patch block so _remerge's
         # own merge paths run against the real git_ops (not the raising mock).
         item = await worker._remerge(req, None)
-        assert item.immediate_outcome is None, (
-            f'_remerge must succeed; got immediate_outcome={item.immediate_outcome!r}'
+        assert isinstance(item, RealMergeItem), (
+            f'_remerge must succeed; got {item!r}'
         )
 
         async def _wip_overlap(*args: Any, **kwargs: Any):
@@ -9573,8 +9572,8 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
 
         _, req = await self._setup_overlap_branch_for_gate(git_ops, branch, config)
         item = await worker._remerge(req, None)
-        assert item.immediate_outcome is None, (
-            f'_remerge must succeed; got {item.immediate_outcome!r}'
+        assert isinstance(item, RealMergeItem), (
+            f'_remerge must succeed; got {item!r}'
         )
 
         # Seed two fake paths in the ledger.
@@ -9735,16 +9734,16 @@ class TestMergedBranchTipCarryThroughRebuild:
         # Merge against current main (pre-move state; base_main is the fork point)
         merge_result = await git_ops.merge_to_main(branch_wt, branch)
         assert merge_result.success and merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
         worker._register_owned_merge_worktree(merge_result.merge_worktree)
 
         # Build item with merged_branch_tip=ORIGINAL_TIP (mirrors merger-loop ~:9131)
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_main,
             speculative=False,
-            skip_verify=False,
             merged_branch_tip=ORIGINAL_TIP,
         )
 
@@ -9830,15 +9829,15 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         merge_result = await git_ops.merge_to_main(branch_wt, branch)
         assert merge_result.success and merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
         worker._register_owned_merge_worktree(merge_result.merge_worktree)
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_main,
             speculative=False,
-            skip_verify=False,
             merged_branch_tip=ORIGINAL_TIP,
         )
 
@@ -9933,19 +9932,19 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         merge_result = await git_ops.merge_to_main(branch_wt, branch)
         assert merge_result.success and merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
         actual_merge_commit = merge_result.merge_commit
         worker._register_owned_merge_worktree(merge_result.merge_worktree)
 
         req = _make_request(branch, branch, branch_wt, config)
         # req.snapshot_tip = None by default → term-3 = None
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
             merged_branch_tip=ORIGINAL_TIP,
         )
 
@@ -10035,7 +10034,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         assert rebuilt.base_sha != original.base_sha, (
             'base_sha must actually change across the rebuild (test setup bug otherwise)'
         )
-        for f in dataclasses.fields(SpeculativeItem):
+        for f in dataclasses.fields(original):
             if f.name == 'base_sha':
                 continue
             original_value = getattr(original, f.name)
@@ -10064,15 +10063,15 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         merge_result = await git_ops.merge_to_main(branch_wt, branch)
         assert merge_result.success and merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
         worker._register_owned_merge_worktree(merge_result.merge_worktree)
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_main,
             speculative=False,
-            skip_verify=False,
             merged_branch_tip=ORIGINAL_TIP,
             counts_against_cap=True,
         )
@@ -10151,18 +10150,18 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         merge_result = await git_ops.merge_to_main(branch_wt, branch)
         assert merge_result.success and merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
         actual_merge_commit = merge_result.merge_commit
         worker._register_owned_merge_worktree(merge_result.merge_worktree)
 
         req = _make_request(branch, branch, branch_wt, config)
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
             merged_branch_tip=ORIGINAL_TIP,
             counts_against_cap=True,
         )
@@ -11409,8 +11408,8 @@ class TestMergeFailureDiagnostic:
         req = _make_request('ghost', 'ghost', git_ops.project_root, config)
         item = await worker._remerge(req, None)
 
+        assert isinstance(item, DecidedItem)
         outcome = item.immediate_outcome
-        assert outcome is not None
         assert outcome.status == 'unknown_branch', f'got {outcome}'
         assert 'ghost' in outcome.reason
 
@@ -12647,11 +12646,10 @@ class TestSpeculationRaceRetry:
             f'item.base_sha {item.base_sha!r} != actual main {actual_main!r}'
         )
 
-        # item must be flowing (no immediate_outcome), merge succeeded
-        assert item.immediate_outcome is None, (
-            f'Expected flowing item but got immediate_outcome={item.immediate_outcome}'
+        # item must be flowing (real, not decided), merge succeeded
+        assert isinstance(item, RealMergeItem), (
+            f'Expected flowing item but got {item!r}'
         )
-        assert item.merge_result is not None
         assert item.merge_result.success
 
         # _verify_and_advance must land the branch on main
@@ -12735,7 +12733,7 @@ class TestSpeculationRaceRetry:
         assert call_count == 2, f'Expected exactly 2 calls, got {call_count}'
 
         # Must be a blocked immediate_outcome
-        assert item.immediate_outcome is not None
+        assert isinstance(item, DecidedItem)
         assert item.immediate_outcome.status == 'blocked', (
             f'Expected blocked, got {item.immediate_outcome.status}'
         )
@@ -12818,7 +12816,7 @@ class TestSpeculationRaceRetry:
         assert call_count == 1, (
             f'Expected exactly 1 call (base==main, not a race), got {call_count}'
         )
-        assert item.immediate_outcome is not None
+        assert isinstance(item, DecidedItem)
         assert item.immediate_outcome.status == 'blocked'
         # Must NOT have first_attempt_* keys (single-attempt diagnostic)
         diag = item.immediate_outcome.failure_diagnostic
@@ -12848,7 +12846,7 @@ class TestSpeculationRaceRetry:
         assert call_count == 1, (
             f'Expected 1 call (non-race stderr), got {call_count}'
         )
-        assert item2.immediate_outcome is not None
+        assert isinstance(item2, DecidedItem)
         assert item2.immediate_outcome.status == 'blocked'
         diag2 = item2.immediate_outcome.failure_diagnostic
         assert diag2 is not None
@@ -12919,7 +12917,7 @@ class TestSpeculationRaceRetry:
         assert call_count == 2, f'Expected 2 calls, got {call_count}'
 
         # Conflict immediate_outcome
-        assert item.immediate_outcome is not None
+        assert isinstance(item, DecidedItem)
         assert item.immediate_outcome.status == 'conflict', (
             f'Expected conflict, got {item.immediate_outcome.status!r}'
         )
@@ -12990,22 +12988,17 @@ class TestSpeculationRaceRetry:
         item = await worker._remerge(req, None)
 
         assert call_count == 2, f'Expected 2 calls, got {call_count}'
-        assert item.immediate_outcome is None, (
-            f'Expected flowing item; got immediate_outcome={item.immediate_outcome}'
+        assert isinstance(item, RealMergeItem), (
+            f'Expected flowing item; got {item!r}'
         )
-        assert item.merge_result is not None
         assert item.merge_result.success
 
-        # SAFETY CONTRACT: main advanced since the pre-rebase, so verification must run.
-        # skip_verify MUST be False regardless of req.pre_rebased.
-        assert item.skip_verify is False, (
-            f'Expected skip_verify=False (main advanced: race gate fired), '
-            f'but got skip_verify={item.skip_verify}. '
-            f'Skipping verification after a speculation-race retry is unsafe.'
-        )
+        # SAFETY CONTRACT: main advanced since the pre-rebase, so verification must
+        # run unconditionally — RealMergeItem has no skip_verify escape hatch at all
+        # (task ο removed the field entirely; task-1724 already made it always False).
 
         # Behavioural check: _verify_and_advance must invoke run_scoped_verification
-        # (not skip it) because skip_verify=False.
+        # (verification is never skipped).
         mock_verify = AsyncMock(return_value=MagicMock(passed=True, summary=''))
         with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
             advanced = await worker._verify_and_advance(item)
@@ -13037,17 +13030,14 @@ class TestSpeculationRaceRetry:
 
         item = await worker._remerge(req, None)
 
-        assert item.immediate_outcome is None, (
-            f'Expected flowing item; got {item.immediate_outcome}'
+        assert isinstance(item, RealMergeItem), (
+            f'Expected flowing item; got {item!r}'
         )
-        assert item.merge_result is not None
         assert item.merge_result.success, (
             f'Expected successful re-merge; got {item.merge_result}'
         )
-        assert item.skip_verify is False, (
-            f'Expected skip_verify=False (unconditionally fail-closed); '
-            f'got skip_verify={item.skip_verify}.'
-        )
+        # Verification is unconditionally fail-closed: RealMergeItem has no
+        # skip_verify escape hatch at all (task ο removed the field entirely).
         if item.merge_wt:
             await git_ops.cleanup_merge_worktree(item.merge_wt)
 
@@ -13086,16 +13076,12 @@ class TestRemergeAlwaysVerifies:
         # task-1724: simplified call — no probe needed, no kwargs.
         item = await worker._remerge(req, None)
 
-        assert item.immediate_outcome is None, (
-            f'Expected flowing item; got {item.immediate_outcome}'
+        assert isinstance(item, RealMergeItem), (
+            f'Expected flowing item; got {item!r}'
         )
-        # task-1724: no-op re-merge must NOT skip the merge gate.
-        assert item.skip_verify is False, (
-            f'No-op re-merge (tree unchanged): expected skip_verify=False — '
-            f'the tree-SHA-pinned skip is removed (task-1724); got '
-            f'skip_verify={item.skip_verify}.  '
-            f'A no-op re-merge must still run the merge gate.'
-        )
+        # task-1724: no-op re-merge must NOT skip the merge gate. task ο removed
+        # the skip_verify field entirely — RealMergeItem has no escape hatch at
+        # all, so this is now a structural guarantee rather than a runtime flag.
 
         # Behavioural check: _verify_and_advance must invoke run_scoped_verification.
         mock_verify = AsyncMock(return_value=MagicMock(passed=True, summary=''))
@@ -13125,15 +13111,14 @@ class TestRemergeAlwaysVerifies:
         req = _make_request('tp-c', 'tp-c', wt, config, pre_rebased=True)
 
         item = await worker._remerge(req, None)
-        if item.merge_wt:
-            await git_ops.cleanup_merge_worktree(item.merge_wt)
+        _wt = item_merge_wt(item)
+        if _wt:
+            await git_ops.cleanup_merge_worktree(_wt)
 
-        assert item.immediate_outcome is None, (
-            f'Expected flowing item; got {item.immediate_outcome}'
-        )
-        assert item.skip_verify is False, (
-            f'No-anchor _remerge must fail closed (skip_verify=False); '
-            f'got skip_verify={item.skip_verify}.'
+        # No-anchor _remerge must fail closed: RealMergeItem has no skip_verify
+        # escape hatch at all (task ο removed the field entirely).
+        assert isinstance(item, RealMergeItem), (
+            f'Expected flowing item; got {item!r}'
         )
 
 
@@ -16035,8 +16020,8 @@ class TestSpeculativeMergeWorkerGate:
 
         # _remerge: merge branch into current main
         item = await worker._remerge(req, None)
-        assert item.immediate_outcome is None, (
-            f'_remerge must succeed; got immediate_outcome={item.immediate_outcome!r}'
+        assert isinstance(item, RealMergeItem), (
+            f'_remerge must succeed; got {item!r}'
         )
 
         # Move main: edit line18 (bottom) — produces overlapping delta
@@ -16105,8 +16090,8 @@ class TestSpeculativeMergeWorkerGate:
         _, req = await self._setup_overlap_branch(git_ops, branch, config)
 
         item = await worker._remerge(req, None)
-        assert item.immediate_outcome is None, (
-            f'_remerge must succeed; got {item.immediate_outcome!r}'
+        assert isinstance(item, RealMergeItem), (
+            f'_remerge must succeed; got {item!r}'
         )
 
         # Move main: edit line18 (bottom) — overlapping delta
@@ -16170,7 +16155,7 @@ class TestSpeculativeMergeWorkerGate:
         req = _make_request(branch, branch, branch_wt, config)
 
         item = await worker._remerge(req, None)
-        assert item.immediate_outcome is None
+        assert isinstance(item, RealMergeItem)
 
         # Move main: add a DISJOINT file (no shared files touched)
         (git_ops.project_root / 'main_only.py').write_text('main = 1\n')
@@ -16218,7 +16203,7 @@ class TestSpeculativeMergeWorkerGate:
         req = _make_request(branch, branch, branch_wt, config)
 
         item = await worker._remerge(req, None)
-        assert item.immediate_outcome is None
+        assert isinstance(item, RealMergeItem)
 
         # main does NOT move
 
@@ -17606,28 +17591,28 @@ class TestSMWGenerationChain:
     """Unit tests for SpeculativeMergeWorker γ2 generation-chain wiring (step-15 RED / step-16 GREEN)."""
 
     async def test_speculative_item_has_merged_branch_tip(self) -> None:
-        """(a) SpeculativeItem can carry merged_branch_tip (default None)."""
-        item = SpeculativeItem(
+        """(a) RealMergeItem can carry merged_branch_tip (default None).
+
+        merged_branch_tip is a RealMergeItem-only field (task ο); a DecidedItem
+        has no such field at all, so this is exercised on the REAL variant.
+        """
+        item = RealMergeItem(
             request=MagicMock(),
-            merge_result=None,
-            merge_wt=None,
+            merge_result=MagicMock(),
+            merge_wt=MagicMock(),
             base_sha='base',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=MergeOutcome('blocked'),
         )
         assert hasattr(item, 'merged_branch_tip')
         assert item.merged_branch_tip is None
         # Can be set explicitly
-        item2 = SpeculativeItem(
+        item2 = RealMergeItem(
             request=MagicMock(),
-            merge_result=None,
-            merge_wt=None,
+            merge_result=MagicMock(),
+            merge_wt=MagicMock(),
             base_sha='base',
             speculative=False,
-            skip_verify=False,
             merged_branch_tip='T1',
-            immediate_outcome=MergeOutcome('blocked'),
         )
         assert item2.merged_branch_tip == 'T1'
 
@@ -17671,7 +17656,7 @@ class TestSMWGenerationChain:
             result=fut,
         )
         merge_commit_sha = 'merge-commit-smw'
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=MagicMock(
                 success=True,
@@ -17683,7 +17668,6 @@ class TestSMWGenerationChain:
             merge_wt=tmp_path / 'merge-wt',
             base_sha='base-sha',
             speculative=False,
-            skip_verify=False,
             started_monotonic=None,
             merged_branch_tip='T1',
         )
@@ -18971,13 +18955,12 @@ class TestSoftCancelMidVerify:
             queue, req, None, registry, retention=retention,
         )
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         async def _finalize_detach_and_done(*_args, **_kwargs):
@@ -19065,13 +19048,12 @@ class TestSoftCancelMidVerify:
             queue, req, None, registry, retention=retention,
         )
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_wt_path,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         verify_started = asyncio.Event()
@@ -19233,13 +19215,12 @@ class TestSoftCancelMidVerify:
             queue, req, None, registry, retention=retention,
         )
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         # Pre-cancel via detach; _on_finalized callback records retention 'abandoned'.
@@ -19299,13 +19280,12 @@ class TestSoftCancelMidVerify:
             queue, req, None, registry, retention=retention,
         )
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         # Pre-cancel via detach; _on_finalized callback records retention 'abandoned'.
@@ -20071,13 +20051,12 @@ class TestOperatorHalt:
         worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
 
         req = _make_request('op-halt', 'op-halt', wt, config)
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_wt_path,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         verify_started = asyncio.Event()
@@ -20164,13 +20143,12 @@ class TestOperatorHalt:
         worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
 
         req = _make_request('wip-noabort', 'wip-noabort', wt, config)
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_wt_path,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         verify_started = asyncio.Event()
@@ -21729,7 +21707,7 @@ class TestSnapshotInflightCollection:
 
         RED: InflightEntry has no started_at field (TypeError on construction).
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import InflightEntry
         from orchestrator.verify_runner import HostLease
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -21741,11 +21719,11 @@ class TestSnapshotInflightCollection:
         fake_runner = MagicMock()
 
         req_a = _make_request('snap-a', 'snap-a', wt, config)
-        item_a = SpeculativeItem(
+        item_a = RealMergeItem(
             request=req_a,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt / 'a'),
             merge_wt=wt / 'a',
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         lease_local = HostLease(name='local', runner=fake_runner, is_local=True)
         entry_a = InflightEntry(
@@ -21755,11 +21733,11 @@ class TestSnapshotInflightCollection:
         )
 
         req_b = _make_request('snap-b', 'snap-b', wt, config)
-        item_b = SpeculativeItem(
+        item_b = RealMergeItem(
             request=req_b,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt / 'b'),
             merge_wt=wt / 'b',
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         lease_remote = HostLease(name='laptop', runner=fake_runner, is_local=False)
         entry_b = InflightEntry(
@@ -21799,7 +21777,6 @@ class TestSnapshotInflightCollection:
         RED (step-3): current snapshot reads _verify_item for verify_in_progress,
         producing a phantom non-None entry when _verify_item is never cleared.
         """
-        from orchestrator.merge_queue import SpeculativeItem
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
@@ -21808,10 +21785,10 @@ class TestSnapshotInflightCollection:
         wt.mkdir()
 
         req_stale = _make_request('phantom', 'phantom', wt, config)
-        item_stale = SpeculativeItem(
-            request=req_stale, merge_result=None, merge_wt=None,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+        item_stale = DecidedItem(
+            request=req_stale,
             immediate_outcome=MergeOutcome('blocked'),
+            base_sha='dead' * 10, speculative=False,
         )
         worker._verify_item = item_stale   # stale, never cleared -- the gamma latent bug
         worker._verify_phase = 'verifying'
@@ -21836,7 +21813,7 @@ class TestSnapshotInflightCollection:
         RED (step-3): verify_in_progress reads _verify_item (singular), so it is
         None when _verify_item is not set, even if _inflight is non-empty.
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import InflightEntry
         from orchestrator.verify_runner import HostLease
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -21848,11 +21825,11 @@ class TestSnapshotInflightCollection:
         fake_runner = MagicMock()
 
         req_head = _make_request('head-task', 'head-task', wt, config)
-        item_head = SpeculativeItem(
+        item_head = RealMergeItem(
             request=req_head,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
             merge_wt=wt,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         entry_head = InflightEntry(
             item=item_head,
@@ -21862,11 +21839,11 @@ class TestSnapshotInflightCollection:
         )
 
         req_second = _make_request('second-task', 'second-task', wt, config)
-        item_second = SpeculativeItem(
+        item_second = RealMergeItem(
             request=req_second,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
             merge_wt=wt,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         entry_second = InflightEntry(
             item=item_second,
@@ -21989,7 +21966,7 @@ class TestHeartbeatOccupancy:
         """
         import json as _json
 
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import InflightEntry
         from orchestrator.verify_runner import HostAllocator, HostLease
 
         db_path = tmp_path / 'occ.db'
@@ -22010,11 +21987,11 @@ class TestHeartbeatOccupancy:
         worker._host_allocator = HostAllocator([fake_remote])
 
         req_a = _make_request('hb-local', 'hb-local', wt, config)
-        item_a = SpeculativeItem(
+        item_a = RealMergeItem(
             request=req_a,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
             merge_wt=wt,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         entry_a = InflightEntry(
             item=item_a,
@@ -22024,11 +22001,11 @@ class TestHeartbeatOccupancy:
         )
 
         req_b = _make_request('hb-laptop', 'hb-laptop', wt, config)
-        item_b = SpeculativeItem(
+        item_b = RealMergeItem(
             request=req_b,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
             merge_wt=wt,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         entry_b = InflightEntry(
             item=item_b,
@@ -22100,7 +22077,7 @@ class TestEntryPhaseDuringFinalize:
         RED: _finalize_inflight sets self._verify_phase='finalizing' but NOT entry.phase,
         so entry.phase stays 'verifying' (stale dispatch-time value).
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import InflightEntry
         from orchestrator.verify_runner import HostLease
 
         branch = 'ep-finalize-a'
@@ -22112,15 +22089,15 @@ class TestEntryPhaseDuringFinalize:
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
+        assert merge_result.merge_worktree is not None
 
         base_sha = await git_ops.get_main_sha()
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()

@@ -3,19 +3,23 @@
 The guard enforces PRD invariant I3 ("pipeline items are constructed only at
 whitelisted factory sites; all rebuilds go through ``dataclasses.replace``") as
 a structural inventory tripwire: it git-greps ``orchestrator/src/`` for real
-``SpeculativeItem(...)`` constructions and asserts the per-file inventory
-matches a pinned allowlist. A NEW construction — in particular a CAS-loop
-hand-rebuild that reconstructs the item field-by-field (the task-1928
-dropped-field bug class) instead of calling ``dataclasses.replace(item, ...)``
-— changes the inventory and fails the build, forcing a deliberate review.
+construction-site tokens and asserts the per-file inventory matches a pinned
+allowlist. A NEW construction — in particular a CAS-loop hand-rebuild that
+reconstructs the item field-by-field (the task-1928 dropped-field bug class)
+instead of calling ``dataclasses.replace(item, ...)`` — changes the inventory
+and fails the build, forcing a deliberate review.
 
 This is deliberately NOT a comment-marker check: it cannot be satisfied by
 annotating a construction line, and it locks no wording. Shape correctness is
-guarded independently by ``SpeculativeItem.__post_init__`` (I2); this guard
-covers the orthogonal "no un-vetted new construction site" property that
-``__post_init__`` cannot see (a hand-rebuild can drop ``base_sha`` and still
-have a valid shape). Task ο extends this same inventory when it adds the union
-constructors.
+guarded independently by the RealMergeItem/DecidedItem dataclasses themselves
+(illegal cross-variant fields are unrepresentable, task ο); this guard covers
+the orthogonal "no un-vetted new construction site" property that a
+dataclass's own shape cannot see (a hand-rebuild can drop ``base_sha`` and
+still have a valid shape). Task ο (2000) retired the SpeculativeItem product
+dataclass in favor of a ``RealMergeItem | DecidedItem`` union — SpeculativeItem
+is now a non-constructible type alias, so the inventory tracks the two union
+constructors instead and separately asserts zero ``SpeculativeItem(``
+constructions remain.
 
 The sibling ``test_no_tracked_editor_backup_files_under_orchestrator`` is a
 repo-hygiene guard: a WIP-snapshot commit once force-added a ~4193-line
@@ -35,38 +39,35 @@ import pytest
 _SCOPED_PATH = 'orchestrator/src/orchestrator/'
 _BACKUP_GLOBS = ('*.tmp.*', '*.py.tmp.*', '*.orig', '*.rej', '*.bak', '*.swp', '*~')
 
-# Pinned inventory of the whitelisted SpeculativeItem factory sites, keyed by
-# repo-relative file. All live in the merger/verifier factory helpers of
-# merge_queue.py; the two former CAS-loop hand-rebuilds are now
+# Pinned inventory of the whitelisted RealMergeItem / DecidedItem factory
+# sites, keyed by repo-relative file. All live in the merger/verifier factory
+# helpers of merge_queue.py; CAS-loop rebuilds go through
 # ``dataclasses.replace(item, base_sha=...)`` and do not construct at all.
 # Bump a count (or add a file) ONLY for a genuine new factory site — never to
 # silence a hand-rebuild that should be ``dataclasses.replace`` instead.
 #
-# Count dropped 15 -> 9 (task 2058) tracking task 1995's MQ-refactor: a new
-# shared ``classify_and_merge`` guard pipeline, adopted in both
-# ``_merger_loop`` and ``_do_merge``, replaced most of the per-branch
-# hand-built constructions that used to live directly in ``_merger_loop``.
-# That collapsed the verifier-queue-put sites there from 9 to 4 and folded
-# one of the six factory-return sites into a shared helper (5 remain), for a
-# net 6-site reduction (9 puts + 6 returns -> 4 puts + 5 returns), all still
-# shape-consistent per __post_init__ (I2). Confirmed by diffing
-# `git grep -n 'SpeculativeItem(' -- orchestrator/src/orchestrator/merge_queue.py`
-# across the task/1995 merge (parents 01ec4eb8d8 and d5b8bcea0d).
+# Task ο (2000) split the prior 9-site ``SpeculativeItem(`` inventory into its
+# REAL (3: real merge success in _merger_loop / _remerge) and DECIDED (6:
+# conflict/already_merged/train-handoff/retry-outcome in _merger_loop /
+# classify_and_merge / _remerge) constructors — same 9 call sites, reframed
+# under the two union constructors that replaced the single product type.
 #
 # Deliberately a per-file *count*, not just a set of filenames: every
 # whitelisted site already lives in this one file, so a bare set-of-files
 # check would be permanently satisfied and blind to a new construction
-# landing in that same file — including a reintroduced hand-rebuild at one
-# of the two former CAS sites, which is exactly the task-1928 failure mode
-# this guard exists to catch. ``SpeculativeItem.__post_init__`` (I2)
-# validates *shape* but not *provenance*: a hand-rebuild can drop a field
-# that isn't part of any I2 invariant (e.g. counts_against_cap) while still
-# producing a shape-valid item, so it would sail through __post_init__
-# undetected. The count is what makes that rebuild visible; it is expected
-# to require a deliberate bump for genuine new sites, not something to
-# relax away.
-_EXPECTED_FACTORY_SITES = {
-    'orchestrator/src/orchestrator/merge_queue.py': 9,
+# landing in that same file — including a reintroduced hand-rebuild, which is
+# exactly the task-1928 failure mode this guard exists to catch. The
+# RealMergeItem/DecidedItem dataclasses validate *shape* (unrepresentability)
+# but not *provenance*: a hand-rebuild can drop a field that isn't part of
+# the type shape (e.g. counts_against_cap) while still producing a
+# shape-valid item, so it would sail through construction undetected. The
+# count is what makes that rebuild visible; it is expected to require a
+# deliberate bump for genuine new sites, not something to relax away.
+_EXPECTED_REAL_MERGE_ITEM_SITES = {
+    'orchestrator/src/orchestrator/merge_queue.py': 3,
+}
+_EXPECTED_DECIDED_ITEM_SITES = {
+    'orchestrator/src/orchestrator/merge_queue.py': 6,
 }
 
 
@@ -110,13 +111,24 @@ def test_strip_line_comment_passthrough_when_no_comment() -> None:
     assert _strip_line_comment('foo(bar, baz)') == 'foo(bar, baz)'
 
 
-def _real_construction_hits(repo_root: Path) -> list[str]:
-    """Return ``path:lineno:code`` git-grep hits that are actual
-    ``SpeculativeItem(`` constructions, excluding lines where the token only
-    appears inside a trailing comment (so a comment/docstring mention is not
-    miscounted as a construction)."""
+def _is_match_case_pattern(code: str) -> bool:
+    """Return True if ``code`` is a ``case Token():`` structural-pattern arm.
+
+    A ``match``/``case`` pattern like ``case RealMergeItem():`` (see
+    ``item_merge_wt``'s exhaustive match) tests the value's type — it calls no
+    constructor at runtime — so it must not be miscounted as a construction
+    site alongside real ``Token(...)`` calls.
+    """
+    return code.lstrip().startswith('case ')
+
+
+def _real_construction_hits(repo_root: Path, token: str) -> list[str]:
+    """Return ``path:lineno:code`` git-grep hits that are actual ``token(``
+    constructions, excluding lines where the token only appears inside a
+    trailing comment (so a comment/docstring mention is not miscounted as a
+    construction) or as a ``case token():`` structural-pattern match arm."""
     result = subprocess.run(
-        ['git', 'grep', '-n', 'SpeculativeItem(', '--', _SCOPED_PATH],
+        ['git', 'grep', '-n', f'{token}(', '--', _SCOPED_PATH],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -135,37 +147,83 @@ def _real_construction_hits(repo_root: Path) -> list[str]:
             continue
         # Drop pure-comment mentions: keep only hits where the construction
         # token precedes any '#'. Production constructor lines have no '#'
-        # before the call; a comment like "# build a SpeculativeItem(...)" does.
+        # before the call; a comment like "# build a token(...)" does.
         code_before_comment = _strip_line_comment(code)
-        if 'SpeculativeItem(' in code_before_comment:
+        if _is_match_case_pattern(code_before_comment):
+            continue
+        if f'{token}(' in code_before_comment:
             hits.append(f'{path}:{lineno}:{code.strip()}')
     return hits
 
 
-def test_speculative_item_constructed_only_at_whitelisted_factory_sites(
+def test_real_merge_item_constructed_only_at_whitelisted_factory_sites(
     repo_root: Path | None,
 ) -> None:
-    """The per-file inventory of ``SpeculativeItem(`` constructions under
+    """The per-file inventory of ``RealMergeItem(`` constructions under
     orchestrator/src/ must match the pinned whitelist.
 
     Guards I3: a future hand-rebuild that bypasses ``dataclasses.replace(...)``
-    and reconstructs a SpeculativeItem field-by-field (the task-1928 bug class)
+    and reconstructs a RealMergeItem field-by-field (the task-1928 bug class)
     appears as an inventory delta and fails here — forcing the author to either
     use ``dataclasses.replace`` or deliberately extend the whitelist.
     """
     if repo_root is None:
         pytest.skip('not running inside a git checkout')
 
-    hits = _real_construction_hits(repo_root)
+    hits = _real_construction_hits(repo_root, 'RealMergeItem')
     inventory = dict(Counter(hit.split(':', 1)[0] for hit in hits))
 
-    assert inventory == _EXPECTED_FACTORY_SITES, (
-        'SpeculativeItem construction inventory drifted from the pinned factory '
-        f'whitelist (I3).\n  expected: {_EXPECTED_FACTORY_SITES}\n  actual:   {inventory}\n'
+    assert inventory == _EXPECTED_REAL_MERGE_ITEM_SITES, (
+        'RealMergeItem construction inventory drifted from the pinned factory '
+        f'whitelist (I3).\n  expected: {_EXPECTED_REAL_MERGE_ITEM_SITES}\n  actual:   {inventory}\n'
         'A new/removed construction site changed this. If you added a CAS-loop or '
         'other rebuild, use dataclasses.replace(item, ...) so no field is silently '
         'dropped. If this is a genuine new factory site, update '
-        '_EXPECTED_FACTORY_SITES above.\nConstruction sites found:\n'
+        '_EXPECTED_REAL_MERGE_ITEM_SITES above.\nConstruction sites found:\n'
+        + '\n'.join(hits)
+    )
+
+
+def test_decided_item_constructed_only_at_whitelisted_factory_sites(
+    repo_root: Path | None,
+) -> None:
+    """The per-file inventory of ``DecidedItem(`` constructions under
+    orchestrator/src/ must match the pinned whitelist.
+
+    Guards I3: a future hand-rebuild that bypasses ``dataclasses.replace(...)``
+    and reconstructs a DecidedItem field-by-field (the task-1928 bug class)
+    appears as an inventory delta and fails here — forcing the author to either
+    use ``dataclasses.replace`` or deliberately extend the whitelist.
+    """
+    if repo_root is None:
+        pytest.skip('not running inside a git checkout')
+
+    hits = _real_construction_hits(repo_root, 'DecidedItem')
+    inventory = dict(Counter(hit.split(':', 1)[0] for hit in hits))
+
+    assert inventory == _EXPECTED_DECIDED_ITEM_SITES, (
+        'DecidedItem construction inventory drifted from the pinned factory '
+        f'whitelist (I3).\n  expected: {_EXPECTED_DECIDED_ITEM_SITES}\n  actual:   {inventory}\n'
+        'A new/removed construction site changed this. If you added a CAS-loop or '
+        'other rebuild, use dataclasses.replace(item, ...) so no field is silently '
+        'dropped. If this is a genuine new factory site, update '
+        '_EXPECTED_DECIDED_ITEM_SITES above.\nConstruction sites found:\n'
+        + '\n'.join(hits)
+    )
+
+
+def test_no_speculative_item_constructions_remain_in_src(repo_root: Path | None) -> None:
+    """Task ο retired the SpeculativeItem product dataclass in favor of the
+    RealMergeItem/DecidedItem union: zero real ``SpeculativeItem(``
+    constructions may remain under orchestrator/src/ — SpeculativeItem is now
+    a non-constructible ``RealMergeItem | DecidedItem`` union type alias."""
+    if repo_root is None:
+        pytest.skip('not running inside a git checkout')
+
+    hits = _real_construction_hits(repo_root, 'SpeculativeItem')
+    assert not hits, (
+        'Found SpeculativeItem( construction(s) in src; SpeculativeItem is now a '
+        'RealMergeItem | DecidedItem union alias and must not be constructed directly:\n'
         + '\n'.join(hits)
     )
 

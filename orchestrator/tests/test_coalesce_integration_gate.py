@@ -913,18 +913,22 @@ class TestBookkeeping:
         )
 
         # (B) _merge_ahead_cap must NOT be locked — no cap was acquired/leaked.
-        # The train's SpeculativeItem has counts_against_cap=False (the
-        # GroupMergeRequest continue fires before the acquire site), so the
-        # verifier never releases it either.  Both sides are clean.
+        # The train's item is a DecidedItem (task ο), which has no
+        # counts_against_cap field at all (the GroupMergeRequest continue fires
+        # before the acquire site), so the verifier never releases it either.
+        # Both sides are clean.
         assert not worker._merge_ahead_cap.locked(), (
             '_merge_ahead_cap must be unlocked after the train lands; '
-            'trains are structurally exempt from Mechanism 1 (counts_against_cap=False)'
+            'trains are structurally exempt from Mechanism 1 (DecidedItem has no '
+            'counts_against_cap field)'
         )
 
-        # (C) The train's SpeculativeItem: speculative=False, counts_against_cap=False.
-        # A GroupMergeRequest is dispatched with speculative=False (bypasses look-ahead)
-        # and counts_against_cap defaults to False (never acquired _merge_ahead_cap).
-        from orchestrator.merge_queue import GroupMergeRequest
+        # (C) The train's item: speculative=False, and a DecidedItem (task ο) —
+        # a GroupMergeRequest is dispatched with speculative=False (bypasses
+        # look-ahead) and DecidedItem has no counts_against_cap field at all
+        # (never acquired _merge_ahead_cap), so trains are structurally exempt
+        # from Mechanism 1 rather than merely defaulted to False.
+        from orchestrator.merge_queue import DecidedItem, GroupMergeRequest
         train_items = [
             item for item in captured_items
             if isinstance(getattr(item, 'request', None), GroupMergeRequest)
@@ -938,9 +942,11 @@ class TestBookkeeping:
             f'Train SpeculativeItem.speculative must be False (bypasses look-ahead); '
             f'got {train_item.speculative!r}'
         )
-        assert not train_item.counts_against_cap, (
-            f'Train SpeculativeItem.counts_against_cap must be False (exempt from Mechanism 1); '
-            f'got {train_item.counts_against_cap!r}'
+        assert isinstance(train_item, DecidedItem), (
+            f'Train item must be a DecidedItem — counts_against_cap is a '
+            f'RealMergeItem-only field (task ο), so trains are structurally exempt '
+            f'from Mechanism 1 rather than merely defaulted to False; got '
+            f'{type(train_item).__name__}'
         )
 
         await worker.stop()

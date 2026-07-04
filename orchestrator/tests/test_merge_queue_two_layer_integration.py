@@ -71,9 +71,12 @@ from orchestrator.harness import Harness
 from orchestrator.merge_queue import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
+    DecidedItem,
     InflightEntry,
+    MergeOutcome,
     MergeRequest,
     NoLandingsCircuitBreaker,
+    RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
     SuffixConflictGraph,
@@ -199,19 +202,22 @@ def _make_fake_item(
     git operations.  Must be called from an async context (for the future).
     """
     req = _make_req(task_id, f'task/{task_id}', config, git_repo)
-    fake_merge_result = (
-        MergeResult(success=True, merge_commit=merge_commit)
-        if merge_commit is not None
-        else None
-    )
-    item = SpeculativeItem(
-        request=req,
-        merge_result=fake_merge_result,
-        merge_wt=Path('/fake/merge-wt') if fake_merge_result is not None else None,
-        base_sha=base_sha,
-        speculative=False,
-        skip_verify=False,
-    )
+    item: SpeculativeItem
+    if merge_commit is not None:
+        item = RealMergeItem(
+            request=req,
+            merge_result=MergeResult(success=True, merge_commit=merge_commit),
+            merge_wt=Path('/fake/merge-wt'),
+            base_sha=base_sha,
+            speculative=False,
+        )
+    else:
+        item = DecidedItem(
+            request=req,
+            immediate_outcome=MergeOutcome('conflict', reason='fake-no-merge-commit'),
+            base_sha=base_sha,
+            speculative=False,
+        )
     return req, item
 
 
@@ -432,13 +438,12 @@ class TestTwoLayerInvariants:
 
         # Build frozen entry.
         req_a = _make_req('task-a', 'task/task-a', config, git_repo)
-        item_a = SpeculativeItem(
+        item_a = RealMergeItem(
             request=req_a,
             merge_result=MergeResult(success=True, merge_commit='merge-sha-a'),
             merge_wt=Path('/fake/merge-wt'),
             base_sha=main_sha,
             speculative=False,
-            skip_verify=False,
         )
         entry_a = _make_inflight_entry(item_a, verifying=True)
         worker._inflight.append(entry_a)
@@ -622,13 +627,12 @@ class TestTwoLayerInvariants:
         # Build the frozen entry: base_sha=M0 (correct chain from real main),
         # merge_commit=M1 (a real SHA so _newest_frozen_commit() returns it).
         req_frozen = _make_req('frozen-s15', 'task/frozen-tip-s15', config, git_repo)
-        item_frozen = SpeculativeItem(
+        item_frozen = RealMergeItem(
             request=req_frozen,
             merge_result=MergeResult(success=True, merge_commit=m1),
             merge_wt=Path('/fake/merge-wt'),
             base_sha=m0,
             speculative=False,
-            skip_verify=False,
         )
         entry_frozen = _make_inflight_entry(item_frozen, verifying=True)
         worker._inflight.append(entry_frozen)
@@ -1496,24 +1500,22 @@ class TestScenario6FrontierImmutableUnderReorder:
 
         # Populate frozen prefix: D chained off main, E chained off D.
         req_d = _make_req('frozen-d', 'task/frozen-d', config, git_repo)
-        item_d = SpeculativeItem(
+        item_d = RealMergeItem(
             request=req_d,
             merge_result=MergeResult(success=True, merge_commit=merge_d_sha),
             merge_wt=Path('/fake/merge-wt-d'),
             base_sha=main_sha,
             speculative=False,
-            skip_verify=False,
         )
         entry_d = _make_inflight_entry(item_d, verifying=True)
 
         req_e = _make_req('frozen-e', 'task/frozen-e', config, git_repo)
-        item_e = SpeculativeItem(
+        item_e = RealMergeItem(
             request=req_e,
             merge_result=MergeResult(success=True, merge_commit=merge_e_sha),
             merge_wt=Path('/fake/merge-wt-e'),
             base_sha=merge_d_sha,  # chained off D
             speculative=False,
-            skip_verify=False,
         )
         entry_e = _make_inflight_entry(item_e, verifying=True)
 
