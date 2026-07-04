@@ -54,3 +54,25 @@ class TestRetrieveEpisodesOrdering:
         # (c) strictly non-increasing created_at order
         created_ats = [ep.created_at for ep in result]
         assert created_ats == sorted(created_ats, reverse=True)
+
+    @pytest.mark.asyncio
+    async def test_retrieve_episodes_none_created_at_sorts_last(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        episodes = [
+            _episode('uuid-mar', datetime(2026, 3, 10, tzinfo=UTC)),
+            _episode('uuid-none', None),
+            _episode('uuid-jun', datetime(2026, 6, 22, tzinfo=UTC)),
+        ]
+        with patch(
+            'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
+            AsyncMock(return_value=episodes),
+        ):
+            # No exception (e.g. TypeError from comparing None to a datetime).
+            result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=len(episodes))
+
+        assert len(result) == len(episodes)
+        # The None-created_at episode sorts last (treated as oldest/unknown).
+        assert result[-1].uuid == 'uuid-none'
+        # The timestamped episodes precede it in non-increasing order.
+        created_ats = [ep.created_at for ep in result[:-1]]
+        assert created_ats == sorted(created_ats, reverse=True)
