@@ -155,6 +155,15 @@ _REAP_GRACE_SECS: float = 5.0
 # reap_grace_secs with room to spare) rather than tight.
 _RUN_TIMEOUT_GRACE_SECS: float = 30.0
 
+# Task 2091: bound `_default_inspect_unit`'s `systemctl --user show` call — a
+# parallel latent-hang gap to task 2090, which only wraps the before_done
+# run_fn subprocess and not this inspect call (esc-2090-11).  This runs on
+# both the baseline inspect and the post-deploy verify inspect; an unbounded
+# `communicate()` here strands the runner exactly like task 2087 (before_
+# done_ran_at stamped, before_done_verified_at never stamped, no escalation
+# filed).  10s comfortably covers a normal `systemctl show` round trip.
+_INSPECT_TIMEOUT_SECS: float = 10.0
+
 
 class DeterministicRunner:
     """Per-slot runner for deterministic gate tasks.
@@ -190,6 +199,10 @@ class DeterministicRunner:
             around the cross-unit ``run_fn`` call in ``run()`` (task 2090).
             Defaults to ``_RUN_TIMEOUT_GRACE_SECS``.  Injected in tests so a
             stuck-run_fn test doesn't actually wait.
+        inspect_timeout_secs: Bound (seconds) on the default unit-inspector's
+            ``systemctl --user show`` ``communicate()`` call (task 2091).
+            Defaults to ``_INSPECT_TIMEOUT_SECS``.  Injected in tests so a
+            wedged-inspect test doesn't actually wait.
     """
 
     def __init__(
@@ -205,6 +218,7 @@ class DeterministicRunner:
         sleeper=None,
         reap_grace_secs=_REAP_GRACE_SECS,
         run_timeout_grace_secs=_RUN_TIMEOUT_GRACE_SECS,
+        inspect_timeout_secs=_INSPECT_TIMEOUT_SECS,
     ):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
@@ -217,6 +231,7 @@ class DeterministicRunner:
         self._sleeper = sleeper or asyncio.sleep
         self._reap_grace_secs = reap_grace_secs
         self._run_timeout_grace_secs = run_timeout_grace_secs
+        self._inspect_timeout_secs = inspect_timeout_secs
 
     # ------------------------------------------------------------------
     # Default injectable seam implementations
@@ -363,7 +378,38 @@ class DeterministicRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await proc.communicate()
+        try:
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=self._inspect_timeout_secs,
+            )
+        except TimeoutError:
+            # Task 2091: a wedged `systemctl show` here (systemd busy/hung, or
+            # a grandchild inheriting the stdout pipe) would otherwise strand
+            # the runner identically to task 2087's signature. This process
+            # is NOT spawned with start_new_session=True (unlike
+            # _default_run_script's), so it shares the orchestrator's own
+            # process group — killing via `_terminate_process_tree`'s
+            # `os.killpg` would risk a self-inflicted SIGKILL. A direct
+            # `proc.kill()` is sufficient: a plain `systemctl show` isn't
+            # expected to fork grandchildren the way a deploy script can.
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)
+            logger.warning(
+                'DeterministicRunner: systemctl show %s timed out after %ss — '
+                'returning MainPID=0 sentinel',
+                unit, self._inspect_timeout_secs,
+            )
+            # MainPID=0 routes through the existing verify-fail path: fresh-PID
+            # verify already treats MainPID=0 as a sentinel failure -> born-at-
+            # L2 escalate + blocked (matching the 2090 hardening pattern).
+            return {
+                'MainPID': 0,
+                'ActiveState': '',
+                'ActiveEnterTimestamp': '',
+                'ActiveEnterTimestampMonotonic': 0,
+            }
         result: dict = {}
         for line in (stdout or b'').decode(errors='replace').splitlines():
             if '=' in line:
