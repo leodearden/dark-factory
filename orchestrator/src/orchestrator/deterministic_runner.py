@@ -109,8 +109,10 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -139,6 +141,20 @@ logger = logging.getLogger(__name__)
 _WRITEBACK_MAX_ATTEMPTS: int = 6
 _WRITEBACK_BACKOFF_BASE: float = 2.0
 
+# Task 2090: bound the reap after a whole-process-group SIGKILL on a
+# before_done subprocess timeout.  A process stuck in an uninterruptible
+# state (or one that otherwise ignores SIGKILL) must never be allowed to hang
+# `_terminate_process_tree` — and therefore `_default_run_script` — forever.
+# 5s comfortably covers a normal kernel-mediated reap while staying bounded.
+_REAP_GRACE_SECS: float = 5.0
+
+# Task 2090: outer wall-clock backstop around the cross-unit `run_fn` call in
+# run().  This is a pure safety margin ON TOP OF before_done['timeout_secs'] —
+# it must never fire before the inner script-runner timeout in the normal
+# case, so 30s is deliberately generous (covers process-group teardown +
+# reap_grace_secs with room to spare) rather than tight.
+_RUN_TIMEOUT_GRACE_SECS: float = 30.0
+
 
 class DeterministicRunner:
     """Per-slot runner for deterministic gate tasks.
@@ -165,6 +181,15 @@ class DeterministicRunner:
         sleeper: Optional async callable ``(seconds: float) -> None`` used to
             pace writeback retries.  Defaults to ``asyncio.sleep``.  Injected
             in tests so retries don't actually sleep.
+        reap_grace_secs: Bound (seconds) on reaping a subprocess after a
+            whole-process-group SIGKILL on timeout (task 2090).  Defaults to
+            ``_REAP_GRACE_SECS``.  Injected in tests so an unkillable-process
+            test doesn't actually wait.
+        run_timeout_grace_secs: Extra margin (seconds), added to
+            ``before_done['timeout_secs']``, for the outer wall-clock guard
+            around the cross-unit ``run_fn`` call in ``run()`` (task 2090).
+            Defaults to ``_RUN_TIMEOUT_GRACE_SECS``.  Injected in tests so a
+            stuck-run_fn test doesn't actually wait.
     """
 
     def __init__(
@@ -178,6 +203,8 @@ class DeterministicRunner:
         writeback_max_attempts=_WRITEBACK_MAX_ATTEMPTS,
         writeback_backoff_base=_WRITEBACK_BACKOFF_BASE,
         sleeper=None,
+        reap_grace_secs=_REAP_GRACE_SECS,
+        run_timeout_grace_secs=_RUN_TIMEOUT_GRACE_SECS,
     ):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
@@ -188,6 +215,8 @@ class DeterministicRunner:
         self._writeback_max_attempts = writeback_max_attempts
         self._writeback_backoff_base = writeback_backoff_base
         self._sleeper = sleeper or asyncio.sleep
+        self._reap_grace_secs = reap_grace_secs
+        self._run_timeout_grace_secs = run_timeout_grace_secs
 
     # ------------------------------------------------------------------
     # Default injectable seam implementations
@@ -372,15 +401,78 @@ class DeterministicRunner:
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
             tail = (stdout or b'').decode(errors='replace')[-2000:]
             return proc.returncode or 0, tail
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
+            # Task 2090: the deploy script may spawn grandchildren (e.g.
+            # restart-fused-memory.sh --drain forking systemctl/curl/journalctl/
+            # sleep/the restarted daemon) that inherit the write end of the
+            # merged stdout pipe above.  Killing only this direct child leaves
+            # them alive as orphans — still holding that pipe open and still
+            # running indefinitely.  start_new_session=True (above) makes this
+            # process its own session/group leader so the WHOLE tree can be
+            # torn down together instead of leaking orphaned processes.
+            await self._terminate_process_tree(proc)
             return 1, f'<script timed out after {timeout_secs}s>'
+
+    async def _terminate_process_tree(self, proc: asyncio.subprocess.Process) -> None:
+        """Kill *proc*'s entire process group and bound the reap (task 2090).
+
+        ``proc`` must have been spawned with ``start_new_session=True`` so its
+        process group is its own — NOT the orchestrator's — otherwise
+        ``os.killpg`` would SIGKILL the orchestrator itself.
+
+        Tries a whole-group SIGKILL first, which reaches any grandchildren
+        (e.g. a backgrounded ``systemctl``/``curl``/``sleep``) that would
+        otherwise survive the direct child's death as leaked orphans —
+        continuing to run (and keep the inherited stdout pipe's write end
+        open) indefinitely.  Note this is NOT needed to unblock ``proc.wait()``
+        below: asyncio's ``Process.wait()`` resolves on the child's own exit
+        notification (via the event loop's child watcher), not on pipe EOF —
+        only ``communicate()`` waits on that.  The process-group kill's value
+        is purely in not leaking the grandchildren themselves.  If the process
+        has already exited (or the group lookup otherwise fails), falls back
+        to a direct ``proc.kill()``.  Both kill attempts tolerate an
+        already-dead process — this helper must NEVER raise, so a timeout
+        branch can always return cleanly even if the process is already gone.
+
+        The reap itself is bounded by ``self._reap_grace_secs`` so a process
+        stuck in an uninterruptible state cannot hang this helper (and
+        therefore ``_default_run_script``) forever.
+
+        Note (residual race): ``os.killpg(os.getpgid(proc.pid), ...)`` targets
+        ``proc.pid`` by number.  If asyncio's child watcher has already reaped
+        the zombie in the background before this call runs, the OS could in
+        principle recycle that PID before ``os.getpgid``/``os.killpg`` execute,
+        making the SIGKILL target an unrelated process group.  This is a
+        low-probability race shared with any PID-based kill (not specific to
+        this helper); the ``ProcessLookupError``/``OSError`` suppression above
+        is the existing mitigation, not a full fix for the underlying race.
+        """
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            logger.debug(
+                'DeterministicRunner: killpg(%s) failed (%s: %s) — falling back '
+                'to direct kill()',
+                proc.pid, type(exc).__name__, exc,
+            )
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)
+        except TimeoutError:
+            logger.warning(
+                'DeterministicRunner: process %s did not exit within '
+                'reap_grace_secs=%s after termination signal — abandoning reap '
+                '(process may be unkillable)',
+                proc.pid, self._reap_grace_secs,
+            )
 
     async def _file_infra_issue_and_block(
         self,
@@ -1035,9 +1127,70 @@ class DeterministicRunner:
                 inspect_fn = self._unit_inspector or self._default_inspect_unit
                 baseline = await inspect_fn(target_unit)
 
-                # Run the deploy script to completion (blocking, cross-unit)
+                # Run the deploy script to completion (blocking, cross-unit).
+                # Task 2090 Layer B: wrap the call in an outer wall-clock guard
+                # that is UNCONDITIONAL — it does not depend on run_fn (or the
+                # subprocess it spawns) ever dying.  Layer A hardens the
+                # DEFAULT script_runner's own timeout handling, but an
+                # injected/custom seam could still hang forever or raise
+                # something unexpected; either way run() must reach
+                # _file_infra_issue_and_block rather than stranding the task
+                # with before_done_ran_at stamped and zero escalations filed
+                # (the exact task-2087 evidence).  The outer bound is strictly
+                # greater than before_done['timeout_secs'] so a well-behaved
+                # seam always flows through the rc!=0 path below first — this
+                # is a pure backstop, not a replacement for it.
                 run_fn = self._script_runner or self._default_run_script
-                rc, out = await run_fn(before_done)
+                outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
+
+                async def _invoke_run_fn():
+                    # A custom/injected seam could itself raise a TimeoutError
+                    # internally (e.g. its own inner asyncio.wait_for) BEFORE
+                    # outer_timeout elapses.  asyncio.wait_for cannot tell that
+                    # apart from its OWN outer-guard timeout — both surface as
+                    # the same `TimeoutError` type at the call site below.
+                    # Translate a seam-internal TimeoutError into a distinct
+                    # exception type HERE, before it can reach wait_for's
+                    # propagation path, so `except TimeoutError` below can only
+                    # ever mean "the outer wall-clock guard itself fired" —
+                    # never a misattributed application error.
+                    try:
+                        return await run_fn(before_done)
+                    except TimeoutError as exc:
+                        raise RuntimeError(
+                            f'run_fn raised TimeoutError internally (not the '
+                            f'outer guard): {exc!r}'
+                        ) from exc
+
+                try:
+                    rc, out = await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)
+                except TimeoutError:
+                    timeout_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Deploy run_fn exceeded the outer guard timeout ({outer_timeout}s = '
+                        f"before_done['timeout_secs'] + run_timeout_grace_secs).",
+                        'The subprocess may be detached/unkillable — check the unit out-of-band '
+                        '(e.g. systemctl --user status, ps) before taking further action.',
+                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy run_fn timed out (subprocess hung): {target_unit}',
+                        detail=timeout_detail,
+                    )
+                except Exception as exc:
+                    error_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'Deploy run_fn raised an unexpected error: {exc!r}',
+                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy run_fn failed (unexpected error): {target_unit}',
+                        detail=error_detail,
+                    )
 
                 if rc != 0:
                     # B7a: script failed — file infra_issue escalation, set blocked (B7a)

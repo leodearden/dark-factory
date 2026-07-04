@@ -71,7 +71,7 @@ def _deploy_task(
     args: list | None = None,
     env: dict | None = None,
     cwd: str = '/tmp',
-    timeout_secs: int = 30,
+    timeout_secs: int | float = 30,
     before_done_ran_at: str | None = None,
     before_done_verified_at: str | None = None,
     before_done_verified_pid: int | None = None,
@@ -1103,6 +1103,387 @@ class TestDefaultRunScriptEnv:
         )
         assert passed_env['MY_DEPLOY_VAR'] == 'hello', (
             'custom override from before_done.env must be present in merged env'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2090 — Layer A: whole-process-group kill on subprocess timeout
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneSubprocessTimeoutHardening:
+    """DeterministicRunner — Layer A: kill the WHOLE process tree on timeout.
+
+    Guards against the inherited-pipe hang behind task 2087's stranding:
+    restart-fused-memory.sh --drain spawns grandchildren (systemctl restart,
+    curl, journalctl, sleep, the restarted daemon) that inherit the write end
+    of the merged stdout pipe.  Killing only the direct child (pre-2090
+    behavior) leaves the tree alive and the pipe open forever.
+    """
+
+    async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
+        """On timeout, a backgrounded grandchild must be killed too, not just
+        the direct child.
+
+        RED today: current code calls ``proc.kill()`` on the direct child only
+        (no ``start_new_session``, no process-group kill) — the orphaned
+        grandchild survives the timeout branch.
+        """
+        import asyncio
+        import os
+        import time
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        script = tmp_path / 'hang.sh'
+        pidfile = tmp_path / 'grandchild.pid'
+        script.write_text(
+            '#!/bin/sh\n'
+            'sleep 60 &\n'
+            'echo $! > "$1"\n'
+            'sleep 60\n'
+        )
+        script.chmod(0o755)
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': str(script),
+            'args': [str(pidfile)],
+            'cwd': str(tmp_path),
+            'timeout_secs': 1,
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        # Hang tripwire: if the fix regresses into a real hang, fail loudly
+        # instead of stalling the suite.
+        rc, tail = await asyncio.wait_for(
+            runner._default_run_script(before_done), timeout=10,
+        )
+
+        assert rc == 1, f'expected rc=1 on timeout, got {rc}'
+        assert 'timed out' in tail, f'expected a timed-out marker in tail, got {tail!r}'
+
+        grandchild_pid = int(pidfile.read_text().strip())
+        deadline = time.monotonic() + 3.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            await asyncio.sleep(0.05)
+        assert not alive, (
+            f'grandchild pid {grandchild_pid} must be dead after timeout — the '
+            f'WHOLE process group must be killed, not just the direct child'
+        )
+
+    async def test_terminate_process_tree_swallows_process_lookup_error(
+        self, tmp_path: Path,
+    ):
+        """``_terminate_process_tree`` must swallow ProcessLookupError from
+        BOTH the killpg path and the proc.kill() fallback — an already-exited
+        process must never propagate out of the timeout-cleanup helper.
+
+        RED today: ``_terminate_process_tree`` does not exist yet
+        (AttributeError).
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=queue,
+            reap_grace_secs=0.05,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.kill = MagicMock(side_effect=ProcessLookupError('already exited'))
+        mock_proc.wait = AsyncMock(return_value=None)
+
+        with (
+            patch('os.getpgid', side_effect=ProcessLookupError('no such process')),
+            patch('os.killpg', side_effect=ProcessLookupError('no such process')) as mock_killpg,
+        ):
+            await runner._terminate_process_tree(mock_proc)
+
+        mock_killpg.assert_not_called()
+        mock_proc.kill.assert_called_once()
+
+    async def test_terminate_process_tree_bounds_reap_when_proc_never_exits(
+        self, tmp_path: Path,
+    ):
+        """The reap following the kill signal must be bounded by
+        ``reap_grace_secs`` — a process that never exits after being signaled
+        (e.g. stuck in an uninterruptible D-state) must not hang
+        ``_terminate_process_tree`` forever.
+
+        The existing ProcessLookupError-swallow test's ``mock_proc.wait``
+        resolves immediately, so it never exercises the
+        ``except TimeoutError: logger.warning(...)`` branch around
+        ``asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)`` —
+        this test exercises that bound directly.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=queue,
+            reap_grace_secs=0.05,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        # proc.wait() never resolves — simulates an unkillable/D-state process
+        # that ignores SIGKILL.
+        never_resolves = asyncio.Event()
+        mock_proc.wait = AsyncMock(side_effect=never_resolves.wait)
+
+        with (
+            patch('os.getpgid', return_value=12345),
+            patch('os.killpg') as mock_killpg,
+        ):
+            # Hang tripwire: if reap_grace_secs stops bounding the wait, fail
+            # loudly instead of stalling the suite.
+            await asyncio.wait_for(
+                runner._terminate_process_tree(mock_proc), timeout=5,
+            )
+
+        mock_killpg.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task 2090 — Layer B: outer wall-clock guard around the cross-unit run_fn call
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestBeforeDoneRunFnOuterGuard:
+    """DeterministicRunner — Layer B: run() must never hang on a stuck run_fn.
+
+    Layer A hardens the DEFAULT script runner's own timeout handling. Layer B
+    is the unconditional backstop around the run_fn CALL SITE in run() itself:
+    even if an injected/custom script_runner seam hangs forever or raises an
+    unexpected exception, run() must still reach _file_infra_issue_and_block
+    and return BLOCKED — it must never strand the task with an empty
+    escalation queue (the exact task-2087 evidence: before_done_ran_at
+    stamped, zero escalations filed, task stuck in-progress forever).
+    """
+
+    async def test_run_fn_hang_files_infra_issue_and_blocks(self, tmp_path: Path):
+        """A run_fn that hangs forever must still produce a BLOCKED outcome
+        and exactly one L2 infra_issue escalation (Layer B outer guard).
+
+        RED today: run() has no outer timeout around ``await run_fn(before_done)``.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='300', target_unit='orchestrator-reify.service', timeout_secs=0,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        # Hang tripwire: if the outer guard regresses, fail loudly instead of
+        # stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('300', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+        assert 'orchestrator-reify.service' in esc.detail, (
+            f'target_unit must appear in detail: {esc.detail!r}'
+        )
+        assert any(
+            phrase in esc.detail.lower()
+            for phrase in ('timed out', 'timeout', 'hung', 'exceeded')
+        ), f'detail must mention the timeout/hang: {esc.detail!r}'
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert stamp_calls, (
+            'before_done_ran_at must already be stamped (I1) before the outer '
+            'guard fires — the deploy must never be re-run on resume'
+        )
+
+    async def test_run_fn_unexpected_exception_files_infra_issue_and_blocks(
+        self, tmp_path: Path,
+    ):
+        """A run_fn that raises an unexpected exception must NOT propagate —
+        run() must route to _file_infra_issue_and_block and return BLOCKED.
+
+        RED today: run() propagates the RuntimeError uncaught.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='301', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _boom(_before_done):
+            raise RuntimeError('spawn exploded')
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_boom,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('301', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+
+    async def test_run_fn_seam_internal_timeout_error_not_misattributed_to_outer_guard(
+        self, tmp_path: Path,
+    ):
+        """A run_fn that raises its OWN TimeoutError (e.g. a custom seam with
+        an inner timeout shorter than the outer guard) must be routed through
+        the generic unexpected-error branch, not reported as 'the outer guard
+        timeout fired' — the two are different failures with different
+        operator remediation (a hung/detached subprocess vs. an application
+        error), and misattributing one as the other sends an operator down
+        the wrong diagnostic path.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='303', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _seam_internal_timeout(_before_done):
+            raise TimeoutError('seam raised its own timeout, unrelated to the wall-clock guard')
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_seam_internal_timeout,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('303', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.summary.startswith('Deploy run_fn failed'), (
+            f'a seam-internal TimeoutError must route through the generic '
+            f'unexpected-error branch, not the outer-guard-timeout branch: '
+            f'{esc.summary!r}'
+        )
+        assert not esc.summary.startswith('Deploy run_fn timed out'), (
+            f'a seam-internal TimeoutError must not be misattributed as the '
+            f'outer-guard timeout branch: {esc.summary!r}'
+        )
+        assert 'exceeded the outer guard timeout' not in esc.detail, (
+            f'a seam-internal TimeoutError must not be misattributed to the '
+            f'outer wall-clock guard: {esc.detail!r}'
+        )
+
+    async def test_outer_guard_does_not_fire_for_well_behaved_runner(
+        self, tmp_path: Path,
+    ):
+        """A run_fn that takes nearly all of before_done['timeout_secs'] but
+        still finishes and returns rc=0 must take the normal success/verify
+        path — the Layer-B outer guard (timeout_secs + run_timeout_grace_secs)
+        must not spuriously fire just because a deploy used most of its inner
+        time budget.
+
+        Regression guard for the invariant "outer bound strictly greater than
+        timeout_secs": if run_timeout_grace_secs (or the outer_timeout
+        computation) ever regressed towards zero, this well-behaved seam
+        would be killed and misreported as a hung subprocess instead of
+        completing normally.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        timeout_secs = 0.3
+        task = _deploy_task(
+            task_id='302', target_unit='orchestrator-reify.service',
+            timeout_secs=timeout_secs,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _finishes_just_under_timeout(_before_done):
+            await asyncio.sleep(timeout_secs - 0.05)
+            return 0, 'deploy ok'
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_finishes_just_under_timeout,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.DONE, (
+            'a run_fn finishing just under timeout_secs must take the normal '
+            'success/verify path, not the outer guard'
+        )
+        assert queue.get_by_task('302', status='pending') == [], (
+            'no escalation should be filed on the success path'
         )
 
 
