@@ -524,13 +524,9 @@ async def _finalize_advanced_merge(
     preserves all existing behaviour — trains pass ``None`` (PRD D9).
     """
     from orchestrator.merge_queue import (
-        AUTO_CHAIN_GENERATIONS_ENABLED,
-        _check_post_merge_equivalence,
-        _check_post_merge_pyright,
         _commit_is_linear,
         _elapsed_ms,
         _emit_merge_attempt,
-        _maybe_auto_chain_generation,
         _resolve_second_parent,
     )
 
@@ -569,102 +565,57 @@ async def _finalize_advanced_merge(
     if resolved_merged_tip is None and await _commit_is_linear(git_ops, advanced_sha):
         allow_worktree_head_fallback = False
 
-    # Decision-2 post-merge content-equivalence check.
-    equiv_failed = await _check_post_merge_equivalence(
-        req.worktree, advanced_sha, git_ops, base_sha,
-        task_id=req.task_id,
-        merged_tip=resolved_merged_tip,
+    ctx = _PostAdvanceContext(
+        git_ops=git_ops,
+        req=req,
+        event_store=event_store,
+        advanced_sha=advanced_sha,
+        base_sha=base_sha,
+        resolved_merged_tip=resolved_merged_tip,
         allow_worktree_head_fallback=allow_worktree_head_fallback,
+        started_monotonic=started_monotonic,
+        train_id=train_id,
+        member_task_ids=member_task_ids,
+        chain_ctx=chain_ctx,
+        merged_branch_tip=merged_branch_tip,
+        log_label=log_label,
     )
-    if equiv_failed:
-        logger.warning(
-            'Task %s%s: post-merge equivalence failed — '
-            'branch HEAD and advanced main %s diverge in: %r',
-            req.task_id, log_label, advanced_sha[:12], equiv_failed,
-        )
-        _emit_merge_attempt(
-            event_store, req.task_id,
-            'post_merge_equivalence_failed',
-            duration_ms=_elapsed_ms(started_monotonic),
-            train_id=train_id,
-            member_task_ids=member_task_ids,
-        )
-        # γ2: if chain_ctx is wired AND the kill-switch is on, try to
-        # discriminate whether the branch tip advanced mid-verify and
-        # auto-chain gen-(n+1).  The switch is OFF by default until γ3
-        # lands the workflow 'superseded' consumer handler + slot handoff.
-        if chain_ctx is not None and AUTO_CHAIN_GENERATIONS_ENABLED:
-            chained = await _maybe_auto_chain_generation(
-                req, advanced_sha, git_ops, event_store,
-                merged_branch_tip=merged_branch_tip or resolved_merged_tip,
-                counts=chain_ctx.counts,
-                queue=chain_ctx.queue,
-                max_auto_generations=chain_ctx.max_auto_generations,
-                retention=chain_ctx.retention,
-            )
-            if chained is not None:
-                _emit_merge_attempt(
-                    event_store, req.task_id,
-                    'post_merge_generation_chained',
-                    duration_ms=_elapsed_ms(started_monotonic),
-                    train_id=train_id,
-                    member_task_ids=member_task_ids,
-                )
-                return chained
-        # The merge already landed on main (advanced_sha IS the merge commit);
-        # record it so reconciliation knows about the landing even though the
-        # gate is signalling a content divergence.
-        #
-        # Robustness note: all downstream consumers (workflow.py, _on_finalized,
-        # merge_status/_durable_terminal_state) branch on outcome.status
-        # ('blocked'), NOT on merge_sha presence.  Carrying merge_sha on a
-        # 'blocked' outcome is therefore safe — no consumer misinterprets a
-        # landed-but-blocked task as 'done' due to the non-None merge_sha.
-        return MergeOutcome(
-            'blocked',
-            merge_sha=advanced_sha,
-            reason=(
-                f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
-                f'branch and main diverge in '
-                f'{", ".join(equiv_failed)}. '
-                f'Conflict resolution likely dropped or rewrote '
-                f'work; review {advanced_sha[:12]} against the '
-                f'task branch tip.'
-            ),
-        )
 
-    # Decision-3 post-merge unscoped type-check.
-    pyright_result = await _check_post_merge_pyright(
-        advanced_sha, git_ops, req.config, req.module_configs,
-        task_id=req.task_id,
-    )
-    if pyright_result.broken:
-        logger.warning(
-            'Task %s%s: post-merge unscoped type-check failed for %s on %s',
-            req.task_id, log_label,
-            ', '.join(pyright_result.failing_subprojects),
-            advanced_sha[:12],
-        )
+    # Declarative post-advance gate chain (task λ): iterate the registered
+    # gates in order.  Registering a new gate is an append to
+    # POST_ADVANCE_GATES — "a registration, not surgery" — not an edit to
+    # this loop.
+    ran = []
+    terminal = None
+    for gate in POST_ADVANCE_GATES:
+        ran.append(gate.name)
+        verdict = await gate.run(ctx)
+        if verdict.passed:
+            continue
         _emit_merge_attempt(
-            event_store, req.task_id,
-            'post_merge_pyright_broken',
+            event_store, req.task_id, verdict.emit_subtype,
             duration_ms=_elapsed_ms(started_monotonic),
             train_id=train_id,
             member_task_ids=member_task_ids,
         )
-        # The merge already landed; record advanced_sha for observability.
-        # Same robustness guarantee as the equivalence case above: consumers
-        # gate on outcome.status ('blocked'), not on merge_sha presence.
-        return MergeOutcome(
-            'blocked',
-            merge_sha=advanced_sha,
-            reason=(
-                f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
-                f'post-merge unscoped type-check failed for '
-                f'{", ".join(pyright_result.failing_subprojects)} '
-                f'on {advanced_sha[:12]}. {pyright_result.detail}'
-            ),
-        )
+        # A gate's on_blocked hook (e.g. the equivalence gate's γ2
+        # auto-chain) may substitute a chained outcome; None means "no
+        # interceptor" or "interceptor declined" — fall through to the
+        # default blocked outcome built from the verdict.
+        if gate.on_blocked is not None:
+            terminal = await gate.on_blocked(ctx)
+        if terminal is None:
+            terminal = MergeOutcome(
+                'blocked', merge_sha=verdict.merge_sha, reason=verdict.reason,
+            )
+        break
+
+    logger.info(
+        'Task %s%s: post-advance gates run: %s',
+        req.task_id, log_label, ', '.join(ran),
+    )
+    if terminal is not None:
+        return terminal
 
     logger.info(f'Task {req.task_id}: merged to main successfully')
     _emit_merge_attempt(
