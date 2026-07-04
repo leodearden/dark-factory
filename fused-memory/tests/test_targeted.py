@@ -2092,6 +2092,80 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
 
 
 # ---------------------------------------------------------------------------
+# _truncate_clean unit tests (task 2080)
+#
+# _format_outcome_echo's `note[:max_note_chars]` slice (and _on_task_done's
+# identical `details[:500]` append) cut on a raw character count with no
+# regard for word/token boundaries, so a long note is silently garbled mid
+# word/number (e.g. task 2054: "8679,8680" chopped to "8679,868") and, in the
+# note+commit branch, the " (commit <sha>)" suffix is glued directly onto
+# that broken fragment. _truncate_clean is the shared pure helper that
+# replaces both raw slices with a clean, word-boundary-aware truncation.
+
+
+def test_truncate_clean_returns_short_text_unchanged():
+    """Text at or under the limit is returned verbatim -- no ellipsis
+    appended -- so every existing short-note/short-details case is
+    unaffected."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    short = 'x' * 20
+    assert _truncate_clean(short, 500) == short
+    assert '…' not in _truncate_clean(short, 500)
+    # Boundary case: exactly at the limit is still "unchanged", not truncated.
+    exact = 'y' * 500
+    assert _truncate_clean(exact, 500) == exact
+
+
+def test_truncate_clean_cuts_on_word_boundary():
+    """A long text with whitespace near the cutoff backs up to that boundary
+    instead of slicing through the trailing word -- the dropped word must
+    not appear as a broken fragment glued to the ellipsis."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    # Index 495 is the last whitespace char within text[:499] (the budget
+    # for limit=500); the word 'ZZZZZZZZZZ' starts right after it and would
+    # be chopped to 'ZZZ' by a naive text[:500] slice.
+    text = ('A' * 495) + ' ' + ('Z' * 10)
+    result = _truncate_clean(text, 500)
+
+    assert result.endswith('…')
+    assert len(result) <= 500
+    # The boundary word must be dropped whole, not split mid-token.
+    assert 'Z' not in result
+    assert 'ZZZ…' not in result
+    assert result == ('A' * 495) + '…'
+
+
+def test_truncate_clean_hard_cuts_when_no_whitespace_in_window():
+    """No whitespace anywhere in the truncation window -- falls back to a
+    hard cut at (limit - 1) chars plus the ellipsis, still honoring the
+    cap."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    long_text = 'N' * 600
+    result = _truncate_clean(long_text, 500)
+
+    assert result == ('N' * 499) + '…'
+    assert len(result) == 500
+
+
+def test_truncate_clean_ignores_early_whitespace_min_retention_guard():
+    """Whitespace that sits very early in the window is NOT used as the cut
+    point when backing up to it would discard more than half the budget --
+    that would collapse a 500-char budget down to a couple of characters."""
+    from fused_memory.reconciliation.targeted import _truncate_clean
+
+    text = 'ab ' + ('N' * 600)
+    result = _truncate_clean(text, 500)
+
+    # Must NOT back up to the space at index 2 (would keep only 'ab').
+    assert not result.startswith('ab…')
+    assert result == text[:499] + '…'
+    assert len(result) == 500
+
+
+# ---------------------------------------------------------------------------
 # _format_outcome_echo truth table (task 2049)
 #
 # _on_task_done's fast-path completion echo currently appends the task's raw
