@@ -1347,6 +1347,17 @@ class TestRebuildEntitySummariesMcpTool:
         assert call_kwargs.get('dry_run') is True
 
     @pytest.mark.asyncio
+    async def test_forwards_entity_uuids_to_service(self, mcp_server, mock_service):
+        """Tool forwards entity_uuids through to memory_service.rebuild_entity_summaries."""
+        await mcp_server._tool_manager.call_tool(
+            'rebuild_entity_summaries',
+            {'project_id': 'know_live', 'entity_uuids': ['cd0e25fd-7a71-481a-9d86-27bb4341168b']},
+        )
+        mock_service.rebuild_entity_summaries.assert_awaited_once()
+        call_kwargs = mock_service.rebuild_entity_summaries.call_args[1]
+        assert call_kwargs.get('entity_uuids') == ['cd0e25fd-7a71-481a-9d86-27bb4341168b']
+
+    @pytest.mark.asyncio
     async def test_invalid_project_id_returns_error(self, mcp_server, mock_service):
         """Returns validation error dict for invalid project_id."""
         import json
