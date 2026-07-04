@@ -2079,6 +2079,47 @@ class TestGetEntity:
 
         assert result['nodes'][0]['labels'] == []
 
+    # ------------------------------------------------------------------
+    # edge_limit parameter (task 2089): threads to graphiti.search num_results
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_edge_limit_threads_to_num_results_fuzzy_path(self, service):
+        """edge_limit is forwarded as num_results to graphiti.search on the fuzzy-fallback path."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        await service.get_entity('entity', project_id='test', edge_limit=25)
+
+        service.graphiti.search.assert_awaited_once()
+        assert service.graphiti.search.call_args.kwargs['num_results'] == 25
+
+    @pytest.mark.asyncio
+    async def test_edge_limit_threads_to_num_results_exact_path(self, service):
+        """edge_limit is forwarded as num_results to graphiti.search on the exact-match path."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        await service.get_entity('Task 115', project_id='test', edge_limit=25)
+
+        service.graphiti.search.assert_awaited_once()
+        assert service.graphiti.search.call_args.kwargs['num_results'] == 25
+
+    @pytest.mark.asyncio
+    async def test_edge_limit_defaults_to_ten(self, service):
+        """Without an explicit edge_limit, num_results stays at 10 (regression guard)."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(return_value=[])
+        service.graphiti.search = AsyncMock(return_value=[])
+
+        await service.get_entity('entity', project_id='test')
+
+        service.graphiti.search.assert_awaited_once()
+        assert service.graphiti.search.call_args.kwargs['num_results'] == 10
+
 
 class TestSerializeTemporal:
     """Unit tests for the _serialize_temporal module-level helper."""
