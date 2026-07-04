@@ -412,11 +412,10 @@ class DeterministicRunner:
             # restart-fused-memory.sh --drain forking systemctl/curl/journalctl/
             # sleep/the restarted daemon) that inherit the write end of the
             # merged stdout pipe above.  Killing only this direct child leaves
-            # them alive holding the pipe open — asyncio's Process.wait() is
-            # itself gated on that pipe reaching EOF, so even the cleanup
-            # below could hang forever without a process-group-wide kill.
-            # start_new_session=True (above) makes this process its own
-            # session/group leader so the WHOLE tree can be torn down together.
+            # them alive as orphans — still holding that pipe open and still
+            # running indefinitely.  start_new_session=True (above) makes this
+            # process its own session/group leader so the WHOLE tree can be
+            # torn down together instead of leaking orphaned processes.
             await self._terminate_process_tree(proc)
             return 1, f'<script timed out after {timeout_secs}s>'
 
@@ -428,19 +427,31 @@ class DeterministicRunner:
         ``os.killpg`` would SIGKILL the orchestrator itself.
 
         Tries a whole-group SIGKILL first, which reaches any grandchildren
-        (e.g. a backgrounded ``systemctl``/``curl``/``sleep``) still holding
-        the inherited stdout pipe open — releasing that pipe is required for
-        asyncio's ``Process.wait()`` to resolve at all, since it internally
-        waits for every pipe transport to reach EOF, not just for the direct
-        child to be reaped.  If the process has already exited (or the group
-        lookup otherwise fails), falls back to a direct ``proc.kill()``.  Both
-        kill attempts tolerate an already-dead process — this helper must
-        NEVER raise, so a timeout branch can always return cleanly even if the
-        process is already gone.
+        (e.g. a backgrounded ``systemctl``/``curl``/``sleep``) that would
+        otherwise survive the direct child's death as leaked orphans —
+        continuing to run (and keep the inherited stdout pipe's write end
+        open) indefinitely.  Note this is NOT needed to unblock ``proc.wait()``
+        below: asyncio's ``Process.wait()`` resolves on the child's own exit
+        notification (via the event loop's child watcher), not on pipe EOF —
+        only ``communicate()`` waits on that.  The process-group kill's value
+        is purely in not leaking the grandchildren themselves.  If the process
+        has already exited (or the group lookup otherwise fails), falls back
+        to a direct ``proc.kill()``.  Both kill attempts tolerate an
+        already-dead process — this helper must NEVER raise, so a timeout
+        branch can always return cleanly even if the process is already gone.
 
         The reap itself is bounded by ``self._reap_grace_secs`` so a process
         stuck in an uninterruptible state cannot hang this helper (and
         therefore ``_default_run_script``) forever.
+
+        Note (residual race): ``os.killpg(os.getpgid(proc.pid), ...)`` targets
+        ``proc.pid`` by number.  If asyncio's child watcher has already reaped
+        the zombie in the background before this call runs, the OS could in
+        principle recycle that PID before ``os.getpgid``/``os.killpg`` execute,
+        making the SIGKILL target an unrelated process group.  This is a
+        low-probability race shared with any PID-based kill (not specific to
+        this helper); the ``ProcessLookupError``/``OSError`` suppression above
+        is the existing mitigation, not a full fix for the underlying race.
         """
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -1131,8 +1142,28 @@ class DeterministicRunner:
                 # is a pure backstop, not a replacement for it.
                 run_fn = self._script_runner or self._default_run_script
                 outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
+
+                async def _invoke_run_fn():
+                    # A custom/injected seam could itself raise a TimeoutError
+                    # internally (e.g. its own inner asyncio.wait_for) BEFORE
+                    # outer_timeout elapses.  asyncio.wait_for cannot tell that
+                    # apart from its OWN outer-guard timeout — both surface as
+                    # the same `TimeoutError` type at the call site below.
+                    # Translate a seam-internal TimeoutError into a distinct
+                    # exception type HERE, before it can reach wait_for's
+                    # propagation path, so `except TimeoutError` below can only
+                    # ever mean "the outer wall-clock guard itself fired" —
+                    # never a misattributed application error.
+                    try:
+                        return await run_fn(before_done)
+                    except TimeoutError as exc:
+                        raise RuntimeError(
+                            f'run_fn raised TimeoutError internally (not the '
+                            f'outer guard): {exc!r}'
+                        ) from exc
+
                 try:
-                    rc, out = await asyncio.wait_for(run_fn(before_done), timeout=outer_timeout)
+                    rc, out = await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)
                 except TimeoutError:
                     timeout_detail = '\n'.join([
                         description,
