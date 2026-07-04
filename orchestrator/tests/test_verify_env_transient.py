@@ -23,6 +23,7 @@ Test coverage:
   step-5: _force_serial_pytest pure helper
   step-7: run_verification env-recovery retry (integration, mocked _run_cmd)
   step-9: run_main_tip_sweep env_transient infra sentinel (mocked run_full_verification)
+  step-11: pip-absence word-boundary regression guard (negative + positive preservation)
 """
 
 from __future__ import annotations
@@ -409,3 +410,61 @@ class TestRunMainTipSweepEnvTransient:
             'git worktree remove --force must run even when retry returns '
             'env_transient (cleanup-in-finally guarantee)'
         )
+
+
+class TestClassifyFailurePipWordBoundary:
+    """step-11: word-boundary regression guard for the pip-absence pattern
+    (fixes reviewer_comprehensive robustness_misclassification at verify.py:440).
+
+    The original `_ENV_TRANSIENT_PATTERNS` pip pattern
+    (``No module named ['"]?pip['"]?``) left the trailing quote optional and
+    had no boundary after 'pip', so `re.search` substring-matched any
+    ModuleNotFoundError whose module name merely STARTS with 'pip'
+    (pipeline, pipx, pipenv, pip_audit, pip-tools). That reproduces the exact
+    INVERSE misattribution this feature forbids: a genuine import/code
+    regression would be silently relabelled 'env_transient', auto-retried via
+    _force_serial_pytest, kept off the archive deny-list, and treated as a
+    None infra sentinel by run_main_tip_sweep — i.e. never surfaced for human
+    triage. RED today: all five pip-prefixed variants currently match.
+    """
+
+    def _classify(self, output: str, rc: int, timed_out: bool) -> str:
+        return verify._classify_failure(output, rc, timed_out)
+
+    @pytest.mark.parametrize(
+        'module_name',
+        ['pipx', 'pipenv', 'pip_audit', 'pip-tools'],
+    )
+    def test_pip_prefixed_module_name_not_env_transient(self, module_name: str):
+        """A ModuleNotFoundError whose module name merely starts with 'pip'
+        must NOT be swept into env_transient — it's a real import/code
+        regression, not a pip-absence signature."""
+        output = f"ModuleNotFoundError: No module named '{module_name}'\n"
+        assert self._classify(output, rc=1, timed_out=False) != 'env_transient'
+
+    def test_pipeline_module_not_found_is_unknown_test_failure(self):
+        """A genuine 'No module named pipeline' import regression must stay
+        RED and be surfaced for human triage — 'unknown_test_failure'
+        specifically — not silently relabelled environmental, auto-retried,
+        and archive-denied."""
+        output = "ModuleNotFoundError: No module named 'pipeline'\n"
+        assert self._classify(output, rc=1, timed_out=False) == 'unknown_test_failure'
+
+    def test_unquoted_runpy_pip_absence_still_env_transient(self):
+        """The grounded task-2045 runpy line — unquoted, no
+        'ModuleNotFoundError:' prefix (emitted by `python -m pip` itself, not
+        a bare `import pip`) — must still classify as env_transient."""
+        output = '/home/leo/src/dark-factory/.venv/bin/python3.12: No module named pip\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'env_transient'
+
+    def test_single_quoted_pip_still_env_transient(self):
+        """The quoted 'ModuleNotFoundError: No module named 'pip'' form must
+        still classify as env_transient after the word-boundary fix."""
+        output = "ModuleNotFoundError: No module named 'pip'\n"
+        assert self._classify(output, rc=1, timed_out=False) == 'env_transient'
+
+    def test_double_quoted_pip_still_env_transient(self):
+        """The double-quoted form must still classify as env_transient after
+        the word-boundary fix."""
+        output = 'ModuleNotFoundError: No module named "pip"\n'
+        assert self._classify(output, rc=1, timed_out=False) == 'env_transient'
