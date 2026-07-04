@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
@@ -1626,3 +1627,256 @@ class TestReclaimOnExhaustionKnobWiring:
         assert harness.git_ops.warm_lane_dispatched_predicate is None, (
             'warm_lane_dispatched_predicate must be None when knob is off (byte-identical)'
         )
+
+
+# ===========================================================================
+# Step-9 (2061): RED — Harness warm-base hard-down wiring + escalation filing
+# ===========================================================================
+
+
+def _make_warm_base_harness(
+    tmp_path: Path,
+    *,
+    warm_lane_pool: bool = True,
+) -> tuple[Harness, EscalationQueue]:
+    """Build a Harness (via _build_harness) with a real EscalationQueue wired
+    on, mirroring test_harness_starvation_watchdog.py::_make_harness_with_queue
+    and test_harness_no_landings_breaker.py::_make_harness.
+    """
+    config = _make_config(
+        max_concurrent_tasks=2,
+        warm_lane_pool=warm_lane_pool,
+        tmp_path=tmp_path,
+    )
+    harness = _build_harness(config)
+    queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = queue
+    return harness, queue
+
+
+class TestHarnessWarmBaseHardDownWiring:
+    """After Harness construction, the probe + all three callbacks must be
+    wired onto the scheduler (task 2061, step-9).
+
+    _build_harness patches ``Scheduler`` with a MagicMock, so an ``is not
+    None`` check on an unset attribute would be vacuously true (MagicMock
+    auto-vivifies child attributes on access).  Equality against the
+    harness-bound method is used instead — the same idiom already used by
+    TestReclaimOnExhaustionKnobWiring in this file — so this is a genuine
+    RED (unset/auto-vivified Mock != bound method) before Harness.__init__
+    wires the callables, and GREEN only once it does.
+    """
+
+    def test_wires_probe_and_all_callbacks(self, tmp_path: Path):
+        harness, _queue = _make_warm_base_harness(tmp_path)
+
+        assert harness.scheduler._warm_base_health_probe == (
+            harness._probe_warm_base_health
+        ), (
+            'Harness must wire scheduler._warm_base_health_probe = '
+            'harness._probe_warm_base_health after construction'
+        )
+        assert harness.scheduler._on_warm_base_warn == (
+            harness._file_warm_base_hard_down_notice
+        ), (
+            'Harness must wire scheduler._on_warm_base_warn = '
+            'harness._file_warm_base_hard_down_notice after construction'
+        )
+        assert harness.scheduler._on_warm_base_promote_l2 == (
+            harness._promote_warm_base_hard_down_l2
+        ), (
+            'Harness must wire scheduler._on_warm_base_promote_l2 = '
+            'harness._promote_warm_base_hard_down_l2 after construction'
+        )
+        assert harness.scheduler._on_warm_base_resolve == (
+            harness._resolve_warm_base_hard_down
+        ), (
+            'Harness must wire scheduler._on_warm_base_resolve = '
+            'harness._resolve_warm_base_hard_down after construction'
+        )
+
+
+@pytest.mark.asyncio
+class TestProbeWarmBaseHealth:
+    """_probe_warm_base_health bridges GitOps._warm_lane_base_resolvable to the
+    scheduler's injected-callback string contract (task 2061, step-9).
+
+    RED: Harness._probe_warm_base_health does not exist yet.
+    """
+
+    async def test_pool_off_always_ok(self, tmp_path: Path):
+        """git_ops.warm_lane_pool is None (knob off) → probe always 'ok'."""
+        harness, _queue = _make_warm_base_harness(tmp_path, warm_lane_pool=False)
+        assert harness.git_ops.warm_lane_pool is None
+
+        assert await harness._probe_warm_base_health() == 'ok'
+
+    async def test_pool_on_delegates_ok(self, tmp_path: Path):
+        from orchestrator.git_ops import WarmBaseHealth
+
+        harness, _queue = _make_warm_base_harness(tmp_path)
+        harness.git_ops._warm_lane_base_resolvable = lambda: WarmBaseHealth.OK
+
+        assert await harness._probe_warm_base_health() == 'ok'
+
+    async def test_pool_on_delegates_absent(self, tmp_path: Path):
+        from orchestrator.git_ops import WarmBaseHealth
+
+        harness, _queue = _make_warm_base_harness(tmp_path)
+        harness.git_ops._warm_lane_base_resolvable = lambda: WarmBaseHealth.ABSENT
+
+        assert await harness._probe_warm_base_health() == 'absent'
+
+    async def test_pool_on_delegates_indeterminate(self, tmp_path: Path):
+        from orchestrator.git_ops import WarmBaseHealth
+
+        harness, _queue = _make_warm_base_harness(tmp_path)
+        harness.git_ops._warm_lane_base_resolvable = lambda: WarmBaseHealth.INDETERMINATE
+
+        assert await harness._probe_warm_base_health() == 'indeterminate'
+
+
+@pytest.mark.asyncio
+class TestWarmBaseHardDownFilingDedupResolve:
+    """_file_warm_base_hard_down_notice / _promote_warm_base_hard_down_l2 /
+    _resolve_warm_base_hard_down: global-sentinel filing, dedup, and resolve
+    (task 2061, step-9).  Mirrors test_harness_no_landings_breaker.py's
+    sentinel/role escalation asserts.
+
+    RED: none of these three Harness methods exist yet.
+    """
+
+    async def test_file_notice_creates_one_pending_info_l0(self, tmp_path: Path):
+        harness, queue = _make_warm_base_harness(tmp_path)
+
+        await harness._file_warm_base_hard_down_notice(
+            summary='WARM_BASE_HARD_DOWN: absent',
+            detail='detail',
+        )
+
+        pending = [
+            e
+            for e in queue.get_by_task(
+                Harness._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+            )
+            if e.agent_role == Harness._WARM_BASE_HARD_DOWN_ROLE
+        ]
+        assert len(pending) == 1, f'expected exactly one pending notice; got {pending!r}'
+        esc = pending[0]
+        assert esc.severity == 'info', f'expected severity="info"; got {esc.severity!r}'
+        assert esc.level == 0, f'expected level=0; got {esc.level}'
+
+    async def test_file_notice_dedup_no_duplicate(self, tmp_path: Path):
+        harness, queue = _make_warm_base_harness(tmp_path)
+
+        await harness._file_warm_base_hard_down_notice(summary='first', detail='d1')
+        await harness._file_warm_base_hard_down_notice(summary='second', detail='d2')
+
+        pending = [
+            e
+            for e in queue.get_by_task(
+                Harness._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+            )
+            if e.agent_role == Harness._WARM_BASE_HARD_DOWN_ROLE and e.level == 0
+        ]
+        assert len(pending) == 1, (
+            f'expected exactly one pending notice after two calls; got {pending!r}'
+        )
+
+    async def test_promote_l2_creates_one_pending_critical_l2(self, tmp_path: Path):
+        from escalation.models import BORN_AT_L2_SEVERITIES
+
+        harness, queue = _make_warm_base_harness(tmp_path)
+
+        await harness._promote_warm_base_hard_down_l2(
+            summary='WARM_BASE_HARD_DOWN: still absent past window',
+            detail='detail',
+        )
+
+        pending = [
+            e
+            for e in queue.get_by_task(
+                Harness._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+            )
+            if e.agent_role == Harness._WARM_BASE_HARD_DOWN_ROLE and e.level == 2
+        ]
+        assert len(pending) == 1, f'expected exactly one pending L2; got {pending!r}'
+        esc = pending[0]
+        assert esc.severity == 'critical', (
+            f'expected severity="critical"; got {esc.severity!r}'
+        )
+        assert esc.severity in BORN_AT_L2_SEVERITIES, (
+            'L2 severity must be in BORN_AT_L2_SEVERITIES (born-at-L2)'
+        )
+        assert esc.category == 'infra_issue', (
+            f'expected category="infra_issue"; got {esc.category!r}'
+        )
+
+    async def test_promote_l2_dedup_no_duplicate(self, tmp_path: Path):
+        harness, queue = _make_warm_base_harness(tmp_path)
+
+        await harness._promote_warm_base_hard_down_l2(summary='first', detail='d1')
+        await harness._promote_warm_base_hard_down_l2(summary='second', detail='d2')
+
+        pending = [
+            e
+            for e in queue.get_by_task(
+                Harness._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+            )
+            if e.agent_role == Harness._WARM_BASE_HARD_DOWN_ROLE and e.level == 2
+        ]
+        assert len(pending) == 1, (
+            f'expected exactly one pending L2 after two calls; got {pending!r}'
+        )
+
+    async def test_resolve_clears_both_notice_and_l2(self, tmp_path: Path):
+        harness, queue = _make_warm_base_harness(tmp_path)
+
+        await harness._file_warm_base_hard_down_notice(summary='notice', detail='d')
+        await harness._promote_warm_base_hard_down_l2(summary='l2', detail='d')
+        pre = [
+            e
+            for e in queue.get_by_task(
+                Harness._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+            )
+            if e.agent_role == Harness._WARM_BASE_HARD_DOWN_ROLE
+        ]
+        assert len(pre) == 2, f'setup: expected notice + L2 both pending; got {pre!r}'
+
+        await harness._resolve_warm_base_hard_down()
+
+        remaining = [
+            e
+            for e in queue.get_by_task(
+                Harness._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+            )
+            if e.agent_role == Harness._WARM_BASE_HARD_DOWN_ROLE
+        ]
+        assert remaining == [], (
+            f'expected no pending escalations after resolve; got {remaining!r}'
+        )
+
+    async def test_resolve_is_idempotent(self, tmp_path: Path):
+        harness, queue = _make_warm_base_harness(tmp_path)
+
+        await harness._file_warm_base_hard_down_notice(summary='notice', detail='d')
+        await harness._resolve_warm_base_hard_down()
+        # Second call must not raise or duplicate anything.
+        await harness._resolve_warm_base_hard_down()
+
+        remaining = [
+            e
+            for e in queue.get_by_task(
+                Harness._WARM_BASE_HARD_DOWN_SENTINEL, status='pending'
+            )
+            if e.agent_role == Harness._WARM_BASE_HARD_DOWN_ROLE
+        ]
+        assert remaining == []
+
+
+def test_seed_rc_76_maps_to_base_absent():
+    """rc-76 discriminant wiring (per GUARD): _seed_rc_to_unavailable(76) is
+    WarmLaneUnavailable.BASE_ABSENT (task 2061, step-9)."""
+    from orchestrator.git_ops import WarmLaneUnavailable, _seed_rc_to_unavailable
+
+    assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT

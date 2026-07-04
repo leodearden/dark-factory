@@ -35,6 +35,22 @@ def git_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _seed_default_warm_base(repo: Path) -> None:
+    """Pre-create the DEFAULT derived warm-lane base (task 2061).
+
+    <repo>/.worktrees/_merge-verify/target, non-empty — so the
+    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK for
+    warm-lane tests using the default (unoverridden) warm_lane_base_target_dir.
+    NOT folded into the shared git_repo fixture: several persistent-merge-
+    worktree tests in this file assert ``_merge-verify`` does NOT exist before
+    it is lazily created, so only warm-lane tests that need a resolvable base
+    call this explicitly.
+    """
+    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
+    default_base.mkdir(parents=True, exist_ok=True)
+    (default_base / '.keep').write_text('warm base sentinel\n')
+
+
 async def _setup_repo(repo: Path):
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
@@ -6412,6 +6428,10 @@ async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
 class TestCreateWorktreeWarmLaneRouting:
     """create_worktree uses the pool when enabled; raises on exhaustion (no cold fallback)."""
 
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
+
     async def test_warm_path_returns_lane_not_branch_named_dir(
         self, git_repo: Path,
     ):
@@ -6528,6 +6548,10 @@ class TestCreateWorktreeWarmLaneRouting:
 @pytest.mark.asyncio
 class TestCleanupWorktreePoolAware:
     """cleanup_worktree routes to release_warm_lane for lanes; cold path unchanged."""
+
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
 
     async def test_cleanup_lane_not_removed(
         self, git_repo: Path,
@@ -6695,6 +6719,10 @@ class TestCleanupWorktreePoolAware:
 @pytest.mark.asyncio
 class TestCreateWorktreeRequeueAndRecycledId:
     """create_worktree requeue regression guard + recycled-id identity guard."""
+
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -7270,6 +7298,10 @@ class TestReleaseWarmLaneBranchRetention:
     """release_warm_lane retains task/<id> when it carries commits beyond main;
     deletes it (on-main only) when the branch is at the main tip."""
 
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
+
     def _warm_config(self) -> GitConfig:
         return GitConfig(
             main_branch='main',
@@ -7498,6 +7530,10 @@ class TestAcquireWarmLaneCreateOnceLeftoverGuard:
     checked out in another worktree), acquire returns WarmLaneUnavailable.FAULT
     while leaving the branch intact.  Fail-safe: _branch_has_commits_beyond_main
     True (including on git error) → reattach/retain direction taken on both paths."""
+
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -7754,6 +7790,10 @@ class TestAcquireWarmLaneResetInPlaceCheckoutGuard:
     Mirrors the create-once site (~1805-1826) which already checks the
     worktree-add rc and raises.  Makes both reattach sites symmetric."""
 
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
+
     def _warm_config(self) -> GitConfig:
         return GitConfig(
             main_branch='main',
@@ -7965,6 +8005,10 @@ class TestRebindBranchToHead:
     RED today: AttributeError — method does not exist.
     GREEN after step-2 implements `git checkout -B <full_branch>`.
     """
+
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(
@@ -8237,6 +8281,10 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
     GREEN after step-4 inserted rebind_branch_to_head in _reuse_warm_lane.
     """
 
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
+
     def _warm_config(self) -> GitConfig:
         return GitConfig(
             main_branch='main',
@@ -8389,6 +8437,10 @@ class TestReuseWarmLaneBranchAware:
     GREEN after step-4 inserts rebind_branch_to_head inside _reuse_warm_lane.
     """
 
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
+
     def _warm_config(self) -> GitConfig:
         return GitConfig(
             main_branch='main',
@@ -8530,6 +8582,10 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
     does not exist; acquire_warm_lane returns EXHAUSTED unconditionally when
     all lanes are ASSIGNED.
     """
+
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
 
     def _warm_config(self) -> GitConfig:
         return GitConfig(

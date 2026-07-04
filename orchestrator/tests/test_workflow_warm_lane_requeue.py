@@ -124,6 +124,40 @@ async def test_disk_pressure_returns_requeued(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# WarmLanePoolHardDown → REQUEUED (task 2061)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pool_hard_down_returns_requeued(tmp_path: Path):
+    """WarmLanePoolHardDown raised by create_worktree → run() returns REQUEUED
+    with block_reason='warm_lane_pool_hard_down' — the host-scoped warm-lane
+    base-absent condition must requeue (fail-open), never escalate a
+    per-task blocked+L1.
+
+    Fails today: WarmLanePoolHardDown does not exist yet (ImportError), and
+    once it does, the broad except Exception would map it to BLOCKED until
+    the dedicated isinstance branch is added in step-6.
+    """
+    from orchestrator.git_ops import WarmLanePoolHardDown
+
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.git_ops.create_worktree = AsyncMock(
+        side_effect=WarmLanePoolHardDown(
+            "warm-lane base absent (host-scoped pool hard-down) for branch "
+            "'1859'; requeue"
+        )
+    )
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+    outcome = await wf.run()
+
+    assert outcome == WorkflowOutcome.REQUEUED
+    mark_blocked.assert_not_awaited()
+    assert wf._last_block_reason == 'warm_lane_pool_hard_down'
+
+
+# ---------------------------------------------------------------------------
 # RuntimeError (FAULT) → BLOCKED
 # ---------------------------------------------------------------------------
 

@@ -248,6 +248,19 @@ starvation_watchdog:
   skip_threshold: 50
   idle_secs: 1800.0
 
+# Warm-lane base hard-down watchdog (task 2061).
+#
+# The warm-lane pool CoW-seeds every lane from a single host-scoped rolling
+# base.  When that base is absent, it is a host-wide infra condition — the
+# scheduler halts dispatch host-wide (fail-open: pending tasks stay pending,
+# in-flight acquires requeue) and files exactly ONE INFO escalation instead of
+# one BLOCKED+L1 per dispatched task.  Auto-clears when the base is rebuilt.
+# If still absent after l2_window_secs, promotes ONE born-at-L2 escalation
+# (the reify reseed ladder is presumed stuck).  Set enabled: false to silence.
+warm_base_hard_down:
+  enabled: true
+  l2_window_secs: 300.0
+
 # Value/h scheduler scoring knobs.
 #   score(t) = TIER_BASE[eff_priority(t)]
 #            + min(age_alpha * age + cpm_beta * log1p(transitive_dependents),

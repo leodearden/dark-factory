@@ -402,6 +402,55 @@ class StarvationWatchdogConfig(BaseModel):
     )
 
 
+class WarmBaseHardDownConfig(BaseModel):
+    """Scheduler warm-lane base hard-down watchdog configuration (task 2061).
+
+    The warm-lane pool CoW-seeds every lane's ``target/`` from a single
+    HOST-SCOPED rolling base (``warm_lane_base_target_path``).  When that base
+    is absent (e.g. mid-rebuild, or the reify reseed ladder is between
+    attempts), it is a host-wide infra condition — not a per-task fault — so
+    it must produce exactly ONE signal, not one BLOCKED+L1 per dispatched
+    task.
+
+    The scheduler probes base health once per ``acquire_next`` tick via an
+    injected callback (``_warm_base_health_probe``, installed by the Harness
+    against ``GitOps._warm_lane_base_resolvable``).  A definite ``ABSENT``
+    reading engages a singleton latch that HALTS dispatch host-wide
+    (fail-open — pending tasks stay pending, in-flight warm-lane acquires
+    requeue via ``WarmLanePoolHardDown``) and files exactly one INFO notice.
+    The latch auto-clears the moment the probe reports ``OK`` again — the
+    natural clear happens when ``GitOps.refresh_warm_base`` (git_ops.py:1659)
+    successfully rebuilds/advances the base.  ``INDETERMINATE`` readings
+    (transient stat/readlink hiccups) never engage, clear, or promote the
+    latch — fail-safe hold.
+
+    If the base is still ``ABSENT`` after ``l2_window_secs`` of continuous
+    latch time, the reify reseed ladder is presumed stuck and exactly ONE
+    born-at-L2 escalation is promoted so a human is notified.
+
+    Set ``enabled: false`` in orchestrator.yaml to silence the watchdog
+    entirely (the git_ops pre-acquire gate and ``WarmLanePoolHardDown``
+    requeue path remain in effect regardless — this knob only controls the
+    scheduler-side halt + escalation latch).
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description='Set to false to disable the warm-base hard-down watchdog entirely.',
+    )
+    l2_window_secs: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            'Bounded remediation window, in seconds: how long the warm-lane '
+            'base may remain continuously ABSENT before the single host-scoped '
+            'L2 escalation is promoted.  Must be > 0.  A healthy reify reseed '
+            'ladder clears the latch (via refresh_warm_base) well within this '
+            'window; still-absent past it is the definition of a stuck ladder.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
@@ -2118,6 +2167,11 @@ class OrchestratorConfig(BaseSettings):
         default_factory=StarvationWatchdogConfig,
     )
 
+    # Scheduler warm-lane base hard-down watchdog (task 2061).
+    warm_base_hard_down: WarmBaseHardDownConfig = Field(
+        default_factory=WarmBaseHardDownConfig,
+    )
+
     # Value/h scheduler scoring (P2/P3 — age boost, CPM weighting).
     age_alpha: float = Field(
         default=10.0,
@@ -2538,6 +2592,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'starvation_watchdog.enabled',
         'starvation_watchdog.skip_threshold',
         'starvation_watchdog.idle_secs',
+        'warm_base_hard_down.enabled',
+        'warm_base_hard_down.l2_window_secs',
         # Loop-pass thresholds (+ the two crashloop-window params read live
         # per rotation; the misconfigured-guard params are a distinct
         # failure-mode family and stay restart-only)
