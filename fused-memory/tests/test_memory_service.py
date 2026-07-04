@@ -3794,6 +3794,277 @@ class TestIsDependencyFact:
         assert _is_dependency_fact(None) is False  # type: ignore[arg-type]
 
 
+class TestReconPoolAutoTag:
+    """Module-level _infer_recon_pool helper + _CYCLE_SUMMARY_STAGE_TO_RECON_POOL map.
+
+    recon_pool is the only key the pool-cap trim and prune script filter on
+    (reconciliation/summary_pool.py, scripts/prune_recon_cycle_summaries.py).
+    _infer_recon_pool derives it server-side from metadata.stage for
+    kind == 'cycle_summary' writes only, so tagging no longer depends on LLM
+    prompt compliance (task 2077).
+    """
+
+    def test_memory_consolidator_stage_maps_to_stage1_pool(self):
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'cycle_summary', 'stage': 'memory_consolidator'}
+        assert _infer_recon_pool(meta) == 'stage1_cycle_summary'
+
+    def test_task_knowledge_sync_stage_maps_to_stage2_pool(self):
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'cycle_summary', 'stage': 'task_knowledge_sync'}
+        assert _infer_recon_pool(meta) == 'stage2_cycle_summary'
+
+    def test_missing_stage_returns_none(self):
+        """stage absent -> cannot infer; add_memory must leave any caller recon_pool alone."""
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'cycle_summary'}
+        assert _infer_recon_pool(meta) is None
+
+    def test_unknown_stage_returns_none(self):
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'cycle_summary', 'stage': 'unknown_stage'}
+        assert _infer_recon_pool(meta) is None
+
+    def test_non_cycle_summary_kind_returns_none(self):
+        """Only kind == 'cycle_summary' writes are touched; other kinds pass through untouched."""
+        from fused_memory.services.memory_service import _infer_recon_pool
+        meta = {'kind': 'note', 'stage': 'memory_consolidator'}
+        assert _infer_recon_pool(meta) is None
+
+    def test_empty_metadata_returns_none(self):
+        from fused_memory.services.memory_service import _infer_recon_pool
+        assert _infer_recon_pool({}) is None
+
+    def test_map_matches_canonical_per_stage_constants(self):
+        """Drift guard: the map's values must equal the per-stage canonical constants
+        that stage1/stage2 themselves emit, so the two copies can't silently diverge."""
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            _STAGE1_CYCLE_SUMMARY_RECON_POOL,
+        )
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+        )
+        from fused_memory.services.memory_service import (
+            _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+        )
+        assert (
+            _CYCLE_SUMMARY_STAGE_TO_RECON_POOL['memory_consolidator']
+            == _STAGE1_CYCLE_SUMMARY_RECON_POOL
+        )
+        assert (
+            _CYCLE_SUMMARY_STAGE_TO_RECON_POOL['task_knowledge_sync']
+            == _STAGE2_CYCLE_SUMMARY_RECON_POOL
+        )
+
+
+class TestReconPoolAutoTagInjection:
+    """Integration: add_memory must inject recon_pool into the metadata dict
+    handed to mem0.add for cycle_summary writes, server-side, independent of
+    whether the caller passed recon_pool (task 2077).
+
+    RED until _infer_recon_pool is wired into add_memory (step-4).
+    """
+
+    @pytest.mark.asyncio
+    async def test_stage1_recon_pool_injected(self, service):
+        await service.add_memory(
+            content='Cycle 3 summary: completed steps 1-4',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={
+                'kind': 'cycle_summary',
+                'stage': 'memory_consolidator',
+                'run_id': 'r1',
+            },
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['recon_pool'] == 'stage1_cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_stage2_recon_pool_injected(self, service):
+        await service.add_memory(
+            content='Cycle 3 summary: completed steps 1-4',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={
+                'kind': 'cycle_summary',
+                'stage': 'task_knowledge_sync',
+                'run_id': 'r1',
+            },
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['recon_pool'] == 'stage2_cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_non_cycle_summary_kind_not_tagged(self, service):
+        """metadata.kind != 'cycle_summary' -> recon_pool must not appear at all."""
+        await service.add_memory(
+            content='Always use type hints',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={'kind': 'note'},
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert 'recon_pool' not in call_kwargs['metadata']
+
+    @pytest.mark.asyncio
+    async def test_no_metadata_not_tagged(self, service):
+        """No metadata at all -> recon_pool must not appear."""
+        await service.add_memory(
+            content='Always use type hints',
+            category='observations_and_summaries',
+            project_id='test',
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert 'recon_pool' not in call_kwargs['metadata']
+
+    @pytest.mark.asyncio
+    async def test_authoritative_override_corrects_wrong_caller_value(self, service):
+        """A known stage's derived recon_pool wins over a caller-supplied value."""
+        await service.add_memory(
+            content='Cycle 3 summary: completed steps 1-4',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={
+                'kind': 'cycle_summary',
+                'stage': 'memory_consolidator',
+                'recon_pool': 'WRONG',
+            },
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['recon_pool'] == 'stage1_cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_unknown_stage_preserves_caller_recon_pool(self, service):
+        """Stage unknown -> cannot infer -> caller-supplied recon_pool must survive untouched."""
+        await service.add_memory(
+            content='Cycle 3 summary: completed steps 1-4',
+            category='observations_and_summaries',
+            project_id='test',
+            metadata={
+                'kind': 'cycle_summary',
+                'stage': 'unknown',
+                'recon_pool': 'caller_val',
+            },
+        )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['recon_pool'] == 'caller_val'
+
+
+class TestReconPoolAutoTagMissingStageWarning:
+    """metadata.stage is itself LLM-supplied (see the reconciliation
+    stage1/stage2 prompts), so a missing/unknown stage means recon_pool
+    could not be derived server-side either — the same prompt-compliance
+    failure task 2077 targets, just shifted from the recon_pool field to the
+    stage field. A WARNING makes these writes observable instead of silently
+    relying on whatever (if anything) the caller passed for recon_pool
+    (amendment review, task 2077).
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_stage_logs_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={'kind': 'cycle_summary', 'run_id': 'run-x'},
+                causation_id='run-x',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for a cycle_summary with missing stage, '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+        record = warning_records[0]
+        message = record.message.lower()
+        assert 'cycle_summary' in message and 'stage' in message, (
+            f'Expected the WARNING to name the missing/unknown-stage condition, '
+            f'got: {record.message!r}'
+        )
+        assert record.stage is None
+        assert record.caller_recon_pool is None
+        assert record.causation_id == 'run-x'
+        assert record.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_unknown_stage_logs_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'unknown_stage',
+                    'recon_pool': 'caller_val',
+                    'run_id': 'run-x',
+                },
+                causation_id='run-x',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for a cycle_summary with an unknown stage, '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+        record = warning_records[0]
+        assert record.stage == 'unknown_stage'
+        assert record.caller_recon_pool == 'caller_val'
+
+    @pytest.mark.asyncio
+    async def test_known_stage_no_warning(self, service, caplog):
+        """Happy path (known stage) must not trigger the missing-stage WARNING."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    'run_id': 'run-x',
+                },
+                causation_id='run-x',
+            )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING when stage is known, got: '
+            f'{[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_cycle_summary_kind_no_warning_even_without_stage(self, service, caplog):
+        """Only kind == 'cycle_summary' writes are subject to this warning."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Always use type hints',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={'kind': 'note'},
+            )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING for a non-cycle_summary kind, got: '
+            f'{[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_metadata_no_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Always use type hints',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+            )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING when no metadata is supplied, got: '
+            f'{[r.message for r in warning_records]}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Step 3: TRACK B.1 service clear_invalid_at RED tests
 # ---------------------------------------------------------------------------

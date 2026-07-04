@@ -73,6 +73,50 @@ def _is_dependency_fact(fact: str | None) -> bool:
     return bool(fact) and _DEPENDENCY_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
 
 
+# Canonical stage -> recon_pool map for per-cycle reconciliation summaries
+# (metadata.kind == 'cycle_summary'). recon_pool is the only key the pool-cap
+# trim and ops prune script filter on (reconciliation/summary_pool.py,
+# scripts/prune_recon_cycle_summaries.py), so this map is what makes tagging
+# independent of LLM prompt compliance (task 2077). These values MUST stay in
+# sync with the per-stage _STAGE1_CYCLE_SUMMARY_RECON_POOL /
+# _STAGE2_CYCLE_SUMMARY_RECON_POOL constants in reconciliation/stages/*.py —
+# a drift-guard test asserts the equality.
+#
+# Importing those constants directly here (instead of duplicating the
+# strings) was considered during task 2077 amendment review and confirmed —
+# empirically, not just by inspection — to create a real circular import:
+# fused_memory.reconciliation.stages.memory_consolidator imports
+# task_knowledge_sync, which imports fused_memory.services.
+# live_workflow_detector; fused_memory/services/__init__.py imports this
+# module (memory_service) first, before anything else. So an entry point
+# that imports memory_consolidator before fused_memory.services has been
+# touched raises "ImportError: cannot import name
+# '_STAGE1_CYCLE_SUMMARY_RECON_POOL' from partially initialized module ...
+# (most likely due to a circular import)". services.memory_service is a
+# lower layer than reconciliation.stages.*; keep the duplicated map plus the
+# drift-guard test rather than inverting that dependency direction.
+_CYCLE_SUMMARY_STAGE_TO_RECON_POOL: dict[str, str] = {
+    'memory_consolidator': 'stage1_cycle_summary',
+    'task_knowledge_sync': 'stage2_cycle_summary',
+}
+
+
+def _infer_recon_pool(meta: dict) -> str | None:
+    """Infer the recon_pool tag for a cycle_summary write from metadata.stage.
+
+    Returns None when meta['kind'] != 'cycle_summary' (non-cycle-summary
+    writes are never touched) or when meta['stage'] is missing/unknown (the
+    pool cannot be inferred; callers must not clobber any caller-supplied
+    recon_pool in that case).
+    """
+    if meta.get('kind') != 'cycle_summary':
+        return None
+    stage = meta.get('stage')
+    if not isinstance(stage, str):
+        return None
+    return _CYCLE_SUMMARY_STAGE_TO_RECON_POOL.get(stage)
+
+
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
 
@@ -922,6 +966,37 @@ class MemoryService:
         stores_written: list[SourceStore] = []
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
+
+        # Server-side recon_pool auto-tag (task 2077): recon_pool is the only
+        # key the pool-cap trim and ops prune script filter on, and relying on
+        # LLM prompt compliance to set it has empirically failed (untagged
+        # cycle_summary piles regrow unbounded). Derive it authoritatively
+        # from metadata.stage when known; when stage is missing/unknown, leave
+        # any caller-supplied recon_pool untouched (cannot infer, must not
+        # clobber).
+        inferred_recon_pool = _infer_recon_pool(meta)
+        if inferred_recon_pool is not None:
+            meta['recon_pool'] = inferred_recon_pool
+        elif meta.get('kind') == 'cycle_summary':
+            # metadata.stage is itself LLM-supplied (see the reconciliation
+            # stage1/stage2 prompts), so a missing/unknown stage means
+            # recon_pool could not be derived server-side either — the same
+            # prompt-compliance failure this task targets, just shifted from
+            # the recon_pool field to the stage field (amendment review,
+            # task 2077). Log so these writes are observable rather than
+            # silently relying on whatever (if anything) the caller passed —
+            # an untagged cycle_summary is invisible to the pool-cap trim and
+            # ops prune script and will regrow unbounded.
+            logger.warning(
+                'MemoryService.add_memory: cycle_summary write with missing/unknown '
+                'metadata.stage — recon_pool could not be inferred server-side',
+                extra={
+                    'project_id': project_id,
+                    'stage': meta.get('stage'),
+                    'caller_recon_pool': meta.get('recon_pool'),
+                    'causation_id': causation_id,
+                },
+            )
 
         write_graphiti = (
             resolved_category in GRAPHITI_PRIMARY or dual_write
