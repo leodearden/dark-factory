@@ -2959,7 +2959,11 @@ class TaskKnowledgeSync(BaseStage):
         appended = 0
         for finding in polled_systemic_findings:
             sig = compute_flag_signature(finding)
-            fp = _flag_content_fingerprint({'content': finding.get('description')})
+            # Findings carry only 'description' (never 'content'), so passing
+            # finding directly is equivalent to the description-only lookup:
+            # _flag_content_fingerprint's content-or-description fallback
+            # resolves it the same way either way.
+            fp = _flag_content_fingerprint(finding)
             if (sig is not None and sig in existing_signatures) or (
                 fp is not None and fp in existing_content_fps
             ):
@@ -3375,15 +3379,29 @@ def _flag_content_fingerprint(item: dict) -> str | None:
     between a Stage 1 / mem0_active_query item (keyed on ``content``) and a
     polled recon_report_systemic finding (keyed on ``description``).
 
+    Deliberately NOT a call site of
+    :func:`~fused_memory.reconciliation.flag_dedup.compute_content_fingerprint_signature`:
+    that helper is gated on ``task_id``/``cited_tasks`` being absent and
+    returns a ``(fp, flag_type)`` tuple for marker write/match in
+    ``dedup_flags``, whereas this helper is ungated (any item with non-blank
+    text qualifies, regardless of task_id) and returns the bare ``fp`` for a
+    same-cycle payload-assembly join. Both delegate to the same underlying
+    :func:`~fused_memory.reconciliation.flag_dedup._content_fingerprint` /
+    :func:`~fused_memory.reconciliation.flag_dedup._normalize_content_description`
+    primitives — if that normalization contract ever changes, cross-check
+    both call sites so the two dedup keys don't silently drift apart.
+
     Text is read as ``item.get('content') or item.get('description') or ''``
     so either field name resolves to the same fingerprint for identical text
-    — the cross-channel equality the dedup relies on. Returns ``None`` when
-    the normalized text is blank (mirrors
+    — the cross-channel equality the dedup relies on. Coerced to ``str`` in
+    case a caller places a truthy non-string value (e.g. an int) under
+    either key, so normalization never raises AttributeError. Returns
+    ``None`` when the normalized text is blank (mirrors
     :func:`compute_content_fingerprint_signature`'s non-blank gate).
 
     Pure, sync, no I/O.
     """
-    text = item.get('content') or item.get('description') or ''
+    text = str(item.get('content') or item.get('description') or '')
     if not _normalize_content_description(text):
         return None
     return _content_fingerprint(text)

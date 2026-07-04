@@ -204,6 +204,19 @@ class TestFlagContentFingerprint:
 
         assert fp1 != fp2
 
+    def test_non_string_content_is_coerced_not_raised(self):
+        """Defensive: a truthy non-string value under `content` (e.g. an int
+        accidentally placed there) must not raise AttributeError out of
+        _normalize_content_description's `.split()` call — it is coerced to
+        `str` first, mirroring compute_content_fingerprint_signature's
+        `str(ftype)` coercion pattern."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _flag_content_fingerprint,
+        )
+
+        assert _flag_content_fingerprint({'content': 452}) == _content_fingerprint('452')
+
 
 # ---------------------------------------------------------------------------
 # assemble_payload integration — recon_report channel reaches Stage 2 even
