@@ -1674,6 +1674,109 @@ class TestSpecLaneFinalizeTerminalRelease:
 
 
 # ===========================================================================
+# task 1997 step-5: rebased_pending_reverify consumes AdvanceOutcome fields
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestGateReverifyConsumesAdvanceOutcome:
+    """_finalize_inflight's rebased_pending_reverify branch must source the
+    post-rebase SHAs from the AdvanceOutcome return value, not the
+    git_ops._last_advanced_sha/_rebased_from/_rebased_onto getattr side
+    channel (task 1997 / MQ-refactor μ).
+
+    RED: the side channel is deliberately left unset on the stub, so the
+    current getattr-reading production code hits the AssertionError
+    backstop (merge_queue.py ~8648-8655).  GREEN (step-6): the CAS loop
+    reads adv_outcome.advanced_sha/rebased_from/rebased_onto directly, so
+    no AssertionError fires.
+    """
+
+    async def test_gate_reverify_consumes_advance_outcome_sha_fields(
+        self, tmp_path: Path,
+    ) -> None:
+        cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
+        worker, mock_git_ops = _make_finalize_test_worker(tmp_path)
+
+        # Deliberately unset — the return value must carry the SHAs on its
+        # own; per Mock semantics, `del` makes subsequent access raise
+        # AttributeError so getattr(..., default) falls back to default.
+        del mock_git_ops._last_advanced_sha
+        del mock_git_ops._rebased_from
+        del mock_git_ops._rebased_onto
+
+        fake_lane = tmp_path / '_spec-0'
+        fake_lane.mkdir(parents=True, exist_ok=True)
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        item.request.task_id = 'task-gate-reverify-sha'
+
+        vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
+        entry = _build_entry(item, vr, merge_wt=fake_lane)
+
+        REBASED_SHA = 'ab' * 20
+        REBASED_FROM = 'ba' * 20
+        REBASED_ONTO = 'cd' * 20
+
+        advance_calls: list[tuple[tuple, dict]] = []
+
+        async def _advance_side_effect(*args, **kwargs):
+            advance_calls.append((args, kwargs))
+            if len(advance_calls) == 1:
+                return AdvanceOutcome(
+                    'rebased_pending_reverify',
+                    advanced_sha=REBASED_SHA,
+                    rebased_from=REBASED_FROM,
+                    rebased_onto=REBASED_ONTO,
+                )
+            # Second call (post-rebuild): terminal failure — sidesteps the
+            # success-path gate machinery, which is not this test's concern.
+            return AdvanceOutcome('not_descendant')
+
+        mock_git_ops.advance_main.side_effect = _advance_side_effect
+
+        captured_reverify_kwargs: dict = {}
+
+        async def _fake_reverify_rebased_tree(
+            git_ops, req, merge_wt, *, rebased_from, rebased_onto, merge_sha, **kwargs,
+        ):
+            captured_reverify_kwargs.update(
+                rebased_from=rebased_from, rebased_onto=rebased_onto, merge_sha=merge_sha,
+            )
+            return None  # gate clears — disjoint/green re-verify
+
+        with patch(
+            'orchestrator.merge_queue._reverify_rebased_tree',
+            new=_fake_reverify_rebased_tree,
+        ):
+            await worker._finalize_inflight(entry)
+
+        assert captured_reverify_kwargs == {
+            'rebased_from': REBASED_FROM,
+            'rebased_onto': REBASED_ONTO,
+            'merge_sha': REBASED_SHA,
+        }, (
+            f'_reverify_rebased_tree must be called with the AdvanceOutcome '
+            f'fields, not the (unset) getattr side channel; got '
+            f'{captured_reverify_kwargs!r}'
+        )
+        assert len(advance_calls) == 2, (
+            f'advance_main must be retried after the gate clears; got '
+            f'{len(advance_calls)} call(s)'
+        )
+        second_args, second_kwargs = advance_calls[1]
+        assert second_args[0] == REBASED_SHA, (
+            f'second advance_main call must retry with current_sha sourced '
+            f'from adv_outcome.advanced_sha; got {second_args[0]!r}'
+        )
+        assert second_kwargs['expected_main'] == REBASED_ONTO, (
+            f'second advance_main call must use item.base_sha rebuilt from '
+            f'rebased_onto (task 1990 replace-only rebuild); got '
+            f'{second_kwargs.get("expected_main")!r}'
+        )
+
+
+# ===========================================================================
 # Late-arrival integration scaffolding (pre-1 / task 1862)
 # ===========================================================================
 # Helpers for the "late-arrival attach to in-flight predecessor tip" tests

@@ -2501,6 +2501,14 @@ class TestGetMergeQueue:
         _finalize_inflight (task 1735, commit 2a9db6ac83).  This test drives the
         real finalize path via an already-passed InflightEntry (verify_task=None),
         and captures the LIVE phase surfaced by snapshot() at the reverify call.
+
+        task 1997 step-5: the git_ops stub deliberately does NOT set
+        _last_advanced_sha/_rebased_from/_rebased_onto — the post-rebase SHAs
+        must be sourced entirely from the AdvanceOutcome return value.  RED:
+        production still reads the getattr side channel (merge_queue.py
+        ~8645-8654) and hits the AssertionError backstop since the stub has
+        no such attributes.  GREEN (step-6): the CAS loop reads
+        adv_outcome.advanced_sha/rebased_from/rebased_onto directly.
         """
         import asyncio
         import types
@@ -2523,7 +2531,11 @@ class TestGetMergeQueue:
         merge_wt = tmp_path / 'merge'
         merge_wt.mkdir()
 
-        advance_calls: list[int] = []
+        REBASED_SHA = 'rebased0abc'
+        REBASED_FROM = 'from0sha'
+        REBASED_ONTO = 'onto0sha'
+
+        advance_call_args: list[tuple[tuple, dict]] = []
         captured_phases_reverify: list[str | None] = []
         captured_snapshot_reverify: list[str | None] = []
         captured_phases_advance2: list[str | None] = []
@@ -2531,16 +2543,16 @@ class TestGetMergeQueue:
         # Explicit return annotation breaks the pyright inference cycle between
         # this closure (reads `worker`) and git_ops_stub/worker below.
         async def fake_advance_main(*args, **kwargs) -> AdvanceOutcome:
-            advance_calls.append(len(advance_calls) + 1)
-            if len(advance_calls) == 1:
-                # First call: trigger rebase path. SHA fields mirror the
-                # git_ops_stub side-channel attributes below (still the
-                # production read path until task 1997 step-6).
+            advance_call_args.append((args, kwargs))
+            if len(advance_call_args) == 1:
+                # First call: trigger rebase path.  The SHA fields are carried
+                # SOLELY by the return value — the git_ops stub below has no
+                # _last_advanced_sha/_rebased_from/_rebased_onto attributes.
                 return AdvanceOutcome(
                     'rebased_pending_reverify',
-                    advanced_sha='rebased0abc',
-                    rebased_from='from0sha',
-                    rebased_onto='onto0sha',
+                    advanced_sha=REBASED_SHA,
+                    rebased_from=REBASED_FROM,
+                    rebased_onto=REBASED_ONTO,
                 )
             else:
                 # Second call (after gate cleared): terminal failure.
@@ -2554,15 +2566,12 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
-        # Side-channel attributes read by _finalize_inflight after
-        # 'rebased_pending_reverify' to extract the post-rebase SHAs.
+        # Deliberately NO _last_advanced_sha/_rebased_from/_rebased_onto —
+        # the SHAs must ride the AdvanceOutcome return value alone (task 1997).
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
             config=config,
-            _last_advanced_sha='rebased0abc',
-            _rebased_from='from0sha',
-            _rebased_onto='onto0sha',
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
 
@@ -2605,6 +2614,8 @@ class TestGetMergeQueue:
 
         import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
 
+        captured_reverify_kwargs: dict = {}
+
         async def fake_reverify_rebased_tree(*args, **kwargs):
             # Capture the phase at the moment _reverify_rebased_tree is invoked,
             # both on the entry and via the live snapshot() observability path.
@@ -2612,6 +2623,13 @@ class TestGetMergeQueue:
             snap = worker.snapshot()
             vip = snap.get('verify_in_progress')
             captured_snapshot_reverify.append(vip['phase'] if vip else None)
+            # Capture the SHA-bearing kwargs forwarded to the reverify gate —
+            # must come from the AdvanceOutcome return value, not getattr.
+            captured_reverify_kwargs.update(
+                rebased_from=kwargs.get('rebased_from'),
+                rebased_onto=kwargs.get('rebased_onto'),
+                merge_sha=kwargs.get('merge_sha'),
+            )
             # Return None → gate cleared (disjoint/green), advance proceeds.
             return None
 
@@ -2636,9 +2654,33 @@ class TestGetMergeQueue:
             f'reverify, got: {captured_snapshot_reverify}'
         )
 
+        # The SHAs forwarded to the reverify gate must come from the
+        # AdvanceOutcome return value — the stub has no getattr side channel.
+        assert captured_reverify_kwargs == {
+            'rebased_from': REBASED_FROM,
+            'rebased_onto': REBASED_ONTO,
+            'merge_sha': REBASED_SHA,
+        }, (
+            f'_reverify_rebased_tree must be called with the AdvanceOutcome '
+            f'fields, not the (unset) getattr side channel; got '
+            f'{captured_reverify_kwargs!r}'
+        )
+
         # advance_main must have been called twice
-        assert len(advance_calls) == 2, (
-            f'Expected 2 advance_main calls, got: {advance_calls}'
+        assert len(advance_call_args) == 2, (
+            f'Expected 2 advance_main calls, got: {len(advance_call_args)}'
+        )
+        # The second (retry) call must resume from the rebased SHA/base —
+        # correct rebased_from -> item.base_sha rebuild (task 1990 replace-only
+        # rebuild) sourced from the return object, not the getattr side channel.
+        second_args, second_kwargs = advance_call_args[1]
+        assert second_args[0] == REBASED_SHA, (
+            f'second advance_main call must retry with current_sha sourced '
+            f'from adv_outcome.advanced_sha; got {second_args[0]!r}'
+        )
+        assert second_kwargs.get('expected_main') == REBASED_ONTO, (
+            f'second advance_main call must use item.base_sha rebuilt from '
+            f'rebased_onto; got {second_kwargs.get("expected_main")!r}'
         )
         # After gate cleared, phase must be 'finalizing' when the second advance_main runs
         assert len(captured_phases_advance2) == 1, (

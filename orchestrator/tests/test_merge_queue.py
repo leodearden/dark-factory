@@ -7012,6 +7012,100 @@ class TestWipHaltSpeculativeMergeWorker:
                     await git_ops.cleanup_merge_worktree(item.merge_wt)
 
 
+@pytest.mark.asyncio
+class TestSpeculativeGateReverifyConsumesAdvanceOutcome:
+    """_finalize_inflight's rebased_pending_reverify branch must source the
+    post-rebase SHAs from the AdvanceOutcome return value, not the
+    git_ops._last_advanced_sha/_rebased_from/_rebased_onto getattr side
+    channel (task 1997 / MQ-refactor μ).
+
+    RED: advance_main is fully patched (the real bridge-writing code never
+    runs), so the getattr side channel stays unset on the real git_ops
+    fixture and current production hits the AssertionError backstop.
+    GREEN (step-6): the CAS loop reads
+    adv_outcome.advanced_sha/rebased_from/rebased_onto directly.
+    """
+
+    async def test_gate_reverify_consumes_advance_outcome_sha_fields(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        wt = await _make_branch_with_file(
+            git_ops, 'gate-reverify-sha', 'file_gate_reverify_sha.py', 'x = 1\n',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+        worker_task = asyncio.create_task(worker.run())
+
+        REBASED_SHA = 'ab' * 20
+        REBASED_FROM = 'ba' * 20
+        REBASED_ONTO = 'cd' * 20
+
+        advance_calls: list[tuple[tuple, dict]] = []
+
+        async def _advance_side_effect(*args, **kwargs):
+            advance_calls.append((args, kwargs))
+            if len(advance_calls) == 1:
+                return AdvanceOutcome(
+                    'rebased_pending_reverify',
+                    advanced_sha=REBASED_SHA,
+                    rebased_from=REBASED_FROM,
+                    rebased_onto=REBASED_ONTO,
+                )
+            # Second call (post-rebuild): terminal failure — sidesteps the
+            # success-path gate machinery, which is not this test's concern.
+            return AdvanceOutcome('not_descendant')
+
+        captured_reverify_kwargs: dict = {}
+
+        async def _fake_reverify_rebased_tree(
+            git_ops_arg, req, merge_wt, *, rebased_from, rebased_onto, merge_sha, **kwargs,
+        ):
+            captured_reverify_kwargs.update(
+                rebased_from=rebased_from, rebased_onto=rebased_onto, merge_sha=merge_sha,
+            )
+            return None  # gate clears — disjoint/green re-verify
+
+        with (
+            patch.object(git_ops, 'advance_main', side_effect=_advance_side_effect),
+            patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
+            patch(
+                'orchestrator.merge_queue._reverify_rebased_tree',
+                new=_fake_reverify_rebased_tree,
+            ),
+        ):
+            req = _make_request('gate-reverify-sha', 'gate-reverify-sha', wt, config)
+            await queue.put(req)
+            outcome = await asyncio.wait_for(req.result, timeout=30)
+
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome!r}'
+        assert captured_reverify_kwargs == {
+            'rebased_from': REBASED_FROM,
+            'rebased_onto': REBASED_ONTO,
+            'merge_sha': REBASED_SHA,
+        }, (
+            f'_reverify_rebased_tree must be called with the AdvanceOutcome '
+            f'fields, not the (unset) getattr side channel; got '
+            f'{captured_reverify_kwargs!r}'
+        )
+        assert len(advance_calls) == 2, (
+            f'advance_main must be retried after the gate clears; got '
+            f'{len(advance_calls)} call(s)'
+        )
+        second_args, second_kwargs = advance_calls[1]
+        assert second_args[0] == REBASED_SHA, (
+            f'second advance_main call must retry with current_sha sourced '
+            f'from adv_outcome.advanced_sha; got {second_args[0]!r}'
+        )
+        assert second_kwargs['expected_main'] == REBASED_ONTO, (
+            f'second advance_main call must use item.base_sha rebuilt from '
+            f'rebased_onto; got {second_kwargs.get("expected_main")!r}'
+        )
+
+        await worker.stop()
+        await worker_task
+
+
 @pytest.mark.parametrize(
     'worker_cls', [MergeWorker, SpeculativeMergeWorker],
 )
