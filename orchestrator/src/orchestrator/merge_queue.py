@@ -21,7 +21,7 @@ import shutil
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterator
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -342,6 +342,16 @@ MERGE_WORKER_SHUTDOWN_REASON = 'Merge worker shutting down'
 finally block.  Used by _buffer_owned_request._on_terminal to distinguish a
 graceful-stop / crash path (keep in journal for recovery) from a deterministic
 terminal failure (remove — not retried on restart)."""
+
+_DEBUG_ASSERTS: bool = os.environ.get('ORCH_DEBUG_ASSERTS', '') == '1'
+"""Module-level single-writer debug-assert flag (task 1999 / MQ-invariants ξ, I7).
+
+Seeded from the ``ORCH_DEBUG_ASSERTS`` env var at import time; gates
+:meth:`SpeculativeMergeWorker._assert_single_writer`.  Read as a module
+global (not re-read from ``os.environ`` per call) so tests/conftest can flip
+it via ``monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)`` without
+import-order fragility.  Off by default: zero production overhead beyond a
+single module-bool branch at each call site."""
 
 
 def _normalize_lane(lane: str) -> str:
@@ -4416,6 +4426,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
     # ── lane-buffer helpers ───────────────────────────────────────────────
 
+    def _assert_single_writer(self, expected_task: asyncio.Task | None, structure: str) -> None:  # type: ignore[type-arg]
+        """Raise if *structure* is being mutated from a coroutine other than *expected_task*.
+
+        Debug-only single-writer discipline check (task 1999 / MQ-invariants
+        ξ, I7) for ``_lane_buffers`` (owner: ``self._merger_task``) and
+        ``_inflight`` (owner: ``self._verifier_task``) — see each attribute's
+        own "Accessed only from the ... coroutine" comment.  A no-op in all
+        of these cases (checked in order, cheapest first):
+
+          * :data:`_DEBUG_ASSERTS` is off (production default) — single
+            module-bool branch, effectively zero overhead.
+          * *expected_task* is ``None`` — no loop has started yet (e.g. the
+            hundreds of direct-call unit tests that construct a bare worker
+            and call a mutation method without ever running ``_spawn_loop``).
+          * ``not self._running`` — :meth:`stop` sets this False BEFORE its
+            own shutdown drains of both structures from the stop coroutine
+            (a legitimate non-owner mutation), so this gate exempts them.
+
+        Otherwise raises :class:`AssertionError` when
+        ``asyncio.current_task()`` is not *expected_task*.
+        """
+        if not _DEBUG_ASSERTS or expected_task is None or not self._running:
+            return
+        cur = asyncio.current_task()
+        if cur is not expected_task:
+            raise AssertionError(
+                f'{structure} mutated from non-owner coroutine {cur!r}; '
+                f'single-writer discipline requires owner {expected_task!r}'
+            )
+
     def _buffer_owned_request(self, item: MergeRequest) -> None:
         """Append *item* to its lane buffer and record it in the durable journal.
 
@@ -4428,6 +4468,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         journal never stalls the merge pipeline.
         """
         lane = _normalize_lane(item.lane)
+        self._assert_single_writer(self._merger_task, '_lane_buffers')
         self._lane_buffers[lane].append(item)
 
         if self._merge_store is not None:
@@ -4550,10 +4591,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if not any(_aging_key(buf[j]) < key_x
                            for j, item in enumerate(buf)
                            if item.request_id in neighbors):
+                    self._assert_single_writer(self._merger_task, '_lane_buffers')
                     del buf[i]
                     return x
             # Defensive fallback (unreachable: the aging-minimal item is always
             # minimal by the above criterion, so the loop always returns).
+            self._assert_single_writer(self._merger_task, '_lane_buffers')
             return buf.popleft()
         return None
 
@@ -4642,6 +4685,41 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         tip = self._newest_frozen_commit()
         return tip if tip is not None else main_sha
 
+    def _frozen_base_chain(self, main_sha: str) -> Iterator[tuple[str, str, str]]:
+        """Walk the frozen prefix's expected-base chain, yielding (rid, expected, actual).
+
+        Shared chain-walk consumed by BOTH :meth:`check_frozen_prefix_invariant`
+        and :meth:`_verify_base_frozen_tip_violations` — the two checks compare
+        the exact same per-entry chained expected base (head expected =
+        main_sha; each subsequent entry's expected = predecessor's
+        merge_commit) and differ only in how they word a mismatch as a
+        violation string. Factored here so that chain-walk is defined exactly
+        once: if base-chain semantics ever change (e.g. how passthrough /
+        conflict entries advance the chain), both surfaces pick up the fix
+        together instead of silently drifting out of sync.
+
+        Entries with no merge_result/merge_commit (passthrough / conflict)
+        are skipped and do NOT advance the chain — mirrors the dispatch
+        guard's own ``item.merge_result is None or not item.base_sha``
+        exclusion.
+
+        Pure/synchronous (no await); never raises on well-formed
+        InflightEntry data.
+        """
+        expected_base = main_sha.strip()
+        for entry in self._frozen_inflight_entries():
+            rid = entry.item.request.request_id
+            mr = entry.item.merge_result
+            if mr is None or not mr.merge_commit:
+                # No merge_commit — nothing to chain; do not advance.
+                continue
+            actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
+            yield rid, expected_base, actual_base
+            # Advance expected_base for the next entry regardless of whether
+            # this one matched, so subsequent chain errors are also surfaced
+            # (not shadowed).
+            expected_base = mr.merge_commit.strip()
+
     def check_frozen_prefix_invariant(self, main_sha: str) -> list[str]:
         """Return §5.3 violations as human-readable strings (empty = healthy) (ε=1890).
 
@@ -4659,29 +4737,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              frozen_prefix() and unfrozen_suffix() is a structural bug; record
              one violation per duplicate.
 
+        The chain walk itself lives in :meth:`_frozen_base_chain` (shared with
+        :meth:`_verify_base_frozen_tip_violations`); this method only compares
+        expected vs. actual and formats its own violation wording.
+
         Pure/synchronous — reads stored in-memory state, no await.
         """
         violations: list[str] = []
-        frozen_entries = self._frozen_inflight_entries()
 
         # ── 1. Base-chain integrity ───────────────────────────────────────────
-        expected_base = main_sha.strip()
-        for entry in frozen_entries:
-            rid = entry.item.request.request_id
-            mr = entry.item.merge_result
-            if mr is None or not mr.merge_commit:
-                # No merge_commit — nothing to chain; advance expected_base
-                # only if there IS a commit to chain to (skip for passthroughs).
-                continue
-            actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
+        for rid, expected_base, actual_base in self._frozen_base_chain(main_sha):
             if actual_base != expected_base:
                 violations.append(
                     f'frozen-prefix base-chain broken at {rid}: '
                     f'expected base {expected_base!r} but item has {actual_base!r}'
                 )
-            # Advance expected_base for the next entry regardless of violation,
-            # so subsequent chain errors are also surfaced (not shadowed).
-            expected_base = mr.merge_commit.strip()
 
         # ── 2. Frozen/suffix disjointness ────────────────────────────────────
         frozen_set = set(self.frozen_prefix())
@@ -4716,6 +4786,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              ``conflicts_with_main`` but absent from nodes is a δ=1889
              graph-consistency violation naming the stale rid.
 
+        (iii) **verify-base ⊆ frozen-tip** (task 1999 / MQ-invariants ξ, I5):
+             snapshot-granularity promotion of the dispatch-time
+             :meth:`_warn_if_verify_base_not_frozen_tip` log-only guard — see
+             :meth:`_verify_base_frozen_tip_violations` for the per-entry
+             chained-base check.  Distinctly worded from
+             :meth:`check_frozen_prefix_invariant`'s base-chain violation so
+             it stands as its own named verify-frontier assertion target,
+             even though it mirrors the same chain math.
+
         Pure / synchronous (no await).  Fail-safe: never raises; any
         unexpected exception inside a sub-check is caught and surfaced as a
         violation string so the caller always receives a ``list[str]``.
@@ -4737,6 +4816,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 violations = []
         except Exception as exc:  # pragma: no cover — defensive
             violations = [f'two_layer_invariants: check_frozen_prefix_invariant raised: {exc}']
+
+        # ── (iii) verify-base ⊆ frozen-tip ───────────────────────────────────
+        # Same main_sha-availability gate as the inherited base-chain check
+        # above; own try/except so a failure here never shadows (or is
+        # shadowed by) check_frozen_prefix_invariant's result.
+        if main_sha and main_sha != 'unknown':
+            try:
+                violations.extend(self._verify_base_frozen_tip_violations(main_sha))
+            except Exception as exc:  # pragma: no cover — defensive
+                violations.append(f'two_layer_invariants: verify-base check raised: {exc}')
 
         graph = self._suffix_conflict_graph
 
@@ -4766,6 +4855,42 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'two_layer_invariants: conflicts_with_main⊆nodes check raised: {exc}'
             )
 
+        return violations
+
+    def _verify_base_frozen_tip_violations(self, main_sha: str) -> list[str]:
+        """Return verify-base/frozen-tip violations as human-readable strings (task 1999 I5).
+
+        Snapshot-granularity promotion of :meth:`_warn_if_verify_base_not_frozen_tip`
+        (the ε=1890 log-only dispatch guard): every currently-frozen entry's
+        recorded ``base_sha`` must equal the frozen-tip base it was dispatched
+        against — the head entry's expected base is *main_sha*, and each
+        subsequent entry's expected base is its predecessor's ``merge_commit``.
+
+        Walks the exact same chain as :meth:`check_frozen_prefix_invariant`,
+        via the shared :meth:`_frozen_base_chain` generator (per-entry
+        chained expected base, NOT a naive "every entry == newest tip"
+        comparison, which would falsely flag a healthy multi-entry frozen
+        prefix whose head is based on main rather than the stack's tip) —
+        the two checks overlap mathematically but are kept as
+        distinctly-worded, separately-named surfaces: this one parallels the
+        retained ε=1890 dispatch-time WARN and gives it a dedicated
+        verify-frontier assertion target in the snapshot health surface.
+        Because both surfaces now build from the same generator, a future
+        change to the chain-walk itself (e.g. how passthrough entries
+        advance the chain) cannot make the two surfaces silently disagree.
+
+        Pure/synchronous (no await). Fail-safe: never raises — callers
+        (:meth:`two_layer_invariants`) wrap this in their own try/except, but
+        the loop body itself cannot raise on well-formed InflightEntry data.
+        """
+        violations: list[str] = []
+        for rid, expected_base, actual_base in self._frozen_base_chain(main_sha):
+            if actual_base != expected_base:
+                violations.append(
+                    f'verify-base⊄frozen-tip at {rid!r}: dispatched for real-verify '
+                    f'with base {actual_base!r} but expected frozen-tip base '
+                    f'{expected_base!r} (ε=1890 §5.3 verify-base/frozen-tip rule)'
+                )
         return violations
 
     # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
@@ -5964,6 +6089,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._merge_ahead_cap.release()
 
         # Drain per-lane buffers (items already removed from _queue by the merger)
+        # Intentionally mutates _lane_buffers directly (not via
+        # _buffer_owned_request/_pop_next_pickable) from the stop coroutine —
+        # a legitimate non-owner drain covered by _assert_single_writer's
+        # not-self._running gate (task 1999 I7), not a wiring omission.
         for lane in MERGE_LANES:
             while self._lane_buffers[lane]:
                 req = self._lane_buffers[lane].popleft()
@@ -6056,6 +6185,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     await self._host_allocator.cancel_and_release(_ie.lease)
             if _ie.was_speculative:
                 self._speculation_slot.release()
+        # Intentionally mutates _inflight directly (not via _inflight_clear())
+        # from the stop coroutine — a legitimate non-owner drain covered by
+        # _assert_single_writer's not-self._running gate (task 1999 I7), not
+        # a wiring omission.
         self._inflight.clear()
 
         # Drain _redispatch: items pending re-dispatch after a cascade.
@@ -7088,6 +7221,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # Verifier coroutine
     # ------------------------------------------------------------------
 
+    def _inflight_append(self, entry: InflightEntry) -> None:
+        """Append *entry* to ``self._inflight`` (verifier-owned single-writer choke point).
+
+        Thin wrapper (task 1999 / MQ-invariants ξ, I7) asserting ownership
+        via ``self._verifier_task`` before mutating — the single choke point
+        every ``_verifier_loop`` append site routes through, mirroring
+        ``_buffer_owned_request`` on the merger side.
+        """
+        self._assert_single_writer(self._verifier_task, '_inflight')
+        self._inflight.append(entry)
+
+    def _inflight_popleft(self) -> InflightEntry:
+        """Pop and return the head of ``self._inflight`` (verifier-owned single-writer choke point).
+
+        See :meth:`_inflight_append`.
+        """
+        self._assert_single_writer(self._verifier_task, '_inflight')
+        return self._inflight.popleft()
+
+    def _inflight_clear(self) -> None:
+        """Clear ``self._inflight`` (verifier-owned single-writer choke point).
+
+        See :meth:`_inflight_append`.  NOT used by :meth:`stop`'s shutdown
+        drain, which intentionally mutates ``self._inflight`` directly from
+        the stop coroutine (a non-owner task) — see the comment at that call
+        site.
+        """
+        self._assert_single_writer(self._verifier_task, '_inflight')
+        self._inflight.clear()
+
     async def _verifier_loop(self) -> None:
         """Verify and CAS-advance for each SpeculativeItem from the Merger.
 
@@ -7210,7 +7373,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if item is None:
                     # Shutdown sentinel: drain remaining in-flight entries, then exit.
                     while self._inflight:
-                        head = self._inflight.popleft()
+                        head = self._inflight_popleft()
                         await self._finalize_inflight(head)
                     return
 
@@ -7270,7 +7433,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                     continue  # don't append to _inflight; fetch next item
 
-                self._inflight.append(entry)
+                self._inflight_append(entry)
 
                 # Continue filling only if another slot is free (real verify entries
                 # consume a host slot, so check free_host_count).
@@ -7287,7 +7450,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             # ── (b) FINALIZE-HEAD ──────────────────────────────────────────────
             if self._inflight:
-                head = self._inflight.popleft()
+                head = self._inflight_popleft()
                 _head_advanced = False
                 try:
                     _head_advanced = await self._finalize_inflight(head)
@@ -7319,7 +7482,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if not _head_advanced and self._inflight:
                     _allocator = self._host_allocator
                     _downstream = list(self._inflight)
-                    self._inflight.clear()
+                    self._inflight_clear()
 
                     # Detect whether the head failure was due to operator halt
                     # (REQUEUED sentinel).  In that case downstream tasks will
@@ -7524,7 +7687,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # The fill loop will block for the next item if a host slot is
                 # free (multi-host overlap) OR break immediately (single-host,
                 # free_host_count()==0) → FINALIZE-HEAD processes the head.
-                self._inflight.append(entry)
+                self._inflight_append(entry)
                 continue  # restart outer loop
 
     async def _build_merge_failure_diagnostic(
