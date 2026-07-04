@@ -36,6 +36,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test
+from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import (
@@ -269,3 +270,98 @@ class TestRecoverStrandedDeterministicTask:
 
         h._escalation_queue.submit.assert_not_called()
         h.scheduler.set_task_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# step-9: Harness._revalidate_open_deterministic_escalation (Source B)
+# ---------------------------------------------------------------------------
+
+
+def _make_esc(*, category: str, agent_role: str, esc_id: str = 'esc-tid-1', task_id: str = 'tid') -> Escalation:
+    return Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role=agent_role,
+        severity='critical',
+        category=category,
+        summary='test escalation',
+        level=2,
+    )
+
+
+class TestRevalidateOpenDeterministicEscalation:
+    """step-9: re-validates OPEN deterministic-deploy escalations against live state."""
+
+    @pytest.mark.asyncio
+    async def test_resolves_when_infra_issue_orchestrator_deterministic_and_healthy(self) -> None:
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(
+            return_value={'MainPID': 111, 'ActiveState': 'active'}
+        )
+        esc = _make_esc(category='infra_issue', agent_role='orchestrator-deterministic')
+        metadata = _strand_metadata()
+
+        await h._revalidate_open_deterministic_escalation(esc, {'id': 'tid'}, metadata)
+
+        h._escalation_queue.resolve.assert_called_once()
+        args, kwargs = h._escalation_queue.resolve.call_args
+        assert args[0] == esc.id
+        resolution = args[1] if len(args) > 1 else kwargs.get('resolution')
+        assert resolution and isinstance(resolution, str)
+        assert kwargs.get('resolved_by') == 'harness-deterministic-recon-sweep'
+
+    @pytest.mark.asyncio
+    async def test_does_not_resolve_when_unconfirmed(self) -> None:
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(
+            return_value={'MainPID': 0, 'ActiveState': 'failed'}
+        )
+        esc = _make_esc(category='infra_issue', agent_role='orchestrator-deterministic')
+        metadata = _strand_metadata()
+
+        await h._revalidate_open_deterministic_escalation(esc, {'id': 'tid'}, metadata)
+
+        h._escalation_queue.resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_never_touches_milestone_gate(self) -> None:
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(
+            return_value={'MainPID': 111, 'ActiveState': 'active'}
+        )
+        esc = _make_esc(category='milestone_gate', agent_role='orchestrator-deterministic')
+        metadata = _strand_metadata()
+
+        await h._revalidate_open_deterministic_escalation(esc, {'id': 'tid'}, metadata)
+
+        h._escalation_queue.resolve.assert_not_called()
+        h._recon_unit_inspector.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_sentinel_agent_role(self) -> None:
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(
+            return_value={'MainPID': 111, 'ActiveState': 'active'}
+        )
+        esc = _make_esc(category='infra_issue', agent_role='orchestrator-scheduler')
+        metadata = _strand_metadata()
+
+        await h._revalidate_open_deterministic_escalation(esc, {'id': 'tid'}, metadata)
+
+        h._escalation_queue.resolve.assert_not_called()
+        h._recon_unit_inspector.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resolves_own_sweep_filed_escalation_when_healthy(self) -> None:
+        h = _make_recon_harness()
+        h._recon_unit_inspector = AsyncMock(
+            return_value={'MainPID': 111, 'ActiveState': 'active'}
+        )
+        esc = _make_esc(
+            category='infra_issue', agent_role='harness-deterministic-recon-sweep',
+        )
+        metadata = _strand_metadata()
+
+        await h._revalidate_open_deterministic_escalation(esc, {'id': 'tid'}, metadata)
+
+        h._escalation_queue.resolve.assert_called_once()
