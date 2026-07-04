@@ -395,6 +395,18 @@ class DeterministicRunner:
         escalation already exists (e.g. prior crash-safe re-dispatch), filing is
         skipped to avoid duplicate L2 escalations.
 
+        The trailing ``set_task_status(..., 'blocked')`` write is best-effort
+        (task 2066 amendment): callers — including
+        ``_writeback_deploy_success`` on writeback-budget exhaustion — may
+        reach this method with the scheduler's own connection persistently
+        severed, i.e. the same failure mode that triggered the escalation in
+        the first place.  The escalation itself is already durable at this
+        point (``EscalationQueue.submit`` writes to local disk, independent of
+        fused-memory), so a failure to *also* persist the 'blocked' status
+        must not propagate — doing so would defeat this method's "always
+        returns BLOCKED, never a raw exception" contract in exactly the
+        scenario it exists to cover.
+
         Returns:
             WorkflowOutcome.BLOCKED
         """
@@ -424,8 +436,21 @@ class DeterministicRunner:
                 esc.id, task_id,
             )
 
-        await self.scheduler.set_task_status(task_id, 'blocked')
-        logger.info('DeterministicRunner: task %s blocked — infra_issue', task_id)
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+            logger.info('DeterministicRunner: task %s blocked — infra_issue', task_id)
+        except Exception as exc:
+            # Do NOT let a still-severed connection turn this into a
+            # propagated exception — it would bubble past run() into the
+            # harness's generic handler and produce a SILENT blocked report,
+            # defeating the point of filing a durable escalation above.
+            logger.warning(
+                'DeterministicRunner: task %s blocked-status writeback failed '
+                '(connection may still be severed): %s: %s — the infra_issue '
+                'escalation is already durable on local disk, so returning '
+                'BLOCKED regardless',
+                task_id, type(exc).__name__, exc,
+            )
         return WorkflowOutcome.BLOCKED
 
     async def _writeback_deploy_success(
@@ -489,6 +514,19 @@ class DeterministicRunner:
                         await self._sleeper(self._writeback_backoff_base * (2 ** attempt))
                     continue
 
+            # Shared-budget design (task 2066 amendment): the verified-stamp
+            # write above and the done-write below intentionally draw from
+            # the SAME `_writeback_max_attempts` budget and `attempt` counter
+            # rather than each getting its own sub-budget.  If the stamp only
+            # lands on the final iteration, the done-write gets exactly one
+            # remaining try before the loop falls through to the
+            # budget-exhausted escalation path below — there is no dedicated
+            # done-write retry allowance.  This keeps the overall ceiling
+            # simple (the ~62s default bounds BOTH writes together) at the
+            # cost of a possibly-single done-write attempt in the worst case;
+            # see
+            # test_stamp_lands_on_final_attempt_then_done_write_fails_still_escalates
+            # for the regression guard covering this exact edge.
             logger.info(
                 'DeterministicRunner: task %s before_done deploy verified — '
                 'pid=%s unit=%s — setting done',
@@ -527,9 +565,14 @@ class DeterministicRunner:
         # writes to disk) so the task is never silently stranded — the exact
         # EVIDENCE failure on task 2059 (empty queue + blocked forever).
         # before_done_ran_at is already stamped (I1 — the deploy is NOT re-run
-        # here).  If the verified stamp landed before the budget ran out, the
-        # existing crash-resume sub-case (a) drives this task to done
-        # automatically on a later re-dispatch — a second safety net.
+        # here).  This files an L2 escalation and blocks the task; the
+        # quiescence guard (section 1, before_done_ran_at+pending sub-case)
+        # prevents re-dispatch while that escalation stays open, so resume is
+        # NOT automatic while blocked.  If the verified stamp landed before
+        # the budget ran out, a human resolving this escalation — and the
+        # task then being re-dispatched — is a second safety net: crash-resume
+        # sub-case (a) will drive it to done at that point, without re-running
+        # the deploy.
         detail = '\n'.join([
             description,
             f'Target unit: {target_unit}',
@@ -539,9 +582,12 @@ class DeterministicRunner:
             'connection) and the verify+writeback could not be persisted '
             f'within the reconnect budget ({self._writeback_max_attempts} '
             'attempts). before_done_ran_at is already stamped (I1 — the '
-            'deploy is NOT re-run). If the verified stamp landed before the '
-            'connection was lost, a later re-dispatch will resume to done '
-            'automatically.',
+            'deploy is NOT re-run). Resolve this escalation to unblock the '
+            'task: if the verified stamp landed before the connection was '
+            'lost, resolving it and letting the task re-dispatch will then '
+            'resume it to done automatically (no re-run); otherwise inspect '
+            f'{target_unit} and the task metadata to determine whether the '
+            'deploy needs to be retried manually.',
         ])
         return await self._file_infra_issue_and_block(
             task_id,

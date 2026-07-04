@@ -898,6 +898,151 @@ class TestCrossUnitWritebackResilience:
         # (e) the deploy script is never re-run.
         script_runner.assert_awaited_once()
 
+    async def test_persistent_severed_connection_with_blocked_write_failure_still_returns_blocked(
+        self, tmp_path: Path,
+    ):
+        """Amendment regression guard (task 2066): when EVERY scheduler write
+        rides the same severed connection — including the fallback
+        set_task_status('blocked') issued by _file_infra_issue_and_block after
+        the writeback budget is exhausted — the durable escalation must still
+        be filed and run() must still return BLOCKED, never a propagated
+        exception.  Unlike test_persistent_severed_connection_files_durable_escalation
+        (which leaves set_task_status healthy), this simulates the connection
+        being down for ALL scheduler writes, matching production where both
+        writes share one connection."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            # Connection never recovers in-window for the verified stamp, so
+            # the done-write is never reached — the ONLY set_task_status call
+            # in this scenario is the fallback 'blocked' write below.
+            return 'before_done_verified_at' not in metadata
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+        # Every set_task_status call fails too — the connection is down for
+        # ALL scheduler writes, not just update_task.
+        scheduler.set_task_status = AsyncMock(
+            side_effect=RuntimeError('transient: fused-memory unavailable')
+        )
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=3,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        # The durable, connection-independent escalation is filed regardless.
+        pending = queue.get_by_task('2066')
+        assert pending, (
+            'Escalation must be filed even when the fallback blocked-status '
+            'write also fails'
+        )
+        assert pending[0].category == 'infra_issue'
+        assert pending[0].level == 2
+
+        # The outcome contract holds even when NO scheduler write succeeds:
+        # BLOCKED, never a propagated exception.
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # The deploy script is never re-run.
+        script_runner.assert_awaited_once()
+
+    async def test_stamp_lands_on_final_attempt_then_done_write_fails_still_escalates(
+        self, tmp_path: Path,
+    ):
+        """Design-edge regression guard (task 2066 amendment): the
+        verified-stamp write and the done-write share ONE writeback budget and
+        `attempt` counter.  If the stamp only lands on the LAST attempt, the
+        done-write gets exactly one remaining try — no dedicated sub-budget.
+        A single failure of that one remaining try must still degrade
+        gracefully to the durable-escalation path (bounded, no propagated
+        exception) rather than looping further or crashing."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        # The verified stamp fails for the first 2 attempts and lands only on
+        # the 3rd/last attempt (writeback_max_attempts=3 below).
+        verified_attempts: list[bool] = []
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            if 'before_done_verified_at' in metadata:
+                result = len(verified_attempts) >= 2
+                verified_attempts.append(result)
+                return result
+            return True
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+
+        # The done-write's only remaining try (on that same last iteration)
+        # fails; the fallback 'blocked' write (issued after budget exhaustion)
+        # stays healthy so this test isolates the shared-budget edge case from
+        # the separate blocked-write-failure scenario covered above.
+        def _set_task_status_side_effect(_task_id, status, **_kwargs):
+            if status == 'done':
+                raise RuntimeError('transient: fused-memory unavailable')
+            return None
+
+        scheduler.set_task_status = AsyncMock(side_effect=_set_task_status_side_effect)
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=3,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        # The stamp landed only on the 3rd/last attempt ...
+        assert verified_attempts == [False, False, True]
+
+        # ... but its single remaining try at the done-write failed, so the
+        # shared budget is exhausted with no attempts left: BLOCKED + durable
+        # escalation, never a propagated exception.
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2066')
+        assert pending, (
+            'Budget exhaustion after a late-landing stamp must still file a '
+            'durable escalation'
+        )
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if len(c.args) > 1 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1, (
+            f'The done-write gets exactly ONE try when the stamp lands on the '
+            f'final attempt (shared budget, no dedicated sub-budget); got '
+            f'{len(done_calls)}'
+        )
+        script_runner.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # Default seam: _default_run_script env merge
