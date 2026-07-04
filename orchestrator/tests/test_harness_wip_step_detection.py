@@ -301,7 +301,7 @@ class TestDetectTipWipCommits:
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt_info.path)
         artifacts.update_base_commit(wt_info.base_commit)
-        workflow.git_ops = None
+        workflow.git_ops = None  # type: ignore[assignment]
 
         result = await workflow._detect_tip_wip_commits()
 

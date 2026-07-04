@@ -273,6 +273,7 @@ class _BriefingLike(Protocol):
     async def build_implementer_prompt(
         self, plan: dict, iteration_log: list, context: str | None = ...,
         rebase_notice: dict | None = ..., task_id: str | None = ...,
+        wip_notice: list[dict] | None = ...,
     ) -> str: ...
     async def build_amender_prompt(
         self, plan: dict, iteration_log: list[dict],
