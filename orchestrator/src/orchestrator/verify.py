@@ -436,8 +436,18 @@ _ENV_TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
         r'^.*unrecognized arguments:.*(?:-n\b|--dist\b|--max-worker-restart\b).*$',
         re.MULTILINE,
     ),
-    # `python -m pip` when pip itself vanished from the venv.
-    re.compile(r'''No module named ['"]?pip['"]?''', re.MULTILINE),
+    # `python -m pip` when pip itself vanished from the venv.  The trailing
+    # negative lookahead (?![\w-]) requires 'pip' to be followed by a
+    # non-word, non-hyphen boundary so a ModuleNotFoundError whose module
+    # name merely STARTS with 'pip' (pipeline, pipx, pipenv, pip_audit,
+    # pip-tools) does not false-positive into env_transient — that would be
+    # the exact inverse misattribution this feature forbids (a genuine
+    # import/code regression silently relabelled environmental, auto-retried,
+    # and archive-denied).  Grounded positives (task 2045's unquoted runpy
+    # line '<executable>: No module named pip' and the quoted 'pip'/"pip"
+    # forms) still match since the boundary follows the closing quote (or
+    # end of line) in each case.
+    re.compile(r'''No module named ['"]?pip['"]?(?![\w-])''', re.MULTILINE),
     # `import xdist` / `import pytest_xdist` when the plugin vanished.
     re.compile(
         r'''ModuleNotFoundError: No module named ['"](xdist|pytest_xdist)['"]''',
