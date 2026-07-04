@@ -126,6 +126,16 @@ _WATCHER_MAX_BACKOFF_SECS: float = 3600.0
 # is non-numeric (task 1907).
 _BG_LOOP_FAILURE_BACKOFF_SECS: float = 60.0
 
+# agent_role values eligible for Source-B re-validation (deterministic-recon-sweep,
+# task 2074): the runner's own sentinel role for deploy infra_issue escalations,
+# plus this sweep's own role so a previously-unconfirmed L1 it filed self-heals
+# once the unit recovers.  Any other role (or category != 'infra_issue') is left
+# untouched — in particular milestone_gate escalations are NEVER auto-resolved.
+_DETERMINISTIC_ESCALATION_SENTINEL_ROLES: frozenset[str] = frozenset({
+    'orchestrator-deterministic',
+    'harness-deterministic-recon-sweep',
+})
+
 # Bound on the thread-off load_config() call inside reload_config() (PRD
 # plans/config-hot-reload-prd.md Open Q3). load_config() runs
 # _discover_module_configs, a filesystem walk that can wedge; this keeps a
@@ -264,6 +274,103 @@ def _is_valid_sha_40(s: object) -> TypeGuard[str]:
         isinstance(s, str)
         and len(s) == 40
         and all(c in '0123456789abcdef' for c in s)
+    )
+
+
+def _deterministic_deploy_health_verdict(inspect_result: dict | None) -> str:
+    """Classify a systemd unit-inspector result as 'healthy' or 'unconfirmed'.
+
+    'healthy' iff MainPID is a positive int AND ActiveState == 'active' — a
+    conservative liveness signal (task 2074 design decision: brittle
+    wall-clock ActiveEnterTimestamp comparison is deliberately avoided; the
+    escalation still routes through the existing watcher/human path for final
+    adjudication).  None-safe: a missing/malformed result is 'unconfirmed'.
+
+    CAVEAT (task 2074 amendment): this is a pure liveness check, NOT a
+    freshness check — it does not confirm that *this* deploy's restart is
+    what made the unit active, only that the unit is up right now.  For a
+    long-lived/always-on service unit (the common case — e.g.
+    'fused-memory.service'), the verdict is near-constant 'healthy'
+    regardless of whether the triggering restart actually took effect,
+    because the unit was probably already active before the deploy ran too.
+    DeterministicRunner's own in-run verify path avoids this ambiguity by
+    comparing a freshly-observed ActiveEnterTimestampMonotonic against a
+    baseline captured immediately before the restart — but that baseline is
+    a local variable, never persisted to task metadata, so it does not exist
+    for a task stranded by a PAST run (this sweep's Source-A recovery case,
+    e.g. task 2059) and a retroactive freshness comparison is not possible
+    without touching deterministic_runner.py to persist one going forward
+    (out of scope for task 2074). Callers (Source A's stranded_blocked/resume
+    filing and Source B's auto-resolve) accept this weaker signal: it is
+    still strictly better than the prior silent-strand status quo, and both
+    paths RE-FILE/resolve an escalation rather than flipping task status
+    directly, so a wrong verdict surfaces via the normal escalation/watcher
+    machinery rather than silently corrupting state.
+    """
+    if not inspect_result:
+        return 'unconfirmed'
+    pid = inspect_result.get('MainPID', 0)
+    if isinstance(pid, int) and pid > 0 and inspect_result.get('ActiveState') == 'active':
+        return 'healthy'
+    return 'unconfirmed'
+
+
+async def _recon_inspect_unit(unit: str) -> dict:
+    """Query systemctl for unit state fields needed for the recon-sweep health verdict.
+
+    Standalone duplicate of ``DeterministicRunner._default_inspect_unit``'s
+    ``systemctl --user show`` pattern — NOT imported from the runner (task 2074
+    does not modify deterministic_runner.py; the runner's inspector is a
+    private bound method requiring an instance).  Returns a dict with at least
+    MainPID (int) and ActiveState (str); MainPID defaults to 0 on parse failure.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        'systemctl', '--user', 'show', unit,
+        '-p', 'MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    result: dict = {}
+    for line in (stdout or b'').decode(errors='replace').splitlines():
+        if '=' in line:
+            key, _, val = line.partition('=')
+            result[key.strip()] = val.strip()
+    for numeric_field in ('MainPID', 'ActiveEnterTimestampMonotonic'):
+        try:
+            result[numeric_field] = int(result.get(numeric_field, 0))
+        except (TypeError, ValueError):
+            result[numeric_field] = 0
+    return result
+
+
+def _is_stranded_deterministic_shape(metadata: dict | None) -> bool:
+    """Return True iff *metadata* matches the task-2059 stranded-deterministic shape.
+
+    Metadata-only predicate (the empty-pending-escalation-queue check is I/O
+    and is performed by the caller).  True iff ALL of:
+      - ``task_kind == 'deterministic'``
+      - ``before_done`` is a dict with a truthy ``target_unit``
+      - ``before_done_ran_at`` is truthy (the deploy action ran)
+      - ``before_done_verified_at``, ``gate_escalated_at``, and
+        ``done_provenance`` are ALL falsy (no terminal outcome was ever recorded)
+
+    None/non-dict *metadata* and a non-dict ``before_done`` are treated as
+    non-matching rather than raising.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get('task_kind') != 'deterministic':
+        return False
+    before_done = metadata.get('before_done')
+    if not isinstance(before_done, dict) or not before_done.get('target_unit'):
+        return False
+    if not metadata.get('before_done_ran_at'):
+        return False
+    return not (
+        metadata.get('before_done_verified_at')
+        or metadata.get('gate_escalated_at')
+        or metadata.get('done_provenance')
     )
 
 
@@ -800,6 +907,17 @@ class Harness:
         # verify when main has not advanced since the previous pass.
         self._last_swept_main_sha: str | None = None
 
+        # Deterministic-strand reconciliation sweep — task 2074.
+        # Periodic recovery sweep for deterministic gate/deploy tasks stranded
+        # BLOCKED by a past occurrence (task 2059) and re-validation of
+        # already-open deterministic-deploy escalations against live systemd
+        # unit state.  See harness.py's deterministic-recon-sweep section.
+        self._deterministic_recon_sweep_task: asyncio.Task | None = None
+        # Injectable unit-inspector seam (mirrors DeterministicRunner's
+        # constructor-injected unit_inspector); None uses the module-level
+        # default _recon_inspect_unit.  Injected in tests to avoid real systemd.
+        self._recon_unit_inspector: Callable[[str], Awaitable[dict]] | None = None
+
         # No-landings circuit-breaker — θ=1893, PRD §5.5.
         # Pure detection logic lives in merge_queue.NoLandingsCircuitBreaker;
         # I/O wiring (disk-stat, halt/resume, escalation file/resolve) lives
@@ -1119,6 +1237,14 @@ class Harness:
             # 1c1e. Start no-landings circuit-breaker (task θ/1893).
             # Halts dispatch when landing-rate==0 AND disk is shrinking.
             self._start_no_landings_breaker()
+
+            # 1c1e1. Start periodic deterministic-strand reconciliation sweep
+            # (task 2074). Recovers deterministic gate/deploy tasks stranded
+            # BLOCKED by a past occurrence (task 2059) and re-validates
+            # already-open deterministic-deploy escalations against live
+            # systemd unit state. Defensive/non-blocking; does not touch
+            # DeterministicRunner's own new-strand hardening (task 2066).
+            self._start_deterministic_recon_sweep()
 
             # 1c1f. Start warm-lane auto-GC cadence loop (task 1926).
             # Periodically invokes _run_warm_lane_gc_reclaim() to bound FREE
@@ -1500,6 +1626,10 @@ class Harness:
                 await self._stop_main_tip_sweep()
             except Exception as e:
                 logger.warning(f'_stop_main_tip_sweep() failed: {e}')
+            try:
+                await self._stop_deterministic_recon_sweep()
+            except Exception as e:
+                logger.warning(f'_stop_deterministic_recon_sweep() failed: {e}')
             try:
                 await self._stop_no_landings_breaker()
             except Exception as e:
@@ -2771,12 +2901,44 @@ Output JSON matching the schema. Every task must appear in the output.
             # the L1 and let resolution drive the status change.  The /unblock
             # blocked-park protection (pending-escalation check above) is also
             # preserved — an open L1 of any category prevents re-filing.
+            #
+            # task_kind == 'deterministic' tasks are excluded here (task 2074
+            # amendment) and delegated exclusively to
+            # _recover_stranded_deterministic_task via the deterministic-recon
+            # sweep.  Rationale: this generic backstop and that sweep write to
+            # the SAME queue and dedup on the SAME get_by_task(tid,
+            # status='pending') check, so whichever fires first wins — and the
+            # escalation-watcher-auto's `stranded_blocked` routing
+            # (skills/escalation-watcher-auto/SKILL.md) auto-resumes ANY
+            # category='stranded_blocked' L1 once its predicate holds,
+            # regardless of the filer's suggested_action or role.  If this
+            # generic reaper won the race for a deterministic-deploy task
+            # whose target unit is actually down, it would file
+            # stranded_blocked/manual_intervention — which still gets
+            # auto-resumed the same as a health-verified 'resume', silently
+            # bypassing the live-systemd-health check that is the entire
+            # point of the task-2074 sweep.  Excluding deterministic tasks
+            # here means only the health-aware sweep ever files their first
+            # escalation, so an unhealthy unit correctly gets
+            # infra_issue/manual_intervention instead.
+            #
+            # The active-workflow guards below (`tid not in
+            # self._escalation_events`, `not self._workflow_cancel_recent`)
+            # are intentionally NOT reimplemented in the deterministic sweep:
+            # task_kind='deterministic' tasks never enter the LLM/workflow
+            # pipeline (no worktree, no branch, no agent — see
+            # DeterministicRunner), so their tid can never appear in
+            # `_escalation_events` or `_workflow_cancel_at`.  Both guards
+            # would be vacuously true for every deterministic task, so
+            # omitting them from the sweep is a no-op simplification, not a
+            # missing safety check.
             if (
                 self.config.stranded_blocked_escalate_enabled
                 and self._escalation_queue is not None
                 and tid not in self._escalation_events       # no active workflow
                 and not self._workflow_cancel_recent(tid)     # not a recent cancel/park
                 and not self._escalation_queue.get_by_task(tid, status='pending')
+                and metadata.get('task_kind') != 'deterministic'
             ):
                 from escalation.models import Escalation
 
@@ -6705,6 +6867,323 @@ Output JSON matching the schema. Every task must appear in the output.
             'Main-tip integrity sweep: filed L1 escalation %s for SHA %s (%s)',
             esc.id, swept_sha[:12], vr.category,
         )
+
+    # ------------------------------------------------------------------
+    # Deterministic-strand reconciliation sweep (task 2074)
+    # ------------------------------------------------------------------
+
+    async def _revalidate_deterministic_deploy_health(self, metadata: dict) -> str:
+        """Re-validate a deterministic deploy's target unit against live systemd state.
+
+        Reads ``metadata['before_done']['target_unit']``; returns 'unconfirmed'
+        WITHOUT invoking the inspector when before_done/target_unit is absent
+        (nothing to inspect).  Otherwise awaits the injected
+        ``self._recon_unit_inspector`` (falling back to the module-level
+        ``_recon_inspect_unit`` default) and classifies the result via
+        ``_deterministic_deploy_health_verdict`` — see that function's
+        docstring for the important CAVEAT: 'healthy' is a liveness signal,
+        not proof that *this* deploy is what brought the unit up, and for an
+        always-on service unit it is near-constant 'healthy'.
+        """
+        before_done = (metadata or {}).get('before_done')
+        target_unit = before_done.get('target_unit') if isinstance(before_done, dict) else None
+        if not target_unit:
+            return 'unconfirmed'
+        inspect_fn = self._recon_unit_inspector or _recon_inspect_unit
+        result = await inspect_fn(target_unit)
+        return _deterministic_deploy_health_verdict(result)
+
+    async def _recover_stranded_deterministic_task(
+        self, tid: str, task: dict, metadata: dict,
+    ) -> None:
+        """Recover a task-2059-shaped stranded deterministic task (Source A).
+
+        Dedup-guarded: skips (logging) when a pending escalation already
+        exists for *tid* — self-dedupes across sweep passes once filed.
+        Re-validates live systemd health for the deploy's target unit and
+        RE-FILES a single L1 escalation — this method NEVER calls
+        ``set_task_status`` (RE-FILE-NEVER-FLIP discipline, mirroring the
+        stranded-blocked-reaper backstop):
+
+          - ``healthy``     -> category='stranded_blocked', suggested_action='resume'.
+            The existing auto-resume watcher resolves this, driving
+            blocked->pending->re-dispatch->DeterministicRunner's resume path
+            (case-(b): "escalation resolved -> resume, no re-run").
+          - ``unconfirmed`` -> category='infra_issue', suggested_action='manual_intervention'.
+            A human must inspect the unit before the task can be resumed.
+        """
+        if self._escalation_queue is None:
+            return
+        if self._escalation_queue.get_by_task(tid, status='pending'):
+            logger.info(
+                'Deterministic-recon-sweep: task %s already has a pending '
+                'escalation — skipping strand recovery (dedup)',
+                tid,
+            )
+            return
+
+        verdict = await self._revalidate_deterministic_deploy_health(metadata)
+        before_done = metadata.get('before_done') or {}
+        target_unit = before_done.get('target_unit', 'unknown')
+
+        if verdict == 'healthy':
+            category = 'stranded_blocked'
+            suggested_action = 'resume'
+            guidance = (
+                f'Live unit {target_unit} is healthy (MainPID>0, ActiveState=active) '
+                f'— the deploy demonstrably succeeded and only the post-deploy '
+                f'writeback failed.  Resolve this L1 (suggested_action=resume) to '
+                f're-pend the task; the existing auto-resume watcher and '
+                f'DeterministicRunner resume path drive it to done with NO re-run.'
+            )
+        else:
+            category = 'infra_issue'
+            suggested_action = 'manual_intervention'
+            guidance = (
+                f'Live unit {target_unit} state could not be confirmed healthy '
+                f'(unit down/failed/unknown) — a human must inspect the unit '
+                f'before this task can be safely resumed or re-triaged.'
+            )
+
+        from escalation.models import Escalation  # noqa: PLC0415
+
+        description = (task or {}).get('description', '')
+        summary = (
+            f'Deterministic strand recovery: task {tid} blocked with '
+            f'before_done_ran_at stamped and no open escalation — target unit '
+            f'{target_unit} is {verdict}.'
+        )[:200]
+        detail = '\n\n'.join(filter(None, [
+            description,
+            f'Target unit: {target_unit}',
+            f'Live health verdict: {verdict}',
+            guidance,
+        ]))
+
+        esc = Escalation(
+            id=self._escalation_queue.make_id(tid),
+            task_id=tid,
+            agent_role='harness-deterministic-recon-sweep',
+            severity='blocking',
+            category=category,
+            summary=summary,
+            detail=detail,
+            suggested_action=suggested_action,
+            level=1,
+        )
+        self._escalation_queue.submit(esc)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=tid,
+                data={
+                    'escalation_id': esc.id,
+                    'category': category,
+                    'severity': 'blocking',
+                    'level': 1,
+                    'reason': 'deterministic-recon-sweep-strand-recovery',
+                },
+            )
+        logger.warning(
+            'Deterministic-recon-sweep: task %s stranded (verdict=%s) — filed '
+            'L1 %s (category=%s, suggested_action=%s, no status change)',
+            tid, verdict, esc.id, category, suggested_action,
+        )
+
+    async def _revalidate_open_deterministic_escalation(
+        self, esc, task: dict, metadata: dict,
+    ) -> None:
+        """Re-validate an OPEN deterministic-deploy ``infra_issue`` escalation (Source B).
+
+        Only touches an escalation that is ALL of:
+          - ``category == 'infra_issue'``
+          - ``agent_role`` in ``_DETERMINISTIC_ESCALATION_SENTINEL_ROLES``
+            (the runner's own sentinel role, or this sweep's own role so a
+            previously-filed 'unconfirmed' L1 can self-heal)
+          - filed against a task matching the stranded-deterministic metadata shape
+
+        ``milestone_gate`` (human-decision) escalations and any non-matching
+        role/category are NEVER touched — checked cheaply before the live
+        unit-inspector call.  When live state now shows 'healthy' —
+        contradicting the escalation's stated "deploy could not be verified"
+        facts — resolves it.  Resolution fires the harness resolve-callback,
+        driving the existing resume -> DeterministicRunner no-re-run path.
+        Unhealthy verdicts are left open (untouched).
+        """
+        if self._escalation_queue is None:
+            return
+        if (
+            esc.category != 'infra_issue'
+            or esc.agent_role not in _DETERMINISTIC_ESCALATION_SENTINEL_ROLES
+        ):
+            return
+        if not _is_stranded_deterministic_shape(metadata):
+            return
+
+        verdict = await self._revalidate_deterministic_deploy_health(metadata)
+        if verdict != 'healthy':
+            return
+
+        before_done = metadata.get('before_done') or {}
+        target_unit = before_done.get('target_unit', 'unknown')
+        resolution = (
+            f'deterministic-recon-sweep: live unit {target_unit} healthy '
+            f'(MainPID>0, ActiveState=active) — deploy verified post-hoc; '
+            f'stated failure is stale.'
+        )
+        self._escalation_queue.resolve(
+            esc.id, resolution, resolved_by='harness-deterministic-recon-sweep',
+        )
+        logger.info(
+            'Deterministic-recon-sweep: re-validated escalation %s for task %s '
+            '— live unit %s healthy, auto-resolved (stale failure)',
+            esc.id, esc.task_id, target_unit,
+        )
+
+    async def _run_deterministic_recon_sweep(self) -> None:
+        """Single testable pass of the deterministic-strand reconciliation sweep.
+
+        Source A: enumerate blocked tasks and recover any absent-escalation
+        strand (task-2059 shape) via ``_recover_stranded_deterministic_task``.
+
+        Source B: enumerate all pending escalations and re-validate any open
+        deterministic-deploy ``infra_issue`` escalation via
+        ``_revalidate_open_deterministic_escalation`` (a no-op for anything
+        that doesn't match).  Reuses Source A's task map as a fast path,
+        falling back to ``scheduler.get_task`` for an escalation whose task
+        wasn't in the blocked set.
+
+        A and B are mutually exclusive per task ACROSS passes by construction
+        (A requires an empty pending queue; B requires an open escalation) —
+        once A files an escalation for a tid, the queue is non-empty so A
+        will not re-fire for it on a later pass; B then owns re-validation
+        and self-heals when the unit recovers.
+
+        WITHIN a single pass, Source B's ``get_pending()`` re-globs the queue
+        directory and so CAN observe an escalation Source A just filed a few
+        lines above (task 2074 amendment — this was previously only true
+        "by accident": an A-filed 'stranded_blocked' escalation isn't
+        'infra_issue' so B's category filter skips it, and an A-filed
+        'infra_issue' one re-verifies to the same 'unconfirmed' verdict
+        within one pass, so re-observing it was a no-op in practice but not
+        by any enforced invariant).  To make the exclusion literally true
+        rather than an implementation-detail coincidence, this method tracks
+        every tid Source A recovered this pass in ``recovered_this_pass`` and
+        the Source-B loop skips any escalation for one of those tids
+        outright — so no task is EVER handled by both sources in the same
+        pass, regardless of category/role filtering or verdict stability.
+
+        Both loops are per-item fail-soft: one bad task/escalation is logged
+        and does not abort the rest of the pass.
+        """
+        if self._escalation_queue is None:
+            return
+
+        tasks = await self.scheduler.get_tasks(statuses=['blocked'])
+        task_by_id: dict[str, dict] = {}
+        recovered_this_pass: set[str] = set()
+        for task in tasks:
+            tid = str(task.get('id', ''))
+            if not tid:
+                continue
+            task_by_id[tid] = task
+            if task.get('status') != 'blocked':
+                continue
+            metadata = task.get('metadata') or {}
+            if not _is_stranded_deterministic_shape(metadata):
+                continue
+            try:
+                if self._escalation_queue.get_by_task(tid, status='pending'):
+                    continue
+                await self._recover_stranded_deterministic_task(tid, task, metadata)
+                recovered_this_pass.add(tid)
+            except Exception as exc:
+                logger.error(
+                    'Deterministic-recon-sweep: Source-A recovery failed for '
+                    'task %s: %s: %s',
+                    tid, type(exc).__name__, exc,
+                )
+
+        for esc in self._escalation_queue.get_pending():
+            if esc.task_id in recovered_this_pass:
+                continue
+            try:
+                task = task_by_id.get(esc.task_id)
+                if task is None:
+                    task = await self.scheduler.get_task(esc.task_id)
+                if task is None:
+                    continue
+                metadata = task.get('metadata') or {}
+                await self._revalidate_open_deterministic_escalation(esc, task, metadata)
+            except Exception as exc:
+                logger.error(
+                    'Deterministic-recon-sweep: Source-B revalidation failed '
+                    'for escalation %s: %s: %s',
+                    esc.id, type(exc).__name__, exc,
+                )
+
+    def _start_deterministic_recon_sweep(self) -> None:
+        """Start the periodic deterministic-strand reconciliation sweep.
+
+        Mirrors _start_main_tip_sweep: a long-lived asyncio.Task wakes every
+        ``deterministic_recon_sweep_interval_secs`` and runs
+        ``_run_deterministic_recon_sweep`` — recovering absent-escalation
+        strands (task 2059 shape) and re-validating open deterministic-deploy
+        escalations against live systemd unit state.
+        """
+        if not self.config.deterministic_recon_sweep_enabled:
+            return
+        if (
+            self._deterministic_recon_sweep_task is not None
+            and not self._deterministic_recon_sweep_task.done()
+        ):
+            return
+        self._deterministic_recon_sweep_task = asyncio.create_task(
+            self._deterministic_recon_sweep_loop(),
+            name='deterministic-recon-sweep',
+        )
+        logger.info(
+            'Deterministic-strand reconciliation sweep started (interval=%.0fs)',
+            self.config.deterministic_recon_sweep_interval_secs,
+        )
+
+    async def _stop_deterministic_recon_sweep(self) -> None:
+        """Cancel the deterministic-strand reconciliation sweep loop."""
+        if self._deterministic_recon_sweep_task is not None:
+            self._deterministic_recon_sweep_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._deterministic_recon_sweep_task
+            self._deterministic_recon_sweep_task = None
+            logger.info('Deterministic-strand reconciliation sweep stopped')
+
+    async def _deterministic_recon_sweep_loop(self) -> None:
+        """Wake periodically and run the deterministic-recon-sweep pass.
+
+        Failure handling mirrors _main_tip_sweep_loop (task 1907): a failed
+        pass is logged as a one-line summary (exc type + message) — NOT via
+        ``logger.exception`` — and every iteration sleeps at least
+        ``_BG_LOOP_FAILURE_BACKOFF_SECS`` on the failure path so a pass that
+        fails immediately can never tight-spin and starve the event loop.
+        """
+        interval = self.config.deterministic_recon_sweep_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._run_deterministic_recon_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Bounded, traceback-free summary — see docstring.
+                logger.error(
+                    'Deterministic-strand reconciliation sweep pass failed: %s: %s',
+                    type(exc).__name__,
+                    exc,
+                )
+                # Backoff guarantee: a fixed, always-numeric quiescent gap so
+                # the loop cannot spin even if the failure surfaced before the
+                # loop's own ``asyncio.sleep``. CancelledError propagates out
+                # of this sleep to stop the loop.
+                await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
