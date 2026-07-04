@@ -441,7 +441,11 @@ class GraphitiBackend:
                 ),
                 timeout=self._read_timeout,
             )
-            episodes = sorted(episodes or [], key=lambda ep: ep.created_at, reverse=True)
+            episodes = sorted(
+                episodes or [],
+                key=lambda ep: getattr(ep, 'created_at', None) or datetime.min.replace(tzinfo=UTC),
+                reverse=True,
+            )
             return episodes[:last_n]
         except TimeoutError:
             logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
