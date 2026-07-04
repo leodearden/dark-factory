@@ -549,6 +549,64 @@ class TestReconReportReaper:
         evicted = state.tick()
         assert evicted == 2
 
+    def test_partial_eviction_preserves_sig_dedup_for_live_run(self):
+        """A completed Stage-1 entry evicted by tick() must not release the
+        run-level signature dedup key while a sibling stage of the same run
+        is still live (task-2088 / run 33c324b0 double-filing regression).
+
+        Reconciliation runs are multi-stage and long-lived: Stage 1
+        (memory_consolidator) typically files a finding and completes early,
+        while Stage 2/3 + remediation keep the run live for minutes. If the
+        reaper evicts the completed Stage-1 entry once it ages past TTL, the
+        run-level dedup key must survive as long as the run itself is still
+        live — otherwise a later stage re-filing the same (task_id, flag_type)
+        allocates a second finding row instead of getting duplicate_finding.
+        """
+        state, t = self._make_state(ttl=300)
+
+        # Stage 1: file the canonical finding and complete.
+        state.start_report('r1', 'memory_consolidator', 'dark_factory')
+        first = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='cycle summary prune rerun needed',
+            suggested_action='rerun cycle summary prune',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert 'finding_id' in first, f'Stage 1 add_finding failed: {first}'
+        finding_id_a = first['finding_id']
+        state.complete('r1', 'stage 1 done')
+
+        # Stage 2 starts — keeps the run LIVE (this entry never completes).
+        state.start_report('r1', 'task_knowledge_sync', 'dark_factory')
+
+        # Advance past TTL and evict — only Stage 1 (completed) is eligible.
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+        assert state.get_assembled_report('r1', 'memory_consolidator') is None
+
+        # Stage 2 re-files the SAME signature — must be deduped against A,
+        # not allocate a fresh finding_id.
+        second = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='different description, same signature',
+            suggested_action='rerun cycle summary prune',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert second.get('error') == 'duplicate_finding', (
+            f'Expected duplicate_finding but got: {second}'
+        )
+        assert second['error_type'] == 'ReconReportDuplicateFinding'
+        assert second['existing_finding_id'] == finding_id_a
+
 
 # ---------------------------------------------------------------------------
 # step-15: FastMCP server factory — RED until step-16
