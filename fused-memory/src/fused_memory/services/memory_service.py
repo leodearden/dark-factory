@@ -2134,6 +2134,7 @@ class MemoryService:
             targets: list[dict] = []
             all_edges: dict[str, list] = {}
             total_entities: int = 0
+            not_found_details: list[dict] = []
 
             if entity_uuids is not None and len(entity_uuids) > 0:
                 requested = list(dict.fromkeys(entity_uuids))  # dedupe, preserve order
@@ -2143,6 +2144,11 @@ class MemoryService:
                     {'uuid': u, 'name': by_uuid[u]['name'], 'old_summary': by_uuid[u]['summary']}
                     for u in requested
                     if u in by_uuid
+                ]
+                not_found_details = [
+                    {'uuid': u, 'name': None, 'status': 'not_found'}
+                    for u in requested
+                    if u not in by_uuid
                 ]
                 total_entities = len(targets)
                 if not dry_run:
@@ -2245,6 +2251,11 @@ class MemoryService:
                             'new_summary': r.get('new_summary', ''),
                             'edge_count': r.get('edge_count', 0),
                         })
+
+            # Requested UUIDs absent from the graph are reported alongside the
+            # rebuilt/skipped/error details in both dry_run and write modes,
+            # without affecting rebuilt/skipped/errors counts.
+            details.extend(not_found_details)
 
             logger.info(
                 'rebuild_entity_summaries: group=%s total=%d stale=%d rebuilt=%d '
