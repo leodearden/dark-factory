@@ -21,7 +21,7 @@ import shutil
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterator
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -4685,6 +4685,41 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         tip = self._newest_frozen_commit()
         return tip if tip is not None else main_sha
 
+    def _frozen_base_chain(self, main_sha: str) -> Iterator[tuple[str, str, str]]:
+        """Walk the frozen prefix's expected-base chain, yielding (rid, expected, actual).
+
+        Shared chain-walk consumed by BOTH :meth:`check_frozen_prefix_invariant`
+        and :meth:`_verify_base_frozen_tip_violations` — the two checks compare
+        the exact same per-entry chained expected base (head expected =
+        main_sha; each subsequent entry's expected = predecessor's
+        merge_commit) and differ only in how they word a mismatch as a
+        violation string. Factored here so that chain-walk is defined exactly
+        once: if base-chain semantics ever change (e.g. how passthrough /
+        conflict entries advance the chain), both surfaces pick up the fix
+        together instead of silently drifting out of sync.
+
+        Entries with no merge_result/merge_commit (passthrough / conflict)
+        are skipped and do NOT advance the chain — mirrors the dispatch
+        guard's own ``item.merge_result is None or not item.base_sha``
+        exclusion.
+
+        Pure/synchronous (no await); never raises on well-formed
+        InflightEntry data.
+        """
+        expected_base = main_sha.strip()
+        for entry in self._frozen_inflight_entries():
+            rid = entry.item.request.request_id
+            mr = entry.item.merge_result
+            if mr is None or not mr.merge_commit:
+                # No merge_commit — nothing to chain; do not advance.
+                continue
+            actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
+            yield rid, expected_base, actual_base
+            # Advance expected_base for the next entry regardless of whether
+            # this one matched, so subsequent chain errors are also surfaced
+            # (not shadowed).
+            expected_base = mr.merge_commit.strip()
+
     def check_frozen_prefix_invariant(self, main_sha: str) -> list[str]:
         """Return §5.3 violations as human-readable strings (empty = healthy) (ε=1890).
 
@@ -4702,29 +4737,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              frozen_prefix() and unfrozen_suffix() is a structural bug; record
              one violation per duplicate.
 
+        The chain walk itself lives in :meth:`_frozen_base_chain` (shared with
+        :meth:`_verify_base_frozen_tip_violations`); this method only compares
+        expected vs. actual and formats its own violation wording.
+
         Pure/synchronous — reads stored in-memory state, no await.
         """
         violations: list[str] = []
-        frozen_entries = self._frozen_inflight_entries()
 
         # ── 1. Base-chain integrity ───────────────────────────────────────────
-        expected_base = main_sha.strip()
-        for entry in frozen_entries:
-            rid = entry.item.request.request_id
-            mr = entry.item.merge_result
-            if mr is None or not mr.merge_commit:
-                # No merge_commit — nothing to chain; advance expected_base
-                # only if there IS a commit to chain to (skip for passthroughs).
-                continue
-            actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
+        for rid, expected_base, actual_base in self._frozen_base_chain(main_sha):
             if actual_base != expected_base:
                 violations.append(
                     f'frozen-prefix base-chain broken at {rid}: '
                     f'expected base {expected_base!r} but item has {actual_base!r}'
                 )
-            # Advance expected_base for the next entry regardless of violation,
-            # so subsequent chain errors are also surfaced (not shadowed).
-            expected_base = mr.merge_commit.strip()
 
         # ── 2. Frozen/suffix disjointness ────────────────────────────────────
         frozen_set = set(self.frozen_prefix())
@@ -4838,39 +4865,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         recorded ``base_sha`` must equal the frozen-tip base it was dispatched
         against — the head entry's expected base is *main_sha*, and each
         subsequent entry's expected base is its predecessor's ``merge_commit``.
-        Mirrors :meth:`check_frozen_prefix_invariant`'s base-chain loop
-        exactly (per-entry chained expected base, NOT a naive "every entry ==
-        newest tip" comparison, which would falsely flag a healthy
-        multi-entry frozen prefix whose head is based on main rather than the
-        stack's tip) — the two checks overlap mathematically but are kept as
+
+        Walks the exact same chain as :meth:`check_frozen_prefix_invariant`,
+        via the shared :meth:`_frozen_base_chain` generator (per-entry
+        chained expected base, NOT a naive "every entry == newest tip"
+        comparison, which would falsely flag a healthy multi-entry frozen
+        prefix whose head is based on main rather than the stack's tip) —
+        the two checks overlap mathematically but are kept as
         distinctly-worded, separately-named surfaces: this one parallels the
         retained ε=1890 dispatch-time WARN and gives it a dedicated
         verify-frontier assertion target in the snapshot health surface.
-
-        Entries with no merge_result/merge_commit (passthrough/conflict) are
-        skipped and do NOT advance the expected-base chain — mirrors both
-        :meth:`check_frozen_prefix_invariant` and the dispatch guard's own
-        ``item.merge_result is None or not item.base_sha`` exclusion.
+        Because both surfaces now build from the same generator, a future
+        change to the chain-walk itself (e.g. how passthrough entries
+        advance the chain) cannot make the two surfaces silently disagree.
 
         Pure/synchronous (no await). Fail-safe: never raises — callers
         (:meth:`two_layer_invariants`) wrap this in their own try/except, but
         the loop body itself cannot raise on well-formed InflightEntry data.
         """
         violations: list[str] = []
-        expected_base = main_sha.strip()
-        for entry in self._frozen_inflight_entries():
-            rid = entry.item.request.request_id
-            mr = entry.item.merge_result
-            if mr is None or not mr.merge_commit:
-                continue  # passthrough / conflict — nothing to chain
-            actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
+        for rid, expected_base, actual_base in self._frozen_base_chain(main_sha):
             if actual_base != expected_base:
                 violations.append(
                     f'verify-base⊄frozen-tip at {rid!r}: dispatched for real-verify '
                     f'with base {actual_base!r} but expected frozen-tip base '
                     f'{expected_base!r} (ε=1890 §5.3 verify-base/frozen-tip rule)'
                 )
-            expected_base = mr.merge_commit.strip()
         return violations
 
     # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
