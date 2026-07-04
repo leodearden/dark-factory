@@ -4879,6 +4879,10 @@ Output JSON matching the schema. Every task must appear in the output.
 
         original_id = assignment.task_id
 
+        # Find prior redo siblings up-front — BEFORE submitting the new
+        # redo, so the not-yet-created replacement is never in this set.
+        prior_redo_ids = await self._find_prior_auto_eval_redos(original_id)
+
         # Rename the original branch + worktree so the new task can use a
         # fresh task/<original_id>-redo branch (sibling task gets its own
         # branch from create_worktree on dispatch).
@@ -4971,6 +4975,28 @@ Output JSON matching the schema. Every task must appear in the output.
                 original_id, exc, new_task_id,
             )
 
+        # Supersede prior redo siblings now that the replacement redo is
+        # confirmed created — at most one live redo per spawned_from should
+        # survive. Best-effort per-sibling: a single cancellation failure
+        # must not abort the loop or affect the primary redo dispatch.
+        for stale_id in prior_redo_ids:
+            try:
+                await self.scheduler.dispatch_tool(
+                    'set_task_status',
+                    {
+                        'project_root': str(self.config.project_root),
+                        'id': stale_id,
+                        'status': 'cancelled',
+                    },
+                    timeout=15,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'Task %s: auto-eval supersede cancel of prior redo '
+                    '%s failed (%s) — continuing',
+                    original_id, stale_id, exc,
+                )
+
         # Cross-reference the new id back onto the original task.
         try:
             await self.scheduler.update_task(
@@ -4999,13 +5025,15 @@ Output JSON matching the schema. Every task must appear in the output.
                     'block_phase': report.block_phase,
                     'rename_succeeded': renamed,
                     'budget_used_24h': used,
+                    'superseded_redo_ids': list(prior_redo_ids),
                 },
             )
 
         logger.info(
             'Task %s: auto-eval dispatched redo task %s '
-            '(rename=%s, budget_used=$%.2f)',
+            '(rename=%s, budget_used=$%.2f, superseded=%d %s)',
             original_id, new_task_id, renamed, used,
+            len(prior_redo_ids), prior_redo_ids,
         )
 
     async def _trailing_24h_fetch_one(
