@@ -4589,10 +4589,16 @@ class TaskWorkflow:
                 for s in self.plan.get(col, [])
                 if isinstance(s, dict) and s.get('status') == 'done' and s.get('commit')
             }
+            # Prefix-match rather than exact-match: the prompt shows an
+            # abbreviated 12-char SHA (see build_implementer_prompt's
+            # wip_section), so an implementer may call mark_step_done with
+            # that short form instead of the full SHA from git log. Exact
+            # equality would then never dedup, re-surfacing the same
+            # already-attributed commit on every subsequent iteration.
             return [
                 {'sha': sha, 'subject': subject}
                 for sha, subject in run
-                if sha not in recorded
+                if not any(sha.startswith(r) or r.startswith(sha) for r in recorded)
             ]
         except Exception:
             return []
