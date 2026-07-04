@@ -310,7 +310,9 @@ class TestMainHealthAutoHealRegistry:
         assert MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS == 1
 
     def test_merge_worker_exposes_registry(self) -> None:
-        from orchestrator.merge_queue import MainHealthAutoHealRegistry, MergeWorker
+        from _serial_merge_worker import MergeWorker
+
+        from orchestrator.merge_queue import MainHealthAutoHealRegistry
         git_ops = _make_mock_git_ops()
         worker = MergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         assert isinstance(worker.auto_heal_registry, MainHealthAutoHealRegistry)

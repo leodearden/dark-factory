@@ -535,9 +535,10 @@ _HALT_ADVANCE_RESULTS: tuple[str, ...] = (
 )
 """``advance_main`` result codes that can trigger a WIP halt.
 
-Shared between :class:`MergeWorker` and :class:`SpeculativeMergeWorker` to
-avoid silent divergence: if the set of halt-triggering results ever changes,
-updating this single constant propagates to both workers automatically."""
+Shared between :class:`SpeculativeMergeWorker` and the retired serial
+worker's test-local reference (see :class:`_TrainMergeHost`) to avoid
+silent divergence: if the set of halt-triggering results ever changes,
+updating this single constant propagates to both automatically."""
 
 
 _ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
@@ -754,20 +755,23 @@ async def _run_post_merge_verify(
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
-    Shared by :class:`MergeWorker` and :class:`SpeculativeMergeWorker`.
+    Shared by :class:`SpeculativeMergeWorker` and the retired serial worker's
+    test-local reference (see :class:`_TrainMergeHost`).
 
     Returns ``None`` when verification passes; returns a ``MergeOutcome``
     (and cleans up *merge_wt*) when it fails via a controlled path (disk
     guard, verify-not-passed).  Does **not** contain a ``try/except`` — any
     exception from ``run_scoped_verification`` propagates to the caller.
-    ``MergeWorker`` calls this bare (exceptions reach ``_process``);
-    ``SpeculativeMergeWorker`` wraps the call in its existing ``try/except``
-    that maps a raised verify to a ``'Verification error: ...'`` outcome.
+    The test-local ``MergeWorker`` reference calls this bare (exceptions
+    reach ``_process``); ``SpeculativeMergeWorker`` wraps the call in its
+    existing ``try/except`` that maps a raised verify to a
+    ``'Verification error: ...'`` outcome.
 
     Args:
         on_result: Optional callback invoked with the final :class:`~orchestrator.verify.VerifyResult`
             BEFORE the pass/fail branch — additive, default ``None`` keeps
-            :class:`MergeWorker` call sites byte-identical.  Used by
+            the test-local ``MergeWorker`` reference's call sites
+            byte-identical.  Used by
             :class:`SpeculativeMergeWorker` to capture warm per-test results
             for PRD §10 invariant 6(b) shadow compare.
         keep_worktrees: Additional worktrees to protect during any disk-pressure
@@ -817,9 +821,10 @@ async def _run_post_merge_verify(
 
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β (all legacy
-    # callers: MergeWorker._do_merge, _reverify_rebased_tree, reverify_member_solo,
-    # _do_train_merge, _run_cold_shadow_verify — recovery/train paths stay on the
-    # trust anchor and out of slot accounting).
+    # callers: the test-local MergeWorker reference's _do_merge,
+    # _reverify_rebased_tree, reverify_member_solo, _do_train_merge,
+    # _run_cold_shadow_verify — recovery/train paths stay on the trust anchor
+    # and out of slot accounting).
     # runner=<RemoteRunner> → pool=[runner] (no LocalRunner); warm-swap is skipped
     # (per-host persistent worktree — handled by γ's _run_inflight_verify caller).
     # The `quarantine` parameter is reserved/unused here; it remains in the signature
@@ -889,7 +894,8 @@ async def _run_post_merge_verify(
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
     # warm per-test results are always the last-observed verify for this commit.
-    # Default None keeps MergeWorker call sites byte-identical.
+    # Default None keeps the test-local MergeWorker reference's call sites
+    # byte-identical.
     if on_result is not None:
         on_result(verify)
 
@@ -1548,7 +1554,8 @@ def _emit_merge_queued(
     """Emit a merge_queued event.  No-op when *event_store* is None.
 
     Centralises the emit payload so both :func:`enqueue_merge_request` and
-    the ``MergeWorker`` CAS-retry path use an identical record shape.  If
+    the test-local ``MergeWorker`` reference's CAS-retry path use an
+    identical record shape.  If
     *reason* is provided (e.g. ``'cas_retry'``) it is stored in ``data``.
 
     *queue_depth* (when provided) records how deep the main queue was at the
@@ -1686,7 +1693,8 @@ async def _maybe_auto_chain_generation(
     # generation.  This is a SECOND, independent add_done_callback alongside
     # the retention _on_finalized registered by enqueue_merge_request — both
     # coexist on gen_next.result.  The callback fires regardless of which
-    # worker (MergeWorker or SpeculativeMergeWorker) finalizes gen_next.
+    # worker (the test-local MergeWorker reference or SpeculativeMergeWorker)
+    # finalizes gen_next.
     _branch = req.branch  # close over the branch name
     def _cleanup_chain_counter(fut: asyncio.Future) -> None:  # noqa: ANN001
         try:
@@ -2205,14 +2213,24 @@ _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'}
 class _TrainMergeHost(Protocol):
     """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
 
-    Both :class:`MergeWorker` and :class:`SpeculativeMergeWorker` inherit
-    :class:`_WipHaltMixin` and define every attribute / constant listed here;
-    the Protocol lets ``_do_train_merge`` accept either worker type without
-    creating a coupling to the concrete class hierarchy.
+    The sole PRODUCTION implementer is :class:`SpeculativeMergeWorker`, which
+    inherits :class:`_WipHaltMixin` and defines every attribute / constant
+    listed here.  The legacy serial worker once named ``MergeWorker`` is
+    retired from production (MQ-refactor task nu, R7b); its readable-reference
+    role now lives as a frozen test-local fixture
+    (``orchestrator/tests/_serial_merge_worker.py``), which also satisfies this
+    Protocol — kept structural (rather than inlined to ``SpeculativeMergeWorker``)
+    so ``_do_train_merge`` stays reusable by that fixture without a
+    production-side dependency on test code.
+
+    This is the CANONICAL note on the retired serial worker's test-local
+    reference; other docstrings/comments in this module that mention it
+    point back here instead of repeating the file path, so there is a single
+    place to update if the fixture is ever moved or renamed.
 
     The surface is intentionally narrow — only the state that the shared
     train-merge pipeline actually touches.  Adding new attributes here does
-    NOT require touching ``_WipHaltMixin``; both concrete workers already
+    NOT require touching ``_WipHaltMixin``; both implementers already
     define them in their own ``__init__``.
     """
 
@@ -2341,7 +2359,7 @@ async def reverify_member_solo(
 
 
 async def classify_and_merge(
-    worker: MergeWorker | SpeculativeMergeWorker,
+    worker: _TrainMergeHost,
     req: MergeRequest,
     base_sha: str,
     *,
@@ -2350,7 +2368,8 @@ async def classify_and_merge(
 ) -> MergedOk | Decided:
     """Shared pre-merge guard + merge + drop-guard pipeline (MQ-refactor kappa).
 
-    Covers the EQUIVALENCE-MATRIX CORE common to ``MergeWorker._do_merge``,
+    Covers the EQUIVALENCE-MATRIX CORE common to the retired serial worker's
+    test-local reference (``_do_merge``; see :class:`_TrainMergeHost`),
     ``SpeculativeMergeWorker._merger_loop``, and
     ``SpeculativeMergeWorker._remerge``: branch-presence guard →
     already-merged detection → merge → conflict / non-conflict-failure →
@@ -2367,9 +2386,10 @@ async def classify_and_merge(
     * Worker CAPABILITY — ``isinstance(worker, SpeculativeMergeWorker)`` —
       gates the drift-bookkeeping (``_note_conflict_detected``) and the rich
       failure diagnostic (``_build_merge_failure_diagnostic`` +
-      ``_render_failure_diagnostic``).  ``MergeWorker`` has neither, so
-      routing ``_do_merge`` through this function reproduces its plain
-      ``MergeOutcome('blocked', reason=details)`` byte-identically.
+      ``_render_failure_diagnostic``).  The test-local ``MergeWorker``
+      reference has neither, so routing ``_do_merge`` through this function
+      reproduces its plain ``MergeOutcome('blocked', reason=details)``
+      byte-identically.
 
     ``req.snapshot_tip`` (an orthogonal per-request field, not a parameter of
     this function) is honored uniformly for already-merged detection
@@ -2441,8 +2461,8 @@ async def classify_and_merge(
 
     # 3. Merge (speculative or normal).  speculative=True is only ever passed
     # for a SpeculativeMergeWorker caller; the isinstance check is a static-
-    # typing narrowing (MergeWorker has no _emit_speculative), not a
-    # behavioural gate.
+    # typing narrowing (the test-local MergeWorker reference has no
+    # _emit_speculative), not a behavioural gate.
     if speculative and isinstance(worker, SpeculativeMergeWorker):
         worker._emit_speculative(
             EventType.speculative_merge, req.task_id, base_sha=base_sha,
@@ -2552,10 +2572,13 @@ async def _do_train_merge(
     worker: _TrainMergeHost,
     req: GroupMergeRequest,
 ) -> MergeOutcome:
-    """Atomic train-merge pipeline shared by MergeWorker and SpeculativeMergeWorker.
+    """Atomic train-merge pipeline shared by SpeculativeMergeWorker and the
+    retired serial worker's test-local reference (see :class:`_TrainMergeHost`,
+    the ``worker`` parameter's type above).
 
     BEHAVIOUR-ADDING (task 1596): trains now inherit the full shared post-merge
-    core at PARITY with MergeWorker._do_merge — specifically:
+    core at PARITY with the test-local MergeWorker reference's ``_do_merge`` —
+    specifically:
       • disk-guard pre-verify short-circuit (_run_post_merge_verify)
       • verify-timeout loop-breaker (worker._post_merge_verify_timeouts)
       • post-merge content-equivalence gate (_finalize_advanced_merge)
@@ -2565,13 +2588,15 @@ async def _do_train_merge(
         (_map_advance_failure via worker.halt_for_wip)
 
     DEFENSIBLE DELTAS — behaviours intentionally absent from the train path
-    despite being present in MergeWorker or SpeculativeMergeWorker:
+    despite being present in the test-local MergeWorker reference or
+    SpeculativeMergeWorker:
 
     1. No ``reverify_on_rebase``: the 1595 disjoint-delta gate lives ONLY in
-       SpeculativeMergeWorker._verify_and_advance's CAS loop.  MergeWorker (the
-       readable serial reference) also does NOT pass it.  "Parity" means parity
-       with MergeWorker, not the spec-worker CAS loop.  Adding the gate here
-       would duplicate speculative-worker logic that has no business in the train.
+       SpeculativeMergeWorker._verify_and_advance's CAS loop.  The test-local
+       MergeWorker reference (the readable serial reference) also does NOT
+       pass it.  "Parity" means parity with that reference, not the
+       spec-worker CAS loop.  Adding the gate here would duplicate
+       speculative-worker logic that has no business in the train.
 
     2. Pyright redundant-but-harmless: the train always rebases its tip onto
        main before merging, so the type surface is fresh.  The post-merge
@@ -2684,8 +2709,9 @@ async def _do_train_merge(
 
     # Loop-breaker: if this train's tip has timed out in post-merge verify
     # MAX_POST_MERGE_VERIFY_TIMEOUTS times in a row, abandon without any git
-    # work — mirrors MergeWorker._do_merge:2286-2298.  A stuck verify
-    # can otherwise burn merge-queue capacity for 30+ minutes per attempt.
+    # work — mirrors the test-local MergeWorker reference's ``_do_merge``.  A
+    # stuck verify can otherwise burn merge-queue capacity for 30+ minutes
+    # per attempt.
     prior_timeouts = worker._post_merge_verify_timeouts.get(req.task_id, 0)
     if prior_timeouts >= worker.MAX_POST_MERGE_VERIFY_TIMEOUTS:
         logger.warning(
@@ -2896,9 +2922,10 @@ async def _do_train_merge(
     # for the whole train attempt, not just the post-advance window.
     #
     # PRD D9: trains are bit-identical, multi-waiter merges — γ2 auto-chaining
-    # applies ONLY to single-branch MergeRequest paths (MergeWorker /
-    # SpeculativeMergeWorker).  chain_ctx=None is passed explicitly here so the
-    # invariant is visible at the call site and not left implicit.
+    # applies ONLY to single-branch MergeRequest paths (the test-local
+    # MergeWorker reference / SpeculativeMergeWorker).  chain_ctx=None is
+    # passed explicitly here so the invariant is visible at the call site and
+    # not left implicit.
     outcome = await _finalize_advanced_merge(
         git_ops, req, event_store,
         merge_commit_fallback=merge_commit,
@@ -2981,9 +3008,10 @@ async def _do_train_merge(
 class _WipHaltMixin:
     """Shared WIP-halt machinery and request-abandoned helper.
 
-    Provides the halt-owner methods that both :class:`MergeWorker` and
-    :class:`SpeculativeMergeWorker` expose as public API to ``workflow.py``
-    and ``harness.py``.
+    Provides the halt-owner methods that :class:`SpeculativeMergeWorker` (the
+    sole production implementer) exposes as public API to ``workflow.py`` and
+    ``harness.py``.  The retired serial worker's test-local reference (see
+    :class:`_TrainMergeHost`) also subclasses this mixin.
 
     Per-lane halt state: each lane in MERGE_LANES has an independent
     asyncio.Event (set = not halted; cleared = halted) and an optional owner
@@ -3071,8 +3099,9 @@ class _WipHaltMixin:
     def _signal_resume(self) -> None:
         """Set the resume signal if the concrete worker has one (SpeculativeMergeWorker).
 
-        The mixin is shared with MergeWorker which has no _resume_signal; the
-        hasattr guard makes the call a no-op on MergeWorker.
+        The mixin is also shared with the retired serial worker's test-local
+        reference, which has no _resume_signal; the hasattr guard makes the
+        call a no-op there.
         """
         sig = getattr(self, '_resume_signal', None)
         if sig is not None:
@@ -3238,332 +3267,6 @@ class _WipHaltMixin:
             )
             return True
         return False
-
-
-class MergeWorker(_WipHaltMixin):
-    """Single coroutine that processes merge requests serially.
-
-    Owns all main-branch advancement via CAS ``update-ref``.  The harness
-    creates one instance and passes the same ``asyncio.Queue`` to every
-    ``TaskWorkflow``.
-
-    .. note:: Legacy path.
-        This class inherits the per-lane halt *state machine* from
-        ``_WipHaltMixin`` and honours ``halt_for_wip`` / ``unhalt_wip``
-        (all-lanes) correctly.  However its ``_dequeue`` picks from the
-        FIFO queue without consulting ``req.lane``, so it does **not**
-        implement lane-priority ordering.  Use
-        :class:`SpeculativeMergeWorker` (the production worker) when lane
-        priority matters.
-    """
-
-    MAX_CAS_RETRIES = 5
-    # After this many consecutive post-merge verify TIMEOUTS for the same
-    # task, the merge queue stops trying and returns an 'abandoned' blocked
-    # outcome.  Caps the verify-timeout / re-enqueue oscillation (two tasks
-    # alternating on the merge queue for hours, each dying at the 30-min
-    # warm timeout).  Counter resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_TIMEOUTS: int = 2
-    # After a post-merge verify fails with an ENOSPC signature, prune stale
-    # _merge-* worktrees and retry the verify at most this many times before
-    # escalating as transient infra.  Disk pressure is often self-healing, so
-    # one retry-after-prune is the conservative middle ground between blindly
-    # blocking and looping.  Resets on any successful merge for that task.
-    MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
-
-    def __init__(
-        self,
-        git_ops: GitOps,
-        queue: asyncio.Queue[MergeRequest],
-        event_store: EventStore | None = None,
-    ):
-        self._git_ops = git_ops
-        self._queue = queue
-        self._event_store = event_store
-        # Front-of-queue buffer for CAS-failure re-enqueue (processed first)
-        self._urgent: collections.deque[MergeRequest] = collections.deque()
-        self._running = True
-        # Per-task CAS re-enqueue counter — prevents infinite loops
-        self._cas_retries: dict[str, int] = {}
-        # Per-task consecutive post-merge-verify-timeout counter.  Bumped
-        # when a verify times out, cleared on a successful merge.  Keyed by
-        # task_id; lives across submissions (re-submits of the same task
-        # after an orchestrator re-queue also feed this counter).
-        self._post_merge_verify_timeouts: dict[str, int] = {}
-        # Per-task ENOSPC prune-and-retry counter (see
-        # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Same lifetime semantics as
-        # the timeout counter: persists across submissions, reset on success.
-        self._post_merge_verify_enospc_retries: dict[str, int] = {}
-        # γ2 per-branch generation auto-chain counter.  Incremented on each
-        # consecutive tip-advance equivalence failure; popped on a clean 'done'
-        # landing or bound-exceeded escalation.  Mirrors _cas_retries shape.
-        self._generation_chain_counts: dict[str, int] = {}
-        # Persistent warm merge-verify worktree: counts verifying attempts so
-        # _safety_valve_due can fire the periodic cold-verify (PRD §10 invariant 6).
-        # Only incremented when not skip_verify; never reset so the counter
-        # covers the full worker lifetime (cross-submission).
-        self._verify_attempt_count: int = 0
-        # Per-lane halt: each event is set (running) by default
-        self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
-        for ln in MERGE_LANES:
-            self._lane_halt[ln].set()
-        self._lane_halt_owner: dict[str, str | None] = {ln: None for ln in MERGE_LANES}
-        # Operator-halt signal (see _WipHaltMixin.operator_halt). Initially
-        # clear = no operator halt. MergeWorker has no verifier abort-poll loop,
-        # so this is for API parity (operator_halt/unhalt_all_lanes reference it).
-        self._operator_halt = asyncio.Event()
-        # Cross-workflow auto-heal attempt counter (shared via self.merge_worker
-        # on TaskWorkflow instances).  Lives on the worker so the counter persists
-        # across the heal→re-break cycle without any harness.py change.
-        self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    async def run(self) -> None:
-        """Main loop — runs until ``stop()`` is called."""
-        while self._running:
-            await self._wait_until_any_lane_runnable()  # blocks if all lanes halted
-            req = await self._dequeue()
-            if req is None:
-                break  # shutdown sentinel
-
-            if self._event_store is not None:
-                self._event_store.emit(
-                    EventType.merge_dequeued,
-                    task_id=req.task_id,
-                    phase='merge',
-                    data={'branch': req.branch, 'queue_depth': self._queue.qsize()},
-                )
-
-            outcome = await self._process(req)
-            # outcome is None when the request was re-enqueued (CAS failure)
-            if outcome is not None and not req.result.done():
-                req.result.set_result(outcome)
-
-    async def stop(self) -> None:
-        """Graceful shutdown: drain queues and resolve all pending Futures."""
-        self._running = False
-        shutdown = MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
-
-        # Drain urgent buffer
-        while self._urgent:
-            req = self._urgent.popleft()
-            if not req.result.done():
-                req.result.set_result(shutdown)
-
-        # Drain main queue
-        while not self._queue.empty():
-            try:
-                req = self._queue.get_nowait()
-                if not req.result.done():
-                    req.result.set_result(shutdown)
-            except asyncio.QueueEmpty:
-                break
-
-        # Unblock the run() loop if it's waiting on an empty queue
-        await self._queue.put(None)  # type: ignore[arg-type]
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
-    async def _dequeue(self) -> MergeRequest | None:
-        """Get the next request — urgent buffer first, then main queue."""
-        if self._urgent:
-            return self._urgent.popleft()
-
-        item = await self._queue.get()
-        if item is None:
-            return None  # shutdown sentinel
-        return item
-
-    async def _process(self, req: MergeRequest) -> MergeOutcome | None:
-        """Process one merge request.  Returns None if re-enqueued."""
-        # Drop-on-detection: if the workflow that submitted this request has
-        # cancelled its result future (workflow soft-cancel), don't even
-        # start the merge.  Skipping here avoids the orphan-halt window
-        # entirely for the common case (workflow exited before dequeue).
-        if self._request_abandoned(req):
-            return None
-        try:
-            return await self._do_merge(req)
-        except WorktreeMissing as exc:
-            # Worktree removed out-of-band (e.g. human cleanup after marking
-            # the task done).  Surface with a recognisable prefix so
-            # ``TaskWorkflow`` can re-check status.
-            logger.info(
-                f'Merge worker for task {req.task_id}: missing worktree '
-                f'{exc.path} — surfacing as blocked'
-            )
-            return MergeOutcome(
-                'blocked',
-                reason=f'{WORKTREE_MISSING_REASON_PREFIX}: {exc.path}',
-            )
-        except Exception as exc:
-            logger.exception(
-                f'Merge worker error for task {req.task_id}: {exc}'
-            )
-            return MergeOutcome('blocked', reason=f'Merge worker error: {exc}')
-
-    async def _do_merge(self, req: MergeRequest) -> MergeOutcome | None:
-        # Train dispatch: GroupMergeRequest is handled by the shared
-        # _do_train_merge pipeline which owns rebase + merge + verify + advance
-        # + member callbacks.  The rest of _do_merge is the single-task path.
-        if isinstance(req, GroupMergeRequest):
-            return await _do_train_merge(self, req)
-
-        t0 = time.monotonic()
-
-        # Loop-breaker: refuse to process tasks that have already timed out
-        # in post-merge verify MAX_POST_MERGE_VERIFY_TIMEOUTS times in a
-        # row.  Short-circuits before any git work so a stuck task can't
-        # keep burning merge-queue capacity (30+ minutes per attempt).
-        prior_timeouts = self._post_merge_verify_timeouts.get(req.task_id, 0)
-        if prior_timeouts >= self.MAX_POST_MERGE_VERIFY_TIMEOUTS:
-            logger.warning(
-                'Task %s: abandoning merge — %d consecutive post-merge '
-                'verify timeouts (threshold=%d)',
-                req.task_id, prior_timeouts,
-                self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
-            )
-            _emit_merge_attempt(
-                self._event_store, req.task_id, 'abandoned_verify_timeouts',
-                attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
-            )
-            return self._abandon_outcome(req.task_id, prior_timeouts)
-
-        # Guard + merge + drop-guard pipeline (MQ-refactor kappa): shared with
-        # SpeculativeMergeWorker's _merger_loop/_remerge.  main_sha is read
-        # here (not just inside classify_and_merge) because it is also
-        # needed below for advance_main's expected_main and
-        # _finalize_advanced_merge's base_sha — classify_and_merge reads its
-        # own actual_main for the already-merged check (benign double-read;
-        # advance_main's CAS tolerates any drift between the two reads).
-        main_sha = await self._git_ops.get_main_sha()
-        result = await classify_and_merge(
-            self, req, main_sha, speculative=False, started_monotonic=t0,
-        )
-        if isinstance(result, Decided):
-            return result.outcome
-        merge_result = result.merge_result
-        branch_head = result.branch_tip
-        # classify_and_merge only returns MergedOk after its own drop-guard
-        # step asserted merge_commit is set, and after rev-parsing branch
-        # HEAD successfully — both are guaranteed non-None here.
-        assert merge_result.merge_commit is not None
-        assert branch_head is not None
-
-        # 4. Verify — task-1724: unconditional, skip_verify path removed
-        merge_wt = merge_result.merge_worktree
-        assert merge_wt is not None
-        # ── Persistent warm merge-verify worktree swap (PRD §10 κ) ──────
-        # Parity with SpeculativeMergeWorker._verify_and_advance: increment the
-        # per-worker verify counter and compute the safety-valve predicate so
-        # every Nth verifying attempt runs a from-scratch cold verify in a
-        # throwaway worktree (PRD §10 invariant 6).
-        # merge_result.merge_commit is non-None (asserted above).
-        self._verify_attempt_count += 1
-        _due = _safety_valve_due(
-            self._verify_attempt_count,
-            req.config.git.persistent_merge_worktree_safety_valve_every_n,
-        )
-        merge_wt, _ = await _acquire_warm_verify_worktree(
-            self._git_ops, req, merge_wt,
-            merge_result.merge_commit,  # non-None; assert at 4044 above
-            safety_valve_due=_due,
-            speculative=False,  # MergeWorker always handles non-speculative items
-        )
-        assert merge_wt is not None  # input was non-None; warm or unchanged
-        out = await _run_post_merge_verify(
-            self._git_ops, req, merge_wt,
-            timeouts=self._post_merge_verify_timeouts,
-            enospc_retries=self._post_merge_verify_enospc_retries,
-            max_timeouts=self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
-            max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-            event_store=self._event_store,
-            merge_sha=merge_result.merge_commit or '',
-        )
-        if out is not None:
-            return out
-
-        # 5. CAS advance_main
-        assert merge_result.merge_commit is not None
-        outcome = await self._git_ops.advance_main(
-            merge_result.merge_commit,
-            merge_wt,
-            branch=req.branch,
-            max_attempts=req.config.max_advance_attempts,
-            expected_main=main_sha,
-        )
-        result = outcome.result
-        await self._git_ops.cleanup_merge_worktree(merge_wt)
-
-        if result == 'advanced':
-            return await _finalize_advanced_merge(
-                self._git_ops, req, self._event_store,
-                merge_commit_fallback=merge_result.merge_commit,
-                base_sha=main_sha,
-                started_monotonic=t0,
-                cas_retries=self._cas_retries,
-                timeouts=self._post_merge_verify_timeouts,
-                enospc_retries=self._post_merge_verify_enospc_retries,
-                chain_ctx=_GenerationChainContext(
-                    queue=self._queue,
-                    counts=self._generation_chain_counts,
-                    max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
-                ),
-                merged_branch_tip=branch_head.strip(),
-                advanced_sha=outcome.advanced_sha,
-            )
-
-        if result in _HALT_ADVANCE_RESULTS and self._request_abandoned(req):
-            # Workflow soft-cancelled mid-merge: dropping the request
-            # prevents the orphan-halt window where no escalation owner
-            # is registered (2026-05-04 incident).
-            return None
-        if result != 'cas_failed':
-            return await _map_advance_failure(
-                self._git_ops, result,
-                task_id=req.task_id,
-                merge_commit_fallback=merge_result.merge_commit,
-                halt=self.halt_for_wip,
-                unhalt=self.unhalt_wip,
-                cas_retries=self._cas_retries,
-                advanced_sha=outcome.advanced_sha,
-            )
-
-        # result == 'cas_failed' — transient, re-enqueue with limit
-        retries = self._cas_retries.get(req.task_id, 0) + 1
-        self._cas_retries[req.task_id] = retries
-        if retries > self.MAX_CAS_RETRIES:
-            self._cas_retries.pop(req.task_id, None)
-            logger.warning(
-                f'Task {req.task_id}: CAS retry limit exhausted '
-                f'({self.MAX_CAS_RETRIES} attempts)'
-            )
-            _emit_merge_attempt(self._event_store, req.task_id, 'cas_exhausted', attempt=retries, duration_ms=_elapsed_ms(t0))
-            return MergeOutcome(
-                'blocked',
-                reason=(
-                    f'CAS retry limit exhausted after '
-                    f'{self.MAX_CAS_RETRIES} attempts for task {req.task_id}'
-                ),
-            )
-
-        logger.info(
-            f'Task {req.task_id}: CAS failed (attempt {retries}/'
-            f'{self.MAX_CAS_RETRIES}), re-enqueueing at front'
-        )
-        _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=retries, duration_ms=_elapsed_ms(t0))
-        _emit_merge_queued(
-            self._event_store, req, reason='cas_retry',
-            queue_depth=self._queue.qsize() + len(self._urgent) + 1,
-            position=0,
-        )
-        self._urgent.append(req)
-        return None  # don't resolve Future — will be reprocessed
 
 
 class MergeMetrics:
@@ -3999,11 +3702,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     """
 
     MAX_CAS_RETRIES = 5
-    # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS — see that class
-    # for rationale.  Kept as a class attribute so tests can monkeypatch
-    # per-class if the two workers ever diverge.
+    # After this many consecutive post-merge verify TIMEOUTS for the same
+    # task, the merge queue stops trying and returns an 'abandoned' blocked
+    # outcome.  Kept as a class attribute so tests can monkeypatch it.
     MAX_POST_MERGE_VERIFY_TIMEOUTS: int = 2
-    # Mirror of MergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES.
+    # After a post-merge verify fails with an ENOSPC signature, prune stale
+    # _merge-* worktrees and retry the verify at most this many times before
+    # escalating as transient infra.  Kept as a class attribute so tests can
+    # monkeypatch it.
     MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int = 1
     # Poll interval (seconds) used in the _verify_and_advance abort-loop that
     # checks whether a sole-waiter detach() cancelled req.result mid-verify.
@@ -4122,13 +3828,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # across submissions so an orchestrator re-queue of the same task
         # continues to feed the same counter.
         self._post_merge_verify_timeouts: dict[str, int] = {}
-        # Per-task ENOSPC prune-and-retry counter (mirror of MergeWorker's;
-        # see MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).  Persists across
-        # submissions, reset on a successful CAS advance.
+        # Per-task ENOSPC prune-and-retry counter (mirrors the test-local
+        # MergeWorker reference's; see MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES).
+        # Persists across submissions, reset on a successful CAS advance.
         self._post_merge_verify_enospc_retries: dict[str, int] = {}
-        # γ2 per-branch generation auto-chain counter (mirrors MergeWorker).
-        # Incremented on each consecutive tip-advance equivalence failure;
-        # popped on a clean 'done' landing or bound-exceeded escalation.
+        # γ2 per-branch generation auto-chain counter (mirrors the test-local
+        # MergeWorker reference's).  Incremented on each consecutive
+        # tip-advance equivalence failure; popped on a clean 'done' landing
+        # or bound-exceeded escalation.
         self._generation_chain_counts: dict[str, int] = {}
         # Speculation-depth cap: one permit consumed by the Merger when it
         # prefetches a speculative item; released by the Verifier when it drains
@@ -4166,8 +3873,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # merges; cleared by unhalt_all_lanes(). Distinct from the per-lane halt
         # state so the automatic WIP-halt path (halt_for_wip) never aborts a verify.
         self._operator_halt = asyncio.Event()
-        # Cross-workflow auto-heal attempt counter (mirrors MergeWorker; shared
-        # via self.merge_worker on TaskWorkflow instances).
+        # Cross-workflow auto-heal attempt counter (mirrors the test-local
+        # MergeWorker reference's; shared via self.merge_worker on
+        # TaskWorkflow instances).
         self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
         # Internal tasks created by run()
         self._merger_task: asyncio.Task | None = None
@@ -4340,7 +4048,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         #       per verify and already exempt from prune/find_inflight
         #       (git_ops.py:2075) — guard in _register_owned_merge_worktree keeps
         #       it out.
-        #   (b) Serial MergeWorker (:4062) holds ≤1 worktree whose build activity
+        #   (b) The retired serial worker's test-local reference (see
+        #       _TrainMergeHost) holds ≤1 worktree whose build activity
         #       refreshes mtime — out of ledger scope.
         #   (c) Cold-shadow (_run_cold_shadow_verify :7670) and drift-check
         #       (_run_drift_check :7912) _merge-* creators are short-lived local

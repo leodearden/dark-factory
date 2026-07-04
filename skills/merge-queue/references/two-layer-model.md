@@ -121,7 +121,7 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `recompute_suffix_conflict_graph()` | merge_queue.py | Worker delegator → `SuffixConflictTracker.recompute()` (suffix_graph.py); recomputes the conflict graph, triggers bounce |
 | `_bounce_conflicting_suffix_items()` | merge_queue.py | Worker delegator → `SuffixConflictTracker.bounce_conflicting_suffix_items()` (suffix_graph.py); graph-time disk-free bounce of the younger conflicting item |
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
-| `classify_and_merge()` | merge_queue.py | Shared pre-merge guard + merge + drop-guard pipeline (branch-presence → already-merged → merge → conflict/non-conflict-failure → drop-guard), returning `MergedOk \| Decided`; `MergeWorker._do_merge`, `SpeculativeMergeWorker._merger_loop`, and `SpeculativeMergeWorker._remerge` all delegate to it instead of each running its own duplicated inline copy (MQ-refactor task κ, task 1995) |
+| `classify_and_merge()` | merge_queue.py | Shared pre-merge guard + merge + drop-guard pipeline (branch-presence → already-merged → merge → conflict/non-conflict-failure → drop-guard), returning `MergedOk \| Decided`; `SpeculativeMergeWorker._merger_loop`, `SpeculativeMergeWorker._remerge`, and the retired serial worker's test-local reference (`tests/_serial_merge_worker.MergeWorker._do_merge`) all delegate to it instead of each running its own duplicated inline copy (MQ-refactor task κ, task 1995) |
 
 ### 7.1 merge_types.py — request/outcome/item/entry types + registries (MQ-refactor task α)
 
@@ -376,6 +376,39 @@ needs this module fully defined first). None of the three constants were moved �
 | `SuffixConflictTracker` | suffix_graph.py | Owns `graph` / `signature` / `last_known_main_sha` / `bounce_registry`; constructed with `git_ops` + `lane_buffers`/`frozen_prefix`/`frozen_prefix_tip` callables |
 | `SuffixConflictTracker.recompute()` | suffix_graph.py | Recompute and store the conflict graph over the unfrozen suffix (debounced, fail-open); `SpeculativeMergeWorker.recompute_suffix_conflict_graph()` delegates here |
 | `SuffixConflictTracker.bounce_conflicting_suffix_items()` | suffix_graph.py | Graph-time disk-free bounce of the younger conflicting item (cap/escalation/TOCTOU); `SpeculativeMergeWorker._bounce_conflicting_suffix_items()` delegates here |
+
+### 7.7 MergeWorker retirement — one production worker, a test-local serial reference (MQ-refactor task ν)
+
+The legacy serial `MergeWorker` — the single-coroutine worker with no lane-priority ordering
+that predated the two-layer model — is retired from `orchestrator/src/orchestrator/merge_queue.py`
+(task ν of `plans/merge-queue-modularization-invariants-prd.md`, R7b). `SpeculativeMergeWorker` is
+now the sole production merge worker.
+
+`MergeWorker`'s class body was moved verbatim (no behavior change) into
+`orchestrator/tests/_serial_merge_worker.py`, following the flat-tests-dir helper convention
+(`_orch_helpers.py`, `_workflow_helpers.py`). Its "readable serial reference" role — a linear,
+single-coroutine worker that is easier to read than the two-coroutine speculative pipeline when
+reasoning about the shared merge/verify/advance mechanics — now lives jointly in that test fixture
+and in this reference doc, rather than as a second class shipped to production.
+
+The two-layer model stays coherent with a single production worker because the shared pipeline
+pieces `MergeWorker` used were never worker-specific in the first place:
+
+- `classify_and_merge()` (§7, task κ/1995) — the shared pre-merge guard + merge + drop-guard
+  pipeline.
+- `_do_train_merge()` + the `_TrainMergeHost` Protocol (merge_queue.py) — the atomic train-merge
+  pipeline. `_TrainMergeHost` stays a structural Protocol (not inlined to `SpeculativeMergeWorker`)
+  specifically so the test-local `MergeWorker` reference keeps satisfying it under the enforced
+  pyright gate (`test_pyright_merge_gate.py`), with no production-side import of test code.
+- `_run_post_merge_verify()`, `_finalize_advanced_merge()`, `_map_advance_failure()`,
+  `_emit_merge_queued()`, `_HALT_ADVANCE_RESULTS`, and `_WipHaltMixin` — all still shared between
+  `SpeculativeMergeWorker` and the test-local reference.
+
+The 89 existing `MergeWorker(...)`-construction tests across 7 files were re-pointed to `from
+_serial_merge_worker import MergeWorker` with a one-line import change each and otherwise left
+untouched — they remain the executable spec for the serial-worker surface (`_dequeue`, `_process`,
+`_do_merge`, `_urgent`, CAS re-enqueue) that `SpeculativeMergeWorker`'s two-coroutine pipeline does
+not exercise identically.
 
 ---
 

@@ -1,4 +1,16 @@
-"""Tests for merge queue: MergeWorker, CAS update-ref, ghost-loop detection."""
+"""Tests for merge queue: MergeWorker, CAS update-ref, ghost-loop detection.
+
+``MergeWorker`` here is the retired serial worker's test-local reference
+(imported from ``_serial_merge_worker``; see
+:class:`orchestrator.merge_queue._TrainMergeHost` for the retirement note),
+not a production class. Parametrizations over
+``[MergeWorker, SpeculativeMergeWorker]`` exercise the shared production
+helpers (``classify_and_merge``, ``_do_train_merge``,
+``_run_post_merge_verify``, ``_finalize_advanced_merge``, CAS advance) that
+both the fixture and the sole production worker call — they are legacy
+shared-helper regression coverage, not a production serial code path under
+test.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import make_placeholder_future, pydantic_spec
+from _serial_merge_worker import MergeWorker
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -43,7 +56,6 @@ from orchestrator.merge_queue import (
     InFlightMergeRegistry,
     MergeOutcome,
     MergeRequest,
-    MergeWorker,
     SpeculativeItem,
     SpeculativeMergeWorker,
     SuffixConflictGraph,
@@ -17564,8 +17576,12 @@ class TestMergeWorkerGenerationChain:
             patch('orchestrator.merge_queue._classify_branch_presence', AsyncMock(return_value=None)),
             patch('orchestrator.merge_queue._check_plan_targets_in_tree',
                   AsyncMock(return_value=MagicMock(dropped=[]))),
-            patch('orchestrator.merge_queue._run_post_merge_verify', AsyncMock(return_value=None)),
-            patch('orchestrator.merge_queue._finalize_advanced_merge', finalize_mock),
+            # _run_post_merge_verify/_finalize_advanced_merge are called as
+            # bare globals from MergeWorker._do_merge, which now lives in
+            # _serial_merge_worker.py (task 1998/R7b) — patch them where
+            # they're looked up, not where they're defined.
+            patch('_serial_merge_worker._run_post_merge_verify', AsyncMock(return_value=None)),
+            patch('_serial_merge_worker._finalize_advanced_merge', finalize_mock),
         ):
             outcome = await worker._do_merge(req)
 
@@ -17838,9 +17854,10 @@ class TestBoundaryTableWorkerEntry:
         Extends TestAttachFanOut with the explicit two-source framing and the
         one-merge assertion.
         """
+        from _serial_merge_worker import MergeWorker
+
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeRequest,
-            MergeWorker,
         )
 
         bt9_branch = 'bt9-peer'
@@ -18053,9 +18070,7 @@ class TestBoundaryTableWorkerEntry:
         entry.
         Reuses _make_stacked_train and the existing train test fixtures.
         """
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeWorker,
-        )
+        from _serial_merge_worker import MergeWorker
 
         req = await _make_stacked_train(git_ops, config, train_id='bt12-train')
 
