@@ -2837,12 +2837,13 @@ async def _do_train_merge(
         return verify_outcome
 
     # (f) CAS-advance main.
-    adv = await git_ops.advance_main(
+    adv_outcome = await git_ops.advance_main(
         merge_commit, merge_wt,
         branch=req.branch,
         max_attempts=req.config.max_advance_attempts,
         expected_main=main_sha,
     )
+    adv = adv_outcome.result
 
     await git_ops.cleanup_merge_worktree(merge_wt)
 
@@ -3487,13 +3488,14 @@ class MergeWorker(_WipHaltMixin):
 
         # 5. CAS advance_main
         assert merge_result.merge_commit is not None
-        result = await self._git_ops.advance_main(
+        outcome = await self._git_ops.advance_main(
             merge_result.merge_commit,
             merge_wt,
             branch=req.branch,
             max_attempts=req.config.max_advance_attempts,
             expected_main=main_sha,
         )
+        result = outcome.result
         await self._git_ops.cleanup_merge_worktree(merge_wt)
 
         if result == 'advanced':
@@ -8555,13 +8557,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entry.phase = 'finalizing'   # per-entry source of truth for snapshot()
             current_sha = merge_commit
             while True:
-                result = await self._git_ops.advance_main(
+                adv_outcome = await self._git_ops.advance_main(
                     current_sha, merge_wt,
                     branch=req.branch,
                     max_attempts=req.config.max_advance_attempts,
                     expected_main=item.base_sha,
                     reverify_on_rebase=True,
                 )
+                result = adv_outcome.result
 
                 if result == 'advanced':
                     self._gate_retries.pop(req.task_id, None)

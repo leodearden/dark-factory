@@ -436,7 +436,7 @@ class TestMergeStatusGitAuthorityIntegration:
         assert merge_result.merge_worktree is not None
 
         adv = await git_ops.advance_main(merge_result.merge_commit)
-        assert adv == 'advanced'
+        assert adv.result == 'advanced'
 
         expected_sha = merge_result.merge_commit
 
@@ -521,7 +521,7 @@ class TestMergeStatusGitAuthorityIntegration:
             'this test requires --no-ff to demonstrate the semantic distinction'
         )
         adv = await git_ops.advance_main(merge_result.merge_commit)
-        assert adv == 'advanced'
+        assert adv.result == 'advanced'
 
         # --- Step 4: intentionally keep branch alive → is_ancestor path fires ---
         # (no cleanup_worktree / cleanup_merge_worktree)

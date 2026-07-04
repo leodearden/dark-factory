@@ -29,7 +29,7 @@ from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, M
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import CpuPriorityConfig, GitConfig, JobserverConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
@@ -2571,7 +2571,7 @@ class TestWipRecoveryNoAdvance:
 
         async def _fake_advance(*args, **kwargs):
             git_ops._last_recovery_branch = recovery_branch
-            return 'pop_conflict_no_advance'
+            return AdvanceOutcome('pop_conflict_no_advance')
 
         monkeypatch.setattr(git_ops, 'advance_main', _fake_advance)
 

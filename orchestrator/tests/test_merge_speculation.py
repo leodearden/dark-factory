@@ -46,7 +46,7 @@ import contextlib
 import logging
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -61,7 +61,13 @@ from test_merge_queue_concurrent_verify import (  # noqa: F401
 
 from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
 from orchestrator.event_store import EventStore, EventType  # noqa: F401
-from orchestrator.git_ops import GitOps, WorktreeInfo, _run  # noqa: F401
+from orchestrator.git_ops import (  # noqa: F401
+    AdvanceOutcome,
+    AdvanceResult,
+    GitOps,
+    WorktreeInfo,
+    _run,
+)
 from orchestrator.merge_queue import (  # noqa: F401
     InflightEntry,
     InflightVerifyResult,
@@ -1033,7 +1039,7 @@ def _make_b9_worker(tmp_path: Path) -> tuple[SpeculativeMergeWorker, MagicMock]:
     )
     mock_git_ops.release_spec_lane = AsyncMock()
     mock_git_ops.cleanup_merge_worktree = AsyncMock()
-    mock_git_ops.advance_main = AsyncMock(return_value='advanced')
+    mock_git_ops.advance_main = AsyncMock(return_value=AdvanceOutcome('advanced'))
 
     worker = SpeculativeMergeWorker(mock_git_ops, asyncio.Queue())
     worker._host_allocator = None  # skip lease release in finally
@@ -1531,7 +1537,7 @@ class TestSpecLaneFinalizeTerminalRelease:
         entry = _build_entry(item, vr, merge_wt=fake_lane)
 
         # Always return 'rebased_pending_reverify' to spin the gate-retry loop
-        mock_git_ops.advance_main.return_value = 'rebased_pending_reverify'
+        mock_git_ops.advance_main.return_value = AdvanceOutcome('rebased_pending_reverify')
 
         with patch(
             'orchestrator.merge_queue._reverify_rebased_tree',
@@ -1576,7 +1582,7 @@ class TestSpecLaneFinalizeTerminalRelease:
             # Cancel req.result DURING advance_main so _request_abandoned is
             # True in the CAS loop but False at the pre-loop short-circuit (8099).
             req.result.cancel()
-            return 'wip_overlap'
+            return AdvanceOutcome('wip_overlap')
 
         mock_git_ops.advance_main.side_effect = _advance_and_cancel
 
@@ -1611,8 +1617,12 @@ class TestSpecLaneFinalizeTerminalRelease:
         vr = InflightVerifyResult(outcome=None, merge_wt=fake_lane, spec_warm=True)
         entry = _build_entry(item, vr, merge_wt=fake_lane)
 
-        # 'merge_conflict' is not in _HALT_ADVANCE_RESULTS and not 'cas_failed'
-        mock_git_ops.advance_main.return_value = 'merge_conflict'
+        # 'merge_conflict' is not in _HALT_ADVANCE_RESULTS and not 'cas_failed' — an
+        # intentionally out-of-domain sentinel exercising the unhandled-code branch,
+        # not a real AdvanceResult member (hence the cast).
+        mock_git_ops.advance_main.return_value = AdvanceOutcome(
+            cast(AdvanceResult, 'merge_conflict')
+        )
 
         with patch(
             'orchestrator.merge_queue._map_advance_failure',
@@ -1649,7 +1659,7 @@ class TestSpecLaneFinalizeTerminalRelease:
         entry = _build_entry(item, vr, merge_wt=fake_lane)
 
         # Always return 'cas_failed' to spin the CAS-retry loop
-        mock_git_ops.advance_main.return_value = 'cas_failed'
+        mock_git_ops.advance_main.return_value = AdvanceOutcome('cas_failed')
 
         await worker._finalize_inflight(entry)
 
@@ -2051,7 +2061,7 @@ class TestLateArrivalCleanCAS:
                 merge_sha, merge_worktree, branch=branch, **kwargs,
             )
             if branch:
-                advance_outcomes[branch] = str(result)
+                advance_outcomes[branch] = result.result
             return result
 
         git_ops.advance_main = _spy_advance_main  # type: ignore[method-assign]
@@ -2993,7 +3003,7 @@ class TestLateArrivalSubmissionOrderCAS:
             advance_call_log.append({
                 'branch': branch,
                 'expected_main': kwargs.get('expected_main'),
-                'result': str(result),
+                'result': result.result,
             })
             return result
 

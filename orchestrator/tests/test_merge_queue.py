@@ -20,7 +20,14 @@ from _orch_helpers import make_placeholder_future, pydantic_spec
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, MergeResult, WorktreeMissing, _run
+from orchestrator.git_ops import (
+    AdvanceOutcome,
+    AdvanceResult,
+    GitOps,
+    MergeResult,
+    WorktreeMissing,
+    _run,
+)
 from orchestrator.merge_queue import (
     EMPTY_SUFFIX_CONFLICT_GRAPH,
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
@@ -182,7 +189,7 @@ class TestCasUpdateRef:
             result.merge_commit,
             expected_main=main_sha,
         )
-        assert advanced == 'advanced'
+        assert advanced.result == 'advanced'
 
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
@@ -215,7 +222,7 @@ class TestCasUpdateRef:
             result.merge_commit,
             expected_main=stale_sha,
         )
-        assert advanced == 'not_descendant'
+        assert advanced.result == 'not_descendant'
 
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
@@ -231,7 +238,7 @@ class TestCasUpdateRef:
 
         # No expected_main — should work as before
         advanced = await git_ops.advance_main(result.merge_commit)
-        assert advanced == 'advanced'
+        assert advanced.result == 'advanced'
 
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
@@ -1659,7 +1666,7 @@ class TestMergeWorker:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return 'cas_failed'  # simulate CAS failure
+                return AdvanceOutcome('cas_failed')  # simulate CAS failure
             return await original(*args, **kwargs)
 
         with (
@@ -1740,7 +1747,7 @@ class TestMergeWorker:
 
         # advance_main always returns cas_failed
         async def _always_cas_fail(*args, **kwargs):
-            return 'cas_failed'
+            return AdvanceOutcome('cas_failed')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_always_cas_fail),
@@ -1775,7 +1782,7 @@ class TestMergeWorker:
         async def _not_descendant(*args, **kwargs):
             nonlocal call_count
             call_count += 1
-            return 'not_descendant'
+            return AdvanceOutcome('not_descendant')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_not_descendant),
@@ -1936,7 +1943,7 @@ class TestMergeWorker:
             nonlocal call_count_c
             call_count_c += 1
             if call_count_c == 1:
-                return 'cas_failed'
+                return AdvanceOutcome('cas_failed')
             return await original_advance(*args, **kwargs)
 
         with (
@@ -3527,7 +3534,7 @@ class TestSpeculativeMergeWorker:
             nonlocal call_count
             call_count += 1
             if call_count <= 2:
-                return 'cas_failed'
+                return AdvanceOutcome('cas_failed')
             return await original_advance(*args, **kwargs)
 
         with (
@@ -3572,7 +3579,7 @@ class TestSpeculativeMergeWorker:
         worker_task = asyncio.create_task(worker.run())
 
         async def _always_cas_fail(*args: Any, **kwargs: Any):
-            return 'cas_failed'
+            return AdvanceOutcome('cas_failed')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_always_cas_fail),
@@ -3596,7 +3603,7 @@ class TestSpeculativeMergeWorker:
 
     @pytest.mark.parametrize('failure_code', ['not_descendant', 'contaminated', 'stash_failed'])
     async def test_speculative_permanent_failure_returns_blocked(
-        self, git_ops: GitOps, config: OrchestratorConfig, failure_code: str,
+        self, git_ops: GitOps, config: OrchestratorConfig, failure_code: AdvanceResult,
     ):
         """Permanent advance_main failure codes block without retry.
 
@@ -3620,7 +3627,7 @@ class TestSpeculativeMergeWorker:
         async def _return_failure(*args: Any, **kwargs: Any):
             nonlocal call_count
             call_count += 1
-            return failure_code
+            return AdvanceOutcome(failure_code)
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_return_failure),
@@ -6573,7 +6580,7 @@ class TestWipHaltMergeWorker:
             call_count += 1
             if call_count == 1:
                 git_ops._last_overlap_files = ['file_halt_1.py']
-                return 'wip_overlap'
+                return AdvanceOutcome('wip_overlap')
             return await original_advance(*args, **kwargs)
 
         with (
@@ -6625,7 +6632,7 @@ class TestWipHaltMergeWorker:
 
         async def _pop_conflict(*args, **kwargs):
             git_ops._last_recovery_branch = 'wip/recovery-recov-1-20260407T120000'
-            return 'pop_conflict'
+            return AdvanceOutcome('pop_conflict')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
@@ -6667,7 +6674,7 @@ class TestWipHaltMergeWorker:
         async def _pop_conflict(*args, **kwargs):
             git_ops._last_recovery_branch = 'wip/recovery-recov-sha-20260428T000000'
             git_ops._last_advanced_sha = 'feedface' * 5  # 40-char fake on-main SHA
-            return 'pop_conflict'
+            return AdvanceOutcome('pop_conflict')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
@@ -6698,7 +6705,7 @@ class TestWipHaltMergeWorker:
         worker_task = asyncio.create_task(worker.run())
 
         async def _unmerged_state(*args: Any, **kwargs: Any):
-            return 'unmerged_state'
+            return AdvanceOutcome('unmerged_state')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_unmerged_state),
@@ -6731,7 +6738,7 @@ class TestWipHaltMergeWorker:
 
         async def _pop_conflict_no_advance(*args: Any, **kwargs: Any):
             git_ops._last_recovery_branch = 'wip/recovery-x-y'
-            return 'pop_conflict_no_advance'
+            return AdvanceOutcome('pop_conflict_no_advance')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_pop_conflict_no_advance),
@@ -6781,7 +6788,7 @@ class TestWipHaltSpeculativeMergeWorker:
             call_count += 1
             if call_count == 1:
                 git_ops._last_overlap_files = ['file_shalt_1.py']
-                return 'wip_overlap'
+                return AdvanceOutcome('wip_overlap')
             return await original_advance(*args, **kwargs)
 
         with (
@@ -6826,7 +6833,7 @@ class TestWipHaltSpeculativeMergeWorker:
 
         async def _pop_conflict(*args, **kwargs):
             git_ops._last_recovery_branch = 'wip/recovery-srecov-1-20260407T120000'
-            return 'pop_conflict'
+            return AdvanceOutcome('pop_conflict')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
@@ -6861,7 +6868,7 @@ class TestWipHaltSpeculativeMergeWorker:
         async def _pop_conflict(*args, **kwargs):
             git_ops._last_recovery_branch = 'wip/recovery-srecov-sha-20260428T000000'
             git_ops._last_advanced_sha = 'cafebabe' * 5
-            return 'pop_conflict'
+            return AdvanceOutcome('pop_conflict')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_pop_conflict),
@@ -6890,7 +6897,7 @@ class TestWipHaltSpeculativeMergeWorker:
         worker_task = asyncio.create_task(worker.run())
 
         async def _unmerged_state(*args: Any, **kwargs: Any):
-            return 'unmerged_state'
+            return AdvanceOutcome('unmerged_state')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_unmerged_state),
@@ -6921,7 +6928,7 @@ class TestWipHaltSpeculativeMergeWorker:
 
         async def _pop_conflict_no_advance(*args: Any, **kwargs: Any):
             git_ops._last_recovery_branch = 'wip/recovery-x-y'
-            return 'pop_conflict_no_advance'
+            return AdvanceOutcome('pop_conflict_no_advance')
 
         with (
             patch.object(git_ops, 'advance_main', side_effect=_pop_conflict_no_advance),
@@ -6973,7 +6980,7 @@ class TestWipHaltSpeculativeMergeWorker:
 
         async def _wip_overlap(*args: Any, **kwargs: Any):
             git_ops._last_overlap_files = ['file_clnup.py']
-            return 'wip_overlap'
+            return AdvanceOutcome('wip_overlap')
 
         try:
             with (
@@ -8053,7 +8060,7 @@ class TestMergeWorkerCasRetryEmitsMergeQueued:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return 'cas_failed'
+                return AdvanceOutcome('cas_failed')
             return await original_advance(*args, **kwargs)
 
         with (
@@ -9858,9 +9865,9 @@ class TestMergedBranchTipCarryThroughRebuild:
         async def _fake_advance(sha, wt, **kw):
             advance_calls[0] += 1
             if advance_calls[0] == 1:
-                return 'cas_failed'
+                return AdvanceOutcome('cas_failed')
             git_ops._last_advanced_sha = actual_merge_commit
-            return 'advanced'
+            return AdvanceOutcome('advanced')
 
         passing = MagicMock(passed=True, summary='', timed_out=False)
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
@@ -10087,9 +10094,9 @@ class TestMergedBranchTipCarryThroughRebuild:
         async def _fake_advance(sha, wt, **kw):
             advance_calls[0] += 1
             if advance_calls[0] == 1:
-                return 'cas_failed'
+                return AdvanceOutcome('cas_failed')
             git_ops._last_advanced_sha = actual_merge_commit
-            return 'advanced'
+            return AdvanceOutcome('advanced', advanced_sha=actual_merge_commit)
 
         passing = MagicMock(passed=True, summary='', timed_out=False)
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
@@ -15269,12 +15276,13 @@ class TestAdvanceMainReverifyOnRebase:
         assert moved_main_sha != base_sha, 'main must have moved for the test'
 
         try:
-            advanced = await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 merge_commit, merge_wt,
                 branch='rev-branch',
                 expected_main=base_sha,
                 reverify_on_rebase=True,
             )
+            advanced = outcome.result
 
             # Must return the new gate result, NOT 'advanced'
             assert advanced == 'rebased_pending_reverify', (
@@ -15345,12 +15353,13 @@ class TestAdvanceMainReverifyOnRebase:
 
         # Main has NOT moved — no rebase needed
         try:
-            advanced = await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 result.merge_commit, result.merge_worktree,
                 branch='rev-no-rebase',
                 expected_main=base_sha,
                 reverify_on_rebase=True,
             )
+            advanced = outcome.result
             assert advanced == 'advanced', (
                 f'No rebase → must return advanced, got {advanced!r}'
             )
@@ -15391,12 +15400,13 @@ class TestAdvanceMainReverifyOnRebase:
 
         try:
             # Default flag (not passed) — should still rebase and advance
-            advanced = await git_ops.advance_main(
+            outcome = await git_ops.advance_main(
                 result.merge_commit, merge_wt,
                 branch='rev-compat',
                 expected_main=base_sha,
                 # reverify_on_rebase NOT passed — default False
             )
+            advanced = outcome.result
             # With default flag, advance_main rebases and advances (old behavior)
             assert advanced in ('advanced', 'cas_failed'), (
                 f'Default flag: expected advanced or cas_failed, got {advanced!r}'
@@ -17424,7 +17434,9 @@ class TestMergeWorkerGenerationChain:
             merge_worktree=tmp_path / 'merge-wt',
             pre_merge_sha='main-sha',
         ))
-        git_ops.advance_main = AsyncMock(return_value='advanced')
+        git_ops.advance_main = AsyncMock(
+            return_value=AdvanceOutcome('advanced', advanced_sha=merge_commit_sha)
+        )
         git_ops.cleanup_merge_worktree = AsyncMock()
 
         worker._git_ops = git_ops
@@ -17522,7 +17534,9 @@ class TestSMWGenerationChain:
 
         queue: asyncio.Queue = asyncio.Queue()
         git_ops = MagicMock()
-        git_ops.advance_main = AsyncMock(return_value='advanced')
+        git_ops.advance_main = AsyncMock(
+            return_value=AdvanceOutcome('advanced', advanced_sha='merge-commit-smw')
+        )
         git_ops.cleanup_merge_worktree = AsyncMock()
 
         worker = SpeculativeMergeWorker(git_ops, queue)
@@ -18548,7 +18562,7 @@ class TestCasRetryMergeQueuedDepthPosition:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return 'cas_failed'
+                return AdvanceOutcome('cas_failed')
             return await original_advance(*args, **kwargs)
 
         with (

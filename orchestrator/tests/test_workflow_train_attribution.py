@@ -20,6 +20,7 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.git_ops import AdvanceOutcome
 from orchestrator.merge_queue import (
     TRAIN_VERIFY_FAILED_REASON_PREFIX,
     MergeOutcome,
@@ -94,7 +95,7 @@ def _make(
     git_ops = MagicMock()
     git_ops.config.branch_prefix = 'task/'
     git_ops.config.main_branch = 'main'
-    git_ops.advance_main = AsyncMock(return_value='advanced')
+    git_ops.advance_main = AsyncMock(return_value=AdvanceOutcome('advanced'))
     git_ops.cleanup_merge_worktree = AsyncMock()
 
     esc_queue = MagicMock()
@@ -744,7 +745,9 @@ class TestEdgeMappings:
             _solo_pass_wt('103'),
         ])
         # advance_main: 'cas_failed' for '102', 'advanced' for '103'
-        f.git_ops.advance_main = AsyncMock(side_effect=['cas_failed', 'advanced'])
+        f.git_ops.advance_main = AsyncMock(side_effect=[
+            AdvanceOutcome('cas_failed'), AdvanceOutcome('advanced'),
+        ])
 
         tagged = _make_tagged_result()
         await f.wf._attribute_train_failure(tagged, 'T-adv-fail', members)
@@ -766,7 +769,9 @@ class TestEdgeMappings:
             _solo_pass_wt('102'),
             _solo_pass_wt('103'),
         ])
-        f.git_ops.advance_main = AsyncMock(side_effect=['cas_failed', 'advanced'])
+        f.git_ops.advance_main = AsyncMock(side_effect=[
+            AdvanceOutcome('cas_failed'), AdvanceOutcome('advanced'),
+        ])
 
         tagged = _make_tagged_result()
         # Should not raise; tip '103' lands successfully
@@ -796,7 +801,9 @@ class TestEdgeMappings:
             passer_103,
         ])
         # '102' advance fails; '103' advance succeeds
-        f.git_ops.advance_main = AsyncMock(side_effect=['cas_failed', 'advanced'])
+        f.git_ops.advance_main = AsyncMock(side_effect=[
+            AdvanceOutcome('cas_failed'), AdvanceOutcome('advanced'),
+        ])
 
         tagged = _make_tagged_result()
         await f.wf._attribute_train_failure(tagged, 'T-adv-cleanup', members)
@@ -951,8 +958,8 @@ class TestPasserLandPath:
                                 expected_main, reverify_on_rebase=False, **kw):
             if expected_main == _main[0]:
                 _main[0] = f'{merge_sha}-advanced'
-                return 'advanced'
-            return 'cas_failed'
+                return AdvanceOutcome('advanced', advanced_sha=_main[0])
+            return AdvanceOutcome('cas_failed')
 
         async def fresh_main():
             return _main[0]

@@ -2383,7 +2383,10 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
+        from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
+            AdvanceOutcome,
+            MergeResult,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
             MergeRequest,
@@ -2410,14 +2413,14 @@ class TestGetMergeQueue:
         # this closure (which reads `worker`) and the git_ops_stub/worker bindings
         # defined below — without it, embedding fake_advance_main in git_ops_stub
         # makes pyright report it as self-referential.
-        async def fake_advance_main(*args, **kwargs) -> str:
+        async def fake_advance_main(*args, **kwargs) -> AdvanceOutcome:
             fh = worker._finalizing_head
             captured_phases.append(fh.phase if fh is not None else None)
             snap = worker.snapshot()
             vip = snap.get('verify_in_progress')
             captured_snapshot_phases.append(vip['phase'] if vip else None)
             # Return 'not_descendant' — terminal non-advanced path
-            return 'not_descendant'
+            return AdvanceOutcome('not_descendant')
 
         async def fake_cleanup_merge_worktree(path):
             pass
@@ -2502,7 +2505,10 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
+        from orchestrator.git_ops import (  # type: ignore[reportMissingImports]
+            AdvanceOutcome,
+            MergeResult,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
             MergeRequest,
@@ -2524,11 +2530,18 @@ class TestGetMergeQueue:
 
         # Explicit return annotation breaks the pyright inference cycle between
         # this closure (reads `worker`) and git_ops_stub/worker below.
-        async def fake_advance_main(*args, **kwargs) -> str:
+        async def fake_advance_main(*args, **kwargs) -> AdvanceOutcome:
             advance_calls.append(len(advance_calls) + 1)
             if len(advance_calls) == 1:
-                # First call: trigger rebase path
-                return 'rebased_pending_reverify'
+                # First call: trigger rebase path. SHA fields mirror the
+                # git_ops_stub side-channel attributes below (still the
+                # production read path until task 1997 step-6).
+                return AdvanceOutcome(
+                    'rebased_pending_reverify',
+                    advanced_sha='rebased0abc',
+                    rebased_from='from0sha',
+                    rebased_onto='onto0sha',
+                )
             else:
                 # Second call (after gate cleared): terminal failure.
                 # Read the live finalize-head entry (production object set by
@@ -2536,7 +2549,7 @@ class TestGetMergeQueue:
                 # forward closure ref to the later-bound `entry`.
                 fh = worker._finalizing_head
                 captured_phases_advance2.append(fh.phase if fh is not None else None)
-                return 'not_descendant'
+                return AdvanceOutcome('not_descendant')
 
         async def fake_cleanup_merge_worktree(path):
             pass
