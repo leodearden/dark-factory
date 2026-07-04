@@ -33,6 +33,7 @@ try:
     from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
     from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
         MergeRequest,
+        RealMergeItem,
         SpeculativeItem,
         SpeculativeMergeWorker,
         TerminalOutcomeRecord,
@@ -49,6 +50,7 @@ except ImportError:
     EventStore: Any = None
     EventType: Any = None
     MergeRequest: Any = None
+    RealMergeItem: Any = None
     SpeculativeItem: Any = None
     SpeculativeMergeWorker: Any = None
     TerminalOutcomeRecord: Any = None
@@ -2271,7 +2273,7 @@ class TestGetMergeQueue:
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
             MergeRequest,
-            SpeculativeItem,
+            RealMergeItem,
             SpeculativeMergeWorker,
         )
 
@@ -2297,10 +2299,10 @@ class TestGetMergeQueue:
         merge_wt_A = tmp_path / 'mergeA'
         merge_wt_A.mkdir()
         merge_result_A = MergeResult(success=True, merge_commit='deadbeefA0000000', merge_worktree=merge_wt_A)
-        item_A = SpeculativeItem(
+        item_A = RealMergeItem(
             request=_req('A'),
             merge_result=merge_result_A, merge_wt=merge_wt_A,
-            base_sha='base', speculative=False, skip_verify=False,
+            base_sha='base', speculative=False,
         )
         await worker._verifier_queue.put(item_A)
 
@@ -2313,10 +2315,10 @@ class TestGetMergeQueue:
         merge_wt_V = tmp_path / 'mergeV'
         merge_wt_V.mkdir()
         merge_result_V = MergeResult(success=True, merge_commit='deadbeefV0000000', merge_worktree=merge_wt_V)
-        item_V = SpeculativeItem(
+        item_V = RealMergeItem(
             request=_req('V'),
             merge_result=merge_result_V, merge_wt=merge_wt_V,
-            base_sha='base', speculative=False, skip_verify=False,
+            base_sha='base', speculative=False,
         )
         worker._inflight.append(InflightEntry(
             item=item_V,
@@ -2390,7 +2392,7 @@ class TestGetMergeQueue:
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
             MergeRequest,
-            SpeculativeItem,
+            RealMergeItem,
             SpeculativeMergeWorker,
         )
 
@@ -2443,13 +2445,12 @@ class TestGetMergeQueue:
             result=loop.create_future(),
         )
         merge_result = MergeResult(success=True, merge_commit='deadbeef0000000', merge_worktree=merge_wt)
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_wt,
             base_sha='base000',
             speculative=False,
-            skip_verify=False,
         )
         # verify_task=None → verify already passed (no fail/skip); _finalize_inflight
         # goes straight to the CAS advance_main loop where it sets phase='finalizing'.
@@ -2518,7 +2519,7 @@ class TestGetMergeQueue:
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InflightEntry,
             MergeRequest,
-            SpeculativeItem,
+            RealMergeItem,
             SpeculativeMergeWorker,
         )
 
@@ -2588,16 +2589,12 @@ class TestGetMergeQueue:
             merge_commit='deadbeef00000001',
             merge_worktree=merge_wt,
         )
-        # skip_verify=True is preserved for fidelity, though _finalize_inflight's
-        # PASS path (verify_task=None) goes straight to the advance_main loop where
-        # 'gate_reverify' is triggered.
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_wt,
             base_sha='base0sha',
             speculative=False,
-            skip_verify=True,
         )
         # verify_task=None → verify already passed; _finalize_inflight runs the
         # CAS advance_main loop that owns the gate_reverify phase transition.
@@ -3544,10 +3541,10 @@ class TestMergeStatus:
             merge_wt = tmp_path / 'merge-wt'
             merge_wt.mkdir()
             merge_result = MergeResult(success=True, merge_commit='deadbeefP0000000', merge_worktree=merge_wt)
-            item = SpeculativeItem(
+            item = RealMergeItem(
                 request=req,
                 merge_result=merge_result, merge_wt=merge_wt,
-                base_sha='base', speculative=False, skip_verify=False,
+                base_sha='base', speculative=False,
             )
             if verify_phase in ('merging',):
                 worker._inflight_req = req

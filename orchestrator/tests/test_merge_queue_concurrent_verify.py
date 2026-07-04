@@ -455,7 +455,7 @@ class TestRunInflightVerifyHappyPath:
         content: str,
     ):
         """Helper: create a branch, merge it to main, return (req, item)."""
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
         req = MergeRequest(
@@ -471,14 +471,16 @@ class TestRunInflightVerifyHappyPath:
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
+        # A successful merge always has a worktree; RealMergeItem.merge_wt is
+        # required non-None (task ο), so narrow explicitly (mirrors merge_queue.py).
+        assert merge_result.merge_worktree is not None
         base_sha = await git_ops.get_main_sha()
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
         return req, item
 
@@ -592,7 +594,7 @@ class TestRunInflightVerifyAbortPoll:
         content: str,
     ):
         """Create a merged SpeculativeItem on the given branch."""
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -609,14 +611,16 @@ class TestRunInflightVerifyAbortPoll:
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
+        # A successful merge always has a worktree; RealMergeItem.merge_wt is
+        # required non-None (task ο), so narrow explicitly (mirrors merge_queue.py).
+        assert merge_result.merge_worktree is not None
         base_sha = await git_ops.get_main_sha()
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
         return req, item
 
@@ -794,7 +798,7 @@ class TestRunInflightVerifyRunnerUnavailable:
         filename: str,
         content: str,
     ):
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -811,14 +815,16 @@ class TestRunInflightVerifyRunnerUnavailable:
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
+        # A successful merge always has a worktree; RealMergeItem.merge_wt is
+        # required non-None (task ο), so narrow explicitly (mirrors merge_queue.py).
+        assert merge_result.merge_worktree is not None
         base_sha = await git_ops.get_main_sha()
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
         return req, item
 
@@ -903,7 +909,7 @@ class TestFinalizeInflightPass:
         filename: str,
         content: str,
     ):
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -920,14 +926,16 @@ class TestFinalizeInflightPass:
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
+        # A successful merge always has a worktree; RealMergeItem.merge_wt is
+        # required non-None (task ο), so narrow explicitly (mirrors merge_queue.py).
+        assert merge_result.merge_worktree is not None
         base_sha = await git_ops.get_main_sha()
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
         return req, item
 
@@ -1142,7 +1150,7 @@ class TestFinalizeInflightNonPass:
         filename: str,
         content: str,
     ):
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -1159,14 +1167,16 @@ class TestFinalizeInflightNonPass:
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
+        # A successful merge always has a worktree; RealMergeItem.merge_wt is
+        # required non-None (task ο), so narrow explicitly (mirrors merge_queue.py).
+        assert merge_result.merge_worktree is not None
         base_sha = await git_ops.get_main_sha()
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
         return req, item
 
@@ -1178,8 +1188,8 @@ class TestFinalizeInflightNonPass:
         outcome: MergeOutcome,
         already_delivered: bool = False,
     ):
-        """Build a SpeculativeItem with immediate_outcome (no real merge)."""
-        from orchestrator.merge_queue import SpeculativeItem
+        """Build a DecidedItem with immediate_outcome (no real merge)."""
+        from orchestrator.merge_queue import DecidedItem
 
         loop = asyncio.get_running_loop()
         req = MergeRequest(
@@ -1193,14 +1203,11 @@ class TestFinalizeInflightNonPass:
             result=loop.create_future(),
             lane='normal',
         )
-        item = SpeculativeItem(
+        item = DecidedItem(
             request=req,
-            merge_result=None,
-            merge_wt=None,
+            immediate_outcome=outcome,
             base_sha='deadbeef' * 5,
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=outcome,
             already_delivered=already_delivered,
         )
         return req, item
@@ -1656,7 +1663,7 @@ class TestSingleHostSerialByteIdentical:
         RED: old loop never writes self._n_failed → stays False after conflict.
         GREEN: step-16 restructured loop → _finalize_inflight sets self._n_failed=True.
         """
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import DecidedItem
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -1664,14 +1671,11 @@ class TestSingleHostSerialByteIdentical:
         req = _make_request('nf-conflict', 'nf-conflict', git_ops.project_root, config)
         conflict_outcome = MergeOutcome('conflict', reason='merge conflict')
 
-        token = SpeculativeItem(
+        token = DecidedItem(
             request=req,
-            merge_result=None,
-            merge_wt=None,
+            immediate_outcome=conflict_outcome,
             base_sha='deadbeef',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=conflict_outcome,
             already_delivered=False,
         )
 
@@ -2499,7 +2503,7 @@ class TestStopDrainsInflight:
         GREEN (step-24): stop() cancels each verify_task, resolves each
         pending req.result with the shutdown outcome.
         """
-        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult, SpeculativeItem
+        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult, RealMergeItem
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -2520,27 +2524,25 @@ class TestStopDrainsInflight:
         verify_task_a = asyncio.ensure_future(_gated_verify_a())
         verify_task_b = asyncio.ensure_future(_gated_verify_b())
 
-        # Build two fake SpeculativeItems with fresh futures.
+        # Build two fake RealMergeItems with fresh futures.
         req_a = _make_request('stop-a', 'task/stop-a', git_ops.project_root, config)
         req_b = _make_request('stop-b', 'task/stop-b', git_ops.project_root, config)
 
         wt_a = git_ops.project_root / '.worktrees' / 'stop-a'
         wt_b = git_ops.project_root / '.worktrees' / 'stop-b'
-        item_a = SpeculativeItem(
+        item_a = RealMergeItem(
             request=req_a,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt_a),
             merge_wt=wt_a,
             base_sha='aaa',
             speculative=False,
-            skip_verify=False,
         )
-        item_b = SpeculativeItem(
+        item_b = RealMergeItem(
             request=req_b,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt_b),
             merge_wt=wt_b,
             base_sha='bbb',
             speculative=False,
-            skip_verify=False,
         )
 
         entry_a = InflightEntry(
@@ -2590,7 +2592,7 @@ class TestStopDrainsInflight:
         RED: tasks remain running after stop() (not cancelled).
         GREEN (step-24): tasks are cancelled by stop().
         """
-        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult, SpeculativeItem
+        from orchestrator.merge_queue import DecidedItem, InflightEntry, InflightVerifyResult
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -2604,14 +2606,11 @@ class TestStopDrainsInflight:
 
         verify_task = asyncio.ensure_future(_blocking_verify())
         req = _make_request('stop-ct', 'task/stop-ct', git_ops.project_root, config)
-        item = SpeculativeItem(
+        item = DecidedItem(
             request=req,
-            merge_result=None,
-            merge_wt=None,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
             base_sha='ccc',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         entry = InflightEntry(
             item=item,
@@ -2643,21 +2642,18 @@ class TestStopDrainsInflight:
         RED: _redispatch items are not drained; their futures stay pending.
         GREEN (step-24): _redispatch drained + futures resolved.
         """
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import DecidedItem
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
         worker._shutdown_timeout = 0.5
 
         req = _make_request('stop-rd', 'task/stop-rd', git_ops.project_root, config)
-        item = SpeculativeItem(
+        item = DecidedItem(
             request=req,
-            merge_result=None,
-            merge_wt=None,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
             base_sha='ddd',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         worker._redispatch.append(item)
 
@@ -2694,7 +2690,7 @@ class TestSnapshotInflight:
         RED: second item's task_id ('snap-b') NOT in entries.
         GREEN: both 'snap-a' and 'snap-b' in entries (with state 'verifying').
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import DecidedItem, InflightEntry
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -2702,23 +2698,17 @@ class TestSnapshotInflight:
         req_a = _make_request('snap-a', 'task/snap-a', git_ops.project_root, config)
         req_b = _make_request('snap-b', 'task/snap-b', git_ops.project_root, config)
 
-        item_a = SpeculativeItem(
+        item_a = DecidedItem(
             request=req_a,
-            merge_result=None,
-            merge_wt=None,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
             base_sha='aaa',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
-        item_b = SpeculativeItem(
+        item_b = DecidedItem(
             request=req_b,
-            merge_result=None,
-            merge_wt=None,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
             base_sha='bbb',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
 
         entry_a = InflightEntry(
@@ -2771,20 +2761,17 @@ class TestSnapshotInflight:
 
         GREEN both before and after step-24 (byte-identical oracle).
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import DecidedItem, InflightEntry
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
 
         req = _make_request('snap-sh', 'task/snap-sh', git_ops.project_root, config)
-        item = SpeculativeItem(
+        item = DecidedItem(
             request=req,
-            merge_result=None,
-            merge_wt=None,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
             base_sha='aaa',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         entry = InflightEntry(
             item=item,
@@ -2821,7 +2808,7 @@ class TestSnapshotInflight:
         After step-24, verify_in_progress must still come from _verify_item
         (back-compat); additional _inflight entries appear only in 'entries'.
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import DecidedItem, InflightEntry
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -2829,15 +2816,15 @@ class TestSnapshotInflight:
         req_a = _make_request('snap-vip-a', 'task/snap-vip-a', git_ops.project_root, config)
         req_b = _make_request('snap-vip-b', 'task/snap-vip-b', git_ops.project_root, config)
 
-        item_a = SpeculativeItem(
-            request=req_a, merge_result=None, merge_wt=None,
-            base_sha='aaa', speculative=False, skip_verify=False,
+        item_a = DecidedItem(
+            request=req_a,
             immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
+            base_sha='aaa', speculative=False,
         )
-        item_b = SpeculativeItem(
-            request=req_b, merge_result=None, merge_wt=None,
-            base_sha='bbb', speculative=False, skip_verify=False,
+        item_b = DecidedItem(
+            request=req_b,
             immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
+            base_sha='bbb', speculative=False,
         )
         entry_a = InflightEntry(
             item=item_a, lease=None, verify_task=None, merge_wt=None,
@@ -2889,7 +2876,7 @@ class TestFinalizeInflightWarmResultsThreading:
         filename: str,
         content: str,
     ):
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -2906,14 +2893,16 @@ class TestFinalizeInflightWarmResultsThreading:
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
+        # A successful merge always has a worktree; RealMergeItem.merge_wt is
+        # required non-None (task ο), so narrow explicitly (mirrors merge_queue.py).
+        assert merge_result.merge_worktree is not None
         base_sha = await git_ops.get_main_sha()
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
         return req, item
 
@@ -3235,7 +3224,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         content: str,
     ):
         """Create a merged SpeculativeItem on the given branch."""
-        from orchestrator.merge_queue import SpeculativeItem
+        from orchestrator.merge_queue import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
         loop = asyncio.get_running_loop()
@@ -3252,14 +3241,16 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
+        # A successful merge always has a worktree; RealMergeItem.merge_wt is
+        # required non-None (task ο), so narrow explicitly (mirrors merge_queue.py).
+        assert merge_result.merge_worktree is not None
         base_sha = await git_ops.get_main_sha()
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
         return req, item
 
@@ -3494,7 +3485,7 @@ class TestStopDrainFiresRemoteCancel:
              → remote_cancels_while_live stays [].
         GREEN (step-2): _abort_remote_verify fires while live=True → [1].
         """
-        from orchestrator.merge_queue import InflightEntry, SpeculativeItem
+        from orchestrator.merge_queue import DecidedItem, InflightEntry
         from orchestrator.verify_runner import HostLease
 
         gate_release = asyncio.Event()
@@ -3513,14 +3504,11 @@ class TestStopDrainFiresRemoteCancel:
             'stop-rc-remote', 'task/stop-rc-remote',
             git_ops.project_root, config,
         )
-        item_remote = SpeculativeItem(
+        item_remote = DecidedItem(
             request=req_remote,
-            merge_result=None,
-            merge_wt=None,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
             base_sha='abc',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         # Start run_merge_verify so the id is live (gate_entered set, awaits release).
         verify_task = asyncio.ensure_future(
@@ -3550,14 +3538,11 @@ class TestStopDrainFiresRemoteCancel:
             'stop-rc-local', 'task/stop-rc-local',
             git_ops.project_root, config,
         )
-        item_local = SpeculativeItem(
+        item_local = DecidedItem(
             request=req_local,
-            merge_result=None,
-            merge_wt=None,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
             base_sha='def',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
         )
         verify_task_local = asyncio.ensure_future(asyncio.sleep(999))
         entry_local = InflightEntry(

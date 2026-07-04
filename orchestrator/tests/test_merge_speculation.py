@@ -73,7 +73,7 @@ from orchestrator.merge_queue import (  # noqa: F401
     InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
-    SpeculativeItem,
+    RealMergeItem,
     SpeculativeMergeWorker,
     _acquire_warm_verify_worktree,
     _maybe_run_drift_check,
@@ -663,8 +663,8 @@ def _make_spec_item(
     cfg: OrchestratorConfig,
     *,
     speculative: bool = True,
-) -> SpeculativeItem:
-    """Build a minimal SpeculativeItem for _run_inflight_verify tests.
+) -> RealMergeItem:
+    """Build a minimal RealMergeItem for _run_inflight_verify tests.
 
     Uses a real asyncio.Future for ``req.result`` so ``_request_abandoned``
     (which checks ``.cancelled()``) returns False — preventing the abort path.
@@ -679,13 +679,12 @@ def _make_spec_item(
     merge_wt = tmp_path / '_merge-abc'
     merge_wt.mkdir(parents=True, exist_ok=True)
 
-    return SpeculativeItem(
+    return RealMergeItem(
         request=fake_req,
         merge_result=MagicMock(merge_commit='deadbeef01234567890a'),
         merge_wt=merge_wt,
         base_sha='aabbccdd00000000aaaa',
         speculative=speculative,
-        skip_verify=False,
     )
 
 
@@ -1049,7 +1048,7 @@ def _make_b9_worker(tmp_path: Path) -> tuple[SpeculativeMergeWorker, MagicMock]:
 
 
 def _build_entry(
-    item: SpeculativeItem,
+    item: RealMergeItem,
     vr: InflightVerifyResult,
     *,
     merge_wt: Path,
@@ -2499,8 +2498,11 @@ class TestLateArrivalGuards:
     (b) DEPTH-K: with K=2, the speculation slot returns to K after the attach
         path completes — no permit leak, merger never double-acquires.
 
-    (c) task-1724: the attached late arrival B carries skip_verify=False in its
-        SpeculativeItem — never silently skips the merge gate.
+    (c) task-1724: the attached late arrival B is a RealMergeItem — it always
+        undergoes real verification, never silently skips the merge gate (the
+        old skip_verify=False field was retired by task ο; a DecidedItem,
+        which the standard speculative merge path never constructs, would be
+        the only way to bypass verify now).
 
     (d) K=1 sanity: with speculation_depth=1, the late-arrival attach still
         works (B attaches to A's commit, verifies, lands) and at most one
@@ -2699,12 +2701,14 @@ class TestLateArrivalGuards:
     async def test_attached_late_arrival_skip_verify_false(
         self, spec_git_repo: Path,
     ) -> None:
-        """task-1724 guard: the late-arrival attached SpeculativeItem carries skip_verify=False.
+        """task-1724 guard: the late-arrival attached item is a RealMergeItem.
 
-        The pending_spec_base ATTACH path creates B's SpeculativeItem via the
-        standard speculative merge path in _merger_loop (:7146) which always sets
-        skip_verify=False (task-1724 invariant).  This test asserts that directly
-        by capturing the SpeculativeItem from the verifier queue.
+        The pending_spec_base ATTACH path creates B's item via the standard
+        speculative merge path in _merger_loop (:7146), which always produces a
+        RealMergeItem (task-1724 invariant: verify is never skipped). This test
+        asserts that directly by capturing B's item from the verifier queue and
+        checking its variant — the old skip_verify=False field was retired by
+        task ο in favor of this structural guarantee.
         """
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -2770,22 +2774,22 @@ class TestLateArrivalGuards:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        # Find the SpeculativeItem for B in captured queue items.
-        from orchestrator.merge_queue import SpeculativeItem as _SI
+        # Find B's item in captured queue items — it must be a RealMergeItem,
+        # proving a real verify always runs for the standard speculative merge
+        # path (task-1724 guard). The old skip_verify=False field check is
+        # retired by task ο: RealMergeItem has no skip_verify field at all,
+        # since a RealMergeItem structurally always undergoes verification
+        # (only a DecidedItem — never constructed by this path — would skip it).
+        from orchestrator.merge_queue import RealMergeItem
         b_items = [
             item for item in captured_items
-            if isinstance(item, _SI) and item.request.task_id == 'sv7-b'
+            if isinstance(item, RealMergeItem) and item.request.task_id == 'sv7-b'
         ]
         assert b_items, (
-            'No SpeculativeItem for B found in verifier queue captures; '
+            'No RealMergeItem for B found in verifier queue captures (expected the '
+            'standard speculative merge path to always produce a RealMergeItem, '
+            'never a DecidedItem skip-verify passthrough); '
             f'captured: {captured_items!r}'
-        )
-        b_item = b_items[0]
-        assert b_item.skip_verify is False, (
-            f'task-1724 guard: attached late arrival B must carry skip_verify=False; '
-            f'got skip_verify={b_item.skip_verify!r}.\n'
-            'The ATTACH path uses the standard speculative merge (:7146) which '
-            'unconditionally sets skip_verify=False (task-1724 invariant).'
         )
 
     async def test_k1_sanity_late_arrival_attaches(self, spec_git_repo: Path) -> None:

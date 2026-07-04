@@ -53,6 +53,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.merge_queue import (
     PersistentWorktreeConfigError,
+    SpeculativeItem,
     SpeculativeMergeWorker,
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
@@ -1288,7 +1289,7 @@ class TestUnreachableHostCapstone:
             InflightStatus,
             InflightVerifyResult,
             MergeRequest,
-            SpeculativeItem,
+            RealMergeItem,
         )
         from orchestrator.verify_runner import HostLease
 
@@ -1323,13 +1324,12 @@ class TestUnreachableHostCapstone:
             fake_runner.name = host_name
             fake_runner.is_local = False
             lease = HostLease(name=host_name, runner=fake_runner, is_local=False)
-            item = SpeculativeItem(
+            item = RealMergeItem(
                 request=req,
                 merge_result=MagicMock(merge_commit='abc123'),
                 merge_wt=MagicMock(),
                 base_sha='base',
                 speculative=False,
-                skip_verify=False,
             )
 
             async def _ru_verify():

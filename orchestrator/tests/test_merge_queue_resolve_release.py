@@ -37,9 +37,11 @@ from test_merge_queue_concurrent_verify import (
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
+    DecidedItem,
     InflightEntry,
     MergeOutcome,
     MergeRequest,
+    RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
 )
@@ -132,20 +134,23 @@ async def _make_real_merged_item(
     content: str,
     *,
     speculative: bool,
-) -> tuple[MergeRequest, SpeculativeItem]:
-    """Build a real merged SpeculativeItem backed by a disk `_merge-*` worktree."""
+) -> tuple[MergeRequest, RealMergeItem]:
+    """Build a real merged RealMergeItem backed by a disk `_merge-*` worktree."""
     worktree = await _make_branch_with_file(git_ops, branch, filename, content)
     req = _make_request(branch, branch, worktree, config)
     merge_result = await git_ops.merge_to_main(worktree, branch)
     assert merge_result.success
     base_sha = await git_ops.get_main_sha()
-    item = SpeculativeItem(
+    # A successful merge always has a worktree; RealMergeItem.merge_wt is
+    # required non-None (task ο), so narrow explicitly (mirrors the production
+    # call sites in merge_queue.py, e.g. _do_merge/_remerge).
+    assert merge_result.merge_worktree is not None
+    item = RealMergeItem(
         request=req,
         merge_result=merge_result,
         merge_wt=merge_result.merge_worktree,
         base_sha=base_sha,
         speculative=speculative,
-        skip_verify=False,
     )
     return req, item
 
@@ -517,20 +522,17 @@ class TestDispatchErrorChokepoint:
 
 def _make_decided_item_and_entry(
     req: MergeRequest, *, was_speculative: bool,
-) -> tuple[SpeculativeItem, InflightEntry]:
-    """Build a DECIDED SpeculativeItem (immediate_outcome set, no real merge)
+) -> tuple[DecidedItem, InflightEntry]:
+    """Build a DECIDED DecidedItem (immediate_outcome set, no real merge)
     and its passthrough InflightEntry (verify_task=None, lease=None,
     merge_wt=None) — the shape _dispatch_item returns for conflict /
     already_merged / skip_verify items.
     """
     immediate_outcome = MergeOutcome('blocked', reason='decided-elsewhere')
-    item = SpeculativeItem(
+    item = DecidedItem(
         request=req,
-        merge_result=None,
-        merge_wt=None,
         base_sha='abc123',
         speculative=was_speculative,
-        skip_verify=False,
         immediate_outcome=immediate_outcome,
     )
     entry = InflightEntry(

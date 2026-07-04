@@ -22,10 +22,10 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
+    DecidedItem,
     InflightEntry,
     MergeOutcome,
     MergeRequest,
-    SpeculativeItem,
     SpeculativeMergeWorker,
 )
 
@@ -429,14 +429,11 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
         result=future,
     )
 
-    # Build a minimal SpeculativeItem
-    item = SpeculativeItem(
+    # Build a minimal DecidedItem
+    item = DecidedItem(
         request=req,
-        merge_result=None,
-        merge_wt=None,
         base_sha='abc123dead',
         speculative=False,
-        skip_verify=False,
         immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
     )
 

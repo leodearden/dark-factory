@@ -22,7 +22,7 @@ from orchestrator.merge_queue import (
     InflightEntry,
     MergeMetrics,
     MergeRequest,
-    SpeculativeItem,
+    RealMergeItem,
     SpeculativeMergeWorker,
 )
 
@@ -377,7 +377,7 @@ class TestWiringIntegration:
         branch: str,
         filename: str,
         content: str,
-    ) -> tuple[MergeRequest, SpeculativeItem]:
+    ) -> tuple[MergeRequest, RealMergeItem]:
         """Create a branch with a committed file, merge it, return (req, item)."""
         worktree = (await git_ops.create_worktree(branch)).path
         (worktree / filename).write_text(content)
@@ -386,6 +386,7 @@ class TestWiringIntegration:
         assert merge_result.success and merge_result.merge_commit, (
             f'merge_to_main failed: {merge_result!r}'
         )
+        assert merge_result.merge_worktree is not None
         base_sha = await git_ops.get_main_sha()
         req = MergeRequest(
             task_id=branch,
@@ -398,17 +399,16 @@ class TestWiringIntegration:
             result=asyncio.get_running_loop().create_future(),
             lane='normal',
         )
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
         return req, item
 
-    def _make_pass_entry(self, item: SpeculativeItem) -> InflightEntry:
+    def _make_pass_entry(self, item: RealMergeItem) -> InflightEntry:
         """Build an InflightEntry representing a completed, passing verify."""
         return InflightEntry(
             item=item,
