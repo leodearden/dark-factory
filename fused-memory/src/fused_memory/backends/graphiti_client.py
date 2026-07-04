@@ -435,6 +435,16 @@ class GraphitiBackend:
         """
         driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
         try:
+            # Tradeoff: limit=None fetches the group's ENTIRE episode set on every
+            # call (no Cypher LIMIT), then we sort/truncate in Python. This is what
+            # makes the created_at ordering correct given that get_by_group_ids'
+            # own ORDER BY uuid DESC LIMIT truncates on the wrong key before we'd
+            # ever see the data. Acceptable today because episode reads are a cold
+            # path and per-project episode counts are bounded (reconciliation GC;
+            # last_n is separately capped at 1000 in tools.py). If per-group episode
+            # volume grows large, revisit with a created_at-indexed Cypher query
+            # (``ORDER BY e.created_at DESC LIMIT $limit``) to push the bound into
+            # the DB instead of transferring+sorting the full set here.
             episodes = await asyncio.wait_for(
                 EpisodicNode.get_by_group_ids(
                     driver, group_ids, limit=None
