@@ -950,6 +950,17 @@ class MemoryService:
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
 
+        # Server-side recon_pool auto-tag (task 2077): recon_pool is the only
+        # key the pool-cap trim and ops prune script filter on, and relying on
+        # LLM prompt compliance to set it has empirically failed (untagged
+        # cycle_summary piles regrow unbounded). Derive it authoritatively
+        # from metadata.stage when known; when stage is missing/unknown, leave
+        # any caller-supplied recon_pool untouched (cannot infer, must not
+        # clobber).
+        inferred_recon_pool = _infer_recon_pool(meta)
+        if inferred_recon_pool is not None:
+            meta['recon_pool'] = inferred_recon_pool
+
         write_graphiti = (
             resolved_category in GRAPHITI_PRIMARY or dual_write
         )
