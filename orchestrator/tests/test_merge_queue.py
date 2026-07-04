@@ -17591,28 +17591,28 @@ class TestSMWGenerationChain:
     """Unit tests for SpeculativeMergeWorker γ2 generation-chain wiring (step-15 RED / step-16 GREEN)."""
 
     async def test_speculative_item_has_merged_branch_tip(self) -> None:
-        """(a) SpeculativeItem can carry merged_branch_tip (default None)."""
-        item = SpeculativeItem(
+        """(a) RealMergeItem can carry merged_branch_tip (default None).
+
+        merged_branch_tip is a RealMergeItem-only field (task ο); a DecidedItem
+        has no such field at all, so this is exercised on the REAL variant.
+        """
+        item = RealMergeItem(
             request=MagicMock(),
-            merge_result=None,
-            merge_wt=None,
+            merge_result=MagicMock(),
+            merge_wt=MagicMock(),
             base_sha='base',
             speculative=False,
-            skip_verify=False,
-            immediate_outcome=MergeOutcome('blocked'),
         )
         assert hasattr(item, 'merged_branch_tip')
         assert item.merged_branch_tip is None
         # Can be set explicitly
-        item2 = SpeculativeItem(
+        item2 = RealMergeItem(
             request=MagicMock(),
-            merge_result=None,
-            merge_wt=None,
+            merge_result=MagicMock(),
+            merge_wt=MagicMock(),
             base_sha='base',
             speculative=False,
-            skip_verify=False,
             merged_branch_tip='T1',
-            immediate_outcome=MergeOutcome('blocked'),
         )
         assert item2.merged_branch_tip == 'T1'
 
@@ -17656,7 +17656,7 @@ class TestSMWGenerationChain:
             result=fut,
         )
         merge_commit_sha = 'merge-commit-smw'
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=MagicMock(
                 success=True,
@@ -17668,7 +17668,6 @@ class TestSMWGenerationChain:
             merge_wt=tmp_path / 'merge-wt',
             base_sha='base-sha',
             speculative=False,
-            skip_verify=False,
             started_monotonic=None,
             merged_branch_tip='T1',
         )
@@ -18962,7 +18961,6 @@ class TestSoftCancelMidVerify:
             merge_wt=merge_result.merge_worktree,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         async def _finalize_detach_and_done(*_args, **_kwargs):
@@ -19050,13 +19048,12 @@ class TestSoftCancelMidVerify:
             queue, req, None, registry, retention=retention,
         )
 
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_wt_path,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         verify_started = asyncio.Event()
@@ -19224,7 +19221,6 @@ class TestSoftCancelMidVerify:
             merge_wt=merge_result.merge_worktree,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         # Pre-cancel via detach; _on_finalized callback records retention 'abandoned'.
@@ -19290,7 +19286,6 @@ class TestSoftCancelMidVerify:
             merge_wt=merge_result.merge_worktree,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         # Pre-cancel via detach; _on_finalized callback records retention 'abandoned'.
@@ -20056,13 +20051,12 @@ class TestOperatorHalt:
         worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
 
         req = _make_request('op-halt', 'op-halt', wt, config)
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_wt_path,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         verify_started = asyncio.Event()
@@ -20149,13 +20143,12 @@ class TestOperatorHalt:
         worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
 
         req = _make_request('wip-noabort', 'wip-noabort', wt, config)
-        item = SpeculativeItem(
+        item = RealMergeItem(
             request=req,
             merge_result=merge_result,
             merge_wt=merge_wt_path,
             base_sha=pre_merge_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         verify_started = asyncio.Event()
@@ -21726,11 +21719,11 @@ class TestSnapshotInflightCollection:
         fake_runner = MagicMock()
 
         req_a = _make_request('snap-a', 'snap-a', wt, config)
-        item_a = SpeculativeItem(
+        item_a = RealMergeItem(
             request=req_a,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt / 'a'),
             merge_wt=wt / 'a',
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         lease_local = HostLease(name='local', runner=fake_runner, is_local=True)
         entry_a = InflightEntry(
@@ -21740,11 +21733,11 @@ class TestSnapshotInflightCollection:
         )
 
         req_b = _make_request('snap-b', 'snap-b', wt, config)
-        item_b = SpeculativeItem(
+        item_b = RealMergeItem(
             request=req_b,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt / 'b'),
             merge_wt=wt / 'b',
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         lease_remote = HostLease(name='laptop', runner=fake_runner, is_local=False)
         entry_b = InflightEntry(
@@ -21793,10 +21786,10 @@ class TestSnapshotInflightCollection:
         wt.mkdir()
 
         req_stale = _make_request('phantom', 'phantom', wt, config)
-        item_stale = SpeculativeItem(
-            request=req_stale, merge_result=None, merge_wt=None,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+        item_stale = DecidedItem(
+            request=req_stale,
             immediate_outcome=MergeOutcome('blocked'),
+            base_sha='dead' * 10, speculative=False,
         )
         worker._verify_item = item_stale   # stale, never cleared -- the gamma latent bug
         worker._verify_phase = 'verifying'
@@ -21833,11 +21826,11 @@ class TestSnapshotInflightCollection:
         fake_runner = MagicMock()
 
         req_head = _make_request('head-task', 'head-task', wt, config)
-        item_head = SpeculativeItem(
+        item_head = RealMergeItem(
             request=req_head,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
             merge_wt=wt,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         entry_head = InflightEntry(
             item=item_head,
@@ -21847,11 +21840,11 @@ class TestSnapshotInflightCollection:
         )
 
         req_second = _make_request('second-task', 'second-task', wt, config)
-        item_second = SpeculativeItem(
+        item_second = RealMergeItem(
             request=req_second,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
             merge_wt=wt,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         entry_second = InflightEntry(
             item=item_second,
@@ -21995,11 +21988,11 @@ class TestHeartbeatOccupancy:
         worker._host_allocator = HostAllocator([fake_remote])
 
         req_a = _make_request('hb-local', 'hb-local', wt, config)
-        item_a = SpeculativeItem(
+        item_a = RealMergeItem(
             request=req_a,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
             merge_wt=wt,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         entry_a = InflightEntry(
             item=item_a,
@@ -22009,11 +22002,11 @@ class TestHeartbeatOccupancy:
         )
 
         req_b = _make_request('hb-laptop', 'hb-laptop', wt, config)
-        item_b = SpeculativeItem(
+        item_b = RealMergeItem(
             request=req_b,
             merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
             merge_wt=wt,
-            base_sha='dead' * 10, speculative=False, skip_verify=False,
+            base_sha='dead' * 10, speculative=False,
         )
         entry_b = InflightEntry(
             item=item_b,
@@ -22097,6 +22090,7 @@ class TestEntryPhaseDuringFinalize:
         )
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
+        assert merge_result.merge_worktree is not None
 
         base_sha = await git_ops.get_main_sha()
         item = RealMergeItem(
@@ -22105,7 +22099,6 @@ class TestEntryPhaseDuringFinalize:
             merge_wt=merge_result.merge_worktree,
             base_sha=base_sha,
             speculative=False,
-            skip_verify=False,
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
