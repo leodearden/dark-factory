@@ -1217,6 +1217,14 @@ class Harness:
             # Halts dispatch when landing-rate==0 AND disk is shrinking.
             self._start_no_landings_breaker()
 
+            # 1c1e1. Start periodic deterministic-strand reconciliation sweep
+            # (task 2074). Recovers deterministic gate/deploy tasks stranded
+            # BLOCKED by a past occurrence (task 2059) and re-validates
+            # already-open deterministic-deploy escalations against live
+            # systemd unit state. Defensive/non-blocking; does not touch
+            # DeterministicRunner's own new-strand hardening (task 2066).
+            self._start_deterministic_recon_sweep()
+
             # 1c1f. Start warm-lane auto-GC cadence loop (task 1926).
             # Periodically invokes _run_warm_lane_gc_reclaim() to bound FREE
             # _lane-*/_spec-* target/ re-accretion independent of acquire
@@ -1597,6 +1605,10 @@ class Harness:
                 await self._stop_main_tip_sweep()
             except Exception as e:
                 logger.warning(f'_stop_main_tip_sweep() failed: {e}')
+            try:
+                await self._stop_deterministic_recon_sweep()
+            except Exception as e:
+                logger.warning(f'_stop_deterministic_recon_sweep() failed: {e}')
             try:
                 await self._stop_no_landings_breaker()
             except Exception as e:
@@ -7032,6 +7044,69 @@ Output JSON matching the schema. Every task must appear in the output.
                     'for escalation %s: %s: %s',
                     esc.id, type(exc).__name__, exc,
                 )
+
+    def _start_deterministic_recon_sweep(self) -> None:
+        """Start the periodic deterministic-strand reconciliation sweep.
+
+        Mirrors _start_main_tip_sweep: a long-lived asyncio.Task wakes every
+        ``deterministic_recon_sweep_interval_secs`` and runs
+        ``_run_deterministic_recon_sweep`` — recovering absent-escalation
+        strands (task 2059 shape) and re-validating open deterministic-deploy
+        escalations against live systemd unit state.
+        """
+        if not self.config.deterministic_recon_sweep_enabled:
+            return
+        if (
+            self._deterministic_recon_sweep_task is not None
+            and not self._deterministic_recon_sweep_task.done()
+        ):
+            return
+        self._deterministic_recon_sweep_task = asyncio.create_task(
+            self._deterministic_recon_sweep_loop(),
+            name='deterministic-recon-sweep',
+        )
+        logger.info(
+            'Deterministic-strand reconciliation sweep started (interval=%.0fs)',
+            self.config.deterministic_recon_sweep_interval_secs,
+        )
+
+    async def _stop_deterministic_recon_sweep(self) -> None:
+        """Cancel the deterministic-strand reconciliation sweep loop."""
+        if self._deterministic_recon_sweep_task is not None:
+            self._deterministic_recon_sweep_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._deterministic_recon_sweep_task
+            self._deterministic_recon_sweep_task = None
+            logger.info('Deterministic-strand reconciliation sweep stopped')
+
+    async def _deterministic_recon_sweep_loop(self) -> None:
+        """Wake periodically and run the deterministic-recon-sweep pass.
+
+        Failure handling mirrors _main_tip_sweep_loop (task 1907): a failed
+        pass is logged as a one-line summary (exc type + message) — NOT via
+        ``logger.exception`` — and every iteration sleeps at least
+        ``_BG_LOOP_FAILURE_BACKOFF_SECS`` on the failure path so a pass that
+        fails immediately can never tight-spin and starve the event loop.
+        """
+        interval = self.config.deterministic_recon_sweep_interval_secs
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._run_deterministic_recon_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Bounded, traceback-free summary — see docstring.
+                logger.error(
+                    'Deterministic-strand reconciliation sweep pass failed: %s: %s',
+                    type(exc).__name__,
+                    exc,
+                )
+                # Backoff guarantee: a fixed, always-numeric quiescent gap so
+                # the loop cannot spin even if the failure surfaced before the
+                # loop's own ``asyncio.sleep``. CancelledError propagates out
+                # of this sleep to stop the loop.
+                await asyncio.sleep(_BG_LOOP_FAILURE_BACKOFF_SECS)
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""

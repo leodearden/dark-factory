@@ -221,6 +221,7 @@ def _neutralise_heavy_startup(harness: Harness) -> None:
     harness._start_main_tip_sweep = MagicMock()
     harness._start_no_landings_breaker = MagicMock()  # task 1918 loop
     harness._start_warm_lane_gc = MagicMock()  # task 1926 loop — neutralised
+    harness._start_deterministic_recon_sweep = MagicMock()  # task 2074 loop — neutralised
     harness._tag_task_modules = AsyncMock()
     harness._recover_crashed_tasks = AsyncMock()
     harness._reconcile_stranded_in_progress = AsyncMock(return_value=0)
