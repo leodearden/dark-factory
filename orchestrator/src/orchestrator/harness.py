@@ -267,6 +267,52 @@ def _is_valid_sha_40(s: object) -> TypeGuard[str]:
     )
 
 
+def _deterministic_deploy_health_verdict(inspect_result: dict | None) -> str:
+    """Classify a systemd unit-inspector result as 'healthy' or 'unconfirmed'.
+
+    'healthy' iff MainPID is a positive int AND ActiveState == 'active' — a
+    conservative liveness signal (task 2074 design decision: brittle
+    wall-clock ActiveEnterTimestamp comparison is deliberately avoided; the
+    escalation still routes through the existing watcher/human path for final
+    adjudication).  None-safe: a missing/malformed result is 'unconfirmed'.
+    """
+    if not inspect_result:
+        return 'unconfirmed'
+    pid = inspect_result.get('MainPID', 0)
+    if isinstance(pid, int) and pid > 0 and inspect_result.get('ActiveState') == 'active':
+        return 'healthy'
+    return 'unconfirmed'
+
+
+async def _recon_inspect_unit(unit: str) -> dict:
+    """Query systemctl for unit state fields needed for the recon-sweep health verdict.
+
+    Standalone duplicate of ``DeterministicRunner._default_inspect_unit``'s
+    ``systemctl --user show`` pattern — NOT imported from the runner (task 2074
+    does not modify deterministic_runner.py; the runner's inspector is a
+    private bound method requiring an instance).  Returns a dict with at least
+    MainPID (int) and ActiveState (str); MainPID defaults to 0 on parse failure.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        'systemctl', '--user', 'show', unit,
+        '-p', 'MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    result: dict = {}
+    for line in (stdout or b'').decode(errors='replace').splitlines():
+        if '=' in line:
+            key, _, val = line.partition('=')
+            result[key.strip()] = val.strip()
+    for numeric_field in ('MainPID', 'ActiveEnterTimestampMonotonic'):
+        try:
+            result[numeric_field] = int(result.get(numeric_field, 0))
+        except (TypeError, ValueError):
+            result[numeric_field] = 0
+    return result
+
+
 def _acquire_project_lock(project_root: Path) -> IO:
     """Acquire an exclusive flock on a per-project lockfile.
 
@@ -799,6 +845,17 @@ class Harness:
         # Last main SHA successfully swept; used to skip the expensive full
         # verify when main has not advanced since the previous pass.
         self._last_swept_main_sha: str | None = None
+
+        # Deterministic-strand reconciliation sweep — task 2074.
+        # Periodic recovery sweep for deterministic gate/deploy tasks stranded
+        # BLOCKED by a past occurrence (task 2059) and re-validation of
+        # already-open deterministic-deploy escalations against live systemd
+        # unit state.  See harness.py's deterministic-recon-sweep section.
+        self._deterministic_recon_sweep_task: asyncio.Task | None = None
+        # Injectable unit-inspector seam (mirrors DeterministicRunner's
+        # constructor-injected unit_inspector); None uses the module-level
+        # default _recon_inspect_unit.  Injected in tests to avoid real systemd.
+        self._recon_unit_inspector = None
 
         # No-landings circuit-breaker — θ=1893, PRD §5.5.
         # Pure detection logic lives in merge_queue.NoLandingsCircuitBreaker;
@@ -6705,6 +6762,28 @@ Output JSON matching the schema. Every task must appear in the output.
             'Main-tip integrity sweep: filed L1 escalation %s for SHA %s (%s)',
             esc.id, swept_sha[:12], vr.category,
         )
+
+    # ------------------------------------------------------------------
+    # Deterministic-strand reconciliation sweep (task 2074)
+    # ------------------------------------------------------------------
+
+    async def _revalidate_deterministic_deploy_health(self, metadata: dict) -> str:
+        """Re-validate a deterministic deploy's target unit against live systemd state.
+
+        Reads ``metadata['before_done']['target_unit']``; returns 'unconfirmed'
+        WITHOUT invoking the inspector when before_done/target_unit is absent
+        (nothing to inspect).  Otherwise awaits the injected
+        ``self._recon_unit_inspector`` (falling back to the module-level
+        ``_recon_inspect_unit`` default) and classifies the result via
+        ``_deterministic_deploy_health_verdict``.
+        """
+        before_done = (metadata or {}).get('before_done')
+        target_unit = before_done.get('target_unit') if isinstance(before_done, dict) else None
+        if not target_unit:
+            return 'unconfirmed'
+        inspect_fn = self._recon_unit_inspector or _recon_inspect_unit
+        result = await inspect_fn(target_unit)
+        return _deterministic_deploy_health_verdict(result)
 
     def _on_escalation(self, escalation) -> None:
         """Callback when any escalation is submitted — wake the waiting workflow/steward."""
