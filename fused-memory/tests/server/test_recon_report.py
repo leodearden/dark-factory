@@ -549,6 +549,239 @@ class TestReconReportReaper:
         evicted = state.tick()
         assert evicted == 2
 
+    def test_partial_eviction_preserves_sig_dedup_for_live_run(self):
+        """A completed Stage-1 entry evicted by tick() must not release the
+        run-level signature dedup key while a sibling stage of the same run
+        is still live (task-2088 / run 33c324b0 double-filing regression).
+
+        Reconciliation runs are multi-stage and long-lived: Stage 1
+        (memory_consolidator) typically files a finding and completes early,
+        while Stage 2/3 + remediation keep the run live for minutes. If the
+        reaper evicts the completed Stage-1 entry once it ages past TTL, the
+        run-level dedup key must survive as long as the run itself is still
+        live — otherwise a later stage re-filing the same (task_id, flag_type)
+        allocates a second finding row instead of getting duplicate_finding.
+        """
+        state, t = self._make_state(ttl=300)
+
+        # Stage 1: file the canonical finding and complete.
+        state.start_report('r1', 'memory_consolidator', 'dark_factory')
+        first = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='cycle summary prune rerun needed',
+            suggested_action='rerun cycle summary prune',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert 'finding_id' in first, f'Stage 1 add_finding failed: {first}'
+        finding_id_a = first['finding_id']
+        state.complete('r1', 'stage 1 done')
+
+        # Stage 2 starts — keeps the run LIVE (this entry never completes).
+        state.start_report('r1', 'task_knowledge_sync', 'dark_factory')
+
+        # Advance past TTL and evict — only Stage 1 (completed) is eligible.
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+        assert state.get_assembled_report('r1', 'memory_consolidator') is None
+
+        # Stage 2 re-files the SAME signature — must be deduped against A,
+        # not allocate a fresh finding_id.
+        second = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='different description, same signature',
+            suggested_action='rerun cycle summary prune',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert second.get('error') == 'duplicate_finding', (
+            f'Expected duplicate_finding but got: {second}'
+        )
+        assert second['error_type'] == 'ReconReportDuplicateFinding'
+        assert second['existing_finding_id'] == finding_id_a
+
+    def test_partial_eviction_keeps_canonical_finding_citable(self):
+        """After a completed Stage-1 entry is evicted while a sibling stage of
+        the same run is still live, the Stage-1 canonical finding must remain
+        resolvable via _resolve_finding — otherwise the duplicate_finding
+        pointer returned to later stages is dangling (task-2088).
+        """
+        state, t = self._make_state(ttl=300)
+
+        state.start_report('r1', 'memory_consolidator', 'dark_factory')
+        first = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='cycle summary prune rerun needed',
+            suggested_action='rerun cycle summary prune',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert 'finding_id' in first, f'Stage 1 add_finding failed: {first}'
+        finding_id_a = first['finding_id']
+        state.complete('r1', 'stage 1 done')
+
+        # Stage 2 starts — keeps the run LIVE.
+        state.start_report('r1', 'task_knowledge_sync', 'dark_factory')
+
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+
+        # The Stage-1 finding must still be resolvable while the run is live.
+        assert state._resolve_finding('r1', finding_id_a) is not None
+
+    def test_full_quiescence_releases_all_run_indices(self):
+        """A multi-stage run whose every stage completes and ages out in a
+        single tick() call must release ALL THREE run-level indices — no
+        cross-run leak once the run is fully quiescent.
+        """
+        state, t = self._make_state(ttl=300)
+
+        state.start_report('r1', 'stage_one', 'dark_factory')
+        first = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='obs one',
+            suggested_action='a',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert 'finding_id' in first, f'Stage 1 add_finding failed: {first}'
+        # complete() targets the run's currently-ACTIVE stage — stamp stage_one
+        # while it is still active, before start_report moves the pointer.
+        state.complete('r1', 'stage 1 done')
+
+        state.start_report('r1', 'stage_two', 'dark_factory')
+        second = state.add_finding(
+            run_id='r1',
+            severity='low',
+            category='informational',
+            description='shared null-null observation',
+            suggested_action='none',
+            actionable=False,
+            task_id=None,
+            flag_type=None,
+        )
+        assert 'finding_id' in second, f'Stage 2 add_finding failed: {second}'
+        state.complete('r1', 'stage 2 done')
+
+        # Both stages complete at the same clock reading; advance past TTL and
+        # evict both in a single tick() call.
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 2
+
+        assert state.get_assembled_report('r1', 'stage_one') is None
+        assert state.get_assembled_report('r1', 'stage_two') is None
+
+        assert 'r1' not in state._run_sig_index
+        assert 'r1' not in state._run_desc_index
+        assert 'r1' not in state._run_finding_index
+
+    def test_partial_eviction_of_one_run_does_not_affect_concurrent_run(self):
+        """Evicting a completed stage of run r1 while r1 is still live must
+        not touch a concurrently-live run r2's dedup indices (task-2088).
+
+        The run-quiescence release path pops indices via ``pop(rid, None)``
+        keyed by run_id; this pins that the release is correctly scoped to
+        the evicting run and never leaks across a sibling run_id that is
+        live at the same time.
+        """
+        state, t = self._make_state(ttl=300)
+
+        # r1: Stage 1 completes (becomes eviction-eligible); Stage 2 starts
+        # and stays in-progress, keeping r1 live.
+        state.start_report('r1', 'memory_consolidator', 'dark_factory')
+        r1_first = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='r1 obs',
+            suggested_action='a',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert 'finding_id' in r1_first, f'r1 Stage 1 add_finding failed: {r1_first}'
+        r1_finding_id = r1_first['finding_id']
+        state.complete('r1', 'r1 stage 1 done')
+        state.start_report('r1', 'task_knowledge_sync', 'dark_factory')
+
+        # r2: a wholly separate, concurrently-live run filing under the SAME
+        # signature — proves the indices are keyed per-run_id, not shared.
+        state.start_report('r2', 'memory_consolidator', 'dark_factory')
+        r2_first = state.add_finding(
+            run_id='r2',
+            severity='moderate',
+            category='task_stale',
+            description='r2 obs',
+            suggested_action='a',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert 'finding_id' in r2_first, f'r2 Stage 1 add_finding failed: {r2_first}'
+        r2_finding_id = r2_first['finding_id']
+        # r2's Stage 1 is left in-progress (no complete()) so r2 is also live
+        # and its entry is not itself eviction-eligible this tick.
+
+        # Advance past TTL and evict — only r1's completed Stage 1 qualifies.
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+        assert state.get_assembled_report('r1', 'memory_consolidator') is None
+
+        # r2's sig index, finding index, and dedup behavior must be entirely
+        # unaffected by r1's partial eviction.
+        assert state._run_sig_index.get('r2', {}).get(
+            ('2077', 'cycle_summary_prune_rerun_needed_post_2077')
+        ) == r2_finding_id
+        assert state._resolve_finding('r2', r2_finding_id) is not None
+        r2_dup = state.add_finding(
+            run_id='r2',
+            severity='moderate',
+            category='task_stale',
+            description='different description, same signature',
+            suggested_action='a',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert r2_dup.get('error') == 'duplicate_finding', (
+            f'Expected r2 dedup unaffected by r1 eviction, got: {r2_dup}'
+        )
+        assert r2_dup['existing_finding_id'] == r2_finding_id
+
+        # r1's own dedup key must also have survived its partial eviction
+        # (covered by the sibling test above; spot-checked here too so this
+        # test stands alone as a complete cross-run regression guard).
+        r1_dup = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='task_stale',
+            description='different description, same signature',
+            suggested_action='a',
+            actionable=True,
+            task_id='2077',
+            flag_type='cycle_summary_prune_rerun_needed_post_2077',
+        )
+        assert r1_dup.get('error') == 'duplicate_finding', (
+            f'Expected r1 dedup to survive its own partial eviction, got: {r1_dup}'
+        )
+        assert r1_dup['existing_finding_id'] == r1_finding_id
+
 
 # ---------------------------------------------------------------------------
 # step-15: FastMCP server factory — RED until step-16
@@ -1257,6 +1490,39 @@ class TestReconReportNullDescDedup:
         # _run_desc_index must not retain r1's hashes
         assert 'r1' not in state._run_desc_index
 
+    def test_partial_eviction_preserves_deschash_dedup_for_live_run(self):
+        """Same partial-eviction scenario as the reaper's signature-path test,
+        but on the null-null description-hash path (task-2088 / run 33c324b0
+        regression): a completed Stage-1 entry evicted by tick() must not
+        release the run-level desc-hash dedup key while a sibling stage of
+        the same run is still live.
+        """
+        state, t = self._make_state(ttl=300)
+
+        # Stage 1: file the canonical null-null finding and complete.
+        state.start_report(run_id='r1', stage='stage_one', project_id='dark_factory')
+        first = self._finding(state, run_id='r1', description='shared observation')
+        assert 'finding_id' in first, f'Stage 1 add_finding failed: {first}'
+        first_id = first['finding_id']
+        state.complete(run_id='r1', summary='stage 1 done')
+
+        # Stage 2 starts — keeps the run LIVE (this entry never completes).
+        state.start_report(run_id='r1', stage='stage_two', project_id='dark_factory')
+
+        # Advance past TTL and evict — only stage_one (completed) is eligible.
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+        assert state.get_assembled_report('r1', 'stage_one') is None
+
+        # Stage 2 re-files the SAME description — must be deduped against
+        # first_id, not allocate a fresh finding_id.
+        second = self._finding(state, run_id='r1', description='shared observation')
+        assert second.get('error') == 'duplicate_finding', (
+            f'Expected duplicate_finding but got: {second}'
+        )
+        assert second['existing_finding_id'] == first_id
+
     def test_empty_description_both_allocate(self):
         """Blank or whitespace-only descriptions normalize to '' — each allocates
         independently (no dedup key) rather than collapsing into one row.
@@ -1287,9 +1553,13 @@ class TestReconReportNullDescDedup:
 
     def test_eviction_partial_run_canonical_stage_cleared(self):
         """Stage 1 holds the canonical finding; stage 2 dedups against it.
-        When stage 1 is evicted via tick(), the desc index entry must be cleaned
-        up correctly — the cleanup guard must not leave the hash dangling just
-        because another stage of the same run referenced it via duplicate_finding.
+
+        While the run is still live (stage_two in-progress), evicting
+        stage_one via tick() must PRESERVE the run-level desc index —
+        releasing it early would let a later stage double-file the same
+        description (task-2088 / run 33c324b0 regression). Only once the run
+        reaches full quiescence (every entry evicted) must the run-level
+        indices be released.
         """
         state, t = self._make_state(ttl=300)
 
@@ -1321,10 +1591,27 @@ class TestReconReportNullDescDedup:
         # Stage 2 entry still exists (not completed → not eligible for eviction)
         assert state.get_assembled_report('r1', 'stage_two') is not None
 
-        # _run_desc_index must NOT retain r1's hash after stage_one is evicted.
-        # The cleanup guard (guard against removing a hash a later entry re-registered)
-        # must not block the delete here, since stage_two never registered any hash.
+        # Run is still LIVE (stage_two in-progress) — the run-level desc
+        # index must be PRESERVED, not torn down just because stage_one
+        # evicted, and dedup against the canonical finding must still fire.
+        assert 'r1' in state._run_desc_index
+        still_dup = self._finding(state, run_id='r1', description='shared observation')
+        assert still_dup.get('error') == 'duplicate_finding', (
+            f'Expected dedup to survive partial eviction, got: {still_dup}'
+        )
+        assert still_dup['existing_finding_id'] == first_id
+
+        # Now bring the run to full quiescence: complete stage_two and evict it.
+        state.complete(run_id='r1', summary='stage 2 done')
+        t[0] = 602.0
+        evicted_2 = state.tick()
+        assert evicted_2 == 1, f'Expected 1 eviction, got {evicted_2}'
+        assert state.get_assembled_report('r1', 'stage_two') is None
+
+        # Full quiescence — the run-level indices must now be released.
         assert 'r1' not in state._run_desc_index
+        assert 'r1' not in state._run_sig_index
+        assert 'r1' not in state._run_finding_index
 
 
 # ---------------------------------------------------------------------------

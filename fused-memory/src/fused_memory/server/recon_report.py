@@ -164,11 +164,17 @@ class _ReportEntry:
     summary_warnings: list[str] = field(default_factory=list)
     completed_at: float | None = None  # clock() — None when in-progress
     created_at: float = 0.0  # clock() — for diagnostics
-    # in-run dedup: (task_id, flag_type) → finding_id
+    # in-run dedup: (task_id, flag_type) → finding_id.  Mirrors the entries
+    # this ONE stage contributed to the run-scoped ReconReportState._run_sig_index.
+    # Not consulted for eviction teardown: since task-2088, run-level indices
+    # are released wholesale at run quiescence (see ReconReportState.tick()),
+    # not by walking this per-entry map — do not resurrect a per-entry loop.
     _signature_to_finding: dict[tuple[str | None, str | None], str] = field(
         default_factory=dict
     )
-    # in-run dedup: description_hash → finding_id (null-null findings only)
+    # in-run dedup: description_hash → finding_id (null-null findings only).
+    # Mirrors this stage's contribution to _run_desc_index; same
+    # run-quiescence-release caveat as _signature_to_finding above.
     _deschash_to_finding: dict[str, str] = field(default_factory=dict)
 
 
@@ -296,7 +302,11 @@ class ReconReportState:
         self._active: dict[str, str] = {}  # run_id → current stage
         # Run-level O(1) indices so add_finding / _resolve_finding avoid scanning
         # all entries across every live run_id.  Populated on the miss path of
-        # add_finding; cleaned up by tick() when entries are evicted.
+        # add_finding.  RUN-QUIESCENCE-scoped lifetime (task-2088): released by
+        # tick() only once the run's LAST (run_id, *) entry evicts — NOT torn
+        # down per-entry — so cross-stage in-run dedup and duplicate_finding
+        # citation pointers survive an individual stage's TTL eviction for as
+        # long as the run itself is still live.  See tick()'s docstring.
         self._run_sig_index: dict[str, dict[tuple, str]] = {}  # run_id → {sig → finding_id}
         self._run_finding_index: dict[str, dict[str, _ReportEntry]] = {}  # run_id → {finding_id → entry}
         self._run_desc_index: dict[str, dict[str, str]] = {}  # run_id → {desc_hash → finding_id}
@@ -843,7 +853,63 @@ class ReconReportState:
     # ------------------------------------------------------------------
 
     def tick(self) -> int:
-        """Sweep completed entries past TTL.  Returns count evicted."""
+        """Sweep completed entries past TTL.  Returns count evicted.
+
+        Each evicted entry's own ``_state``/``_active`` lookup slots are
+        removed immediately — that part of the contract is unchanged. This is
+        NOT the same as the ``_ReportEntry`` object being garbage-collected
+        immediately: while its run is still live, ``_run_finding_index``
+        keeps a reference to the evicted entry (see below) so its findings
+        stay citable, and the object only becomes unreachable once the run's
+        indices are popped at quiescence.
+
+        The three shared run-level dedup indices (``_run_sig_index`` /
+        ``_run_desc_index`` / ``_run_finding_index``) are RUN-QUIESCENCE
+        scoped, not per-entry (task-2088). They are keyed for the WHOLE run
+        across all of its stages, and reconciliation runs are multi-stage and
+        long-lived: Stage 1 (memory_consolidator) typically files a finding
+        and completes early, while Stage 2/3 + remediation keep the run live
+        for minutes. Releasing a run's indices the moment any ONE completed
+        stage ages out — while a sibling stage of the SAME run is still live
+        — would drop the in-run dedup key mid-run and let a later stage
+        double-file a signature/description already reported by an evicted
+        stage (run 33c324b0 regression), and would dangle any
+        duplicate_finding pointer already handed to another stage by
+        collapsing _run_finding_index out from under it.
+
+        So: while at least one ``(run_id, *)`` entry remains in ``_state``
+        (in-progress, or completed but not yet past its own TTL), all three
+        indices for that run_id are preserved untouched, even for stages that
+        have already been evicted. Only when a run's LAST entry evicts do we
+        release its three indices, wholesale via ``pop(rid, None)`` rather
+        than by walking the evicted entry's own signature/desc-hash/finding
+        maps — this correctly reclaims contributions from every stage of the
+        run in one shot and is robust to several same-run entries evicting
+        within the same tick() call. Do not reintroduce per-entry teardown
+        here; see test_eviction_partial_run_canonical_stage_cleared and the
+        sibling tests in TestReconReportReaper for the regression this
+        guards against.
+
+        Quiescence is computed ONCE per tick() call — the set of run_ids
+        still present in ``_state`` after all of this sweep's deletions —
+        rather than via a per-evicted-entry ``any()`` scan over ``_state``.
+        The latter is O(evicted × remaining _state size) and becomes
+        quadratic when many entries across many runs age out in the same
+        sweep; computing the surviving run_id set once and then doing an O(1)
+        membership check per evicted run_id is O(evicted + remaining).
+
+        Retention caveat: reaching quiescence requires every ``(run_id, *)``
+        entry to individually hit completed_at + TTL. An in-progress entry
+        never expires on its own — it is immortal by design (PRD §9.4; see
+        test_inprogress_not_evicted_by_ttl) — so a stalled or crashed stage
+        that never calls complete() pins that run_id's three indices, and
+        every already-evicted sibling entry object kept reachable through
+        ``_run_finding_index``, for as long as the process keeps running.
+        There is currently no separate max-lifetime sweep for in-progress
+        entries to bound this. This is an accepted tradeoff for task-2088
+        (worst case is bounded by process restart, not memory exhaustion
+        under normal operation), not a defect this task fixes.
+        """
         now = self._clock()
         to_evict = [
             (rid, stage)
@@ -851,31 +917,27 @@ class ReconReportState:
             if entry.completed_at is not None
             and now - entry.completed_at > self._ttl_seconds
         ]
+        evicted_run_ids: set[str] = set()
         for key in to_evict:
             rid, stage = key
-            evicted = self._state[key]
             del self._state[key]
+            evicted_run_ids.add(rid)
             # Remove _active pointer only if it still points at this stage
             if self._active.get(rid) == stage:
                 del self._active[rid]
-            # Clean up run-level indices for evicted findings
-            if rid in self._run_sig_index:
-                for sig, fid in evicted._signature_to_finding.items():
-                    if self._run_sig_index[rid].get(sig) == fid:
-                        del self._run_sig_index[rid][sig]
-                if not self._run_sig_index[rid]:
-                    del self._run_sig_index[rid]
-            if rid in self._run_finding_index:
-                for f in evicted.findings:
-                    self._run_finding_index[rid].pop(f.finding_id, None)
-                if not self._run_finding_index[rid]:
-                    del self._run_finding_index[rid]
-            if rid in self._run_desc_index:
-                for dhash, fid in evicted._deschash_to_finding.items():
-                    if self._run_desc_index[rid].get(dhash) == fid:
-                        del self._run_desc_index[rid][dhash]
-                if not self._run_desc_index[rid]:
-                    del self._run_desc_index[rid]
+        if evicted_run_ids:
+            # Run-quiescence gate (task-2088) — see the tick() docstring above.
+            # Compute the set of run_ids with a surviving _state entry ONCE,
+            # after all of this sweep's deletions, instead of rescanning
+            # _state per evicted entry. A run_id that evicted this tick and
+            # has no surviving entry is fully quiescent — release its three
+            # shared indices wholesale.
+            live_run_ids = {r for (r, _s) in self._state}
+            for rid in evicted_run_ids:
+                if rid not in live_run_ids:
+                    self._run_sig_index.pop(rid, None)
+                    self._run_finding_index.pop(rid, None)
+                    self._run_desc_index.pop(rid, None)
         if to_evict:
             logger.debug('recon_report reaper evicted %d entries', len(to_evict))
         return len(to_evict)
