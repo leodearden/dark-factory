@@ -595,10 +595,19 @@ async def _finalize_advanced_merge(
         # GateVerdict.block() always populates reason/emit_subtype; the
         # field type is Optional only because it's shared with the
         # all-None .ok() case.  Bind to locals and narrow once for pyright.
+        # An explicit guard (not `assert`) so a mis-constructed verdict —
+        # e.g. a future gate building GateVerdict(passed=False, ...)
+        # directly instead of via .block() — fails loudly even under `-O`,
+        # rather than silently emitting a None subtype.
         emit_subtype = verdict.emit_subtype
         reason = verdict.reason
-        assert emit_subtype is not None
-        assert reason is not None
+        if emit_subtype is None or reason is None:
+            raise AssertionError(
+                f'gate {gate.name!r} returned a blocked GateVerdict with '
+                f'reason/emit_subtype unset (reason={reason!r}, '
+                f'emit_subtype={emit_subtype!r}); construct blocked verdicts '
+                f'via GateVerdict.block(), which always populates both'
+            )
         _emit_merge_attempt(
             event_store, req.task_id, emit_subtype,
             duration_ms=_elapsed_ms(started_monotonic),
