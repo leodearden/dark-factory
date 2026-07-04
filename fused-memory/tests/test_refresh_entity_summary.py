@@ -11,16 +11,24 @@ Covers:
 """
 from __future__ import annotations
 
+import contextlib
+import os
+import re
+import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params, make_rebuild_detail
+from falkordb import FalkorDB as _SyncFalkorDB
+from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     EdgeDict,
     GraphitiBackend,
     NodeNotFoundError,
+    _MultiTenantFalkorDriver,
 )
 from fused_memory.server.tools import create_mcp_server
 
@@ -305,6 +313,53 @@ class TestGetValidEdgesForNode:
         backend = make_backend(mock_config)
         await assert_ro_query_only(backend, make_graph_mock, [], 'get_valid_edges_for_node', 'node-uuid-1', group_id='test')
 
+    @pytest.mark.asyncio
+    async def test_cypher_dedups_by_edge_identity_not_property_tuple(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """Query dedupes by edge ELEMENT identity (WITH DISTINCT e), not property tuple.
+
+        FalkorDB does not enforce property uniqueness, and redirect_node_edges
+        copies new.uuid = old.uuid on merge, so an entity can carry multiple
+        genuinely-distinct RELATES_TO elements sharing one (uuid, fact, name)
+        tuple. `RETURN DISTINCT e.uuid, e.fact, e.name` collapses those distinct
+        elements into a single row, undercounting edge_count. `WITH DISTINCT e`
+        dedupes by the edge element itself, so each relationship is counted once.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
+        cypher = extract_cypher(call_args)
+        # Regex (not a plain substring) so harmless reformatting (e.g. extra/
+        # collapsed whitespace) can't produce a false-negative test failure.
+        assert re.search(r'WITH\s+DISTINCT\s+e\b', cypher), (
+            f'Cypher must dedupe by edge element identity (WITH DISTINCT e): {cypher}'
+        )
+        assert 'RETURN DISTINCT' not in cypher, f"Cypher must not dedupe by property tuple: {cypher}"
+        assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
+
+    @pytest.mark.asyncio
+    async def test_identical_property_rows_preserved(self, mock_config, make_backend, make_graph_mock):
+        """Python layer does no dedup — identical-property rows from the DB are both kept.
+
+        Element-identity dedup (WITH DISTINCT e) happens server-side in Cypher;
+        the Python layer must not additionally dedupe by property tuple, or it
+        would re-introduce the undercount for distinct edges that legitimately
+        share a copied (uuid, fact, name) tuple (e.g. after redirect_node_edges).
+        """
+        backend = make_backend(mock_config)
+        rows = [
+            ['edge-1', 'same fact', 'rel'],
+            ['edge-1', 'same fact', 'rel'],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
+        assert len(result) == 2
+
 
 # ---------------------------------------------------------------------------
 # GraphitiBackend.get_all_valid_edges (bulk fetch)
@@ -332,14 +387,36 @@ class TestGetAllValidEdges:
         assert result['node-2'] == [{'uuid': 'e3', 'fact': 'factC', 'name': 'edge3'}]
 
     @pytest.mark.asyncio
-    async def test_cypher_uses_return_distinct(self, mock_config, make_backend, make_graph_mock):
-        """Cypher query passed to ro_query contains 'RETURN DISTINCT'."""
+    async def test_cypher_dedups_by_edge_identity(self, mock_config, make_backend, make_graph_mock):
+        """Query dedupes by (entity, edge-element) identity, not property tuple.
+
+        FalkorDB does not enforce property uniqueness, and redirect_node_edges
+        copies new.uuid = old.uuid on merge, so an entity can carry multiple
+        genuinely-distinct RELATES_TO elements sharing one (uuid, fact, name)
+        tuple. `RETURN DISTINCT n.uuid, e.uuid, e.fact, e.name` collapses those
+        distinct elements into a single row, undercounting edge_count.
+        `WITH DISTINCT n, e` dedupes by the (entity, edge-element) pair itself:
+        it still preserves the intended double-attribution (a directed edge
+        appears once under each endpoint entity, as distinct (n, e) pairs) and
+        still collapses the undirected self-loop double-match, while no longer
+        collapsing genuinely-distinct edges that share copied properties.
+        """
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        cypher = graph.ro_query.call_args.args[0]
-        assert 'RETURN DISTINCT' in cypher
+        call_args = graph.ro_query.call_args
+        assert call_args is not None, "graph.ro_query was not called"
+        cypher = extract_cypher(call_args)
+        # Regex (not a plain substring) so harmless reformatting — different
+        # comma spacing, or listing the two WITH variables in the other order
+        # (both are semantically identical for an unordered DISTINCT dedup) —
+        # can't produce a false-negative test failure.
+        assert re.search(r'WITH\s+DISTINCT\s+(?:n\s*,\s*e|e\s*,\s*n)\b', cypher), (
+            f'Cypher must dedupe by (entity, edge) identity (WITH DISTINCT n, e): {cypher}'
+        )
+        assert 'RETURN DISTINCT' not in cypher, f"Cypher must not dedupe by property tuple: {cypher}"
+        assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
     @pytest.mark.asyncio
     async def test_empty_graph_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
@@ -417,14 +494,16 @@ class TestGetAllValidEdges:
     async def test_identical_rows_produce_duplicate_entries(self, mock_config, make_backend, make_graph_mock):
         """Python grouping loop does no dedup — identical rows produce duplicate list entries.
 
-        RETURN DISTINCT in the Cypher query is the sole guard against duplicate
-        rows (it guards specifically against self-loop duplicates where A→A edges
-        yield two identical rows under the undirected MATCH).  If the database
-        ever returns identical rows the Python layer faithfully appends both,
-        producing duplicate entries in the result list.  This test documents and
-        locks in that contract so it is never accidentally 'fixed' at the Python
-        layer (which would silently change behaviour for the legitimate self-loop
-        case that RETURN DISTINCT already handles).
+        WITH DISTINCT n, e in the Cypher query is the sole guard against
+        duplicate rows (it guards specifically against self-loop duplicates
+        where A→A edges yield two identical rows under the undirected MATCH).
+        If the database ever returns identical rows the Python layer faithfully
+        appends both, producing duplicate entries in the result list.  This test
+        documents and locks in that contract so it is never accidentally 'fixed'
+        at the Python layer (which would silently change behaviour for the
+        legitimate self-loop case that WITH DISTINCT n, e already handles, and
+        would re-introduce the edge_count undercount for genuinely-distinct
+        edges that share a copied property tuple).
         """
         backend = make_backend(mock_config)
         rows = [
@@ -1112,3 +1191,132 @@ class TestMemoryServiceRefreshEntitySummaryJournalFix:
         assert call_kwargs.get('success') is False
         assert call_kwargs.get('error') is not None
         assert 'FalkorDB timeout' in call_kwargs['error']
+
+
+# ---------------------------------------------------------------------------
+# Live-FalkorDB integration tests: edge-element-identity dedup (task 2084)
+# ---------------------------------------------------------------------------
+#
+# TestGetValidEdgesForNode / TestGetAllValidEdges above mock graph.ro_query and
+# feed it canned rows, so they can only pin the *Cypher string* (WITH DISTINCT
+# e / WITH DISTINCT n, e present, RETURN DISTINCT absent) — a mock returning N
+# rows yields len(...) == N regardless of whether the dedup clause is
+# semantically correct. These tests exercise the real FalkorDB server-side
+# DISTINCT semantics the fix depends on:
+#   (a) an undirected self-loop A->A edge is still counted once, and
+#   (b) two genuinely-distinct edges that share a copied (uuid, fact, name)
+#       property tuple — as redirect_node_edges produces on the merge path —
+#       are both counted, not collapsed into one.
+# Skipped automatically when FalkorDB is not reachable, following the
+# established pattern in tests/test_list_indices_integration.py.
+
+FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
+FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
+
+
+def _falkor_available() -> bool:
+    """FalkorDB-native reachability probe (mirrors test_list_indices_integration.py)."""
+    try:
+        client = _SyncFalkorDB(host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2)
+        try:
+            client.select_graph('_probe').query('RETURN 1')
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+        return True
+    except Exception:
+        return False
+
+
+@pytest_asyncio.fixture
+async def edge_dedup_live_graph():
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up.
+
+    A fresh graph name is minted on every invocation (rather than a shared
+    module-level constant) so the dedup tests below never share state, even
+    under pytest-xdist or a shared FalkorDB instance.
+    """
+    graph_name = f'_test_2084_edge_dedup_{uuid.uuid4().hex[:8]}'
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    with contextlib.suppress(Exception):
+        stale = client.select_graph(graph_name)
+        await stale.delete()
+    graph = client.select_graph(graph_name)
+    try:
+        yield graph_name, graph
+    finally:
+        with contextlib.suppress(Exception):
+            await graph.delete()
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+
+@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@pytest.mark.timeout(15)
+class TestEdgeDedupLiveFalkorDB:
+    """Pin WITH DISTINCT e / WITH DISTINCT n, e result semantics against real FalkorDB."""
+
+    @pytest.mark.asyncio
+    async def test_self_loop_edge_counted_once(self, mock_config, edge_dedup_live_graph):
+        """An undirected self-loop A->A edge is counted once, not twice.
+
+        get_valid_edges_for_node's undirected MATCH (n)-[e]-() traverses a
+        self-loop from both 'directions', matching the same edge element
+        twice. WITH DISTINCT e must collapse that to a single row.
+        """
+        graph_name, graph = edge_dedup_live_graph
+        await graph.query(
+            "CREATE (a:Entity {uuid: $uuid, name: 'SelfLoopNode'}) "
+            'WITH a '
+            "CREATE (a)-[:RELATES_TO {uuid: 'edge-self', fact: 'A relates to A', name: 'self_rel'}]->(a)",
+            {'uuid': 'node-self-loop'},
+        )
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            result = await backend.get_valid_edges_for_node('node-self-loop', group_id=graph_name)
+            assert len(result) == 1
+            assert result[0]['uuid'] == 'edge-self'
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_distinct_edges_sharing_copied_properties_both_counted(
+        self, mock_config, edge_dedup_live_graph
+    ):
+        """Two distinct edges sharing one copied (uuid, fact, name) tuple are both counted.
+
+        Simulates the post-redirect_node_edges scenario: a merge sets
+        new.uuid = old.uuid on the redirected edge, so two genuinely-distinct
+        RELATES_TO relationships can share identical properties. A
+        property-tuple RETURN DISTINCT would collapse them into one row;
+        WITH DISTINCT e / WITH DISTINCT n, e must not.
+        """
+        graph_name, graph = edge_dedup_live_graph
+        await graph.query(
+            "CREATE (:Entity {uuid: 'node-a', name: 'A'}), "
+            "(:Entity {uuid: 'node-b', name: 'B'}), "
+            "(:Entity {uuid: 'node-c', name: 'C'})"
+        )
+        await graph.query(
+            'MATCH (a:Entity {uuid: $a}), (b:Entity {uuid: $b}) '
+            "CREATE (a)-[:RELATES_TO {uuid: $edge_uuid, fact: $fact, name: $name}]->(b)",
+            {'a': 'node-a', 'b': 'node-b', 'edge_uuid': 'shared-uuid', 'fact': 'shared fact', 'name': 'shared_name'},
+        )
+        await graph.query(
+            'MATCH (a:Entity {uuid: $a}), (c:Entity {uuid: $c}) '
+            "CREATE (a)-[:RELATES_TO {uuid: $edge_uuid, fact: $fact, name: $name}]->(c)",
+            {'a': 'node-a', 'c': 'node-c', 'edge_uuid': 'shared-uuid', 'fact': 'shared fact', 'name': 'shared_name'},
+        )
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            edges_for_a = await backend.get_valid_edges_for_node('node-a', group_id=graph_name)
+            assert len(edges_for_a) == 2
+
+            all_edges = await backend.get_all_valid_edges(group_id=graph_name)
+            assert len(all_edges['node-a']) == 2
+            assert len(all_edges['node-b']) == 1
+            assert len(all_edges['node-c']) == 1
+        finally:
+            await backend.close()
