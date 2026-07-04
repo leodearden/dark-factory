@@ -793,7 +793,7 @@ class TestCreateWorktreeWarmLanePoolHardDown:
             'Lane must stay FREE — no ASSIGNED leak'
         )
 
-    def test_warm_lane_pool_hard_down_is_a_warm_lane_requeue(self):
+    async def test_warm_lane_pool_hard_down_is_a_warm_lane_requeue(self):
         from orchestrator.git_ops import WarmLanePoolHardDown, WarmLaneRequeue
 
         assert issubclass(WarmLanePoolHardDown, WarmLaneRequeue)

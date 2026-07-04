@@ -605,6 +605,7 @@ class WarmLaneRequeue(Exception):
     Subclasses:
         WarmLanePoolExhausted — all lanes ASSIGNED (backpressure).
         WarmLaneDiskPressure  — seed exited 75 (EX_TEMPFAIL, transient infra).
+        WarmLanePoolHardDown  — warm base absent (host-scoped pool condition).
     """
 
 
@@ -620,6 +621,24 @@ class WarmLaneDiskPressure(WarmLaneRequeue):
 
     Task should be requeued with a ``warm_lane_disk_pressure (transient infra)``
     block-reason annotation so the requeue is distinguishable from backpressure.
+    """
+
+
+class WarmLanePoolHardDown(WarmLaneRequeue):
+    """Warm-lane CoW seed base is absent — a HOST-SCOPED pool condition
+    (task 2061), not a per-task fault.
+
+    Raised instead of a generic FAULT/RuntimeError so the workflow requeues
+    (fail-open, inv.6) rather than escalating a per-task blocked+L1 — one
+    dispatched task hitting this is symptomatic of a host-wide condition that
+    would otherwise produce N identical escalations for N dispatched tasks.
+    The scheduler's warm-base hard-down watchdog (see
+    ``Scheduler._apply_warm_base_hard_down_watchdog``) is the PRIMARY
+    defense (halts dispatch before any task attempts an acquire); this
+    exception is defense-in-depth for any task already in flight when the
+    base vanishes.  Task should be requeued with a
+    ``warm_lane_pool_hard_down`` block-reason annotation.  Run
+    reify/scripts/ensure-warm-base.sh to rebuild the base.
     """
 
 
@@ -1184,6 +1203,12 @@ class GitOps:
             if pool_info is WarmLaneUnavailable.DISK_PRESSURE:
                 raise WarmLaneDiskPressure(
                     f'warm-lane seed disk pressure for branch {branch_name!r}; requeue'
+                )
+            if pool_info is WarmLaneUnavailable.BASE_ABSENT:
+                raise WarmLanePoolHardDown(
+                    f'warm-lane base absent (host-scoped pool hard-down) for '
+                    f'branch {branch_name!r}; requeue (fail-open) — run '
+                    f'reify/scripts/ensure-warm-base.sh'
                 )
             # FAULT or DISABLED → RuntimeError reuses existing blocked+L1 plumbing.
             # DISABLED is a programming error (caller bypassed the pool-enabled

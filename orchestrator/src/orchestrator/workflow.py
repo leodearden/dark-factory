@@ -60,6 +60,7 @@ from orchestrator.git_ops import (
     GitOps,
     TrainMembership,
     WarmLanePoolExhausted,
+    WarmLanePoolHardDown,
     WarmLaneRequeue,
     _run,
     is_wip_safety_commit,
@@ -2029,7 +2030,17 @@ class TaskWorkflow:
             # infra)' to exclude disk-pressure requeues from the cap (analogous to
             # the HTTP-5xx transient exclusion in is_transient_api_requeue).
             # Touching scheduler.py is out of scope for this task.
-            if isinstance(e, WarmLanePoolExhausted):
+            #
+            # WarmLanePoolHardDown (task 2061) — the warm base is absent, a
+            # HOST-SCOPED pool condition (one base serves every lane).  Checked
+            # FIRST since one dispatched task hitting this is symptomatic of a
+            # host-wide condition the scheduler's warm-base hard-down watchdog
+            # is the primary defense for; this requeue is defense-in-depth for
+            # any task already in flight when the base vanished.
+            if isinstance(e, WarmLanePoolHardDown):
+                block_reason = 'warm_lane_pool_hard_down'
+                block_phase = 'host_pool_hard_down'
+            elif isinstance(e, WarmLanePoolExhausted):
                 block_reason = 'warm_lane_pool_exhausted'
                 block_phase = 'backpressure'
             else:  # WarmLaneDiskPressure
