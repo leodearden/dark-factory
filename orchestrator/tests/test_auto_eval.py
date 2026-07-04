@@ -95,6 +95,9 @@ def _make(
     scheduler = MagicMock()
     scheduler.dispatch_tool = _dispatch
     scheduler.update_task = update_task
+    # Default: no prior auto-eval redo siblings. Tests exercising the
+    # dedupe/supersede behaviour override this per-test.
+    scheduler.get_tasks = AsyncMock(return_value=[])
     harness.scheduler = scheduler
 
     metadata: dict = {
