@@ -36,6 +36,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Literal
+from unittest.mock import patch
 
 import pytest
 from _orch_helpers import make_placeholder_future
@@ -47,9 +48,11 @@ from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_queue import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     Decided,
+    DropGuardResult,
     MergedOk,
     MergeOutcome,
     MergeRequest,
+    MergeWorker,
     SpeculativeMergeWorker,
 )
 
@@ -517,6 +520,180 @@ class TestClassifyAndMergeSpeculativeWorker:
 
         assert isinstance(result, MergedOk)
         assert _count_events(es.db_path, 'speculative_merge') == 0
+
+        if result.merge_wt:
+            await git_ops.cleanup_merge_worktree(result.merge_wt)
+
+
+# ---------------------------------------------------------------------------
+# step-6: classify_and_merge on the SERIAL worker (MergeWorker) preserves
+# _do_merge's exact quirks (no drift bookkeeping, no rich diagnostic).
+#
+# classify_and_merge already capability-gates the SpeculativeMergeWorker-only
+# calls (isinstance check added in step-4, ahead of the plan's step-7), so
+# this suite is GREEN on first run rather than RED — see the commit message
+# for the full accounting. Written as originally scoped for the guard-matrix
+# coverage regardless.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestClassifyAndMergeSerialWorker:
+    """Direct-drive guard-matrix coverage for classify_and_merge on the plain
+    (non-capability) serial worker (step-6, task 1995).
+    """
+
+    async def test_real_conflict_returns_decided_conflict_no_drift_side_effect(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        from orchestrator.merge_queue import classify_and_merge
+
+        worktree = (await git_ops.create_worktree('conflict-serial-1')).path
+        (git_ops.project_root / 'README.md').write_text('# Main version\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Main change'], cwd=git_ops.project_root)
+        (worktree / 'README.md').write_text('# Task version\n')
+        await git_ops.commit(worktree, 'Task change')
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        # MergeWorker has neither _merge_metrics nor _note_conflict_detected —
+        # classify_and_merge must not raise AttributeError reaching for them.
+        worker = MergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('conflict-serial-1', 'conflict-serial-1', worktree, config)
+        main_sha = await git_ops.get_main_sha()
+
+        result = await classify_and_merge(
+            worker, req, main_sha, speculative=False, started_monotonic=time.monotonic(),
+        )
+
+        assert isinstance(result, Decided)
+        assert result.outcome.status == 'conflict'
+        assert result.outcome.conflict_details
+        assert _merge_attempt_subtypes(es.db_path) == ['conflict']
+
+    async def test_non_conflict_merge_failure_returns_plain_reason_no_diagnostic(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.merge_queue import classify_and_merge
+
+        worktree = await _make_branch_with_file(
+            git_ops, 'nonconflict-serial-1', 'f.py', 'x = 1\n',
+        )
+        main_sha = await git_ops.get_main_sha()
+
+        async def _fake_merge_to_main(wt, br, base_sha=None):
+            return MergeResult(success=False, conflicts=False, details='boom')
+
+        monkeypatch.setattr(git_ops, 'merge_to_main', _fake_merge_to_main)
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('nonconflict-serial-1', 'nonconflict-serial-1', worktree, config)
+
+        result = await classify_and_merge(
+            worker, req, main_sha, speculative=False, started_monotonic=time.monotonic(),
+        )
+
+        assert isinstance(result, Decided)
+        assert result.outcome.status == 'blocked'
+        assert result.outcome.reason == 'boom'
+        assert result.outcome.failure_diagnostic is None
+        assert _count_events(es.db_path, 'merge_attempt') == 0
+
+    async def test_already_merged_honors_snapshot_tip(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Mirrors test_merge_queue.py's TestClassifyBranchPresence-adjacent
+        test_already_merged_honors_snapshot_tip (task 1917 regression):
+        branch tip SNAP is merged onto main, worktree HEAD is then rewritten
+        to a DIVERGENT commit D (non-ancestor of main); req.snapshot_tip=SNAP
+        must still resolve to already_merged."""
+        from orchestrator.merge_queue import classify_and_merge
+
+        wt = (await git_ops.create_worktree('snap-cm-1')).path
+        (wt / 'snap_cm.py').write_text('snap = 1\n')
+        await git_ops.commit(wt, 'Add snap_cm.py')
+
+        rc, snap_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
+        assert rc == 0
+        snap = snap_out.strip()
+
+        merge_result = await git_ops.merge_to_main(wt, 'snap-cm-1')
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        await git_ops.advance_main(
+            merge_result.merge_commit, merge_result.merge_worktree,
+            branch='snap-cm-1', max_attempts=1,
+        )
+        if merge_result.merge_worktree:
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # Rewrite worktree HEAD to a DIVERGENT commit D (non-ancestor of main).
+        (wt / 'snap_cm.py').write_text('DIVERGENT = 999\n')
+        rc, _, _ = await _run(['git', 'add', 'snap_cm.py'], cwd=wt)
+        assert rc == 0
+        rc, _, _ = await _run(['git', 'commit', '-m', 'Divergent'], cwd=wt)
+        assert rc == 0
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('snap-cm-1', 'snap-cm-1', wt, config)
+        req.snapshot_tip = snap  # the already-merged tip — check must use this
+        main_sha = await git_ops.get_main_sha()
+
+        result = await classify_and_merge(
+            worker, req, main_sha, speculative=False, started_monotonic=time.monotonic(),
+        )
+
+        assert isinstance(result, Decided)
+        assert result.outcome.status == 'already_merged', (
+            f'expected already_merged (snapshot_tip=SNAP is ancestor of main); '
+            f'got {result.outcome.status!r}'
+        )
+
+    async def test_drop_guard_uses_passed_base_sha(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """The base_sha parameter — not some internally-recomputed value —
+        must reach _check_plan_targets_in_tree as its main_sha argument."""
+        from orchestrator.merge_queue import classify_and_merge
+
+        worktree = await _make_branch_with_file(
+            git_ops, 'dropguard-base-1', 'f.py', 'x = 1\n',
+        )
+        custom_base_sha = 'deadbeef' * 5  # 40 hex chars; deliberately not real main
+
+        captured_base_shas: list[str] = []
+
+        async def _spy_check_plan_targets(
+            merge_commit_sha, task_worktree, git_ops_arg, main_sha, *, task_id=None,
+        ):
+            captured_base_shas.append(main_sha)
+            return DropGuardResult(dropped=[])
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = MergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('dropguard-base-1', 'dropguard-base-1', worktree, config)
+
+        with patch(
+            'orchestrator.merge_queue._check_plan_targets_in_tree',
+            _spy_check_plan_targets,
+        ):
+            result = await classify_and_merge(
+                worker, req, custom_base_sha, speculative=False,
+                started_monotonic=time.monotonic(),
+            )
+
+        assert isinstance(result, MergedOk)
+        assert captured_base_shas == [custom_base_sha]
 
         if result.merge_wt:
             await git_ops.cleanup_merge_worktree(result.merge_wt)
