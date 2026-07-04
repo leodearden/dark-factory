@@ -27,6 +27,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _serial_merge_worker import MergeWorker
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, GitOps, TrainMembership, _run
@@ -38,7 +39,6 @@ from orchestrator.merge_queue import (
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
-    MergeWorker,
 )
 from orchestrator.verify import VerifyResult, run_scoped_verification
 

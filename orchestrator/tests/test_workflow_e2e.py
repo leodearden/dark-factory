@@ -445,7 +445,7 @@ def _build_workflow(
     agent_stub: AgentStub,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
     """Wire up a TaskWorkflow with all fakes injected."""
-    from orchestrator.merge_queue import MergeWorker
+    from _serial_merge_worker import MergeWorker
 
     scheduler = FakeScheduler()
     merge_queue: asyncio.Queue = asyncio.Queue()
@@ -1731,7 +1731,7 @@ def _build_workflow_with_escalation(
     merge work; omitting create_task avoids the 'Task was destroyed but it is
     pending!' warning in pytest teardown.
     """
-    from orchestrator.merge_queue import MergeWorker
+    from _serial_merge_worker import MergeWorker
 
     scheduler = FakeScheduler()
     queue_dir = tmp_path / 'escalation_queue'

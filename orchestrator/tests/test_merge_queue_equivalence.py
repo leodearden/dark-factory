@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _serial_merge_worker import MergeWorker
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -25,7 +26,6 @@ from orchestrator.merge_queue import (
     POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
-    MergeWorker,
     PostMergePyrightResult,
     SpeculativeMergeWorker,
     _check_post_merge_pyright,

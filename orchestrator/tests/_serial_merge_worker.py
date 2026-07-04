@@ -28,6 +28,7 @@ import collections
 import time
 
 from orchestrator.merge_queue import (
+    _HALT_ADVANCE_RESULTS,
     MAX_AUTO_CHAINED_GENERATIONS,
     MERGE_LANES,
     MERGE_WORKER_SHUTDOWN_REASON,
@@ -48,7 +49,6 @@ from orchestrator.merge_queue import (
     _emit_merge_queued,
     _finalize_advanced_merge,
     _GenerationChainContext,
-    _HALT_ADVANCE_RESULTS,
     _map_advance_failure,
     _run_post_merge_verify,
     _safety_valve_due,

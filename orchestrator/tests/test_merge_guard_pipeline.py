@@ -41,6 +41,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _orch_helpers import make_placeholder_future
+from _serial_merge_worker import MergeWorker
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -53,7 +54,6 @@ from orchestrator.merge_queue import (
     MergedOk,
     MergeOutcome,
     MergeRequest,
-    MergeWorker,
     SpeculativeMergeWorker,
 )
 
