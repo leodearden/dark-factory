@@ -2019,17 +2019,29 @@ class TaskWorkflow:
             # FAULT (RuntimeError) is deliberately NOT caught here — it falls through
             # to the broad except below → _mark_blocked → BLOCKED + L1.
             #
-            # NOTE (Suggestion 2 / follow-up): both WarmLanePoolExhausted and
-            # WarmLaneDiskPressure requeues return WorkflowOutcome.REQUEUED here,
-            # which the harness counts against the per-task requeue_cap equally.
-            # This is intentional for EXHAUSTED (genuine backpressure) but is
-            # undesirable for DISK_PRESSURE (transient infra): a persistent disk-
-            # full condition will tight-loop, burning the retry budget with no
-            # backoff.  The block_reason discriminant is already set so a future
-            # scheduler change can special-case 'warm_lane_disk_pressure (transient
-            # infra)' to exclude disk-pressure requeues from the cap (analogous to
-            # the HTTP-5xx transient exclusion in is_transient_api_requeue).
-            # Touching scheduler.py is out of scope for this task.
+            # NOTE (Suggestion 2 / follow-up; extended for WarmLanePoolHardDown
+            # by reviewer_comprehensive resource_efficiency, task 2061 amendment
+            # pass): WarmLanePoolExhausted, WarmLaneDiskPressure, AND
+            # WarmLanePoolHardDown requeues all return WorkflowOutcome.REQUEUED
+            # here, which the harness counts against the per-task requeue_cap
+            # equally.  This is intentional for EXHAUSTED (genuine backpressure)
+            # but is undesirable for DISK_PRESSURE and HARD_DOWN (both transient
+            # infra): a persistent condition will tight-loop, burning the retry
+            # budget with no backoff.  HARD_DOWN's exposure is bounded relative
+            # to DISK_PRESSURE's, though: the scheduler's proactive per-tick
+            # watchdog (Scheduler._apply_warm_base_hard_down_watchdog) halts ALL
+            # new dispatch host-wide the moment it observes ABSENT, so once
+            # engaged a requeued task simply waits parked instead of being
+            # redispatched into the same failure — only a task that races ahead
+            # of the watchdog on the very first tick spends one requeue before
+            # the halt engages.  The block_reason discriminant is already set so
+            # a future scheduler change can special-case both
+            # 'warm_lane_disk_pressure (transient infra)' and
+            # 'warm_lane_pool_hard_down' to exclude these requeues from the cap
+            # (analogous to the HTTP-5xx transient exclusion in
+            # is_transient_api_requeue).  Touching scheduler.py's requeue-cap
+            # classifier for this is out of scope for this task; tracking as a
+            # follow-up is acceptable per reviewer_comprehensive.
             #
             # WarmLanePoolHardDown (task 2061) — the warm base is absent, a
             # HOST-SCOPED pool condition (one base serves every lane).  Checked
