@@ -7925,6 +7925,144 @@ async def test_live_workflow_gate_threads_task_status_for_deferred_cited_task(
     )
 
 
+@pytest.mark.asyncio
+async def test_live_workflow_gate_threads_task_kind_for_blocked_deterministic_cited_task(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    """_run_remediation_pass must thread the cited task's metadata.task_kind into
+    is_workflow_live_for_task so a BLOCKED deterministic task (which never
+    acquires a worktree/branch of its own — routed to DeterministicRunner)
+    whose only live signal would be the project-wide orchestrator lock is NOT
+    treated as live — the persistently-unresolved escalation FIRES instead of
+    being suppressed.
+
+    Extension of task 2031
+    (test_live_workflow_gate_threads_task_status_for_deferred_cited_task):
+    'blocked' is deliberately NOT in ORCH_LIVE_INELIGIBLE_STATUSES (a normal
+    blocked task may legitimately auto-unblock mid-pipeline), so suppressing
+    this case needs the additional task_kind signal. The fake
+    is_workflow_live_for_task below returns False ONLY when it receives
+    status='blocked' AND task_kind='deterministic' — so this test passes only
+    if the harness actually forwards the cited task's task_kind (sourced from
+    remediation_tree's metadata) rather than calling the detector with no
+    task_kind.
+    """
+    import uuid as _uuid
+
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.reconciliation.harness as harness_module
+    from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    task_id = '2059'
+    actionable_finding = _make_finding_with_cited_task(task_id)
+
+    # remediation_tree is built (inside _run_remediation_pass) from
+    # taskmaster.get_tasks — populate it with the blocked deterministic cited
+    # task so the harness has a status+task_kind to look up and forward.
+    harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+        'tasks': [
+            {
+                'id': 2059, 'title': 'Blocked deterministic task', 'status': 'blocked',
+                'metadata': {'task_kind': 'deterministic'}, 'dependencies': [],
+            },
+        ]
+    }
+
+    # Fake detector: reports "live" for anything EXCEPT status='blocked' AND
+    # task_kind='deterministic'.
+    # A pre-fix call site passes no task_kind kwarg, so kw.get('task_kind') is
+    # None, the compound condition is False (live) — which would suppress the
+    # escalation and fail this test, proving the harness must forward the real
+    # task_kind.
+    received_task_kinds: list[str | None] = []
+
+    def _fake_is_live(_tid, _pr, **kw):
+        received_task_kinds.append(kw.get('task_kind'))
+        return not (kw.get('status') == 'blocked' and kw.get('task_kind') == 'deterministic')
+
+    monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _fake_is_live)
+
+    # Seed N-2 prior completed runs so persistence reaches threshold.
+    n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
+    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+    for i in range(n_seed):
+        rid = str(_uuid.uuid4())
+        run = ReconciliationRun(
+            id=rid,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:1',
+            started_at=base_time + timedelta(minutes=i),
+            events_processed=1,
+            status=RunStatus.running,
+        )
+        await journal.start_run(run)
+        await journal.update_run_stage_reports(
+            rid, {'integrity_check': {'items_flagged': [actionable_finding]}}
+        )
+        await journal.complete_run(rid, 'completed')
+
+    await event_buffer.push(_make_event())
+
+    async def s3_returns_finding(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[actionable_finding],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    harness.stages[2].run = s3_returns_finding
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    # (a) Escalation MUST be emitted — the blocked deterministic task's
+    # project-wide orchestrator signal must not suppress it.
+    pending = esc_queue.get_pending()
+    stranded_escalations = [
+        e for e in pending
+        if e.category == 'recon_integrity_issue'
+        and 'Persistently unresolved' in e.summary
+    ]
+    assert len(stranded_escalations) >= 1, (
+        f'Expected an escalation for the blocked deterministic cited task '
+        f'(task_kind must be forwarded so the project-wide orchestrator signal '
+        f'is dropped); got pending: {[e.summary for e in pending]}'
+    )
+
+    # (b) No suppression log fired for task 2059.
+    suppressed_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.integrity_escalation_suppressed_live_workflow'
+    ]
+    assert suppressed_records == [], (
+        f'Expected NO suppression log for the blocked deterministic task; got '
+        f'affected_ids: {[r.__dict__.get("affected_ids") for r in suppressed_records]}'
+    )
+
+    # (c) The harness actually forwarded task_kind="deterministic" to the detector.
+    assert 'deterministic' in received_task_kinds, (
+        f'Expected is_workflow_live_for_task to receive task_kind="deterministic" '
+        f'for task 2059; got received_task_kinds={received_task_kinds!r}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Harness injects filtered_task_tree into IntegrityCheck (task 1661 step-7)
 # ---------------------------------------------------------------------------
