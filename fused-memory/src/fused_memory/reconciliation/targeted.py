@@ -1202,6 +1202,40 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     return bool(metadata.get(_STAGE2_SUPPRESS_KEY))
 
 
+def _truncate_clean(text: str, limit: int) -> str:
+    """Truncate ``text`` to at most ``limit`` chars without splitting a word.
+
+    Task 2080: a naive ``text[:limit]`` slice (the previous behavior of both
+    ``_format_outcome_echo``'s note cap and ``_on_task_done``'s legacy
+    ``details[:500]`` append) cuts at a raw character count with no regard
+    for word/token boundaries — e.g. a dense CSV-like note's "8679,8680" was
+    silently garbled to "8679,868", and in the note+commit echo the
+    " (commit <sha>)" suffix then glued directly onto that broken fragment.
+
+    Contract:
+    - ``text`` at or under ``limit`` is returned unchanged (no ellipsis).
+    - Otherwise, one char of the budget is reserved for a trailing ellipsis
+      ('…', U+2026) and the cut backs up to the last whitespace boundary
+      within that budget — but ONLY when doing so retains more than half the
+      budget. This avoids collapsing the result to a handful of characters
+      when whitespace is sparse or sits only very early in the window; in
+      that case (or when there is no whitespace at all) it falls back to a
+      hard cut at the budget.
+
+    The result length is always <= ``limit``.
+    """
+    if len(text) <= limit:
+        return text
+    budget = limit - 1
+    window = text[:budget]
+    last_ws = -1
+    for i, ch in enumerate(window):
+        if ch.isspace():
+            last_ws = i
+    head = text[:last_ws] if last_ws > budget // 2 else text[:budget]
+    return head.rstrip() + '…'
+
+
 def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) -> str | None:
     """Format ``done_provenance`` into a landed-outcome completion echo, or None.
 
