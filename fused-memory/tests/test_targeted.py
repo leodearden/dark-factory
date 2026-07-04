@@ -2594,6 +2594,68 @@ async def test_on_task_done_first_transition_echoes_provenance_not_description(
     assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
 
 
+# ---------------------------------------------------------------------------
+# Legacy details-fallback clean truncation (task 2080)
+#
+# When no usable done_provenance exists (_format_outcome_echo returns None),
+# _on_task_done falls back to appending the raw description + `details`.
+# `details` was previously hard-cut with a raw `details[:500]` slice -- the
+# same naive-character-count bug fixed in _format_outcome_echo's note
+# branches. This pins the legacy fallback to the same clean, word-boundary
+# truncation contract (_truncate_clean).
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_legacy_details_fallback_truncates_cleanly(
+    reconciler, mock_memory_service, mock_taskmaster,
+):
+    """No usable done_provenance (metadata={}) forces the description+details
+    fallback. `details` is long enough, with a word straddling the old
+    raw-slice boundary, that a naive `details[:500]` cut would glue a broken
+    trailing fragment ('ZZZZ...') onto the memory write; the clean
+    truncation must instead back up to the word boundary and end with a
+    single ellipsis, dropping the trailing word whole."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        'id': '361', 'title': 'Autopilot task', 'status': 'done',
+        'metadata': {},
+    })
+
+    long_details = ('A' * 495) + ' ' + ('Z' * 50)
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'details': long_details,
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content') or ''
+
+    assert '\nDetails: ' in content, f'Expected a Details section, got: {content!r}'
+    details_part = content.split('\nDetails: ', 1)[1]
+
+    assert details_part.endswith('…'), (
+        f'Expected the Details portion to end with an ellipsis, got: {details_part!r}'
+    )
+    assert len(details_part) <= 500
+    # A raw details[:500] slice would have cut mid-word, leaving a partial
+    # 'Z' fragment glued onto the end -- the clean cut must drop the whole
+    # trailing word instead of leaking any of it.
+    assert 'Z' not in content, (
+        f'Expected the mid-word fragment NOT to leak into the echo, got: {content!r}'
+    )
+    assert details_part == ('A' * 495) + '…'
+
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
 @pytest.mark.asyncio
 async def test_on_task_done_authoritative_memory_wins_over_provenance(
     reconciler, mock_memory_service, mock_taskmaster,
