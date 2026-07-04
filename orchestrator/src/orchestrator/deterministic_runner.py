@@ -82,10 +82,17 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      (B7a).
    - Re-inspect and verify a fresh ``MainPID`` (>0, non-sentinel) and a
      strictly-later ``ActiveEnterTimestampMonotonic`` (B7b).
-   - If ``always_escalates=False``: stamp ``before_done_verified_at`` (the
-     positive proof the resume path requires), then set task to ``done`` with
+   - If ``always_escalates=False``: hand off to ``_writeback_deploy_success``
+     (task 2066), which stamps ``before_done_verified_at`` (the positive proof
+     the resume path requires) and then sets the task to ``done`` with
      ``done_provenance.kind='deterministic-deploy'`` carrying the fresh PID
-     and timestamp (B6); return DONE.
+     and timestamp (B6).  Both writes are patiently retried — bounded and
+     paced — because the deploy script may itself have severed the
+     orchestrator's own fused-memory/MCP connection (e.g. it restarted the
+     service backing that connection); a plain retry recovers once the
+     connection auto-reconnects.  If the writeback budget is exhausted
+     first, files a durable local ``infra_issue`` escalation and returns
+     BLOCKED instead of silently stranding the task with an empty queue.
    - If ``always_escalates=True``: fall through to gate (act-then-ask).
 
 3. **Pure gate** (``before_done=None``, ``always_escalates=True``):
@@ -114,6 +121,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Task 2066: cross-unit before_done writeback resilience.
+#
+# The cross-unit blocking deploy may restart the very service backing the
+# orchestrator's own fused-memory/MCP connection (e.g. task 2059), severing
+# it for the duration of a `--drain` restart.  `McpSession._raw_call`
+# (mcp_lifecycle.py) opens a fresh httpx.AsyncClient and re-inits the session
+# on any transient failure, so the NEXT call auto-reconnects — a successful
+# write IS the reconnection proof.  These constants size the post-deploy
+# verify+writeback retry budget to patiently outlast such a restart instead
+# of the much shorter Scheduler._TRANSIENT_RETRIES budget (sized for a plain
+# API hiccup, not a service restart).
+#
+# 6 attempts / base 2.0s exponential backoff -> 5 sleeps summing to
+# 2.0 * (2**5 - 1) = 62s of patient retrying before giving up — bounded (no
+# infinite loop) while comfortably exceeding a typical `--drain` restart.
+_WRITEBACK_MAX_ATTEMPTS: int = 6
+_WRITEBACK_BACKOFF_BASE: float = 2.0
+
 
 class DeterministicRunner:
     """Per-slot runner for deterministic gate tasks.
@@ -133,6 +158,13 @@ class DeterministicRunner:
             that runs the deploy script to completion.  Defaults to
             ``_default_run_script`` (awaited create_subprocess_exec).
             Injected in tests to avoid spawning real processes.
+        writeback_max_attempts: Bound on the post-deploy verify+writeback
+            retry loop (task 2066).  Defaults to ``_WRITEBACK_MAX_ATTEMPTS``.
+        writeback_backoff_base: Exponential backoff base (seconds) for the
+            writeback retry loop.  Defaults to ``_WRITEBACK_BACKOFF_BASE``.
+        sleeper: Optional async callable ``(seconds: float) -> None`` used to
+            pace writeback retries.  Defaults to ``asyncio.sleep``.  Injected
+            in tests so retries don't actually sleep.
     """
 
     def __init__(
@@ -143,6 +175,9 @@ class DeterministicRunner:
         script_runner=None,
         own_unit_resolver=None,
         restart_scheduler=None,
+        writeback_max_attempts=_WRITEBACK_MAX_ATTEMPTS,
+        writeback_backoff_base=_WRITEBACK_BACKOFF_BASE,
+        sleeper=None,
     ):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
@@ -150,6 +185,9 @@ class DeterministicRunner:
         self._script_runner = script_runner
         self._own_unit_resolver = own_unit_resolver
         self._restart_scheduler = restart_scheduler
+        self._writeback_max_attempts = writeback_max_attempts
+        self._writeback_backoff_base = writeback_backoff_base
+        self._sleeper = sleeper or asyncio.sleep
 
     # ------------------------------------------------------------------
     # Default injectable seam implementations
@@ -357,6 +395,18 @@ class DeterministicRunner:
         escalation already exists (e.g. prior crash-safe re-dispatch), filing is
         skipped to avoid duplicate L2 escalations.
 
+        The trailing ``set_task_status(..., 'blocked')`` write is best-effort
+        (task 2066 amendment): callers — including
+        ``_writeback_deploy_success`` on writeback-budget exhaustion — may
+        reach this method with the scheduler's own connection persistently
+        severed, i.e. the same failure mode that triggered the escalation in
+        the first place.  The escalation itself is already durable at this
+        point (``EscalationQueue.submit`` writes to local disk, independent of
+        fused-memory), so a failure to *also* persist the 'blocked' status
+        must not propagate — doing so would defeat this method's "always
+        returns BLOCKED, never a raw exception" contract in exactly the
+        scenario it exists to cover.
+
         Returns:
             WorkflowOutcome.BLOCKED
         """
@@ -386,9 +436,164 @@ class DeterministicRunner:
                 esc.id, task_id,
             )
 
-        await self.scheduler.set_task_status(task_id, 'blocked')
-        logger.info('DeterministicRunner: task %s blocked — infra_issue', task_id)
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+            logger.info('DeterministicRunner: task %s blocked — infra_issue', task_id)
+        except Exception as exc:
+            # Do NOT let a still-severed connection turn this into a
+            # propagated exception — it would bubble past run() into the
+            # harness's generic handler and produce a SILENT blocked report,
+            # defeating the point of filing a durable escalation above.
+            logger.warning(
+                'DeterministicRunner: task %s blocked-status writeback failed '
+                '(connection may still be severed): %s: %s — the infra_issue '
+                'escalation is already durable on local disk, so returning '
+                'BLOCKED regardless',
+                task_id, type(exc).__name__, exc,
+            )
         return WorkflowOutcome.BLOCKED
+
+    async def _writeback_deploy_success(
+        self,
+        task_id: str,
+        new_state: dict,
+        target_unit: str,
+        description: str,
+    ) -> WorkflowOutcome:
+        """Patiently persist a successful cross-unit deploy's verify+done writeback.
+
+        Task 2066: the cross-unit deploy script may restart the very service
+        backing the orchestrator's own fused-memory/MCP connection (e.g. task
+        2059), severing it for the duration of a ``--drain`` restart.  Because
+        ``McpSession._raw_call`` auto-reconnects on the next call after any
+        transient failure, a plain patient retry — not an explicit reconnect —
+        is sufficient: a successful write IS the reconnection proof.
+
+        Retries the ``before_done_verified_at``/``before_done_verified_pid``
+        stamp (treating a ``False`` return from ``update_task`` as transient)
+        until it lands, then retries the ``done`` write (catching a transient/
+        ``RuntimeError`` from ``set_task_status``'s own exhausted retry) —
+        both within the SAME bounded, paced ``_writeback_max_attempts``/
+        ``_writeback_backoff_base`` budget, without re-stamping and without
+        re-running the deploy script (I1 once-only — this helper only
+        persists an already-completed deploy's outcome).
+
+        On budget exhaustion (fused-memory never recovers in-window), files a
+        durable local ``infra_issue`` escalation (disk-backed, connection-
+        independent) and returns BLOCKED — so the task is never silently
+        stranded with an empty escalation queue (the EVIDENCE failure on task
+        2059).
+
+        Returns:
+            WorkflowOutcome.DONE — verified stamp + done write both persisted.
+            WorkflowOutcome.BLOCKED — writeback budget exhausted; infra_issue filed.
+        """
+        verified_iso = datetime.now(UTC).isoformat()
+        pid = new_state.get('MainPID', 0)
+        active_enter_timestamp = new_state.get('ActiveEnterTimestamp', '')
+
+        stamped = False
+        for attempt in range(self._writeback_max_attempts):
+            if not stamped:
+                stamped = bool(await self.scheduler.update_task(
+                    task_id,
+                    {
+                        'before_done_verified_at': verified_iso,
+                        'before_done_verified_pid': pid,
+                    },
+                    metadata_mode='merge',
+                ))
+                if not stamped:
+                    logger.warning(
+                        'DeterministicRunner: task %s verified-stamp writeback failed '
+                        '(attempt %d/%d) — connection may be severed by the deploy; '
+                        'retrying',
+                        task_id, attempt + 1, self._writeback_max_attempts,
+                    )
+                    if attempt + 1 < self._writeback_max_attempts:
+                        await self._sleeper(self._writeback_backoff_base * (2 ** attempt))
+                    continue
+
+            # Shared-budget design (task 2066 amendment): the verified-stamp
+            # write above and the done-write below intentionally draw from
+            # the SAME `_writeback_max_attempts` budget and `attempt` counter
+            # rather than each getting its own sub-budget.  If the stamp only
+            # lands on the final iteration, the done-write gets exactly one
+            # remaining try before the loop falls through to the
+            # budget-exhausted escalation path below — there is no dedicated
+            # done-write retry allowance.  This keeps the overall ceiling
+            # simple (the ~62s default bounds BOTH writes together) at the
+            # cost of a possibly-single done-write attempt in the worst case;
+            # see
+            # test_stamp_lands_on_final_attempt_then_done_write_fails_still_escalates
+            # for the regression guard covering this exact edge.
+            logger.info(
+                'DeterministicRunner: task %s before_done deploy verified — '
+                'pid=%s unit=%s — setting done',
+                task_id, pid, target_unit,
+            )
+            try:
+                await self.scheduler.set_task_status(
+                    task_id,
+                    'done',
+                    done_provenance={
+                        'kind': 'deterministic-deploy',
+                        'pid': pid,
+                        'active_enter_timestamp': active_enter_timestamp,
+                        'unit': target_unit,
+                    },
+                )
+                return WorkflowOutcome.DONE
+            except Exception as exc:
+                # set_task_status already exhausted its own transient retry
+                # budget (Scheduler._TRANSIENT_RETRIES) before raising — the
+                # connection may still be severed.  Retry the done-write
+                # within the SAME writeback budget rather than letting this
+                # propagate out of run() (stamped stays True — no re-stamp).
+                logger.warning(
+                    'DeterministicRunner: task %s done-write failed (attempt %d/%d): '
+                    '%s: %s — connection may still be severed; retrying',
+                    task_id, attempt + 1, self._writeback_max_attempts,
+                    type(exc).__name__, exc,
+                )
+                if attempt + 1 < self._writeback_max_attempts:
+                    await self._sleeper(self._writeback_backoff_base * (2 ** attempt))
+                continue
+
+        # Budget exhausted — fused-memory never recovered in-window.  File a
+        # durable, connection-independent local escalation (EscalationQueue.submit
+        # writes to disk) so the task is never silently stranded — the exact
+        # EVIDENCE failure on task 2059 (empty queue + blocked forever).
+        # before_done_ran_at is already stamped (I1 — the deploy is NOT re-run
+        # here).  This files an L2 escalation and blocks the task; the
+        # quiescence guard (section 1, before_done_ran_at+pending sub-case)
+        # prevents re-dispatch while that escalation stays open, so resume is
+        # NOT automatic while blocked.  If the verified stamp landed before
+        # the budget ran out, a human resolving this escalation — and the
+        # task then being re-dispatched — is a second safety net: crash-resume
+        # sub-case (a) will drive it to done at that point, without re-running
+        # the deploy.
+        detail = '\n'.join([
+            description,
+            f'Target unit: {target_unit}',
+            'The cross-unit deploy ran and verified successfully, but the '
+            "orchestrator's own fused-memory/MCP connection was severed by "
+            'the deploy (e.g. the deploy restarted the service backing that '
+            'connection) and the verify+writeback could not be persisted '
+            f'within the reconnect budget ({self._writeback_max_attempts} '
+            'attempts). before_done_ran_at is already stamped (I1 — the '
+            'deploy is NOT re-run). Resolve this escalation to unblock the '
+            'task: if the verified stamp landed before the connection was '
+            'lost, resolving it and letting the task re-dispatch will then '
+            'resume it to done automatically (no re-run); otherwise inspect '
+            f'{target_unit} and the task metadata to determine whether the '
+            'deploy needs to be retried manually.',
+        ])
+        return await self._file_infra_issue_and_block(
+            task_id,
+            summary=f'Deploy verify/writeback stranded (connection severed): {target_unit}',
+            detail=detail,
+        )
 
     async def _file_milestone_gate_and_block(
         self, task_id: str, task: dict, metadata: dict
@@ -880,34 +1085,13 @@ class DeterministicRunner:
 
                 if not always_escalates:
                     # Pure cross-unit deploy (B6): verified → set done with provenance.
-                    # Stamp before_done_verified_at FIRST: it is the positive proof a
-                    # later resume (after a crash in the window before the done write)
-                    # requires to drive to done rather than re-escalate as a crash-window.
-                    verified_iso = datetime.now(UTC).isoformat()
-                    await self.scheduler.update_task(
-                        task_id,
-                        {
-                            'before_done_verified_at': verified_iso,
-                            'before_done_verified_pid': pid,
-                        },
-                        metadata_mode='merge',
+                    # Task 2066: the deploy may have severed the orchestrator's own
+                    # fused-memory/MCP connection (e.g. it restarted the service
+                    # backing that connection) — delegate to the connection-resilient
+                    # writeback helper rather than a single unguarded write pair.
+                    return await self._writeback_deploy_success(
+                        task_id, new_state, target_unit, description,
                     )
-                    logger.info(
-                        'DeterministicRunner: task %s before_done deploy verified — '
-                        'pid=%d unit=%s — setting done',
-                        task_id, pid, target_unit,
-                    )
-                    await self.scheduler.set_task_status(
-                        task_id,
-                        'done',
-                        done_provenance={
-                            'kind': 'deterministic-deploy',
-                            'pid': pid,
-                            'active_enter_timestamp': new_state.get('ActiveEnterTimestamp', ''),
-                            'unit': target_unit,
-                        },
-                    )
-                    return WorkflowOutcome.DONE
 
                 # always_escalates=True with before_done (cross-unit act-then-ask):
                 # action already ran — fall through to the gate below.

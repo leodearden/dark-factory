@@ -690,6 +690,361 @@ class TestBeforeDoneCrossUnitDeploy:
 
 
 # ---------------------------------------------------------------------------
+# Task 2066: cross-unit writeback resilience — severed-then-recovered connection
+# (RED until the _writeback_deploy_success helper + constructor seams land)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestCrossUnitWritebackResilience:
+    """DeterministicRunner — cross-unit deploy verify+writeback survives a
+    self-severed fused-memory connection (task 2066).
+
+    The deploy script may restart the very service backing the orchestrator's
+    own fused-memory/MCP connection (e.g. task 2059), severing it for the
+    duration of a `--drain` restart.  These tests simulate that by making
+    scheduler.update_task / scheduler.set_task_status transiently fail before
+    recovering, and assert the runner patiently retries the writeback instead
+    of silently stranding the task (the EVIDENCE failure on task 2059).
+    """
+
+    async def test_verified_stamp_retried_past_transient_connection_failure(self, tmp_path: Path):
+        """update_task is retried past a transient severed connection until the
+        verified stamp durably persists, then done is set with fresh provenance."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        # Connection severed for the verified-stamp write's first two attempts,
+        # recovered on the 3rd (before_done_ran_at's stamp is unaffected — True).
+        verified_call_returns: list[bool] = []
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            if 'before_done_verified_at' in metadata:
+                result = len(verified_call_returns) >= 2
+                verified_call_returns.append(result)
+                return result
+            return True
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=5,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        # (a) update_task retried more than once for the verified stamp, and the
+        # final such call returned True — the stamp durably persisted despite
+        # the transient failure.
+        assert len(verified_call_returns) > 1, (
+            f'Expected the verified-stamp write to be retried; got only '
+            f'{len(verified_call_returns)} attempt(s): {verified_call_returns}'
+        )
+        assert verified_call_returns[-1] is True, (
+            'Final before_done_verified_at update_task call must have returned True'
+        )
+
+        # (b) paced retry — the injected sleeper was awaited at least once.
+        sleeper.assert_awaited()
+
+        # (c) set_task_status awaited with done + fresh provenance; outcome DONE.
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[0] == '2066'
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance is not None, 'done_provenance must be passed as a kwarg'
+        assert provenance['kind'] == 'deterministic-deploy'
+        assert provenance['pid'] == _FRESH_UNIT_STATE['MainPID']
+        assert outcome == WorkflowOutcome.DONE
+
+        # (d) I1 — the deploy script is NEVER re-run, even across writeback retries.
+        script_runner.assert_awaited_once()
+
+    async def test_done_write_retried_past_transient_set_task_status_error(self, tmp_path: Path):
+        """A transient RuntimeError from set_task_status('done', ...) is retried
+        within budget rather than propagating out of run() (task 2066)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        # before_done_verified_at stamps fine (connection alive for that write);
+        # the FIRST done-write hits a transient RuntimeError (connection severed
+        # mid-writeback), the second succeeds (connection recovered).
+        scheduler.set_task_status = AsyncMock(
+            side_effect=[RuntimeError('transient: fused-memory unavailable'), None]
+        )
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=5,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE, (
+            'A transient set_task_status RuntimeError must be retried within '
+            'budget, not propagate out of run()'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if len(c.args) > 1 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) >= 2, (
+            f'Expected set_task_status to be retried at least twice for the '
+            f'done write; got {len(done_calls)} call(s)'
+        )
+        script_runner.assert_awaited_once()
+        assert queue.get_by_task('2066') == [], (
+            'No escalation should be filed when the writeback recovers within budget'
+        )
+
+    async def test_persistent_severed_connection_files_durable_escalation(self, tmp_path: Path):
+        """A PERSISTENTLY severed connection (never recovers in-window) files a
+        durable infra_issue escalation instead of silently stranding the task
+        with an empty queue — the direct EVIDENCE regression guard (task 2059/2066)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            # Connection never recovers in-window for the verified stamp.
+            return 'before_done_verified_at' not in metadata
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=3,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        # (a) durable, connection-independent escalation filed — the queue is
+        # never empty, unlike the EVIDENCE failure on task 2059.
+        pending = queue.get_by_task('2066')
+        assert pending, 'Budget exhaustion must file a durable escalation, not leave the queue empty'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+        assert 'orchestrator-reify.service' in esc.detail
+        assert 'severed' in esc.detail.lower() or 'connection' in esc.detail.lower(), (
+            f'Detail must explain the self-severed-connection/writeback-stranding '
+            f'cause: {esc.detail!r}'
+        )
+
+        # (b) outcome is BLOCKED, never a propagated raw exception.
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # (c) before_done_ran_at was stamped pre-deploy (I1 crash-safe stamp).
+        ran_at_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('before_done_ran_at')
+        ]
+        assert ran_at_calls, 'before_done_ran_at must be stamped before the deploy runs'
+
+        # (d) bounded attempts — no infinite loop.
+        verified_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and 'before_done_verified_at' in c.args[1]
+        ]
+        assert len(verified_calls) == 3, (
+            f'Expected exactly writeback_max_attempts (3) verified-stamp attempts; '
+            f'got {len(verified_calls)}'
+        )
+        assert sleeper.await_count == 2, (
+            f'Expected exactly writeback_max_attempts-1 (2) sleeps; got {sleeper.await_count}'
+        )
+
+        # (e) the deploy script is never re-run.
+        script_runner.assert_awaited_once()
+
+    async def test_persistent_severed_connection_with_blocked_write_failure_still_returns_blocked(
+        self, tmp_path: Path,
+    ):
+        """Amendment regression guard (task 2066): when EVERY scheduler write
+        rides the same severed connection — including the fallback
+        set_task_status('blocked') issued by _file_infra_issue_and_block after
+        the writeback budget is exhausted — the durable escalation must still
+        be filed and run() must still return BLOCKED, never a propagated
+        exception.  Unlike test_persistent_severed_connection_files_durable_escalation
+        (which leaves set_task_status healthy), this simulates the connection
+        being down for ALL scheduler writes, matching production where both
+        writes share one connection."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            # Connection never recovers in-window for the verified stamp, so
+            # the done-write is never reached — the ONLY set_task_status call
+            # in this scenario is the fallback 'blocked' write below.
+            return 'before_done_verified_at' not in metadata
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+        # Every set_task_status call fails too — the connection is down for
+        # ALL scheduler writes, not just update_task.
+        scheduler.set_task_status = AsyncMock(
+            side_effect=RuntimeError('transient: fused-memory unavailable')
+        )
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=3,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        # The durable, connection-independent escalation is filed regardless.
+        pending = queue.get_by_task('2066')
+        assert pending, (
+            'Escalation must be filed even when the fallback blocked-status '
+            'write also fails'
+        )
+        assert pending[0].category == 'infra_issue'
+        assert pending[0].level == 2
+
+        # The outcome contract holds even when NO scheduler write succeeds:
+        # BLOCKED, never a propagated exception.
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        # The deploy script is never re-run.
+        script_runner.assert_awaited_once()
+
+    async def test_stamp_lands_on_final_attempt_then_done_write_fails_still_escalates(
+        self, tmp_path: Path,
+    ):
+        """Design-edge regression guard (task 2066 amendment): the
+        verified-stamp write and the done-write share ONE writeback budget and
+        `attempt` counter.  If the stamp only lands on the LAST attempt, the
+        done-write gets exactly one remaining try — no dedicated sub-budget.
+        A single failure of that one remaining try must still degrade
+        gracefully to the durable-escalation path (bounded, no propagated
+        exception) rather than looping further or crashing."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2066', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        # The verified stamp fails for the first 2 attempts and lands only on
+        # the 3rd/last attempt (writeback_max_attempts=3 below).
+        verified_attempts: list[bool] = []
+
+        def _update_task_side_effect(_task_id, metadata, **_kwargs):
+            if 'before_done_verified_at' in metadata:
+                result = len(verified_attempts) >= 2
+                verified_attempts.append(result)
+                return result
+            return True
+
+        scheduler.update_task = AsyncMock(side_effect=_update_task_side_effect)
+
+        # The done-write's only remaining try (on that same last iteration)
+        # fails; the fallback 'blocked' write (issued after budget exhaustion)
+        # stays healthy so this test isolates the shared-budget edge case from
+        # the separate blocked-write-failure scenario covered above.
+        def _set_task_status_side_effect(_task_id, status, **_kwargs):
+            if status == 'done':
+                raise RuntimeError('transient: fused-memory unavailable')
+            return None
+
+        scheduler.set_task_status = AsyncMock(side_effect=_set_task_status_side_effect)
+        sleeper = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+            writeback_max_attempts=3,
+            writeback_backoff_base=0.01,
+            sleeper=sleeper,
+        )
+        outcome = await runner.run(assignment)
+
+        # The stamp landed only on the 3rd/last attempt ...
+        assert verified_attempts == [False, False, True]
+
+        # ... but its single remaining try at the done-write failed, so the
+        # shared budget is exhausted with no attempts left: BLOCKED + durable
+        # escalation, never a propagated exception.
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2066')
+        assert pending, (
+            'Budget exhaustion after a late-landing stamp must still file a '
+            'durable escalation'
+        )
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if len(c.args) > 1 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1, (
+            f'The done-write gets exactly ONE try when the stamp lands on the '
+            f'final attempt (shared budget, no dedicated sub-budget); got '
+            f'{len(done_calls)}'
+        )
+        script_runner.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Default seam: _default_run_script env merge
 # ---------------------------------------------------------------------------
 
