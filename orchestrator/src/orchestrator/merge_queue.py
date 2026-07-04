@@ -2421,74 +2421,90 @@ async def classify_and_merge(
         req.worktree, req.branch, base_sha=base_sha if speculative else None,
     )
 
-    # 4. Conflict → reject immediately (caller resolves outside queue).
-    if merge_result.conflicts:
-        _emit_merge_attempt(
-            event_store, req.task_id, 'conflict',
-            duration_ms=_elapsed_ms(started_monotonic),
-        )
-        if isinstance(worker, SpeculativeMergeWorker):
-            # ι=1894: record drift = main_position − base at merge-start.
-            worker._note_conflict_detected(req.request_id)
-        if merge_result.merge_worktree:
-            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        return Decided(
-            MergeOutcome('conflict', conflict_details=merge_result.details),
-            merge_result=merge_result,
-        )
-
-    # 5. Non-conflict failure.
-    if not merge_result.success:
-        if merge_result.merge_worktree:
-            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        if isinstance(worker, SpeculativeMergeWorker):
-            diag = await worker._build_merge_failure_diagnostic(
-                req,
-                base_sha=merge_result.pre_merge_sha or base_sha,
-                base_label='speculative' if speculative else 'main_head',
-                git_stderr=merge_result.details,
+    # Steps 4-7 run inside a try/except: an unexpected exception anywhere in
+    # the post-merge pipeline (e.g. merge_commit is None despite a reported
+    # success, or a drop-guard/diagnostic helper raises) must still clean up
+    # the merge worktree before propagating.  Mirrors the pre-extraction
+    # callers' merge_result_local-based safety net, which this function now
+    # owns in full since it owns the merge_to_main call.
+    try:
+        # 4. Conflict → reject immediately (caller resolves outside queue).
+        if merge_result.conflicts:
+            _emit_merge_attempt(
+                event_store, req.task_id, 'conflict',
+                duration_ms=_elapsed_ms(started_monotonic),
             )
-            rendered = worker._render_failure_diagnostic(diag)
+            if isinstance(worker, SpeculativeMergeWorker):
+                # ι=1894: record drift = main_position − base at merge-start.
+                worker._note_conflict_detected(req.request_id)
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
             return Decided(
-                MergeOutcome(
-                    'blocked',
-                    reason=f'{merge_result.details}\n{rendered}',
-                    failure_diagnostic=diag,
-                ),
+                MergeOutcome('conflict', conflict_details=merge_result.details),
                 merge_result=merge_result,
             )
-        return Decided(
-            MergeOutcome('blocked', reason=merge_result.details),
+
+        # 5. Non-conflict failure.
+        if not merge_result.success:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+            if isinstance(worker, SpeculativeMergeWorker):
+                diag = await worker._build_merge_failure_diagnostic(
+                    req,
+                    base_sha=merge_result.pre_merge_sha or base_sha,
+                    base_label='speculative' if speculative else 'main_head',
+                    git_stderr=merge_result.details,
+                )
+                rendered = worker._render_failure_diagnostic(diag)
+                return Decided(
+                    MergeOutcome(
+                        'blocked',
+                        reason=f'{merge_result.details}\n{rendered}',
+                        failure_diagnostic=diag,
+                    ),
+                    merge_result=merge_result,
+                )
+            return Decided(
+                MergeOutcome('blocked', reason=merge_result.details),
+                merge_result=merge_result,
+            )
+
+        # 6. Drop-guard: every file the task planned must survive the merge.
+        assert merge_result.merge_commit is not None
+        merge_commit = merge_result.merge_commit.strip()
+        drop_result = await _check_plan_targets_in_tree(
+            merge_commit, req.worktree, git_ops, base_sha, task_id=req.task_id,
+        )
+        if drop_result.dropped:
+            if merge_result.merge_worktree:
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+            _emit_merge_attempt(
+                event_store, req.task_id, 'dropped_plan_targets',
+                duration_ms=_elapsed_ms(started_monotonic),
+            )
+            reason = (
+                f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: '
+                f'{", ".join(drop_result.dropped)}. '
+                f'Conflict resolution likely dropped planned work. '
+                f'Review the merge commit and restore missing files.'
+            )
+            return Decided(MergeOutcome('blocked', reason=reason))
+
+        # 7. Success.
+        return MergedOk(
             merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            branch_tip=branch_head,
         )
-
-    # 6. Drop-guard: every file the task planned must survive the merge.
-    assert merge_result.merge_commit is not None
-    merge_commit = merge_result.merge_commit.strip()
-    drop_result = await _check_plan_targets_in_tree(
-        merge_commit, req.worktree, git_ops, base_sha, task_id=req.task_id,
-    )
-    if drop_result.dropped:
+    except Exception:
         if merge_result.merge_worktree:
-            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
-        _emit_merge_attempt(
-            event_store, req.task_id, 'dropped_plan_targets',
-            duration_ms=_elapsed_ms(started_monotonic),
-        )
-        reason = (
-            f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: '
-            f'{", ".join(drop_result.dropped)}. '
-            f'Conflict resolution likely dropped planned work. '
-            f'Review the merge commit and restore missing files.'
-        )
-        return Decided(MergeOutcome('blocked', reason=reason))
-
-    # 7. Success.
-    return MergedOk(
-        merge_result=merge_result,
-        merge_wt=merge_result.merge_worktree,
-        branch_tip=branch_head,
-    )
+            logger.debug(
+                'Task %s: classify_and_merge: cleaning up merge worktree '
+                'after post-merge error', req.task_id,
+            )
+            with contextlib.suppress(Exception):
+                await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+        raise
 
 
 async def _do_train_merge(
@@ -7129,144 +7145,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         self._inflight_req = None
                         continue
 
-                    # ── Step 0.5: branch-presence guard ───────────────────────
-                    # A missing branch ref resolves terminally before the
-                    # rev-parse HEAD below: unknown_branch on a never-existed
-                    # ref (typically a mis-routed merge_request) or
-                    # already_merged when the ref was cleaned up post-merge.
-                    # Riding it through the verifier queue as an immediate
-                    # outcome means the latest event is the terminal
-                    # merge_attempt _classify_branch_presence emitted, not a
-                    # bare merge_dequeued (phantom in_flight on the dashboard).
-                    # Pass req.worktree for parity with _do_merge: the
-                    # absent-ref worktree-HEAD fallback fires in both paths.
-                    guard = await _classify_branch_presence(
-                        self._git_ops, self._event_store, req.task_id,
-                        req.branch, t0,
-                        worktree=req.worktree,
+                    # ── Guard + merge + drop-guard pipeline (MQ-refactor kappa) ──
+                    # classify_and_merge (module-level) covers branch-presence →
+                    # already-merged → merge → conflict / non-conflict-failure →
+                    # drop-guard.  It emits all merge_attempt/speculative_merge
+                    # events internally, so the event stream is identical to the
+                    # pre-extraction inline copy.  See its docstring for the full
+                    # equivalence-matrix contract shared with _do_merge/_remerge.
+                    result = await classify_and_merge(
+                        self, req, base_for_merge, speculative=speculative,
+                        started_monotonic=t0,
                     )
-                    if guard is not None:
-                        _already = self._oob_deliver(req, guard, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
-                            request=req, merge_result=None, merge_wt=None,
-                            base_sha=actual_main, speculative=speculative,
-                            skip_verify=False, immediate_outcome=guard,
-                            already_delivered=_already,
-                            started_monotonic=t0,
-                        ))
-                        self._speculation_controller.on_transfer_terminal()
-                        self._inflight_req = None
-                        continue
-
-                    # ── Step 1: already-merged detection ──────────────────────
-                    rc, branch_head, err = await _run(
-                        ['git', 'rev-parse', 'HEAD'], cwd=req.worktree,
-                    )
-                    if rc != 0:
-                        logger.warning(
-                            f'Task {req.task_id}: rev-parse HEAD failed: {err.strip()}'
-                        )
-                        # failure_diagnostic is NOT populated here: this failure
-                        # occurs before a merge attempt (git cannot even read the
-                        # worktree HEAD), so the merge_to_main diagnostic fields
-                        # (base_sha, branch_ref_in_worktree, etc.) are meaningless.
-                        # failure_diagnostic is only set on genuine merge_to_main
-                        # non-conflict failures downstream.
-                        _revparse_fail = MergeOutcome(
-                            'blocked',
-                            reason=f'rev-parse HEAD failed: {err.strip()}',
-                        )
-                        _already = self._oob_deliver(req, _revparse_fail, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
-                            request=req, merge_result=None, merge_wt=None,
-                            base_sha=actual_main, speculative=speculative,
-                            skip_verify=False,
-                            immediate_outcome=_revparse_fail,
-                            already_delivered=_already,
-                            started_monotonic=t0,
-                        ))
-                        self._speculation_controller.on_transfer_terminal()
-                        self._inflight_req = None
-                        continue
-                    branch_head = branch_head.strip()
-                    if await self._git_ops.is_ancestor(branch_head, actual_main) and not await self._git_ops.has_uncommitted_work(req.worktree):
-                        logger.info(
-                            f'Task {req.task_id}: branch already on main — skipping'
-                        )
-                        _emit_merge_attempt(self._event_store, req.task_id, 'already_merged', duration_ms=_elapsed_ms(t0))
-                        await self._verifier_queue.put(SpeculativeItem(
-                            request=req, merge_result=None, merge_wt=None,
-                            base_sha=actual_main, speculative=speculative,
-                            skip_verify=False,
-                            immediate_outcome=MergeOutcome('already_merged'),
-                            started_monotonic=t0,
-                        ))
-                        self._speculation_controller.on_transfer_terminal()
-                        self._inflight_req = None
-                        continue
-
-                    # ── Step 2: merge (speculative or normal) ─────────────────
-                    if speculative:
-                        self._emit_speculative(
-                            EventType.speculative_merge, req.task_id,
-                            base_sha=base_for_merge,
-                        )
-                    merge_result = await self._git_ops.merge_to_main(
-                        req.worktree, req.branch, base_sha=base_for_merge if speculative else None,
-                    )
-                    merge_result_local = merge_result  # track for cleanup on post-merge exception
-
-                    # ── Step 3: conflict or non-conflict failure ───────────────
-                    if merge_result.conflicts:
-                        logger.info(f'Task {req.task_id}: merge conflicts')
-                        _emit_merge_attempt(self._event_store, req.task_id, 'conflict', duration_ms=_elapsed_ms(t0))
-                        # ι=1894: record drift = main_position − base at merge-start
-                        self._note_conflict_detected(req.request_id)
-                        if merge_result.merge_worktree:
-                            await self._git_ops.cleanup_merge_worktree(
-                                merge_result.merge_worktree,
-                            )
-                        _conflict = MergeOutcome(
-                            'conflict', conflict_details=merge_result.details,
-                        )
-                        _already = self._oob_deliver(req, _conflict, speculative=speculative)
+                    if isinstance(result, Decided):
+                        # Uniform _oob_deliver call: its own predicate already
+                        # excludes status in {'done','already_merged'}, so this
+                        # is a no-op for the already-merged arm — identical to
+                        # the old bare-put that skipped the call entirely.
+                        _already = self._oob_deliver(req, result.outcome, speculative=speculative)
                         await self._verifier_queue.put(SpeculativeItem(
                             request=req, merge_result=None, merge_wt=None,
                             base_sha=base_for_merge, speculative=speculative,
                             skip_verify=False,
-                            immediate_outcome=_conflict,
+                            immediate_outcome=result.outcome,
                             already_delivered=_already,
-                            started_monotonic=t0,
-                        ))
-                        self._speculation_controller.on_transfer_terminal()
-                        self._inflight_req = None
-                        continue
-
-                    if not merge_result.success:
-                        if merge_result.merge_worktree:
-                            await self._git_ops.cleanup_merge_worktree(
-                                merge_result.merge_worktree,
-                            )
-                        _diag = await self._build_merge_failure_diagnostic(
-                            req,
-                            base_sha=merge_result.pre_merge_sha or base_for_merge,
-                            base_label='speculative' if speculative else 'main_head',
-                            git_stderr=merge_result.details,
-                        )
-                        _rendered = self._render_failure_diagnostic(_diag)
-                        _merge_fail = MergeOutcome(
-                            'blocked',
-                            reason=f'{merge_result.details}\n{_rendered}',
-                            failure_diagnostic=_diag,
-                        )
-                        _already = self._oob_deliver(req, _merge_fail, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
-                            request=req, merge_result=None, merge_wt=None,
-                            base_sha=base_for_merge, speculative=speculative,
-                            skip_verify=False,
-                            immediate_outcome=_merge_fail,
-                            already_delivered=_already,
-                            failure_diagnostic=_diag,
+                            failure_diagnostic=result.outcome.failure_diagnostic,
                             started_monotonic=t0,
                         ))
                         self._speculation_controller.on_transfer_terminal()
@@ -7274,49 +7176,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         continue
 
                     # ── Merge succeeded ────────────────────────────────────────
-                    merge_commit = merge_result.merge_commit
-                    assert merge_commit is not None
-                    merge_commit = merge_commit.strip()
-
-                    # Drop-guard: every file the task planned must survive.
-                    # Pass base_for_merge (the pre-merge main tip the merge
-                    # was computed against — actual or speculative) so the
-                    # subtraction is rebase-robust.
-                    drop_result = await _check_plan_targets_in_tree(
-                        merge_commit, req.worktree, self._git_ops, base_for_merge,
-                        task_id=req.task_id,
-                    )
-                    dropped = drop_result.dropped
-                    if dropped:
-                        if merge_result.merge_worktree:
-                            await self._git_ops.cleanup_merge_worktree(
-                                merge_result.merge_worktree,
-                            )
-                        logger.warning(
-                            f'Task {req.task_id}: merge dropped plan '
-                            f'targets: {dropped}'
-                        )
-                        _emit_merge_attempt(self._event_store, req.task_id, 'dropped_plan_targets', duration_ms=_elapsed_ms(t0))
-                        reason = (
-                            f'{DROPPED_PLAN_TARGETS_REASON_PREFIX}: '
-                            f'{", ".join(dropped)}. '
-                            f'Conflict resolution likely dropped '
-                            f'planned work. Review the merge commit '
-                            f'and restore missing files.'
-                        )
-                        _drop = MergeOutcome('blocked', reason=reason)
-                        _already = self._oob_deliver(req, _drop, speculative=speculative)
-                        await self._verifier_queue.put(SpeculativeItem(
-                            request=req, merge_result=None, merge_wt=None,
-                            base_sha=base_for_merge, speculative=speculative,
-                            skip_verify=False,
-                            immediate_outcome=_drop,
-                            already_delivered=_already,
-                            started_monotonic=t0,
-                        ))
-                        self._speculation_controller.on_transfer_terminal()
-                        self._inflight_req = None
-                        continue
+                    merge_result = result.merge_result
+                    merge_result_local = merge_result  # track for cleanup on post-merge exception
+                    branch_head = result.branch_tip
+                    assert merge_result.merge_commit is not None
+                    merge_commit = merge_result.merge_commit.strip()
 
                     # Mechanism 1: cap non-speculative build-ahead.
                     # Trains (continue before this) and immediate-outcome guards
