@@ -699,6 +699,16 @@ class GraphitiBackend:
         Matches the node as either source or target (undirected) and filters
         edges where invalid_at IS NULL (i.e. not yet invalidated).
 
+        Deduplicates by edge ELEMENT identity (WITH DISTINCT e), not by the
+        (uuid, fact, name) property tuple. FalkorDB does not enforce property
+        uniqueness, and redirect_node_edges (the merge path) copies
+        new.uuid = old.uuid onto redirected edges, so an entity can carry
+        multiple genuinely-distinct RELATES_TO relationships that share one
+        (uuid, fact, name) tuple. Deduping on the element itself still
+        collapses the undirected self-loop double-match (an A→A edge matches
+        the same element twice) while correctly counting distinct edges that
+        happen to share copied properties.
+
         Args:
             node_uuid: UUID of the Entity node.
             group_id: Project graph to query.
@@ -710,7 +720,8 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
             'WHERE e.invalid_at IS NULL '
-            'RETURN DISTINCT e.uuid, e.fact, e.name'
+            'WITH DISTINCT e '
+            'RETURN e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
         return [
