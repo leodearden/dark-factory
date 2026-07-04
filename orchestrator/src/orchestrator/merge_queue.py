@@ -4716,6 +4716,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
              ``conflicts_with_main`` but absent from nodes is a δ=1889
              graph-consistency violation naming the stale rid.
 
+        (iii) **verify-base ⊆ frozen-tip** (task 1999 / MQ-invariants ξ, I5):
+             snapshot-granularity promotion of the dispatch-time
+             :meth:`_warn_if_verify_base_not_frozen_tip` log-only guard — see
+             :meth:`_verify_base_frozen_tip_violations` for the per-entry
+             chained-base check.  Distinctly worded from
+             :meth:`check_frozen_prefix_invariant`'s base-chain violation so
+             it stands as its own named verify-frontier assertion target,
+             even though it mirrors the same chain math.
+
         Pure / synchronous (no await).  Fail-safe: never raises; any
         unexpected exception inside a sub-check is caught and surfaced as a
         violation string so the caller always receives a ``list[str]``.
@@ -4737,6 +4746,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 violations = []
         except Exception as exc:  # pragma: no cover — defensive
             violations = [f'two_layer_invariants: check_frozen_prefix_invariant raised: {exc}']
+
+        # ── (iii) verify-base ⊆ frozen-tip ───────────────────────────────────
+        # Same main_sha-availability gate as the inherited base-chain check
+        # above; own try/except so a failure here never shadows (or is
+        # shadowed by) check_frozen_prefix_invariant's result.
+        if main_sha and main_sha != 'unknown':
+            try:
+                violations.extend(self._verify_base_frozen_tip_violations(main_sha))
+            except Exception as exc:  # pragma: no cover — defensive
+                violations.append(f'two_layer_invariants: verify-base check raised: {exc}')
 
         graph = self._suffix_conflict_graph
 
@@ -4766,6 +4785,49 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'two_layer_invariants: conflicts_with_main⊆nodes check raised: {exc}'
             )
 
+        return violations
+
+    def _verify_base_frozen_tip_violations(self, main_sha: str) -> list[str]:
+        """Return verify-base/frozen-tip violations as human-readable strings (task 1999 I5).
+
+        Snapshot-granularity promotion of :meth:`_warn_if_verify_base_not_frozen_tip`
+        (the ε=1890 log-only dispatch guard): every currently-frozen entry's
+        recorded ``base_sha`` must equal the frozen-tip base it was dispatched
+        against — the head entry's expected base is *main_sha*, and each
+        subsequent entry's expected base is its predecessor's ``merge_commit``.
+        Mirrors :meth:`check_frozen_prefix_invariant`'s base-chain loop
+        exactly (per-entry chained expected base, NOT a naive "every entry ==
+        newest tip" comparison, which would falsely flag a healthy
+        multi-entry frozen prefix whose head is based on main rather than the
+        stack's tip) — the two checks overlap mathematically but are kept as
+        distinctly-worded, separately-named surfaces: this one parallels the
+        retained ε=1890 dispatch-time WARN and gives it a dedicated
+        verify-frontier assertion target in the snapshot health surface.
+
+        Entries with no merge_result/merge_commit (passthrough/conflict) are
+        skipped and do NOT advance the expected-base chain — mirrors both
+        :meth:`check_frozen_prefix_invariant` and the dispatch guard's own
+        ``item.merge_result is None or not item.base_sha`` exclusion.
+
+        Pure/synchronous (no await). Fail-safe: never raises — callers
+        (:meth:`two_layer_invariants`) wrap this in their own try/except, but
+        the loop body itself cannot raise on well-formed InflightEntry data.
+        """
+        violations: list[str] = []
+        expected_base = main_sha.strip()
+        for entry in self._frozen_inflight_entries():
+            rid = entry.item.request.request_id
+            mr = entry.item.merge_result
+            if mr is None or not mr.merge_commit:
+                continue  # passthrough / conflict — nothing to chain
+            actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
+            if actual_base != expected_base:
+                violations.append(
+                    f'verify-base⊄frozen-tip at {rid!r}: dispatched for real-verify '
+                    f'with base {actual_base!r} but expected frozen-tip base '
+                    f'{expected_base!r} (ε=1890 §5.3 verify-base/frozen-tip rule)'
+                )
+            expected_base = mr.merge_commit.strip()
         return violations
 
     # ── MQ-invariants iota (task 1994): resource-conservation audits ────────
