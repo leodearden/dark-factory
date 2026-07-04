@@ -15,6 +15,7 @@ import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 
+from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.mcp_tools.scheduler_state import (
     read_scheduler_events,
     read_scheduler_state,
@@ -1134,11 +1135,29 @@ def create_mcp_server(
                 agent_id=agent_id,
                 session_id=session_id,
                 params={'entity_uuid': entity_uuid},
-                result_summary={'found': True},
+                result_summary={
+                    'found': True,
+                    'name': result.get('name'),
+                    'has_summary': bool(result.get('summary')),
+                },
             )
             return result
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
+        except NodeNotFoundError as e:
+            # Expected diagnostic outcome, not a backend failure — this tool
+            # exists specifically to confirm whether a node exists. Log it
+            # as a successful read that resolved to "not found" so read-op
+            # error metrics stay reserved for genuine backend errors.
+            await _log_read(
+                operation='get_entity_by_uuid',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'entity_uuid': entity_uuid},
+                result_summary={'found': False},
+            )
+            return {'error': str(e), 'error_type': type(e).__name__}
         except Exception as e:
             logger.exception(f'get_entity_by_uuid error: {e}')
             await _log_read(
