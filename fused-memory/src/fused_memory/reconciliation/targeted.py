@@ -432,7 +432,7 @@ class TargetedReconciler:
                         content += f" {description}"
                     details = task.get('details', '')
                     if details:
-                        content += f"\nDetails: {details[:500]}"
+                        content += f"\nDetails: {_truncate_clean(details, 500)}"
 
             write_metadata: dict[str, Any] = {
                 'source': _ECHO_SOURCE,
