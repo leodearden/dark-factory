@@ -13,6 +13,7 @@ from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     GitOps,
+    MergeResult,
     ScrubOutcome,
     ScrubResult,
     TrainStackResult,
@@ -1369,6 +1370,142 @@ class TestAdvanceMainCasRetrySha:
         assert merge.success and merge.merge_commit
         assert await git_ops.advance_main(merge.merge_commit) == 'advanced'
         assert git_ops._last_advanced_sha == merge.merge_commit
+
+    # -- AdvanceOutcome value-object contract (task 1997 / MQ-refactor μ) --
+    #
+    # AdvanceOutcome does not exist yet in orchestrator.git_ops, and
+    # advance_main still returns a bare AdvanceResult literal — every test
+    # below is RED (ImportError on the local `from orchestrator.git_ops
+    # import AdvanceOutcome`) until step-2 lands the value object.
+
+    async def _prepare_cas_retry_landing(
+        self, git_ops: GitOps,
+    ) -> tuple[MergeResult, str]:
+        """Land branch A, then prepare branch B's merge worktree pinned to
+        the ORIGINAL (pre-A) main so a subsequent ``advance_main(merge_b...)``
+        call must rebase B to land it (the CAS-retry path). Mirrors the setup
+        in ``test_last_advanced_sha_is_post_rebase_after_cas_retry`` above.
+
+        Returns ``(merge_b, original_main_sha)``; the caller drives the
+        actual ``advance_main`` call (and its assertions) since (b) and (c)
+        exercise this scenario with different arguments.
+        """
+        _, original_main_sha, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        original_main_sha = original_main_sha.strip()
+
+        wt_a = await git_ops.create_worktree('cas-a-outcome')
+        (wt_a.path / 'a.py').write_text('a = 1\n')
+        await git_ops.commit(wt_a.path, 'Add a')
+
+        wt_b = await git_ops.create_worktree('cas-b-outcome')
+        (wt_b.path / 'b.py').write_text('b = 1\n')
+        await git_ops.commit(wt_b.path, 'Add b')
+
+        merge_a = await git_ops.merge_to_main(wt_a.path, 'cas-a-outcome')
+        assert merge_a.success and merge_a.merge_commit and merge_a.merge_worktree
+        assert await git_ops.advance_main(merge_a.merge_commit) == 'advanced'
+        await git_ops.cleanup_merge_worktree(merge_a.merge_worktree)
+
+        merge_b = await git_ops.merge_to_main(
+            wt_b.path, 'cas-b-outcome', base_sha=original_main_sha,
+        )
+        assert merge_b.success and merge_b.merge_commit and merge_b.merge_worktree
+        return merge_b, original_main_sha
+
+    async def test_advance_main_returns_outcome_object_on_fast_forward(
+        self, git_ops: GitOps,
+    ):
+        """advance_main returns an AdvanceOutcome value object; when no CAS
+        retry is needed, advanced_sha equals the input merge_sha and the
+        rebase-only fields (rebased_from/rebased_onto) are None.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+
+        wt = await git_ops.create_worktree('ff-outcome')
+        (wt.path / 'y.py').write_text('y = 1\n')
+        await git_ops.commit(wt.path, 'Add y')
+        merge = await git_ops.merge_to_main(wt.path, 'ff-outcome')
+        assert merge.success and merge.merge_commit
+
+        outcome = await git_ops.advance_main(merge.merge_commit)
+
+        assert isinstance(outcome, AdvanceOutcome)
+        assert outcome.result == 'advanced'
+        assert outcome.advanced_sha == merge.merge_commit
+        assert outcome.rebased_from is None
+        assert outcome.rebased_onto is None
+
+    async def test_advance_main_returns_outcome_object_after_cas_retry(
+        self, git_ops: GitOps,
+    ):
+        """On the CAS-retry rebase path, the returned AdvanceOutcome's
+        advanced_sha is the post-rebase SHA that is actually on main — not
+        the stale pre-rebase ``MergeResult.merge_commit``.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+
+        merge_b, _original_main_sha = await self._prepare_cas_retry_landing(git_ops)
+        pre_rebase_sha = merge_b.merge_commit
+        assert merge_b.merge_worktree is not None
+
+        outcome = await git_ops.advance_main(
+            pre_rebase_sha,
+            merge_worktree=merge_b.merge_worktree,
+            branch='cas-b-outcome',
+        )
+
+        assert isinstance(outcome, AdvanceOutcome)
+        assert outcome.result == 'advanced'
+        assert outcome.advanced_sha is not None
+        assert outcome.advanced_sha != pre_rebase_sha
+
+        rc, _, _ = await _run(
+            ['git', 'merge-base', '--is-ancestor',
+             outcome.advanced_sha, git_ops.config.main_branch],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'outcome.advanced_sha {outcome.advanced_sha} must be on main'
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
+
+    async def test_advance_main_returns_outcome_object_with_reverify_on_rebase(
+        self, git_ops: GitOps,
+    ):
+        """With reverify_on_rebase=True, a CAS-retry rebase returns
+        'rebased_pending_reverify' with advanced_sha (post-rebase),
+        rebased_from (original base) and rebased_onto (moved main) all
+        populated on the returned object — no update-ref performed.
+        """
+        from orchestrator.git_ops import AdvanceOutcome
+
+        merge_b, original_main_sha = await self._prepare_cas_retry_landing(git_ops)
+        pre_rebase_sha = merge_b.merge_commit
+        assert merge_b.merge_worktree is not None
+
+        _, moved_main_sha, _ = await _run(
+            ['git', 'rev-parse', git_ops.config.main_branch],
+            cwd=git_ops.project_root,
+        )
+        moved_main_sha = moved_main_sha.strip()
+
+        outcome = await git_ops.advance_main(
+            pre_rebase_sha,
+            merge_worktree=merge_b.merge_worktree,
+            branch='cas-b-outcome',
+            expected_main=original_main_sha,
+            reverify_on_rebase=True,
+        )
+
+        assert isinstance(outcome, AdvanceOutcome)
+        assert outcome.result == 'rebased_pending_reverify'
+        assert outcome.advanced_sha is not None
+        assert outcome.advanced_sha != pre_rebase_sha
+        assert outcome.rebased_from == original_main_sha
+        assert outcome.rebased_onto == moved_main_sha
+
+        await git_ops.cleanup_merge_worktree(merge_b.merge_worktree)
 
 
 # -- Shared helpers for re-merge-fallback tests --------------------------------
