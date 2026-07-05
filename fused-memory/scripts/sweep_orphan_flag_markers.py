@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One-shot sweep: detect and optionally delete stage1_flag_marker records in Mem0/Qdrant
-that are missing the ``kind='stage1_flag_marker'`` metadata key (task-1659 orphans).
+that are missing the ``kind='stage1_flag_marker'`` metadata key (task-1659 orphans) or
+that lack a usable ``task_id`` (task-2108 orphans).
 
 Background
 ----------
@@ -193,8 +194,14 @@ async def run(args: Any, memory_service: Any) -> dict:
         JSON-serialisable report dict:
             - dry_run (bool)
             - before (dict with total_source and total_with_kind counts)
-            - orphan_count (int)
+            - orphan_count (int): size of the deduplicated union of
+              find_orphan_markers + find_taskless_markers — the actual
+              number of records deleted (or that would be deleted).
             - orphan_ids (list[str])
+            - taskless_orphan_count (int): raw len(find_taskless_markers(...)).
+              Overlaps with the kind-orphan predicate for members missing
+              BOTH kind and task_id, so it does not subtract cleanly from
+              orphan_count — see the inline NOTE above its assignment.
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
             - after (dict with counts, only when apply=True)
@@ -244,6 +251,12 @@ async def run(args: Any, memory_service: Any) -> dict:
 
     orphan_ids = [o['id'] for o in orphans]
 
+    # NOTE: taskless_orphan_count is the raw size of the taskless predicate
+    # (find_taskless_markers), not a "taskless-only" diagnostic — it includes
+    # members that are ALSO kind-orphans (e.g. a member missing both kind and
+    # task_id). It therefore does not subtract from / sum cleanly against
+    # orphan_count to reconstruct the union; it exists purely to make the
+    # taskless predicate's contribution to the sweep observable.
     report: dict = {
         'dry_run': not args.apply,
         'before': before,
@@ -282,11 +295,17 @@ def main() -> int:
         format='%(asctime)s %(name)s %(levelname)s %(message)s',
     )
     parser = argparse.ArgumentParser(
-        description='Detect (and optionally delete) stage1_flag_marker records missing kind.',
+        description=(
+            'Detect (and optionally delete) stage1_flag_marker records missing '
+            'kind or task_id.'
+        ),
     )
     parser.add_argument(
         '--apply', action='store_true', default=False,
-        help='Commit deletions (default: dry-run only).',
+        help=(
+            'Commit deletions of stage1_flag_marker records missing kind or '
+            'task_id (default: dry-run only).'
+        ),
     )
     parser.add_argument(
         '--project-id', dest='project_id', default='dark_factory',
