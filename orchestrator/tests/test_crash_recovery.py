@@ -2,6 +2,7 @@
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -200,7 +201,12 @@ class TestRecoverCrashedTasks:
 
     async def test_recover_no_worktrees_dir_noop(self, harness: Harness):
         """Worktree base doesn't exist -> no-op, no errors."""
-        # Don't create the worktree base dir
+        # The fixture's mark_pool_storage_present() call creates worktree_base
+        # as a side effect (task 2099) — remove it again so this test still
+        # exercises the pre-existing "base missing entirely" guard, distinct
+        # from the pool-storage-absent guard (base exists, sentinel absent)
+        # covered by the dedicated storage-absent tests.
+        shutil.rmtree(harness.git_ops.worktree_base)
         assert not harness.git_ops.worktree_base.exists()
 
         await harness._recover_crashed_tasks()
