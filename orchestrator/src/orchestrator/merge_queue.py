@@ -4915,15 +4915,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         by :meth:`snapshot`'s ``'speculation'`` key and
         :meth:`speculation_accounting_violations`. Counts
         ``self._inflight`` entries with ``was_speculative`` plus
-        ``self._verifier_queue`` items with ``.speculative`` — the same
+        ``self._verifier_queue`` items with ``.speculative`` plus
+        ``self._redispatch`` items with ``.speculative`` — the same
         CPython internal-deque read ``snapshot()`` already performs
         elsewhere (synchronous, no await, no lock; safe under asyncio's
         single-loop model).
+
+        ``self._redispatch`` is a third verifier-side resting place for an
+        un-released speculation permit (task 2063): a speculative item is
+        parked there, still holding its permit, when ``_dispatch_item``
+        returns ``None`` because ``free_host_count() == 0`` (verify hosts <
+        speculation_depth) — the item is awaiting a host, not abandoned.
+        Omitting this deque undercounts by one for the whole multi-heartbeat
+        window the item spends parked, which self-clears once a host frees
+        it into ``self._inflight``; this is what previously surfaced as a
+        spurious ``speculation-slot conservation violated`` audit finding.
+        The narrower mid-``_dispatch_item`` git-call await and the
+        in-dispatch speculative-remerge window are single-tick, sub-heartbeat
+        transients that the ``RESOURCE_AUDIT_ESCALATION_STREAK >= 3``
+        detector already tolerates — intentionally left uncounted here
+        (characterize-first minimal-fix scope, not a further leak).
         """
         return (
             sum(1 for _ie in self._inflight if _ie.was_speculative)
             + sum(
                 1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
+                if _item is not None and _item.speculative
+            )
+            + sum(
+                1 for _item in self._redispatch
                 if _item is not None and _item.speculative
             )
         )
