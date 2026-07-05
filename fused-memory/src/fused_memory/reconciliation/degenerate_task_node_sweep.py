@@ -39,6 +39,7 @@ Design decisions (captured in plan.json):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
@@ -131,28 +132,62 @@ async def sweep_degenerate_task_nodes(
             (default: ``DEFAULT_TASK_NODE_NAME_TEMPLATES``).
         log: Logger to use (default: this module's logger).
 
+    Best-effort (mirrors ``MemoryService._dedup_episode_nodes``): a transient
+    backend error scanning (``find_duplicate_entity_nodes``) or deleting
+    (``delete_entity_node``) is caught, logged, and tallied into
+    ``stats['errors']`` — it never aborts the sweep for the remaining
+    task_ids/templates. ``asyncio.CancelledError``/``KeyboardInterrupt``/
+    ``SystemExit`` are re-raised unchanged (never swallowed as best-effort).
+
     Returns:
         dict with int counts: ``scanned`` (nodes examined across all
         task_id/template combinations), ``degenerate`` (nodes seen with
         edge_count == 0), ``deleted`` (successful deletes), ``errors``
-        (always 0 here — best-effort error tallying is layered in by
-        callers/hardening; see module callers for the wrapped variant).
+        (caught find/delete failures).
+
+    Empty *task_ids* short-circuits to all-zero stats with no graphiti calls.
     """
     stats = {'scanned': 0, 'degenerate': 0, 'deleted': 0, 'errors': 0}
+
+    if not task_ids:
+        return stats
 
     for task_id in task_ids:
         for template in name_templates:
             name = template.format(id=task_id)
-            matches = await memory_service.graphiti.find_duplicate_entity_nodes(
-                name, group_id=project_id,
-            )
+            try:
+                matches = await memory_service.graphiti.find_duplicate_entity_nodes(
+                    name, group_id=project_id,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                log.exception(
+                    'degenerate_task_node_sweep: find_duplicate_entity_nodes failed '
+                    'for name=%s group_id=%s',
+                    name, project_id,
+                )
+                stats['errors'] += 1
+                continue
+
             for match in matches:
                 stats['scanned'] += 1
-                if int(match['edge_count']) == 0:
-                    stats['degenerate'] += 1
+                if int(match['edge_count']) != 0:
+                    continue
+                stats['degenerate'] += 1
+                try:
                     await memory_service.graphiti.delete_entity_node(
                         match['uuid'], group_id=project_id,
                     )
                     stats['deleted'] += 1
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    log.exception(
+                        'degenerate_task_node_sweep: delete_entity_node failed '
+                        'for uuid=%s group_id=%s',
+                        match['uuid'], project_id,
+                    )
+                    stats['errors'] += 1
 
     return stats
