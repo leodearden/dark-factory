@@ -2122,6 +2122,17 @@ class TestGetEntity:
         assert service.graphiti.search.call_args.kwargs['num_results'] == 10
 
 
+class TestEdgeToDict:
+    """Unit tests for the module-level _edge_to_dict helper."""
+
+    def test_edge_to_dict_normalizes_dict_shape(self):
+        """A plain EdgeDict (from get_valid_edges_for_node) normalizes uuid/fact,
+        drops 'name', and yields temporal=None (EdgeDict carries no valid_at/invalid_at).
+        """
+        result = memory_service._edge_to_dict({'uuid': 'e-1', 'fact': 'F', 'name': 'N'})
+        assert result == {'uuid': 'e-1', 'fact': 'F', 'temporal': None}
+
+
 class TestSerializeTemporal:
     """Unit tests for the _serialize_temporal module-level helper."""
 
