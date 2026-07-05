@@ -623,12 +623,14 @@ async def test_supersede_cancel_failure_is_isolated(tmp_path: Path):
 
     calls: list[tuple[str, dict]] = []
 
-    async def _flaky_dispatch(name, args, *, timeout=15):
-        calls.append((name, args))
+    async def _flaky_dispatch(
+        name: str, arguments: dict, *, timeout: float = 15,
+    ) -> dict:
+        calls.append((name, arguments))
         if (
             name == 'set_task_status'
-            and args.get('id') == 'redo-old-1'
-            and args.get('status') == 'cancelled'
+            and arguments.get('id') == 'redo-old-1'
+            and arguments.get('status') == 'cancelled'
         ):
             raise RuntimeError('transient dispatch failure')
         if name == 'submit_task':
