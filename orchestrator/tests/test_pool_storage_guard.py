@@ -27,6 +27,7 @@ This module builds up the guard from the bottom:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -34,7 +35,13 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import POOL_ROOT_SENTINEL, GitOps
+from orchestrator.git_ops import (
+    POOL_ROOT_SENTINEL,
+    GitOps,
+    WarmLaneUnavailable,
+    WorktreeInfo,
+    _run,
+)
 
 
 @pytest.fixture
@@ -216,3 +223,216 @@ class TestWarmLaneGcReclaimGuard:
             [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
             cwd=git_ops.project_root,
         )
+
+
+# ---------------------------------------------------------------------------
+# Real-repo fixtures for the acquire create-once discriminator (step-7/8).
+# Mirrors test_git_ops.py's git_repo / _seed_default_warm_base / _add_warm_lane_scripts.
+# ---------------------------------------------------------------------------
+
+
+async def _init_acquire_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+def _seed_default_warm_base(repo: Path) -> None:
+    """Pre-create the DEFAULT derived warm-lane base (task 2061) so the
+    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK.
+
+    These tests exercise the task-2099 create-once DISCRIMINATOR — a
+    DIFFERENT (later) gate — not the 2061 base-health gate.  Mirrors
+    test_git_ops.py's ``_seed_default_warm_base``.  Deliberately does NOT
+    mark ``.pool-root`` — that is exactly the condition under test.
+    """
+    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
+    default_base.mkdir(parents=True, exist_ok=True)
+    (default_base / '.keep').write_text('warm base sentinel\n')
+
+
+async def _add_warm_lane_scripts(repo: Path) -> None:
+    """Commit a stub seed-warm-lane.sh into repo/scripts/ (mirrors test_git_ops.py)."""
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    seed_script = scripts_dir / 'seed-warm-lane.sh'
+    seed_script.write_text(
+        '#!/usr/bin/env bash\nmkdir -p "$2/target"\necho "seeded" > "$2/target/seeded.bin"\n'
+    )
+    seed_script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
+
+
+@pytest.fixture
+def acquire_git_repo(tmp_path: Path) -> Path:
+    """Real git repo with the default warm base pre-seeded (2061 gate: OK),
+    but WITHOUT the .pool-root sentinel — worktree_base exists (it was
+    created as a side effect of seeding the base) but storage is not marked
+    present, simulating an unmounted mountpoint with a live, empty mount dir.
+    """
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_acquire_repo(repo))
+    _seed_default_warm_base(repo)
+    return repo
+
+
+def _acquire_config() -> GitConfig:
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=True,
+        merge_spec_warm_lane_pool=True,
+    )
+
+
+@pytest.mark.asyncio
+class TestAcquireCreateOnceDiscriminatorAndMarkChokepoint:
+    """acquire_warm_lane / acquire_spec_lane create-once discriminator +
+    the _seed_warm_lane mark-on-success chokepoint (step-7/8)."""
+
+    async def test_acquire_warm_lane_create_once_refuses_when_storage_absent(
+        self, acquire_git_repo: Path,
+    ):
+        await _add_warm_lane_scripts(acquire_git_repo)
+        git_ops = GitOps(
+            _acquire_config(), acquire_git_repo,
+            warm_lane_pool_size=1, merge_spec_warm_lane_pool_size=1,
+        )
+        # worktree_base (.worktrees) already exists via _seed_default_warm_base
+        # (it created .worktrees/_merge-verify/target) — but .pool-root was
+        # never written, simulating an unmounted mountpoint.
+        assert git_ops.worktree_base.exists()
+        assert not git_ops.pool_storage_present()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=acquire_git_repo)
+        start_ref = start_ref_raw.strip()
+
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert result is WarmLaneUnavailable.BASE_ABSENT, (
+            f'Expected BASE_ABSENT requeue signal, got {result!r}'
+        )
+        lane_dir = git_ops.worktree_base / '_lane-0'
+        assert not lane_dir.exists(), (
+            'create-once must NOT create the lane dir when storage is absent'
+        )
+        callback.assert_called_once()
+
+    async def test_acquire_spec_lane_create_once_refuses_when_storage_absent(
+        self, acquire_git_repo: Path,
+    ):
+        await _add_warm_lane_scripts(acquire_git_repo)
+        git_ops = GitOps(
+            _acquire_config(), acquire_git_repo,
+            warm_lane_pool_size=1, merge_spec_warm_lane_pool_size=1,
+        )
+        assert git_ops.worktree_base.exists()
+        assert not git_ops.pool_storage_present()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        _, head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=acquire_git_repo)
+        merge_commit = head_raw.strip()
+
+        wt, warm = await git_ops.acquire_spec_lane(merge_commit)
+
+        assert warm is False, f'Expected cold fallback (warm=False), got warm={warm}'
+        spec_lane_dir = git_ops.worktree_base / '_spec-0'
+        assert not spec_lane_dir.exists(), (
+            'create-once must NOT create the spec lane dir when storage is absent'
+        )
+        callback.assert_called_once()
+
+    async def test_seed_warm_lane_marks_sentinel_on_success(
+        self, acquire_git_repo: Path,
+    ):
+        await _add_warm_lane_scripts(acquire_git_repo)
+        git_ops = GitOps(_acquire_config(), acquire_git_repo)
+        assert not git_ops.pool_storage_present()
+
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=acquire_git_repo)
+        start_ref = start_ref_raw.strip()
+        lane = git_ops.worktree_base / 'manual-lane'
+        rc_add, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(lane), start_ref],
+            cwd=acquire_git_repo,
+        )
+        assert rc_add == 0, f'setup: worktree add failed: {err}'
+
+        rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+
+        assert rc == 0, f'seed should succeed via the stub script, got rc={rc}'
+        assert git_ops.pool_storage_present() is True, (
+            '_seed_warm_lane must mark the .pool-root sentinel on rc==0'
+        )
+
+    async def test_seed_warm_lane_does_not_mark_sentinel_on_failure(
+        self, acquire_git_repo: Path,
+    ):
+        # NO _add_warm_lane_scripts -> seed script absent -> rc == 127.
+        git_ops = GitOps(_acquire_config(), acquire_git_repo)
+        assert not git_ops.pool_storage_present()
+
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=acquire_git_repo)
+        start_ref = start_ref_raw.strip()
+        lane = git_ops.worktree_base / 'manual-lane'
+        rc_add, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(lane), start_ref],
+            cwd=acquire_git_repo,
+        )
+        assert rc_add == 0, f'setup: worktree add failed: {err}'
+
+        rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+
+        assert rc == 127, f'expected seed-script-absent sentinel, got rc={rc}'
+        assert git_ops.pool_storage_present() is False, (
+            '_seed_warm_lane must NOT mark the sentinel on non-zero rc'
+        )
+
+    async def test_acquire_warm_lane_create_once_proceeds_when_storage_present(
+        self, acquire_git_repo: Path,
+    ):
+        """Control (regression guard): sentinel present -> normal create-once."""
+        await _add_warm_lane_scripts(acquire_git_repo)
+        git_ops = GitOps(
+            _acquire_config(), acquire_git_repo,
+            warm_lane_pool_size=1, merge_spec_warm_lane_pool_size=1,
+        )
+        git_ops.mark_pool_storage_present()
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=acquire_git_repo)
+        start_ref = start_ref_raw.strip()
+
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected normal create-once success, got {result!r}'
+        )
+        assert result.path == git_ops.worktree_base / '_lane-0'
+
+    async def test_acquire_spec_lane_create_once_proceeds_when_storage_present(
+        self, acquire_git_repo: Path,
+    ):
+        """Control (regression guard): sentinel present -> normal create-once."""
+        await _add_warm_lane_scripts(acquire_git_repo)
+        git_ops = GitOps(
+            _acquire_config(), acquire_git_repo,
+            warm_lane_pool_size=1, merge_spec_warm_lane_pool_size=1,
+        )
+        git_ops.mark_pool_storage_present()
+        _, head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=acquire_git_repo)
+        merge_commit = head_raw.strip()
+
+        wt, warm = await git_ops.acquire_spec_lane(merge_commit)
+
+        assert warm is True, f'Expected normal warm create-once success, got warm={warm}'
+        assert wt == git_ops.worktree_base / '_spec-0'
