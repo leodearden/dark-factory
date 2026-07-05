@@ -2206,8 +2206,7 @@ Output JSON matching the schema. Every task must appear in the output.
         This step handles only the un-pinned case (``pool.assignments_snapshot()``
         has no entry for the checked-out id yet) — the idempotent-skip,
         never-steal, and dup-checkout-detach precedence guards (consulting
-        the snapshot) and the terminal/absent-detach branches are added by
-        later steps of task 2062.
+        the snapshot) are added by later steps of task 2062.
         """
         pool = self.git_ops.warm_lane_pool
         if pool is None:
@@ -2227,6 +2226,9 @@ Output JSON matching the schema. Every task must appear in the output.
         degraded = resolver_failed(statuses, err)
         live = {} if degraded else {str(k): v for k, v in statuses.items()}
 
+        # NOTE: this loop does not yet consult pool.assignments_snapshot() —
+        # the idempotent-skip, never-steal, and dup-checkout-detach
+        # precedence guards land in later steps of task 2062.
         for bare_id, lane in checkouts.items():
             if degraded:
                 logger.warning(
@@ -2235,15 +2237,28 @@ Output JSON matching the schema. Every task must appear in the output.
                     bare_id, lane,
                 )
                 pool.restore_assignment(bare_id, lane)
-            elif bare_id in live and live[bare_id] not in TERMINAL_STATUSES:
+            elif bare_id not in live:
+                logger.info(
+                    'Lane-checkout reconciler: %s absent from a healthy '
+                    'status read (task deleted) — detaching stale checkout '
+                    'at %s',
+                    bare_id, lane,
+                )
+                await self.git_ops.detach_lane_checkout(lane, bare_id)
+            elif live[bare_id] in TERMINAL_STATUSES:
+                logger.info(
+                    'Lane-checkout reconciler: %s is terminal (%s) — '
+                    'detaching stale checkout at %s',
+                    bare_id, live[bare_id], lane,
+                )
+                await self.git_ops.detach_lane_checkout(lane, bare_id)
+            else:
                 logger.info(
                     'Lane-checkout reconciler: re-pinning live task %s -> %s '
                     '(recovery skipped this id)',
                     bare_id, lane,
                 )
                 pool.restore_assignment(bare_id, lane)
-            # else: terminal/absent-detach and pinned/dup/steal precedence
-            # guards land in later steps; no-op for now.
 
     async def _reap_orphan_worktrees(self) -> None:
         """Reap/quarantine worktrees whose id no longer maps to a live task.
