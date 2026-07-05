@@ -5116,6 +5116,134 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
+    async def reap_orphaned_merge_worktrees(
+        self,
+        *,
+        recovered_branches: Collection[str] = (),
+        now: float | None = None,
+    ) -> dict[str, list[str]]:
+        """Reap aged unregistered on-disk ``_merge-*`` worktrees (I6 leak
+        closure, task 2060).
+
+        The remediation counterpart to :meth:`worktree_ledger_violations`:
+        that method only DETECTS leaked worktrees; this method REMOVES them.
+        Intended to run once at worker construction/recovery time (see
+        ``Harness._reap_orphaned_merge_worktrees``), backstopping two orphan
+        sources — a caller's ``finally`` cleanup skipped by a mid-run SIGTERM,
+        and an orchestrator restart that wipes :attr:`_owned_merge_worktrees`
+        while the on-disk worktree (and its ``.git/worktrees`` admin entry)
+        survives.
+
+        Reuses :meth:`worktree_ledger_violations`'s exact os.scandir discovery
+        so remediation stays symmetric with detection: direct children of
+        ``git_ops.worktree_base`` whose name starts with ``'_merge-'``,
+        excluding the persistent warm worktree
+        (:data:`PERSISTENT_MERGE_WORKTREE_NAME`) and any path already present
+        in :attr:`_owned_merge_worktrees`.  A candidate is only removed (via
+        :meth:`GitOps.cleanup_merge_worktree`) once its mtime age exceeds
+        :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS` — the same grace window
+        :meth:`worktree_ledger_violations` uses — so a worktree from a
+        just-started concurrent merge (register-after-create race) is never
+        touched.
+
+        Before the reap scan, *recovered_branches* (the branches of merge
+        requests recovered from the durable journal — see
+        ``Harness._recover_pending_merges``) are each resolved via
+        :meth:`GitOps.find_inflight_merge_worktree`, the documented
+        cross-restart branch→on-disk-worktree oracle.  Any match is
+        RE-ADOPTED — registered into :attr:`_owned_merge_worktrees` via
+        :meth:`_register_owned_merge_worktree` — rather than left to the reap
+        scan, since it backs a legitimate in-flight merge regardless of age
+        (re-adoption bypasses the grace gate entirely).
+
+        *now* is injectable for deterministic tests; defaults to
+        ``time.time()``.
+
+        Returns ``{'readopted': [...], 'reaped': [...]}`` — string paths of
+        every worktree re-adopted / removed this sweep.  Returns
+        ``{'readopted': [], 'reaped': []}`` immediately when ``worktree_base``
+        is missing or not a directory.
+        """
+        readopted: list[str] = []
+        reaped: list[str] = []
+
+        base = getattr(self._git_ops, 'worktree_base', None)
+        if base is None or not base.is_dir():
+            return {'readopted': readopted, 'reaped': reaped}
+
+        for branch in recovered_branches:
+            try:
+                wt = await self._git_ops.find_inflight_merge_worktree(branch)
+            except Exception:  # noqa: BLE001
+                # Fail-open: one branch's oracle miss must never abort the
+                # startup sweep (find_inflight_merge_worktree runs git).
+                logger.warning(
+                    'reap_orphaned_merge_worktrees: find_inflight_merge_worktree '
+                    'failed for branch %s — skipping re-adoption',
+                    branch, exc_info=True,
+                )
+                continue
+            if wt is not None:
+                self._register_owned_merge_worktree(wt)
+                readopted.append(str(wt.resolve()))
+
+        effective_now = now if now is not None else time.time()
+        grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        # Computed AFTER re-adoption so the reap scan below skips paths just
+        # re-adopted above (re-adoption is exempt from the grace gate).
+        owned = {p.resolve() for p in self._owned_merge_worktrees}
+
+        try:
+            with os.scandir(base) as it:
+                candidates = list(it)
+        except OSError:
+            # Fail-open: worktree_base vanished / became unreadable in the
+            # TOCTOU window after the is_dir() guard above.  Honour the
+            # never-raise contract — return the report-so-far (any re-adoptions
+            # already applied are preserved) rather than aborting startup.
+            # Mirrors worktree_ledger_violations' defensive scan wrap.
+            logger.warning(
+                'reap_orphaned_merge_worktrees: scandir of %s failed — '
+                'skipping reap scan this sweep', base, exc_info=True,
+            )
+            candidates = []
+        for entry in candidates:
+            name = entry.name
+            if not name.startswith('_merge-') or name == PERSISTENT_MERGE_WORKTREE_NAME:
+                continue
+            try:
+                if not entry.is_dir():
+                    continue
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            path = Path(entry.path).resolve()
+            if path in owned:
+                continue
+            age = effective_now - mtime
+            if age > grace:
+                try:
+                    await self._git_ops.cleanup_merge_worktree(path)
+                except Exception:  # noqa: BLE001
+                    # Fail-open: one worktree's removal failure must never
+                    # abort the sweep of the remaining orphans.
+                    logger.warning(
+                        'reap_orphaned_merge_worktrees: cleanup_merge_worktree '
+                        'failed for %s — leaving for a later sweep',
+                        path, exc_info=True,
+                    )
+                    continue
+                reaped.append(str(path))
+
+        if reaped or readopted:
+            logger.info(
+                'reap_orphaned_merge_worktrees: reaped=%d readopted=%d',
+                len(reaped),
+                len(readopted),
+            )
+
+        return {'readopted': readopted, 'reaped': reaped}
+
     def _warn_if_verify_base_not_frozen_tip(
         self,
         item: SpeculativeItem,

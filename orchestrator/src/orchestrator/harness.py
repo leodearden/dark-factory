@@ -1226,10 +1226,23 @@ class Harness:
             # 1c0a. Recover in-flight merge requests from the durable journal
             # (task 1772). Runs after _rehydrate_merge_halt so a halted queue
             # holds re-enqueued items rather than racing to merge them.
+            _recover_report: dict = {}
             try:
-                await self._recover_pending_merges()
+                _recover_report = await self._recover_pending_merges()
             except Exception as e:
                 logger.warning(f'Failed to recover pending merges: {e}')
+
+            # 1c0a2. Reap orphaned _merge-* worktrees left by a mid-run SIGTERM
+            # or a restart that wiped the in-memory ledger (task 2060, I6 leak).
+            # Runs after recovery so a worktree still backing a recovered
+            # in-flight merge is re-adopted rather than reaped.  Own try/except
+            # so a reaper fault never blocks startup.
+            try:
+                await self._reap_orphaned_merge_worktrees(
+                    _recover_report.get('requests', []),
+                )
+            except Exception as e:
+                logger.warning(f'Failed to reap orphaned merge worktrees: {e}')
 
             # 1c0b. File the L1 escalation for a pause restored from a prior
             # run (deferred from _load_persisted_scheduler_pause, which ran
@@ -6300,7 +6313,7 @@ Output JSON matching the schema. Every task must appear in the output.
         logger.warning(reason)
         return esc.id
 
-    async def _recover_pending_merges(self) -> None:
+    async def _recover_pending_merges(self) -> dict:
         """Rehydrate in-flight merge requests from the durable journal (task 1772).
 
         Delegates to ``recover_pending_merges`` which:
@@ -6312,6 +6325,12 @@ Output JSON matching the schema. Every task must appear in the output.
         so a halted queue buffers the re-enqueued items rather than merging
         them.  Non-fatal: a corrupt or partial journal logs a warning and lets
         startup continue rather than blocking the orchestrator.
+
+        Returns the ``recover_pending_merges`` report dict (``recovered`` /
+        ``dropped`` / ``requests`` / ``journal_corrupt``) so ``run()`` can
+        thread the recovered requests' branches into
+        :meth:`_reap_orphaned_merge_worktrees` (task 2060) — a recovered
+        in-flight worktree is re-adopted rather than reaped.
         """
         report = await recover_pending_merges(
             self._merge_store,
@@ -6327,6 +6346,37 @@ Output JSON matching the schema. Every task must appear in the output.
             report.get('recovered', 0),
             report.get('dropped', 0),
             report.get('journal_corrupt', False),
+        )
+        return report
+
+    async def _reap_orphaned_merge_worktrees(self, recovered_requests) -> None:
+        """Reap aged orphaned ``_merge-*`` worktrees at startup (task 2060, I6).
+
+        Startup backstop for the merge-worktree-ledger leak: an on-disk
+        ``_merge-<uuid>`` worktree can survive a mid-run SIGTERM (skipped
+        ``finally`` cleanup) or an orchestrator restart (which wipes the
+        in-memory ``_owned_merge_worktrees`` ledger while the worktree + its
+        ``.git/worktrees`` admin entry persist).  Delegates to
+        :meth:`SpeculativeMergeWorker.reap_orphaned_merge_worktrees`, which
+        re-adopts any worktree still backing a recovered in-flight merge and
+        reaps the rest once they age past the resource-audit grace window.
+
+        *recovered_requests* is the ``report['requests']`` list from
+        :meth:`_recover_pending_merges`; each request's ``branch`` is passed as
+        ``recovered_branches`` so its worktree is re-adopted (registered) rather
+        than reaped.  A no-op when the merge worker is absent (disabled / not
+        yet constructed); the worker method is itself fail-open per record.
+        """
+        if self._merge_worker is None:
+            return
+        branches = [req.branch for req in recovered_requests]
+        report = await self._merge_worker.reap_orphaned_merge_worktrees(
+            recovered_branches=branches,
+        )
+        logger.info(
+            '_reap_orphaned_merge_worktrees: readopted=%d reaped=%d',
+            len(report.get('readopted', [])),
+            len(report.get('reaped', [])),
         )
 
     async def _stop_escalation_server(self) -> None:
