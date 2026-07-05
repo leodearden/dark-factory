@@ -294,6 +294,15 @@ class DeterministicRunner:
         script = before_done['script']
         args = before_done.get('args') or []
 
+        # The transient unit runs under the systemd --user manager, which does
+        # NOT inherit the orchestrator's own working directory — it defaults to
+        # $HOME.  A relative deploy `script` would therefore fail to be found
+        # (exit 127) once the unit fires.  Resolve an explicit cwd from
+        # before_done['cwd'] when the caller supplied one; otherwise fall back
+        # to this process's own os.getcwd(), which is project_root because the
+        # orchestrator's own systemd unit pins WorkingDirectory=project_root.
+        cwd = before_done.get('cwd') or os.getcwd()
+
         esc_summary = summary or (
             f'Self-restart fire-time failure: {target_unit}'
         )
@@ -347,6 +356,7 @@ class DeterministicRunner:
             f'--on-active={on_active_secs}',
             f'--unit={transient_unit}',
             '--collect',
+            f'--working-directory={cwd}',
             '/bin/sh', '-c', wrapped,
         ]
         proc = await asyncio.create_subprocess_exec(
