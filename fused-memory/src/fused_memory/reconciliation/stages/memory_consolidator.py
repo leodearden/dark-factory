@@ -17,6 +17,10 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
     build_summary_nonce_section,
 )
+from fused_memory.reconciliation.degenerate_task_node_sweep import (
+    extract_terminal_task_ids,
+    sweep_degenerate_task_nodes,
+)
 from fused_memory.reconciliation.flag_dedup import (
     acknowledge_resolved_flags,
     compute_content_fingerprint_signature,
@@ -349,6 +353,20 @@ class MemoryConsolidator(BaseStage):
                     report.stats['stage1_human_operator_escalated'] = len(escalated)
                 else:
                     report.stats['stage1_human_operator_escalated'] = 0
+
+        # ── Degenerate task-node sweep (task 2107) ─────────────────────────────
+        # Delete degenerate ("tasks {id}", edge_count == 0) placeholder Graphiti
+        # nodes for terminal (done + cancelled) tasks. extract_terminal_task_ids
+        # returns [] for a None filtered_task_tree, so this naturally no-ops when
+        # the harness hasn't set one.
+        terminal_ids = extract_terminal_task_ids(self.filtered_task_tree)
+        if terminal_ids:
+            sweep_stats = await sweep_degenerate_task_nodes(
+                self.memory, self.project_id, terminal_ids,
+            )
+            report.stats['degenerate_task_nodes_swept'] = sweep_stats['deleted']
+            report.stats['degenerate_task_nodes_scanned'] = sweep_stats['scanned']
+
         return report
 
     def get_system_prompt(self) -> str:
