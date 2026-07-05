@@ -1431,11 +1431,12 @@ async def _sweep_stale_persistence_markers(
     Enumerates deterministically via ``memory_service.get_memories_by_metadata``
     (Qdrant payload-filter scroll) — NEVER semantic search, which silently
     drops low-similarity rows and is unsuitable for exhaustive GC. Members
-    with a missing or unparseable ``created_at`` are KEPT (never deleted).
+    with a missing or unparseable ``created_at`` are KEPT (never deleted),
+    mirroring :func:`_sweep_stale_flag_markers`'s safety posture.
 
     Deletes are issued best-effort in parallel via ``asyncio.gather`` with
-    ``return_exceptions=True``; failed deletes are excluded from the
-    returned count.
+    ``return_exceptions=True`` (mirrors :func:`_sweep_stale_fixc_markers`):
+    individual failures log WARNING and are excluded from the returned count.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata`` and
@@ -1450,13 +1451,35 @@ async def _sweep_stale_persistence_markers(
         scroll_limit: Max records to enumerate in one scroll (default 1000).
 
     Returns:
-        Number of memories successfully deleted (0 if nothing is stale).
+        Number of memories successfully deleted (0 if nothing is stale, or
+        on enumeration failure).
     """
-    members = await memory_service.get_memories_by_metadata(
-        project_id=project_id,
-        filters={'source': _STAGE2_PERSISTENCE_MARKER_SOURCE},
-        limit=scroll_limit,
-    )
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'source': _STAGE2_PERSISTENCE_MARKER_SOURCE},
+            limit=scroll_limit,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._sweep_stale_persistence_markers: '
+            'get_memories_by_metadata failed for project_id=%s; skipping sweep',
+            project_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
+
+    if len(members) >= scroll_limit:
+        logger.warning(
+            'reconciliation._sweep_stale_persistence_markers: enumerated %d of scroll_limit=%d '
+            'stage2_persistence_marker records — scroll cap reached; older stale markers may '
+            'remain uncollected this cycle; re-run with a higher scroll_limit.',
+            len(members), scroll_limit,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+    if not members:
+        return 0
 
     cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
 
@@ -1476,6 +1499,9 @@ async def _sweep_stale_persistence_markers(
         if created_at < cutoff:
             stale_ids.append(mid)
 
+    if not stale_ids:
+        return 0
+
     results = await asyncio.gather(
         *(
             memory_service.delete_memory(
@@ -1491,8 +1517,14 @@ async def _sweep_stale_persistence_markers(
     )
 
     success_count = 0
-    for result in results:
-        if not isinstance(result, BaseException):
+    for mid, result in zip(stale_ids, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'reconciliation._sweep_stale_persistence_markers: delete failed for memory_id=%s; not counted',
+                mid,
+                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+            )
+        else:
             success_count += 1
     return success_count
 
