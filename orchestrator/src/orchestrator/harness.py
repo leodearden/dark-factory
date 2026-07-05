@@ -2435,6 +2435,23 @@ Output JSON matching the schema. Every task must appear in the output.
         if not worktree_base.exists():
             return
 
+        # Pool-storage guard (task 2099): worktree_base can EXIST as an
+        # unmounted mountpoint dir, making every mount-resident worktree
+        # APPEAR missing to the checks below — the Jul-3 incident this
+        # guards against. Abort the ENTIRE sweep (no DB read, no
+        # cleanup/quarantine, no prune tail) rather than risk treating a
+        # live lane as an orphan.
+        if not self.git_ops.pool_storage_present():
+            logger.warning(
+                'Orphan reaper: pool storage absent/unmounted at %s — '
+                'aborting the ENTIRE sweep (no cleanup/quarantine/prune) to '
+                'avoid treating mount-resident worktrees as orphans',
+                worktree_base,
+            )
+            self._file_pool_storage_absent_escalation()
+            return
+        await self._resolve_pool_storage_absent_escalation()
+
         statuses, err = await self.scheduler.get_statuses()
         if resolver_failed(statuses, err):
             logger.warning(

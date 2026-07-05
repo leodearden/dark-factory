@@ -44,6 +44,13 @@ def harness(tmp_path: Path, mock_orch_config):
 
     # Replace git_ops cleanup/quarantine with async mocks; keep worktree_base real
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
+    # Task 2099: mark pool storage present by default so the new
+    # mount-presence guard on _recover_crashed_tasks does not false-trip
+    # across this file's recovery-routing tests, which all assume an
+    # already-mounted host — an orthogonal concern to plan recovery/cleanup
+    # routing. The dedicated storage-absent tests remove the sentinel
+    # explicitly to exercise the guard itself.
+    h.git_ops.mark_pool_storage_present()
     h.git_ops.cleanup_worktree = AsyncMock()
     h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
     # Registration guard (reify 4655/4947): default to "still registered" so
