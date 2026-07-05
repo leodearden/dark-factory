@@ -2383,11 +2383,15 @@ class GitOps:
             # path (which recovers the committed work via alpha-retention,
             # task 1912) when repair cannot restore the registration. Never
             # FAULT a healable orphan.
-            if reused and not await self._is_registered_worktree(lane):
-                if not await self._repair_orphaned_reuse_lane(lane, branch_name):
-                    self.warm_lane_pool.drop_assignment(branch_name)
-                    reused = False
-                # else: registration restored in place — proceed as reused
+            if (
+                reused
+                and not await self._is_registered_worktree(lane)
+                and not await self._repair_orphaned_reuse_lane(lane, branch_name)
+            ):
+                self.warm_lane_pool.drop_assignment(branch_name)
+                reused = False
+            # else: not reused, already registered, or repair restored the
+            # registration in place — proceed (possibly still reused) below.
 
             if reused:
                 # ── Reuse path: live requeue of same task on same lane ────
