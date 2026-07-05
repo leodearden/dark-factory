@@ -93,7 +93,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.git_ops import AdvanceOutcome, GitOps, MergeResult, _run
 from orchestrator.harness import Harness
 from orchestrator.merge_queue import (
     DecidedItem,
@@ -1199,3 +1199,123 @@ class TestScenario7ItemShape:
                 phase='passthrough',
                 passthrough_outcome=MergeOutcome('conflict'),
             )
+
+
+# ── step-11 RED / step-12 GREEN: Row 8 — CAS-retry rebased landing carries merged_branch_tip ──
+
+
+@pytest.mark.asyncio
+class TestScenario8CasRetryTipCarry:
+    """Row 8: a CAS-retry rebased landing (advance_main -> 'rebased_pending_reverify')
+    must carry item.merged_branch_tip through the I3 replace-only rebuild so
+    the post-merge equivalence gate receives the REAL branch tip instead of
+    None — no phantom POST_MERGE_EQUIVALENCE_FAILED 'blocked' on
+    byte-identical work (task-1928 regression pin; ε=1890 I3).
+
+    Driven directly via worker._verify_and_advance(item) (style C). Models
+    test_merge_queue.py's TestMergedBranchTipCarryThroughRebuild — reuses its
+    test-(C) mocked-``advance_main`` technique (a simple branch + a fully
+    mocked CAS loop, no real overlap/rebase needed) but targets the
+    'rebased_pending_reverify' branch (``dataclasses.replace(item,
+    base_sha=rebased_onto)``) instead of 'cas_failed'.
+
+    advance_main is fully mocked, so the fabricated advanced_sha returned on
+    the second call is not a real git object: ``_resolve_second_parent``
+    (fallback term-1) fails open to None against a nonexistent SHA (see its
+    docstring), leaving item.merged_branch_tip (term-2) as the only
+    surviving trusted-tip source — req.snapshot_tip (term-3) is None by
+    default (_make_req does not set it). This isolates exactly what I3's
+    dataclasses.replace guarantee is responsible for.
+    """
+
+    async def test_rebased_pending_reverify_carries_merged_branch_tip(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        branch = 'row8-cas-retry'
+        worker = _make_worker(git_ops)
+
+        # Simple branch; no real overlap/rebase needed (advance_main is mocked).
+        branch_wt = (await git_ops.create_worktree(branch)).path
+        (branch_wt / 'row8.py').write_text('row8 = 1\n')
+        await git_ops.commit(branch_wt, 'Add row8.py')
+        _, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=branch_wt)
+        ORIGINAL_TIP = head_out.strip()
+
+        base_sha = await git_ops.get_main_sha()
+        merge_result = await git_ops.merge_to_main(branch_wt, branch)
+        assert merge_result.success and merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        worker._register_owned_merge_worktree(merge_result.merge_worktree)
+
+        req = _make_req(branch, branch, config, git_repo)
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=False,
+            merged_branch_tip=ORIGINAL_TIP,
+        )
+
+        # advance_main mock: call 1 -> rebased_pending_reverify (forces the
+        # dataclasses.replace(item, base_sha=rebased_onto) rebuild); call 2+
+        # -> advanced, with a FABRICATED advanced_sha (not a real git object
+        # — see class docstring for why that isolates term-2).
+        advance_calls = [0]
+
+        async def _fake_advance(sha: str, wt: Path, **kw: Any) -> AdvanceOutcome:
+            advance_calls[0] += 1
+            if advance_calls[0] == 1:
+                return AdvanceOutcome(
+                    'rebased_pending_reverify',
+                    advanced_sha='f' * 40,
+                    rebased_from=base_sha,
+                    rebased_onto='e' * 40,
+                )
+            return AdvanceOutcome('advanced', advanced_sha='a' * 40)
+
+        captured_equiv_kw: dict = {}
+
+        async def _spy_equiv(*args: Any, **kwargs: Any) -> list[str]:
+            captured_equiv_kw.update(kwargs)
+            return []  # clean -> outcome proceeds to 'done'
+
+        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                AsyncMock(return_value=_mock_verify_result(True)),
+            ),
+            patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
+            patch(
+                'orchestrator.merge_queue._reverify_rebased_tree',
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_equivalence',
+                side_effect=_spy_equiv,
+            ),
+            patch(
+                'orchestrator.merge_queue._check_post_merge_pyright',
+                AsyncMock(return_value=pyright_clean),
+            ),
+        ):
+            advanced = await worker._verify_and_advance(item)
+
+        assert advanced is True, 'Expected True (main advanced)'
+        outcome = req.result.result()
+        assert outcome.status == 'done', (
+            f'no phantom POST_MERGE_EQUIVALENCE_FAILED blocked; got {outcome!r}'
+        )
+        assert captured_equiv_kw.get('merged_tip') == ORIGINAL_TIP, (
+            f'_check_post_merge_equivalence must be called with '
+            f'merged_tip={ORIGINAL_TIP!r} (merged_branch_tip carried through '
+            f'the rebased_pending_reverify replace-only rebuild); got '
+            f'{captured_equiv_kw.get("merged_tip")!r}'
+        )
+
+        main_sha = await git_ops.get_main_sha()
+        _assert_quiescent(worker, main_sha, [req])
