@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1990,3 +1991,105 @@ class TestLaneBranchCheckouts:
             result = await git_ops.lane_branch_checkouts()
 
         assert result is None
+
+
+@pytest.mark.asyncio
+class TestDetachLaneCheckout:
+    """GitOps.detach_lane_checkout() — commit WIP then detach a lane's HEAD,
+    WITHOUT removing the worktree or deleting the branch (step-3 RED / step-4 GREEN).
+    """
+
+    async def test_commits_wip_and_detaches_retaining_worktree_and_branch(
+        self, tmp_path: Path,
+    ):
+        """WIP on the checked-out branch is committed, HEAD ends up detached,
+        and both the branch and the worktree registration survive."""
+        from orchestrator.git_ops import GitOps
+        from orchestrator.git_ops import _run as git_run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        lane0 = git_ops.worktree_base / '_lane-0'
+        lane0.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(lane0), '-b', 'task/777', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        # Uncommitted WIP on a tracked file.
+        (lane0 / 'README.md').write_text('# Test\nWIP change\n')
+
+        result = await git_ops.detach_lane_checkout(lane0, '777')
+        assert result is True
+
+        # HEAD at lane0 is now DETACHED (no symbolic ref).
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane0)
+        assert rc != 0, 'HEAD must be detached after detach_lane_checkout'
+
+        # The branch still exists...
+        rc, _, _ = await git_run(['git', 'rev-parse', '--verify', 'task/777'], cwd=repo)
+        assert rc == 0, 'task/777 branch must survive detach_lane_checkout'
+
+        # ...and now carries the committed WIP beyond main.
+        rc, out, _ = await git_run(
+            ['git', 'rev-list', '--count', 'main..task/777'], cwd=repo,
+        )
+        assert rc == 0 and int(out.strip()) > 0, (
+            'WIP must be committed onto task/777 before detaching'
+        )
+
+        # The lane is still a registered worktree (not removed).
+        rc, out, _ = await git_run(['git', 'worktree', 'list', '--porcelain'], cwd=repo)
+        assert rc == 0
+        assert str(lane0) in out, 'lane worktree registration must survive detach'
+
+    async def test_detach_failure_logs_error_and_returns_false(
+        self, tmp_path: Path, caplog,
+    ):
+        """`git checkout --detach` failing -> returns False and logs at ERROR."""
+        from orchestrator.git_ops import GitOps
+        from orchestrator.git_ops import _run as orig_run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        lane0 = git_ops.worktree_base / '_lane-0'
+        lane0.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await orig_run(
+            ['git', 'worktree', 'add', str(lane0), '-b', 'task/777', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        async def fake_run(cmd, cwd=None):
+            if 'checkout' in cmd and '--detach' in cmd:
+                return (128, '', 'fatal: boom')
+            return await orig_run(cmd, cwd=cwd)
+
+        with (
+            caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+        ):
+            result = await git_ops.detach_lane_checkout(lane0, '777')
+
+        assert result is False
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'detach_lane_checkout must log at ERROR on checkout --detach failure'
