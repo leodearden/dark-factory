@@ -2300,3 +2300,109 @@ class TestReconcileLaneCheckouts:
         assert isinstance(result, WorktreeInfo), (
             f'expected a reattach WorktreeInfo onto a fresh lane, got {result!r}'
         )
+
+    async def test_prepinned_same_lane_is_idempotent_noop(self, tmp_path: Path):
+        """PRE-PINNED: recovery already re-pinned this id to this EXACT lane
+        (simulated via pool.restore_assignment before reconcile runs) ->
+        reconcile is a no-op: detach_lane_checkout is never called and the
+        lane stays ASSIGNED/attached."""
+        from orchestrator.git_ops import _run as git_run
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+        canon = pool._match_lane(lane5)
+        assert canon is not None
+        pool.restore_assignment('3965', canon)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'in-progress'}, None),
+        )
+        git_ops.detach_lane_checkout = AsyncMock()
+
+        await harness._reconcile_lane_checkouts()
+
+        git_ops.detach_lane_checkout.assert_not_called()
+        assert pool.assignment_for('3965') == canon
+        assert pool.state(canon) == LaneState.ASSIGNED
+
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc == 0, 'HEAD must remain attached for an already-pinned lane (no-op)'
+
+    async def test_dup_checkout_detaches_unpinned_keeping_original_pin(
+        self, tmp_path: Path,
+    ):
+        """DUP-CHECKOUT: recovery pinned this id to a DIFFERENT lane
+        (_lane-2); the physically-checked-out duplicate (_lane-5) is
+        detached while the original pin is kept untouched."""
+        from orchestrator.git_ops import _run as git_run
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+        lane2 = git_ops.worktree_base / '_lane-2'
+        pool.restore_assignment('3965', lane2)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'in-progress'}, None),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for('3965') == lane2, (
+            'the original pin (_lane-2) must be kept untouched'
+        )
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc != 0, (
+            'the un-pinned duplicate checkout (_lane-5) must be detached'
+        )
+
+    async def test_never_steal_skips_when_lane_pinned_to_different_id(
+        self, tmp_path: Path, caplog,
+    ):
+        """NEVER-STEAL: _lane-5 is pinned to a DIFFERENT id (4031); reconcile
+        must skip the dup checkout entirely rather than stealing the lane
+        recovery already assigned to that other id."""
+        from orchestrator.git_ops import _run as git_run
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+        canon = pool._match_lane(lane5)
+        assert canon is not None
+        pool.restore_assignment('4031', canon)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'in-progress'}, None),
+        )
+        git_ops.detach_lane_checkout = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_lane_checkouts()
+
+        git_ops.detach_lane_checkout.assert_not_called()
+        assert pool.assignment_for('4031') == canon, (
+            'the existing pin to a DIFFERENT id must never be stolen'
+        )
+        assert pool.assignment_for('3965') is None, (
+            'the never-steal case must skip entirely — 3965 must NOT be '
+            'pinned onto the lane already owned by 4031'
+        )
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc == 0, 'never-steal must not detach the lane'
+        assert 'never-steal' in caplog.text, (
+            f'expected a never-steal warning in the log; got: {caplog.text!r}'
+        )
+
+    async def test_git_error_read_makes_zero_pool_mutations(self, tmp_path: Path):
+        """GIT-ERROR: lane_branch_checkouts() returns None -> reconcile makes
+        ZERO pool mutations (no restore_assignment, no detach_lane_checkout)."""
+        harness, git_ops, pool, _lane5 = await self._make_fixture(tmp_path)
+        git_ops.lane_branch_checkouts = AsyncMock(return_value=None)
+        git_ops.detach_lane_checkout = AsyncMock()
+        pool.restore_assignment = MagicMock(wraps=pool.restore_assignment)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'in-progress'}, None),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        git_ops.detach_lane_checkout.assert_not_called()
+        pool.restore_assignment.assert_not_called()
+        assert pool.assignment_for('3965') is None
