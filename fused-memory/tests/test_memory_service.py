@@ -4199,6 +4199,92 @@ class TestReconPoolAutoTagMissingStageWarning:
         )
 
 
+class TestCycleSummaryRunIdGuard:
+    """add_memory must warn when metadata.run_id is dropped/empty even though
+    metadata.stage is present and known (task 2094).
+
+    Task 2077/1653 only warned when recon_pool could not be inferred (i.e.
+    stage missing/unknown) via an `elif` gated on `inferred_recon_pool is
+    None`. A write with a VALID stage short-circuits into the `if` branch and
+    never reaches a run_id check, so a dropped/empty run_id sailed through
+    with zero warnings — invisible to the Path-2 triple-filter
+    count_memories_by_metadata({kind, run_id, stage}) pre-check. RED until
+    the guard is decoupled from recon_pool inference (step-4).
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_id_dropped_with_valid_stage_logs_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={'kind': 'cycle_summary', 'stage': 'memory_consolidator'},
+                causation_id='run-x',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for a cycle_summary with a dropped run_id '
+            f'(stage present), got {len(warning_records)}: '
+            f'{[r.message for r in warning_records]}'
+        )
+        record = warning_records[0]
+        message = record.message.lower()
+        assert 'cycle_summary' in message and 'run_id' in message, (
+            f'Expected the WARNING to name the dropped-run_id condition, '
+            f'got: {record.message!r}'
+        )
+        assert record.run_id is None
+        assert record.stage == 'memory_consolidator'
+        assert 'run_id' in record.missing_cycle_summary_keys
+
+    @pytest.mark.asyncio
+    async def test_empty_run_id_with_valid_stage_logs_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    'run_id': '',
+                },
+                causation_id='run-x',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for a cycle_summary with an empty run_id '
+            f'(stage present), got {len(warning_records)}: '
+            f'{[r.message for r in warning_records]}'
+        )
+        record = warning_records[0]
+        assert 'run_id' in record.missing_cycle_summary_keys
+
+    @pytest.mark.asyncio
+    async def test_stage_and_run_id_both_present_no_warning(self, service, caplog):
+        """Control: known stage AND present run_id -> silent (happy path)."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    'run_id': 'run-x',
+                },
+                causation_id='run-x',
+            )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING when both stage and run_id are present and valid, '
+            f'got: {[r.message for r in warning_records]}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Step 3: TRACK B.1 service clear_invalid_at RED tests
 # ---------------------------------------------------------------------------
