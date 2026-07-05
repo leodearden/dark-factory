@@ -926,7 +926,16 @@ class GitOps:
 
         Runs ``git worktree repair <lane>`` from ``project_root`` (cheapest
         recovery — restores a stale/broken registration WITHOUT touching
-        ``.task/plan.json`` or uncommitted WIP) and re-checks registration.
+        ``.task/plan.json`` or uncommitted WIP) and re-checks registration
+        with ``_is_registered_worktree`` REGARDLESS of the repair
+        subprocess's exit code (review, task 2097): exit code alone is not
+        treated as authoritative, since what the caller ultimately cares
+        about — and bases its routing decision on — is whether the lane is
+        ACTUALLY registered afterwards, not whether the repair subprocess
+        happened to report success. Checking unconditionally also means a
+        False return here is a fresh, just-taken confirmation, not a stale
+        snapshot — safe for the caller to treat as decisive without a
+        further re-probe of its own.
 
         Returns:
             True when the lane is a registered worktree afterwards (safe to
@@ -943,10 +952,13 @@ class GitOps:
         rc, _, err = await _run(
             ['git', 'worktree', 'repair', str(lane)], cwd=self.project_root,
         )
-        if rc == 0 and await self._is_registered_worktree(lane):
+        if await self._is_registered_worktree(lane):
             logger.info(
-                'acquire_warm_lane: repaired orphaned reuse lane %s in place '
-                '(registration restored; .task/ + WIP preserved)', lane,
+                'acquire_warm_lane: lane %s is a registered worktree after '
+                '`git worktree repair` (rc=%d) — registration is the '
+                'authoritative signal, not exit code (review, task 2097); '
+                '.task/ + WIP preserved',
+                lane, rc,
             )
             return True
         logger.warning(
@@ -2383,6 +2395,35 @@ class GitOps:
             # path (which recovers the committed work via alpha-retention,
             # task 1912) when repair cannot restore the registration. Never
             # FAULT a healable orphan.
+            #
+            # Perf note (review, task 2097): this puts one `git worktree list
+            # --porcelain` fork on every warm-lane REUSE, including the
+            # healthy common case. A cheap local stat-only pre-check was
+            # considered and rejected: the step-3 repairable-registration
+            # fixture leaves the admin dir itself present with only its
+            # internal back-pointer corrupted, so a mere existence check on
+            # the admin dir cannot distinguish "healthy" from "repairable"
+            # without re-deriving `git worktree repair`'s own validation
+            # rules — fragile to hand-roll without dedicated tests. Caching
+            # the result is also out of scope for this task: it would live
+            # in warm_lane_pool.py, which is not a locked module here.
+            # Accepting the extra fork; revisit only if profiling shows it
+            # matters against real reuse volume.
+            #
+            # `_orphan_confirmed_unregistered` is set True only when we reach
+            # the demote below, at which point `_repair_orphaned_reuse_lane`
+            # has ALREADY re-checked registration itself, freshly, as the
+            # very last step of its own attempt — regardless of the repair
+            # subprocess's exit code (see its docstring: exit code alone is
+            # not authoritative). Basing the flag on that post-attempt check,
+            # not on the pre-repair check a few lines up, matters: it means
+            # the `elif` below can skip a third, redundant
+            # `_is_registered_worktree` probe using the FRESHEST available
+            # answer rather than a snapshot that predates the repair attempt
+            # — if repair's side effects registered the lane despite a
+            # nonzero exit, `_repair_orphaned_reuse_lane` already returned
+            # True above and this demote never runs at all.
+            _orphan_confirmed_unregistered = False
             if (
                 reused
                 and not await self._is_registered_worktree(lane)
@@ -2390,6 +2431,7 @@ class GitOps:
             ):
                 self.warm_lane_pool.drop_assignment(branch_name)
                 reused = False
+                _orphan_confirmed_unregistered = True
             # else: not reused, already registered, or repair restored the
             # registration in place — proceed (possibly still reused) below.
 
@@ -2444,7 +2486,16 @@ class GitOps:
                     return _seed_rc_to_unavailable(rc)
                 # Falls through to shared tail
 
-            elif not await self._is_registered_worktree(lane):
+            # `_orphan_confirmed_unregistered` (set above) short-circuits this
+            # probe when the guard already confirmed the lane unregistered
+            # and repair failed — avoids a third `git worktree list
+            # --porcelain` fork for the same lane (review, task 2097) and
+            # makes the routing decisive: once the guard commits to
+            # demote-and-reattach we do not re-probe and risk flipping into
+            # the already-registered/reset branch below on a (theoretical,
+            # unlikely per review) registration flip-flop between the
+            # guard's check and here.
+            elif _orphan_confirmed_unregistered or not await self._is_registered_worktree(lane):
                 # ── Create-once branch ────────────────────────────────────
                 # Self-heal: remove a stale unregistered directory so
                 # git worktree add doesn't refuse a non-empty dir.
