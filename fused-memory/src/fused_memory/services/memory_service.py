@@ -1505,8 +1505,12 @@ class MemoryService:
         Tries an exact, case-sensitive name match first (via
         graphiti.get_nodes_by_exact_name): canonical labels like "Task 115" resolve to
         the exact node instead of scattering across fuzzy neighbours. On an exact hit,
-        fuzzy node search (search_nodes) is skipped entirely; edges still come from the
-        fuzzy fact search below. On no exact match, falls back to the fuzzy gather path.
+        fuzzy node search (search_nodes) is skipped entirely, and edges are fetched
+        from the resolved node's uuid via graphiti.get_valid_edges_for_node (a uuid
+        traversal) instead of a semantic fact search — this keeps edges consistent
+        with the resolved node rather than scattering across unrelated nodes that
+        happen to be textually similar. Only the fuzzy fallback below uses the
+        semantic edge search. On no exact match, falls back to the fuzzy gather path.
 
         Both Graphiti calls in the fuzzy fallback run concurrently via
         asyncio.gather(return_exceptions=True). This ensures neither call becomes an
@@ -1536,11 +1540,8 @@ class MemoryService:
         # its 0/1/many result decides whether the fuzzy gather runs at all.
         exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
         if exact:
-            edges = await self.graphiti.search(
-                query=name,
-                group_ids=[project_id],
-                num_results=edge_limit,
-            )
+            node_uuid = exact[0].get('uuid')
+            edges = await self.graphiti.get_valid_edges_for_node(node_uuid, group_id=project_id)
             node_data = [_node_to_dict(n) for n in exact]
             edge_data = [_edge_to_dict(e) for e in edges]
             return {'nodes': node_data, 'edges': edge_data}
