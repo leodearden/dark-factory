@@ -311,6 +311,129 @@ class TestRedispatchSpeculativeAccounting:
 
 
 # ---------------------------------------------------------------------------
+# task 2096: _finalizing_head-held speculative permit accounting
+#
+# _inflight_speculative_count() (post task-2063) scans self._inflight,
+# self._verifier_queue and self._redispatch, but never self._finalizing_head.
+# _finalize_inflight sets self._finalizing_head at the top of its try, awaits
+# the ENTIRE `await entry.verify_task`, and only releases the speculation
+# permit (if was_speculative) in its finally — so for the full verify
+# duration (20-60 min observed on reify) a speculative head's permit is held
+# solely by _finalizing_head, invisible to this count. That produces a
+# spurious 'speculation-slot conservation violated' finding for the whole
+# window (the dominant, longest-lived instance of this class of bug — task
+# 2063 fixed the shorter _redispatch-parked case above).
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeHeadSpeculativeAccounting:
+    """Unit tests for the task-2096 _finalizing_head under-count fix.
+
+    RED pre-fix: a speculative item held solely by _finalizing_head (for the
+    entire `await entry.verify_task` duration inside _finalize_inflight) is
+    invisible to _inflight_speculative_count(), so the count comes up one (or
+    more) short and speculation_accounting_violations() reports a spurious
+    conservation violation. GREEN post-fix: the count includes it and the
+    identity holds.
+    """
+
+    def _make_finalizing_entry(self, tmp_path: Path, *, speculative: bool):
+        from orchestrator.merge_queue import InflightEntry
+
+        return InflightEntry(
+            item=_make_spec_item(tmp_path, speculative=speculative),
+            lease=None,
+            verify_task=None,
+            merge_wt=None,
+            was_speculative=speculative,
+            phase='finalizing',
+        )
+
+    def test_two_host_finalizing_head_plus_inflight_both_counted(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import InflightEntry, SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        # Drain both speculation permits: slot_available=0, held_by_merger=0
+        # on a bare worker (nothing else touches the semaphore).
+        worker._speculation_slot._value = 0
+
+        # One speculative permit is countable via the existing _inflight scan...
+        worker._inflight.append(InflightEntry(
+            item=_make_spec_item(tmp_path, speculative=True),
+            lease=None,
+            verify_task=None,
+            merge_wt=None,
+            was_speculative=True,
+            phase='verifying',
+        ))
+        # ...and one is held solely by the finalize-head for the entire
+        # `await entry.verify_task` window — the gap this task closes.
+        worker._finalizing_head = self._make_finalizing_entry(tmp_path, speculative=True)
+
+        assert worker._inflight_speculative_count() == 2
+        assert worker.speculation_accounting_violations() == []
+        assert worker.snapshot()['resource_audit']['speculation_accounting'] == []
+        # Pin the OTHER consumer of _inflight_speculative_count() too (mirrors
+        # the equivalent pin in TestRedispatchSpeculativeAccounting above).
+        assert worker.snapshot()['speculation']['inflight_speculative'] == 2
+
+    def test_single_host_finalizing_head_alone_counted(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=1)
+
+        # Drain the single speculation permit; the finalizing head is the
+        # ONLY place a speculative item can be during its verify window.
+        worker._speculation_slot._value = 0
+        worker._finalizing_head = self._make_finalizing_entry(tmp_path, speculative=True)
+
+        assert worker._inflight_speculative_count() == 1
+        assert worker.speculation_accounting_violations() == []
+        assert worker.snapshot()['resource_audit']['speculation_accounting'] == []
+
+    def test_nonspeculative_finalizing_head_not_counted(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        """A non-speculative finalizing head (the common case) contributes 0 —
+        else the fix would over-count and could mask a genuine imbalance.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        worker._finalizing_head = self._make_finalizing_entry(tmp_path, speculative=False)
+
+        assert worker._inflight_speculative_count() == 0
+        assert worker.speculation_accounting_violations() == []
+
+    def test_detector_not_blinded_by_widened_census(self, git_ops: GitOps) -> None:
+        """A genuinely dropped permit with an EMPTY census (no _inflight,
+        _verifier_queue, _redispatch, or _finalizing_head entry to account for
+        it) must still trip exactly one violation — the census widening in
+        this task must not mask the real leak class the audit exists to catch.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        # Force a leak: a permit vanished from the shared semaphore without
+        # being recorded as held-by-merger, transferred to the verifier, or
+        # genuinely still available — breaks identity (a). _finalizing_head
+        # stays None (its __init__ default) — no census location covers it.
+        worker._speculation_slot._value -= 1
+
+        violations = worker.speculation_accounting_violations()
+
+        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
+        assert 'speculation-slot conservation violated' in violations[0]
+
+
+# ---------------------------------------------------------------------------
 # step-3 RED / step-4 GREEN: worktree_ledger_violations()
 # ---------------------------------------------------------------------------
 
