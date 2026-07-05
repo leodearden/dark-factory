@@ -3152,6 +3152,52 @@ class GitOps:
                 return current
         return None
 
+    async def lane_branch_checkouts(self) -> dict[str, Path] | None:
+        """Map every pool-lane branch checkout to its bare task id.
+
+        Generalises :meth:`_worktree_holding_branch`'s porcelain parse:
+        instead of resolving one target branch, it walks every ``worktree``/
+        ``branch`` pair in ``git worktree list --porcelain`` and keeps those
+        whose branch is namespaced under ``config.branch_prefix`` AND whose
+        worktree path resolves to a registered :class:`WarmLanePool` lane
+        (via :meth:`WarmLanePool._match_lane`).  Non-task branches, detached
+        entries, and non-pool worktrees are filtered out.
+
+        Returns:
+            ``{bare_id: canonical_lane}`` (bare_id has ``branch_prefix``
+            stripped; canonical_lane is the pool's registered lane Path, not
+            necessarily identical to the porcelain path e.g. under symlinks).
+            ``None`` when the warm-lane pool is disabled, or when ``git
+            worktree list`` errors — callers must treat both as a no-op and
+            never mass-mutate on an unreliable read.
+        """
+        pool = self.warm_lane_pool
+        if pool is None:
+            return None
+
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=self.project_root,
+        )
+        if rc != 0:
+            return None
+
+        head_prefix = f'refs/heads/{self.config.branch_prefix}'
+        result: dict[str, Path] = {}
+        current: Path | None = None
+        for line in out.splitlines():
+            if line.startswith('worktree '):
+                current = Path(line[len('worktree '):].strip())
+                continue
+            if not line.startswith('branch ') or current is None:
+                continue
+            name = line[len('branch '):].strip()
+            if not name.startswith(head_prefix):
+                continue
+            matched = pool._match_lane(current)
+            if matched is not None:
+                result[name[len(head_prefix):]] = matched
+        return result
+
     async def _branch_has_commits_beyond_main(self, full_branch: str) -> bool:
         """Whether *full_branch* carries commits beyond main.
 
