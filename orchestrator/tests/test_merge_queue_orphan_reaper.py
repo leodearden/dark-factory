@@ -282,3 +282,87 @@ class TestReapOrphanedMergeWorktreesReadoption:
         assert worker.worktree_ledger_violations(now=_NOW) == [], (
             're-adoption (registration) must cure the false violation'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED / step-8 GREEN: fail-open robustness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapOrphanedMergeWorktreesFailOpen:
+    """Unit tests asserting the sweep never raises and never lets one bad
+    record abort the rest — this is a startup maintenance sweep and must not
+    block orchestrator startup (task 2060 step-7).
+
+    (a) already holds from step-2's initial guard. (b)/(c) are RED until
+    step-8 GREEN adds the per-path/per-branch try/except guards.
+    """
+
+    async def test_missing_worktree_base_returns_empty_report_without_raising(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        assert not git_ops.worktree_base.exists()
+
+        report = await worker.reap_orphaned_merge_worktrees(now=_NOW)
+
+        assert report == {'readopted': [], 'reaped': []}
+
+    async def test_cleanup_failure_for_one_path_does_not_abort_the_sweep(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        wt_a = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+        wt_b = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+
+        real_cleanup = git_ops.cleanup_merge_worktree
+
+        async def _flaky_cleanup(path: Path) -> None:
+            if path == wt_a.resolve():
+                raise RuntimeError('boom')
+            await real_cleanup(path)
+
+        monkeypatch.setattr(
+            git_ops, 'cleanup_merge_worktree', AsyncMock(side_effect=_flaky_cleanup),
+        )
+
+        report = await worker.reap_orphaned_merge_worktrees(now=_NOW)
+
+        assert str(wt_b.resolve()) in report['reaped'], (
+            f'the non-raising path must still be reaped: {report!r}'
+        )
+        assert not wt_b.exists()
+        assert str(wt_a.resolve()) not in report['reaped'], (
+            'the raising path must not be recorded as reaped'
+        )
+
+    async def test_find_inflight_failure_for_one_branch_does_not_abort_the_sweep(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        orphan = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+
+        async def _boom(branch: str) -> Path | None:
+            raise RuntimeError('boom')
+
+        monkeypatch.setattr(
+            git_ops, 'find_inflight_merge_worktree', AsyncMock(side_effect=_boom),
+        )
+
+        report = await worker.reap_orphaned_merge_worktrees(
+            recovered_branches=['some-branch'], now=_NOW,
+        )
+
+        assert report['readopted'] == []
+        assert str(orphan.resolve()) in report['reaped'], (
+            f'an unrelated aged orphan must still be reaped: {report!r}'
+        )
