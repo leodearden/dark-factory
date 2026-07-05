@@ -112,6 +112,25 @@ _WARM_LANE_RECLAIM_PROTECTED_STATUSES: frozenset[str] = frozenset(
     {'merge-deferred', 'deferred'}
 )
 
+# Prior auto-eval redo siblings (task 2075) are only safe to silently
+# supersede (cancel) when they are still idle/unstarted. Deliberately
+# EXCLUDES two members of ACTIVE_TASK_STATUSES that _find_prior_auto_eval_redos
+# uses to *discover* candidates:
+#   'in-progress' — an agent may be actively doing useful work on it; a
+#                    cancel here can abort real progress and orphan its
+#                    worktree/branch.
+#   'blocked'      — it may be sitting on an open human-facing escalation; a
+#                    cancel here would silently discard that escalation.
+# This narrower set gates the actual cancel dispatch in _maybe_auto_eval via
+# _filter_cancellable_redos, which re-checks each candidate's CURRENT status
+# immediately before cancelling — closing the race window between the
+# initial _find_prior_auto_eval_redos snapshot and the cancel loop (a
+# candidate that completed/was cancelled on its own in the interim is simply
+# absent from that re-check and left alone).
+_AUTO_EVAL_SUPERSEDE_SAFE_STATUSES: frozenset[str] = frozenset(
+    {'pending', 'deferred'}
+)
+
 # Grace period added to the watcher rotation timeout on top of
 # watcher_rotation_hours*3600.  Gives the agent time to emit its digest and
 # exit cleanly before the supervisor kills it with a SIGTERM timeout.
@@ -4834,6 +4853,56 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             return []
 
+    async def _filter_cancellable_redos(
+        self, candidate_ids: list[str],
+    ) -> list[str]:
+        """Re-check prior-redo candidates immediately before cancelling them.
+
+        ``candidate_ids`` is normally the snapshot ``_find_prior_auto_eval_redos``
+        returned at the *start* of ``_maybe_auto_eval`` — several awaits
+        (submit_task + a status flip) before the cancel loop actually runs.
+        This re-check closes two hazards in that window (task 2075 review
+        amendment):
+
+        - A candidate may have reached a terminal state (done/cancelled) in
+          the interim — force-cancelling it would wrongly revert a
+          completed/already-cancelled task and emit a spurious reconciliation
+          event. Since this re-fetch is scoped to ``ACTIVE_TASK_STATUSES``,
+          a candidate that raced to a terminal state is simply absent from
+          the result and therefore excluded below.
+        - A candidate may be 'in-progress' (active agent work) or 'blocked'
+          (an open human-facing escalation) — both are members of
+          ``ACTIVE_TASK_STATUSES`` but neither is safe to silently supersede;
+          see ``_AUTO_EVAL_SUPERSEDE_SAFE_STATUSES``.
+
+        Only candidates whose CURRENT status is a member of
+        ``_AUTO_EVAL_SUPERSEDE_SAFE_STATUSES`` are returned. Best-effort:
+        fails open to ``[]`` on any lookup error — a transient failure here
+        skips superseding this round rather than cancelling against stale
+        information; a later auto-eval trigger (if any) will re-discover the
+        same stale siblings and retry.
+        """
+        if not candidate_ids:
+            return []
+        try:
+            tasks = await self.scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
+            status_by_id = {
+                str(t.get('id')): t.get('status')
+                for t in tasks
+                if isinstance(t, dict)
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Auto-eval supersede re-check failed (%s) — skipping cancel '
+                'of %d candidate(s) this round: %s',
+                exc, len(candidate_ids), candidate_ids,
+            )
+            return []
+        return [
+            cid for cid in candidate_ids
+            if status_by_id.get(cid) in _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES
+        ]
+
     async def _maybe_auto_eval(
         self, assignment, report: TaskReport,
     ) -> None:
@@ -4852,6 +4921,12 @@ Output JSON matching the schema. Every task must appear in the output.
         ``submit_task(planning_mode=True)`` (curator dedupe bypass) with
         ``metadata.force_full_path=True`` to prevent the redo from taking
         an optimistic path itself.
+
+        Once the replacement redo is confirmed created, any still-'pending'/
+        'deferred' prior redo siblings sharing the same ``spawned_from`` are
+        cancelled (task 2075) so at most one live redo survives per original
+        task. 'in-progress' and 'blocked' siblings are deliberately left
+        alone — see ``_AUTO_EVAL_SUPERSEDE_SAFE_STATUSES``.
         """
         if not getattr(self.config, 'auto_eval_enabled', False):
             return
@@ -4977,9 +5052,21 @@ Output JSON matching the schema. Every task must appear in the output.
 
         # Supersede prior redo siblings now that the replacement redo is
         # confirmed created — at most one live redo per spawned_from should
-        # survive. Best-effort per-sibling: a single cancellation failure
-        # must not abort the loop or affect the primary redo dispatch.
-        for stale_id in prior_redo_ids:
+        # survive. Re-check each candidate's CURRENT status immediately
+        # before cancelling (task 2075 review amendment): the initial
+        # `prior_redo_ids` snapshot is several awaits stale by this point
+        # (submit_task + the pending flip above), so a candidate may have
+        # since completed/been cancelled on its own, or moved to
+        # 'in-progress' (active agent work) / 'blocked' (an open human
+        # escalation) — none of those are safe to silently cancel. Only
+        # still-'pending'/'deferred' siblings are superseded; see
+        # _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES and _filter_cancellable_redos.
+        # Best-effort per-sibling: a single cancellation failure must not
+        # abort the loop or affect the primary redo dispatch.
+        cancellable_redo_ids = await self._filter_cancellable_redos(
+            prior_redo_ids,
+        )
+        for stale_id in cancellable_redo_ids:
             try:
                 await self.scheduler.dispatch_tool(
                     'set_task_status',
@@ -5025,7 +5112,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     'block_phase': report.block_phase,
                     'rename_succeeded': renamed,
                     'budget_used_24h': used,
-                    'superseded_redo_ids': list(prior_redo_ids),
+                    'superseded_redo_ids': list(cancellable_redo_ids),
                 },
             )
 
@@ -5033,7 +5120,7 @@ Output JSON matching the schema. Every task must appear in the output.
             'Task %s: auto-eval dispatched redo task %s '
             '(rename=%s, budget_used=$%.2f, superseded=%d %s)',
             original_id, new_task_id, renamed, used,
-            len(prior_redo_ids), prior_redo_ids,
+            len(cancellable_redo_ids), cancellable_redo_ids,
         )
 
     async def _trailing_24h_fetch_one(

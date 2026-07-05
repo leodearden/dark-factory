@@ -215,6 +215,77 @@ async def test_find_prior_auto_eval_redos_fail_open():
     assert result == []
 
 
+# ---------------------------------------------------------------------------
+# Harness._filter_cancellable_redos (task 2075 review amendment)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_filter_cancellable_redos_excludes_in_progress_and_blocked():
+    """Only still-pending/deferred candidates are safe to auto-cancel.
+
+    'in-progress' may be real agent work in flight; 'blocked' may be an
+    open human-facing escalation. Neither should be silently superseded.
+    """
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {'id': 'redo-pending', 'status': 'pending'},
+        {'id': 'redo-deferred', 'status': 'deferred'},
+        {'id': 'redo-in-progress', 'status': 'in-progress'},
+        {'id': 'redo-blocked', 'status': 'blocked'},
+    ])
+
+    result = await harness._filter_cancellable_redos(
+        ['redo-pending', 'redo-deferred', 'redo-in-progress', 'redo-blocked'],
+    )
+
+    assert set(result) == {'redo-pending', 'redo-deferred'}
+
+
+@pytest.mark.asyncio
+async def test_filter_cancellable_redos_excludes_raced_to_terminal():
+    """A candidate that completed/was cancelled since the snapshot must not
+    be re-cancelled — it is simply absent from the fresh active-only fetch.
+    """
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {'id': 'redo-still-here', 'status': 'deferred'},
+        # 'redo-done' is absent: it raced to a terminal state and the
+        # server-side ACTIVE_TASK_STATUSES filter excludes it.
+    ])
+
+    result = await harness._filter_cancellable_redos(
+        ['redo-still-here', 'redo-done'],
+    )
+
+    assert result == ['redo-still-here']
+
+
+@pytest.mark.asyncio
+async def test_filter_cancellable_redos_fail_open():
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_tasks = AsyncMock(side_effect=RuntimeError('boom'))
+
+    result = await harness._filter_cancellable_redos(['redo-1'])
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_filter_cancellable_redos_empty_candidates_skips_query():
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_tasks = AsyncMock(return_value=[])
+
+    result = await harness._filter_cancellable_redos([])
+
+    assert result == []
+    harness.scheduler.get_tasks.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_dispatches_redo_on_block(tmp_path: Path):
     f = _make(project_root=tmp_path / 'proj')
@@ -487,3 +558,108 @@ async def test_no_supersede_when_no_prior_redos(tmp_path: Path):
     ]
     assert len(emit_calls) == 1
     assert emit_calls[0].kwargs['data']['superseded_redo_ids'] == []
+
+
+@pytest.mark.asyncio
+async def test_supersede_excludes_in_progress_and_blocked_siblings(tmp_path: Path):
+    """in-progress (active agent work) and blocked (open human escalation)
+    prior redos must be left alone — only pending/deferred are superseded.
+    """
+    f = _make(project_root=tmp_path / 'proj')
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-deferred',
+            'status': 'deferred',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-in-progress',
+            'status': 'in-progress',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-blocked',
+            'status': 'blocked',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    status_calls = [c for c in f.submit_calls if c[0] == 'set_task_status']
+    cancelled_ids = {
+        c[1].get('id') for c in status_calls if c[1].get('status') == 'cancelled'
+    }
+    assert cancelled_ids == {'redo-old-deferred'}
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert len(emit_calls) == 1
+    assert emit_calls[0].kwargs['data']['superseded_redo_ids'] == [
+        'redo-old-deferred',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_supersede_cancel_failure_is_isolated(tmp_path: Path):
+    """One stale sibling's cancel dispatch raising must not abort the other
+    cancellation, the new redo's pending flip, back-link, or event emission.
+    """
+    f = _make(project_root=tmp_path / 'proj')
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-1',
+            'status': 'deferred',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-2',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    calls: list[tuple[str, dict]] = []
+
+    async def _flaky_dispatch(name, args, *, timeout=15):
+        calls.append((name, args))
+        if (
+            name == 'set_task_status'
+            and args.get('id') == 'redo-old-1'
+            and args.get('status') == 'cancelled'
+        ):
+            raise RuntimeError('transient dispatch failure')
+        if name == 'submit_task':
+            return {'task_id': 'redo-1', 'status': 'deferred'}
+        return {'ok': True}
+
+    f.harness.scheduler.dispatch_tool = _flaky_dispatch
+
+    # Must not raise despite the failing cancel dispatch.
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    cancelled_ids = {
+        c[1].get('id') for c in calls
+        if c[0] == 'set_task_status' and c[1].get('status') == 'cancelled'
+    }
+    assert cancelled_ids == {'redo-old-1', 'redo-old-2'}
+
+    flipped = [
+        c for c in calls
+        if c[0] == 'set_task_status' and c[1].get('status') == 'pending'
+    ]
+    assert len(flipped) == 1
+    assert flipped[0][1].get('id') == 'redo-1'
+
+    f.update_task.assert_awaited_once()
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert len(emit_calls) == 1
+    assert set(emit_calls[0].kwargs['data']['superseded_redo_ids']) == {
+        'redo-old-1', 'redo-old-2',
+    }
