@@ -1322,6 +1322,35 @@ class TestRecoveryTerminalTaskLaneRelease:
             'task with None status must fall through to restore (safe default; A self-heals)'
         )
 
+    async def test_recovery_skips_pin_for_unregistered_lane(self, tmp_path: Path):
+        """(24) reify 4655/4947: an ORPHANED lane (mkdir'd, never `git worktree
+        add`ed) must NOT be re-pinned even for a non-terminal task:
+        restore_assignment is skipped, cleanup_worktree is not called either,
+        the plan is still recovered, and the lane is left FREE so the
+        create-once self-heal path repairs it on the next acquire.
+        """
+        harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
+
+        git_ops._is_registered_worktree = AsyncMock(return_value=False)
+        harness.scheduler.get_status = AsyncMock(return_value='in-progress')
+
+        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
+             patch.object(pool, 'restore_assignment') as mock_restore:
+            await harness._recover_crashed_tasks()
+
+        from orchestrator.warm_lane_pool import LaneState
+
+        # Unregistered lane: restore_assignment must NOT be called
+        mock_restore.assert_not_called()
+        # Plan is still recovered — independent of the pin
+        assert '3459' in harness._recovered_plans, (
+            'plan must still be recovered even when the lane is left unpinned'
+        )
+        # Lane is not torn down either — left for create-once self-heal
+        mock_cleanup.assert_not_called()
+        # Lane must remain FREE (never pinned)
+        assert pool.state(lane_entry) == LaneState.FREE
+
 
 # ===========================================================================
 # Step-17 (1881): RED — disk-backstop opt-in wiring in _mark_in_progress_done

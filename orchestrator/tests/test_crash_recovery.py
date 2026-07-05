@@ -1,6 +1,7 @@
 """Tests for crash recovery — surviving worktree detection and plan injection."""
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -672,6 +673,43 @@ class TestRecoverCrashedTasksWarmLane:
         assert pool.assignment_for('42') is None
         # Lane state must remain FREE — restore_assignment was bypassed
         assert pool.state(lane_path) == LaneState.FREE
+
+    async def test_warm_lane_orphaned_registration_not_pinned(
+        self, harness: Harness, caplog,
+    ):
+        """reify 4655/4947: an ORPHANED lane (dir + plan.json on disk, but no
+        longer a registered git worktree) must NOT be re-pinned even though the
+        task is non-terminal.  Restoring the assignment unconditionally would
+        re-ASSIGN a broken lane on every restart, forcing the next dispatch
+        down the faulting reuse fast-path and shielding the lane from the
+        create-once self-heal forever.  Skipping the pin leaves the lane FREE
+        (self-healed on next acquire) while the plan is still recovered.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane_path = _setup_lane(base, '_lane-0', plan)
+        harness.git_ops._is_registered_worktree = AsyncMock(return_value=False)
+        # get_status left at fixture default (None) — non-terminal path.
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._recover_crashed_tasks()
+
+        # No pin: assignment map untouched, lane remains FREE
+        assert pool.assignment_for('42') is None, (
+            'unregistered lane must not be pinned to the task'
+        )
+        assert pool.state(lane_path) == LaneState.FREE, (
+            'unregistered lane must stay FREE for create-once self-heal'
+        )
+        # Plan is still recovered — independent of the pin
+        assert '42' in harness._recovered_plans
+        # Lane must not be torn down either (self-heal happens on next acquire)
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        # Loud post-crash integrity signal
+        assert 'regist' in caplog.text, (
+            f'expected a registration warning in the log; got: {caplog.text!r}'
+        )
 
 
 # ===========================================================================
