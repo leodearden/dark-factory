@@ -2473,4 +2473,7 @@ class TestMidRunRecycleLeak:
             'leaks the checkout, and a subsequent create-once acquire '
             'elsewhere would collide with "already used by worktree"'
         )
-        assert pool.assignment_for('3965') is None
+        assert pool.assignment_for('555') is None, (
+            'the recycled lane must be released/unassigned after the '
+            'failing re-seed, not left dangling on a stale pin'
+        )
