@@ -33,6 +33,7 @@ def service(mock_config):
     svc.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+    svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
@@ -2049,23 +2050,123 @@ class TestGetEntity:
         assert result['nodes'][1]['uuid'] == 'u-2'
 
     @pytest.mark.asyncio
-    async def test_exact_match_edges_come_from_fuzzy_search(self, service):
-        """Edges are still sourced from the fuzzy fact search even on an exact node hit."""
+    async def test_exact_match_edges_come_from_resolved_node_uuid(self, service):
+        """On an exact node hit, edges come from the resolved node's uuid via
+        get_valid_edges_for_node — NOT from a semantic graphiti.search() fact
+        search, which can return edges belonging to unrelated nodes.
+        """
         from _fm_helpers import MockEdge
 
-        dt = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.get_nodes_by_exact_name = AsyncMock(
-            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
+            return_value=[{'uuid': 'u-138', 'name': 'Task 138', 'summary': 's', 'labels': []}]
         )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[
+                {'uuid': 'e-own', 'fact': 'Task 138 depends on Task 5', 'name': 'DEPENDS_ON'}
+            ]
+        )
+        # Decoy: if the (buggy) semantic search were still consulted, this
+        # unrelated edge would leak into the result.
         service.graphiti.search = AsyncMock(
-            return_value=[MockEdge(fact='F', uuid='e-1', valid_at=dt, invalid_at=None)]
+            return_value=[MockEdge(fact='Task 68 depends on Task 12', uuid='e-wrong-68')]
         )
 
-        result = await service.get_entity('Task 115', project_id='test')
+        result = await service.get_entity('Task 138', project_id='test')
 
-        assert result['edges'][0]['fact'] == 'F'
-        assert result['edges'][0]['temporal']['valid_at'] == dt.isoformat()
-        assert result['edges'][0]['temporal']['invalid_at'] is None
+        assert len(result['edges']) == 1
+        assert result['edges'][0]['uuid'] == 'e-own'
+        assert result['edges'][0]['fact'] == 'Task 138 depends on Task 5'
+        assert all(e['uuid'] != 'e-wrong-68' for e in result['edges'])
+        service.graphiti.get_valid_edges_for_node.assert_awaited_once_with('u-138', group_id='test')
+        service.graphiti.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exact_match_edges_union_across_duplicate_nodes(self, service):
+        """When multiple nodes share an exact name (duplicate-name pathology),
+        edges are fetched for EVERY resolved uuid and unioned, deduped by edge
+        uuid, so `edges` stays consistent with the full `nodes` array.
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[
+            {'uuid': 'u-1', 'name': 'Alice', 'summary': 's1', 'labels': []},
+            {'uuid': 'u-2', 'name': 'Alice', 'summary': 's2', 'labels': []},
+        ])
+
+        edges_by_uuid = {
+            'u-1': [
+                {'uuid': 'e-a', 'fact': 'A', 'name': 'x'},
+                {'uuid': 'e-shared', 'fact': 'S', 'name': 'y'},
+            ],
+            'u-2': [
+                {'uuid': 'e-shared', 'fact': 'S', 'name': 'y'},
+                {'uuid': 'e-b', 'fact': 'B', 'name': 'z'},
+            ],
+        }
+
+        def fake_edges(node_uuid, *, group_id):
+            return edges_by_uuid[node_uuid]
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=fake_edges)
+
+        result = await service.get_entity('Alice', project_id='test')
+
+        assert [e['uuid'] for e in result['edges']] == ['e-a', 'e-shared', 'e-b']
+        service.graphiti.get_valid_edges_for_node.assert_any_await('u-1', group_id='test')
+        service.graphiti.get_valid_edges_for_node.assert_any_await('u-2', group_id='test')
+        assert service.graphiti.get_valid_edges_for_node.await_count == 2
+
+    # ------------------------------------------------------------------
+    # exact-match edge fetch failure — mirrors the fuzzy fallback's two-tier
+    # gather(return_exceptions=True) discipline (task 2102 amendment)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_exact_match_edge_fetch_failure_raises_and_settles_siblings(self, service):
+        """When one concurrent get_valid_edges_for_node call fails, the exception
+        propagates AND the sibling call still settles (return_exceptions=True)
+        rather than being left running as an orphaned background task — the same
+        discipline the fuzzy fallback already has (see
+        test_both_failures_raises_first_exception / test_both_failures_emits_two_warnings).
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[
+            {'uuid': 'u-1', 'name': 'Alice', 'summary': 's1', 'labels': []},
+            {'uuid': 'u-2', 'name': 'Alice', 'summary': 's2', 'labels': []},
+        ])
+
+        async def fake_edges(node_uuid, *, group_id):
+            if node_uuid == 'u-1':
+                raise RuntimeError('u-1 failed')
+            return [{'uuid': 'e-b', 'fact': 'B', 'name': 'z'}]
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=fake_edges)
+
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(RuntimeError, match='u-1 failed'):
+            await service.get_entity('Alice', project_id='test')
+
+        # Both coroutines settled under gather(return_exceptions=True) even
+        # though one raised — no orphaned background task for 'u-2'.
+        assert service.graphiti.get_valid_edges_for_node.await_count == 2
+        assert mock_logger.warning.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_exact_match_edge_fetch_cancelled_error_propagates(self, service):
+        """asyncio.CancelledError from get_valid_edges_for_node must propagate
+        unchanged and must NOT be logged via the isinstance(r, Exception) guard —
+        same structured-concurrency precedence as the fuzzy fallback's
+        test_cancelled_error_propagates.
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-138', 'name': 'Task 138', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(asyncio.CancelledError):
+            await service.get_entity('Task 138', project_id='test')
+
+        assert mock_logger.warning.call_count == 0
 
     @pytest.mark.asyncio
     async def test_exact_match_labels_default_empty(self, service):
@@ -2096,17 +2197,23 @@ class TestGetEntity:
         assert service.graphiti.search.call_args.kwargs['num_results'] == 25
 
     @pytest.mark.asyncio
-    async def test_edge_limit_threads_to_num_results_exact_path(self, service):
-        """edge_limit is forwarded as num_results to graphiti.search on the exact-match path."""
+    async def test_edge_limit_does_not_reach_search_on_exact_path(self, service):
+        """edge_limit is a fuzzy-path-only cap. On the exact-match path (task 2102)
+        edges come from get_valid_edges_for_node(uuid) — an uncapped uuid traversal —
+        so graphiti.search is never consulted and edge_limit does not thread anywhere.
+        Regression guard: an exact hit must not fall back to the semantic edge search
+        that could return edges belonging to unrelated nodes.
+        """
         service.graphiti.get_nodes_by_exact_name = AsyncMock(
             return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
         )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
         service.graphiti.search = AsyncMock(return_value=[])
 
         await service.get_entity('Task 115', project_id='test', edge_limit=25)
 
-        service.graphiti.search.assert_awaited_once()
-        assert service.graphiti.search.call_args.kwargs['num_results'] == 25
+        service.graphiti.search.assert_not_awaited()
+        service.graphiti.get_valid_edges_for_node.assert_awaited_once_with('u-115', group_id='test')
 
     @pytest.mark.asyncio
     async def test_edge_limit_defaults_to_ten(self, service):
@@ -2119,6 +2226,33 @@ class TestGetEntity:
 
         service.graphiti.search.assert_awaited_once()
         assert service.graphiti.search.call_args.kwargs['num_results'] == 10
+
+
+class TestEdgeToDict:
+    """Unit tests for the module-level _edge_to_dict helper."""
+
+    def test_edge_to_dict_normalizes_dict_shape(self):
+        """A plain EdgeDict (from get_valid_edges_for_node) normalizes uuid/fact,
+        drops 'name', and yields temporal=None (EdgeDict carries no valid_at/invalid_at).
+        """
+        result = memory_service._edge_to_dict({'uuid': 'e-1', 'fact': 'F', 'name': 'N'})
+        assert result == {'uuid': 'e-1', 'fact': 'F', 'temporal': None}
+
+    def test_edge_to_dict_dict_shape_with_temporal_serializes(self):
+        """A dict input that DOES carry valid_at/invalid_at still serializes them via
+        _serialize_temporal, locking in the docstring's forward-compatibility claim
+        that the dict branch stays correct if EdgeDict is later enriched with
+        temporal fields.
+        """
+        dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
+        result = memory_service._edge_to_dict(
+            {'uuid': 'e-1', 'fact': 'F', 'valid_at': dt_valid, 'invalid_at': None}
+        )
+        assert result == {
+            'uuid': 'e-1',
+            'fact': 'F',
+            'temporal': {'valid_at': '2024-03-01T10:00:00+00:00', 'invalid_at': None},
+        }
 
 
 class TestSerializeTemporal:

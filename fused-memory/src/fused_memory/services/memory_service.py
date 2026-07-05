@@ -211,12 +211,21 @@ def _node_to_dict(n: Any) -> dict:
 
 
 def _edge_to_dict(e: Any) -> dict:
-    """Normalize a Graphiti fact-search result into get_entity's edge dict shape.
+    """Normalize a Graphiti edge into get_entity's edge dict shape.
 
-    Shared by both the exact-match and fuzzy branches of get_entity — edges
-    always come from the fuzzy graphiti.search() fact search regardless of
-    how the node was resolved.
+    Accepts either a dict (exact-match path, from graphiti.get_valid_edges_for_node —
+    an EdgeDict {uuid, fact, name} with no temporal fields) or an object with
+    attributes (fuzzy-match path, from graphiti.search — a fact-search result
+    that may carry valid_at/invalid_at). Dict inputs yield temporal=None today
+    since EdgeDict has no valid_at/invalid_at keys; _serialize_temporal is used
+    regardless so this stays forward-compatible if EdgeDict is later enriched.
     """
+    if isinstance(e, dict):
+        return {
+            'uuid': e.get('uuid'),
+            'fact': e.get('fact', ''),
+            'temporal': _serialize_temporal(e.get('valid_at'), e.get('invalid_at')),
+        }
     return {
         'uuid': getattr(e, 'uuid', None),
         'fact': getattr(e, 'fact', str(e)),
@@ -1496,15 +1505,23 @@ class MemoryService:
         Tries an exact, case-sensitive name match first (via
         graphiti.get_nodes_by_exact_name): canonical labels like "Task 115" resolve to
         the exact node instead of scattering across fuzzy neighbours. On an exact hit,
-        fuzzy node search (search_nodes) is skipped entirely; edges still come from the
-        fuzzy fact search below. On no exact match, falls back to the fuzzy gather path.
+        fuzzy node search (search_nodes) is skipped entirely, and edges are fetched
+        from each resolved node's uuid via graphiti.get_valid_edges_for_node (a uuid
+        traversal) instead of a semantic fact search — this keeps edges consistent
+        with the resolved node(s) rather than scattering across unrelated nodes that
+        happen to be textually similar. When multiple nodes share the exact name
+        (duplicate-name pathology), edges are fetched for every matched uuid and
+        unioned, deduped by edge uuid, so `edges` stays consistent with the full
+        `nodes` array. Only the fuzzy fallback below uses the semantic edge search.
+        On no exact match, falls back to the fuzzy gather path.
 
-        Both Graphiti calls in the fuzzy fallback run concurrently via
-        asyncio.gather(return_exceptions=True). This ensures neither call becomes an
-        orphaned background task in the error path: gather() awaits both coroutines to
-        settlement before returning, even when one (or both) raise an exception.  If
-        any call fails, all exceptions are logged (warning) then the first exception
-        is re-raised.
+        Concurrent Graphiti calls — both the exact-match branch's per-uuid
+        get_valid_edges_for_node fetches and the fuzzy fallback's node/edge
+        search — run via asyncio.gather(return_exceptions=True). This ensures no
+        call becomes an orphaned background task in the error path: gather()
+        awaits every coroutine to settlement before returning, even when one (or
+        more) raise an exception. If any call fails, all exceptions are logged
+        (warning) then the first exception is re-raised.
 
         Performance trade-off: the exact-match lookup below is a serial round-trip
         that runs in front of the fuzzy gather on every call — its result (hit vs.
@@ -1516,22 +1533,57 @@ class MemoryService:
         as added complexity that would leave non-numeric exact lookups (e.g.
         "Auth Service") still exposed to fuzzy neighbours for no benefit.
 
-        Edge cap: edges are gathered via a single graphiti.search() call capped at
-        `edge_limit` (default 10, applied identically on both the exact-match and
-        fuzzy-fallback branches). graphiti.search returns edges in RELEVANCE-ranked
-        order, so when an entity has more than `edge_limit` valid edges, the
-        lowest-ranked ones are silently dropped from the result — raise edge_limit
-        to fetch more, or cross-check completeness via a direct search() call.
+        Edge cap: `edge_limit` (default 10) applies ONLY to the fuzzy-fallback
+        branch, where edges are gathered via a single graphiti.search() call
+        passing edge_limit as num_results. graphiti.search returns edges in
+        RELEVANCE-ranked order, so when an entity has more than `edge_limit`
+        valid edges, the lowest-ranked ones are silently dropped — raise
+        edge_limit to fetch more, or cross-check completeness via a direct
+        search() call. The exact-match branch does NOT use edge_limit: its
+        get_valid_edges_for_node traversal returns every valid edge for the
+        resolved node uuid(s), uncapped.
         """
         # See "Performance trade-off" above: this call is intentionally serial —
         # its 0/1/many result decides whether the fuzzy gather runs at all.
         exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
         if exact:
-            edges = await self.graphiti.search(
-                query=name,
-                group_ids=[project_id],
-                num_results=edge_limit,
+            uuids = [uuid for n in exact if (uuid := n.get('uuid'))]
+            edge_results = await asyncio.gather(
+                *(self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
+                return_exceptions=True,
             )
+            # Two-tier check (see async_utils.propagate_cancellations), mirroring
+            # the fuzzy fallback below: return_exceptions=True ensures a transient
+            # failure in one concurrent get_valid_edges_for_node call cannot leave
+            # sibling coroutines running as orphaned background tasks. Pass 1
+            # re-raises structured-cancellation signals; Pass 2 logs every
+            # exception, then raises the first (get_entity's local Pass-2
+            # semantics — see async_utils docstring).
+            propagate_cancellations(edge_results)
+            first_exc = next((r for r in edge_results if isinstance(r, Exception)), None)
+            if first_exc is not None:
+                for r in edge_results:
+                    if isinstance(r, Exception):
+                        logger.warning(
+                            'get_entity: get_valid_edges_for_node failed: %s: %s',
+                            type(r).__name__,
+                            r,
+                        )
+                raise first_exc
+            edge_lists = cast(list, edge_results)
+            # Duplicate-name matches each contribute their own edges; dedup by
+            # edge uuid so `edges` stays consistent with the (possibly
+            # multi-node) `nodes` array instead of double-counting shared edges.
+            seen: set = set()
+            edges = []
+            for edge_list in edge_lists:
+                for e in edge_list:
+                    edge_uuid = e.get('uuid')
+                    if edge_uuid is not None:
+                        if edge_uuid in seen:
+                            continue
+                        seen.add(edge_uuid)
+                    edges.append(e)
             node_data = [_node_to_dict(n) for n in exact]
             edge_data = [_edge_to_dict(e) for e in edges]
             return {'nodes': node_data, 'edges': edge_data}
