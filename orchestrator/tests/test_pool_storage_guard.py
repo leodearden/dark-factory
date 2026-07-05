@@ -34,7 +34,9 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from orchestrator.config import GitConfig
+from escalation.queue import EscalationQueue
+
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import (
     POOL_ROOT_SENTINEL,
     GitOps,
@@ -42,6 +44,7 @@ from orchestrator.git_ops import (
     WorktreeInfo,
     _run,
 )
+from orchestrator.harness import Harness
 
 
 @pytest.fixture
@@ -436,3 +439,93 @@ class TestAcquireCreateOnceDiscriminatorAndMarkChokepoint:
 
         assert warm is True, f'Expected normal warm create-once success, got warm={warm}'
         assert wt == git_ops.worktree_base / '_spec-0'
+
+
+# ---------------------------------------------------------------------------
+# Harness escalation helper + resolver (step-9/10).
+# Mirrors test_harness_warm_lane_wiring.py's _build_harness / _make_config /
+# TestWarmBaseHardDownFilingDedupResolve patterns.
+# ---------------------------------------------------------------------------
+
+
+def _build_harness(config: OrchestratorConfig) -> Harness:
+    """Construct a Harness with heavy constructors patched out."""
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.Scheduler'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        return Harness(config)
+
+
+def _make_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
+    """Bare Harness with a real EscalationQueue wired on."""
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    (repo / '.git').mkdir()  # bare minimum to satisfy path checks
+    config = OrchestratorConfig(
+        project_root=repo, max_concurrent_tasks=2, git=GitConfig(),
+    )
+    harness = _build_harness(config)
+    queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = queue
+    return harness, queue
+
+
+@pytest.mark.asyncio
+class TestPoolStorageAbsentEscalationHelperAndResolver:
+    """_file_pool_storage_absent_escalation / _resolve_pool_storage_absent_escalation
+    (step-9/10) — mirrors Harness._file_scheduler_pause_escalation's has_open_l1
+    dedup pattern and _resolve_warm_base_hard_down's resolve-all-pending pattern."""
+
+    async def test_files_one_pending_blocking_l1(self, tmp_path: Path):
+        harness, queue = _make_harness_with_queue(tmp_path)
+
+        harness._file_pool_storage_absent_escalation()
+
+        pending = [
+            e
+            for e in queue.get_by_task(
+                Harness._POOL_STORAGE_ABSENT_SENTINEL, status='pending',
+            )
+            if e.agent_role == Harness._POOL_STORAGE_ABSENT_ROLE
+        ]
+        assert len(pending) == 1, f'expected exactly one pending L1; got {pending!r}'
+        esc = pending[0]
+        assert esc.category == 'infra_issue', f'expected category="infra_issue"; got {esc.category!r}'
+        assert esc.level == 1, f'expected level=1; got {esc.level}'
+        assert esc.severity == 'blocking', f'expected severity="blocking"; got {esc.severity!r}'
+
+    async def test_second_call_deduped_still_one_open(self, tmp_path: Path):
+        harness, queue = _make_harness_with_queue(tmp_path)
+
+        harness._file_pool_storage_absent_escalation()
+        harness._file_pool_storage_absent_escalation()
+
+        pending = [
+            e
+            for e in queue.get_by_task(
+                Harness._POOL_STORAGE_ABSENT_SENTINEL, status='pending',
+            )
+            if e.agent_role == Harness._POOL_STORAGE_ABSENT_ROLE
+        ]
+        assert len(pending) == 1, (
+            f'expected exactly one pending L1 after two calls (dedup); got {pending!r}'
+        )
+
+    async def test_no_escalation_queue_is_noop(self, tmp_path: Path):
+        harness, _queue = _make_harness_with_queue(tmp_path)
+        harness._escalation_queue = None
+
+        harness._file_pool_storage_absent_escalation()  # must not raise
+
+    async def test_resolve_clears_pending_l1(self, tmp_path: Path):
+        harness, queue = _make_harness_with_queue(tmp_path)
+        harness._file_pool_storage_absent_escalation()
+        assert queue.has_open_l1(Harness._POOL_STORAGE_ABSENT_SENTINEL)
+
+        await harness._resolve_pool_storage_absent_escalation()
+
+        assert not queue.has_open_l1(Harness._POOL_STORAGE_ABSENT_SENTINEL), (
+            'expected no open L1 after resolve'
+        )
