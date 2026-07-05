@@ -6448,6 +6448,326 @@ class TestSweepStaleFlagMarkers:
         memory_service.delete_memory.assert_not_awaited()
 
 
+class TestSweepStalePersistenceMarkers:
+    """_sweep_stale_persistence_markers age-GCs stage2_persistence_marker Mem0 records.
+
+    Mirrors _sweep_stale_flag_markers (task 1944) but is AGE-ONLY: this marker
+    family's metadata is {source, flag_id, run_id} with no task_id/fp:
+    content-fingerprint key, so the cross-cycle predates_cycle predicate does
+    not apply here. It scrolls Mem0 for {'source': 'stage2_persistence_marker'}
+    members (deterministic Qdrant payload filter, never semantic search) and
+    selects those whose created_at is strictly older than a cutoff
+    (now - max_age_days) for best-effort delete.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_markers_deleted_fresh_marker_kept(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE,
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'stale-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'source': 'stage2_persistence_marker', 'flag_id': 'f1', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'stale-2',
+                'created_at': (fixed_now - timedelta(days=30)).isoformat(),
+                'metadata': {
+                    'source': 'stage2_persistence_marker', 'flag_id': 'f2', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'fresh-1',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {
+                    'source': 'stage2_persistence_marker', 'flag_id': 'f3', 'run_id': 'prior-run',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_persistence_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 2
+        assert memory_service.delete_memory.await_count == 2
+
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'stale-1', 'stale-2'}
+        assert 'fresh-1' not in deleted_ids
+
+        for call in memory_service.delete_memory.call_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get('store') == 'mem0'
+            assert kwargs.get('project_id') == 'reify'
+            assert kwargs.get('causation_id') == 'r1'
+            assert kwargs.get('_source') == _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE
+
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        call = memory_service.get_memories_by_metadata.call_args
+        filters = call.kwargs.get('filters') or {}
+        assert filters == {'source': 'stage2_persistence_marker'}
+
+        # Deterministic scroll only — semantic search must never be used for GC.
+        memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_or_unparseable_created_at_are_kept_not_deleted(self):
+        """Members with created_at=None, a non-ISO string, or a non-string value
+        must never be deleted — pins the safety posture ('members with a
+        missing or unparseable created_at are KEPT'). A regression that
+        deleted undatable markers instead of keeping them would be silent
+        data loss and must fail this test."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'missing-created-at',
+                'created_at': None,
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f1'},
+            },
+            {
+                'id': 'unparseable-created-at',
+                'created_at': 'not-a-date',
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f2'},
+            },
+            {
+                'id': 'non-string-created-at',
+                'created_at': 12345,
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f3'},
+            },
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f4'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_persistence_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'genuinely-stale'}
+
+    @pytest.mark.asyncio
+    async def test_created_at_exactly_at_cutoff_boundary_is_kept(self):
+        """created_at == now - max_age_days sits exactly on the cutoff boundary.
+        The comparison is strictly '<', so this member must be KEPT, not
+        deleted — pins the strict-inequality semantics against an off-by-one
+        regression (e.g. switching to '<=')."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        max_age_days = 14
+        members = [
+            {
+                'id': 'exactly-at-cutoff',
+                'created_at': (fixed_now - timedelta(days=max_age_days)).isoformat(),
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f1'},
+            },
+            {
+                'id': 'just-past-cutoff',
+                'created_at': (
+                    fixed_now - timedelta(days=max_age_days, seconds=1)
+                ).isoformat(),
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f2'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_persistence_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now, max_age_days=max_age_days,
+        )
+
+        assert result == 1
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'just-past-cutoff'}
+        assert 'exactly-at-cutoff' not in deleted_ids
+
+    @pytest.mark.asyncio
+    async def test_member_missing_id_is_skipped_not_raised(self):
+        """A malformed scroll member missing 'id' must be skipped, not raise
+        KeyError — the sweep is a best-effort contract end-to-end (enumeration
+        and delete failures are already swallowed; a missing 'id' must not be
+        the one path that aborts TaskKnowledgeSync.run())."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                # no 'id' key at all
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f1'},
+            },
+            {
+                'id': '',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f2'},
+            },
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f3'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_persistence_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'genuinely-stale'}
+
+    @pytest.mark.asyncio
+    async def test_enumeration_failure_returns_zero_and_logs_warning(self, caplog):
+        """When get_memories_by_metadata raises, returns 0, does NOT raise, logs WARNING."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant gone')
+        )
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_persistence_markers(memory_service, 'reify', run_id='r1')
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+    @pytest.mark.asyncio
+    async def test_empty_enumeration_returns_zero_and_no_deletes(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_persistence_markers(memory_service, 'reify', run_id='r1')
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_partial_delete_failure_excluded_from_count_logs_warning(self, caplog):
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'bad',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f1'},
+            },
+            {
+                'id': 'ok',
+                'created_at': (fixed_now - timedelta(days=30)).isoformat(),
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': 'f2'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(side_effect=[RuntimeError('boom'), None])
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_persistence_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        assert result == 1
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) == 1
+        assert 'bad' in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_scroll_cap_reached_logs_no_silent_caps_warning(self, caplog):
+        """When enumeration returns exactly scroll_limit members, log a WARNING that
+        older stale markers may remain uncollected this cycle."""
+        import logging
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': f'm{i}',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage2_persistence_marker', 'flag_id': f'f{i}'},
+            }
+            for i in range(3)
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _sweep_stale_persistence_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=3,
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+
 class TestComputeStaleFlags:
     """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
 
@@ -7550,6 +7870,122 @@ class TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat:
 
         assert 'stale_flag_markers_gc_swept' in report.stats
         assert report.stats['stale_flag_markers_gc_swept'] == 0
+
+
+class TestTaskKnowledgeSyncStalePersistenceMarkersGcSweptStat:
+    """TaskKnowledgeSync.run() sets report.stats['stale_persistence_markers_gc_swept']
+    after super().run().
+
+    Monkeypatches the module-level _sweep_stale_persistence_markers helper
+    (task 2095) rather than arranging real stale markers — the helper's own
+    behavior is covered exhaustively by TestSweepStalePersistenceMarkers;
+    these tests verify only that run() calls it and threads its count into
+    report.stats. Unlike TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat,
+    there is no run_window_start forwarding to test: _sweep_stale_persistence_markers
+    is age-only and has no cross-cycle fp: predicate (task 2095 design).
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_stale_persistence_markers_gc_swept_stat_set_after_run(self, mock_deps):
+        """run() calls _sweep_stale_persistence_markers(self.memory, self.project_id, run_id)
+        and injects its return value into report.stats."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_stale_persistence_markers',
+                new=AM(return_value=4),
+            ) as mock_sweep,
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert report.stats.get('stale_persistence_markers_gc_swept') == 4
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], 'reify', 'test-run',
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_persistence_markers_gc_swept_stat_explicit_zero(self, mock_deps):
+        """When nothing is stale, the stat is 0 — explicitly set, not absent — so
+        downstream consumers never need a .get(..., 0) fallback."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_stale_persistence_markers',
+                new=AM(return_value=0),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert 'stale_persistence_markers_gc_swept' in report.stats
+        assert report.stats['stale_persistence_markers_gc_swept'] == 0
 
 
 class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
