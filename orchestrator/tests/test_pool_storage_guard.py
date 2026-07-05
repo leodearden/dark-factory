@@ -151,6 +151,52 @@ class TestPoolInUsePredicate:
         assert git_ops.pool_in_use() is True
 
 
+class TestPoolStorageBootstrapOk:
+    """GitOps._pool_storage_bootstrap_ok() (task 2099 review-fix).
+
+    Distinguishes a fresh-host first-seed BOOTSTRAP (warm base present &
+    non-empty INSIDE worktree_base — mount provably up, sentinel just not
+    written yet) from a genuine unmounted mountpoint (base absent) or an
+    off-mount base config (base present elsewhere, says nothing about
+    worktree_base's own mount).  Fail-safe: anything but the proven case
+    returns False.
+    """
+
+    def test_base_present_inside_worktree_base_is_true(self, git_ops: GitOps):
+        base = git_ops.worktree_base / '_merge-verify' / 'target'
+        base.mkdir(parents=True, exist_ok=True)
+        (base / '.keep').write_text('warm base\n')
+        assert git_ops._pool_storage_bootstrap_ok() is True
+
+    def test_base_absent_is_false(self, git_ops: GitOps):
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)  # empty mountpoint
+        assert git_ops._pool_storage_bootstrap_ok() is False
+
+    def test_base_empty_dir_is_false(self, git_ops: GitOps):
+        base = git_ops.worktree_base / '_merge-verify' / 'target'
+        base.mkdir(parents=True, exist_ok=True)  # exists but EMPTY -> ABSENT
+        assert git_ops._pool_storage_bootstrap_ok() is False
+
+    def test_off_mount_base_is_false(self, git_config: GitConfig, tmp_path: Path):
+        """Base configured OFF worktree_base: even present & non-empty, its
+        presence on another mount cannot prove worktree_base's own mount, so
+        bootstrap is refused (a shadow lane could still land on the root fs)."""
+        off_mount = tmp_path / 'elsewhere' / 'base'
+        off_mount.mkdir(parents=True, exist_ok=True)
+        (off_mount / '.keep').write_text('off-mount base\n')
+        cfg = GitConfig(
+            main_branch='main', branch_prefix='task/', remote='origin',
+            worktree_dir='.worktrees', push_after_advance=False,
+            warm_lane_base_target_dir=str(off_mount),
+        )
+        project_root = tmp_path / 'project2'
+        project_root.mkdir()
+        git_ops = GitOps(cfg, project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)  # empty mountpoint
+        assert git_ops._warm_lane_base_resolvable().name == 'OK'
+        assert git_ops._pool_storage_bootstrap_ok() is False
+
+
 @pytest.mark.asyncio
 class TestPruneWorktreesGuard:
     """prune_worktrees() refuses ``git worktree prune`` when pool storage is
@@ -363,14 +409,38 @@ async def _add_warm_lane_scripts(repo: Path) -> None:
 @pytest.fixture
 def acquire_git_repo(tmp_path: Path) -> Path:
     """Real git repo with the default warm base pre-seeded (2061 gate: OK),
-    but WITHOUT the .pool-root sentinel — worktree_base exists (it was
-    created as a side effect of seeding the base) but storage is not marked
-    present, simulating an unmounted mountpoint with a live, empty mount dir.
+    but WITHOUT the .pool-root sentinel.
+
+    This is the FRESH-HOST BOOTSTRAP state (task 2099 review-fix): the CoW
+    seed base (``.worktrees/_merge-verify/target``) is present & non-empty
+    INSIDE worktree_base — proof the mount is up — yet ``.pool-root`` was
+    never written because its only writer (``_seed_warm_lane`` on ``rc == 0``)
+    lives PAST the create-once discriminator.  The discriminator must
+    recognise this as a first-seed bootstrap and proceed (marking the
+    sentinel), NOT mistake it for an unmounted mountpoint and refuse forever.
+
+    Contrast ``empty_mountpoint_git_repo`` below, where the base is ABSENT —
+    the genuine unmounted-mountpoint case that must still refuse.
     """
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_acquire_repo(repo))
     _seed_default_warm_base(repo)
+    return repo
+
+
+@pytest.fixture
+def empty_mountpoint_git_repo(tmp_path: Path) -> Path:
+    """Real git repo whose worktree_base exists but is EMPTY — the genuine
+    unmounted-mountpoint case (task 2099).  No warm base target, no
+    ``.pool-root``: ``_pool_storage_bootstrap_ok()`` is False, so the
+    create-once discriminator must refuse (cold fallback), never bootstrap a
+    shadow lane on the underlying root fs.
+    """
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_init_acquire_repo(repo))
+    (repo / '.worktrees').mkdir()  # empty mountpoint dir, no base target
     return repo
 
 
@@ -391,9 +461,15 @@ class TestAcquireCreateOnceDiscriminatorAndMarkChokepoint:
     """acquire_warm_lane / acquire_spec_lane create-once discriminator +
     the _seed_warm_lane mark-on-success chokepoint (step-7/8)."""
 
-    async def test_acquire_warm_lane_create_once_refuses_when_storage_absent(
+    async def test_acquire_warm_lane_create_once_bootstraps_when_base_present(
         self, acquire_git_repo: Path,
     ):
+        """Fresh-host bootstrap (task 2099 review-fix): worktree_base exists
+        with a present warm base but no ``.pool-root`` (its writer lives past
+        this gate).  The create-once discriminator must recognise this as a
+        first-seed bootstrap — mark the sentinel and PROCEED — not refuse
+        forever.  Without this the very first warm lane on a fresh host
+        deadlocks the pool permanently."""
         await _add_warm_lane_scripts(acquire_git_repo)
         git_ops = GitOps(
             _acquire_config(), acquire_git_repo,
@@ -401,7 +477,7 @@ class TestAcquireCreateOnceDiscriminatorAndMarkChokepoint:
         )
         # worktree_base (.worktrees) already exists via _seed_default_warm_base
         # (it created .worktrees/_merge-verify/target) — but .pool-root was
-        # never written, simulating an unmounted mountpoint.
+        # never written: the fresh-host bootstrap state.
         assert git_ops.worktree_base.exists()
         assert not git_ops.pool_storage_present()
 
@@ -412,18 +488,53 @@ class TestAcquireCreateOnceDiscriminatorAndMarkChokepoint:
 
         result = await git_ops.acquire_warm_lane('A', start_ref)
 
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected first-seed bootstrap to succeed, got {result!r}'
+        )
+        assert result.path == git_ops.worktree_base / '_lane-0'
+        assert git_ops.pool_storage_present() is True, (
+            'bootstrap must write .pool-root so subsequent acquires see storage present'
+        )
+        callback.assert_not_called()
+
+    async def test_acquire_warm_lane_create_once_refuses_when_base_absent(
+        self, empty_mountpoint_git_repo: Path,
+    ):
+        """Genuine unmounted-mountpoint (task 2099): worktree_base exists but
+        is EMPTY (no base target).  The 2061 base-health gate short-circuits
+        with BASE_ABSENT before the discriminator is even reached — no lane
+        dir is created on the underlying root fs."""
+        await _add_warm_lane_scripts(empty_mountpoint_git_repo)
+        git_ops = GitOps(
+            _acquire_config(), empty_mountpoint_git_repo,
+            warm_lane_pool_size=1, merge_spec_warm_lane_pool_size=1,
+        )
+        assert git_ops.worktree_base.exists()
+        assert not git_ops.pool_storage_present()
+        assert not git_ops._pool_storage_bootstrap_ok()
+
+        _, start_ref_raw, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=empty_mountpoint_git_repo,
+        )
+        start_ref = start_ref_raw.strip()
+
+        result = await git_ops.acquire_warm_lane('A', start_ref)
+
         assert result is WarmLaneUnavailable.BASE_ABSENT, (
             f'Expected BASE_ABSENT requeue signal, got {result!r}'
         )
-        lane_dir = git_ops.worktree_base / '_lane-0'
-        assert not lane_dir.exists(), (
-            'create-once must NOT create the lane dir when storage is absent'
+        assert not (git_ops.worktree_base / '_lane-0').exists()
+        assert git_ops.pool_storage_present() is False, (
+            'an empty unmounted mountpoint must never get a bootstrap sentinel'
         )
-        callback.assert_called_once()
 
-    async def test_acquire_spec_lane_create_once_refuses_when_storage_absent(
+    async def test_acquire_spec_lane_create_once_bootstraps_when_base_present(
         self, acquire_git_repo: Path,
     ):
+        """Fresh-host bootstrap for the spec pool (task 2099 review-fix).
+        acquire_spec_lane has no 2061 base-health pre-gate, so its create-once
+        discriminator is the primary gate — it must equally recognise the
+        base-present/sentinel-absent state as a first-seed bootstrap."""
         await _add_warm_lane_scripts(acquire_git_repo)
         git_ops = GitOps(
             _acquire_config(), acquire_git_repo,
@@ -439,11 +550,40 @@ class TestAcquireCreateOnceDiscriminatorAndMarkChokepoint:
 
         wt, warm = await git_ops.acquire_spec_lane(merge_commit)
 
+        assert warm is True, f'Expected first-seed bootstrap warm success, got warm={warm}'
+        assert wt == git_ops.worktree_base / '_spec-0'
+        assert git_ops.pool_storage_present() is True
+        callback.assert_not_called()
+
+    async def test_acquire_spec_lane_create_once_refuses_when_base_absent(
+        self, empty_mountpoint_git_repo: Path,
+    ):
+        """Genuine unmounted-mountpoint for the spec pool (task 2099): an empty
+        worktree_base with no base target => _pool_storage_bootstrap_ok() False
+        => refuse, cold fallback, callback fired, no spec lane on root fs."""
+        await _add_warm_lane_scripts(empty_mountpoint_git_repo)
+        git_ops = GitOps(
+            _acquire_config(), empty_mountpoint_git_repo,
+            warm_lane_pool_size=1, merge_spec_warm_lane_pool_size=1,
+        )
+        assert git_ops.worktree_base.exists()
+        assert not git_ops.pool_storage_present()
+        assert not git_ops._pool_storage_bootstrap_ok()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        _, head_raw, _ = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=empty_mountpoint_git_repo,
+        )
+        merge_commit = head_raw.strip()
+
+        wt, warm = await git_ops.acquire_spec_lane(merge_commit)
+
         assert warm is False, f'Expected cold fallback (warm=False), got warm={warm}'
-        spec_lane_dir = git_ops.worktree_base / '_spec-0'
-        assert not spec_lane_dir.exists(), (
+        assert not (git_ops.worktree_base / '_spec-0').exists(), (
             'create-once must NOT create the spec lane dir when storage is absent'
         )
+        assert git_ops.pool_storage_present() is False
         callback.assert_called_once()
 
     async def test_seed_warm_lane_marks_sentinel_on_success(

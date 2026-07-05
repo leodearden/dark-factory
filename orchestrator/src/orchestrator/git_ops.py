@@ -991,6 +991,45 @@ class GitOps:
                 '_note_pool_storage_absent: callback raised', exc_info=True,
             )
 
+    def _pool_storage_bootstrap_ok(self) -> bool:
+        """True iff a missing ``.pool-root`` is a first-seed BOOTSTRAP rather
+        than an unmounted mountpoint (task 2099 review-fix).
+
+        The ``.pool-root`` sentinel has exactly one writer — :meth:`_seed_warm_lane`
+        on ``rc == 0`` — which is reached only AFTER the create-once
+        discriminators (:meth:`acquire_warm_lane` / :meth:`acquire_spec_lane`).
+        Those discriminators refuse when ``worktree_base.exists() and not
+        pool_storage_present()``.  On a genuinely fresh host the sentinel has
+        never been written, so absent a bootstrap escape the very first lane
+        acquisition is refused forever, the seed never runs, the sentinel is
+        never written, and the pool is permanently disabled — a
+        chicken-and-egg deadlock.
+
+        This predicate breaks the cycle by recognising the ONE case where a
+        missing sentinel is provably safe to seed through: the warm-lane CoW
+        seed base resolves ``OK`` (present AND non-empty) AND lives INSIDE
+        :attr:`worktree_base`.  A populated base target under worktree_base
+        cannot exist on an empty, unmounted mountpoint — so its presence is
+        substrate-independent proof that worktree_base's own storage is
+        mounted and writable.  When that holds, the create-once site marks the
+        sentinel and proceeds (a real seed then re-marks it idempotently).
+
+        Fail-safe (returns False → refuse, never bootstrap) when:
+        - the base is ABSENT/INDETERMINATE (empty unmounted mountpoint, or a
+          transient stat/readlink hiccup), or
+        - the base is configured OFF worktree_base
+          (``config.warm_lane_base_target_dir`` points elsewhere) — its
+          presence on a different mount says nothing about worktree_base's
+          own mount, so a bootstrap there could still create a shadow lane on
+          the underlying root fs of an unmounted mountpoint.
+        """
+        if self._warm_lane_base_resolvable() is not WarmBaseHealth.OK:
+            return False
+        try:
+            return self.warm_lane_base_target_path.is_relative_to(self.worktree_base)
+        except (OSError, ValueError):
+            return False
+
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
 
@@ -2190,16 +2229,30 @@ class GitOps:
                 # `.pool-root` absent => suspected unmounted mountpoint =>
                 # refuse (release lane, cold fallback).
                 if self.worktree_base.exists() and not self.pool_storage_present():
-                    logger.warning(
-                        'acquire_spec_lane: create-once — pool storage '
-                        'absent/unmounted at %s — refusing to create spec '
-                        'lane %s on the underlying filesystem; cold fallback',
-                        self.worktree_base, lane,
-                    )
-                    self._note_pool_storage_absent()
-                    await self.spec_warm_lane_pool.release(lane)
-                    wt = await self.create_throwaway_verify_worktree(merge_commit)
-                    return wt, False
+                    if self._pool_storage_bootstrap_ok():
+                        # First-seed bootstrap (task 2099 review-fix): the CoW
+                        # seed base is present & non-empty INSIDE worktree_base,
+                        # proving the mount is up — a missing sentinel here is a
+                        # fresh host, not an unmounted mountpoint. Mark it now so
+                        # subsequent acquisitions see storage present, then fall
+                        # through to the normal create (the seed re-marks it).
+                        logger.info(
+                            'acquire_spec_lane: create-once — .pool-root absent '
+                            'but warm base present under %s; first-seed bootstrap '
+                            '(marking sentinel, proceeding)', self.worktree_base,
+                        )
+                        self.mark_pool_storage_present()
+                    else:
+                        logger.warning(
+                            'acquire_spec_lane: create-once — pool storage '
+                            'absent/unmounted at %s — refusing to create spec '
+                            'lane %s on the underlying filesystem; cold fallback',
+                            self.worktree_base, lane,
+                        )
+                        self._note_pool_storage_absent()
+                        await self.spec_warm_lane_pool.release(lane)
+                        wt = await self.create_throwaway_verify_worktree(merge_commit)
+                        return wt, False
                 # Self-heal a stale unregistered directory first
                 # (mirrors reset_persistent_merge_worktree's self-heal pattern).
                 if lane.exists():
@@ -2652,15 +2705,32 @@ class GitOps:
                 # mountpoint => refuse to create a NEW lane on the underlying
                 # root fs.
                 if self.worktree_base.exists() and not self.pool_storage_present():
-                    logger.warning(
-                        'acquire_warm_lane: create-once — pool storage '
-                        'absent/unmounted at %s — refusing to create lane '
-                        '%s on the underlying filesystem',
-                        self.worktree_base, lane,
-                    )
-                    self._note_pool_storage_absent()
-                    await self.release_warm_lane(lane, branch_name)
-                    return WarmLaneUnavailable.BASE_ABSENT
+                    if self._pool_storage_bootstrap_ok():
+                        # First-seed bootstrap (task 2099 review-fix): the CoW
+                        # seed base is present & non-empty INSIDE worktree_base,
+                        # proving the mount is up — a missing sentinel here is a
+                        # fresh host, not an unmounted mountpoint. Without this
+                        # escape the very first warm lane on a fresh host would
+                        # be refused forever (the sentinel's only writer,
+                        # _seed_warm_lane, lives past this gate). Mark it now,
+                        # then fall through to the normal create (the seed
+                        # re-marks it idempotently).
+                        logger.info(
+                            'acquire_warm_lane: create-once — .pool-root absent '
+                            'but warm base present under %s; first-seed bootstrap '
+                            '(marking sentinel, proceeding)', self.worktree_base,
+                        )
+                        self.mark_pool_storage_present()
+                    else:
+                        logger.warning(
+                            'acquire_warm_lane: create-once — pool storage '
+                            'absent/unmounted at %s — refusing to create lane '
+                            '%s on the underlying filesystem',
+                            self.worktree_base, lane,
+                        )
+                        self._note_pool_storage_absent()
+                        await self.release_warm_lane(lane, branch_name)
+                        return WarmLaneUnavailable.BASE_ABSENT
                 # Self-heal: remove a stale unregistered directory so
                 # git worktree add doesn't refuse a non-empty dir.
                 if lane.exists():
