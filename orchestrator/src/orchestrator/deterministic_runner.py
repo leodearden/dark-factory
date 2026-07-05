@@ -288,6 +288,7 @@ class DeterministicRunner:
         """
         import shlex
         import sys
+        from pathlib import Path
 
         queue_dir = str(self.escalation_queue.queue_dir)
         target_unit = before_done.get('target_unit', 'unknown')
@@ -340,7 +341,13 @@ class DeterministicRunner:
         # exit code is preserved (`exit "$__rc"`) so journald records the failure.
         # Note: --collect removes the unit from `systemctl --failed` after it
         # exits (whether success or failure); journald retains the full log.
-        payload = ' '.join(shlex.quote(p) for p in [script, *args])
+        #
+        # Absolutize a relative script against cwd (mirrors service_restart.py's
+        # `target = Path(project_root) / script`): defense-in-depth so the script
+        # is still found even if --working-directory were ever ignored. Scripts
+        # already absolute are left unchanged (no double-join under cwd).
+        script_abs = script if Path(script).is_absolute() else str(Path(cwd) / script)
+        payload = ' '.join(shlex.quote(p) for p in [script_abs, *args])
         on_failure = ' '.join(shlex.quote(p) for p in escalation_cmd)
         wrapped = (
             f'{payload}; __rc=$?; '
