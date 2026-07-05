@@ -5396,13 +5396,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # (free_host_count() == 0, verify hosts < speculation_depth) or a
         # cascade-remerged item awaiting re-dispatch — parked on
         # self._redispatch, not yet re-appended to self._inflight.  Without
-        # this section the item is invisible to dashboard/heartbeat depth
-        # and occupancy for the whole multi-heartbeat window it spends
-        # parked (task 2068, follow-up from esc-2063-2 / task 2063's I4
+        # this section the item is invisible to dashboard/heartbeat entries
+        # and depth for the whole multi-heartbeat window it spends parked
+        # (task 2068, follow-up from esc-2063-2 / task 2063's I4
         # speculation-permit conservation characterization — 2063 fixes only
         # the conservation COUNT via _inflight_speculative_count() and
         # deliberately does not touch entries; this closes the matching
-        # observability gap). Mirrors 1b (_remerging_item)'s transient-window
+        # observability gap). This restores entries/depth visibility ONLY —
+        # occupancy is deliberately left untouched: it derives solely from
+        # self._inflight (hosts with an actual lease), and a redispatch-parked
+        # item holds no host lease while it waits, so it must NOT be counted
+        # toward occupancy. Mirrors 1b (_remerging_item)'s transient-window
         # side-field pattern. self._redispatch is front-priority (drained by
         # the verifier loop's DISPATCH-FILL ahead of _verifier_queue), so its
         # entries are listed here, ahead of the awaiting_verify section below.
