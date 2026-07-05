@@ -82,9 +82,10 @@ test_merge_queue_concurrent_verify.py (γ=1735).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Any, Literal
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from escalation.queue import EscalationQueue
@@ -539,3 +540,165 @@ class TestQuiescenceContract:
             'speculation_accounting': [],
             'worktree_ledger': [],
         }
+
+
+# ── step-03 RED / step-04 GREEN: Row 1 — speculative head-failure cascade ───
+
+
+@pytest.mark.asyncio
+class TestScenario1SpeculativeCascade:
+    """Row 1: speculative head-failure cascade re-lands N+1 (submission order
+    preserved), both Futures resolved.
+
+    N (head, LOCAL verify) FAILS with a failing VerifyResult (not an
+    exception) — a genuine chain failure, so N resolves permanently
+    'blocked' (``_finalize_inflight``'s FAIL/skip branch; NOT retried — only
+    RUNNER_UNAVAILABLE is transient/re-dispatched).  N+1 (speculative
+    downstream, REMOTE verify) is still in-flight when N fails: the
+    _verifier_loop head-failure cascade must cancel N+1's in-flight remote
+    verify, re-merge N+1 onto ACTUAL main (not N's now-abandoned speculative
+    commit / N's failure), and re-dispatch it for a fresh verify — N+1 lands
+    'done' independently of N's failure.
+
+    Style A: drives worker.run() over the public worker._queue, with a
+    two-host allocator (local + gated remote) so N and N+1 verify
+    concurrently — the precondition for the cascade to matter.
+
+    Modelled on TestCascadeFiresRemoteCancel (failing-VerifyResult head, not
+    RunnerUnavailable — including its ``outcome_a.status not in ('done',
+    'already_merged')`` assertion shape) and TestRunnerUnavailableHeadCascade
+    (gated-runner remote + file-presence assertions), both in
+    test_merge_queue_concurrent_verify.py.  The cascade's remote-cancel call
+    is asserted directly (``cancel_verify.assert_called()``) rather than via
+    ``worker._remerge_occurred`` — that flag is dispatch-transient (reset to
+    False by the immediate clean re-dispatch of the re-merged N+1; see
+    _dispatch_item's Mechanism-2 staleness check) so it is not a stable
+    post-hoc signal once the scenario has fully drained.
+    """
+
+    async def test_head_failure_cascade_relands_both_requests(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """N fails permanently (local, gated); N+1 (remote) survives via cascade."""
+        # ── N's gated local verify: FAILS (failing VerifyResult) on call 0 ───
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _local_verify_side_effect(*args: Any, **kwargs: Any) -> VerifyResult:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # N's initial verify: wait for gate, then FAIL (not raise).
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return _mock_verify_result(False)
+            # Re-dispatched verifies (N and N+1 after cascade re-merge): pass.
+            return _mock_verify_result(True)
+
+        # ── N+1's remote verify: gated, then passes ──────────────────────────
+        gate_b_release = asyncio.Event()
+        gate_b_entered = asyncio.Event()
+        gated_remote = _gated_runner(
+            gate_b_release, gate_b_entered, passed=True, name='remote-cascade1',
+        )
+
+        # ── Branches ─────────────────────────────────────────────────────────
+        wt_a = await _make_branch_with_file(git_ops, 'task/casc1-a', 'casc1_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/casc1-b', 'casc1_b.py', 'b = 2\n')
+
+        # ── Worker + two-host allocator (N local, N+1 remote) ────────────────
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, gated_remote)
+
+        loop = asyncio.get_running_loop()
+        req_a = MergeRequest(
+            task_id='casc1-a', branch='task/casc1-a', worktree=wt_a,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+        req_b = MergeRequest(
+            task_id='casc1-b', branch='task/casc1-b', worktree=wt_b,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=loop.create_future(), lane='normal',
+        )
+
+        outcome_a: MergeOutcome | None = None
+        outcome_b: MergeOutcome | None = None
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            _local_verify_side_effect,
+        ):
+            worker_task = asyncio.create_task(worker.run())
+
+            await q.put(req_a)
+            await q.put(req_b)
+
+            # Wait for BOTH verifies to enter — confirms true concurrent
+            # overlap (the cascade only matters if N+1 is genuinely in-flight
+            # when N fails).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+
+            # N fails → _finalize_inflight(N) returns False → head-failure
+            # cascade fires for N+1: cancels its in-flight verify, re-merges
+            # it onto actual main, and re-dispatches both.
+            gate_a_release.set()
+            # Release N+1's gate too, so the (possibly still-running) gated
+            # task can unblock even if cancel() arrives slightly late.
+            gate_b_release.set()
+
+            with contextlib.suppress(TimeoutError):
+                outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            with contextlib.suppress(TimeoutError):
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── N (head): must FAIL permanently — a genuine VerifyResult failure
+        # is a real chain failure, not a transient RUNNER_UNAVAILABLE that
+        # gets re-dispatched (see _finalize_inflight's FAIL/skip branch).
+        assert outcome_a is not None and outcome_a.status not in ('done', 'already_merged'), (
+            f'Expected N to fail (genuine VerifyResult failure, not '
+            f'RunnerUnavailable), got status={outcome_a.status!r}.'
+        )
+
+        # ── N+1 (speculative downstream): must land 'done' after cascade ────
+        # even though its "head" (N) permanently failed — the cascade
+        # re-merges N+1 against ACTUAL main independently of N's fate.
+        assert outcome_b is not None and outcome_b.status == 'done', (
+            f'Expected N+1 (speculative downstream) to resolve "done" after '
+            f'cascade re-merge re-dispatch, got {outcome_b!r}. If the cascade '
+            f'did not fire, N+1 would stay in _inflight with a stale '
+            f'speculative commit and eventually fail CAS or time out.'
+        )
+
+        # ── Cascade cancelled N+1's in-flight remote verify ──────────────────
+        gated_remote.cancel_verify.assert_called()
+
+        # ── Main has N+1's file but NOT N's (N failed and was never merged;
+        # N+1 landed independently via the cascade re-merge) ─────────────────
+        _, main_files, _ = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert 'casc1_a.py' not in main_files, (
+            'N (casc1_a.py) failed verification and must NOT be on main'
+        )
+        assert 'casc1_b.py' in main_files, (
+            'N+1 (casc1_b.py) must be on main after cascade re-merge/re-verify'
+        )
+
+        # ── Quiescence: I4 (speculation accounting) and the other 4 surfaces
+        # all hold once the cascade has fully drained.
+        main_sha = await git_ops.get_main_sha()
+        _assert_quiescent(worker, main_sha, [req_a, req_b])
