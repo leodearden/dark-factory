@@ -288,11 +288,21 @@ class DeterministicRunner:
         """
         import shlex
         import sys
+        from pathlib import Path
 
         queue_dir = str(self.escalation_queue.queue_dir)
         target_unit = before_done.get('target_unit', 'unknown')
         script = before_done['script']
         args = before_done.get('args') or []
+
+        # The transient unit runs under the systemd --user manager, which does
+        # NOT inherit the orchestrator's own working directory — it defaults to
+        # $HOME.  A relative deploy `script` would therefore fail to be found
+        # (exit 127) once the unit fires.  Resolve an explicit cwd from
+        # before_done['cwd'] when the caller supplied one; otherwise fall back
+        # to this process's own os.getcwd(), which is project_root because the
+        # orchestrator's own systemd unit pins WorkingDirectory=project_root.
+        cwd = before_done.get('cwd') or os.getcwd()
 
         esc_summary = summary or (
             f'Self-restart fire-time failure: {target_unit}'
@@ -331,7 +341,13 @@ class DeterministicRunner:
         # exit code is preserved (`exit "$__rc"`) so journald records the failure.
         # Note: --collect removes the unit from `systemctl --failed` after it
         # exits (whether success or failure); journald retains the full log.
-        payload = ' '.join(shlex.quote(p) for p in [script, *args])
+        #
+        # Absolutize a relative script against cwd (mirrors service_restart.py's
+        # `target = Path(project_root) / script`): defense-in-depth so the script
+        # is still found even if --working-directory were ever ignored. Scripts
+        # already absolute are left unchanged (no double-join under cwd).
+        script_abs = script if Path(script).is_absolute() else str(Path(cwd) / script)
+        payload = ' '.join(shlex.quote(p) for p in [script_abs, *args])
         on_failure = ' '.join(shlex.quote(p) for p in escalation_cmd)
         wrapped = (
             f'{payload}; __rc=$?; '
@@ -347,6 +363,7 @@ class DeterministicRunner:
             f'--on-active={on_active_secs}',
             f'--unit={transient_unit}',
             '--collect',
+            f'--working-directory={cwd}',
             '/bin/sh', '-c', wrapped,
         ]
         proc = await asyncio.create_subprocess_exec(

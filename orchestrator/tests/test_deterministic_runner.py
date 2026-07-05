@@ -3495,6 +3495,179 @@ class TestDefaultScheduleDetachedRestart:
 
 
 # ---------------------------------------------------------------------------
+# Task 2105: _default_schedule_detached_restart must consume before_done.cwd
+# (systemd-run --working-directory + absolutized payload script) so relative
+# deploy scripts stop failing 127 when the transient unit fires from the
+# systemd user-manager's default cwd instead of the project root.
+# (RED until step-2 adds --working-directory / step-4 absolutizes the payload)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDetachedRestartWorkingDirectory:
+    """_default_schedule_detached_restart must consume before_done.cwd so the
+    transient unit runs (and locates relative scripts) from the right directory."""
+
+    def _make_mock_proc(self, returncode: int = 0) -> object:
+        """Return a mock proc with communicate() → (b'', b'') and returncode."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+        mock_proc.returncode = returncode
+        return mock_proc
+
+    async def test_relative_script_explicit_cwd_sets_working_directory(self, tmp_path: Path):
+        """An explicit before_done['cwd'] must become a --working-directory=<cwd> option.
+
+        Without this, the transient unit fires from the systemd user-manager's
+        default cwd (~$HOME), where a repo-relative deploy script does not exist
+        (exit 127 — the esc-2104-1 fire-time failure).
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': 'scripts/restart-all-orchestrators.sh',
+            'args': [],
+            'cwd': '/home/leo/src/dark-factory',
+            'target_unit': 'orchestrator-dark-factory.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-2105.service',
+                on_active_secs=60,
+                task_id='2105',
+            )
+
+        argv = mock_exec.call_args_list[0].args
+        all_argv = ' '.join(str(a) for a in argv)
+        assert '--working-directory=/home/leo/src/dark-factory' in all_argv, (
+            f'--working-directory must be set from before_done["cwd"]: {all_argv!r}'
+        )
+        assert argv[-3] == '/bin/sh' and argv[-2] == '-c', (
+            f'the /bin/sh -c wrapper tail must be preserved: {argv!r}'
+        )
+
+    async def test_relative_script_absent_cwd_falls_back_to_getcwd(self, tmp_path: Path):
+        """With no before_done['cwd'], --working-directory must fall back to os.getcwd().
+
+        The orchestrator's own systemd unit pins WorkingDirectory=project_root, so
+        os.getcwd() at scheduling time is the correct fallback root.
+        """
+        import os
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': 'scripts/restart-all-orchestrators.sh',
+            'args': [],
+            'target_unit': 'orchestrator-dark-factory.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-2106.service',
+                on_active_secs=60,
+                task_id='2106',
+            )
+
+        all_argv = ' '.join(
+            str(a) for call in mock_exec.call_args_list for a in call.args
+        )
+        assert f'--working-directory={os.getcwd()}' in all_argv, (
+            f'--working-directory must fall back to os.getcwd(): {all_argv!r}'
+        )
+
+    async def test_relative_script_absolutized_in_payload(self, tmp_path: Path):
+        """A relative script must be absolutized against cwd in the /bin/sh -c payload.
+
+        --working-directory alone is not enough to trust for the leading command
+        of the payload: absolutizing the script too is defense-in-depth so it is
+        still found even if --working-directory were ever ignored.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': 'scripts/restart-all-orchestrators.sh',
+            'args': [],
+            'cwd': '/home/leo/src/dark-factory',
+            'target_unit': 'orchestrator-dark-factory.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-2107.service',
+                on_active_secs=60,
+                task_id='2107',
+            )
+
+        argv = mock_exec.call_args_list[0].args
+        assert argv[-3] == '/bin/sh' and argv[-2] == '-c', (
+            f'expected a /bin/sh -c wrapper payload, got {argv!r}'
+        )
+        wrapped = argv[-1]
+        expected_abs = str(Path('/home/leo/src/dark-factory') / 'scripts/restart-all-orchestrators.sh')
+        assert expected_abs in wrapped, (
+            f'payload must embed the absolutized script path {expected_abs!r}: {wrapped!r}'
+        )
+        assert not wrapped.startswith('scripts/restart-all-orchestrators.sh'), (
+            f'payload must not lead with the bare relative script as the command: {wrapped!r}'
+        )
+
+    async def test_absolute_script_left_unchanged_in_payload(self, tmp_path: Path):
+        """An already-absolute script must be embedded unchanged (no double-join under cwd)."""
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': '/usr/local/bin/restart-deploy.sh',
+            'args': [],
+            'cwd': '/home/leo/src/dark-factory',
+            'target_unit': 'orchestrator-reify.service',
+        }
+        mock_proc = self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-2108.service',
+                on_active_secs=60,
+                task_id='2108',
+            )
+
+        argv = mock_exec.call_args_list[0].args
+        wrapped = argv[-1]
+        assert wrapped.startswith('/usr/local/bin/restart-deploy.sh'), (
+            f'an absolute script must be embedded unchanged, leading the payload: {wrapped!r}'
+        )
+        assert '/home/leo/src/dark-factory/usr/local/bin/restart-deploy.sh' not in wrapped, (
+            f'absolute script must not be double-joined under cwd: {wrapped!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step-9 (ε): own-unit resolution from ORCH_UNIT env var + end-to-end
 # self-detection without injected resolver
 # (RED until step-10 finalises _default_resolve_own_unit + docstring)
