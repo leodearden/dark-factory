@@ -232,3 +232,53 @@ class TestReapOrphanedMergeWorktreesPreservation:
         assert report['reaped'] == [str(orphan.resolve())], (
             f'expected only the genuine orphan reaped, got: {report["reaped"]!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED / step-6 GREEN: re-adoption via recovered_branches
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapOrphanedMergeWorktreesReadoption:
+    """Unit tests for re-adoption of worktrees backing recovered in-flight
+    merges via ``recovered_branches`` (task 2060 step-5).
+
+    RED until step-6 GREEN adds re-adoption to reap_orphaned_merge_worktrees.
+    """
+
+    async def test_recovered_branch_readopts_its_aged_worktree(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        # Aged past grace — if this were an ordinary orphan it would be
+        # reaped, but it backs a recovered in-flight merge so it must be
+        # re-adopted instead.
+        wt = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+
+        async def _fake_find_inflight(branch: str) -> Path | None:
+            return wt if branch == 'recovered-x' else None
+
+        monkeypatch.setattr(
+            git_ops, 'find_inflight_merge_worktree',
+            AsyncMock(side_effect=_fake_find_inflight),
+        )
+
+        report = await worker.reap_orphaned_merge_worktrees(
+            recovered_branches=['recovered-x', 'no-match-branch'], now=_NOW,
+        )
+
+        assert wt.resolve() in worker._owned_merge_worktrees, (
+            're-adoption must register the worktree into the liveness ledger'
+        )
+        assert report['readopted'] == [str(wt.resolve())], (
+            f'the no-match branch must contribute nothing to readopted, got: {report!r}'
+        )
+        assert str(wt.resolve()) not in report['reaped']
+        assert wt.exists(), 're-adoption must bypass the grace/reap gate despite its age'
+        assert worker.worktree_ledger_violations(now=_NOW) == [], (
+            're-adoption (registration) must cure the false violation'
+        )
