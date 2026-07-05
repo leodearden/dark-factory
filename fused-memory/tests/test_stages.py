@@ -6448,6 +6448,82 @@ class TestSweepStaleFlagMarkers:
         memory_service.delete_memory.assert_not_awaited()
 
 
+class TestSweepStalePersistenceMarkers:
+    """_sweep_stale_persistence_markers age-GCs stage2_persistence_marker Mem0 records.
+
+    Mirrors _sweep_stale_flag_markers (task 1944) but is AGE-ONLY: this marker
+    family's metadata is {source, flag_id, run_id} with no task_id/fp:
+    content-fingerprint key, so the cross-cycle predates_cycle predicate does
+    not apply here. It scrolls Mem0 for {'source': 'stage2_persistence_marker'}
+    members (deterministic Qdrant payload filter, never semantic search) and
+    selects those whose created_at is strictly older than a cutoff
+    (now - max_age_days) for best-effort delete.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_markers_deleted_fresh_marker_kept(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE,
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'stale-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'source': 'stage2_persistence_marker', 'flag_id': 'f1', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'stale-2',
+                'created_at': (fixed_now - timedelta(days=30)).isoformat(),
+                'metadata': {
+                    'source': 'stage2_persistence_marker', 'flag_id': 'f2', 'run_id': 'prior-run',
+                },
+            },
+            {
+                'id': 'fresh-1',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {
+                    'source': 'stage2_persistence_marker', 'flag_id': 'f3', 'run_id': 'prior-run',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_persistence_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 2
+        assert memory_service.delete_memory.await_count == 2
+
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'stale-1', 'stale-2'}
+        assert 'fresh-1' not in deleted_ids
+
+        for call in memory_service.delete_memory.call_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get('store') == 'mem0'
+            assert kwargs.get('project_id') == 'reify'
+            assert kwargs.get('causation_id') == 'r1'
+            assert kwargs.get('_source') == _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE
+
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        call = memory_service.get_memories_by_metadata.call_args
+        filters = call.kwargs.get('filters') or {}
+        assert filters == {'source': 'stage2_persistence_marker'}
+
+        # Deterministic scroll only — semantic search must never be used for GC.
+        memory_service.search.assert_not_awaited()
+
+
 class TestComputeStaleFlags:
     """_compute_stale_flags returns flag_ids whose persistence count >= threshold."""
 
