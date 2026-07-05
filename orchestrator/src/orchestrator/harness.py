@@ -2203,10 +2203,13 @@ Output JSON matching the schema. Every task must appear in the output.
           DB-independent and self-heals (a genuinely-terminal re-pinned lane
           is reclaimed by the next :meth:`_reconcile_terminal_lanes` pass).
 
-        This step handles only the un-pinned case (``pool.assignments_snapshot()``
-        has no entry for the checked-out id yet) — the idempotent-skip,
-        never-steal, and dup-checkout-detach precedence guards (consulting
-        the snapshot) are added by later steps of task 2062.
+        Precedence (consulting ``pool.assignments_snapshot()``, computed once
+        per pass): (1) the id is already pinned to THIS exact lane -> skip,
+        idempotent; (2) this lane is pinned to a DIFFERENT id -> skip, never
+        steal a lane recovery assigned to someone else; (3) the id is pinned
+        to a DIFFERENT lane (a duplicate checkout) -> detach this un-pinned
+        duplicate, keeping the original pin; (4) otherwise -> the
+        degraded/absent/terminal/live status logic below.
         """
         pool = self.git_ops.warm_lane_pool
         if pool is None:
@@ -2226,10 +2229,47 @@ Output JSON matching the schema. Every task must appear in the output.
         degraded = resolver_failed(statuses, err)
         live = {} if degraded else {str(k): v for k, v in statuses.items()}
 
-        # NOTE: this loop does not yet consult pool.assignments_snapshot() —
-        # the idempotent-skip, never-steal, and dup-checkout-detach
-        # precedence guards land in later steps of task 2062.
+        # Precedence guards consulting the CURRENT in-memory assignment map —
+        # computed once before the loop so a lane already reconciled this
+        # pass cannot be mistaken for a fresh dup/steal on a later iteration.
+        assigned = pool.assignments_snapshot()
+        lane_to_id: dict[Path, str] = {}
+        for pinned_id, pinned_lane in assigned.items():
+            canon = pool._match_lane(pinned_lane)
+            if canon is not None:
+                lane_to_id[canon] = pinned_id
+
         for bare_id, lane in checkouts.items():
+            canon_pinned = (
+                pool._match_lane(assigned[bare_id]) if bare_id in assigned else None
+            )
+            other_id = lane_to_id.get(lane)
+
+            if canon_pinned == lane:
+                # Idempotent skip: recovery already re-pinned this exact id
+                # to this exact lane (e.g. _recover_crashed_tasks fired) —
+                # nothing to do.
+                continue
+            if other_id is not None and other_id != bare_id:
+                # NEVER-STEAL: this lane is pinned to a DIFFERENT id already —
+                # never take a lane recovery assigned to someone else.
+                logger.warning(
+                    'Lane-checkout reconciler: lane %s is pinned to a '
+                    'DIFFERENT id %s (never-steal) — skipping checkout for %s',
+                    lane, other_id, bare_id,
+                )
+                continue
+            if canon_pinned is not None:
+                # DUP-CHECKOUT: bare_id is already pinned to a DIFFERENT lane
+                # — detach this un-pinned duplicate, keep the original pin.
+                logger.info(
+                    'Lane-checkout reconciler: %s is already pinned to a '
+                    'different lane (%s) — detaching duplicate checkout at %s',
+                    bare_id, canon_pinned, lane,
+                )
+                await self.git_ops.detach_lane_checkout(lane, bare_id)
+                continue
+
             if degraded:
                 logger.warning(
                     'Lane-checkout reconciler: DEGRADED status read — '
