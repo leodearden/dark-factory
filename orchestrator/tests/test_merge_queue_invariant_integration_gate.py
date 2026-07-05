@@ -1105,7 +1105,12 @@ class TestScenario56NewSurfaceEscalations:
         # Force a leak: a speculation-slot permit vanished without being
         # recorded as held-by-merger, transferred to the verifier, or
         # genuinely still available — breaks the I4 conservation identity.
-        worker._speculation_slot._value -= 1
+        # Go through the public acquire() (as row 4 does above) rather than
+        # poking the private CPython Semaphore._value counter directly, so
+        # this does not couple to an undocumented implementation detail that
+        # could change across Python versions or break if the semaphore ever
+        # gains waiters.
+        await worker._speculation_slot.acquire()
 
         violations = worker.speculation_accounting_violations()
         assert violations, 'expected the forced permit leak to surface a violation'
@@ -1125,8 +1130,10 @@ class TestScenario56NewSurfaceEscalations:
         assert esc.category == 'merge_resource_leak'
 
         # Restore the permit -> the identity holds again and full quiescence
-        # returns (all 5 surfaces, not just this one).
-        worker._speculation_slot._value += 1
+        # returns (all 5 surfaces, not just this one). Mirror the public
+        # acquire() above with the public release() rather than poking
+        # ._value directly.
+        worker._speculation_slot.release()
 
         main_sha = await git_ops.get_main_sha()
         _assert_quiescent(worker, main_sha, [])
@@ -1545,6 +1552,13 @@ class TestScenario9GuardMatrixEquivalence:
 
             monkeypatch.setattr(git_ops, 'merge_to_main', _dispatch_merge_to_main)
 
+        # Capture main before either path runs. Equivalence is only
+        # meaningful when both paths see the same base — if a future
+        # scenario ever advances main between the merger and remerge runs,
+        # fail here with a clear diagnostic instead of a confusing
+        # status/event-stream mismatch below.
+        main_sha_before = await git_ops.get_main_sha()
+
         # ── Drive the MERGER path ───────────────────────────────────────────
         es_merger = _make_event_store_for(tmp_path, 'merger')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -1575,6 +1589,14 @@ class TestScenario9GuardMatrixEquivalence:
         queue2: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker2 = SpeculativeMergeWorker(git_ops, queue2, event_store=es_remerge)
         item = await worker2._remerge(remerge_req, time.monotonic())
+
+        main_sha_after = await git_ops.get_main_sha()
+        assert main_sha_after == main_sha_before, (
+            f'scenario={scenario}: main moved from {main_sha_before!r} to '
+            f'{main_sha_after!r} between the merger and remerge path runs — '
+            'the two paths were not run against the same base, so their '
+            'outcomes are not comparable'
+        )
 
         # A flowing (non-decided) item means _remerge merged successfully
         # without hitting any guard.  None is a deliberately distinct
@@ -1712,13 +1734,14 @@ class TestScenario1112Preservation:
         }
         expected_keys = pre_existing_keys | {'resource_audit'}
         missing = expected_keys - snap.keys()
+        # Additive-only contract: every expected key must be present
+        # (expected_keys <= snap.keys()), but a future genuinely-additive key
+        # must NOT fail this gate (the class docstring explicitly allows
+        # additive extension) — so this checks the subset relationship, not
+        # an exact key count.
         assert not missing, (
             f'expected snapshot() keys missing: {missing!r}. '
             f'Keys present: {sorted(snap.keys())!r}'
-        )
-        assert len(snap.keys()) == 13, (
-            f'expected exactly 13 additive-only snapshot keys, got '
-            f'{sorted(snap.keys())!r}'
         )
 
         assert snap['resource_audit'] == {
