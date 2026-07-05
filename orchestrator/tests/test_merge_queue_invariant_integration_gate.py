@@ -97,6 +97,8 @@ from orchestrator.harness import Harness
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
+    InflightStatus,
+    InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
     RealMergeItem,
@@ -105,7 +107,7 @@ from orchestrator.merge_queue import (
 )
 from orchestrator.run_store import RunStore
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import HostAllocator
+from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
 # ── Module-level sentinel ─────────────────────────────────────────────────────
 
@@ -259,6 +261,59 @@ def _make_inflight_entry(
         was_speculative=False,
         phase='verifying',
     )
+
+
+async def _make_merged_item(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    branch: str,
+    filename: str,
+    content: str,
+    *,
+    speculative: bool = False,
+) -> tuple[MergeRequest, RealMergeItem]:
+    """Create a REAL merged RealMergeItem on a fresh branch (style C driving).
+
+    Ported from TestRunInflightVerifyRemoteCancelOnAbort._make_merged_item
+    (test_merge_queue_concurrent_verify.py) — merges *branch* to main via a
+    real ``git_ops.merge_to_main`` call (no queue/dispatch involved) so rows
+    2-4/8 can drive ``_run_inflight_verify``/``_finalize_inflight`` directly
+    against a real merge commit.  Does NOT advance main — the caller decides
+    whether/how to finalize.
+    """
+    wt = await _make_branch_with_file(git_ops, branch, filename, content)
+    loop = asyncio.get_running_loop()
+    req = MergeRequest(
+        task_id=branch, branch=branch, worktree=wt,
+        pre_rebased=False, task_files=None, module_configs=[],
+        config=config, result=loop.create_future(), lane='normal',
+    )
+    merge_result = await git_ops.merge_to_main(wt, branch)
+    assert merge_result.success and merge_result.merge_commit
+    assert merge_result.merge_worktree is not None
+    base_sha = await git_ops.get_main_sha()
+    item = RealMergeItem(
+        request=req,
+        merge_result=merge_result,
+        merge_wt=merge_result.merge_worktree,
+        base_sha=base_sha,
+        speculative=speculative,
+    )
+    return req, item
+
+
+def _wrap_verify_result(vr: InflightVerifyResult) -> asyncio.Future:
+    """Wrap a pre-computed InflightVerifyResult in an already-resolved Future.
+
+    Lets style-C tests call ``_run_inflight_verify`` for the real vr, then
+    build the InflightEntry ``_finalize_inflight`` expects without re-running
+    the verify (mirrors test_merge_speculation.py's ``_build_entry`` helper).
+    """
+
+    async def _resolved() -> InflightVerifyResult:
+        return vr
+
+    return asyncio.ensure_future(_resolved())
 
 
 # ── Branch / commit helpers ───────────────────────────────────────────────────
@@ -702,3 +757,243 @@ class TestScenario1SpeculativeCascade:
         # all hold once the cascade has fully drained.
         main_sha = await git_ops.get_main_sha()
         _assert_quiescent(worker, main_sha, [req_a, req_b])
+
+
+# ── step-05 RED / step-06 GREEN: Rows 2,3,4 — verifier lifecycle faults ─────
+
+
+@pytest.mark.asyncio
+class TestScenario234VerifierLifecycleFaults:
+    """Rows 2-4: _run_inflight_verify / _finalize_inflight lifecycle faults.
+
+    Style C: direct _run_inflight_verify(item, lease) [+ _finalize_inflight
+    for the release-half assertions], driven against REAL merged items
+    (``_make_merged_item``) rather than the full worker.run() loop — these
+    rows test the verify/finalize halves of ``_verify_and_advance`` in
+    isolation, per the task's documented style-C driving convention.
+    """
+
+    async def test_runner_unavailable_quarantines_and_redispatches(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Row 2: RunnerUnavailable quarantines the host and re-dispatches —
+        NOT a chain failure — and the re-dispatched item eventually lands.
+        """
+        worker = _make_worker(git_ops)
+
+        fake_remote = _make_fake_remote(name='ru2-remote')
+        fake_remote.run_merge_verify = AsyncMock(
+            side_effect=RunnerUnavailable('simulated host failure'),
+        )
+        allocator = _inject_two_host_allocator(worker, fake_remote)
+        lease = allocator.acquire_remote()
+        assert lease is not None, 'precondition: remote slot must be free'
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'task/casc2-ru', 'casc2_ru.py', 'r = 1\n',
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        result = await worker._run_inflight_verify(item, lease)
+        assert result.status == 'RUNNER_UNAVAILABLE', (
+            f'Expected RUNNER_UNAVAILABLE, got status={result.status!r}'
+        )
+        assert result.merge_wt == item.merge_wt, (
+            'RUNNER_UNAVAILABLE must preserve merge_wt (re-dispatched, not cleaned)'
+        )
+
+        entry = InflightEntry(
+            item=item, lease=lease, verify_task=_wrap_verify_result(result),
+            merge_wt=None, was_speculative=False, phase='verifying',
+        )
+        advanced = await worker._finalize_inflight(entry)
+        assert advanced is False
+
+        assert 'ru2-remote' in worker._runner_quarantine, (
+            'RUNNER_UNAVAILABLE must quarantine the failed remote host'
+        )
+        assert worker._n_failed is False, (
+            'RUNNER_UNAVAILABLE is transient, NOT a chain failure — '
+            '_n_failed must stay False'
+        )
+        assert len(worker._redispatch) == 1, (
+            f'Expected the re-merged item on _redispatch, got {worker._redispatch!r}'
+        )
+        redispatched = worker._redispatch.popleft()
+        assert redispatched.request is req
+
+        assert not req.result.done(), (
+            'req.result must still be pending immediately after the '
+            'RUNNER_UNAVAILABLE finalize (no premature resolution)'
+        )
+
+        # ── "Future eventually resolvable": drive the re-dispatched item to
+        # a clean landing via the compat shim (a fresh, healthy verify) —
+        # confirms the item is genuinely re-verifiable, not stuck.
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            AsyncMock(return_value=_mock_verify_result(True)),
+        ):
+            landed = await worker._verify_and_advance(redispatched)
+        assert landed is True
+        assert req.result.done() and req.result.result().status == 'done', (
+            f'Expected the re-dispatched item to eventually land "done", got '
+            f'{req.result.result() if req.result.done() else "<pending>"!r}'
+        )
+
+    async def test_operator_halt_requeues_and_reverifies(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Row 3: operator-halt mid-verify -> REQUEUED; unhalt + re-verify -> 'done'."""
+        worker = _make_worker(git_ops)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+
+        gate_release = asyncio.Event()
+        gate_entered = asyncio.Event()
+        gated = _gated_runner(gate_release, gate_entered, passed=True, name='casc3-halt')
+
+        # Signal when the abort-poll's remote cancel actually fires, so the
+        # test can wait for the halt to be NOTICED before releasing the
+        # gate — releasing it immediately after operator_halt() races the
+        # gated runner's own completion (via gate_release) against the
+        # poll's next halt check, and the runner usually wins (asyncio.wait
+        # returns as soon as verify_task completes, which can be sooner than
+        # the halt is ever checked).
+        cancel_fired = asyncio.Event()
+
+        async def _signaling_cancel() -> int:
+            cancel_fired.set()
+            return 0
+
+        gated.cancel_verify = AsyncMock(side_effect=_signaling_cancel)
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'task/casc3-halt', 'casc3_halt.py', 'h = 1\n',
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+        lease = HostLease(name='casc3-halt', runner=gated, is_local=False)
+
+        cas_retries_before = dict(worker._cas_retries)
+        gate_retries_before = dict(worker._gate_retries)
+
+        verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+
+        # Trigger operator halt mid-verify; wait for the abort-poll to
+        # actually notice it (remote cancel fired) before releasing the gate.
+        worker.operator_halt('test row-3 halt')
+        await asyncio.wait_for(cancel_fired.wait(), timeout=2.0)
+        gate_release.set()
+
+        result = await asyncio.wait_for(verify_future, timeout=5.0)
+        assert result.status == 'REQUEUED', (
+            f'Expected REQUEUED, got status={result.status!r}'
+        )
+        assert not req.result.done(), (
+            'operator-halt REQUEUED must leave req.result pending — a halt is not a failure'
+        )
+        assert worker._queue.qsize() == 1, 'req must be back on worker._queue'
+        assert worker._cas_retries == cas_retries_before, (
+            'per-task CAS retry counters must be untouched by a halt'
+        )
+        assert worker._gate_retries == gate_retries_before, (
+            'per-task gate retry counters must be untouched by a halt'
+        )
+
+        requeued_req = worker._queue.get_nowait()
+        assert requeued_req is req
+
+        # Unhalt, then re-verify the SAME item (main hasn't moved; the merge
+        # commit is still valid) — must land 'done'.
+        worker.unhalt_all_lanes('test row-3 unhalt')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            AsyncMock(return_value=_mock_verify_result(True)),
+        ):
+            landed = await worker._verify_and_advance(item)
+        assert landed is True
+        assert req.result.done() and req.result.result().status == 'done', (
+            f'Expected re-verify after unhalt to land "done", got '
+            f'{req.result.result() if req.result.done() else "<pending>"!r}'
+        )
+
+    async def test_abandoned_waiter_dropped_and_cleaned(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Row 4: sole-waiter abandon (Future cancelled) mid-verify -> DROPPED,
+        merge_wt cleaned, no leaked speculation slot.
+        """
+        worker = _make_worker(git_ops)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+
+        req, item = await _make_merged_item(
+            git_ops, config, 'task/casc4-drop', 'casc4_drop.py', 'd = 1\n',
+            speculative=True,
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+        assert item.merge_wt in worker._owned_merge_worktrees
+
+        # Simulate this item holding a speculation permit the way a real
+        # speculative dispatch would — _run_inflight_verify/_finalize_inflight
+        # never ACQUIRE the semaphore themselves (only _finalize_inflight's
+        # finally block releases it, gated on entry.was_speculative), so the
+        # direct-call style needs to arm it manually to make the release
+        # observable.
+        await worker._speculation_slot.acquire()
+
+        gate_entered = asyncio.Event()
+
+        async def _hang_verify(*args: Any, **kwargs: Any) -> Any:
+            gate_entered.set()
+            await asyncio.sleep(100)  # abandon wins long before this returns
+            return None  # pragma: no cover — unreachable
+
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _hang_verify):
+            verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+
+            # Sole waiter gives up: cancel the result Future mid-verify.
+            req.result.cancel()
+
+            result = await asyncio.wait_for(verify_future, timeout=5.0)
+
+        assert result.status == 'DROPPED', (
+            f'Expected DROPPED, got status={result.status!r}'
+        )
+        assert result.merge_wt is None, 'DROPPED must report merge_wt cleaned (None)'
+        assert req.result.cancelled() is True, (
+            'abandon must never set_result on the already-cancelled future'
+        )
+
+        entry = InflightEntry(
+            item=item, lease=lease, verify_task=_wrap_verify_result(result),
+            merge_wt=None, was_speculative=True, phase='verifying',
+        )
+        advanced = await worker._finalize_inflight(entry)
+        assert advanced is False
+
+        assert worker.speculation_accounting_violations() == [], (
+            'the speculation slot must be released on the DROPPED path — no leak'
+        )
+        assert item.merge_wt not in worker._owned_merge_worktrees, (
+            'merge_wt must be deregistered from the owned-worktree ledger on '
+            'DROPPED cleanup'
+        )
+
+        main_sha = await git_ops.get_main_sha()
+        _assert_quiescent(worker, main_sha, [req])
