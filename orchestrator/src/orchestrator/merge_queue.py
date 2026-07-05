@@ -5189,6 +5189,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 await self._git_ops.cleanup_merge_worktree(path)
                 reaped.append(str(path))
 
+        if reaped or readopted:
+            logger.info(
+                'reap_orphaned_merge_worktrees: reaped=%d readopted=%d',
+                len(reaped),
+                len(readopted),
+            )
+
         return {'readopted': readopted, 'reaped': reaped}
 
     def _warn_if_verify_base_not_frozen_tip(
