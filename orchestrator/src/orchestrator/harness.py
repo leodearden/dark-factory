@@ -829,6 +829,17 @@ class Harness:
         # None (byte-identical when unwired) — same declare-in-callee /
         # install-in-harness pattern as warm_lane_reclaim_candidate_provider.
         self.git_ops._on_pool_storage_absent = self._file_pool_storage_absent_escalation
+        # In-memory hint gating the orphan-reaper's per-tick resolve scan
+        # (task 2099 review-fix, efficiency). MUST default True ("maybe
+        # pending") rather than False ("never filed") — a fresh process
+        # start needs its first sweep to still scan the escalation queue so
+        # a stale pool-storage-absent L1 left open by a pre-gate build is
+        # auto-cleared across a restart (see _reap_orphan_worktrees). Set
+        # True whenever _file_pool_storage_absent_escalation trips; cleared
+        # to False only by _resolve_pool_storage_absent_escalation once it
+        # confirms zero pending escalations, so the common healthy
+        # steady-state stops paying the per-tick queue-scan cost.
+        self._pool_storage_absent_maybe_pending: bool = True
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
@@ -2469,8 +2480,11 @@ Output JSON matching the schema. Every task must appear in the output.
         # worktree_base.exists() True there too — without this gate, every
         # pool-less host that has ever run a task would abort its sweep and
         # file a spurious escalation at every startup. The resolve call
-        # below stays unconditional so a pool-less host on a build that
-        # pre-dates this gate can still auto-clear a stale open L1.
+        # below is gated on _pool_storage_absent_maybe_pending rather than
+        # skipped outright — that flag starts True on every process start,
+        # so a pool-less host on a build that pre-dates this gate can still
+        # auto-clear a stale open L1 on its first post-restart sweep; only
+        # the subsequent, confirmed-clear steady-state ticks skip the scan.
         if self.git_ops.pool_in_use() and not self.git_ops.pool_storage_present():
             logger.warning(
                 'Orphan reaper: pool storage absent/unmounted at %s — '
@@ -2480,7 +2494,8 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             self._file_pool_storage_absent_escalation()
             return
-        await self._resolve_pool_storage_absent_escalation()
+        if self._pool_storage_absent_maybe_pending:
+            await self._resolve_pool_storage_absent_escalation()
 
         statuses, err = await self.scheduler.get_statuses()
         if resolver_failed(statuses, err):
@@ -3656,7 +3671,12 @@ Output JSON matching the schema. Every task must appear in the output.
         Best-effort: a missing queue (bare-Harness unit tests) or any submit
         failure is swallowed so escalation filing never breaks the guarded
         call site.
+
+        Marks ``_pool_storage_absent_maybe_pending`` True unconditionally
+        (even if the queue is missing or the dedup below finds one already
+        open) so the reaper's resolve scan runs again once storage recovers.
         """
+        self._pool_storage_absent_maybe_pending = True
         if not self._escalation_queue:        # bare-Harness unit tests stay green
             return
         try:
@@ -3717,6 +3737,13 @@ Output JSON matching the schema. Every task must appear in the output.
         (``EscalationQueue.resolve`` is a no-op if already resolved).
         Best-effort: no-op when ``_escalation_queue`` is None or resolve
         raises.
+
+        On successful completion (no exception) clears
+        ``_pool_storage_absent_maybe_pending`` to False — this scan has just
+        proven there is nothing left to resolve, so the reaper's caller can
+        skip the next scan(s) until ``_file_pool_storage_absent_escalation``
+        sets the flag True again. Left True on exception (fail-safe: keep
+        re-scanning rather than risk silently never resolving a real L1).
         """
         if not self._escalation_queue:
             return
@@ -3737,6 +3764,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 logger.info(
                     'Pool-storage-absent: auto-resolved escalation %s', esc.id,
                 )
+            self._pool_storage_absent_maybe_pending = False
         except Exception:
             logger.warning(
                 'Pool-storage-absent: failed to resolve escalation(s)',
