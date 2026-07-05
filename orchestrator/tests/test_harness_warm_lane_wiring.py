@@ -2233,3 +2233,70 @@ class TestReconcileLaneCheckouts:
             'a degraded status read must fail-safe RE-PIN, never detach'
         )
         assert pool.state(canon) == LaneState.ASSIGNED
+
+    async def test_terminal_status_detaches_and_reattach_elsewhere_succeeds(
+        self, tmp_path: Path,
+    ):
+        """TERMINAL status (e.g. 'done') -> DETACH (never re-pin); a fresh
+        acquire lands on a different free lane and reattaches the branch —
+        no 'already used by worktree' collision, WIP commit preserved."""
+        from orchestrator.git_ops import _run as git_run
+        from orchestrator.git_ops import WorktreeInfo
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'done'}, None),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for('3965') is None, (
+            'a terminal status must NOT be re-pinned'
+        )
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc != 0, 'terminal checkout must be detached'
+
+        rc, _, _ = await git_run(
+            ['git', 'rev-parse', '--verify', 'task/3965'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'task/3965 branch must survive the detach'
+
+        result = await git_ops.acquire_warm_lane('3965', 'main')
+        assert isinstance(result, WorktreeInfo), (
+            f'expected a reattach WorktreeInfo onto a fresh lane, got {result!r}'
+        )
+
+        rc, out, _ = await git_run(
+            ['git', 'rev-list', '--count', 'main..task/3965'], cwd=git_ops.project_root,
+        )
+        assert rc == 0 and int(out.strip()) > 0, (
+            'the pre-existing WIP commit on task/3965 must survive the reattach'
+        )
+
+    async def test_deleted_id_absent_from_healthy_read_detaches(
+        self, tmp_path: Path,
+    ):
+        """A HEALTHY status read that OMITS the id entirely (task deleted) ->
+        DETACH, same as a terminal status; a fresh acquire does not collide."""
+        from orchestrator.git_ops import _run as git_run
+        from orchestrator.git_ops import WorktreeInfo
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'999': 'pending'}, None),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for('3965') is None, (
+            'an id absent from a healthy read must NOT be re-pinned'
+        )
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc != 0, 'deleted-id checkout must be detached'
+
+        result = await git_ops.acquire_warm_lane('3965', 'main')
+        assert isinstance(result, WorktreeInfo), (
+            f'expected a reattach WorktreeInfo onto a fresh lane, got {result!r}'
+        )
