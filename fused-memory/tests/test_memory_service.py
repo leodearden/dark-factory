@@ -2050,23 +2050,35 @@ class TestGetEntity:
         assert result['nodes'][1]['uuid'] == 'u-2'
 
     @pytest.mark.asyncio
-    async def test_exact_match_edges_come_from_fuzzy_search(self, service):
-        """Edges are still sourced from the fuzzy fact search even on an exact node hit."""
+    async def test_exact_match_edges_come_from_resolved_node_uuid(self, service):
+        """On an exact node hit, edges come from the resolved node's uuid via
+        get_valid_edges_for_node — NOT from a semantic graphiti.search() fact
+        search, which can return edges belonging to unrelated nodes.
+        """
         from _fm_helpers import MockEdge
 
-        dt = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
         service.graphiti.get_nodes_by_exact_name = AsyncMock(
-            return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
+            return_value=[{'uuid': 'u-138', 'name': 'Task 138', 'summary': 's', 'labels': []}]
         )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            return_value=[
+                {'uuid': 'e-own', 'fact': 'Task 138 depends on Task 5', 'name': 'DEPENDS_ON'}
+            ]
+        )
+        # Decoy: if the (buggy) semantic search were still consulted, this
+        # unrelated edge would leak into the result.
         service.graphiti.search = AsyncMock(
-            return_value=[MockEdge(fact='F', uuid='e-1', valid_at=dt, invalid_at=None)]
+            return_value=[MockEdge(fact='Task 68 depends on Task 12', uuid='e-wrong-68')]
         )
 
-        result = await service.get_entity('Task 115', project_id='test')
+        result = await service.get_entity('Task 138', project_id='test')
 
-        assert result['edges'][0]['fact'] == 'F'
-        assert result['edges'][0]['temporal']['valid_at'] == dt.isoformat()
-        assert result['edges'][0]['temporal']['invalid_at'] is None
+        assert len(result['edges']) == 1
+        assert result['edges'][0]['uuid'] == 'e-own'
+        assert result['edges'][0]['fact'] == 'Task 138 depends on Task 5'
+        assert all(e['uuid'] != 'e-wrong-68' for e in result['edges'])
+        service.graphiti.get_valid_edges_for_node.assert_awaited_once_with('u-138', group_id='test')
+        service.graphiti.search.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_exact_match_labels_default_empty(self, service):
