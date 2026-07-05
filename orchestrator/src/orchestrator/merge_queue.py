@@ -4943,6 +4943,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if _item is not None and _item.speculative
             )
             + sum(
+                # Unlike the _verifier_queue._queue scan above (which can
+                # hold a real ``None`` stop-sentinel), _redispatch never
+                # holds None — both parking sites only ever append a
+                # RealMergeItem. The `is not None` guard here is kept solely
+                # for scan-shape parity with that comprehension, not because
+                # _redispatch has a None case to handle.
                 1 for _item in self._redispatch
                 if _item is not None and _item.speculative
             )

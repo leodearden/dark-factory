@@ -4333,10 +4333,41 @@ class TestRedispatchSpeculativeConservation:
 
             # Sample the audit at several heartbeat-observable points while
             # the speculative item sits parked (the multi-heartbeat window
-            # the original false positive persisted across).
-            worker._maybe_log_queue_heartbeat(1_000_000.0)
-            worker._maybe_log_queue_heartbeat(1_000_100.0)
-            worker._maybe_log_queue_heartbeat(1_000_200.0)
+            # the original false positive persisted across). Check the
+            # recorded_violations delta AROUND EACH INDIVIDUAL call (rather
+            # than leaning on the blanket non-empty check further below,
+            # which the explicit speculation_accounting_violations() call a
+            # few lines down would satisfy all on its own) so the test
+            # proves _maybe_log_queue_heartbeat itself drives the audit
+            # (via _check_resource_audit and snapshot()'s own
+            # resource_audit key) on every one of these calls while B is
+            # parked — not merely that *some* call somewhere recorded a
+            # sample. Asserts a non-empty delta rather than a hardcoded
+            # multiplier: the exact number of speculation_accounting_
+            # violations() calls per heartbeat (currently 2 — once via
+            # _check_resource_audit, once via snapshot()'s resource_audit
+            # key) is an incidental implementation detail, not the contract
+            # under test.
+            heartbeat_samples: list[list[str]] = []
+            for heartbeat_ts in (1_000_000.0, 1_000_100.0, 1_000_200.0):
+                _pre_count = len(recorded_violations)
+                worker._maybe_log_queue_heartbeat(heartbeat_ts)
+                _new_samples = recorded_violations[_pre_count:]
+                assert _new_samples, (
+                    f'expected _maybe_log_queue_heartbeat({heartbeat_ts}) to '
+                    f'invoke speculation_accounting_violations at least once '
+                    f'via _check_resource_audit — proves the audit genuinely '
+                    f'runs on the heartbeat path itself while B is parked, '
+                    f'not just via the explicit call below; got no new '
+                    f'recorded samples'
+                )
+                heartbeat_samples.extend(_new_samples)
+            assert all(v == [] for v in heartbeat_samples), (
+                f'speculation-slot identity must hold on every '
+                f'heartbeat-triggered audit call while the speculative item '
+                f'is parked on _redispatch; got {heartbeat_samples!r}'
+            )
+
             assert worker.speculation_accounting_violations() == [], (
                 'speculation-slot identity must hold while the speculative '
                 'item is parked on _redispatch'
@@ -4349,7 +4380,17 @@ class TestRedispatchSpeculativeConservation:
             outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
             outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
 
+            # Same source-specific proof for the post-resolution heartbeat.
+            _pre_final_heartbeat_samples = len(recorded_violations)
             worker._maybe_log_queue_heartbeat(1_000_300.0)
+            final_heartbeat_samples = recorded_violations[_pre_final_heartbeat_samples:]
+            assert final_heartbeat_samples and all(
+                v == [] for v in final_heartbeat_samples
+            ), (
+                f'expected the post-resolution heartbeat call to invoke the '
+                f'audit at least once and find it clean; got '
+                f'{final_heartbeat_samples!r}'
+            )
 
             await worker.stop()
 
