@@ -1954,7 +1954,10 @@ async def _track_flag_persistence(
     Note: markers accumulate monotonically (same pattern as ``stage1_flag_marker``
     in ``flag_dedup.py``).  FIX C's prompt-driven deletion ensures healthy flags
     never reach threshold; the monotonic growth is bounded to failure cases.
-    Manual GC is acceptable — see design decision in plan.json.
+    Automated age-based GC is performed each cycle by
+    :func:`_sweep_stale_persistence_markers` (see ``TaskKnowledgeSync.run()``),
+    which deletes markers older than ``STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS``
+    (task 2095).
 
     Note (task 1256): this function receives only *surviving_ids* — flags whose
     ``metadata.run_id`` differs from the active run are partitioned out by
@@ -2474,6 +2477,20 @@ class TaskKnowledgeSync(BaseStage):
             run_window_start=getattr(self, '_run_window_start', None),
         )
         report.stats['stale_flag_markers_gc_swept'] = gc_swept
+
+        # --- stage2_persistence_marker age-based GC (task 2095) ---
+        # The stage2_persistence_marker pool is written by _track_flag_persistence
+        # (Channel 3: persistence-counter markers, distinct from stage1_flag_marker
+        # above and from the flag_for_stage2 relay swept elsewhere). Runs
+        # unconditionally on both full and remediation paths so the pool is
+        # bounded every cycle. Explicit zero so downstream consumers never need
+        # a .get(..., 0) fallback. No run_window_start is forwarded: unlike
+        # _sweep_stale_flag_markers, this sweep is age-only and has no
+        # cross-cycle fp: content-fingerprint predicate to gate (task 2095 design).
+        persistence_gc_swept = await _sweep_stale_persistence_markers(
+            self.memory, self.project_id, run_id,
+        )
+        report.stats['stale_persistence_markers_gc_swept'] = persistence_gc_swept
 
         return report
 
