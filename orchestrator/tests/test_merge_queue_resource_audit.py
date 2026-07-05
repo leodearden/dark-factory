@@ -434,6 +434,89 @@ class TestFinalizeHeadSpeculativeAccounting:
 
 
 # ---------------------------------------------------------------------------
+# task 2096: dispatch-gap (in-dispatch item) speculative permit accounting
+#
+# _verifier_loop's DISPATCH-FILL pops an item off _redispatch/_verifier_queue
+# then `entry = await self._dispatch_item(item)` — the item is off the queue
+# but not yet appended to _inflight during that await (host-acquisition git
+# calls, in-dispatch speculative-remerge). A speculative item's `.speculative`
+# is stable across this await (Mechanism-2's chain-remerge is skipped for
+# speculative items), so the gap is countable. Post-fix, self._dispatching_item
+# (set immediately before the await, cleared in a bulletproof finally) closes
+# this census gap the same way self._finalizing_head closed the finalize-head
+# gap above.
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchGapSpeculativeAccounting:
+    """Unit tests for the task-2096 dispatch-gap (_dispatching_item) fix.
+
+    RED pre-fix: self._dispatching_item is not yet an attribute
+    _inflight_speculative_count() scans (it does not exist on the worker at
+    all until step-4's __init__ change), so a drained permit "in dispatch"
+    reads as a conservation violation. Tests set it via ad-hoc attribute
+    assignment (mirroring how TestFinalizeHeadSpeculativeAccounting sets
+    worker._finalizing_head above) — this works pre-fix because Python
+    allows setting a new instance attribute even before __init__ declares it;
+    the count just doesn't look at it yet.
+    """
+
+    def test_dispatching_item_alone_counted(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=1)
+
+        # Drain the single speculation permit; the in-dispatch item is the
+        # ONLY place a speculative item can be during the dispatch-gap.
+        worker._speculation_slot._value = 0
+        worker._dispatching_item = _make_spec_item(tmp_path, speculative=True)  # type: ignore[attr-defined]
+
+        assert worker._inflight_speculative_count() == 1
+        assert worker.speculation_accounting_violations() == []
+        assert worker.snapshot()['speculation']['inflight_speculative'] == 1
+
+    def test_dispatching_item_plus_inflight_both_counted(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import InflightEntry, SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        # Drain both permits: one is in-dispatch, one is already in _inflight.
+        worker._speculation_slot._value = 0
+        worker._dispatching_item = _make_spec_item(tmp_path, speculative=True)  # type: ignore[attr-defined]
+        worker._inflight.append(InflightEntry(
+            item=_make_spec_item(tmp_path, speculative=True),
+            lease=None,
+            verify_task=None,
+            merge_wt=None,
+            was_speculative=True,
+            phase='verifying',
+        ))
+
+        assert worker._inflight_speculative_count() == 2
+        assert worker.speculation_accounting_violations() == []
+        assert worker.snapshot()['resource_audit']['speculation_accounting'] == []
+
+    def test_nonspeculative_dispatching_item_not_counted(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        """A non-speculative in-dispatch item contributes 0 — else the fix
+        would over-count and could mask a genuine imbalance.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        worker._dispatching_item = _make_spec_item(tmp_path, speculative=False)  # type: ignore[attr-defined]
+
+        assert worker._inflight_speculative_count() == 0
+        assert worker.speculation_accounting_violations() == []
+
+
+# ---------------------------------------------------------------------------
 # step-3 RED / step-4 GREEN: worktree_ledger_violations()
 # ---------------------------------------------------------------------------
 
