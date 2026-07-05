@@ -154,3 +154,102 @@ class TestSweepDegenerateTaskNodesCore:
         assert stats == {'scanned': 2, 'degenerate': 1, 'deleted': 1, 'errors': 0}, (
             f'Expected exactly the degenerate node counted+deleted, got stats={stats!r}'
         )
+
+
+# --------------------------------------------------------------------------- #
+# sweep_degenerate_task_nodes — best-effort resilience / edge cases
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepDegenerateTaskNodesBestEffort:
+    """A transient backend error scanning or deleting one task id/name must not
+    abort the sweep for the remaining ids — it is tallied into stats['errors']
+    and the loop continues (mirrors MemoryService._dedup_episode_nodes)."""
+
+    @pytest.mark.asyncio
+    async def test_delete_failure_is_swallowed_and_second_delete_still_attempted(self):
+        """delete_entity_node raises for the first degenerate node; the second
+        degenerate node's delete is still attempted; both count as scanned+degenerate,
+        but only the successful one counts as deleted, and the failure counts as an error."""
+        memory_service = _make_memory_service()
+
+        async def fake_find(name, *, group_id):
+            if name == 'tasks 142':
+                return [{'uuid': 'node-142', 'created_at': 100, 'edge_count': 0}]
+            if name == 'tasks 144':
+                return [{'uuid': 'node-144', 'created_at': 100, 'edge_count': 0}]
+            return []
+
+        memory_service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find)
+        memory_service.graphiti.delete_entity_node = AsyncMock(
+            side_effect=[RuntimeError('lock contention'), None],
+        )
+
+        stats = await sweep_degenerate_task_nodes(memory_service, 'test_project', ['142', '144'])
+
+        assert memory_service.graphiti.delete_entity_node.await_count == 2, (
+            'The second degenerate node must still be attempted after the first delete fails'
+        )
+        assert stats == {'scanned': 2, 'degenerate': 2, 'deleted': 1, 'errors': 1}, (
+            f'Expected the failed delete tallied as an error without blocking the second, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_find_failure_for_one_task_id_does_not_block_next_task_id(self):
+        """find_duplicate_entity_nodes raises for the first task id; the second
+        task id is still looked up and its degenerate node still deleted."""
+        memory_service = _make_memory_service()
+
+        async def fake_find(name, *, group_id):
+            if name == 'tasks 142':
+                raise RuntimeError('transient read timeout')
+            if name == 'tasks 148':
+                return [{'uuid': 'node-148', 'created_at': 100, 'edge_count': 0}]
+            return []
+
+        memory_service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find)
+
+        stats = await sweep_degenerate_task_nodes(memory_service, 'test_project', ['142', '148'])
+
+        assert memory_service.graphiti.find_duplicate_entity_nodes.await_count == 2, (
+            'Both task ids must be looked up even though the first raised'
+        )
+        memory_service.graphiti.delete_entity_node.assert_awaited_once_with(
+            'node-148', group_id='test_project',
+        )
+        assert stats == {'scanned': 1, 'degenerate': 1, 'deleted': 1, 'errors': 1}, (
+            f'Expected the find failure tallied as an error and the second id still processed, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_task_ids_yields_all_zero_stats_with_no_graphiti_calls(self):
+        """Empty task_ids -> all-zero stats; neither graphiti method is awaited."""
+        memory_service = _make_memory_service()
+
+        stats = await sweep_degenerate_task_nodes(memory_service, 'test_project', [])
+
+        assert stats == {'scanned': 0, 'degenerate': 0, 'deleted': 0, 'errors': 0}
+        memory_service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
+        memory_service.graphiti.delete_entity_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_matches_and_all_healthy_matches_both_yield_zero_deletions(self):
+        """A name with no matches and a name with only healthy (edge_count>0)
+        matches both contribute zero degenerate/deleted counts."""
+        memory_service = _make_memory_service()
+
+        async def fake_find(name, *, group_id):
+            if name == 'tasks 150':
+                return []
+            if name == 'tasks 160':
+                return [{'uuid': 'node-160', 'created_at': 100, 'edge_count': 5}]
+            return []
+
+        memory_service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find)
+
+        stats = await sweep_degenerate_task_nodes(memory_service, 'test_project', ['150', '160'])
+
+        memory_service.graphiti.delete_entity_node.assert_not_awaited()
+        assert stats == {'scanned': 1, 'degenerate': 0, 'deleted': 0, 'errors': 0}, (
+            f'Expected only the healthy node scanned and nothing deleted, got {stats!r}'
+        )
