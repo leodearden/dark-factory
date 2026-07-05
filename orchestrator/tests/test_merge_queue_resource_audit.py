@@ -196,6 +196,111 @@ class TestSpeculationAccountingViolations:
 
 
 # ---------------------------------------------------------------------------
+# task 2063: _redispatch-parked speculative permit accounting
+#
+# _inflight_speculative_count() is the single source of truth feeding both
+# snapshot()['speculation']['inflight_speculative'] and
+# speculation_accounting_violations(). Before the fix it scanned only
+# self._inflight (was_speculative) and self._verifier_queue (.speculative),
+# missing a speculative item parked on self._redispatch while it waits for a
+# free verify host (DISPATCH-FILL / blocking-get paths in _verifier_loop when
+# _dispatch_item returns None because verify hosts < speculation_depth). That
+# gap produced the observed multi-heartbeat, self-clearing skew:
+# 'slot_available(0) + held_by_merger(0) + inflight_speculative(1) == 1,
+# expected depth=2' — one speculative permit countable in _verifier_queue,
+# one uncounted on _redispatch.
+# ---------------------------------------------------------------------------
+
+
+def _make_spec_item(tmp_path: Path, *, speculative: bool):
+    """Build a minimal RealMergeItem for _inflight_speculative_count() tests.
+
+    Post task-o: SpeculativeItem is a TypeAlias = RealMergeItem | DecidedItem,
+    not a constructor — build the REAL arm directly. RealMergeItem has no
+    __post_init__ and the counter under test reads only ``.speculative``, so
+    a bare MagicMock request is fine here (no real asyncio.Future needed,
+    unlike test_merge_speculation.py's fuller _make_spec_item which drives
+    _run_inflight_verify).
+    """
+    from orchestrator.merge_types import RealMergeItem
+
+    return RealMergeItem(
+        request=MagicMock(),
+        merge_result=MagicMock(merge_commit='deadbeef01234567890a'),
+        merge_wt=tmp_path / '_merge-x',
+        base_sha='aabbccdd00000000aaaa',
+        speculative=speculative,
+    )
+
+
+class TestRedispatchSpeculativeAccounting:
+    """Unit tests for the task-2063 _redispatch under-count fix.
+
+    RED pre-fix: a speculative item parked on _redispatch is invisible to
+    _inflight_speculative_count(), so the count comes up one short and
+    speculation_accounting_violations() reports a spurious conservation
+    violation. GREEN post-fix: the count includes it and the identity holds.
+    """
+
+    def test_speculative_item_parked_on_redispatch_is_counted(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        # Drain both speculation permits: slot_available=0, held_by_merger=0
+        # on a bare worker (nothing else touches the semaphore).
+        worker._speculation_slot._value = 0
+
+        # One speculative permit is countable via the existing
+        # _verifier_queue scan...
+        worker._verifier_queue.put_nowait(_make_spec_item(tmp_path, speculative=True))
+        # ...and one is parked on _redispatch awaiting a free host — the gap
+        # this task closes.
+        worker._redispatch.append(_make_spec_item(tmp_path, speculative=True))
+
+        assert worker._inflight_speculative_count() == 2
+        assert worker.speculation_accounting_violations() == []
+        assert worker.snapshot()['resource_audit']['speculation_accounting'] == []
+
+    def test_redispatch_undercount_produces_the_observed_violation_message(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        # Same drain, but ONLY the verifier-queue item is present: a genuine
+        # 1-permit-vs-2-drained imbalance that holds both pre- and post-fix —
+        # pins the identity/message semantics of the exact skew being closed.
+        worker._speculation_slot._value = 0
+        worker._verifier_queue.put_nowait(_make_spec_item(tmp_path, speculative=True))
+
+        violations = worker.speculation_accounting_violations()
+
+        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
+        assert 'speculation-slot conservation violated' in violations[0]
+        assert 'expected depth=2' in violations[0]
+
+    def test_nonspeculative_redispatch_item_not_counted(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        # A cascade-remerged item parked on _redispatch is non-speculative
+        # (_remerge returns speculative=False; its slot was already released
+        # before remerge) and must never be counted — else the fix would
+        # over-count and could mask a genuine imbalance.
+        worker._redispatch.append(_make_spec_item(tmp_path, speculative=False))
+
+        assert worker._inflight_speculative_count() == 0
+        assert worker.speculation_accounting_violations() == []
+
+
+# ---------------------------------------------------------------------------
 # step-3 RED / step-4 GREEN: worktree_ledger_violations()
 # ---------------------------------------------------------------------------
 
