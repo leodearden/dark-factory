@@ -6894,6 +6894,175 @@ class TestSweepTerminalTaskFlagMarkers:
         assert result == 2
         assert taskmaster.get_task.await_count == 1
 
+    @pytest.mark.asyncio
+    async def test_comma_joined_all_components_terminal_deleted(self):
+        """A comma-joined marker ('12,15') is deleted when EVERY component
+        task resolves to a terminal status."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'multi-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,15', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _get_task(task_id, project_root):
+            return {'12': {'status': 'done'}, '15': {'status': 'cancelled'}}[task_id]
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 1
+        memory_service.delete_memory.assert_awaited_once()
+        assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'multi-marker'
+        assert taskmaster.get_task.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_mixed_status_kept(self):
+        """A comma-joined marker with one terminal and one live component
+        must be KEPT — a still-live component means the finding may remain
+        relevant."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'multi-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,15', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _get_task(task_id, project_root):
+            return {'12': {'status': 'done'}, '15': {'status': 'pending'}}[task_id]
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_component_get_task_raises_kept_fail_safe(self):
+        """A comma-joined marker where one component's get_task call raises
+        must be KEPT (fail-safe) — the errored component resolves to
+        'unknown', which is never in TERMINAL_STATUSES."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'multi-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,15', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _get_task(task_id, project_root):
+            if task_id == '15':
+                raise RuntimeError('taskmaster down')
+            return {'status': 'done'}
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_degenerate_component_handled_without_raising(self):
+        """A degenerate comma-joined task_id ('12,' — a trailing comma
+        yielding an empty component) must not raise. It is rejected by
+        _is_valid_marker_task_id (mirrors flag_dedup's own trailing-comma
+        rejection), so the marker is treated as an invalid task reference:
+        skipped entirely, no get_task call, KEPT."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'degenerate-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_shared_component_dedup_across_markers(self):
+        """Overlapping components across two comma-joined markers ('12,15'
+        and '15,20') must resolve the shared '15' via a SINGLE get_task
+        call — the distinct-component cache applies across markers, not just
+        within one marker's component list."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'marker-a',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,15', 'flag_type': 'x'},
+            },
+            {
+                'id': 'marker-b',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '15,20', 'flag_type': 'y'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 2
+        assert taskmaster.get_task.await_count == 3
+
 
 class TestSweepStalePersistenceMarkers:
     """_sweep_stale_persistence_markers age-GCs stage2_persistence_marker Mem0 records.
