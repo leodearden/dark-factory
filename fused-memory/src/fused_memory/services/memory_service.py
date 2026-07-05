@@ -1506,11 +1506,14 @@ class MemoryService:
         graphiti.get_nodes_by_exact_name): canonical labels like "Task 115" resolve to
         the exact node instead of scattering across fuzzy neighbours. On an exact hit,
         fuzzy node search (search_nodes) is skipped entirely, and edges are fetched
-        from the resolved node's uuid via graphiti.get_valid_edges_for_node (a uuid
+        from each resolved node's uuid via graphiti.get_valid_edges_for_node (a uuid
         traversal) instead of a semantic fact search — this keeps edges consistent
-        with the resolved node rather than scattering across unrelated nodes that
-        happen to be textually similar. Only the fuzzy fallback below uses the
-        semantic edge search. On no exact match, falls back to the fuzzy gather path.
+        with the resolved node(s) rather than scattering across unrelated nodes that
+        happen to be textually similar. When multiple nodes share the exact name
+        (duplicate-name pathology), edges are fetched for every matched uuid and
+        unioned, deduped by edge uuid, so `edges` stays consistent with the full
+        `nodes` array. Only the fuzzy fallback below uses the semantic edge search.
+        On no exact match, falls back to the fuzzy gather path.
 
         Both Graphiti calls in the fuzzy fallback run concurrently via
         asyncio.gather(return_exceptions=True). This ensures neither call becomes an
@@ -1540,8 +1543,23 @@ class MemoryService:
         # its 0/1/many result decides whether the fuzzy gather runs at all.
         exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
         if exact:
-            node_uuid = exact[0].get('uuid')
-            edges = await self.graphiti.get_valid_edges_for_node(node_uuid, group_id=project_id)
+            uuids = [n.get('uuid') for n in exact if n.get('uuid')]
+            edge_lists = await asyncio.gather(
+                *(self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids)
+            )
+            # Duplicate-name matches each contribute their own edges; dedup by
+            # edge uuid so `edges` stays consistent with the (possibly
+            # multi-node) `nodes` array instead of double-counting shared edges.
+            seen: set = set()
+            edges = []
+            for edge_list in edge_lists:
+                for e in edge_list:
+                    edge_uuid = e.get('uuid')
+                    if edge_uuid is not None:
+                        if edge_uuid in seen:
+                            continue
+                        seen.add(edge_uuid)
+                    edges.append(e)
             node_data = [_node_to_dict(n) for n in exact]
             edge_data = [_edge_to_dict(e) for e in edges]
             return {'nodes': node_data, 'edges': edge_data}
