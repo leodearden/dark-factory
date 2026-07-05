@@ -2334,6 +2334,20 @@ class GitOps:
         full_branch = f'{self.config.branch_prefix}{branch_name}'
 
         try:
+            # ── Orphaned-lane reuse guard (task 2097) ───────────────────────
+            # The reuse path (_reuse_warm_lane -> commit()) and the identity-
+            # MISMATCH _reset_warm_lane call both assume a mapped lane is a
+            # valid registered worktree. A lane whose dir + .git pointer
+            # survive but whose .git/worktrees/<name> admin dir was pruned
+            # (mount-down startup window) is NOT registered and hard-faults
+            # ('not a git repository'). Drop the stale assignment and demote
+            # to the create-once self-heal/reattach path so the committed
+            # work (alpha-retention, task 1912) is recovered — never FAULT a
+            # healable orphan.
+            if reused and not await self._is_registered_worktree(lane):
+                self.warm_lane_pool.drop_assignment(branch_name)
+                reused = False
+
             if reused:
                 # ── Reuse path: live requeue of same task on same lane ────
                 # Identity guard: if expected_title is set, verify the stored
