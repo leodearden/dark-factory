@@ -2114,6 +2114,60 @@ class TestGetEntity:
         service.graphiti.get_valid_edges_for_node.assert_any_await('u-2', group_id='test')
         assert service.graphiti.get_valid_edges_for_node.await_count == 2
 
+    # ------------------------------------------------------------------
+    # exact-match edge fetch failure — mirrors the fuzzy fallback's two-tier
+    # gather(return_exceptions=True) discipline (task 2102 amendment)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_exact_match_edge_fetch_failure_raises_and_settles_siblings(self, service):
+        """When one concurrent get_valid_edges_for_node call fails, the exception
+        propagates AND the sibling call still settles (return_exceptions=True)
+        rather than being left running as an orphaned background task — the same
+        discipline the fuzzy fallback already has (see
+        test_both_failures_raises_first_exception / test_both_failures_emits_two_warnings).
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[
+            {'uuid': 'u-1', 'name': 'Alice', 'summary': 's1', 'labels': []},
+            {'uuid': 'u-2', 'name': 'Alice', 'summary': 's2', 'labels': []},
+        ])
+
+        async def fake_edges(node_uuid, *, group_id):
+            if node_uuid == 'u-1':
+                raise RuntimeError('u-1 failed')
+            return [{'uuid': 'e-b', 'fact': 'B', 'name': 'z'}]
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=fake_edges)
+
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(RuntimeError, match='u-1 failed'):
+            await service.get_entity('Alice', project_id='test')
+
+        # Both coroutines settled under gather(return_exceptions=True) even
+        # though one raised — no orphaned background task for 'u-2'.
+        assert service.graphiti.get_valid_edges_for_node.await_count == 2
+        assert mock_logger.warning.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_exact_match_edge_fetch_cancelled_error_propagates(self, service):
+        """asyncio.CancelledError from get_valid_edges_for_node must propagate
+        unchanged and must NOT be logged via the isinstance(r, Exception) guard —
+        same structured-concurrency precedence as the fuzzy fallback's
+        test_cancelled_error_propagates.
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=[{'uuid': 'u-138', 'name': 'Task 138', 'summary': 's', 'labels': []}]
+        )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+
+        with patch('fused_memory.services.memory_service.logger') as mock_logger, \
+             pytest.raises(asyncio.CancelledError):
+            await service.get_entity('Task 138', project_id='test')
+
+        assert mock_logger.warning.call_count == 0
+
     @pytest.mark.asyncio
     async def test_exact_match_labels_default_empty(self, service):
         """An exact node dict with no/None labels yields labels == [] in the result."""
@@ -2177,6 +2231,22 @@ class TestEdgeToDict:
         """
         result = memory_service._edge_to_dict({'uuid': 'e-1', 'fact': 'F', 'name': 'N'})
         assert result == {'uuid': 'e-1', 'fact': 'F', 'temporal': None}
+
+    def test_edge_to_dict_dict_shape_with_temporal_serializes(self):
+        """A dict input that DOES carry valid_at/invalid_at still serializes them via
+        _serialize_temporal, locking in the docstring's forward-compatibility claim
+        that the dict branch stays correct if EdgeDict is later enriched with
+        temporal fields.
+        """
+        dt_valid = datetime(2024, 3, 1, 10, 0, 0, tzinfo=UTC)
+        result = memory_service._edge_to_dict(
+            {'uuid': 'e-1', 'fact': 'F', 'valid_at': dt_valid, 'invalid_at': None}
+        )
+        assert result == {
+            'uuid': 'e-1',
+            'fact': 'F',
+            'temporal': {'valid_at': '2024-03-01T10:00:00+00:00', 'invalid_at': None},
+        }
 
 
 class TestSerializeTemporal:
