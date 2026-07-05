@@ -920,6 +920,43 @@ class GitOps:
                 return True
         return False
 
+    async def _repair_orphaned_reuse_lane(self, lane: Path, branch_name: str) -> bool:
+        """Attempt in-place recovery of a REUSE lane whose worktree registration
+        was lost (task 2097).
+
+        Runs ``git worktree repair <lane>`` from ``project_root`` (cheapest
+        recovery — restores a stale/broken registration WITHOUT touching
+        ``.task/plan.json`` or uncommitted WIP) and re-checks registration.
+
+        Returns:
+            True when the lane is a registered worktree afterwards (safe to
+            proceed with the normal reuse path); False when the caller must
+            drop the assignment and fall through to the create-once
+            self-heal/reattach path.
+
+        NOTE: cannot reconstruct a fully-deleted ``.git/worktrees/<name>``
+        admin dir (``git worktree prune`` wipe) — returns False there, and
+        reattach recovers the committed work instead.
+        """
+        if not lane.exists():
+            return False
+        rc, _, err = await _run(
+            ['git', 'worktree', 'repair', str(lane)], cwd=self.project_root,
+        )
+        if rc == 0 and await self._is_registered_worktree(lane):
+            logger.info(
+                'acquire_warm_lane: repaired orphaned reuse lane %s in place '
+                '(registration restored; .task/ + WIP preserved)', lane,
+            )
+            return True
+        logger.warning(
+            'acquire_warm_lane: git worktree repair could not restore lane %s '
+            'for branch %s (rc=%d: %s) — dropping assignment, routing to '
+            'create-once reattach',
+            lane, branch_name, rc, err.strip(),
+        )
+        return False
+
     async def _freshen_main(self) -> tuple[str, int | None]:
         """Fetch from remote and return the freshest ref to use as worktree base.
 
@@ -2339,14 +2376,18 @@ class GitOps:
             # MISMATCH _reset_warm_lane call both assume a mapped lane is a
             # valid registered worktree. A lane whose dir + .git pointer
             # survive but whose .git/worktrees/<name> admin dir was pruned
-            # (mount-down startup window) is NOT registered and hard-faults
-            # ('not a git repository'). Drop the stale assignment and demote
-            # to the create-once self-heal/reattach path so the committed
-            # work (alpha-retention, task 1912) is recovered — never FAULT a
-            # healable orphan.
+            # (mount-down startup window) or corrupted (stale gitdir pointer)
+            # is NOT registered and hard-faults ('not a git repository').
+            # Try the cheapest recovery first — an in-place `git worktree
+            # repair` — and only demote to the create-once self-heal/reattach
+            # path (which recovers the committed work via alpha-retention,
+            # task 1912) when repair cannot restore the registration. Never
+            # FAULT a healable orphan.
             if reused and not await self._is_registered_worktree(lane):
-                self.warm_lane_pool.drop_assignment(branch_name)
-                reused = False
+                if not await self._repair_orphaned_reuse_lane(lane, branch_name):
+                    self.warm_lane_pool.drop_assignment(branch_name)
+                    reused = False
+                # else: registration restored in place — proceed as reused
 
             if reused:
                 # ── Reuse path: live requeue of same task on same lane ────
