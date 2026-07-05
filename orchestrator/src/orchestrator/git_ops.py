@@ -912,6 +912,21 @@ class GitOps:
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
 
+    def pool_in_use(self) -> bool:
+        """True iff a warm or spec lane pool is configured on this host (task 2099).
+
+        ``pool_storage_present()``'s only writer (:meth:`_seed_warm_lane` on
+        ``rc == 0``) never runs unless a pool is configured, so on a
+        pool-less host (``warm_lane_pool=False`` and
+        ``merge_spec_warm_lane_pool=False``, the default) ``.pool-root`` is
+        NEVER written and ``pool_storage_present()`` is permanently False by
+        design — not because a mount went down. The destructive-sweep guards
+        gate on ``pool_in_use() and not pool_storage_present()`` rather than
+        ``not pool_storage_present()`` alone so that a pool-less host is
+        never mistaken for a mount-down incident.
+        """
+        return self.warm_lane_pool is not None or self.spec_warm_lane_pool is not None
+
     def pool_storage_present(self) -> bool:
         """True iff worktree_base is backed by live pool storage (task 2099).
 
@@ -2015,10 +2030,15 @@ class GitOps:
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
 
         **Pool-storage guard (task 2099)**: refuses to spawn the script when
-        :meth:`pool_storage_present` is False — an unmounted mountpoint must
-        never let the GC script reclaim/reset lanes it can only see as
-        missing.  Returns the same 127 fail-soft sentinel used for an absent
-        script, so callers treat it identically to 'nothing reclaimed'.
+        a pool is configured (:meth:`pool_in_use`) but :meth:`pool_storage_present`
+        is False — an unmounted mountpoint must never let the GC script
+        reclaim/reset lanes it can only see as missing.  Skipped entirely
+        when no pool is in use: ``pool_storage_present()`` is permanently
+        False on a pool-less host (its only writer never runs without a
+        pool), so that alone must never be treated as a mount-down
+        incident.  Returns the same 127 fail-soft sentinel used for an
+        absent script, so callers treat it identically to 'nothing
+        reclaimed'.
 
         Returns:
             0   — reclaim succeeded.
@@ -2026,7 +2046,7 @@ class GitOps:
                 sentinel).
             other non-zero — reclaim script error (caller still re-checks).
         """
-        if not self.pool_storage_present():
+        if self.pool_in_use() and not self.pool_storage_present():
             logger.warning(
                 '_run_warm_lane_gc_reclaim: pool storage absent/unmounted at '
                 '%s — refusing to spawn warm-lane-gc.sh reclaim',
@@ -6578,14 +6598,18 @@ class GitOps:
         worktrees removed off-band (manual ``rm -rf``, quarantine, reap).
         Never raises.
 
-        **Pool-storage guard (task 2099)**: refuses to run when
-        :meth:`pool_storage_present` is False.  An unmounted mountpoint dir
-        makes every mount-resident worktree APPEAR removed off-band, so an
-        unguarded prune would wipe every registered lane + ``_merge-verify``
-        admin entry the instant the mount comes back — exactly the Jul-3
-        incident this guards against.
+        **Pool-storage guard (task 2099)**: refuses to run when a pool is
+        configured (:meth:`pool_in_use`) but :meth:`pool_storage_present` is
+        False.  An unmounted mountpoint dir makes every mount-resident
+        worktree APPEAR removed off-band, so an unguarded prune would wipe
+        every registered lane + ``_merge-verify`` admin entry the instant
+        the mount comes back — exactly the Jul-3 incident this guards
+        against.  Skipped entirely when no pool is in use:
+        ``pool_storage_present()`` is permanently False on a pool-less host
+        (its only writer never runs without a pool), so that alone must
+        never disable ``git worktree prune`` on every default host.
         """
-        if not self.pool_storage_present():
+        if self.pool_in_use() and not self.pool_storage_present():
             logger.warning(
                 'prune_worktrees: pool storage absent/unmounted at %s — '
                 'refusing to run `git worktree prune` (would wipe '
