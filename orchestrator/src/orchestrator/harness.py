@@ -1372,6 +1372,13 @@ class Harness:
             # 2c. Recover crashed tasks from surviving worktrees
             await self._recover_crashed_tasks()
 
+            # 2c2. Reconcile stale branch checkouts left behind by recovery's
+            # skip branches (identity-guard defer, no-plan/corrupt-plan
+            # release) — runs while scheduler._dispatched is still empty, so
+            # it only repairs what _recover_crashed_tasks skipped and never
+            # races a live dispatch.
+            await self._reconcile_lane_checkouts()
+
             # 2d. Reconcile stranded in-progress tasks (live-claimant-aware)
             await self._reconcile_stranded_in_progress()
 
@@ -2163,6 +2170,80 @@ Output JSON matching the schema. Every task must appear in the output.
                 f'Crash recovery: {recovered} plans recovered, '
                 f'{cleaned} worktrees cleaned'
             )
+
+    async def _reconcile_lane_checkouts(self) -> None:
+        """Reconcile stale `task/<id>` branch checkouts left behind by recovery.
+
+        ``_recover_crashed_tasks`` re-pins ``id -> lane`` via
+        ``pool.restore_assignment`` for every worktree it can positively
+        identify, so re-dispatch takes the REUSE path and issues no fresh
+        ``git worktree add``.  But several of its branches SKIP restore while
+        leaving the git-admin checkout intact (the identity-guard defer on a
+        transient ``scheduler.get_task() is None``; the no-plan/corrupt-plan/
+        no-task-id release branches whose best-effort detach can fail under
+        git-admin desync).  After a restart, ``_assignments`` is then empty
+        for that id, a fresh dispatch grabs a DIFFERENT lane, and ``git
+        worktree add`` collides with "already used by worktree" — a fault
+        that persists until a human intervenes.
+
+        This method closes that gap by reconciling from git's OWN
+        authoritative worktree admin (:meth:`GitOps.lane_branch_checkouts`)
+        rather than trusting the in-memory assignment map alone.  Called from
+        :meth:`run` immediately after ``_recover_crashed_tasks`` — same
+        startup envelope as the orphan reaper (``scheduler._dispatched`` is
+        still empty, single asyncio loop), so ``restore_assignment`` /
+        ``assignments_snapshot`` (both synchronous, no ``await``) cannot race
+        a live dispatch.
+
+        Fail-safe posture (never mass-destroy on an unreliable read):
+        - ``lane_branch_checkouts()`` returns ``None`` (pool disabled, or a
+          ``git worktree list`` error) -> no-op entirely.
+        - A DEGRADED ``get_statuses`` read (:func:`resolver_failed`) -> every
+          stale checkout is RE-PINNED (never detached) — re-pin is
+          DB-independent and self-heals (a genuinely-terminal re-pinned lane
+          is reclaimed by the next :meth:`_reconcile_terminal_lanes` pass).
+
+        This step handles only the un-pinned case (``pool.assignments_snapshot()``
+        has no entry for the checked-out id yet) — the idempotent-skip,
+        never-steal, and dup-checkout-detach precedence guards (consulting
+        the snapshot) and the terminal/absent-detach branches are added by
+        later steps of task 2062.
+        """
+        pool = self.git_ops.warm_lane_pool
+        if pool is None:
+            return
+
+        checkouts = await self.git_ops.lane_branch_checkouts()
+        if checkouts is None:
+            logger.warning(
+                'Lane-checkout reconciler: lane_branch_checkouts() returned '
+                'None (pool disabled or git error) — skipping reconcile',
+            )
+            return
+        if not checkouts:
+            return
+
+        statuses, err = await self.scheduler.get_statuses()
+        degraded = resolver_failed(statuses, err)
+        live = {} if degraded else {str(k): v for k, v in statuses.items()}
+
+        for bare_id, lane in checkouts.items():
+            if degraded:
+                logger.warning(
+                    'Lane-checkout reconciler: DEGRADED status read — '
+                    're-pinning %s -> %s fail-safe (never detach on a bad read)',
+                    bare_id, lane,
+                )
+                pool.restore_assignment(bare_id, lane)
+            elif bare_id in live and live[bare_id] not in TERMINAL_STATUSES:
+                logger.info(
+                    'Lane-checkout reconciler: re-pinning live task %s -> %s '
+                    '(recovery skipped this id)',
+                    bare_id, lane,
+                )
+                pool.restore_assignment(bare_id, lane)
+            # else: terminal/absent-detach and pinned/dup/steal precedence
+            # guards land in later steps; no-op for now.
 
     async def _reap_orphan_worktrees(self) -> None:
         """Reap/quarantine worktrees whose id no longer maps to a live task.
