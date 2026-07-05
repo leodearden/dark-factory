@@ -2195,3 +2195,75 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
             f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals "
             f"in assembled-path payload; got snippet:\n{payload[-800:]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2107 step-7 (RED) / step-8 (GREEN): degenerate task-node sweep wiring
+# ---------------------------------------------------------------------------
+
+
+class TestDegenerateTaskNodeSweepWiring:
+    """MemoryConsolidator.run() must invoke sweep_degenerate_task_nodes with the
+    terminal (done + cancelled) task ids drawn from filtered_task_tree, and
+    surface its stats as report.stats['degenerate_task_nodes_swept'] /
+    report.stats['degenerate_task_nodes_scanned'].
+
+    RED until step-8 wires extract_terminal_task_ids + sweep_degenerate_task_nodes
+    into run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_sweeps_terminal_task_ids_and_surfaces_stats(self):
+        """run() awaits the sweep with done+cancelled ids (incl. cancelled 142 & 144)
+        and surfaces its scanned/deleted stats under the degenerate_task_nodes_* keys."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+        stage.filtered_task_tree = FilteredTaskTree(
+            done_tasks=[{'id': 148}],
+            cancelled_tasks=[{'id': 142}, {'id': 144}],
+        )
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        # dedup_flags passes all flags through unchanged (mirrors the
+        # TestStaleCountSnapshotCorrectionWiring pattern); items_flagged is
+        # empty here so dedup_flags is not actually invoked, but patching it
+        # keeps this test isolated from that unrelated post-processor.
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+        sweep_mock = AsyncMock(
+            return_value={'scanned': 3, 'degenerate': 2, 'deleted': 2, 'errors': 0}
+        )
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.sweep_degenerate_task_nodes',
+                new=sweep_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-2107-step7',
+            )
+
+        sweep_mock.assert_awaited_once_with(stage.memory, 'test_project', ['148', '142', '144'])
+        assert report.stats.get('degenerate_task_nodes_swept') == 2, (
+            f"Expected report.stats['degenerate_task_nodes_swept'] == 2 (stats['deleted']); "
+            f'got stats={report.stats!r}. '
+            'RED: sweep_degenerate_task_nodes is not yet wired into run().'
+        )
+        assert report.stats.get('degenerate_task_nodes_scanned') == 3, (
+            f"Expected report.stats['degenerate_task_nodes_scanned'] == 3 (stats['scanned']); "
+            f'got stats={report.stats!r}'
+        )
