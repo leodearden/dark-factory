@@ -253,3 +253,113 @@ class TestSweepDegenerateTaskNodesBestEffort:
         assert stats == {'scanned': 1, 'degenerate': 0, 'deleted': 0, 'errors': 0}, (
             f'Expected only the healthy node scanned and nothing deleted, got {stats!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_malformed_edge_count_is_tallied_as_error_never_deleted(self):
+        """A match with a missing or None edge_count is uncertain, not degenerate:
+        it must be tallied into stats['errors'] (never assumed to be 0) and never
+        deleted, while the sweep still proceeds to a later, well-formed match."""
+        memory_service = _make_memory_service()
+
+        async def fake_find(name, *, group_id):
+            if name == 'tasks 142':
+                return [{'uuid': 'node-142-missing-key', 'created_at': 100}]  # no edge_count key
+            if name == 'tasks 144':
+                return [{'uuid': 'node-144-none', 'created_at': 100, 'edge_count': None}]
+            if name == 'tasks 148':
+                return [{'uuid': 'node-148', 'created_at': 100, 'edge_count': 0}]
+            return []
+
+        memory_service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find)
+
+        stats = await sweep_degenerate_task_nodes(
+            memory_service, 'test_project', ['142', '144', '148'],
+        )
+
+        memory_service.graphiti.delete_entity_node.assert_awaited_once_with(
+            'node-148', group_id='test_project',
+        )
+        assert stats == {'scanned': 3, 'degenerate': 1, 'deleted': 1, 'errors': 2}, (
+            'Expected both the missing-key and None edge_count matches tallied as '
+            f'errors (never deleted) and the well-formed match still processed, got {stats!r}'
+        )
+
+
+# --------------------------------------------------------------------------- #
+# sweep_degenerate_task_nodes — name_templates parameterization
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepDegenerateTaskNodesNameTemplates:
+    """name_templates is the module's stated extension point for future
+    casings/singular forms — every template must be queried per task id, and
+    counts must aggregate across templates."""
+
+    @pytest.mark.asyncio
+    async def test_multiple_name_templates_are_all_queried_and_aggregated(self):
+        """With 2 name_templates, both are queried for the task id and
+        scanned/degenerate/deleted counts aggregate across both."""
+        memory_service = _make_memory_service()
+
+        async def fake_find(name, *, group_id):
+            if name == 'tasks 142':
+                return [{'uuid': 'node-lower-142', 'created_at': 100, 'edge_count': 0}]
+            if name == 'Task 142':
+                return [{'uuid': 'node-title-142', 'created_at': 100, 'edge_count': 0}]
+            return []
+
+        memory_service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find)
+
+        stats = await sweep_degenerate_task_nodes(
+            memory_service,
+            'test_project',
+            ['142'],
+            name_templates=('tasks {id}', 'Task {id}'),
+        )
+
+        called_names = [
+            c.args[0] for c in memory_service.graphiti.find_duplicate_entity_nodes.await_args_list
+        ]
+        assert called_names == ['tasks 142', 'Task 142'], (
+            f'Expected both templates queried (in order) for the task id, got {called_names!r}'
+        )
+        deleted_uuids = {c.args[0] for c in memory_service.graphiti.delete_entity_node.await_args_list}
+        assert deleted_uuids == {'node-lower-142', 'node-title-142'}, (
+            f'Expected the degenerate node from each template deleted, got {deleted_uuids!r}'
+        )
+        assert stats == {'scanned': 2, 'degenerate': 2, 'deleted': 2, 'errors': 0}, (
+            f'Expected counts aggregated across both templates, got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_second_template_still_queried_when_first_has_no_matches(self):
+        """A break/continue regression in the per-template loop would stop after
+        the first template's empty result; this pins that the second is still
+        queried and its degenerate node still deleted."""
+        memory_service = _make_memory_service()
+
+        async def fake_find(name, *, group_id):
+            if name == 'tasks 148':
+                return []
+            if name == 'Task 148':
+                return [{'uuid': 'node-title-148', 'created_at': 100, 'edge_count': 0}]
+            return []
+
+        memory_service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find)
+
+        stats = await sweep_degenerate_task_nodes(
+            memory_service,
+            'test_project',
+            ['148'],
+            name_templates=('tasks {id}', 'Task {id}'),
+        )
+
+        assert memory_service.graphiti.find_duplicate_entity_nodes.await_count == 2, (
+            'Expected both templates queried even though the first returned no matches'
+        )
+        memory_service.graphiti.delete_entity_node.assert_awaited_once_with(
+            'node-title-148', group_id='test_project',
+        )
+        assert stats == {'scanned': 1, 'degenerate': 1, 'deleted': 1, 'errors': 0}, (
+            f'Expected only the second template contributing counts, got {stats!r}'
+        )

@@ -136,7 +136,10 @@ async def sweep_degenerate_task_nodes(
     backend error scanning (``find_duplicate_entity_nodes``) or deleting
     (``delete_entity_node``) is caught, logged, and tallied into
     ``stats['errors']`` — it never aborts the sweep for the remaining
-    task_ids/templates. ``asyncio.CancelledError``/``KeyboardInterrupt``/
+    task_ids/templates. A match with a missing/``None``/unparseable
+    ``edge_count`` is likewise tallied into ``stats['errors']`` and skipped
+    rather than assumed to be 0 — uncertain is never treated as degenerate, so
+    it is never deleted. ``asyncio.CancelledError``/``KeyboardInterrupt``/
     ``SystemExit`` are re-raised unchanged (never swallowed as best-effort).
 
     Returns:
@@ -172,7 +175,21 @@ async def sweep_degenerate_task_nodes(
 
             for match in matches:
                 stats['scanned'] += 1
-                if int(match['edge_count']) != 0:
+                try:
+                    is_degenerate = int(match['edge_count']) == 0
+                except (KeyError, TypeError, ValueError):
+                    # A match with a missing/None/unparseable edge_count is
+                    # uncertain, not degenerate — never assume 0 and delete.
+                    # Tally as best-effort error and move on, mirroring every
+                    # other failure mode in this loop.
+                    log.exception(
+                        'degenerate_task_node_sweep: match with missing/malformed '
+                        'edge_count for name=%s group_id=%s: %r',
+                        name, project_id, match,
+                    )
+                    stats['errors'] += 1
+                    continue
+                if not is_degenerate:
                     continue
                 stats['degenerate'] += 1
                 try:
