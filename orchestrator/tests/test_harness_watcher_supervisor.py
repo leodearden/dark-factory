@@ -1894,6 +1894,7 @@ def _make_run_wired_harness(tmp_path: Path) -> tuple:
     h._start_merge_worker = AsyncMock()
     h._tag_task_modules = AsyncMock()
     h._recover_crashed_tasks = AsyncMock()
+    h._reconcile_lane_checkouts = AsyncMock()
     h._reconcile_stranded_in_progress = AsyncMock()
     h._tag_prd_metadata = AsyncMock()
     h._start_orphan_l0_reaper = MagicMock()
