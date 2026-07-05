@@ -2197,17 +2197,23 @@ class TestGetEntity:
         assert service.graphiti.search.call_args.kwargs['num_results'] == 25
 
     @pytest.mark.asyncio
-    async def test_edge_limit_threads_to_num_results_exact_path(self, service):
-        """edge_limit is forwarded as num_results to graphiti.search on the exact-match path."""
+    async def test_edge_limit_does_not_reach_search_on_exact_path(self, service):
+        """edge_limit is a fuzzy-path-only cap. On the exact-match path (task 2102)
+        edges come from get_valid_edges_for_node(uuid) — an uncapped uuid traversal —
+        so graphiti.search is never consulted and edge_limit does not thread anywhere.
+        Regression guard: an exact hit must not fall back to the semantic edge search
+        that could return edges belonging to unrelated nodes.
+        """
         service.graphiti.get_nodes_by_exact_name = AsyncMock(
             return_value=[{'uuid': 'u-115', 'name': 'Task 115', 'summary': 's', 'labels': []}]
         )
+        service.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
         service.graphiti.search = AsyncMock(return_value=[])
 
         await service.get_entity('Task 115', project_id='test', edge_limit=25)
 
-        service.graphiti.search.assert_awaited_once()
-        assert service.graphiti.search.call_args.kwargs['num_results'] == 25
+        service.graphiti.search.assert_not_awaited()
+        service.graphiti.get_valid_edges_for_node.assert_awaited_once_with('u-115', group_id='test')
 
     @pytest.mark.asyncio
     async def test_edge_limit_defaults_to_ten(self, service):

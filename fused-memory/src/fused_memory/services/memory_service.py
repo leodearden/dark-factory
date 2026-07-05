@@ -1533,12 +1533,15 @@ class MemoryService:
         as added complexity that would leave non-numeric exact lookups (e.g.
         "Auth Service") still exposed to fuzzy neighbours for no benefit.
 
-        Edge cap: edges are gathered via a single graphiti.search() call capped at
-        `edge_limit` (default 10, applied identically on both the exact-match and
-        fuzzy-fallback branches). graphiti.search returns edges in RELEVANCE-ranked
-        order, so when an entity has more than `edge_limit` valid edges, the
-        lowest-ranked ones are silently dropped from the result — raise edge_limit
-        to fetch more, or cross-check completeness via a direct search() call.
+        Edge cap: `edge_limit` (default 10) applies ONLY to the fuzzy-fallback
+        branch, where edges are gathered via a single graphiti.search() call
+        passing edge_limit as num_results. graphiti.search returns edges in
+        RELEVANCE-ranked order, so when an entity has more than `edge_limit`
+        valid edges, the lowest-ranked ones are silently dropped — raise
+        edge_limit to fetch more, or cross-check completeness via a direct
+        search() call. The exact-match branch does NOT use edge_limit: its
+        get_valid_edges_for_node traversal returns every valid edge for the
+        resolved node uuid(s), uncapped.
         """
         # See "Performance trade-off" above: this call is intentionally serial —
         # its 0/1/many result decides whether the fuzzy gather runs at all.
