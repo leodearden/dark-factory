@@ -8821,3 +8821,296 @@ class TestAcquireWarmLaneReclaimOnExhaustion:
         assert result.path == lane, (
             f'Reclaimed lane path must be _lane-0 ({lane}) even after commit failure'
         )
+
+
+# ===========================================================================
+# Task 2097: RED — orphaned-lane reuse guard (registration check +
+# repair/reattach fallback) in acquire_warm_lane
+# ===========================================================================
+
+
+def _lane_admin_dir(lane: Path) -> Path:
+    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
+    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
+    content = (lane / '.git').read_text().strip()
+    prefix = 'gitdir:'
+    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
+    return Path(content[len(prefix):].strip())
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneOrphanedReuseGuard:
+    """The REUSE path (in-memory map hit -> reused=True) assumes a mapped
+    lane is a valid registered worktree.  When a lane's directory + .git
+    pointer file survive but its .git/worktrees/<name> admin dir was wiped
+    (git worktree prune during a mount-down startup window), the reuse
+    branch runs _reuse_warm_lane -> commit() against a lane git no longer
+    recognizes, hard-faulting with 'not a git repository'.  The identity-
+    MISMATCH branch's _reset_warm_lane call makes the same registered-
+    worktree assumption and faults identically.
+
+    RED today: both faults surface as WarmLaneUnavailable.FAULT instead of
+    a recovered WorktreeInfo (task 2097).
+    GREEN after step-2/step-4: the guard demotes an orphaned reuse into the
+    existing create-once self-heal/reattach path (or repairs it in place),
+    never FAULTing a healable orphan.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _warm_base(self, git_repo: Path) -> None:
+        _seed_default_warm_base(git_repo)
+
+    def _warm_config(self) -> GitConfig:
+        return GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+            push_after_advance=False,
+            warm_lane_pool=True,
+        )
+
+    async def test_pruned_admin_dir_reuse_reattaches_and_does_not_fault(
+        self, git_repo: Path,
+    ):
+        """A REUSE candidate (in-memory map hit) whose admin dir was pruned
+        must reattach to the retained task/A branch instead of FAULTing.
+
+        RED today: the reuse branch calls _reuse_warm_lane -> commit()
+        directly against the unregistered lane, which hard-faults with
+        'fatal: not a git repository: <repo>/.git/worktrees/A' — converted
+        by the top-level except to WarmLaneUnavailable.FAULT.
+        """
+        import shutil
+
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        info = await git_ops.acquire_warm_lane('A', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        # task/A gains a commit beyond main.
+        (lane / 'committed.txt').write_text('committed work\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'wip on task/A'], cwd=lane)
+
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "A"}')
+
+        # Advance main with an unrelated commit.
+        (git_repo / 'main_advance.txt').write_text('main advance\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'advance main'], cwd=git_repo)
+        _, main_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        main_head = main_head_raw.strip()
+
+        # DO NOT release — 'A' stays mapped in warm_lane_pool._assignments,
+        # so the next acquire_for('A') returns reused=True.
+
+        # Simulate the prune wipe: delete the lane's admin dir.
+        admin_dir = _lane_admin_dir(lane)
+        shutil.rmtree(admin_dir)
+        assert not await git_ops._is_registered_worktree(lane), (
+            'lane must be unregistered after its admin dir is wiped (setup check)'
+        )
+
+        result = await git_ops.acquire_warm_lane('A', main_head)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected WorktreeInfo (recovered via reattach), got {result!r} — '
+            f'a healable orphan must never FAULT (task 2097)'
+        )
+
+        _, branch_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=result.path,
+        )
+        assert branch_raw.strip() == 'task/A', (
+            f'Reattached lane must be ON task/A, got {branch_raw.strip()!r}'
+        )
+        assert (result.path / 'committed.txt').exists(), (
+            'committed work must survive the reattach (recovered from task/A)'
+        )
+
+        _, count_raw, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/A'], cwd=git_repo,
+        )
+        assert int(count_raw.strip()) > 0, (
+            'task/A must still carry commits beyond main (never-destroy)'
+        )
+
+    async def test_pruned_admin_dir_reuse_identity_mismatch_does_not_fault(
+        self, git_repo: Path,
+    ):
+        """Same orphan setup, but with an expected_title MISMATCH on re-acquire.
+
+        RED today: the identity-mismatch branch calls _reset_warm_lane
+        against the unregistered lane, which hard-faults identically to the
+        matched-identity case.  The orphan guard must demote to create-once
+        reattach BEFORE the mismatch branch's _reset_warm_lane call is ever
+        reached.
+        """
+        import shutil
+
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        info = await git_ops.acquire_warm_lane('A', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        (lane / 'committed.txt').write_text('committed work\n')
+        await _run(['git', 'add', '-A'], cwd=lane)
+        await _run(['git', 'commit', '-m', 'wip on task/A'], cwd=lane)
+
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "A"}')
+        _write_stored_title(lane, 'OLD TITLE')
+
+        (git_repo / 'main_advance.txt').write_text('main advance\n')
+        await _run(['git', 'add', '-A'], cwd=git_repo)
+        await _run(['git', 'commit', '-m', 'advance main'], cwd=git_repo)
+        _, main_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        main_head = main_head_raw.strip()
+
+        admin_dir = _lane_admin_dir(lane)
+        shutil.rmtree(admin_dir)
+        assert not await git_ops._is_registered_worktree(lane), (
+            'lane must be unregistered after its admin dir is wiped (setup check)'
+        )
+
+        result = await git_ops.acquire_warm_lane(
+            'A', main_head, expected_title='NEW TITLE',
+        )
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected WorktreeInfo (recovered via reattach) even on an '
+            f'identity MISMATCH, got {result!r} — the orphan guard must fire '
+            f"before the mismatch branch's _reset_warm_lane call (task 2097)"
+        )
+
+        rc_verify, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo,
+        )
+        assert rc_verify == 0, 'task/A branch must be RETAINED (never-destroy)'
+
+    async def test_registered_reuse_unaffected_by_orphan_guard(
+        self, git_repo: Path,
+    ):
+        """Regression guard: a normally-registered reuse (the common case)
+        must be a strict no-op under the new guard — protects 1923/1912.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        info = await git_ops.acquire_warm_lane('C', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "C"}')
+
+        # Do NOT release; do NOT touch the admin dir — lane stays registered.
+        result = await git_ops.acquire_warm_lane('C', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Registered reuse must succeed unchanged, got {result!r}'
+        )
+        assert result.path == lane, 'registered reuse must return the SAME lane'
+        assert (task_dir / 'plan.json').exists(), (
+            '.task/plan.json must survive a registered reuse'
+        )
+
+        _, lane_head_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane)
+        lane_head = lane_head_raw.strip()
+        _, branch_head_raw, _ = await _run(['git', 'rev-parse', 'task/C'], cwd=git_repo)
+        assert branch_head_raw.strip() == lane_head, (
+            'task/C ref must equal lane HEAD after reuse (rebind intact, 1923)'
+        )
+
+    async def test_repairable_orphan_reuse_repairs_in_place_and_preserves_task_dir(
+        self, git_repo: Path,
+    ):
+        """A REUSE candidate whose admin dir has a corrupted (but linkable)
+        gitdir pointer must be repaired IN PLACE — not demoted to reattach.
+
+        Distinct from the pruned-admin-dir fixture (step-1's `rm -rf`, which
+        `git worktree repair` cannot heal): here the admin dir itself
+        survives — only its `gitdir` pointer is stale. `git worktree repair`
+        fixes this class of orphan without touching the lane's working
+        directory, so .task/plan.json and any uncommitted WIP survive
+        UNTOUCHED (unlike the demote/reattach path, which rmtree's the lane).
+
+        RED after step-2: the demote-only guard cannot distinguish a
+        repairable orphan from an unrepairable one — it always drops the
+        assignment and routes into the create-once branch, which self-heal
+        rmtree's the lane (destroying .task/plan.json and the uncommitted
+        WIP) and then fails outright: task/R already exists with 0 commits
+        beyond main, so `_orphan_has_commits` is False and the plain
+        `git worktree add -b task/R` collides with the existing branch,
+        returning WarmLaneUnavailable.FAULT.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        start_ref = start_ref_raw.strip()
+
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        info = await git_ops.acquire_warm_lane('R', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        lane = info.path
+
+        task_dir = lane / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "R"}')
+        (lane / 'uncommitted_wip.txt').write_text('uncommitted work\n')
+
+        # DO NOT release — 'R' stays mapped, so the next acquire_for('R')
+        # returns reused=True.
+
+        # Construct a REPAIRABLE orphan: corrupt the admin dir's gitdir
+        # pointer (lane dir + admin dir both survive and stay linkable).
+        admin_dir = _lane_admin_dir(lane)
+        (admin_dir / 'gitdir').write_text('/tmp/bogus/.git\n')
+        assert not await git_ops._is_registered_worktree(lane), (
+            'lane must appear unregistered once its admin dir gitdir '
+            'pointer is corrupted (setup check)'
+        )
+
+        result = await git_ops.acquire_warm_lane('R', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected WorktreeInfo (repaired in place), got {result!r} — '
+            f'a repairable orphan must never FAULT nor lose in-place state '
+            f'(task 2097)'
+        )
+        assert await git_ops._is_registered_worktree(lane), (
+            'git worktree repair must have restored the registration in place'
+        )
+        assert (task_dir / 'plan.json').exists(), (
+            '.task/plan.json must survive ON DISK — repair must not rmtree '
+            'the lane (that would prove reattach, not in-place repair)'
+        )
+
+        _, branch_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert branch_raw.strip() == 'task/R', (
+            f'Repaired lane must be ON task/R, got {branch_raw.strip()!r}'
+        )
+
+        rc_show, _, _ = await _run(
+            ['git', 'show', 'task/R:uncommitted_wip.txt'], cwd=git_repo,
+        )
+        assert rc_show == 0, (
+            'previously-uncommitted WIP must be recoverable on task/R '
+            "(committed by _reuse_warm_lane's commit() after repair)"
+        )
