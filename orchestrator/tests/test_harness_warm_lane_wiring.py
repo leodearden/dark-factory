@@ -1261,6 +1261,13 @@ class TestRecoveryTerminalTaskLaneRelease:
         }
         (task_dir / 'plan.json').write_text(json.dumps(plan))
 
+        # Registration guard (reify 4655/4947): default to "still registered"
+        # so the T10 restore-path tests (this lane is plain mkdir'd, never
+        # `git worktree add`ed) keep exercising the positive (non-terminal +
+        # registered -> restore) path. The orphaned-lane invariant test
+        # overrides this to False.
+        git_ops._is_registered_worktree = AsyncMock(return_value=True)
+
         return harness, git_ops, pool, lane_entry
 
     async def test_recovery_releases_terminal_task_lane(self, tmp_path: Path):

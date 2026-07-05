@@ -2108,7 +2108,28 @@ Output JSON matching the schema. Every task must appear in the output.
                     await self.git_ops.cleanup_worktree(entry, recovery_id)
                     cleaned += 1
                     continue
-                pool.restore_assignment(recovery_id, entry)
+                # Registration guard (reify 4655/4947): only re-pin the lane
+                # if it is STILL a registered git worktree.  A stale plan.json
+                # can survive in an ORPHANED lane (dir present on disk, but its
+                # '.git/worktrees' admin entry is gone) — pinning it
+                # unconditionally re-ASSIGNs the broken lane on every restart,
+                # which (a) forces the next dispatch down the reuse fast-path
+                # (which faults on the missing worktree) and (b) shields the
+                # lane from the create-once self-heal forever, since that
+                # self-heal only ever sees FREE lanes.  Skipping the pin
+                # leaves the lane FREE so the next acquire_for() self-heals it
+                # (rmtree + fresh 'git worktree add'); the plan is still
+                # recovered below via _recovered_plans independent of the pin.
+                if await self.git_ops._is_registered_worktree(entry):
+                    pool.restore_assignment(recovery_id, entry)
+                else:
+                    logger.warning(
+                        'Recovery: lane %s for task %s is NOT a registered '
+                        'git worktree (orphaned .git/worktrees admin entry) — '
+                        'leaving FREE for create-once self-heal; plan is '
+                        'still recovered under task id %s',
+                        entry.name, recovery_id, recovery_id,
+                    )
 
             # Check if plan has any completed steps
             # Note: some plans have prerequisites as plain strings (not dicts)

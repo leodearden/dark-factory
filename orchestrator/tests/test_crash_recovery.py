@@ -46,6 +46,12 @@ def harness(tmp_path: Path, mock_orch_config):
     h.git_ops.worktree_base = (tmp_path / '.worktrees').resolve()
     h.git_ops.cleanup_worktree = AsyncMock()
     h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    # Registration guard (reify 4655/4947): default to "still registered" so
+    # the existing warm-lane restore-path tests (fabricated via mkdir, never
+    # `git worktree add`ed) keep exercising the positive (non-terminal +
+    # registered -> restore) path. Tests for the orphaned-lane invariant
+    # override this to False.
+    h.git_ops._is_registered_worktree = AsyncMock(return_value=True)
     # Exercise the (best-effort) event emits without a real store.
     h.event_store = MagicMock()
 
