@@ -31,6 +31,13 @@ def harness(tmp_path: Path, mock_orch_config):
     base = (tmp_path / '.worktrees').resolve()
     base.mkdir(parents=True, exist_ok=True)
     h.git_ops.worktree_base = base
+    # Task 2099: mark pool storage present by default so the new
+    # mount-presence guard on _reap_orphan_worktrees does not false-trip
+    # across this file's reaper-routing tests, which all assume an
+    # already-mounted host — an orthogonal concern to orphan/lane routing.
+    # The dedicated storage-absent tests below remove the sentinel
+    # explicitly to exercise the guard itself.
+    h.git_ops.mark_pool_storage_present()
     # Mock the git-level helpers — their behaviour is covered in test_git_ops.
     h.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=False)
     h.git_ops.quarantine_worktree = AsyncMock(return_value=tmp_path / 'q-dest')
@@ -277,3 +284,54 @@ async def test_reaper_skips_spec_pool_lanes(harness: Harness):
         f'Spec lane {spec_lane_path} must NOT be quarantined by the orphan '
         f'reaper (quarantine_worktree is not pool-aware — it would move the dir)'
     )
+
+
+# ===========================================================================
+# Task 2099: reaper guard on pool-storage-absent (mount-down safety)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestOrphanReaperPoolStorageAbsentGuard:
+    """_reap_orphan_worktrees must refuse its ENTIRE sweep — no DB read, no
+    cleanup/quarantine, no prune — when pool storage is absent (task 2099).
+
+    Direct regression guard for the Jul-3 incident: an unmounted mountpoint
+    dir must never let the reaper (and its prune_worktrees tail) treat every
+    mount-resident worktree as an orphan.
+    """
+
+    async def test_storage_absent_aborts_entire_sweep(self, harness: Harness):
+        from orchestrator.git_ops import POOL_ROOT_SENTINEL
+
+        # The `harness` fixture marks pool storage present by default —
+        # remove the sentinel to simulate an unmounted mountpoint with a
+        # live, empty (from git's perspective) mount dir.
+        (harness.git_ops.worktree_base / POOL_ROOT_SENTINEL).unlink()
+        assert not harness.git_ops.pool_storage_present()
+
+        _mk(harness.git_ops.worktree_base, '500')  # plain orphan dir
+        pool = WarmLanePool(worktree_base=harness.git_ops.worktree_base, size=1)
+        harness.git_ops.warm_lane_pool = pool
+        _mk(harness.git_ops.worktree_base, '_lane-0')  # registered-lane-looking dir
+
+        harness._file_pool_storage_absent_escalation = MagicMock()
+
+        await harness._reap_orphan_worktrees()
+
+        harness.scheduler.get_statuses.assert_not_called()  # type: ignore[attr-defined]
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+        harness.git_ops.prune_worktrees.assert_not_called()  # type: ignore[attr-defined]
+        harness._file_pool_storage_absent_escalation.assert_called_once()  # type: ignore[attr-defined]
+
+    async def test_storage_present_control_reaps_clean_orphan(self, harness: Harness):
+        """Regression guard: sentinel present (the fixture default) — the
+        existing reap-clean-orphan behavior is unchanged."""
+        assert harness.git_ops.pool_storage_present()
+        wt = _mk(harness.git_ops.worktree_base, '500')
+
+        await harness._reap_orphan_worktrees()
+
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '500')  # type: ignore[attr-defined]
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
