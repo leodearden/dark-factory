@@ -117,6 +117,35 @@ def _infer_recon_pool(meta: dict) -> str | None:
     return _CYCLE_SUMMARY_STAGE_TO_RECON_POOL.get(stage)
 
 
+_REQUIRED_CYCLE_SUMMARY_KEYS: tuple[str, ...] = ('stage', 'run_id')
+
+
+def _missing_cycle_summary_keys(meta: dict) -> list[str]:
+    """Return which required keys among _REQUIRED_CYCLE_SUMMARY_KEYS are
+    missing/invalid on a cycle_summary write; [] for non-cycle_summary kinds
+    (and whenever all required keys are present and valid).
+
+    stage is invalid when absent, non-str, or not a known key in
+    _CYCLE_SUMMARY_STAGE_TO_RECON_POOL — the same "known stage" check
+    _infer_recon_pool uses, so there is one source of truth for the stage
+    set. run_id is invalid when absent, non-str, or empty/whitespace-only
+    (an empty run_id is as useless to the Path-2 triple-filter
+    count_memories_by_metadata({kind, run_id, stage}) pre-check as an absent
+    one). Order is stable: 'stage' before 'run_id'.
+    """
+    if meta.get('kind') != 'cycle_summary':
+        return []
+
+    missing: list[str] = []
+    stage = meta.get('stage')
+    if not isinstance(stage, str) or stage not in _CYCLE_SUMMARY_STAGE_TO_RECON_POOL:
+        missing.append('stage')
+    run_id = meta.get('run_id')
+    if not isinstance(run_id, str) or not run_id.strip():
+        missing.append('run_id')
+    return missing
+
+
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
 
