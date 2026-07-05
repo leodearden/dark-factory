@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1880,3 +1881,599 @@ def test_seed_rc_76_maps_to_base_absent():
     from orchestrator.git_ops import WarmLaneUnavailable, _seed_rc_to_unavailable
 
     assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT
+
+
+# ===========================================================================
+# Task 2062: warm-lane restart recovery — reconcile stale branch checkouts
+# ===========================================================================
+#
+# ROOT CAUSE: release_warm_lane only detaches a lane's HEAD; it never removes
+# the worktree, so after a restart git still has task/<id> checked out at the
+# old lane while the in-memory pool assignment is empty.  Re-dispatch then
+# grabs a DIFFERENT lane and `git worktree add` collides with "already used by
+# worktree".  These tests build the primitives (lane_branch_checkouts,
+# detach_lane_checkout) and the Harness-level reconciler
+# (_reconcile_lane_checkouts) that closes the gap, plus the fix for a
+# restart-independent mid-run leak in the recycle/reuse release paths.
+
+
+@pytest.mark.asyncio
+class TestLaneBranchCheckouts:
+    """GitOps.lane_branch_checkouts() — {bare_id: canonical_lane} built from
+    git's authoritative `git worktree list --porcelain` (step-1 RED / step-2 GREEN).
+    """
+
+    async def test_maps_pool_lane_branches_to_bare_ids(self, tmp_path: Path):
+        """Two pool lanes checked out on task/<id> branches map to {id: lane};
+        a non-pool worktree on a non-task branch is filtered out."""
+        from orchestrator.git_ops import GitOps
+        from orchestrator.git_ops import _run as git_run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=2,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=2)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        lane0 = git_ops.worktree_base / '_lane-0'
+        lane1 = git_ops.worktree_base / '_lane-1'
+        lane0.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(lane0), '-b', 'task/111', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(lane1), '-b', 'task/222', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        # Non-pool worktree on a non-task branch — must be filtered out.
+        side = tmp_path / 'side'
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(side), '-b', 'feature/x', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        result = await git_ops.lane_branch_checkouts()
+
+        assert result == {
+            '111': pool._match_lane(lane0),
+            '222': pool._match_lane(lane1),
+        }
+
+    async def test_returns_none_when_pool_disabled(self, tmp_path: Path):
+        """warm_lane_pool disabled (size=0) -> lane_branch_checkouts() returns None."""
+        from orchestrator.git_ops import GitOps
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=2,
+            git=GitConfig(warm_lane_pool=False),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=0)
+        assert git_ops.warm_lane_pool is None
+
+        assert await git_ops.lane_branch_checkouts() is None
+
+    async def test_returns_none_on_git_error(self, tmp_path: Path):
+        """`git worktree list` failing (non-zero rc) -> None (fail-safe, never mass-mutate)."""
+        from orchestrator.git_ops import GitOps
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=2,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=2)
+        assert git_ops.warm_lane_pool is not None
+
+        async def fake_run(cmd, cwd=None):
+            if 'worktree' in cmd and 'list' in cmd:
+                return (128, '', 'fatal: boom')
+            return (0, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            result = await git_ops.lane_branch_checkouts()
+
+        assert result is None
+
+
+@pytest.mark.asyncio
+class TestDetachLaneCheckout:
+    """GitOps.detach_lane_checkout() — commit WIP then detach a lane's HEAD,
+    WITHOUT removing the worktree or deleting the branch (step-3 RED / step-4 GREEN).
+    """
+
+    async def test_commits_wip_and_detaches_retaining_worktree_and_branch(
+        self, tmp_path: Path,
+    ):
+        """WIP on the checked-out branch is committed, HEAD ends up detached,
+        and both the branch and the worktree registration survive."""
+        from orchestrator.git_ops import GitOps
+        from orchestrator.git_ops import _run as git_run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        lane0 = git_ops.worktree_base / '_lane-0'
+        lane0.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(lane0), '-b', 'task/777', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        # Uncommitted WIP on a tracked file.
+        (lane0 / 'README.md').write_text('# Test\nWIP change\n')
+
+        result = await git_ops.detach_lane_checkout(lane0, '777')
+        assert result is True
+
+        # HEAD at lane0 is now DETACHED (no symbolic ref).
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane0)
+        assert rc != 0, 'HEAD must be detached after detach_lane_checkout'
+
+        # The branch still exists...
+        rc, _, _ = await git_run(['git', 'rev-parse', '--verify', 'task/777'], cwd=repo)
+        assert rc == 0, 'task/777 branch must survive detach_lane_checkout'
+
+        # ...and now carries the committed WIP beyond main.
+        rc, out, _ = await git_run(
+            ['git', 'rev-list', '--count', 'main..task/777'], cwd=repo,
+        )
+        assert rc == 0 and int(out.strip()) > 0, (
+            'WIP must be committed onto task/777 before detaching'
+        )
+
+        # The lane is still a registered worktree (not removed).
+        rc, out, _ = await git_run(['git', 'worktree', 'list', '--porcelain'], cwd=repo)
+        assert rc == 0
+        assert str(lane0) in out, 'lane worktree registration must survive detach'
+
+    async def test_detach_failure_logs_error_and_returns_false(
+        self, tmp_path: Path, caplog,
+    ):
+        """`git checkout --detach` failing -> returns False and logs at ERROR."""
+        from orchestrator.git_ops import GitOps
+        from orchestrator.git_ops import _run as orig_run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        assert git_ops.warm_lane_pool is not None
+
+        lane0 = git_ops.worktree_base / '_lane-0'
+        lane0.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await orig_run(
+            ['git', 'worktree', 'add', str(lane0), '-b', 'task/777', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        async def fake_run(cmd, cwd=None):
+            if 'checkout' in cmd and '--detach' in cmd:
+                return (128, '', 'fatal: boom')
+            return await orig_run(cmd, cwd=cwd)
+
+        with (
+            caplog.at_level(logging.ERROR, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+        ):
+            result = await git_ops.detach_lane_checkout(lane0, '777')
+
+        assert result is False
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'detach_lane_checkout must log at ERROR on checkout --detach failure'
+
+
+@pytest.mark.asyncio
+class TestReconcileLaneCheckouts:
+    """Harness._reconcile_lane_checkouts() — reconcile git's authoritative
+    worktree admin against the in-memory pool assignment map at startup,
+    closing the gap left by _recover_crashed_tasks' skip branches
+    (steps 5/7/9 RED, steps 6/8/10 GREEN).
+    """
+
+    async def _make_fixture(self, tmp_path: Path, *, pool_size: int = 6):
+        """Harness + real GitOps pool with task/3965 checked out at _lane-5
+        (a commit beyond main), while pool._assignments stays EMPTY —
+        simulating a restart where _recover_crashed_tasks skipped this id.
+
+        pool_size=6 so _lane-0..4 are FREE and get handed out by acquire_for
+        before _lane-5 (the one actually holding task/3965) is ever reached —
+        this is exactly the collision setup the fix must reconcile away.
+        """
+        from orchestrator.git_ops import GitOps
+        from orchestrator.git_ops import _run as git_run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        # Pre-create the default warm-lane CoW seed base so the pre-acquire
+        # base-health gate sees WarmBaseHealth.OK (mirrors wl_git_repo in
+        # test_warm_lane_pool.py), and a no-op seed script so a successful
+        # acquire's seed step succeeds.
+        default_base = repo / '.worktrees' / '_merge-verify' / 'target'
+        default_base.mkdir(parents=True, exist_ok=True)
+        (default_base / '.keep').write_text('warm base sentinel\n')
+        scripts_dir = repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text('#!/usr/bin/env bash\nexit 0\n')
+        seed_script.chmod(0o755)
+        await git_run(['git', 'add', '-A'], cwd=repo)
+        await git_run(['git', 'commit', '-m', 'add no-op seed-warm-lane.sh'], cwd=repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=pool_size,
+            git=GitConfig(warm_lane_pool=True),
+            worktree_identity_guard_enabled=False,
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=pool_size)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        harness = _build_harness(config)
+        harness.git_ops = git_ops
+
+        lane5 = git_ops.worktree_base / '_lane-5'
+        lane5.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(lane5), '-b', 'task/3965', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+        (lane5 / 'wip.txt').write_text('unmerged work\n')
+        await git_run(['git', 'add', '-A'], cwd=lane5)
+        await git_run(['git', 'commit', '-m', 'wip: task 3965 work'], cwd=lane5)
+
+        return harness, git_ops, pool, lane5
+
+    async def test_control_no_reconcile_collides_on_reacquire(
+        self, tmp_path: Path, caplog,
+    ):
+        """CONTROL (documents the bug): with NO reconcile, a fresh acquire grabs
+        a different (first-free) lane and collides with the branch already
+        checked out at _lane-5."""
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        _harness, git_ops, _pool, _lane5 = await self._make_fixture(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('3965', 'main')
+
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'expected FAULT from the worktree-add collision, got {result!r}'
+        )
+        assert 'already used by worktree' in caplog.text, (
+            f'expected the git collision message in the log; got: {caplog.text!r}'
+        )
+
+    async def test_repin_on_live_status_reuses_original_lane(self, tmp_path: Path):
+        """RE-PIN: a live (non-terminal) status re-pins the id to its ORIGINAL
+        lane, so the next acquire reuses it (no fault) and the WIP survives."""
+        from orchestrator.git_ops import WorktreeInfo
+        from orchestrator.git_ops import _run as git_run
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+        canon = pool._match_lane(lane5)
+        assert canon is not None
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'in-progress'}, None),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for('3965') == canon, (
+            'reconcile must re-pin 3965 to its ORIGINAL lane (_lane-5)'
+        )
+        assert pool.state(canon) == LaneState.ASSIGNED
+
+        result = await git_ops.acquire_warm_lane('3965', 'main')
+        assert isinstance(result, WorktreeInfo), (
+            f'expected a reuse WorktreeInfo (lane re-pinned), got {result!r}'
+        )
+        assert result.path == canon
+
+        rc, out, _ = await git_run(
+            ['git', 'rev-list', '--count', 'main..task/3965'], cwd=git_ops.project_root,
+        )
+        assert rc == 0 and int(out.strip()) > 0, (
+            'the pre-existing WIP commit on task/3965 must survive the reuse'
+        )
+
+    async def test_degraded_status_read_repins_fail_safe(self, tmp_path: Path):
+        """DEGRADED get_statuses (error) -> fail-safe re-pin (never detach on a
+        bad read), mirroring test_recovery_restores_on_status_read_failure."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, _git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+        canon = pool._match_lane(lane5)
+        assert canon is not None
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({}, RuntimeError('boom')),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for('3965') == canon, (
+            'a degraded status read must fail-safe RE-PIN, never detach'
+        )
+        assert pool.state(canon) == LaneState.ASSIGNED
+
+    async def test_terminal_status_detaches_and_reattach_elsewhere_succeeds(
+        self, tmp_path: Path,
+    ):
+        """TERMINAL status (e.g. 'done') -> DETACH (never re-pin); a fresh
+        acquire lands on a different free lane and reattaches the branch —
+        no 'already used by worktree' collision, WIP commit preserved."""
+        from orchestrator.git_ops import WorktreeInfo
+        from orchestrator.git_ops import _run as git_run
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'done'}, None),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for('3965') is None, (
+            'a terminal status must NOT be re-pinned'
+        )
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc != 0, 'terminal checkout must be detached'
+
+        rc, _, _ = await git_run(
+            ['git', 'rev-parse', '--verify', 'task/3965'], cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'task/3965 branch must survive the detach'
+
+        result = await git_ops.acquire_warm_lane('3965', 'main')
+        assert isinstance(result, WorktreeInfo), (
+            f'expected a reattach WorktreeInfo onto a fresh lane, got {result!r}'
+        )
+
+        rc, out, _ = await git_run(
+            ['git', 'rev-list', '--count', 'main..task/3965'], cwd=git_ops.project_root,
+        )
+        assert rc == 0 and int(out.strip()) > 0, (
+            'the pre-existing WIP commit on task/3965 must survive the reattach'
+        )
+
+    async def test_deleted_id_absent_from_healthy_read_detaches(
+        self, tmp_path: Path,
+    ):
+        """A HEALTHY status read that OMITS the id entirely (task deleted) ->
+        DETACH, same as a terminal status; a fresh acquire does not collide."""
+        from orchestrator.git_ops import WorktreeInfo
+        from orchestrator.git_ops import _run as git_run
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'999': 'pending'}, None),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for('3965') is None, (
+            'an id absent from a healthy read must NOT be re-pinned'
+        )
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc != 0, 'deleted-id checkout must be detached'
+
+        result = await git_ops.acquire_warm_lane('3965', 'main')
+        assert isinstance(result, WorktreeInfo), (
+            f'expected a reattach WorktreeInfo onto a fresh lane, got {result!r}'
+        )
+
+    async def test_prepinned_same_lane_is_idempotent_noop(self, tmp_path: Path):
+        """PRE-PINNED: recovery already re-pinned this id to this EXACT lane
+        (simulated via pool.restore_assignment before reconcile runs) ->
+        reconcile is a no-op: detach_lane_checkout is never called and the
+        lane stays ASSIGNED/attached."""
+        from orchestrator.git_ops import _run as git_run
+        from orchestrator.warm_lane_pool import LaneState
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+        canon = pool._match_lane(lane5)
+        assert canon is not None
+        pool.restore_assignment('3965', canon)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'in-progress'}, None),
+        )
+        git_ops.detach_lane_checkout = AsyncMock()
+
+        await harness._reconcile_lane_checkouts()
+
+        git_ops.detach_lane_checkout.assert_not_called()
+        assert pool.assignment_for('3965') == canon
+        assert pool.state(canon) == LaneState.ASSIGNED
+
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc == 0, 'HEAD must remain attached for an already-pinned lane (no-op)'
+
+    async def test_dup_checkout_detaches_unpinned_keeping_original_pin(
+        self, tmp_path: Path,
+    ):
+        """DUP-CHECKOUT: recovery pinned this id to a DIFFERENT lane
+        (_lane-2); the physically-checked-out duplicate (_lane-5) is
+        detached while the original pin is kept untouched."""
+        from orchestrator.git_ops import _run as git_run
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+        lane2 = git_ops.worktree_base / '_lane-2'
+        pool.restore_assignment('3965', lane2)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'in-progress'}, None),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        assert pool.assignment_for('3965') == lane2, (
+            'the original pin (_lane-2) must be kept untouched'
+        )
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc != 0, (
+            'the un-pinned duplicate checkout (_lane-5) must be detached'
+        )
+
+    async def test_never_steal_skips_when_lane_pinned_to_different_id(
+        self, tmp_path: Path, caplog,
+    ):
+        """NEVER-STEAL: _lane-5 is pinned to a DIFFERENT id (4031); reconcile
+        must skip the dup checkout entirely rather than stealing the lane
+        recovery already assigned to that other id."""
+        from orchestrator.git_ops import _run as git_run
+
+        harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
+        canon = pool._match_lane(lane5)
+        assert canon is not None
+        pool.restore_assignment('4031', canon)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'in-progress'}, None),
+        )
+        git_ops.detach_lane_checkout = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._reconcile_lane_checkouts()
+
+        git_ops.detach_lane_checkout.assert_not_called()
+        assert pool.assignment_for('4031') == canon, (
+            'the existing pin to a DIFFERENT id must never be stolen'
+        )
+        assert pool.assignment_for('3965') is None, (
+            'the never-steal case must skip entirely — 3965 must NOT be '
+            'pinned onto the lane already owned by 4031'
+        )
+        rc, _, _ = await git_run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=lane5)
+        assert rc == 0, 'never-steal must not detach the lane'
+        assert 'never-steal' in caplog.text, (
+            f'expected a never-steal warning in the log; got: {caplog.text!r}'
+        )
+
+    async def test_git_error_read_makes_zero_pool_mutations(self, tmp_path: Path):
+        """GIT-ERROR: lane_branch_checkouts() returns None -> reconcile makes
+        ZERO pool mutations (no restore_assignment, no detach_lane_checkout)."""
+        harness, git_ops, pool, _lane5 = await self._make_fixture(tmp_path)
+        git_ops.lane_branch_checkouts = AsyncMock(return_value=None)
+        git_ops.detach_lane_checkout = AsyncMock()
+        pool.restore_assignment = MagicMock(wraps=pool.restore_assignment)
+
+        harness.scheduler.get_statuses = AsyncMock(
+            return_value=({'3965': 'in-progress'}, None),
+        )
+
+        await harness._reconcile_lane_checkouts()
+
+        git_ops.detach_lane_checkout.assert_not_called()
+        pool.restore_assignment.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestMidRunRecycleLeak:
+    """Restart-INDEPENDENT leak: a recycled-lane re-seed failure must not
+    leave the new task's branch checked out at the (now-FREE) lane
+    (step-11 RED / step-12 GREEN — route the bare ``pool.release()`` calls
+    in the recycle/reuse fault paths through ``release_warm_lane`` instead,
+    which detaches before releasing).
+    """
+
+    async def test_reset_in_place_seed_failure_does_not_leak_checkout(
+        self, tmp_path: Path,
+    ):
+        """A recycled FREE lane whose re-seed fails must not leave task/555
+        checked out at the lane afterward — else the next create-once
+        acquire elsewhere collides with "already used by worktree"."""
+        from orchestrator.git_ops import GitOps, WarmLaneUnavailable
+        from orchestrator.git_ops import _run as git_run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        # Pre-create the default warm-lane CoW seed base so the pre-acquire
+        # base-health gate sees WarmBaseHealth.OK — it runs BEFORE the (here
+        # mocked-out) real seed step either way.
+        default_base = repo / '.worktrees' / '_merge-verify' / 'target'
+        default_base.mkdir(parents=True, exist_ok=True)
+        (default_base / '.keep').write_text('warm base sentinel\n')
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # _lane-0 is a recycled FREE lane already holding task/555 at the
+        # main tip (NO commits beyond main -> _orphan_has_commits is False
+        # -> the fresh reset-in-place recycle path is taken, not the γ
+        # reattach guard).  Pool state defaults to FREE with no assignment —
+        # exactly the "recycled" shape (a leftover checkout the pool doesn't
+        # know about yet).
+        lane0 = git_ops.worktree_base / '_lane-0'
+        lane0.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(lane0), '-b', 'task/555', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        git_ops._seed_warm_lane = AsyncMock(return_value=1)
+
+        result = await git_ops.acquire_warm_lane('555', 'main')
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'expected FAULT from the forced seed failure, got {result!r}'
+        )
+
+        checkouts = await git_ops.lane_branch_checkouts()
+        assert checkouts is not None
+        assert '555' not in checkouts, (
+            'task/555 must not still be checked out at _lane-0 after the '
+            'failing re-seed — a bare pool.release() without detaching '
+            'leaks the checkout, and a subsequent create-once acquire '
+            'elsewhere would collide with "already used by worktree"'
+        )
+        assert pool.assignment_for('555') is None, (
+            'the recycled lane must be released/unassigned after the '
+            'failing re-seed, not left dangling on a stale pin'
+        )

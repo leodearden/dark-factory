@@ -55,6 +55,7 @@ def startup_harness(tmp_path: Path, mock_orch_config) -> Harness:
     h._start_terminal_status_watcher = MagicMock()
     h._tag_task_modules = AsyncMock()
     h._recover_crashed_tasks = AsyncMock()
+    h._reconcile_lane_checkouts = AsyncMock()
     h._reconcile_stranded_in_progress = AsyncMock()
     h._tag_prd_metadata = AsyncMock()
 

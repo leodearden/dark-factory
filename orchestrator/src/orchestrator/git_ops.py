@@ -2377,7 +2377,11 @@ class GitOps:
                             '%s; releasing lane',
                             rc, lane,
                         )
-                    await self.warm_lane_pool.release(lane)
+                    # release_warm_lane (not a bare pool.release) — detaches
+                    # HEAD first so the branch _reset_warm_lane just checked
+                    # out here doesn't leak a "already used by worktree"
+                    # collision for the next acquire (task 2062 mid-run leak).
+                    await self.release_warm_lane(lane, branch_name)
                     return _seed_rc_to_unavailable(rc)
                 # Falls through to shared tail
 
@@ -2871,7 +2875,13 @@ class GitOps:
                     'retry for %s -> FAULT (escalate per 1859)',
                     lane, exc_info=True,
                 )
-                await self.warm_lane_pool.release(lane)
+                # release_warm_lane (not a bare pool.release) — detaches HEAD
+                # first so a branch left checked out by a partially-applied
+                # _reset_warm_lane doesn't leak a collision for the next
+                # acquire (task 2062 mid-run leak).
+                await self.release_warm_lane(
+                    lane, full_branch[len(self.config.branch_prefix):],
+                )
                 return WarmLaneUnavailable.FAULT
 
         # Reset succeeded (attempt 1 or 2).  Run the thin re-seed unchanged.
@@ -2893,7 +2903,13 @@ class GitOps:
                     '%s; releasing lane',
                     rc, lane,
                 )
-            await self.warm_lane_pool.release(lane)
+            # release_warm_lane (not a bare pool.release) — detaches HEAD
+            # first so the branch _reset_warm_lane just checked out here
+            # doesn't leak a collision for the next acquire (task 2062
+            # mid-run leak).
+            await self.release_warm_lane(
+                lane, full_branch[len(self.config.branch_prefix):],
+            )
             return _seed_rc_to_unavailable(rc)
 
         return None  # success — caller falls through to shared tail
@@ -2942,6 +2958,42 @@ class GitOps:
 
         await self.warm_lane_pool.release(lane_dir)
         logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
+
+    async def detach_lane_checkout(self, lane: Path, bare_id: str) -> bool:
+        """Commit WIP then detach *lane*'s HEAD, preserving branch and worktree.
+
+        Used by :meth:`Harness._reconcile_lane_checkouts` to free git's
+        single-checkout lock on a stale ``task/<bare_id>`` branch without
+        losing uncommitted work: :meth:`commit` snapshots WIP onto the
+        currently-checked-out branch first (mirrors the reclaim/
+        ``_reuse_warm_lane`` commit-before-mutate contract), THEN ``git
+        checkout --detach`` frees the branch for a future ``git worktree
+        add`` elsewhere.
+
+        Does NOT remove the worktree (would dangle the pool's registered
+        lane path) and does NOT delete the branch — the branch is exactly
+        the WIP-recovery handle the next acquire's ``_orphan_has_commits`` →
+        reattach → ``_reuse_warm_lane`` path depends on.
+
+        Returns:
+            True on success.  False (and logs at ERROR) if ``git checkout
+            --detach`` fails — the caller must NOT treat the branch as freed.
+        """
+        # commit() returns None when the tree is already clean — fine.
+        await self.commit(lane, 'chore: save WIP before lane-checkout reconcile detach')
+
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=lane)
+        if rc != 0:
+            logger.error(
+                'detach_lane_checkout: checkout --detach failed for %s (task %s): %s',
+                lane, bare_id, err,
+            )
+            return False
+        logger.info(
+            'detach_lane_checkout: detached %s (task %s) — branch and worktree retained',
+            lane, bare_id,
+        )
+        return True
 
     async def release_lane_for_terminal_task(
         self,
@@ -3151,6 +3203,52 @@ class GitOps:
             elif line.startswith('branch ') and line[len('branch '):].strip() == target:
                 return current
         return None
+
+    async def lane_branch_checkouts(self) -> dict[str, Path] | None:
+        """Map every pool-lane branch checkout to its bare task id.
+
+        Generalises :meth:`_worktree_holding_branch`'s porcelain parse:
+        instead of resolving one target branch, it walks every ``worktree``/
+        ``branch`` pair in ``git worktree list --porcelain`` and keeps those
+        whose branch is namespaced under ``config.branch_prefix`` AND whose
+        worktree path resolves to a registered :class:`WarmLanePool` lane
+        (via :meth:`WarmLanePool._match_lane`).  Non-task branches, detached
+        entries, and non-pool worktrees are filtered out.
+
+        Returns:
+            ``{bare_id: canonical_lane}`` (bare_id has ``branch_prefix``
+            stripped; canonical_lane is the pool's registered lane Path, not
+            necessarily identical to the porcelain path e.g. under symlinks).
+            ``None`` when the warm-lane pool is disabled, or when ``git
+            worktree list`` errors — callers must treat both as a no-op and
+            never mass-mutate on an unreliable read.
+        """
+        pool = self.warm_lane_pool
+        if pool is None:
+            return None
+
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=self.project_root,
+        )
+        if rc != 0:
+            return None
+
+        head_prefix = f'refs/heads/{self.config.branch_prefix}'
+        result: dict[str, Path] = {}
+        current: Path | None = None
+        for line in out.splitlines():
+            if line.startswith('worktree '):
+                current = Path(line[len('worktree '):].strip())
+                continue
+            if not line.startswith('branch ') or current is None:
+                continue
+            name = line[len('branch '):].strip()
+            if not name.startswith(head_prefix):
+                continue
+            matched = pool._match_lane(current)
+            if matched is not None:
+                result[name[len(head_prefix):]] = matched
+        return result
 
     async def _branch_has_commits_beyond_main(self, full_branch: str) -> bool:
         """Whether *full_branch* carries commits beyond main.
