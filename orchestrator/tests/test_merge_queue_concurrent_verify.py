@@ -4184,3 +4184,203 @@ class TestCascadeErrorContainment:
             f'Expected worker task to exit cleanly (exception() is None), '
             f'got {worker_task.exception()!r}.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2063: _redispatch-parked speculative permit accounting (signal test)
+# ---------------------------------------------------------------------------
+
+
+class _FakeEscalationQueue:
+    """Minimal fake escalation queue (per-file duplication convention — see
+    the identical helper in test_merge_queue_resource_audit.py).
+    """
+
+    def __init__(self) -> None:
+        self._open_l1 = False
+        self._seq = 0
+        self.submitted: list[Any] = []
+
+    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+        return self._open_l1
+
+    def make_id(self, task_id: str) -> str:
+        self._seq += 1
+        return f'esc-{self._seq}'
+
+    def submit(self, esc: Any) -> None:
+        self.submitted.append(esc)
+
+
+@pytest.mark.asyncio
+class TestRedispatchSpeculativeConservation:
+    """Signal/e2e regression lock (task 2063): a genuinely speculative item
+    parked on ``_redispatch`` must stay counted by
+    ``_inflight_speculative_count()`` throughout the REAL merger/verifier
+    pipeline — not just in the hand-constructed unit tests in
+    test_merge_queue_resource_audit.py.
+
+    MECHANISM — why a quarantined remote, not a literal single host:
+    ``_dispatch_item``'s fast-path host check is ``if allocator.
+    free_host_count() == 0: return None`` (merge_queue.py, DISPATCH-FILL).
+    On a literal single-host worker this branch is structurally
+    unreachable: dispatch and finalize are always in lockstep, so by the
+    time DISPATCH-FILL tries the next item, finalize has already released
+    the one host. ``HostAllocator.free_host_count()`` (verify_runner.py)
+    counts slots marked FREE with NO regard to quarantine, while
+    ``acquire_remote()`` skips quarantined names even when FREE. Injecting
+    a two-host allocator (local + 1 remote) and quarantining the remote up
+    front makes ``free_host_count()`` report 1 (the quarantined remote,
+    nominally free) while NO slot is actually acquirable once local is
+    busy — the exact "verify hosts < speculation_depth" condition, reached
+    deterministically through the real DISPATCH-FILL code path rather than
+    by poking ``_redispatch`` directly.
+
+    SCENARIO: A's local verify is gated then FAILS. While gated, the merger
+    speculatively merges B against A's tentative commit and hands it to the
+    verifier; DISPATCH-FILL's attempt to dispatch B finds
+    free_host_count() > 0 (the quarantined remote) but the real acquire()
+    fails (local busy, remote quarantined) — B parks on ``_redispatch``,
+    STILL ``speculative=True``. When A's gate releases (A fails), the
+    existing 'previous_failed' chain-invalidation path re-merges B against
+    actual main (speculative -> False) and re-dispatches it; B's second
+    local verify passes -> 'done'.
+    """
+
+    async def test_speculative_redispatch_item_stays_counted_through_real_pipeline(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """The I4 speculation-slot identity holds at every heartbeat-observable
+        point while a genuinely speculative item sits parked on
+        ``_redispatch``, and no ``merge_resource_leak`` escalation ever fires.
+        """
+        gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
+        _local_calls: list[int] = [0]
+
+        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
+            call = _local_calls[0]
+            _local_calls[0] += 1
+            if call == 0:
+                # A's verify: gate, then FAIL.
+                gate_a_entered.set()
+                await gate_a_release.wait()
+                return MagicMock(
+                    passed=False, summary='test_failure', test_output='FAILED',
+                    lint_output='', type_output='', category='test_failure',
+                    timed_out=False, verify_skipped=False,
+                )
+            # B's re-dispatched local verify (after the previous_failed remerge).
+            return MagicMock(
+                passed=True, summary='ok', test_output='ok', lint_output='',
+                type_output='', category='', timed_out=False, verify_skipped=False,
+            )
+
+        wt_a = await _make_branch_with_file(git_ops, 'task/rc-a', 'rc_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/rc-b', 'rc_b.py', 'b = 2\n')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        fake_esc_queue = _FakeEscalationQueue()
+        worker = SpeculativeMergeWorker(
+            git_ops, q, speculation_depth=2, escalation_queue=fake_esc_queue,
+        )
+        # Fast/deterministic: alarm on the very first violating heartbeat
+        # (documented test override — merge_queue.py's
+        # RESOURCE_AUDIT_ESCALATION_STREAK class-attr docstring).
+        worker.RESOURCE_AUDIT_ESCALATION_STREAK = 1
+
+        fake_remote = _make_fake_remote('laptop')
+        _inject_two_host_allocator(worker, fake_remote)
+        # Nominally FREE (never acquired) but unusable — see class docstring.
+        worker._runner_quarantine.add('laptop')
+
+        recorded_violations: list[list[str]] = []
+        _orig_violations = worker.speculation_accounting_violations
+
+        def _traced_violations() -> list[str]:
+            result = _orig_violations()
+            recorded_violations.append(result)
+            return result
+
+        worker.speculation_accounting_violations = _traced_violations  # type: ignore[method-assign]
+
+        req_a = _make_request('rc-a', 'task/rc-a', wt_a, config)
+        req_b = _make_request('rc-b', 'task/rc-b', wt_b, config)
+
+        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
+            worker_task = asyncio.create_task(worker.run())
+
+            await worker._queue.put(req_a)
+            await worker._queue.put(req_b)
+
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+
+            # Bounded poll (not a flat sleep): the merger's real git worktree
+            # + commit calls have variable latency, so wait until B has
+            # actually landed on _redispatch rather than guessing a delay.
+            deadline = asyncio.get_running_loop().time() + 15.0
+            while not worker._redispatch and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.05)
+
+            parked = list(worker._redispatch)
+            assert len(parked) == 1 and parked[0].speculative, (
+                f'Expected exactly one speculative item parked on _redispatch '
+                f'while A is gated (proves the fix is actually exercised); '
+                f'got {parked!r}.'
+            )
+
+            # Sample the audit at several heartbeat-observable points while
+            # the speculative item sits parked (the multi-heartbeat window
+            # the original false positive persisted across).
+            worker._maybe_log_queue_heartbeat(1_000_000.0)
+            worker._maybe_log_queue_heartbeat(1_000_100.0)
+            worker._maybe_log_queue_heartbeat(1_000_200.0)
+            assert worker.speculation_accounting_violations() == [], (
+                'speculation-slot identity must hold while the speculative '
+                'item is parked on _redispatch'
+            )
+
+            # A fails -> the existing 'previous_failed' chain-invalidation
+            # path re-merges B against actual main and re-dispatches it.
+            gate_a_release.set()
+
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
+
+            worker._maybe_log_queue_heartbeat(1_000_300.0)
+
+            await worker.stop()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(worker_task, timeout=5.0)
+
+        assert outcome_a.status != 'done', (
+            f'Expected A to fail (gated verify returns passed=False), got {outcome_a!r}'
+        )
+        assert outcome_b is not None and outcome_b.status == 'done', (
+            f'Expected B to land after remerge + re-verify, got {outcome_b!r}'
+        )
+
+        assert recorded_violations, 'expected at least one recorded audit sample'
+        assert all(v == [] for v in recorded_violations), (
+            f'speculation-slot identity must hold at every heartbeat-observable '
+            f'point (identity broken pre-fix while B sat uncounted on '
+            f'_redispatch); got samples: {recorded_violations!r}'
+        )
+
+        leak_escalations = [
+            esc for esc in fake_esc_queue.submitted
+            if getattr(esc, 'category', None) == 'merge_resource_leak'
+        ]
+        assert leak_escalations == [], (
+            f'Expected zero merge_resource_leak escalations, got {leak_escalations!r}'
+        )
+
+        from orchestrator.git_ops import _run as _git_run
+        _, main_files, _ = await _git_run(
+            ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=git_ops.project_root,
+        )
+        assert 'rc_b.py' in main_files, 'B (rc_b.py) must land on main after remerge'
+        assert 'rc_a.py' not in main_files, 'A (rc_a.py) must NOT land (verify failed)'
