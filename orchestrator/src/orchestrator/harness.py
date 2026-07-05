@@ -1938,8 +1938,14 @@ Output JSON matching the schema. Every task must appear in the output.
         # look planless/corrupt to the scan below — the Jul-3 incident this
         # guards against. Defer the ENTIRE recovery pass (no cleanup) rather
         # than destroy recoverable plans that merely appear empty because
-        # the mount has not come up yet.
-        if not self.git_ops.pool_storage_present():
+        # the mount has not come up yet. Gated on pool_in_use() (step-16
+        # review-fix): pool_storage_present() is permanently False on a
+        # pool-less host (its only writer never runs without a configured
+        # pool) — e.g. worktree_base.exists() is already True there from a
+        # prior COLD worktree — so without this gate every pool-less host
+        # would defer recovery and file a spurious escalation at every
+        # startup.
+        if self.git_ops.pool_in_use() and not self.git_ops.pool_storage_present():
             logger.warning(
                 'Crash recovery: pool storage absent/unmounted at %s — '
                 'deferring the ENTIRE recovery pass (no cleanup) to avoid '
@@ -2456,8 +2462,16 @@ Output JSON matching the schema. Every task must appear in the output.
         # APPEAR missing to the checks below — the Jul-3 incident this
         # guards against. Abort the ENTIRE sweep (no DB read, no
         # cleanup/quarantine, no prune tail) rather than risk treating a
-        # live lane as an orphan.
-        if not self.git_ops.pool_storage_present():
+        # live lane as an orphan. Gated on pool_in_use() (step-16/17
+        # review-fix): pool_storage_present() is permanently False on a
+        # pool-less host (its only writer never runs without a configured
+        # pool), and cold worktrees at worktree_base/<branch> make
+        # worktree_base.exists() True there too — without this gate, every
+        # pool-less host that has ever run a task would abort its sweep and
+        # file a spurious escalation at every startup. The resolve call
+        # below stays unconditional so a pool-less host on a build that
+        # pre-dates this gate can still auto-clear a stale open L1.
+        if self.git_ops.pool_in_use() and not self.git_ops.pool_storage_present():
             logger.warning(
                 'Orphan reaper: pool storage absent/unmounted at %s — '
                 'aborting the ENTIRE sweep (no cleanup/quarantine/prune) to '
