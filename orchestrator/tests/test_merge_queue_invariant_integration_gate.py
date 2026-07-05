@@ -102,7 +102,6 @@ from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
     InFlightMergeRegistry,
-    InflightStatus,
     InflightVerifyResult,
     MergeOutcome,
     MergeRequest,
@@ -310,8 +309,8 @@ async def _make_merged_item(
     return req, item
 
 
-def _wrap_verify_result(vr: InflightVerifyResult) -> asyncio.Future:
-    """Wrap a pre-computed InflightVerifyResult in an already-resolved Future.
+def _wrap_verify_result(vr: InflightVerifyResult) -> asyncio.Task:  # type: ignore[type-arg]
+    """Wrap a pre-computed InflightVerifyResult in an already-resolved Task.
 
     Lets style-C tests call ``_run_inflight_verify`` for the real vr, then
     build the InflightEntry ``_finalize_inflight`` expects without re-running
@@ -732,7 +731,7 @@ class TestScenario1SpeculativeCascade:
         # gets re-dispatched (see _finalize_inflight's FAIL/skip branch).
         assert outcome_a is not None and outcome_a.status not in ('done', 'already_merged'), (
             f'Expected N to fail (genuine VerifyResult failure, not '
-            f'RunnerUnavailable), got status={outcome_a.status!r}.'
+            f'RunnerUnavailable), got {outcome_a!r}.'
         )
 
         # ── N+1 (speculative downstream): must land 'done' after cascade ────
@@ -833,6 +832,9 @@ class TestScenario234VerifierLifecycleFaults:
         )
         redispatched = worker._redispatch.popleft()
         assert redispatched.request is req
+        assert isinstance(redispatched, RealMergeItem), (
+            f'RUNNER_UNAVAILABLE re-dispatch must produce a RealMergeItem, got {redispatched!r}'
+        )
 
         assert not req.result.done(), (
             'req.result must still be pending immediately after the '
