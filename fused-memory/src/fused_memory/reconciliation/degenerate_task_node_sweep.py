@@ -96,3 +96,63 @@ def extract_terminal_task_ids(tree: FilteredTaskTree | None) -> list[str]:
             seen.add(tid)
             result.append(tid)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Async I/O helpers
+# --------------------------------------------------------------------------- #
+
+
+async def sweep_degenerate_task_nodes(
+    memory_service,
+    project_id: str,
+    task_ids: list[str],
+    *,
+    name_templates: tuple[str, ...] = DEFAULT_TASK_NODE_NAME_TEMPLATES,
+    log: logging.Logger = logger,
+) -> dict:
+    """Delete degenerate (edge_count == 0) "tasks {id}" placeholder nodes.
+
+    For each ``task_id`` in *task_ids*, and each template in
+    *name_templates*, looks up every exact-name node via
+    ``memory_service.graphiti.find_duplicate_entity_nodes`` and deletes any
+    match whose ``edge_count`` is exactly 0 via
+    ``memory_service.graphiti.delete_entity_node``. A node with >= 1 valid
+    edge is NEVER deleted — this is a safety invariant, not a tuning knob.
+
+    Args:
+        memory_service: Object exposing a ``.graphiti`` backend with
+            ``find_duplicate_entity_nodes(name, *, group_id)`` and
+            ``delete_entity_node(uuid, *, group_id)``.
+        project_id: Graph/group_id to scope the lookup and delete to.
+        task_ids: Str task ids to check (typically from
+            ``extract_terminal_task_ids``).
+        name_templates: Node-name templates formatted with ``id=task_id``
+            (default: ``DEFAULT_TASK_NODE_NAME_TEMPLATES``).
+        log: Logger to use (default: this module's logger).
+
+    Returns:
+        dict with int counts: ``scanned`` (nodes examined across all
+        task_id/template combinations), ``degenerate`` (nodes seen with
+        edge_count == 0), ``deleted`` (successful deletes), ``errors``
+        (always 0 here — best-effort error tallying is layered in by
+        callers/hardening; see module callers for the wrapped variant).
+    """
+    stats = {'scanned': 0, 'degenerate': 0, 'deleted': 0, 'errors': 0}
+
+    for task_id in task_ids:
+        for template in name_templates:
+            name = template.format(id=task_id)
+            matches = await memory_service.graphiti.find_duplicate_entity_nodes(
+                name, group_id=project_id,
+            )
+            for match in matches:
+                stats['scanned'] += 1
+                if int(match['edge_count']) == 0:
+                    stats['degenerate'] += 1
+                    await memory_service.graphiti.delete_entity_node(
+                        match['uuid'], group_id=project_id,
+                    )
+                    stats['deleted'] += 1
+
+    return stats
