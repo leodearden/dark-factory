@@ -437,3 +437,105 @@ class _FakeEscalationQueue:
     def open_it(self):
         """Simulate a prior open L1 (for dedup tests)."""
         self._open_l1 = True
+
+
+# ── Shared quiescence helper ──────────────────────────────────────────────────
+
+
+def _assert_quiescent(
+    worker: SpeculativeMergeWorker,
+    main_sha: str,
+    requests: list[MergeRequest],
+) -> None:
+    """Assert the 5-surface QUIESCENCE contract holds for *worker*.
+
+    Called after each scenario to confirm the pipeline returned to a clean
+    resting state with no leaked permits, worktrees, ledger entries, or
+    unresolved Futures:
+
+      (a) every request in *requests* has resolved (done or cancelled) — no
+          dangling in-flight work left over from the scenario.
+      (b) worker.speculation_accounting_violations() == [] — I4 permit/cap
+          conservation holds.  Requires *worker* to still be ``_running``
+          (both accounting methods short-circuit to [] when not running —
+          see their docstrings — so a stopped worker would make this
+          assertion vacuous, not meaningful).
+      (c) worker.worktree_ledger_violations() == [] — I6 on-disk
+          ``_merge-*`` worktree ledger is fully accounted for.  Also
+          requires a running worker (same short-circuit).
+      (d) the request-liveness ledger is empty AFTER sweeping resolved
+          entries.  Resolution is detected PASSIVELY — RequestLedger has no
+          on-resolve hook, so a resolved request stays armed until
+          ``sweep_resolved()`` runs; calling it here before ``is_empty()``
+          is required, not optional.
+      (e) worker.two_layer_invariants(main_sha) == [] — *main_sha* MUST be a
+          REAL sha, never 'unknown': the base-chain and verify-base
+          sub-checks are silently skipped for the 'unknown' sentinel, which
+          would make this assertion pass vacuously rather than meaningfully.
+    """
+    for req in requests:
+        assert req.result.done() or req.result.cancelled(), (
+            f'Expected request {req.request_id!r} (task {req.task_id!r}) to '
+            f'have resolved (done or cancelled) at quiescence, but it is '
+            f'still pending'
+        )
+
+    spec_violations = worker.speculation_accounting_violations()
+    assert spec_violations == [], (
+        f'speculation_accounting_violations() non-empty at quiescence: {spec_violations!r}'
+    )
+
+    wt_violations = worker.worktree_ledger_violations()
+    assert wt_violations == [], (
+        f'worktree_ledger_violations() non-empty at quiescence: {wt_violations!r}'
+    )
+
+    # Resolution is passive — sweep before asserting emptiness (see
+    # RequestLedger.sweep_resolved's docstring).
+    worker._request_ledger.sweep_resolved()
+    assert worker._request_ledger.is_empty(), (
+        f'request-liveness ledger non-empty at quiescence: '
+        f'{worker._request_ledger.open_request_ids()!r}'
+    )
+
+    assert main_sha and main_sha != 'unknown', (
+        f'_assert_quiescent requires a REAL main_sha, got {main_sha!r}'
+    )
+    tli_violations = worker.two_layer_invariants(main_sha)
+    assert tli_violations == [], (
+        f'two_layer_invariants({main_sha!r}) non-empty at quiescence: {tli_violations!r}'
+    )
+
+
+# ── step-01 RED: shared quiescence helper + healthy-at-rest ─────────────────
+
+
+@pytest.mark.asyncio
+class TestQuiescenceContract:
+    """The 5-surface quiescence contract asserted by _assert_quiescent.
+
+    RED until the helper/module lands. Every §Boundary-test scenario below
+    calls _assert_quiescent after driving its fault — this class pins the
+    trivial healthy-at-rest baseline: a freshly-built, still-running worker
+    with no submitted work is already quiescent.
+    """
+
+    async def test_healthy_running_worker_is_quiescent(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+    ) -> None:
+        """A freshly-built running worker with no work is quiescent."""
+        worker = _make_worker(git_ops)
+        assert worker._running is True, 'precondition: a fresh worker starts running'
+
+        main_sha = await git_ops.get_main_sha()
+
+        _assert_quiescent(worker, main_sha, [])
+
+        snap = worker.snapshot()
+        assert snap['resource_audit'] == {
+            'speculation_accounting': [],
+            'worktree_ledger': [],
+        }
