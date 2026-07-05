@@ -2678,6 +2678,22 @@ class TaskKnowledgeSync(BaseStage):
         )
         report.stats['stale_flag_markers_gc_swept'] = gc_swept
 
+        # --- stage1_flag_marker terminal-task-status GC (task 2103) ---
+        # Complements the age-only/fp: sweep immediately above: that sweep has
+        # no predicate on the REFERENCED TASK's own status, so a finding whose
+        # task goes done/cancelled soon after being flagged is both recent
+        # (<14 days) and typically bare-numeric (not fp:) — both existing
+        # predicates evaluate False and the marker is never collected (the
+        # confirmed root cause of the 2026-07-05 solar_challenge_platform
+        # incident's 16-record manual bulk GC). Runs unconditionally on both
+        # full and remediation paths; degrades to a no-op (0) when taskmaster
+        # or project_root is unset. Explicit zero so downstream consumers
+        # never need a .get(..., 0) fallback.
+        terminal_gc_swept = await _sweep_terminal_task_flag_markers(
+            self.memory, self.taskmaster, self.project_root, self.project_id, run_id,
+        )
+        report.stats['terminal_task_flag_markers_gc_swept'] = terminal_gc_swept
+
         # --- stage2_persistence_marker age-based GC (task 2095) ---
         # The stage2_persistence_marker pool is written by _track_flag_persistence
         # (Channel 3: persistence-counter markers, distinct from stage1_flag_marker
