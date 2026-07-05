@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Literal, NamedTuple, TypedDict
+from typing import Any, Literal, NamedTuple, TypedDict
 
 from orchestrator.config import GitConfig
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -166,6 +166,13 @@ PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
 # / find_inflight_merge_worktree — the same mechanism that already exempts
 # _spec-*/_lane-*/_solo-* worktrees — with no explicit skip required.
 PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
+
+# Sentinel filename marking worktree_base as backed by live pool storage
+# (task 2099).  Lives ON the pool storage itself (plain dir or real mount
+# alike — substrate-independent, no config knob), so it disappears along
+# with an unmounted mountpoint even though the mountpoint DIR still exists.
+# See GitOps.pool_storage_present() / mark_pool_storage_present().
+POOL_ROOT_SENTINEL: str = '.pool-root'
 
 # The _iact-* band (worktree_base/<iact_prefix><slug>, config.iact_prefix
 # default '_iact-') minted by GitOps.create_interactive_worktree is
@@ -892,9 +899,82 @@ class GitOps:
             Callable[[list[str]], Awaitable[set[str]]] | None
         ) = None
         self.warm_lane_dispatched_predicate: Callable[[str], bool] | None = None
+        # Pool-storage-absent safety-valve callback (task 2099).  Declared
+        # here (default None), installed by Harness.__init__ — mirrors the
+        # declare-on-callee / install-in-harness pattern used by
+        # warm_lane_reclaim_candidate_provider above.  Fired best-effort by
+        # _note_pool_storage_absent() from every destructive-sweep guard site
+        # (prune_worktrees, _run_warm_lane_gc_reclaim, acquire create-once)
+        # when pool_storage_present() is False.  None (unwired) is
+        # byte-identical to today — e.g. cli/recover/evals call sites.
+        self._on_pool_storage_absent: Callable[..., Any] | None = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
+
+    def pool_storage_present(self) -> bool:
+        """True iff worktree_base is backed by live pool storage (task 2099).
+
+        Checks for the ``POOL_ROOT_SENTINEL`` (``.pool-root``) sentinel FILE
+        directly inside :attr:`worktree_base`.  The sentinel lives ON the pool
+        storage itself, so it disappears along with an unmounted mountpoint
+        even though the mountpoint directory still exists — unlike
+        ``worktree_base.exists()``, which is True for an empty, unmounted
+        mountpoint dir (the root cause of the Jul-3 incident this guards
+        against).
+
+        Fail-safe: any ``OSError`` (e.g. a torn read racing a concurrent
+        mount transition) is treated as absent.  Never raises.
+        """
+        try:
+            return (self.worktree_base / POOL_ROOT_SENTINEL).is_file()
+        except OSError:
+            logger.debug(
+                'pool_storage_present: stat error checking %s — treating as '
+                'absent (fail-safe)',
+                self.worktree_base,
+                exc_info=True,
+            )
+            return False
+
+    def mark_pool_storage_present(self) -> None:
+        """Write the ``.pool-root`` sentinel marking storage as present.
+
+        Idempotent best-effort: creates :attr:`worktree_base` if missing,
+        then writes the sentinel file (a no-op if it already exists).  Any
+        ``OSError`` is logged and swallowed — never raises, since a failed
+        mark must not block whatever seed/warmup operation triggered it.
+
+        Called from exactly ONE chokepoint — :meth:`_seed_warm_lane` on
+        ``rc == 0`` — because a successful seed proves the mount is present
+        and writable (see that method's docstring for the full rationale).
+        """
+        try:
+            self.worktree_base.mkdir(parents=True, exist_ok=True)
+            (self.worktree_base / POOL_ROOT_SENTINEL).touch(exist_ok=True)
+        except OSError:
+            logger.warning(
+                'mark_pool_storage_present: failed to write sentinel under %s',
+                self.worktree_base,
+                exc_info=True,
+            )
+
+    def _note_pool_storage_absent(self) -> None:
+        """Best-effort dispatch to the injected ``_on_pool_storage_absent`` hook.
+
+        No-op when unwired (default None).  Swallows any exception raised by
+        the callback so a guard site can never be broken by escalation-filing
+        failing — mirrors the other declare-on-callee callback dispatchers in
+        this class.
+        """
+        if self._on_pool_storage_absent is None:
+            return
+        try:
+            self._on_pool_storage_absent()
+        except Exception:
+            logger.warning(
+                '_note_pool_storage_absent: callback raised', exc_info=True,
+            )
 
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
