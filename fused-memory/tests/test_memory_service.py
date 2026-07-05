@@ -33,6 +33,7 @@ def service(mock_config):
     svc.graphiti.get_edge_invalid_at = AsyncMock(return_value=None)
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+    svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
