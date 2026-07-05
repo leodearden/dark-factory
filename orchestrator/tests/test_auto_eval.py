@@ -19,6 +19,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.task_status import ACTIVE_TASK_STATUSES
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -95,6 +96,28 @@ def _make(
     scheduler = MagicMock()
     scheduler.dispatch_tool = _dispatch
     scheduler.update_task = update_task
+    # Default: no prior auto-eval redo siblings. Tests exercising the
+    # dedupe/supersede behaviour override this per-test.
+    scheduler.get_tasks = AsyncMock(return_value=[])
+
+    async def _derive_statuses(*, ids: list[str] | None = None):
+        # _filter_cancellable_redos re-checks candidates via get_statuses
+        # (task 2075 review amendment), not get_tasks. Deriving its
+        # response from whatever scheduler.get_tasks currently returns
+        # (looked up at call time, so per-test get_tasks overrides are
+        # picked up automatically) keeps the two in sync without every
+        # supersede test having to stub get_statuses separately.
+        tasks = await scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
+        status_by_id = {
+            str(t.get('id')): t.get('status')
+            for t in tasks
+            if isinstance(t, dict)
+        }
+        if ids is None:
+            return dict(status_by_id), None
+        return {i: status_by_id[i] for i in ids if i in status_by_id}, None
+
+    scheduler.get_statuses = AsyncMock(side_effect=_derive_statuses)
     harness.scheduler = scheduler
 
     metadata: dict = {
@@ -152,6 +175,152 @@ def _make_report(
         block_phase=block_phase,
         cost_usd=0.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Harness._find_prior_auto_eval_redos
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_prior_auto_eval_redos_filters_siblings():
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_tasks = AsyncMock(return_value=[
+        # (a) matching siblings — same spawned_from, auto_eval_redo truthy.
+        {
+            'id': 'redo-A',
+            'status': 'deferred',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-B',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        # (b) non-redo task sharing spawned_from — must be excluded.
+        {
+            'id': 'other',
+            'metadata': {'spawned_from': 'orig-task'},
+        },
+        # (c) redo for a different parent — must be excluded.
+        {
+            'id': 'redo-X',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'someone-else'},
+        },
+        # (d) the original task itself — must be excluded.
+        {
+            'id': 'orig-task',
+            'metadata': {},
+        },
+    ])
+
+    result = await harness._find_prior_auto_eval_redos('orig-task')
+
+    assert set(result) == {'redo-A', 'redo-B'}
+    harness.scheduler.get_tasks.assert_awaited_once_with(
+        statuses=ACTIVE_TASK_STATUSES,
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_prior_auto_eval_redos_fail_open():
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_tasks = AsyncMock(side_effect=RuntimeError('boom'))
+
+    result = await harness._find_prior_auto_eval_redos('orig-task')
+
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Harness._filter_cancellable_redos (task 2075 review amendment)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_filter_cancellable_redos_excludes_non_pending():
+    """Only still-'pending' candidates are safe to auto-cancel.
+
+    'in-progress' may be real agent work in flight; 'blocked' may be an
+    open human-facing escalation; 'deferred' may be a steward's deliberate
+    hold (WORKFLOW_PRESERVE_STATUSES treats 'deferred' the same as
+    'blocked'/'merge-deferred' — "leave this alone, human will sort it");
+    'review' is under active verification; 'merge-deferred' is train-parked.
+    None of these should be silently superseded.
+    """
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_statuses = AsyncMock(return_value=(
+        {
+            'redo-pending': 'pending',
+            'redo-deferred': 'deferred',
+            'redo-in-progress': 'in-progress',
+            'redo-blocked': 'blocked',
+            'redo-review': 'review',
+            'redo-merge-deferred': 'merge-deferred',
+        },
+        None,
+    ))
+
+    result = await harness._filter_cancellable_redos([
+        'redo-pending', 'redo-deferred', 'redo-in-progress',
+        'redo-blocked', 'redo-review', 'redo-merge-deferred',
+    ])
+
+    assert result == ['redo-pending']
+    harness.scheduler.get_statuses.assert_awaited_once_with(
+        ids=[
+            'redo-pending', 'redo-deferred', 'redo-in-progress',
+            'redo-blocked', 'redo-review', 'redo-merge-deferred',
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_filter_cancellable_redos_excludes_raced_to_terminal():
+    """A candidate that completed/was cancelled since the snapshot must not
+    be re-cancelled — get_statuses reports its current (terminal) status,
+    which is not a member of _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES.
+    """
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_statuses = AsyncMock(return_value=(
+        {'redo-still-here': 'pending', 'redo-done': 'done'},
+        None,
+    ))
+
+    result = await harness._filter_cancellable_redos(
+        ['redo-still-here', 'redo-done'],
+    )
+
+    assert result == ['redo-still-here']
+
+
+@pytest.mark.asyncio
+async def test_filter_cancellable_redos_fail_open():
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_statuses = AsyncMock(
+        return_value=({}, RuntimeError('boom')),
+    )
+
+    result = await harness._filter_cancellable_redos(['redo-1'])
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_filter_cancellable_redos_empty_candidates_skips_query():
+    harness = Harness.__new__(Harness)
+    harness.scheduler = MagicMock()
+    harness.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+    result = await harness._filter_cancellable_redos([])
+
+    assert result == []
+    harness.scheduler.get_statuses.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -360,3 +529,227 @@ async def test_auto_eval_back_link_forwards_merge_mode(tmp_path: Path, monkeypat
     assert blob.get('memory_hints') == ['hint-A'], (
         f"Sibling memory_hints must survive in written blob; got: {blob}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Supersede prior auto-eval redo siblings on repeated re-block (task 2075)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_supersedes_prior_redo_siblings(tmp_path: Path):
+    f = _make(project_root=tmp_path / 'proj')
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-1',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-2',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    submitted = [c for c in f.submit_calls if c[0] == 'submit_task']
+    status_calls = [c for c in f.submit_calls if c[0] == 'set_task_status']
+    cancelled = [c for c in status_calls if c[1].get('status') == 'cancelled']
+    flipped = [c for c in status_calls if c[1].get('status') == 'pending']
+
+    assert len(submitted) == 1
+    assert {c[1].get('id') for c in cancelled} == {'redo-old-1', 'redo-old-2'}
+    # The new redo's own deferred → pending flip must still fire.
+    assert len(flipped) == 1
+    assert flipped[0][1].get('id') == 'redo-1'
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert len(emit_calls) == 1
+    data = emit_calls[0].kwargs['data']
+    assert set(data['superseded_redo_ids']) == {'redo-old-1', 'redo-old-2'}
+
+
+@pytest.mark.asyncio
+async def test_no_supersede_when_no_prior_redos(tmp_path: Path):
+    """Regression guard: happy path unchanged when there are no prior redos."""
+    f = _make(project_root=tmp_path / 'proj')
+    # _make's default scheduler.get_tasks stub returns [] (no prior siblings).
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    status_calls = [c for c in f.submit_calls if c[0] == 'set_task_status']
+    cancelled = [c for c in status_calls if c[1].get('status') == 'cancelled']
+    flipped = [c for c in status_calls if c[1].get('status') == 'pending']
+
+    assert cancelled == []
+    assert len(flipped) == 1
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert len(emit_calls) == 1
+    assert emit_calls[0].kwargs['data']['superseded_redo_ids'] == []
+
+
+@pytest.mark.asyncio
+async def test_no_supersede_when_submit_fails(tmp_path: Path):
+    """Regression guard: a failed/id-less submit_task must preserve prior
+    redo siblings.
+
+    _maybe_auto_eval returns early (harness.py, before the supersede block)
+    when submit_task fails to produce a new_task_id. If the supersede
+    cancellation ran anyway, prior redos would be cancelled with no live
+    replacement — violating the 'at most one live redo per spawned_from'
+    invariant by leaving zero. The ordering (query prior siblings before
+    submit, cancel only after a replacement is confirmed) exists precisely
+    to prevent this.
+    """
+    f = _make(
+        project_root=tmp_path / 'proj',
+        submit_returns={'error': 'curator full'},
+    )
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-1',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    status_calls = [c for c in f.submit_calls if c[0] == 'set_task_status']
+    cancelled = [c for c in status_calls if c[1].get('status') == 'cancelled']
+    assert cancelled == []
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert emit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_supersede_excludes_non_pending_siblings(tmp_path: Path):
+    """Only still-'pending' prior redos are superseded.
+
+    'in-progress' (active agent work), 'blocked' (open human escalation),
+    'deferred' (possibly a steward's deliberate hold — WORKFLOW_PRESERVE_STATUSES
+    treats it the same as 'blocked'/'merge-deferred'), 'review' (active
+    verification), and 'merge-deferred' (train-parked) prior redos must all
+    be left alone.
+    """
+    f = _make(project_root=tmp_path / 'proj')
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-deferred',
+            'status': 'deferred',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-in-progress',
+            'status': 'in-progress',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-blocked',
+            'status': 'blocked',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-review',
+            'status': 'review',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-merge-deferred',
+            'status': 'merge-deferred',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    status_calls = [c for c in f.submit_calls if c[0] == 'set_task_status']
+    cancelled_ids = {
+        c[1].get('id') for c in status_calls if c[1].get('status') == 'cancelled'
+    }
+    assert cancelled_ids == set()
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert len(emit_calls) == 1
+    assert emit_calls[0].kwargs['data']['superseded_redo_ids'] == []
+
+
+@pytest.mark.asyncio
+async def test_supersede_cancel_failure_is_isolated(tmp_path: Path):
+    """One stale sibling's cancel dispatch raising must not abort the other
+    cancellation, the new redo's pending flip, back-link, or event emission.
+    """
+    f = _make(project_root=tmp_path / 'proj')
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-1',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-2',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    calls: list[tuple[str, dict]] = []
+
+    async def _flaky_dispatch(
+        name: str, arguments: dict, *, timeout: float = 15,
+    ) -> dict:
+        calls.append((name, arguments))
+        if (
+            name == 'set_task_status'
+            and arguments.get('id') == 'redo-old-1'
+            and arguments.get('status') == 'cancelled'
+        ):
+            raise RuntimeError('transient dispatch failure')
+        if name == 'submit_task':
+            return {'task_id': 'redo-1', 'status': 'deferred'}
+        return {'ok': True}
+
+    f.harness.scheduler.dispatch_tool = _flaky_dispatch
+
+    # Must not raise despite the failing cancel dispatch.
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    cancelled_ids = {
+        c[1].get('id') for c in calls
+        if c[0] == 'set_task_status' and c[1].get('status') == 'cancelled'
+    }
+    assert cancelled_ids == {'redo-old-1', 'redo-old-2'}
+
+    flipped = [
+        c for c in calls
+        if c[0] == 'set_task_status' and c[1].get('status') == 'pending'
+    ]
+    assert len(flipped) == 1
+    assert flipped[0][1].get('id') == 'redo-1'
+
+    f.update_task.assert_awaited_once()
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert len(emit_calls) == 1
+    assert set(emit_calls[0].kwargs['data']['superseded_redo_ids']) == {
+        'redo-old-1', 'redo-old-2',
+    }
