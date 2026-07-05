@@ -18,6 +18,21 @@ Orphan markers are deleted (not updated in place) for two reasons:
     on the next MISS cycle (at most one extra re-escalation, within the existing
     best-effort-replacement tolerance).
 
+Taskless markers (task 2108)
+-----------------------------
+In addition to the missing-``kind`` orphans above, this sweep also purges
+stage1_flag_marker records that carry a valid ``kind`` but lack a usable
+``task_id`` (missing key, ``None``, or ``''``) — see ``find_taskless_markers``.
+This is safe for the same self-healing reason as above, plus one more:
+``mem0_dedup.find_prior_memories`` filters candidate priors by
+``str(meta.get('task_id', '')) != task_id_str`` (see
+``fused_memory.reconciliation.flag_dedup``), so a marker without a task_id can
+*never* be returned as a dedup prior. It cannot collapse a repeat flag,
+cannot suppress re-escalation, and Stage 2 never sweeps it either — it is
+pure dead weight from the moment it is written. Deleting it therefore loses
+zero dedup capability; if the underlying flag recurs, the next MISS cycle
+writes a fresh marker with both ``kind`` and ``task_id`` set.
+
 Enumeration strategy
 --------------------
 Markers are enumerated via ``get_memories_by_metadata(filters={'source':MARKER_SOURCE})``,
@@ -77,6 +92,29 @@ def find_orphan_markers(members: list[dict]) -> list[dict]:
     return [
         m for m in members
         if (m.get('metadata') or {}).get('kind') != MARKER_KIND
+    ]
+
+
+def find_taskless_markers(members: list[dict]) -> list[dict]:
+    """Return members whose metadata lacks a usable ``task_id`` (task 2108).
+
+    Mirrors the ``task_id is None or task_id == ''`` emptiness guard used by
+    ``flag_dedup.filter_suppressed`` — a marker is taskless when its
+    ``task_id`` is missing, ``None``, or ``''``. Numeric and ``fp:``-hash
+    task_ids are valid and are never considered taskless, regardless of
+    ``kind``.
+
+    Args:
+        members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+
+    Returns:
+        Subset of *members* for which ``metadata.get('task_id')`` is missing,
+        ``None``, or ``''``. Order is preserved. An all-valid input returns ``[]``.
+    """
+    return [
+        m for m in members
+        if (m.get('metadata') or {}).get('task_id') in (None, '')
     ]
 
 
