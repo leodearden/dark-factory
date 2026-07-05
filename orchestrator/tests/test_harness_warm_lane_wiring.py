@@ -1880,3 +1880,113 @@ def test_seed_rc_76_maps_to_base_absent():
     from orchestrator.git_ops import WarmLaneUnavailable, _seed_rc_to_unavailable
 
     assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT
+
+
+# ===========================================================================
+# Task 2062: warm-lane restart recovery — reconcile stale branch checkouts
+# ===========================================================================
+#
+# ROOT CAUSE: release_warm_lane only detaches a lane's HEAD; it never removes
+# the worktree, so after a restart git still has task/<id> checked out at the
+# old lane while the in-memory pool assignment is empty.  Re-dispatch then
+# grabs a DIFFERENT lane and `git worktree add` collides with "already used by
+# worktree".  These tests build the primitives (lane_branch_checkouts,
+# detach_lane_checkout) and the Harness-level reconciler
+# (_reconcile_lane_checkouts) that closes the gap, plus the fix for a
+# restart-independent mid-run leak in the recycle/reuse release paths.
+
+
+@pytest.mark.asyncio
+class TestLaneBranchCheckouts:
+    """GitOps.lane_branch_checkouts() — {bare_id: canonical_lane} built from
+    git's authoritative `git worktree list --porcelain` (step-1 RED / step-2 GREEN).
+    """
+
+    async def test_maps_pool_lane_branches_to_bare_ids(self, tmp_path: Path):
+        """Two pool lanes checked out on task/<id> branches map to {id: lane};
+        a non-pool worktree on a non-task branch is filtered out."""
+        from orchestrator.git_ops import GitOps
+        from orchestrator.git_ops import _run as git_run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=2,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=2)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        lane0 = git_ops.worktree_base / '_lane-0'
+        lane1 = git_ops.worktree_base / '_lane-1'
+        lane0.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(lane0), '-b', 'task/111', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(lane1), '-b', 'task/222', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        # Non-pool worktree on a non-task branch — must be filtered out.
+        side = tmp_path / 'side'
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(side), '-b', 'feature/x', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        result = await git_ops.lane_branch_checkouts()
+
+        assert result == {
+            '111': pool._match_lane(lane0),
+            '222': pool._match_lane(lane1),
+        }
+
+    async def test_returns_none_when_pool_disabled(self, tmp_path: Path):
+        """warm_lane_pool disabled (size=0) -> lane_branch_checkouts() returns None."""
+        from orchestrator.git_ops import GitOps
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=2,
+            git=GitConfig(warm_lane_pool=False),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=0)
+        assert git_ops.warm_lane_pool is None
+
+        assert await git_ops.lane_branch_checkouts() is None
+
+    async def test_returns_none_on_git_error(self, tmp_path: Path):
+        """`git worktree list` failing (non-zero rc) -> None (fail-safe, never mass-mutate)."""
+        from orchestrator.git_ops import GitOps
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=2,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=2)
+        assert git_ops.warm_lane_pool is not None
+
+        async def fake_run(cmd, cwd=None):
+            if 'worktree' in cmd and 'list' in cmd:
+                return (128, '', 'fatal: boom')
+            return (0, '', '')
+
+        with patch('orchestrator.git_ops._run', side_effect=fake_run):
+            result = await git_ops.lane_branch_checkouts()
+
+        assert result is None
