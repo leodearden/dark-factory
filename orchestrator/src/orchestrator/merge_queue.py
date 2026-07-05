@@ -5527,13 +5527,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # self._speculation_controller.snapshot()) plus
             # inflight_speculative — the count of speculative items now owned
             # by the verifier (self._inflight entries with was_speculative +
-            # self._verifier_queue items with .speculative; same CPython
-            # internal-deque read as the 'entries' section above). Together
-            # these make the permit-conservation identity slot_available +
-            # held_by_merger + inflight_speculative == depth fully computable
-            # from snapshot() (task iota's conservation audit). Pure
-            # synchronous read — no await, no git calls. No collision with
-            # existing keys.
+            # self._verifier_queue items with .speculative + self._redispatch
+            # items with .speculative — task 2063's fix for the parked-item
+            # under-count; same CPython internal-deque read as the 'entries'
+            # section above). Together these make the permit-conservation
+            # identity slot_available + held_by_merger + inflight_speculative
+            # == depth fully computable from snapshot() (task iota's
+            # conservation audit). Pure synchronous read — no await, no git
+            # calls. No collision with existing keys.
             'speculation': {
                 **self._speculation_controller.snapshot(),
                 'inflight_speculative': self._inflight_speculative_count(),

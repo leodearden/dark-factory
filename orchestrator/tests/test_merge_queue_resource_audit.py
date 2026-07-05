@@ -218,14 +218,18 @@ def _make_spec_item(tmp_path: Path, *, speculative: bool):
     Post task-o: SpeculativeItem is a TypeAlias = RealMergeItem | DecidedItem,
     not a constructor — build the REAL arm directly. RealMergeItem has no
     __post_init__ and the counter under test reads only ``.speculative``, so
-    a bare MagicMock request is fine here (no real asyncio.Future needed,
+    a near-bare MagicMock request is fine here (no real asyncio.Future needed,
     unlike test_merge_speculation.py's fuller _make_spec_item which drives
-    _run_inflight_verify).
+    _run_inflight_verify). ``enqueued_at`` is set to a real float (rather than
+    left as an auto-attribute MagicMock) because full ``snapshot()`` calls
+    build an 'entries' dict per queued item and compute
+    ``max(0.0, now - req.enqueued_at)``, which raises TypeError comparing a
+    bare MagicMock against a float.
     """
     from orchestrator.merge_types import RealMergeItem
 
     return RealMergeItem(
-        request=MagicMock(),
+        request=MagicMock(enqueued_at=1_000_000.0),
         merge_result=MagicMock(merge_commit='deadbeef01234567890a'),
         merge_wt=tmp_path / '_merge-x',
         base_sha='aabbccdd00000000aaaa',
