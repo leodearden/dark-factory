@@ -27,7 +27,9 @@ This module builds up the guard from the bottom:
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -109,3 +111,46 @@ class TestPoolStoragePresentPredicate:
 
         monkeypatch.setattr(Path, 'is_file', _raise)
         assert git_ops.pool_storage_present() is False
+
+
+@pytest.mark.asyncio
+class TestPruneWorktreesGuard:
+    """prune_worktrees() refuses ``git worktree prune`` when pool storage is
+    absent (step-3/4) — this is the direct fix for the Jul-3 incident: an
+    unmounted mountpoint dir must never let git "clean up" every registered
+    lane + _merge-verify admin entry."""
+
+    async def test_prune_skipped_when_storage_absent(self, git_ops: GitOps, caplog):
+        # base exists (dir present) but the sentinel was never written —
+        # simulates an unmounted mountpoint with a live, empty mount dir.
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        assert not git_ops.pool_storage_present()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', mock_run),
+        ):
+            await git_ops.prune_worktrees()
+
+        mock_run.assert_not_called()
+        callback.assert_called_once()
+        assert any('pool storage' in r.message.lower() for r in caplog.records), (
+            f'Expected a loud WARNING naming pool storage; got '
+            f'{[r.message for r in caplog.records]}'
+        )
+
+    async def test_prune_runs_when_storage_present(self, git_ops: GitOps):
+        git_ops.mark_pool_storage_present()
+        assert git_ops.pool_storage_present()
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with patch('orchestrator.git_ops._run', mock_run):
+            await git_ops.prune_worktrees()
+
+        mock_run.assert_awaited_once_with(
+            ['git', 'worktree', 'prune'], cwd=git_ops.project_root,
+        )
