@@ -366,3 +366,44 @@ class TestReapOrphanedMergeWorktreesFailOpen:
         assert str(orphan.resolve()) in report['reaped'], (
             f'an unrelated aged orphan must still be reaped: {report!r}'
         )
+
+    async def test_scandir_failure_does_not_raise_and_preserves_readoptions(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A TOCTOU disappearance of ``worktree_base`` between the ``is_dir()``
+        guard and the ``os.scandir`` must NOT raise out of the method — it
+        returns the report-so-far, preserving re-adoptions applied before the
+        scan.  Honours the never-raise contract self-containedly (not just via
+        the harness caller's try/except).
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+
+        # A recovered in-flight worktree re-adopted BEFORE the reap scan.
+        inflight = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+        monkeypatch.setattr(
+            git_ops, 'find_inflight_merge_worktree',
+            AsyncMock(return_value=inflight),
+        )
+
+        # worktree_base is a real dir (is_dir guard passes) but the scandir
+        # itself blows up mid-sweep (base vanished / unreadable).
+        assert git_ops.worktree_base.is_dir()
+
+        def _boom_scandir(path: object) -> object:
+            raise OSError('base vanished')
+
+        monkeypatch.setattr('orchestrator.merge_queue.os.scandir', _boom_scandir)
+
+        report = await worker.reap_orphaned_merge_worktrees(
+            recovered_branches=['recovered-x'], now=_NOW,
+        )
+
+        # No raise; reap scan skipped, but the pre-scan re-adoption survives.
+        assert report['reaped'] == []
+        assert str(inflight.resolve()) in report['readopted']
+        assert inflight.resolve() in {
+            p.resolve() for p in worker._owned_merge_worktrees
+        }

@@ -5193,8 +5193,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # re-adopted above (re-adoption is exempt from the grace gate).
         owned = {p.resolve() for p in self._owned_merge_worktrees}
 
-        with os.scandir(base) as it:
-            candidates = list(it)
+        try:
+            with os.scandir(base) as it:
+                candidates = list(it)
+        except OSError:
+            # Fail-open: worktree_base vanished / became unreadable in the
+            # TOCTOU window after the is_dir() guard above.  Honour the
+            # never-raise contract — return the report-so-far (any re-adoptions
+            # already applied are preserved) rather than aborting startup.
+            # Mirrors worktree_ledger_violations' defensive scan wrap.
+            logger.warning(
+                'reap_orphaned_merge_worktrees: scandir of %s failed — '
+                'skipping reap scan this sweep', base, exc_info=True,
+            )
+            candidates = []
         for entry in candidates:
             name = entry.name
             if not name.startswith('_merge-') or name == PERSISTENT_MERGE_WORKTREE_NAME:
