@@ -43,22 +43,60 @@ _mod = _load_module()
 # Helpers
 # ===========================================================================
 
-def _member(id: str, kind: str | None = 'stage1_flag_marker') -> dict:
-    """Build a scroll-shaped member dict."""
+def _member(
+    id: str,
+    kind: str | None = 'stage1_flag_marker',
+    task_id: str | None = '1970',
+) -> dict:
+    """Build a scroll-shaped member dict.
+
+    Defaults to the production shape written by
+    ``flag_dedup._write_and_confirm_marker``: both ``kind`` and ``task_id``
+    present. Pass ``kind=None`` / ``task_id=None`` to omit either key and
+    isolate the corresponding orphan dimension.
+    """
     metadata: dict = {'source': 'stage1_flag_marker'}
     if kind is not None:
         metadata['kind'] = kind
+    if task_id is not None:
+        metadata['task_id'] = task_id
     return {'id': id, 'created_at': '2026-01-01T00:00:00Z', 'metadata': metadata}
 
 
 def _orphan(id: str) -> dict:
-    """Member that has source but no kind — the orphan shape."""
+    """Member that has source and task_id but no kind — the kind-orphan shape.
+
+    Carries a task_id so it isolates the kind dimension only (does not also
+    trip the taskless predicate).
+    """
     return _member(id, kind=None)
 
 
 def _wrong_kind(id: str) -> dict:
-    """Member with source and a mismatched kind value."""
+    """Member with source, task_id, and a mismatched kind value.
+
+    Carries a task_id so it isolates the kind dimension only.
+    """
     return _member(id, kind='something_else')
+
+
+def _taskless(id: str) -> dict:
+    """Member that has source+kind but NO task_id key — the 1e2b9417 shape.
+
+    This is the orphan class task 2108 adds: a stage1_flag_marker with a
+    valid kind that is nonetheless dead weight because it lacks a task_id
+    (see find_taskless_markers).
+    """
+    return _member(id, kind='stage1_flag_marker', task_id=None)
+
+
+def _bothmissing(id: str) -> dict:
+    """Member lacking BOTH kind and task_id — the union-dedup edge case.
+
+    Must be caught by both find_orphan_markers and find_taskless_markers,
+    but deleted exactly once when run() unions the two by id.
+    """
+    return _member(id, kind=None, task_id=None)
 
 
 # ===========================================================================
@@ -120,6 +158,92 @@ class TestFindOrphanMarkers:
         result = _mod.find_orphan_markers(members)
         assert len(result) == 1
         assert result[0]['id'] == 'no-meta'
+
+
+# ===========================================================================
+# Tests: find_taskless_markers
+# ===========================================================================
+
+class TestFindTasklessMarkers:
+    """Tests for the pure function find_taskless_markers(members) (task 2108).
+
+    A marker is "taskless" when its metadata lacks a usable task_id — this
+    is the shape of orphan marker 1e2b9417, which carried source+kind but no
+    task_id and was therefore invisible to find_orphan_markers.
+    """
+
+    def test_missing_task_id_key_is_taskless(self):
+        """A member whose metadata lacks the task_id key entirely is taskless."""
+        member = _taskless('t1')
+        result = _mod.find_taskless_markers([member])
+        assert len(result) == 1
+        assert result[0]['id'] == 't1', f'Expected id=t1, got: {result!r}'
+
+    def test_task_id_none_is_taskless(self):
+        """A member whose metadata.task_id is explicitly None is taskless."""
+        member = {
+            'id': 't2',
+            'created_at': '2026-01-01T00:00:00Z',
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': None,
+            },
+        }
+        result = _mod.find_taskless_markers([member])
+        assert len(result) == 1
+        assert result[0]['id'] == 't2', f'Expected id=t2, got: {result!r}'
+
+    def test_task_id_empty_string_is_taskless(self):
+        """A member whose metadata.task_id is '' is taskless."""
+        member = {
+            'id': 't3',
+            'created_at': '2026-01-01T00:00:00Z',
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': '',
+            },
+        }
+        result = _mod.find_taskless_markers([member])
+        assert len(result) == 1
+        assert result[0]['id'] == 't3', f'Expected id=t3, got: {result!r}'
+
+    def test_real_task_id_is_not_taskless_even_if_kind_missing(self):
+        """A member with a real task_id is NOT taskless, even lacking kind."""
+        member = _orphan('o1')  # kind=None, task_id='1970' (default from _member)
+        result = _mod.find_taskless_markers([member])
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_fp_hash_task_id_is_not_taskless(self):
+        """A member with an fp:-hash task_id carries a valid (non-taskless) task_id."""
+        member = _member('f1', task_id='fp:9a8b7c6d5e4f')
+        result = _mod.find_taskless_markers([member])
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_member_with_no_metadata_is_taskless(self):
+        """A member with missing metadata dict entirely is treated as taskless."""
+        members = [{'id': 'no-meta', 'created_at': '2026-01-01', 'metadata': None}]
+        result = _mod.find_taskless_markers(members)
+        assert len(result) == 1
+        assert result[0]['id'] == 'no-meta'
+
+    def test_empty_input_returns_empty(self):
+        """Empty input list returns empty list."""
+        result = _mod.find_taskless_markers([])
+        assert result == []
+
+    def test_preserves_identity_and_order(self):
+        """Returned dicts are the same objects, in input order."""
+        valid1 = _member('v1')
+        taskless_a = _taskless('ta')
+        valid2 = _member('v2')
+        taskless_b = _taskless('tb')
+        members = [valid1, taskless_a, valid2, taskless_b]
+        result = _mod.find_taskless_markers(members)
+        assert result == [taskless_a, taskless_b], f'Expected [ta, tb], got: {result!r}'
+        assert result[0] is taskless_a, 'Expected same object identity'
+        assert result[1] is taskless_b, 'Expected same object identity'
 
 
 # ===========================================================================
@@ -305,3 +429,55 @@ class TestRun:
             f'Expected source filter, got: {call_kwargs!r}'
         )
         memory_service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_sweeps_union_of_kind_orphans_and_taskless_markers(self):
+        """run() sweeps the id-deduplicated union of find_orphan_markers and
+        find_taskless_markers (task 2108).
+
+        members: a fully valid marker (v1), a taskless marker with a valid
+        kind (t1 — the 1e2b9417 shape), a kind-orphan that carries a task_id
+        (o1), and a marker missing BOTH kind and task_id (b1). b1 is caught
+        by both predicates but must be deleted exactly once.
+        """
+        members = [
+            _member('v1'),
+            _taskless('t1'),
+            _orphan('o1'),
+            _bothmissing('b1'),
+        ]
+
+        # --- Dry run: verify enumeration/report shape ---
+        dry_service = AsyncMock()
+        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2])
+        dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        dry_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(self._args(apply=False), dry_service)
+
+        dry_service.delete_memory.assert_not_called()
+        assert set(report['orphan_ids']) == {'t1', 'o1', 'b1'}, (
+            f"Expected {{'t1', 'o1', 'b1'}}, got: {report['orphan_ids']!r}"
+        )
+        assert report['orphan_count'] == 3, f"Expected 3, got: {report['orphan_count']!r}"
+        assert report['taskless_orphan_count'] == 2, (
+            f"Expected 2 (t1 and b1), got: {report['taskless_orphan_count']!r}"
+        )
+
+        # --- Apply: verify delete fan-out is deduped by id ---
+        apply_service = AsyncMock()
+        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2, 1, 1])
+        apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        apply_service.delete_memory = AsyncMock(return_value=None)
+
+        apply_report = await _mod.run(self._args(apply=True), apply_service)
+
+        assert apply_service.delete_memory.call_count == 3, (
+            'Expected exactly 3 deletes (b1 deduped, not double-deleted): '
+            f'{apply_service.delete_memory.call_args_list!r}'
+        )
+        deleted_ids = {
+            c.kwargs.get('memory_id') for c in apply_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'t1', 'o1', 'b1'}, f'Expected no v1, got: {deleted_ids!r}'
+        assert apply_report['taskless_orphan_count'] == 2
