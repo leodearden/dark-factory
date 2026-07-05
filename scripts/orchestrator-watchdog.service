@@ -1,9 +1,14 @@
 [Unit]
-Description=Probe escalation MCP ports; restart unresponsive orchestrator
+Description=Probe orchestrator escalation MCP ports; revive dead-enabled and restart wedged
 
 [Service]
 Type=oneshot
 # Own-unit self-identification: harmless here (this oneshot never runs a
 # DeterministicRunner), kept for uniformity with the other orchestrator units.
 Environment=ORCH_UNIT=orchestrator-watchdog.service
+# Promoted from /home/leo/bin/orchestrator-watchdog.sh to the repo-tracked
+# Python implementation 2026-05-28: ss-based probe, startup-grace window,
+# is_unit_enabled skip, tested in tests/scripts/test_orchestrator_watchdog.py.
 ExecStart=/home/leo/src/dark-factory/scripts/orchestrator-watchdog.py
+StandardOutput=journal
+StandardError=journal
