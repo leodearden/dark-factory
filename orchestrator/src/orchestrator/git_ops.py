@@ -6513,7 +6513,23 @@ class GitOps:
         Clears the ``.git/worktrees`` administrative records left behind by
         worktrees removed off-band (manual ``rm -rf``, quarantine, reap).
         Never raises.
+
+        **Pool-storage guard (task 2099)**: refuses to run when
+        :meth:`pool_storage_present` is False.  An unmounted mountpoint dir
+        makes every mount-resident worktree APPEAR removed off-band, so an
+        unguarded prune would wipe every registered lane + ``_merge-verify``
+        admin entry the instant the mount comes back — exactly the Jul-3
+        incident this guards against.
         """
+        if not self.pool_storage_present():
+            logger.warning(
+                'prune_worktrees: pool storage absent/unmounted at %s — '
+                'refusing to run `git worktree prune` (would wipe '
+                '.git/worktrees admin entries for every mount-resident lane)',
+                self.worktree_base,
+            )
+            self._note_pool_storage_absent()
+            return
         try:
             rc, _, err = await _run(
                 ['git', 'worktree', 'prune'], cwd=self.project_root,
