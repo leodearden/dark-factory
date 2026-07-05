@@ -1543,7 +1543,7 @@ class MemoryService:
         # its 0/1/many result decides whether the fuzzy gather runs at all.
         exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
         if exact:
-            uuids = [n.get('uuid') for n in exact if n.get('uuid')]
+            uuids = [uuid for n in exact if (uuid := n.get('uuid'))]
             edge_lists = await asyncio.gather(
                 *(self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids)
             )
