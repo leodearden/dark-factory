@@ -33,7 +33,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
