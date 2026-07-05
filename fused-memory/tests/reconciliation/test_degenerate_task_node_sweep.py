@@ -17,10 +17,24 @@ Covers:
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
+    sweep_degenerate_task_nodes,
 )
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+
+def _make_memory_service() -> MagicMock:
+    """MagicMock memory_service with an AsyncMock .graphiti (mirrors test_merge_entities.py)."""
+    memory_service = MagicMock()
+    memory_service.graphiti = MagicMock()
+    memory_service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+    memory_service.graphiti.delete_entity_node = AsyncMock()
+    return memory_service
 
 
 class TestExtractTerminalTaskIds:
@@ -100,3 +114,43 @@ class TestExtractTerminalTaskIds:
         tree = FilteredTaskTree(active_tasks=[{'id': 1, 'status': 'pending'}])
 
         assert extract_terminal_task_ids(tree) == []
+
+
+# --------------------------------------------------------------------------- #
+# sweep_degenerate_task_nodes — core behavior
+# --------------------------------------------------------------------------- #
+
+
+class TestSweepDegenerateTaskNodesCore:
+    """sweep_degenerate_task_nodes finds exact-name 'tasks {id}' nodes per task id
+    and deletes ONLY the ones with edge_count == 0 — a node with >= 1 valid edge
+    is never touched (safety invariant)."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_only_the_degenerate_node_never_the_healthy_one(self):
+        """One degenerate (edge_count=0) + one healthy (edge_count=3) node.
+
+        delete_entity_node must be awaited exactly once, for the degenerate
+        node's uuid with group_id=project_id, and never for the healthy node.
+        """
+        memory_service = _make_memory_service()
+
+        async def fake_find(name, *, group_id):
+            if name == 'tasks 142':
+                return [{'uuid': 'node-142', 'created_at': 100, 'edge_count': 0}]
+            if name == 'tasks 148':
+                return [{'uuid': 'node-148', 'created_at': 100, 'edge_count': 3}]
+            return []
+
+        memory_service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find)
+
+        stats = await sweep_degenerate_task_nodes(memory_service, 'test_project', ['142', '148'])
+
+        memory_service.graphiti.delete_entity_node.assert_awaited_once_with(
+            'node-142', group_id='test_project',
+        )
+        deleted_uuids = [c.args[0] for c in memory_service.graphiti.delete_entity_node.await_args_list]
+        assert 'node-148' not in deleted_uuids, 'A node with edge_count > 0 must never be deleted'
+        assert stats == {'scanned': 2, 'degenerate': 1, 'deleted': 1, 'errors': 0}, (
+            f'Expected exactly the degenerate node counted+deleted, got stats={stats!r}'
+        )
