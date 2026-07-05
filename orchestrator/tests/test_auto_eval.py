@@ -598,6 +598,44 @@ async def test_no_supersede_when_no_prior_redos(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_no_supersede_when_submit_fails(tmp_path: Path):
+    """Regression guard: a failed/id-less submit_task must preserve prior
+    redo siblings.
+
+    _maybe_auto_eval returns early (harness.py, before the supersede block)
+    when submit_task fails to produce a new_task_id. If the supersede
+    cancellation ran anyway, prior redos would be cancelled with no live
+    replacement — violating the 'at most one live redo per spawned_from'
+    invariant by leaving zero. The ordering (query prior siblings before
+    submit, cancel only after a replacement is confirmed) exists precisely
+    to prevent this.
+    """
+    f = _make(
+        project_root=tmp_path / 'proj',
+        submit_returns={'error': 'curator full'},
+    )
+    f.harness.scheduler.get_tasks = AsyncMock(return_value=[
+        {
+            'id': 'redo-old-1',
+            'status': 'pending',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+    ])
+
+    await f.harness._maybe_auto_eval(f.assignment, _make_report())
+
+    status_calls = [c for c in f.submit_calls if c[0] == 'set_task_status']
+    cancelled = [c for c in status_calls if c[1].get('status') == 'cancelled']
+    assert cancelled == []
+
+    emit_calls = [
+        c for c in f.event_emit.call_args_list
+        if c.args and c.args[0] == EventType.auto_eval_dispatched
+    ]
+    assert emit_calls == []
+
+
+@pytest.mark.asyncio
 async def test_supersede_excludes_non_pending_siblings(tmp_path: Path):
     """Only still-'pending' prior redos are superseded.
 
