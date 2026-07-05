@@ -43,22 +43,51 @@ _mod = _load_module()
 # Helpers
 # ===========================================================================
 
-def _member(id: str, kind: str | None = 'stage1_flag_marker') -> dict:
-    """Build a scroll-shaped member dict."""
+def _member(
+    id: str,
+    kind: str | None = 'stage1_flag_marker',
+    task_id: str | None = '1970',
+) -> dict:
+    """Build a scroll-shaped member dict.
+
+    Defaults to the production shape written by
+    ``flag_dedup._write_and_confirm_marker``: both ``kind`` and ``task_id``
+    present. Pass ``kind=None`` / ``task_id=None`` to omit either key and
+    isolate the corresponding orphan dimension.
+    """
     metadata: dict = {'source': 'stage1_flag_marker'}
     if kind is not None:
         metadata['kind'] = kind
+    if task_id is not None:
+        metadata['task_id'] = task_id
     return {'id': id, 'created_at': '2026-01-01T00:00:00Z', 'metadata': metadata}
 
 
 def _orphan(id: str) -> dict:
-    """Member that has source but no kind — the orphan shape."""
+    """Member that has source and task_id but no kind — the kind-orphan shape.
+
+    Carries a task_id so it isolates the kind dimension only (does not also
+    trip the taskless predicate).
+    """
     return _member(id, kind=None)
 
 
 def _wrong_kind(id: str) -> dict:
-    """Member with source and a mismatched kind value."""
+    """Member with source, task_id, and a mismatched kind value.
+
+    Carries a task_id so it isolates the kind dimension only.
+    """
     return _member(id, kind='something_else')
+
+
+def _taskless(id: str) -> dict:
+    """Member that has source+kind but NO task_id key — the 1e2b9417 shape.
+
+    This is the orphan class task 2108 adds: a stage1_flag_marker with a
+    valid kind that is nonetheless dead weight because it lacks a task_id
+    (see find_taskless_markers).
+    """
+    return _member(id, kind='stage1_flag_marker', task_id=None)
 
 
 # ===========================================================================
