@@ -172,3 +172,63 @@ class TestReapOrphanedMergeWorktreesCore:
 
         assert wt.exists(), 'fresh-within-grace orphan must be preserved'
         assert str(wt.resolve()) not in report['reaped']
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: preservation guards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapOrphanedMergeWorktreesPreservation:
+    """Unit tests asserting the sweep preserves everything it must not touch
+    — the persistent ``_merge-verify`` worktree, an already-owned
+    (registered) worktree, and a fresh (within-grace) unregistered worktree
+    — while still reaping the one genuine aged orphan alongside them in the
+    SAME sweep (task 2060 step-3).
+
+    The ``_merge-verify`` and grace-skip preservations already hold
+    structurally from step-2 (same discovery/skip logic as
+    ``worktree_ledger_violations``); this class is the first to exercise the
+    owned-skip explicitly, and the first to combine all three preservation
+    guards with a genuine reap in a single sweep.
+    """
+
+    async def test_sweep_reaps_only_the_genuine_orphan(self, git_ops: GitOps) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+
+        # (1) genuine aged orphan — expected reaped.
+        orphan = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+
+        # (2) persistent _merge-verify, aged past grace — expected preserved.
+        verify_wt = _mkdir_worktree(
+            git_ops, PERSISTENT_MERGE_WORKTREE_NAME, mtime=_NOW - _GRACE - 10,
+        )
+
+        # (3) aged ephemeral, but pre-registered (owned) — expected preserved.
+        owned_wt = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+        worker._register_owned_merge_worktree(owned_wt)
+
+        # (4) fresh (within-grace) unregistered — expected preserved.
+        fresh_wt, _ = await git_ops._create_merge_worktree()
+
+        report = await worker.reap_orphaned_merge_worktrees(now=_NOW)
+
+        assert str(orphan.resolve()) in report['reaped']
+        assert not orphan.exists()
+
+        assert verify_wt.exists(), '_merge-verify must survive the sweep'
+        assert str(verify_wt.resolve()) not in report['reaped']
+
+        assert owned_wt.exists(), 'owned/registered worktree must survive the sweep'
+        assert str(owned_wt.resolve()) not in report['reaped']
+
+        assert fresh_wt.exists(), 'fresh-within-grace worktree must survive the sweep'
+        assert str(fresh_wt.resolve()) not in report['reaped']
+
+        assert report['reaped'] == [str(orphan.resolve())], (
+            f'expected only the genuine orphan reaped, got: {report["reaped"]!r}'
+        )
