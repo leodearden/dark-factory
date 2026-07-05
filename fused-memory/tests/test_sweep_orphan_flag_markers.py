@@ -90,6 +90,15 @@ def _taskless(id: str) -> dict:
     return _member(id, kind='stage1_flag_marker', task_id=None)
 
 
+def _bothmissing(id: str) -> dict:
+    """Member lacking BOTH kind and task_id — the union-dedup edge case.
+
+    Must be caught by both find_orphan_markers and find_taskless_markers,
+    but deleted exactly once when run() unions the two by id.
+    """
+    return _member(id, kind=None, task_id=None)
+
+
 # ===========================================================================
 # Tests: find_orphan_markers
 # ===========================================================================
@@ -420,3 +429,55 @@ class TestRun:
             f'Expected source filter, got: {call_kwargs!r}'
         )
         memory_service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_sweeps_union_of_kind_orphans_and_taskless_markers(self):
+        """run() sweeps the id-deduplicated union of find_orphan_markers and
+        find_taskless_markers (task 2108).
+
+        members: a fully valid marker (v1), a taskless marker with a valid
+        kind (t1 — the 1e2b9417 shape), a kind-orphan that carries a task_id
+        (o1), and a marker missing BOTH kind and task_id (b1). b1 is caught
+        by both predicates but must be deleted exactly once.
+        """
+        members = [
+            _member('v1'),
+            _taskless('t1'),
+            _orphan('o1'),
+            _bothmissing('b1'),
+        ]
+
+        # --- Dry run: verify enumeration/report shape ---
+        dry_service = AsyncMock()
+        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2])
+        dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        dry_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(self._args(apply=False), dry_service)
+
+        dry_service.delete_memory.assert_not_called()
+        assert set(report['orphan_ids']) == {'t1', 'o1', 'b1'}, (
+            f"Expected {{'t1', 'o1', 'b1'}}, got: {report['orphan_ids']!r}"
+        )
+        assert report['orphan_count'] == 3, f"Expected 3, got: {report['orphan_count']!r}"
+        assert report['taskless_orphan_count'] == 2, (
+            f"Expected 2 (t1 and b1), got: {report['taskless_orphan_count']!r}"
+        )
+
+        # --- Apply: verify delete fan-out is deduped by id ---
+        apply_service = AsyncMock()
+        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2, 1, 1])
+        apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        apply_service.delete_memory = AsyncMock(return_value=None)
+
+        apply_report = await _mod.run(self._args(apply=True), apply_service)
+
+        assert apply_service.delete_memory.call_count == 3, (
+            'Expected exactly 3 deletes (b1 deduped, not double-deleted): '
+            f'{apply_service.delete_memory.call_args_list!r}'
+        )
+        deleted_ids = {
+            c.kwargs.get('memory_id') for c in apply_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'t1', 'o1', 'b1'}, f'Expected no v1, got: {deleted_ids!r}'
+        assert apply_report['taskless_orphan_count'] == 2
