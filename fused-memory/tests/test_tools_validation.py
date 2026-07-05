@@ -7,6 +7,7 @@ never module-level attributes.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,6 +15,14 @@ import pytest
 import fused_memory.server.tools as tools_module
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.utils.validation import validate_project_id, validate_project_root
+
+
+def _parse_tool_result(result):
+    """Extract the dict from a FastMCP TextContent result or pass-through dict."""
+    if isinstance(result, list):
+        content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+        return json.loads(content)
+    return result
 
 
 class TestToolsDelegateToSharedValidators:
@@ -262,3 +271,79 @@ class TestKnownProjectRegistryGate:
             f"Error must mention DASHBOARD_KNOWN_PROJECT_ROOTS; got: {result['error']!r}"
         )
         mock_service.add_episode.assert_not_called()
+
+
+class TestGetEntityEdgeLimitMCPTool:
+    """task 2089 step-3: MCP get_entity tool accepts, validates, and forwards edge_limit."""
+
+    @pytest.mark.asyncio
+    async def test_edge_limit_forwarded_to_service(self):
+        """get_entity MCP tool forwards edge_limit=25 to memory_service.get_entity."""
+        mock_service = AsyncMock()
+        mock_service.get_entity.return_value = {'nodes': [], 'edges': []}
+        server = create_mcp_server(mock_service)
+
+        await server._tool_manager.call_tool(
+            'get_entity',
+            {'name': 'entity', 'project_id': 'test', 'edge_limit': 25},
+        )
+
+        mock_service.get_entity.assert_called_once()
+        call_kwargs = mock_service.get_entity.call_args[1]
+        assert call_kwargs.get('edge_limit') == 25, (
+            'edge_limit=25 must be forwarded from MCP get_entity tool to memory_service.get_entity'
+        )
+
+    @pytest.mark.asyncio
+    async def test_edge_limit_defaults_to_ten(self):
+        """get_entity MCP tool forwards edge_limit=10 to the service when not specified."""
+        mock_service = AsyncMock()
+        mock_service.get_entity.return_value = {'nodes': [], 'edges': []}
+        server = create_mcp_server(mock_service)
+
+        await server._tool_manager.call_tool(
+            'get_entity',
+            {'name': 'entity', 'project_id': 'test'},
+        )
+
+        mock_service.get_entity.assert_called_once()
+        call_kwargs = mock_service.get_entity.call_args[1]
+        assert call_kwargs.get('edge_limit') == 10, (
+            'edge_limit must default to 10 in MCP get_entity tool'
+        )
+
+    @pytest.mark.asyncio
+    async def test_edge_limit_zero_returns_validation_error(self):
+        """edge_limit=0 is rejected at the MCP boundary before reaching the service."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'get_entity',
+            {'name': 'entity', 'project_id': 'test', 'edge_limit': 0},
+        )
+
+        parsed = _parse_tool_result(result)
+        assert 'error' in parsed, f'Expected error key in result: {parsed!r}'
+        assert parsed.get('error_type') == 'ValidationError', (
+            f"Expected error_type='ValidationError', got: {parsed!r}"
+        )
+        mock_service.get_entity.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_edge_limit_above_1000_clamped(self):
+        """edge_limit=5000 is clamped to 1000 before being forwarded to the service."""
+        mock_service = AsyncMock()
+        mock_service.get_entity.return_value = {'nodes': [], 'edges': []}
+        server = create_mcp_server(mock_service)
+
+        await server._tool_manager.call_tool(
+            'get_entity',
+            {'name': 'entity', 'project_id': 'test', 'edge_limit': 5000},
+        )
+
+        mock_service.get_entity.assert_called_once()
+        call_kwargs = mock_service.get_entity.call_args[1]
+        assert call_kwargs.get('edge_limit') == 1000, (
+            f"edge_limit=5000 must be clamped to 1000, got: {call_kwargs.get('edge_limit')!r}"
+        )

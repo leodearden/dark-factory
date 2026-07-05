@@ -1488,6 +1488,8 @@ class MemoryService:
         self,
         name: str,
         project_id: str = 'main',
+        *,
+        edge_limit: int = 10,
     ) -> dict:
         """Entity lookup in Graphiti — returns nodes + edges.
 
@@ -1513,6 +1515,13 @@ class MemoryService:
         name-pattern regex was considered and rejected (see plan design_decisions)
         as added complexity that would leave non-numeric exact lookups (e.g.
         "Auth Service") still exposed to fuzzy neighbours for no benefit.
+
+        Edge cap: edges are gathered via a single graphiti.search() call capped at
+        `edge_limit` (default 10, applied identically on both the exact-match and
+        fuzzy-fallback branches). graphiti.search returns edges in RELEVANCE-ranked
+        order, so when an entity has more than `edge_limit` valid edges, the
+        lowest-ranked ones are silently dropped from the result — raise edge_limit
+        to fetch more, or cross-check completeness via a direct search() call.
         """
         # See "Performance trade-off" above: this call is intentionally serial —
         # its 0/1/many result decides whether the fuzzy gather runs at all.
@@ -1521,7 +1530,7 @@ class MemoryService:
             edges = await self.graphiti.search(
                 query=name,
                 group_ids=[project_id],
-                num_results=10,
+                num_results=edge_limit,
             )
             node_data = [_node_to_dict(n) for n in exact]
             edge_data = [_edge_to_dict(e) for e in edges]
@@ -1536,7 +1545,7 @@ class MemoryService:
             self.graphiti.search(
                 query=name,
                 group_ids=[project_id],
-                num_results=10,
+                num_results=edge_limit,
             ),
             return_exceptions=True,
         )

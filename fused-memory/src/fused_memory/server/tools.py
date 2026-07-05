@@ -1047,6 +1047,7 @@ def create_mcp_server(
     async def get_entity(
         name: str,
         project_id: str,
+        edge_limit: int = 10,
         agent_id: str | None = None,
         session_id: str | None = None,
         ctx: Context | None = None,
@@ -1060,24 +1061,40 @@ def create_mcp_server(
         their edges as relationship facts, and connected entities. Use this for direct
         entity lookup when you know the name; use search() for broader semantic queries.
 
+        Edges are capped at edge_limit (default 10) and returned in Graphiti's
+        relevance-ranked order, so an entity with more than edge_limit valid edges
+        will silently omit the lowest-ranked ones. Raise edge_limit to fetch more
+        edges, or cross-check completeness with search() when keeping the default.
+
         Args:
             name: Entity name (exact match tried first; falls back to fuzzy/approximate
                 matching when no exact match exists)
             project_id: Project scope (required)
+            edge_limit: Max edges to return (default: 10; raise to reduce the chance
+                of relevance-ranked edges being dropped)
             agent_id: Which agent is reading (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         if err := validate_project_id(project_id):
             return err
+        if edge_limit <= 0:
+            return {
+                'error': f'Invalid edge_limit {edge_limit!r}. Must be a positive integer.',
+                'error_type': 'ValidationError',
+            }
+        if edge_limit > 1000:
+            edge_limit = 1000
         try:
-            result = await memory_service.get_entity(name=name, project_id=project_id)
+            result = await memory_service.get_entity(
+                name=name, project_id=project_id, edge_limit=edge_limit
+            )
             await _log_read(
                 operation='get_entity',
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'name': name},
+                params={'name': name, 'edge_limit': edge_limit},
                 result_summary={
                     'nodes': len(result.get('nodes', [])),
                     'edges': len(result.get('edges', [])),
@@ -1093,7 +1110,7 @@ def create_mcp_server(
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'name': name},
+                params={'name': name, 'edge_limit': edge_limit},
                 success=False,
                 error=str(e),
             )
