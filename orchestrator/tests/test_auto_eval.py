@@ -99,6 +99,25 @@ def _make(
     # Default: no prior auto-eval redo siblings. Tests exercising the
     # dedupe/supersede behaviour override this per-test.
     scheduler.get_tasks = AsyncMock(return_value=[])
+
+    async def _derive_statuses(*, ids: list[str] | None = None):
+        # _filter_cancellable_redos re-checks candidates via get_statuses
+        # (task 2075 review amendment), not get_tasks. Deriving its
+        # response from whatever scheduler.get_tasks currently returns
+        # (looked up at call time, so per-test get_tasks overrides are
+        # picked up automatically) keeps the two in sync without every
+        # supersede test having to stub get_statuses separately.
+        tasks = await scheduler.get_tasks(statuses=ACTIVE_TASK_STATUSES)
+        status_by_id = {
+            str(t.get('id')): t.get('status')
+            for t in tasks
+            if isinstance(t, dict)
+        }
+        if ids is None:
+            return dict(status_by_id), None
+        return {i: status_by_id[i] for i in ids if i in status_by_id}, None
+
+    scheduler.get_statuses = AsyncMock(side_effect=_derive_statuses)
     harness.scheduler = scheduler
 
     metadata: dict = {
@@ -221,40 +240,56 @@ async def test_find_prior_auto_eval_redos_fail_open():
 
 
 @pytest.mark.asyncio
-async def test_filter_cancellable_redos_excludes_in_progress_and_blocked():
-    """Only still-pending/deferred candidates are safe to auto-cancel.
+async def test_filter_cancellable_redos_excludes_non_pending():
+    """Only still-'pending' candidates are safe to auto-cancel.
 
     'in-progress' may be real agent work in flight; 'blocked' may be an
-    open human-facing escalation. Neither should be silently superseded.
+    open human-facing escalation; 'deferred' may be a steward's deliberate
+    hold (WORKFLOW_PRESERVE_STATUSES treats 'deferred' the same as
+    'blocked'/'merge-deferred' — "leave this alone, human will sort it");
+    'review' is under active verification; 'merge-deferred' is train-parked.
+    None of these should be silently superseded.
     """
     harness = Harness.__new__(Harness)
     harness.scheduler = MagicMock()
-    harness.scheduler.get_tasks = AsyncMock(return_value=[
-        {'id': 'redo-pending', 'status': 'pending'},
-        {'id': 'redo-deferred', 'status': 'deferred'},
-        {'id': 'redo-in-progress', 'status': 'in-progress'},
-        {'id': 'redo-blocked', 'status': 'blocked'},
+    harness.scheduler.get_statuses = AsyncMock(return_value=(
+        {
+            'redo-pending': 'pending',
+            'redo-deferred': 'deferred',
+            'redo-in-progress': 'in-progress',
+            'redo-blocked': 'blocked',
+            'redo-review': 'review',
+            'redo-merge-deferred': 'merge-deferred',
+        },
+        None,
+    ))
+
+    result = await harness._filter_cancellable_redos([
+        'redo-pending', 'redo-deferred', 'redo-in-progress',
+        'redo-blocked', 'redo-review', 'redo-merge-deferred',
     ])
 
-    result = await harness._filter_cancellable_redos(
-        ['redo-pending', 'redo-deferred', 'redo-in-progress', 'redo-blocked'],
+    assert result == ['redo-pending']
+    harness.scheduler.get_statuses.assert_awaited_once_with(
+        ids=[
+            'redo-pending', 'redo-deferred', 'redo-in-progress',
+            'redo-blocked', 'redo-review', 'redo-merge-deferred',
+        ],
     )
-
-    assert set(result) == {'redo-pending', 'redo-deferred'}
 
 
 @pytest.mark.asyncio
 async def test_filter_cancellable_redos_excludes_raced_to_terminal():
     """A candidate that completed/was cancelled since the snapshot must not
-    be re-cancelled — it is simply absent from the fresh active-only fetch.
+    be re-cancelled — get_statuses reports its current (terminal) status,
+    which is not a member of _AUTO_EVAL_SUPERSEDE_SAFE_STATUSES.
     """
     harness = Harness.__new__(Harness)
     harness.scheduler = MagicMock()
-    harness.scheduler.get_tasks = AsyncMock(return_value=[
-        {'id': 'redo-still-here', 'status': 'deferred'},
-        # 'redo-done' is absent: it raced to a terminal state and the
-        # server-side ACTIVE_TASK_STATUSES filter excludes it.
-    ])
+    harness.scheduler.get_statuses = AsyncMock(return_value=(
+        {'redo-still-here': 'pending', 'redo-done': 'done'},
+        None,
+    ))
 
     result = await harness._filter_cancellable_redos(
         ['redo-still-here', 'redo-done'],
@@ -267,7 +302,9 @@ async def test_filter_cancellable_redos_excludes_raced_to_terminal():
 async def test_filter_cancellable_redos_fail_open():
     harness = Harness.__new__(Harness)
     harness.scheduler = MagicMock()
-    harness.scheduler.get_tasks = AsyncMock(side_effect=RuntimeError('boom'))
+    harness.scheduler.get_statuses = AsyncMock(
+        return_value=({}, RuntimeError('boom')),
+    )
 
     result = await harness._filter_cancellable_redos(['redo-1'])
 
@@ -278,12 +315,12 @@ async def test_filter_cancellable_redos_fail_open():
 async def test_filter_cancellable_redos_empty_candidates_skips_query():
     harness = Harness.__new__(Harness)
     harness.scheduler = MagicMock()
-    harness.scheduler.get_tasks = AsyncMock(return_value=[])
+    harness.scheduler.get_statuses = AsyncMock(return_value=({}, None))
 
     result = await harness._filter_cancellable_redos([])
 
     assert result == []
-    harness.scheduler.get_tasks.assert_not_awaited()
+    harness.scheduler.get_statuses.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -505,7 +542,7 @@ async def test_supersedes_prior_redo_siblings(tmp_path: Path):
     f.harness.scheduler.get_tasks = AsyncMock(return_value=[
         {
             'id': 'redo-old-1',
-            'status': 'deferred',
+            'status': 'pending',
             'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
         },
         {
@@ -561,9 +598,14 @@ async def test_no_supersede_when_no_prior_redos(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_supersede_excludes_in_progress_and_blocked_siblings(tmp_path: Path):
-    """in-progress (active agent work) and blocked (open human escalation)
-    prior redos must be left alone — only pending/deferred are superseded.
+async def test_supersede_excludes_non_pending_siblings(tmp_path: Path):
+    """Only still-'pending' prior redos are superseded.
+
+    'in-progress' (active agent work), 'blocked' (open human escalation),
+    'deferred' (possibly a steward's deliberate hold — WORKFLOW_PRESERVE_STATUSES
+    treats it the same as 'blocked'/'merge-deferred'), 'review' (active
+    verification), and 'merge-deferred' (train-parked) prior redos must all
+    be left alone.
     """
     f = _make(project_root=tmp_path / 'proj')
     f.harness.scheduler.get_tasks = AsyncMock(return_value=[
@@ -582,6 +624,16 @@ async def test_supersede_excludes_in_progress_and_blocked_siblings(tmp_path: Pat
             'status': 'blocked',
             'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
         },
+        {
+            'id': 'redo-old-review',
+            'status': 'review',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
+        {
+            'id': 'redo-old-merge-deferred',
+            'status': 'merge-deferred',
+            'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
+        },
     ])
 
     await f.harness._maybe_auto_eval(f.assignment, _make_report())
@@ -590,16 +642,14 @@ async def test_supersede_excludes_in_progress_and_blocked_siblings(tmp_path: Pat
     cancelled_ids = {
         c[1].get('id') for c in status_calls if c[1].get('status') == 'cancelled'
     }
-    assert cancelled_ids == {'redo-old-deferred'}
+    assert cancelled_ids == set()
 
     emit_calls = [
         c for c in f.event_emit.call_args_list
         if c.args and c.args[0] == EventType.auto_eval_dispatched
     ]
     assert len(emit_calls) == 1
-    assert emit_calls[0].kwargs['data']['superseded_redo_ids'] == [
-        'redo-old-deferred',
-    ]
+    assert emit_calls[0].kwargs['data']['superseded_redo_ids'] == []
 
 
 @pytest.mark.asyncio
@@ -611,7 +661,7 @@ async def test_supersede_cancel_failure_is_isolated(tmp_path: Path):
     f.harness.scheduler.get_tasks = AsyncMock(return_value=[
         {
             'id': 'redo-old-1',
-            'status': 'deferred',
+            'status': 'pending',
             'metadata': {'auto_eval_redo': True, 'spawned_from': 'orig-task'},
         },
         {
