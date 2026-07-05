@@ -1515,12 +1515,13 @@ class MemoryService:
         `nodes` array. Only the fuzzy fallback below uses the semantic edge search.
         On no exact match, falls back to the fuzzy gather path.
 
-        Both Graphiti calls in the fuzzy fallback run concurrently via
-        asyncio.gather(return_exceptions=True). This ensures neither call becomes an
-        orphaned background task in the error path: gather() awaits both coroutines to
-        settlement before returning, even when one (or both) raise an exception.  If
-        any call fails, all exceptions are logged (warning) then the first exception
-        is re-raised.
+        Concurrent Graphiti calls — both the exact-match branch's per-uuid
+        get_valid_edges_for_node fetches and the fuzzy fallback's node/edge
+        search — run via asyncio.gather(return_exceptions=True). This ensures no
+        call becomes an orphaned background task in the error path: gather()
+        awaits every coroutine to settlement before returning, even when one (or
+        more) raise an exception. If any call fails, all exceptions are logged
+        (warning) then the first exception is re-raised.
 
         Performance trade-off: the exact-match lookup below is a serial round-trip
         that runs in front of the fuzzy gather on every call — its result (hit vs.
@@ -1544,9 +1545,29 @@ class MemoryService:
         exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
         if exact:
             uuids = [uuid for n in exact if (uuid := n.get('uuid'))]
-            edge_lists = await asyncio.gather(
-                *(self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids)
+            edge_results = await asyncio.gather(
+                *(self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
+                return_exceptions=True,
             )
+            # Two-tier check (see async_utils.propagate_cancellations), mirroring
+            # the fuzzy fallback below: return_exceptions=True ensures a transient
+            # failure in one concurrent get_valid_edges_for_node call cannot leave
+            # sibling coroutines running as orphaned background tasks. Pass 1
+            # re-raises structured-cancellation signals; Pass 2 logs every
+            # exception, then raises the first (get_entity's local Pass-2
+            # semantics — see async_utils docstring).
+            propagate_cancellations(edge_results)
+            first_exc = next((r for r in edge_results if isinstance(r, Exception)), None)
+            if first_exc is not None:
+                for r in edge_results:
+                    if isinstance(r, Exception):
+                        logger.warning(
+                            'get_entity: get_valid_edges_for_node failed: %s: %s',
+                            type(r).__name__,
+                            r,
+                        )
+                raise first_exc
+            edge_lists = cast(list, edge_results)
             # Duplicate-name matches each contribute their own edges; dedup by
             # edge uuid so `edges` stays consistent with the (possibly
             # multi-node) `nodes` array instead of double-counting shared edges.
