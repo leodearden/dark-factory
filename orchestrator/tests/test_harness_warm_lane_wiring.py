@@ -2182,8 +2182,8 @@ class TestReconcileLaneCheckouts:
     async def test_repin_on_live_status_reuses_original_lane(self, tmp_path: Path):
         """RE-PIN: a live (non-terminal) status re-pins the id to its ORIGINAL
         lane, so the next acquire reuses it (no fault) and the WIP survives."""
-        from orchestrator.git_ops import _run as git_run
         from orchestrator.git_ops import WorktreeInfo
+        from orchestrator.git_ops import _run as git_run
         from orchestrator.warm_lane_pool import LaneState
 
         harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
@@ -2240,8 +2240,8 @@ class TestReconcileLaneCheckouts:
         """TERMINAL status (e.g. 'done') -> DETACH (never re-pin); a fresh
         acquire lands on a different free lane and reattaches the branch —
         no 'already used by worktree' collision, WIP commit preserved."""
-        from orchestrator.git_ops import _run as git_run
         from orchestrator.git_ops import WorktreeInfo
+        from orchestrator.git_ops import _run as git_run
 
         harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
 
@@ -2279,8 +2279,8 @@ class TestReconcileLaneCheckouts:
     ):
         """A HEALTHY status read that OMITS the id entirely (task deleted) ->
         DETACH, same as a terminal status; a fresh acquire does not collide."""
-        from orchestrator.git_ops import _run as git_run
         from orchestrator.git_ops import WorktreeInfo
+        from orchestrator.git_ops import _run as git_run
 
         harness, git_ops, pool, lane5 = await self._make_fixture(tmp_path)
 
