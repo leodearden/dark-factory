@@ -847,3 +847,92 @@ class TestRecoverCrashedTasksWarmLaneEdgeCases:
         assert '_lane-0' not in harness._recovered_sessions
         assert '_lane-0' not in harness._preserved_worktrees
         assert '_lane-0' not in harness._recovered_plans
+
+
+@pytest.mark.asyncio
+class TestRecoverCrashedTasksPoolStorageAbsentGuard:
+    """_recover_crashed_tasks must defer — not clean up — when pool storage
+    is absent (task 2099).
+
+    Direct regression guard for the Jul-3 incident: an unmounted mountpoint
+    dir must never let crash recovery treat every mount-resident worktree as
+    planless/corrupt and destroy potentially-recoverable work.
+    """
+
+    async def test_storage_absent_defers_no_plan_worktree(self, harness: Harness):
+        from orchestrator.git_ops import POOL_ROOT_SENTINEL
+
+        # The `harness` fixture marks pool storage present by default —
+        # remove the sentinel to simulate an unmounted mountpoint with a
+        # live, empty (from git's perspective) mount dir.
+        (harness.git_ops.worktree_base / POOL_ROOT_SENTINEL).unlink()
+        assert not harness.git_ops.pool_storage_present()
+
+        wt = _setup_worktree(harness.git_ops.worktree_base, '36')  # no plan.json
+
+        harness._file_pool_storage_absent_escalation = MagicMock()
+
+        await harness._recover_crashed_tasks()
+
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        assert harness._recovered_plans == {}
+        harness._file_pool_storage_absent_escalation.assert_called_once()  # type: ignore[attr-defined]
+        assert wt.exists()
+
+    async def test_storage_absent_defers_corrupt_plan_worktree(self, harness: Harness):
+        from orchestrator.git_ops import POOL_ROOT_SENTINEL
+
+        (harness.git_ops.worktree_base / POOL_ROOT_SENTINEL).unlink()
+        assert not harness.git_ops.pool_storage_present()
+
+        wt = harness.git_ops.worktree_base / '38'
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True)
+        (task_dir / 'plan.json').write_text('{not valid json!!!')
+
+        harness._file_pool_storage_absent_escalation = MagicMock()
+
+        await harness._recover_crashed_tasks()
+
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        assert harness._recovered_plans == {}
+        harness._file_pool_storage_absent_escalation.assert_called_once()  # type: ignore[attr-defined]
+        assert wt.exists()
+
+    async def test_storage_absent_defers_recoverable_plan_worktree(
+        self, harness: Harness,
+    ):
+        """Even a worktree WITH recoverable progress must not be scanned —
+        the guard returns before the iterdir() loop, so _recovered_plans
+        stays empty rather than getting a false sense of what's live."""
+        from orchestrator.git_ops import POOL_ROOT_SENTINEL
+
+        (harness.git_ops.worktree_base / POOL_ROOT_SENTINEL).unlink()
+        assert not harness.git_ops.pool_storage_present()
+
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='35')
+        _setup_worktree(harness.git_ops.worktree_base, '35', plan)
+
+        harness._file_pool_storage_absent_escalation = MagicMock()
+
+        await harness._recover_crashed_tasks()
+
+        assert harness._recovered_plans == {}
+        harness._file_pool_storage_absent_escalation.assert_called_once()  # type: ignore[attr-defined]
+
+    async def test_storage_present_control_recovery_unchanged(
+        self, harness: Harness,
+    ):
+        """Regression guard: sentinel present (the fixture default) — the
+        existing recover-plan / cleanup-no-plan behavior is unchanged."""
+        assert harness.git_ops.pool_storage_present()
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='35')
+        _setup_worktree(harness.git_ops.worktree_base, '35', plan)
+        wt_noplan = _setup_worktree(harness.git_ops.worktree_base, '36')
+
+        await harness._recover_crashed_tasks()
+
+        assert '35' in harness._recovered_plans
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            wt_noplan, '36',
+        )
