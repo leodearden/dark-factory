@@ -6448,6 +6448,622 @@ class TestSweepStaleFlagMarkers:
         memory_service.delete_memory.assert_not_awaited()
 
 
+class TestSweepTerminalTaskFlagMarkers:
+    """_sweep_terminal_task_flag_markers GCs stage1_flag_marker records whose
+    referenced task(s) have reached a terminal status (task 2103).
+
+    Unlike _sweep_stale_flag_markers (age-only / fp: cross-cycle predicate),
+    this sweep is keyed on the REFERENCED TASK's live status: a marker is
+    swept only when EVERY component task_id (numeric or comma-joined) resolves
+    via taskmaster.get_task to a status in TERMINAL_STATUSES ({'done',
+    'cancelled'}). fp: content-fingerprint keys and invalid task_ids are left
+    to the existing age/fp: GC and never trigger a get_task call. Fail-safe:
+    any get_task error, non-dict result, 'unknown'/absent status, or
+    non-terminal component status => KEEP.
+    """
+
+    @pytest.mark.asyncio
+    async def test_numeric_task_done_or_cancelled_deleted(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'done-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {
+                    'source': 'stage1_flag_marker', 'kind': 'stage1_flag_marker',
+                    'task_id': '110', 'flag_type': 'x',
+                },
+            },
+            {
+                'id': 'cancelled-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {
+                    'source': 'stage1_flag_marker', 'kind': 'stage1_flag_marker',
+                    'task_id': '154', 'flag_type': 'x',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _get_task(task_id, project_root):
+            return {'110': {'status': 'done'}, '154': {'status': 'cancelled'}}[task_id]
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 2
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'done-marker', 'cancelled-marker'}
+
+        for call in memory_service.delete_memory.call_args_list:
+            kwargs = call.kwargs
+            assert kwargs.get('store') == 'mem0'
+            assert kwargs.get('project_id') == 'reify'
+            assert kwargs.get('causation_id') == 'r1'
+
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        call = memory_service.get_memories_by_metadata.call_args
+        filters = call.kwargs.get('filters') or {}
+        assert filters == {'source': 'stage1_flag_marker'}
+
+        # Deterministic scroll only — semantic search must never be used for GC.
+        memory_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_task_kept(self):
+        """A marker whose task is still 'in-progress' or 'pending' must be KEPT."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'in-progress-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '138', 'flag_type': 'x'},
+            },
+            {
+                'id': 'pending-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '139', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _get_task(task_id, project_root):
+            return {'138': {'status': 'in-progress'}, '139': {'status': 'pending'}}[task_id]
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fp_and_invalid_task_ids_skipped_no_get_task_call(self):
+        """fp: content-fingerprint keys and invalid task_ids (non-digit, empty)
+        are not real task references — they must be skipped entirely, without
+        ever calling taskmaster.get_task, and left to the existing age/fp: GC."""
+        from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        fp = _content_fingerprint('some-finding')
+        members = [
+            {
+                'id': 'fp-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': fp, 'flag_type': 'x'},
+            },
+            {
+                'id': 'invalid-abc-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 'abc', 'flag_type': 'x'},
+            },
+            {
+                'id': 'invalid-empty-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_task_raises_kept_fail_safe(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'errors-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '200', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=RuntimeError('taskmaster down'))
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_dict_or_unknown_or_absent_status_kept(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'non-dict-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '201', 'flag_type': 'x'},
+            },
+            {
+                'id': 'unknown-status-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '202', 'flag_type': 'x'},
+            },
+            {
+                'id': 'absent-status-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '203', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _get_task(task_id, project_root):
+            return {
+                '201': 'not-a-dict-result',
+                '202': {'status': 'unknown'},
+                '203': {},
+            }[task_id]
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_enumeration_failure_returns_zero_and_logs_warning(self, caplog):
+        """When get_memories_by_metadata raises, returns 0, does NOT raise, logs WARNING."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant gone')
+        )
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_terminal_task_flag_markers(
+                memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+    @pytest.mark.asyncio
+    async def test_empty_enumeration_returns_zero_and_no_deletes(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_member_missing_id_is_skipped_not_raised(self):
+        """A malformed scroll member missing 'id' (or carrying an empty 'id')
+        must be skipped before its task_id is ever resolved — best-effort
+        contract end-to-end, and no wasted get_task call for an undeletable
+        marker."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                # no 'id' key at all
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '110', 'flag_type': 'x'},
+            },
+            {
+                'id': '',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '111', 'flag_type': 'x'},
+            },
+            {
+                'id': 'genuinely-terminal',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '112', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 1
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'genuinely-terminal'}
+        assert taskmaster.get_task.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_partial_delete_failure_excluded_from_count_logs_warning(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'bad',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '110', 'flag_type': 'x'},
+            },
+            {
+                'id': 'ok',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '111', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(side_effect=[RuntimeError('boom'), None])
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_terminal_task_flag_markers(
+                memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            )
+
+        assert result == 1
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) == 1
+        assert 'bad' in warning_records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_scroll_cap_reached_logs_no_silent_caps_warning(self, caplog):
+        """When enumeration returns exactly scroll_limit members, log a WARNING that
+        older stale markers may remain uncollected this cycle."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': f'm{i}',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {
+                    'source': 'stage1_flag_marker', 'task_id': str(200 + i), 'flag_type': 'x',
+                },
+            }
+            for i in range(3)
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            await _sweep_terminal_task_flag_markers(
+                memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1', scroll_limit=3,
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warning_records) >= 1
+
+    @pytest.mark.asyncio
+    async def test_degrades_to_noop_when_taskmaster_or_project_root_falsy(self):
+        """No taskmaster and no project_root => returns 0 with NO enumeration
+        and NO get_task call (mirrors flag_dedup.filter_terminal_metadata_flags'
+        degradation posture)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        result_no_taskmaster = await _sweep_terminal_task_flag_markers(
+            memory_service, None, '/home/leo/src/reify', 'reify', 'r1',
+        )
+        result_no_project_root = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '', 'reify', 'r1',
+        )
+
+        assert result_no_taskmaster == 0
+        assert result_no_project_root == 0
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_shared_numeric_task_id_resolved_via_single_get_task_call(self):
+        """The SAME distinct numeric task_id referenced by two markers must
+        resolve via a SINGLE get_task call (status-cache dedup), mirroring the
+        post-flight _resolve_live_status pattern — the incident's 150x2/132x3
+        collapse to single lookups."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'marker-a',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '150', 'flag_type': 'x'},
+            },
+            {
+                'id': 'marker-b',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '150', 'flag_type': 'y'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 2
+        assert taskmaster.get_task.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_all_components_terminal_deleted(self):
+        """A comma-joined marker ('12,15') is deleted when EVERY component
+        task resolves to a terminal status."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'multi-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,15', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _get_task(task_id, project_root):
+            return {'12': {'status': 'done'}, '15': {'status': 'cancelled'}}[task_id]
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 1
+        memory_service.delete_memory.assert_awaited_once()
+        assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'multi-marker'
+        assert taskmaster.get_task.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_mixed_status_kept(self):
+        """A comma-joined marker with one terminal and one live component
+        must be KEPT — a still-live component means the finding may remain
+        relevant."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'multi-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,15', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _get_task(task_id, project_root):
+            return {'12': {'status': 'done'}, '15': {'status': 'pending'}}[task_id]
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_component_get_task_raises_kept_fail_safe(self):
+        """A comma-joined marker where one component's get_task call raises
+        must be KEPT (fail-safe) — the errored component resolves to
+        'unknown', which is never in TERMINAL_STATUSES."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'multi-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,15', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _get_task(task_id, project_root):
+            if task_id == '15':
+                raise RuntimeError('taskmaster down')
+            return {'status': 'done'}
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_degenerate_component_handled_without_raising(self):
+        """A degenerate comma-joined task_id ('12,' — a trailing comma
+        yielding an empty component) must not raise. It is rejected by
+        _is_valid_marker_task_id (mirrors flag_dedup's own trailing-comma
+        rejection), so the marker is treated as an invalid task reference:
+        skipped entirely, no get_task call, KEPT."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'degenerate-marker',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,', 'flag_type': 'x'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_shared_component_dedup_across_markers(self):
+        """Overlapping components across two comma-joined markers ('12,15'
+        and '15,20') must resolve the shared '15' via a SINGLE get_task
+        call — the distinct-component cache applies across markers, not just
+        within one marker's component list."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_terminal_task_flag_markers,
+        )
+
+        members = [
+            {
+                'id': 'marker-a',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '12,15', 'flag_type': 'x'},
+            },
+            {
+                'id': 'marker-b',
+                'created_at': '2026-07-01T00:00:00+00:00',
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': '15,20', 'flag_type': 'y'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
+
+        result = await _sweep_terminal_task_flag_markers(
+            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+        )
+
+        assert result == 2
+        assert taskmaster.get_task.await_count == 3
+
+
 class TestSweepStalePersistenceMarkers:
     """_sweep_stale_persistence_markers age-GCs stage2_persistence_marker Mem0 records.
 
@@ -7870,6 +8486,123 @@ class TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat:
 
         assert 'stale_flag_markers_gc_swept' in report.stats
         assert report.stats['stale_flag_markers_gc_swept'] == 0
+
+
+class TestTaskKnowledgeSyncTerminalTaskFlagMarkersGcSweptStat:
+    """TaskKnowledgeSync.run() sets report.stats['terminal_task_flag_markers_gc_swept']
+    after super().run().
+
+    Monkeypatches the module-level _sweep_terminal_task_flag_markers helper
+    (task 2103) rather than arranging real markers/taskmaster state — the
+    helper's own behavior is covered exhaustively by
+    TestSweepTerminalTaskFlagMarkers; these tests verify only that run()
+    calls it (with taskmaster and project_root threaded through) and injects
+    its count into report.stats.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        from fused_memory.config.schema import ReconciliationConfig
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata.return_value = 0
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return {
+            'memory_service': memory_service,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+        }
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_flag_markers_gc_swept_stat_set_after_run(self, mock_deps):
+        """run() calls _sweep_terminal_task_flag_markers(self.memory, self.taskmaster,
+        self.project_root, self.project_id, run_id) and injects its return value into
+        report.stats."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_terminal_task_flag_markers',
+                new=AM(return_value=2),
+            ) as mock_sweep,
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert report.stats.get('terminal_task_flag_markers_gc_swept') == 2
+        mock_sweep.assert_awaited_once_with(
+            mock_deps['memory_service'], mock_deps['taskmaster'],
+            '/home/leo/src/reify', 'reify', 'test-run',
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_flag_markers_gc_swept_stat_explicit_zero(self, mock_deps):
+        """When nothing is terminal-swept, the stat is 0 — explicitly set, not
+        absent — so downstream consumers never need a .get(..., 0) fallback."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock as AM
+        from unittest.mock import patch
+
+        from fused_memory.models.reconciliation import StageId, StageReport
+        from fused_memory.reconciliation.stages.base import BaseStage
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'reify'
+        stage.project_root = '/home/leo/src/reify'
+
+        mock_deps['memory_service'].search.return_value = []
+        mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
+
+        base_report = StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+        watermark = Watermark(project_id='reify')
+
+        with (
+            patch.object(BaseStage, 'run', new=AM(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.task_knowledge_sync._sweep_terminal_task_flag_markers',
+                new=AM(return_value=0),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=watermark, prior_reports=[], run_id='test-run'
+            )
+
+        assert 'terminal_task_flag_markers_gc_swept' in report.stats
+        assert report.stats['terminal_task_flag_markers_gc_swept'] == 0
 
 
 class TestTaskKnowledgeSyncStalePersistenceMarkersGcSweptStat:

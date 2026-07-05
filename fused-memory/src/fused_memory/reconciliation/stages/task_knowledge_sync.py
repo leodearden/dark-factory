@@ -33,6 +33,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 )
 from fused_memory.reconciliation.flag_dedup import (
     _content_fingerprint,
+    _is_valid_marker_task_id,
     _normalize_content_description,
     acknowledge_resolved_flags,
     compute_flag_signature,
@@ -1158,6 +1159,20 @@ _STAGE2_SUMMARY_RECONSTRUCTION_SOURCE = 'stage2_summary_reconstruction'
 STAGE1_FLAG_MARKER_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 
+# Terminal-task-status GC for stage1_flag_marker records (task 2103).
+# _sweep_stale_flag_markers above is keyed ONLY on marker age / cross-cycle
+# fp: predicates — it has no predicate on the REFERENCED TASK's own status. A
+# finding that stops recurring right after its task goes done/cancelled is
+# recent (<14 days) and typically has a bare-numeric task_id (not fp:), so
+# both existing predicates evaluate False and the marker is never swept. This
+# sweep closes that gap by resolving each marker's referenced task(s) via
+# taskmaster.get_task and deleting only when every referenced task is
+# confirmed terminal (fail-safe KEEP otherwise). Kept as a separate helper
+# (not folded into _sweep_stale_flag_markers) to preserve that function's
+# age-only unit tests and isolate the Taskmaster-I/O failure mode — mirrors
+# the separate _sweep_stale_persistence_markers helper (task 2095).
+_STAGE1_FLAG_MARKER_TERMINAL_GC_SWEEP_SOURCE = 'stage1_flag_marker_terminal_gc_sweep'
+
 # Age-based GC for the stage2_persistence_marker Channel-3 persistence-counter
 # family (task 2095), mirroring the stage1_flag_marker age-GC above (task 1944).
 # _track_flag_persistence writes one stage2_persistence_marker per surviving
@@ -1396,6 +1411,191 @@ async def _sweep_stale_flag_markers(
         if isinstance(result, BaseException):
             logger.warning(
                 'reconciliation._sweep_stale_flag_markers: delete failed for memory_id=%s; not counted',
+                mid,
+                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+            )
+        else:
+            success_count += 1
+    return success_count
+
+
+async def _sweep_terminal_task_flag_markers(
+    memory_service,
+    taskmaster,
+    project_root: str,
+    project_id: str,
+    run_id: str,
+    *,
+    scroll_limit: int = 1000,
+) -> int:
+    """Terminal-task-status GC for ``stage1_flag_marker`` records (task 2103).
+
+    :func:`_sweep_stale_flag_markers` above sweeps ``stage1_flag_marker``
+    records on marker AGE and cross-cycle ``fp:`` predicates only — it has no
+    predicate keyed on the REFERENCED TASK's own live status. A finding that
+    stops recurring right after its task reaches a terminal state is
+    typically recent (<14 days) and has a bare-numeric ``task_id`` (not
+    ``fp:``), so both existing predicates evaluate False and the marker is
+    never swept (the confirmed root cause of the 2026-07-05
+    solar_challenge_platform incident, which required a manual 16-record bulk
+    GC).
+
+    This sweep closes that gap: it enumerates the same ``stage1_flag_marker``
+    pool, resolves each marker's referenced task_id(s) — numeric or
+    comma-joined (e.g. ``'12,15'``) — via ``taskmaster.get_task``, and
+    deletes the marker only when EVERY referenced component task is
+    confirmed to be in ``TERMINAL_STATUSES`` (``{'done', 'cancelled'}``).
+    ``fp:`` content-fingerprint keys and invalid task_ids are skipped
+    entirely (no ``get_task`` call) — they are not references to real tasks
+    and remain the responsibility of :func:`_sweep_stale_flag_markers`'s
+    existing age/fp: GC.
+
+    **Fail-safe direction**: deletion is the irreversible direction, so a
+    marker is deleted ONLY on positively-confirmed terminal status for every
+    referenced component. A ``get_task`` error, non-dict result,
+    ``'unknown'``/absent status, or any non-terminal component status =>
+    KEEP. A transient Taskmaster outage then costs at most one skipped GC
+    cycle — the marker is self-healing (rewritten on the next dedup MISS)
+    and will be swept next cycle once ``get_task`` recovers.
+
+    Each DISTINCT component task_id is resolved via ``get_task`` exactly
+    once (status-cache dedup) — mirroring the post-flight
+    ``_resolve_live_status`` pattern — so markers sharing a task_id (the
+    incident's 150x2/132x3 pattern) collapse to a single Taskmaster call.
+
+    Degrades to a no-op when ``taskmaster`` or ``project_root`` is falsy
+    (mirrors ``flag_dedup.filter_terminal_metadata_flags``'s degradation
+    posture).
+
+    Enumerates deterministically via ``memory_service.get_memories_by_metadata``
+    (Qdrant payload-filter scroll) — NEVER semantic search, which silently
+    drops low-similarity rows and is unsuitable for exhaustive GC. Deletes
+    are issued best-effort in parallel via ``asyncio.gather`` with
+    ``return_exceptions=True`` (mirrors :func:`_sweep_stale_flag_markers`):
+    individual failures log WARNING and are excluded from the returned
+    count.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata`` and
+            ``delete_memory``.
+        taskmaster: Object with an async ``get_task(task_id, project_root)``
+            method. Falsy => no-op (returns 0).
+        project_root: Project root passed through to ``get_task``. Falsy =>
+            no-op (returns 0).
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as
+            ``causation_id`` in the audit journal.
+        scroll_limit: Max records to enumerate in one scroll (default 1000).
+
+    Returns:
+        Number of memories successfully deleted (0 if nothing is stale, on
+        enumeration failure, or when degraded to a no-op).
+    """
+    if not taskmaster or not project_root:
+        return 0
+
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'source': 'stage1_flag_marker'},
+            limit=scroll_limit,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._sweep_terminal_task_flag_markers: '
+            'get_memories_by_metadata failed for project_id=%s; skipping sweep',
+            project_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return 0
+
+    if len(members) >= scroll_limit:
+        logger.warning(
+            'reconciliation._sweep_terminal_task_flag_markers: enumerated %d of '
+            'scroll_limit=%d stage1_flag_marker records — scroll cap reached; '
+            'older terminal-task markers may remain uncollected this cycle; '
+            're-run with a higher scroll_limit.',
+            len(members), scroll_limit,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+    if not members:
+        return 0
+
+    # First pass: select candidate markers (numeric / comma-joined task_id
+    # references only — fp: fingerprints and invalid ids are left to
+    # _sweep_stale_flag_markers's existing age/fp: GC) and record each
+    # candidate's component task_ids.
+    candidates: dict[str, list[str]] = {}
+    for member in members:
+        mid = member.get('id')
+        if not mid:
+            continue
+        tid = str((member.get('metadata') or {}).get('task_id') or '')
+        if not _is_valid_marker_task_id(tid) or is_content_fingerprint_task_id(tid):
+            continue
+        components = [c.strip() for c in tid.split(',') if c.strip()]
+        if not components:
+            continue
+        candidates[mid] = components
+
+    if not candidates:
+        return 0
+
+    # Resolve each DISTINCT component task_id exactly once (status-cache
+    # dedup), mirroring the post-flight _resolve_live_status pattern.
+    distinct_components = list({c for components in candidates.values() for c in components})
+
+    async def _safe_get_task(component: str):
+        try:
+            return await taskmaster.get_task(component, project_root)
+        except Exception as exc:
+            logger.debug(
+                'reconciliation._sweep_terminal_task_flag_markers: '
+                'get_task failed for task_id=%s: %s',
+                component, exc,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+            return None  # KEEP marker on error (fail-safe)
+
+    task_results = await asyncio.gather(*(_safe_get_task(c) for c in distinct_components))
+    status_cache: dict[str, str] = {
+        component: (_extract_status(result) if isinstance(result, dict) else 'unknown')
+        for component, result in zip(distinct_components, task_results, strict=True)
+    }
+
+    # Conservative: delete only when EVERY referenced component task is
+    # confirmed terminal — a still-live component means the finding may
+    # remain relevant, so any 'unknown'/errored/non-terminal component keeps
+    # the marker.
+    stale_ids = [
+        mid
+        for mid, components in candidates.items()
+        if all(status_cache.get(c, 'unknown') in TERMINAL_STATUSES for c in components)
+    ]
+
+    if not stale_ids:
+        return 0
+
+    results = await asyncio.gather(
+        *(
+            memory_service.delete_memory(
+                memory_id=mid,
+                store='mem0',
+                project_id=project_id,
+                causation_id=run_id,
+                _source=_STAGE1_FLAG_MARKER_TERMINAL_GC_SWEEP_SOURCE,
+            )
+            for mid in stale_ids
+        ),
+        return_exceptions=True,
+    )
+
+    success_count = 0
+    for mid, result in zip(stale_ids, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'reconciliation._sweep_terminal_task_flag_markers: delete failed for memory_id=%s; not counted',
                 mid,
                 extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
             )
@@ -2477,6 +2677,22 @@ class TaskKnowledgeSync(BaseStage):
             run_window_start=getattr(self, '_run_window_start', None),
         )
         report.stats['stale_flag_markers_gc_swept'] = gc_swept
+
+        # --- stage1_flag_marker terminal-task-status GC (task 2103) ---
+        # Complements the age-only/fp: sweep immediately above: that sweep has
+        # no predicate on the REFERENCED TASK's own status, so a finding whose
+        # task goes done/cancelled soon after being flagged is both recent
+        # (<14 days) and typically bare-numeric (not fp:) — both existing
+        # predicates evaluate False and the marker is never collected (the
+        # confirmed root cause of the 2026-07-05 solar_challenge_platform
+        # incident's 16-record manual bulk GC). Runs unconditionally on both
+        # full and remediation paths; degrades to a no-op (0) when taskmaster
+        # or project_root is unset. Explicit zero so downstream consumers
+        # never need a .get(..., 0) fallback.
+        terminal_gc_swept = await _sweep_terminal_task_flag_markers(
+            self.memory, self.taskmaster, self.project_root, self.project_id, run_id,
+        )
+        report.stats['terminal_task_flag_markers_gc_swept'] = terminal_gc_swept
 
         # --- stage2_persistence_marker age-based GC (task 2095) ---
         # The stage2_persistence_marker pool is written by _track_flag_persistence
