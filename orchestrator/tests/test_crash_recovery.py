@@ -690,6 +690,11 @@ class TestRecoverCrashedTasksWarmLane:
         down the faulting reuse fast-path and shielding the lane from the
         create-once self-heal forever.  Skipping the pin leaves the lane FREE
         (self-healed on next acquire) while the plan is still recovered.
+
+        Sibling coverage: test_harness_warm_lane_wiring.py::
+        TestRecoveryTerminalTaskLaneRelease::test_recovery_skips_pin_for_unregistered_lane
+        exercises the same invariant against a real git repo + GitOps pool;
+        keep both in sync if this invariant ever changes.
         """
         pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
@@ -712,10 +717,53 @@ class TestRecoverCrashedTasksWarmLane:
         assert '42' in harness._recovered_plans
         # Lane must not be torn down either (self-heal happens on next acquire)
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
-        # Loud post-crash integrity signal
-        assert 'regist' in caplog.text, (
-            f'expected a registration warning in the log; got: {caplog.text!r}'
+        # Loud post-crash integrity signal — tightened to the specific
+        # orphaned-lane warning (not just any 'regist*' log line) and pinned
+        # to this task's id so an unrelated registration message can't
+        # satisfy it.
+        assert any(
+            rec.levelno == logging.WARNING
+            and '42' in rec.getMessage()
+            and 'NOT a registered' in rec.getMessage()
+            for rec in caplog.records
+        ), f'expected the orphaned-lane registration warning for task 42; got: {caplog.text!r}'
+
+    async def test_warm_lane_registration_check_exception_falls_back_to_pin(
+        self, harness: Harness, caplog,
+    ):
+        """If the registration check itself raises (e.g. a WorktreeMissing/
+        OSError from a git subprocess hiccup), recovery must not propagate the
+        exception (which would abort recovery for every other worktree) and
+        must not treat the failure as conclusive "unregistered" — it falls
+        back to the pre-guard safe default (pin), mirroring the transient-None
+        term_status handling above.  See harness.py:_recover_crashed_tasks for
+        why the rc!=0-collapsed-to-False case inside _is_registered_worktree
+        itself is a separate, out-of-scope concern (would need a git_ops.py
+        contract change); this test locks only the exception-safety net that
+        IS addressable from this call site.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane_path = _setup_lane(base, '_lane-0', plan)
+        harness.git_ops._is_registered_worktree = AsyncMock(
+            side_effect=OSError('git worktree list failed')
         )
+        # get_status left at fixture default (None) — non-terminal path.
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._recover_crashed_tasks()  # must not raise
+
+        # Safe default: pin IS restored despite the raised exception
+        assert pool.assignment_for('42') == lane_path
+        assert pool.state(lane_path) == LaneState.ASSIGNED
+        assert '42' in harness._recovered_plans
+        assert any(
+            rec.levelno == logging.WARNING
+            and '42' in rec.getMessage()
+            and 'registration check raised' in rec.getMessage()
+            for rec in caplog.records
+        ), f'expected a registration-check-raised warning; got: {caplog.text!r}'
 
 
 # ===========================================================================

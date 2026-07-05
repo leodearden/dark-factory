@@ -1335,6 +1335,11 @@ class TestRecoveryTerminalTaskLaneRelease:
         restore_assignment is skipped, cleanup_worktree is not called either,
         the plan is still recovered, and the lane is left FREE so the
         create-once self-heal path repairs it on the next acquire.
+
+        Sibling coverage: test_crash_recovery.py::TestRecoverCrashedTasksWarmLane::
+        test_warm_lane_orphaned_registration_not_pinned exercises the same
+        invariant with mock-based fixtures; keep both in sync if this
+        invariant ever changes.
         """
         harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
 

@@ -2120,7 +2120,32 @@ Output JSON matching the schema. Every task must appear in the output.
                 # leaves the lane FREE so the next acquire_for() self-heals it
                 # (rmtree + fresh 'git worktree add'); the plan is still
                 # recovered below via _recovered_plans independent of the pin.
-                if await self.git_ops._is_registered_worktree(entry):
+                #
+                # Note on fail-safe direction: _is_registered_worktree()
+                # itself collapses a git command failure (rc != 0) to False —
+                # correct for its OTHER caller (git_ops.py's create-once
+                # self-heal gate, where a downstream destroy-gate absorbs a
+                # false negative) but that swallow is invisible from here, so
+                # this call site cannot currently tell "positively orphaned"
+                # apart from "git was transiently unreachable" — fully fixing
+                # that needs a contract change (tri-state return, or raise on
+                # command failure) in git_ops.py, which is out of scope for
+                # this task (no lock on that file); tracked as a follow-up.
+                # What we CAN fail safe on from here is an outright exception
+                # (e.g. a raised WorktreeMissing/OSError) escaping the check —
+                # treat that like the transient-None term_status case above
+                # and fall through to the old unconditional-pin behavior
+                # rather than let it abort recovery for every other worktree.
+                try:
+                    is_registered = await self.git_ops._is_registered_worktree(entry)
+                except OSError as e:
+                    logger.warning(
+                        'Recovery: registration check raised for lane %s '
+                        'task %s (%s) — restoring pin as safe default',
+                        entry.name, recovery_id, e,
+                    )
+                    is_registered = True
+                if is_registered:
                     pool.restore_assignment(recovery_id, entry)
                 else:
                     logger.warning(
