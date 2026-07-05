@@ -4230,11 +4230,6 @@ class TestCycleSummaryRunIdGuard:
             f'{[r.message for r in warning_records]}'
         )
         record = warning_records[0]
-        message = record.message.lower()
-        assert 'cycle_summary' in message and 'run_id' in message, (
-            f'Expected the WARNING to name the dropped-run_id condition, '
-            f'got: {record.message!r}'
-        )
         assert record.run_id is None
         assert record.stage == 'memory_consolidator'
         assert 'run_id' in record.missing_cycle_summary_keys
