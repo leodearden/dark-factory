@@ -1158,6 +1158,19 @@ _STAGE2_SUMMARY_RECONSTRUCTION_SOURCE = 'stage2_summary_reconstruction'
 STAGE1_FLAG_MARKER_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 
+# Age-based GC for the stage2_persistence_marker Channel-3 persistence-counter
+# family (task 2095), mirroring the stage1_flag_marker age-GC above (task 1944).
+# _track_flag_persistence writes one stage2_persistence_marker per surviving
+# flag per cycle with NO existing sweep. Unlike stage1_flag_marker (persistent
+# dedup-state meant to persist indefinitely), this is a bounded failure-case
+# counter: once a flag stops recurring (deleted by FIX C, or simply resolved)
+# its markers are orphaned. 14 days matches the task-1944 default for
+# operator consistency; a still-live flag rewrites a fresh marker every
+# cycle (its newest marker is always <1 day old), so age-GC only trims aged
+# surplus and never blocks the STAGE2_FLAG_PERSISTENCE_THRESHOLD escalation.
+STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS: int = 14
+_STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep'
+
 
 async def _sweep_stale_fixc_markers(
     memory_service,
@@ -1387,6 +1400,99 @@ async def _sweep_stale_flag_markers(
                 extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
             )
         else:
+            success_count += 1
+    return success_count
+
+
+async def _sweep_stale_persistence_markers(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    max_age_days: int = STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS,
+    now: datetime | None = None,
+    scroll_limit: int = 1000,
+) -> int:
+    """Age-GC orphaned ``stage2_persistence_marker`` Mem0 records (task 2095).
+
+    ``stage2_persistence_marker`` records are written once per surviving flag
+    per cycle by :func:`_track_flag_persistence` with no existing collector.
+    A flag that stops recurring (deleted by FIX C, or simply resolved) leaves
+    its markers orphaned; this helper closes that gap by enumerating the
+    whole pool and deleting members whose ``created_at`` is strictly older
+    than ``now - max_age_days``.
+
+    AGE-ONLY mirror of :func:`_sweep_stale_flag_markers` (task 1944): this
+    helper does NOT implement that function's cross-cycle ``fp:``
+    content-fingerprint predicate. ``stage2_persistence_marker`` metadata is
+    ``{source, flag_id, run_id}`` with no ``task_id``/``fp:`` key, so that
+    predicate has no applicable input here.
+
+    Enumerates deterministically via ``memory_service.get_memories_by_metadata``
+    (Qdrant payload-filter scroll) — NEVER semantic search, which silently
+    drops low-similarity rows and is unsuitable for exhaustive GC. Members
+    with a missing or unparseable ``created_at`` are KEPT (never deleted).
+
+    Deletes are issued best-effort in parallel via ``asyncio.gather`` with
+    ``return_exceptions=True``; failed deletes are excluded from the
+    returned count.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata`` and
+            ``delete_memory``.
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            in the audit journal.
+        max_age_days: Staleness cutoff in days (default
+            ``STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS`` == 14).
+        now: Reference "current time" for the cutoff calculation. Defaults to
+            ``datetime.now(UTC)``; tests inject a fixed value.
+        scroll_limit: Max records to enumerate in one scroll (default 1000).
+
+    Returns:
+        Number of memories successfully deleted (0 if nothing is stale).
+    """
+    members = await memory_service.get_memories_by_metadata(
+        project_id=project_id,
+        filters={'source': _STAGE2_PERSISTENCE_MARKER_SOURCE},
+        limit=scroll_limit,
+    )
+
+    cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
+
+    stale_ids: list[str] = []
+    for member in members:
+        mid = member.get('id')
+        if not mid:
+            continue
+        raw = member.get('created_at')
+        if raw is None:
+            continue
+        try:
+            created_at = _assume_utc(datetime.fromisoformat(raw))
+        except (ValueError, TypeError):
+            continue
+
+        if created_at < cutoff:
+            stale_ids.append(mid)
+
+    results = await asyncio.gather(
+        *(
+            memory_service.delete_memory(
+                memory_id=mid,
+                store='mem0',
+                project_id=project_id,
+                causation_id=run_id,
+                _source=_STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE,
+            )
+            for mid in stale_ids
+        ),
+        return_exceptions=True,
+    )
+
+    success_count = 0
+    for result in results:
+        if not isinstance(result, BaseException):
             success_count += 1
     return success_count
 
