@@ -122,6 +122,16 @@ def test_reify_orchestrator_service_structure() -> None:
         "Requires=fused-memory.service is a regression — use Wants= so a "
         "transient fused-memory blip doesn't permanently cancel our start job"
     )
+    # Primary prevention for the Jul-3 registration-wipe incident: the reify
+    # unit's warm-lane pool storage (XFS loop image at /home/leo/src/warm-lanes)
+    # must gate startup via RequiresMountsFor, or a post-crash reboot can start
+    # this orchestrator before the mount is up and its first sweep's
+    # `git worktree prune` runs against an empty mountpoint.
+    assert "RequiresMountsFor=/home/leo/src/warm-lanes" in content, (
+        "Missing RequiresMountsFor=/home/leo/src/warm-lanes — without it systemd "
+        "has no ordering on the warm-lane loop-image mount and can start this "
+        "orchestrator before the mount is up (Jul-3 registration-wipe incident)"
+    )
 
     # --- [Service] ---
     assert "Type=simple" in content
@@ -159,7 +169,8 @@ def test_reify_orchestrator_service_structure() -> None:
 
 
 def test_reify_and_df_differ_only_in_config_and_description() -> None:
-    """The two orchestrator service files must be identical except Description and --config path.
+    """The two orchestrator service files must be identical except Description,
+    --config path, and the reify-only warm-lane mount gate.
 
     This guards the 'same shape' invariant: any structural drift (missing key,
     different Restart policy, etc.) that appears in one but not the other will
@@ -167,6 +178,23 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     """
     df_lines = DF_SERVICE.read_text(encoding="utf-8").splitlines()
     reify_lines = REIFY_SERVICE.read_text(encoding="utf-8").splitlines()
+
+    # orchestrator-reify.service alone gates on the warm-lane pool storage
+    # mount (XFS loop image at /home/leo/src/warm-lanes) — dark-factory runs
+    # entirely on the root filesystem and has no such mount to wait on. This
+    # is a deliberate, permanent structural difference (Jul-3 registration-
+    # wipe incident prevention), so it's stripped before the line-for-line
+    # comparison below rather than being treated as drift.
+    warm_lane_block_start = (
+        "# Warm-lane pool storage (XFS loop image) mount gate: the fstab entry for"
+    )
+    warm_lane_directive = "RequiresMountsFor=/home/leo/src/warm-lanes"
+    if warm_lane_block_start in reify_lines:
+        start_idx = reify_lines.index(warm_lane_block_start)
+        end_idx = reify_lines.index(warm_lane_directive, start_idx)
+        # Drop the comment block, the directive itself, and the single
+        # trailing blank line that separates it from the next block.
+        del reify_lines[start_idx : end_idx + 2]
 
     assert len(df_lines) == len(reify_lines), (
         f"Service files have different line counts: df={len(df_lines)} reify={len(reify_lines)}"
