@@ -2108,7 +2108,53 @@ Output JSON matching the schema. Every task must appear in the output.
                     await self.git_ops.cleanup_worktree(entry, recovery_id)
                     cleaned += 1
                     continue
-                pool.restore_assignment(recovery_id, entry)
+                # Registration guard (reify 4655/4947): only re-pin the lane
+                # if it is STILL a registered git worktree.  A stale plan.json
+                # can survive in an ORPHANED lane (dir present on disk, but its
+                # '.git/worktrees' admin entry is gone) — pinning it
+                # unconditionally re-ASSIGNs the broken lane on every restart,
+                # which (a) forces the next dispatch down the reuse fast-path
+                # (which faults on the missing worktree) and (b) shields the
+                # lane from the create-once self-heal forever, since that
+                # self-heal only ever sees FREE lanes.  Skipping the pin
+                # leaves the lane FREE so the next acquire_for() self-heals it
+                # (rmtree + fresh 'git worktree add'); the plan is still
+                # recovered below via _recovered_plans independent of the pin.
+                #
+                # Note on fail-safe direction: _is_registered_worktree()
+                # itself collapses a git command failure (rc != 0) to False —
+                # correct for its OTHER caller (git_ops.py's create-once
+                # self-heal gate, where a downstream destroy-gate absorbs a
+                # false negative) but that swallow is invisible from here, so
+                # this call site cannot currently tell "positively orphaned"
+                # apart from "git was transiently unreachable" — fully fixing
+                # that needs a contract change (tri-state return, or raise on
+                # command failure) in git_ops.py, which is out of scope for
+                # this task (no lock on that file); tracked as a follow-up.
+                # What we CAN fail safe on from here is an outright exception
+                # (e.g. a raised WorktreeMissing/OSError) escaping the check —
+                # treat that like the transient-None term_status case above
+                # and fall through to the old unconditional-pin behavior
+                # rather than let it abort recovery for every other worktree.
+                try:
+                    is_registered = await self.git_ops._is_registered_worktree(entry)
+                except OSError as e:
+                    logger.warning(
+                        'Recovery: registration check raised for lane %s '
+                        'task %s (%s) — restoring pin as safe default',
+                        entry.name, recovery_id, e,
+                    )
+                    is_registered = True
+                if is_registered:
+                    pool.restore_assignment(recovery_id, entry)
+                else:
+                    logger.warning(
+                        'Recovery: lane %s for task %s is NOT a registered '
+                        'git worktree (orphaned .git/worktrees admin entry) — '
+                        'leaving FREE for create-once self-heal; plan is '
+                        'still recovered under task id %s',
+                        entry.name, recovery_id, recovery_id,
+                    )
 
             # Check if plan has any completed steps
             # Note: some plans have prerequisites as plain strings (not dicts)
