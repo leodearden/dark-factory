@@ -3918,6 +3918,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the same transient-window pattern as _remerging_item and _inflight_req.
         # Set at the top of _finalize_inflight; cleared in its finally clause.
         self._finalizing_head: InflightEntry | None = None
+        # Dispatch-gap census (task 2096): set to the item just popped from
+        # _redispatch/_verifier_queue for the duration of `await
+        # self._dispatch_item(item)` in _verifier_loop's DISPATCH-FILL — the
+        # item is off the queue but not yet appended to _inflight during
+        # that await (host-acquisition git calls, in-dispatch speculative-
+        # remerge). Closes the I4 speculation-permit census gap the same way
+        # _finalizing_head closes the finalize-head gap above. Set
+        # immediately before the await in a nested try; cleared in its
+        # finally so an exception inside _dispatch_item can never leave it
+        # stale. Census-only: unlike _finalizing_head / _remerging_item, this
+        # field is NOT read by snapshot()'s 'entries' section (task 2068).
+        self._dispatching_item: SpeculativeItem | None = None
         # Persistent warm merge-verify worktree: counts verifying attempts so
         # _safety_valve_due can fire the periodic cold-verify (PRD §10 invariant 6).
         # Incremented on every LOCAL-lease verify attempt — task-1724 made verify
@@ -4913,28 +4925,52 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Single source of truth for the ``inflight_speculative`` term shared
         by :meth:`snapshot`'s ``'speculation'`` key and
-        :meth:`speculation_accounting_violations`. Counts
-        ``self._inflight`` entries with ``was_speculative`` plus
-        ``self._verifier_queue`` items with ``.speculative`` plus
-        ``self._redispatch`` items with ``.speculative`` — the same
-        CPython internal-deque read ``snapshot()`` already performs
-        elsewhere (synchronous, no await, no lock; safe under asyncio's
-        single-loop model).
+        :meth:`speculation_accounting_violations`. From the instant a
+        speculative item's permit transfers to the verifier
+        (``SpeculationController.on_transfer``/``on_transfer_terminal``, at
+        the ``_verifier_queue.put()`` call site) until the permit is
+        released, the item must be counted from exactly one of these
+        locations — the same CPython internal-deque read ``snapshot()``
+        already performs elsewhere (synchronous, no await, no lock; safe
+        under asyncio's single-loop model):
 
-        ``self._redispatch`` is a third verifier-side resting place for an
-        un-released speculation permit (task 2063): a speculative item is
-        parked there, still holding its permit, when ``_dispatch_item``
-        returns ``None`` because ``free_host_count() == 0`` (verify hosts <
-        speculation_depth) — the item is awaiting a host, not abandoned.
-        Omitting this deque undercounts by one for the whole multi-heartbeat
-        window the item spends parked, which self-clears once a host frees
-        it into ``self._inflight``; this is what previously surfaced as a
-        spurious ``speculation-slot conservation violated`` audit finding.
-        The narrower mid-``_dispatch_item`` git-call await and the
-        in-dispatch speculative-remerge window are single-tick, sub-heartbeat
-        transients that the ``RESOURCE_AUDIT_ESCALATION_STREAK >= 3``
-        detector already tolerates — intentionally left uncounted here
-        (characterize-first minimal-fix scope, not a further leak).
+          * ``self._inflight``      — entries with ``was_speculative`` (task θ/1993).
+          * ``self._verifier_queue`` — items with ``.speculative`` (task θ/1993).
+          * ``self._redispatch``    — items with ``.speculative`` (task 2063): a
+            speculative item parked here, still holding its permit, when
+            ``_dispatch_item`` returns ``None`` because ``free_host_count()
+            == 0`` (verify hosts < speculation_depth) — awaiting a host, not
+            abandoned. Omitting this deque undercounts by one for the whole
+            multi-heartbeat window the item spends parked.
+          * ``self._finalizing_head`` — ``was_speculative`` (task 2096): set at
+            the top of ``_finalize_inflight`` and held for the ENTIRE
+            ``await entry.verify_task`` — i.e. the full verify duration
+            (20-60 min observed on reify), *not* the "single-tick,
+            sub-heartbeat transient" task 2063 originally characterized this
+            window as. Before this term was added, a speculative head's
+            permit was invisible to this count for that whole duration,
+            producing a spurious ``speculation-slot conservation violated``
+            audit finding for the entire verify (confirmed via the reify
+            esc-__merge_resource_leak__-23/-24 incidents) — the dominant,
+            longest-lived instance of the under-count class task 2063 first
+            fixed the shorter ``_redispatch``-parked case of.
+          * ``self._dispatching_item`` — ``.speculative`` (task 2096): set in
+            ``_verifier_loop``'s DISPATCH-FILL immediately before ``await
+            self._dispatch_item(item)`` and cleared in a bulletproof
+            ``finally``. Covers the "dispatch-gap": the item is off
+            ``_redispatch``/``_verifier_queue`` but not yet appended to
+            ``self._inflight`` during that await (host-acquisition git
+            calls, in-dispatch speculative-remerge). A speculative item's
+            ``.speculative`` is stable across this await (Mechanism 2's
+            chain-remerge is skipped for speculative items), so the gap is
+            safely countable. This is census-only: unlike
+            ``_finalizing_head``/``_remerging_item``, ``_dispatching_item``
+            is NOT surfaced in ``snapshot()``'s ``'entries'`` section —
+            that observability parity is task 2068's scope.
+
+        With all five locations covered, every point from permit-transfer
+        (``on_transfer``/``on_transfer_terminal``) to the verifier-side
+        release is accounted for — no uncounted location remains.
         """
         return (
             sum(1 for _ie in self._inflight if _ie.was_speculative)
@@ -4951,6 +4987,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # _redispatch has a None case to handle.
                 1 for _item in self._redispatch
                 if _item is not None and _item.speculative
+            )
+            + (
+                1 if self._finalizing_head is not None
+                and self._finalizing_head.was_speculative
+                else 0
+            )
+            + (
+                1 if self._dispatching_item is not None
+                and self._dispatching_item.speculative
+                else 0
             )
         )
 
@@ -5689,12 +5735,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # by the verifier (self._inflight entries with was_speculative +
             # self._verifier_queue items with .speculative + self._redispatch
             # items with .speculative — task 2063's fix for the parked-item
-            # under-count; same CPython internal-deque read as the 'entries'
-            # section above). Together these make the permit-conservation
-            # identity slot_available + held_by_merger + inflight_speculative
-            # == depth fully computable from snapshot() (task iota's
-            # conservation audit). Pure synchronous read — no await, no git
-            # calls. No collision with existing keys.
+            # under-count + self._finalizing_head was_speculative — task
+            # 2096's fix for the verify-duration finalize-head under-count;
+            # same CPython internal-deque read as the 'entries' section
+            # above). Together these make the permit-conservation identity
+            # slot_available + held_by_merger + inflight_speculative == depth
+            # fully computable from snapshot() (task iota's conservation
+            # audit). Pure synchronous read — no await, no git calls. No
+            # collision with existing keys.
             'speculation': {
                 **self._speculation_controller.snapshot(),
                 'inflight_speculative': self._inflight_speculative_count(),
@@ -7571,8 +7619,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 # Dispatch the item (applies Mechanism 1, abandon/halt/passthrough/
                 # chain-remerge logic, host acquire, verify task launch).
+                #
+                # Dispatch-gap census (task 2096): self._dispatching_item is set
+                # immediately before the await and cleared in a nested finally —
+                # independent of the outer exception handling below — so a raise
+                # inside _dispatch_item can never leave it stale.  This closes the
+                # I4 speculation-permit census for the whole dispatch-gap window
+                # (the item is off the queue but not yet in self._inflight).
                 try:
-                    entry = await self._dispatch_item(item)
+                    self._dispatching_item = item
+                    try:
+                        entry = await self._dispatch_item(item)
+                    finally:
+                        self._dispatching_item = None
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     raise
                 except BaseException as exc:

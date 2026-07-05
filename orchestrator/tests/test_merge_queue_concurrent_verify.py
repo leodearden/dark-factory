@@ -4439,3 +4439,149 @@ class TestRedispatchSpeculativeConservation:
         )
         assert 'rc_b.py' in main_files, 'B (rc_b.py) must land on main after remerge'
         assert 'rc_a.py' not in main_files, 'A (rc_a.py) must NOT land (verify failed)'
+
+
+# ---------------------------------------------------------------------------
+# task 2096: _finalizing_head speculative-permit accounting THROUGHOUT the
+# real finalize-head verify-duration window.
+#
+# TestFinalizingHeadLifecycle (test_merge_queue_finalize_head_visibility.py)
+# already proves _finalizing_head is set/cleared around `await
+# entry.verify_task`. This test proves the I4 speculation-slot identity
+# (speculation_accounting_violations()) stays CLEAN for the entire duration
+# of that await when the finalizing head itself is speculative — the real
+# window esc-__merge_resource_leak__-23/-24 (reify) observed as a spurious
+# violation lasting the full verify (20-60 min), not the "single-tick"
+# transient task 2063 assumed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeHeadSpeculativeAccountingThroughout:
+    """RED pre-fix (task 2096): _inflight_speculative_count() never scans
+    self._finalizing_head, so while a speculative finalizing head is paused
+    mid-`await entry.verify_task` (gated below), the identity check is short
+    by one and speculation_accounting_violations() reports a spurious
+    conservation violation for the whole window.
+    """
+
+    async def _make_merged_item(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+        content: str,
+    ):
+        """Build a real merged (speculative) item so _finalize_inflight's
+        merge_result path works — mirrors TestFinalizeInflightPass /
+        TestFinalizingHeadLifecycle's identically-named per-class helper.
+        """
+        from orchestrator.merge_queue import RealMergeItem
+
+        wt = await _make_branch_with_file(git_ops, branch, filename, content)
+        req = _make_request(branch, branch, wt, config)
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success and merge_result.merge_commit
+        assert merge_result.merge_worktree is not None
+        base_sha = await git_ops.get_main_sha()
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_result.merge_worktree,
+            base_sha=base_sha,
+            speculative=True,
+        )
+        return req, item
+
+    async def test_speculation_accounting_clean_throughout_speculative_finalize_head_await(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
+        from orchestrator.verify_runner import HostLease
+
+        gate = asyncio.Event()
+
+        async def _gated_fail_verify() -> InflightVerifyResult:
+            await gate.wait()
+            return InflightVerifyResult(
+                outcome=MergeOutcome('blocked', reason='gated-test'),
+                merge_wt=None,
+            )
+
+        req, item = await self._make_merged_item(
+            git_ops, config, 'fh-spec-gate', 'fhspec.py', 'x = 1\n',
+        )
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q, speculation_depth=2)
+
+        alloc = MagicMock()
+        alloc.release = AsyncMock()
+        alloc.cancel_and_release = AsyncMock()
+        worker._host_allocator = alloc
+
+        # Drain both speculation permits up front: the gated finalizing head
+        # (was_speculative=True below) accounts for one, a second speculative
+        # entry parked in _inflight accounts for the other.
+        worker._speculation_slot._value = 0
+
+        _, second_item = await self._make_merged_item(
+            git_ops, config, 'fh-spec-second', 'fhspec2.py', 'y = 2\n',
+        )
+        worker._inflight.append(InflightEntry(
+            item=second_item,
+            lease=HostLease(name='local2', runner=MagicMock(), is_local=True),
+            verify_task=None,
+            merge_wt=second_item.merge_wt,
+            was_speculative=True,
+            phase='awaiting_verify',
+        ))
+
+        local_lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        verify_task = asyncio.ensure_future(_gated_fail_verify())
+        entry = InflightEntry(
+            item=item,
+            lease=local_lease,
+            verify_task=verify_task,
+            merge_wt=None,
+            was_speculative=True,
+            phase='verifying',
+        )
+
+        # Launch _finalize_inflight; it will pause at `await entry.verify_task`.
+        fin = asyncio.ensure_future(worker._finalize_inflight(entry))
+        await asyncio.sleep(0)  # yield to let _finalize_inflight reach the await
+
+        assert worker._finalizing_head is entry, (  # type: ignore[attr-defined]
+            f'Expected worker._finalizing_head is entry after yield; '
+            f'got {worker._finalizing_head!r}.'
+        )
+
+        violations_mid_await = worker.speculation_accounting_violations()
+        assert violations_mid_await == [], (
+            f'speculation-slot identity must hold for the ENTIRE '
+            f'`await entry.verify_task` window when the finalizing head is '
+            f'itself speculative (task 2096); got {violations_mid_await!r}. '
+            f'RED: _inflight_speculative_count() does not yet scan '
+            f'_finalizing_head, so the drained-but-uncounted permit reads '
+            f'as a conservation violation for the whole verify duration.'
+        )
+        assert worker._inflight_speculative_count() == 2, (
+            f'Expected both the finalizing head and the parked _inflight '
+            f'entry counted; got {worker._inflight_speculative_count()!r}.'
+        )
+
+        # Release the gate so _finalize_inflight can complete.
+        gate.set()
+        await fin
+
+        assert worker._finalizing_head is None, (  # type: ignore[attr-defined]
+            f'Expected worker._finalizing_head is None after _finalize_inflight; '
+            f'got {worker._finalizing_head!r}.'
+        )
+        assert req.result.done(), 'Expected req.result to be resolved after FAIL path.'
+        assert worker.speculation_accounting_violations() == [], (
+            'speculation-slot identity must hold after the finalizing head '
+            'releases its permit in the finally clause.'
+        )
