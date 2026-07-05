@@ -27,7 +27,7 @@ import pytest
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import RealMergeItem
+from orchestrator.merge_types import DecidedItem, MergeOutcome, RealMergeItem
 
 # ── fixtures (mirrors test_merge_queue_finalize_head_visibility.py) ─────────
 
@@ -150,3 +150,97 @@ class TestSnapshotRedispatchEntries:
 
         assert snap['entries'] == []
         assert snap['depth'] == 0
+
+    async def test_redispatch_entries_precede_awaiting_verify_entries(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """_redispatch is front-priority (drained by the verifier loop's
+        DISPATCH-FILL ahead of _verifier_queue), so section 1c must place its
+        entries BEFORE any awaiting_verify entry in snapshot()['entries'] —
+        presence alone isn't enough.
+
+        Guards the positional invariant documented in snapshot()'s section 1c
+        comment: a future refactor that moved 1c below section 2 would keep
+        the redispatch entry present (and depth correct) while silently
+        breaking the head-of-line / position semantics dashboard consumers
+        rely on. Without this test, that regression would pass both
+        test_redispatch_parked_item_appears_in_entries (only _redispatch is
+        populated there) and the depth/entries-presence checks.
+        """
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        rd_req = _make_req('rd-parked', 'task/rd-parked', config, git_repo)
+        rd_item = RealMergeItem(
+            request=rd_req,
+            merge_result=None,  # type: ignore[arg-type]
+            merge_wt=git_repo,
+            base_sha='deadbeef',
+            speculative=True,
+        )
+        worker._redispatch.append(rd_item)
+
+        av_req = _make_req('av-waiting', 'task/av-waiting', config, git_repo)
+        av_item = RealMergeItem(
+            request=av_req,
+            merge_result=None,  # type: ignore[arg-type]
+            merge_wt=git_repo,
+            base_sha='deadbeef',
+            speculative=False,
+        )
+        worker._verifier_queue.put_nowait(av_item)
+
+        snap = worker.snapshot()
+
+        entry_task_ids = [e['task_id'] for e in snap['entries']]
+        assert 'rd-parked' in entry_task_ids and 'av-waiting' in entry_task_ids, (
+            f"Expected both the redispatch and awaiting_verify entries present, "
+            f"got {entry_task_ids}."
+        )
+        rd_index = entry_task_ids.index('rd-parked')
+        av_index = entry_task_ids.index('av-waiting')
+        assert rd_index < av_index, (
+            f"Expected the redispatch entry (index {rd_index}) to precede the "
+            f"awaiting_verify entry (index {av_index}) since _redispatch is "
+            f"front-priority over _verifier_queue. Got order: {entry_task_ids}."
+        )
+
+    async def test_redispatch_decided_item_has_none_worktree(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A DecidedItem parked on _redispatch must surface with worktree=None.
+
+        _redispatch is typed deque[SpeculativeItem] (RealMergeItem |
+        DecidedItem), and this isn't just type-possible: _remerge() returns
+        SpeculativeItem and can resolve to a DecidedItem (e.g. an
+        already-merged/conflict outcome hit during a cascade-remerge), and
+        both cascade-remerge call sites push its result straight onto
+        _redispatch (append/appendleft). A DecidedItem never owns a merge
+        worktree — item_merge_wt's DecidedItem arm always returns None — so
+        section 1c's worktree_path=item_merge_wt(_rd_item) must resolve to
+        None for this case rather than raising or defaulting incorrectly.
+        """
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+
+        req = _make_req('rd-decided', 'task/rd-decided', config, git_repo)
+        item = DecidedItem(
+            request=req,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
+            base_sha='deadbeef',
+            speculative=False,
+        )
+        worker._redispatch.append(item)
+
+        snap = worker.snapshot()
+
+        entry_task_ids = [e['task_id'] for e in snap['entries']]
+        assert 'rd-decided' in entry_task_ids, (
+            f"Expected 'rd-decided' in snapshot entries, got {entry_task_ids}."
+        )
+        rd_entry = snap['entries'][0]
+        assert rd_entry['state'] == 'awaiting_host'
+        assert rd_entry['worktree'] is None, (
+            "Expected worktree is None for a DecidedItem parked on _redispatch "
+            f"(it never owns a merge worktree), got {rd_entry['worktree']!r}."
+        )
