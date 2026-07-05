@@ -5146,15 +5146,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         just-started concurrent merge (register-after-create race) is never
         touched.
 
-        *recovered_branches* is reserved for re-adoption of worktrees backing
-        recovered in-flight merges; not yet consulted (readopted is always
-        ``[]``).
+        Before the reap scan, *recovered_branches* (the branches of merge
+        requests recovered from the durable journal — see
+        ``Harness._recover_pending_merges``) are each resolved via
+        :meth:`GitOps.find_inflight_merge_worktree`, the documented
+        cross-restart branch→on-disk-worktree oracle.  Any match is
+        RE-ADOPTED — registered into :attr:`_owned_merge_worktrees` via
+        :meth:`_register_owned_merge_worktree` — rather than left to the reap
+        scan, since it backs a legitimate in-flight merge regardless of age
+        (re-adoption bypasses the grace gate entirely).
 
         *now* is injectable for deterministic tests; defaults to
         ``time.time()``.
 
         Returns ``{'readopted': [...], 'reaped': [...]}`` — string paths of
-        every worktree removed this sweep.  Returns
+        every worktree re-adopted / removed this sweep.  Returns
         ``{'readopted': [], 'reaped': []}`` immediately when ``worktree_base``
         is missing or not a directory.
         """
@@ -5165,8 +5171,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if base is None or not base.is_dir():
             return {'readopted': readopted, 'reaped': reaped}
 
+        for branch in recovered_branches:
+            wt = await self._git_ops.find_inflight_merge_worktree(branch)
+            if wt is not None:
+                self._register_owned_merge_worktree(wt)
+                readopted.append(str(wt.resolve()))
+
         effective_now = now if now is not None else time.time()
         grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        # Computed AFTER re-adoption so the reap scan below skips paths just
+        # re-adopted above (re-adoption is exempt from the grace gate).
         owned = {p.resolve() for p in self._owned_merge_worktrees}
 
         with os.scandir(base) as it:
