@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -997,3 +998,117 @@ class TestScenario234VerifierLifecycleFaults:
 
         main_sha = await git_ops.get_main_sha()
         _assert_quiescent(worker, main_sha, [req])
+
+
+# ── step-07 RED / step-08 GREEN: Rows 5,6 — new invariant-surface escalations ──
+
+
+@pytest.mark.asyncio
+class TestScenario56NewSurfaceEscalations:
+    """Rows 5-6: the two NEW invariant-surface escalations introduced by the
+    module-split batch — request-liveness (eta=1992, I1) and resource-
+    conservation audit (iota=1994, I4). Both are OBSERVATION + ESCALATION
+    ONLY (PRD design decision 4): neither resolves a Future nor mutates
+    queue/inflight/worktree state.
+
+    Driven directly (sync, clock-injectable) against a worker wired to a
+    _FakeEscalationQueue so the filed escalation's category/summary and the
+    WARNING log line can be asserted on — mirrors
+    test_merge_queue_request_liveness.py's TestCheckRequestLiveness and
+    test_merge_queue_resource_audit.py's TestCheckResourceAudit.
+    """
+
+    async def test_wedged_verify_escalates_liveness(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Row 5: a dequeued-but-never-resolved request ages past the stuck
+        threshold -> exactly one WARNING naming request_id/branch, plus a
+        dedup'd category='merge_request_stuck' L1 escalation. Resolving the
+        request and sweeping empties the ledger; full quiescence then holds.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), escalation_queue=fake_eq)
+
+        req = _make_req('row5-wedged', 'task/row5-wedged', config, git_repo)
+
+        t0 = 1_000_000.0
+        # Arm the ledger the way the merger loop does on dequeue. This
+        # request is never pushed onto worker._queue/_inflight, so it is
+        # absent from snapshot()['entries'] entirely — the leaked/unowned
+        # shape, not merely a slow-but-visible in-flight verify.
+        worker._request_ledger.on_dequeue(req, now=t0)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._check_request_liveness(t0 + 2000, threshold_s=1000)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got: {caplog.text}'
+        assert req.request_id in warnings[0].message
+        assert req.branch in warnings[0].message
+
+        assert len(fake_eq.submitted) == 1
+        esc = fake_eq.submitted[0]
+        assert esc.category == 'merge_request_stuck'
+        assert req.request_id in esc.summary
+
+        # Resolve the request and sweep -> the ledger empties passively
+        # (RequestLedger has no on-resolve hook; see its module docstring).
+        req.result.set_result(MergeOutcome('done'))
+        worker._request_ledger.sweep_resolved()
+        assert worker._request_ledger.is_empty()
+
+        main_sha = await git_ops.get_main_sha()
+        _assert_quiescent(worker, main_sha, [req])
+
+    async def test_forced_permit_leak_surfaces_resource_audit(
+        self,
+        git_ops: GitOps,
+    ) -> None:
+        """Row 6: a forced speculation-slot permit leak surfaces as a
+        non-empty speculation_accounting_violations() /
+        snapshot()['resource_audit']['speculation_accounting'], and
+        persisting across RESOURCE_AUDIT_ESCALATION_STREAK consecutive
+        _check_resource_audit calls escalates category='merge_resource_leak'.
+        Restoring the permit clears the violation; full quiescence then holds.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        assert worker._running is True, (
+            'both audit surfaces short-circuit to [] when not running — see '
+            'speculation_accounting_violations\' docstring'
+        )
+
+        # Force a leak: a speculation-slot permit vanished without being
+        # recorded as held-by-merger, transferred to the verifier, or
+        # genuinely still available — breaks the I4 conservation identity.
+        worker._speculation_slot._value -= 1
+
+        violations = worker.speculation_accounting_violations()
+        assert violations, 'expected the forced permit leak to surface a violation'
+        assert any('speculation-slot conservation violated' in v for v in violations)
+        assert worker.snapshot()['resource_audit']['speculation_accounting'] == violations
+
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+        for i in range(1, n + 1):
+            worker._check_resource_audit(1000.0 + i)
+
+        assert worker._resource_audit_violation_streak == n
+        assert len(fake_eq.submitted) == 1, (
+            f'expected exactly one escalation after {n} consecutive violating '
+            f'heartbeats, got {len(fake_eq.submitted)}'
+        )
+        esc = fake_eq.submitted[0]
+        assert esc.category == 'merge_resource_leak'
+
+        # Restore the permit -> the identity holds again and full quiescence
+        # returns (all 5 surfaces, not just this one).
+        worker._speculation_slot._value += 1
+
+        main_sha = await git_ops.get_main_sha()
+        _assert_quiescent(worker, main_sha, [])
