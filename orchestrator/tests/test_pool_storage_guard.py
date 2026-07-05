@@ -154,3 +154,65 @@ class TestPruneWorktreesGuard:
         mock_run.assert_awaited_once_with(
             ['git', 'worktree', 'prune'], cwd=git_ops.project_root,
         )
+
+
+def _write_warm_lane_gc_stub(project_root: Path) -> Path:
+    """Write a minimal ``warm-lane-gc.sh`` stub at ``<project_root>/scripts/``.
+
+    Mirrors test_warm_lane_disk_guard.py's ``_write_disk_guard_stubs`` gc
+    stub — existence is all ``_run_warm_lane_gc_reclaim``'s ``script.exists()``
+    check cares about; ``_run`` itself is mocked in these tests so the stub
+    body never actually runs.
+    """
+    scripts_dir = project_root / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script = scripts_dir / 'warm-lane-gc.sh'
+    script.write_text('#!/usr/bin/env bash\nexit 0\n')
+    script.chmod(0o755)
+    return script
+
+
+@pytest.mark.asyncio
+class TestWarmLaneGcReclaimGuard:
+    """_run_warm_lane_gc_reclaim() refuses to spawn warm-lane-gc.sh when pool
+    storage is absent (step-5/6) — same rationale as the prune guard: an
+    unmounted mountpoint must never let the GC script reclaim/reset lanes
+    against it."""
+
+    async def test_reclaim_skipped_when_storage_absent(self, git_ops: GitOps, caplog):
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        _write_warm_lane_gc_stub(git_ops.project_root)
+        assert not git_ops.pool_storage_present()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', mock_run),
+        ):
+            rc = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert rc == 127, f'Expected fail-soft 127 sentinel, got {rc}'
+        mock_run.assert_not_called()
+        callback.assert_called_once()
+        assert any('pool storage' in r.message.lower() for r in caplog.records), (
+            f'Expected a loud WARNING naming pool storage; got '
+            f'{[r.message for r in caplog.records]}'
+        )
+
+    async def test_reclaim_runs_when_storage_present(self, git_ops: GitOps):
+        git_ops.mark_pool_storage_present()
+        script = _write_warm_lane_gc_stub(git_ops.project_root)
+        assert git_ops.pool_storage_present()
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with patch('orchestrator.git_ops._run', mock_run):
+            rc = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert rc == 0
+        mock_run.assert_awaited_once_with(
+            [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
+            cwd=git_ops.project_root,
+        )
