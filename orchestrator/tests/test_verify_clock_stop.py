@@ -245,7 +245,7 @@ class TestClockStopConfigValidator:
 
 
 class TestMatchClockMarker:
-    """_match_clock_marker returns 'stop'/'heartbeat'/'start'/None by substring match."""
+    """_match_clock_marker returns 'stop'/'heartbeat'/'start'/None by line-anchored match."""
 
     @pytest.fixture()
     def cfg(self):
@@ -316,11 +316,34 @@ class TestMatchClockMarker:
         assert _match_clock_marker('<<R>> waited=10', cfg) == 'start'
         assert _match_clock_marker('@@REIFY_CLOCK_STOP@@', cfg) is None
 
-    def test_substring_tolerance_with_prefix(self, cfg):
-        """A line with a leading harness prefix before the marker still matches."""
+    def test_leading_whitespace_still_matches(self, cfg):
+        """A marker with only leading WHITESPACE still matches (lstrip-anchored)."""
         from orchestrator.verify import _match_clock_marker
-        line = '[harness] 2026-06-26T12:00:00 @@REIFY_CLOCK_HEARTBEAT@@ waited=30'
+        line = '   \t@@REIFY_CLOCK_HEARTBEAT@@ waited=30'
         assert _match_clock_marker(line, cfg) == 'heartbeat'
+
+    def test_marker_embedded_in_prose_does_not_match(self, cfg):
+        """A marker embedded MID-LINE (assertion prose / log prefix) does NOT match.
+
+        Regression for reify esc-4791-52 / task 4998: run_all.sh infra tests print
+        lines like 'PASS: C: stderr contains @@REIFY_CLOCK_STOP@@ ...'.  Under the
+        old substring match these polluted the clock-stop state machine, leaving
+        the parser wrongly STOPPED going into the heavy compile -> spurious 180s
+        heartbeat-idle false-kill.  Anchored matching (line-start after lstrip)
+        ignores such embedded tokens.
+        """
+        from orchestrator.verify import _match_clock_marker
+        assert _match_clock_marker(
+            'PASS: C: stderr contains @@REIFY_CLOCK_STOP@@ reason=psi_pressure (hold)', cfg
+        ) is None
+        assert _match_clock_marker(
+            '  PASS: stderr contains @@REIFY_CLOCK_START@@ (STOP/START balanced)', cfg
+        ) is None
+        # An arbitrary leading log/harness prefix is ALSO no longer tolerated
+        # (deliberate tightening — that tolerance was the source of the pollution).
+        assert _match_clock_marker(
+            '[harness] 2026-06-26T12:00:00 @@REIFY_CLOCK_HEARTBEAT@@ waited=30', cfg
+        ) is None
 
 
 # ── Step-7 / Step-8: Core _run_cmd clock-stop behavioral tests ────────────────

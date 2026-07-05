@@ -2355,10 +2355,14 @@ class OrchestratorConfig(BaseSettings):
                 'verify_clock_stop_enabled is True; got: '
                 + repr(values)
             )
-        # Reject any marker that is a substring of another.  Distinctness alone
-        # is insufficient: 'STOP' is distinct from 'STOPSTART', but the former
-        # is a substring of the latter, so _match_clock_marker would match 'stop'
-        # first for a line containing 'STOPSTART' and silently misclassify it.
+        # Reject any marker that is a substring of another.  _match_clock_marker
+        # is now line-ANCHORED (line.lstrip().startswith(marker)), so the strict
+        # hazard is a marker being a PREFIX of another: 'STOP' is distinct from
+        # 'STOPSTART', but the former is a prefix of the latter, so a STOPSTART
+        # line would match 'stop' first in the stop→heartbeat→start priority order
+        # and be silently misclassified.  The substring test below is a (stronger)
+        # superset of the prefix requirement — keeping it rejects prefix collisions
+        # a fortiori and stays correct if matching ever loosens again.
         marker_items = list(markers.items())
         for i, (name_a, val_a) in enumerate(marker_items):
             for name_b, val_b in marker_items[i + 1:]:
@@ -2367,9 +2371,9 @@ class OrchestratorConfig(BaseSettings):
                         f'{name_a!r} ({val_a!r}) must not be a substring of '
                         f'{name_b!r} ({val_b!r}), nor vice versa, when '
                         'verify_clock_stop_enabled is True; _match_clock_marker '
-                        'uses substring containment in stop→heartbeat→start '
-                        'priority order and would misclassify a line where one '
-                        'marker string is contained in another.'
+                        'anchors on line-start in stop→heartbeat→start priority '
+                        'order and would misclassify a line where one marker '
+                        'string is a prefix of another.'
                     )
         return self
 
