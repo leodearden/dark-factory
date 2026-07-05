@@ -44,6 +44,7 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.harness import Harness
+from orchestrator.warm_lane_pool import WarmLanePool
 
 
 @pytest.fixture
@@ -122,6 +123,34 @@ class TestPoolStoragePresentPredicate:
         assert git_ops.pool_storage_present() is False
 
 
+class TestPoolInUsePredicate:
+    """GitOps.pool_in_use() (step-15/16 review-fix).
+
+    ``pool_storage_present()``'s only writer (``_seed_warm_lane`` on
+    ``rc == 0``) NEVER runs unless a warm or spec pool is configured, so on
+    the DEFAULT config (``warm_lane_pool=False``,
+    ``merge_spec_warm_lane_pool=False``) ``.pool-root`` is never written and
+    ``pool_storage_present()`` is PERMANENTLY False by design — not because a
+    real mount went down. ``pool_in_use()`` lets the destructive-sweep
+    guards distinguish "no pool configured at all" (skip the guard, restore
+    pre-2099 behaviour) from "a pool IS configured but its mount is down"
+    (fire the guard — the real Jul-3 incident).
+    """
+
+    def test_no_pools_configured_is_false(self, git_ops: GitOps):
+        assert git_ops.warm_lane_pool is None
+        assert git_ops.spec_warm_lane_pool is None
+        assert git_ops.pool_in_use() is False
+
+    def test_warm_lane_pool_configured_is_true(self, git_ops: GitOps):
+        git_ops.warm_lane_pool = Mock()
+        assert git_ops.pool_in_use() is True
+
+    def test_spec_warm_lane_pool_configured_is_true(self, git_ops: GitOps):
+        git_ops.spec_warm_lane_pool = Mock()
+        assert git_ops.pool_in_use() is True
+
+
 @pytest.mark.asyncio
 class TestPruneWorktreesGuard:
     """prune_worktrees() refuses ``git worktree prune`` when pool storage is
@@ -133,6 +162,12 @@ class TestPruneWorktreesGuard:
         # base exists (dir present) but the sentinel was never written —
         # simulates an unmounted mountpoint with a live, empty mount dir.
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        # A pool must be configured for this guard to fire (step-15
+        # review-fix): pool_storage_present() is permanently False on a
+        # pool-less host by design (see TestPoolInUsePredicate and
+        # test_prune_runs_when_no_pool_configured below), so pool_in_use()
+        # is what distinguishes a real mount-down incident from that.
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
         assert not git_ops.pool_storage_present()
 
         callback = Mock()
@@ -164,6 +199,31 @@ class TestPruneWorktreesGuard:
             ['git', 'worktree', 'prune'], cwd=git_ops.project_root,
         )
 
+    async def test_prune_runs_when_no_pool_configured(self, git_ops: GitOps):
+        """Step-15 review-fix: on a pool-less host (both pools None — the
+        default git_ops fixture) `.pool-root` is never written, so
+        pool_storage_present() is permanently False by design. The guard
+        must NOT treat that as a mount-down incident — prune must proceed
+        normally (restoring pre-2099 behaviour) and the callback must not
+        fire."""
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        assert git_ops.warm_lane_pool is None
+        assert git_ops.spec_warm_lane_pool is None
+        assert not git_ops.pool_in_use()
+        assert not git_ops.pool_storage_present()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with patch('orchestrator.git_ops._run', mock_run):
+            await git_ops.prune_worktrees()
+
+        mock_run.assert_awaited_once_with(
+            ['git', 'worktree', 'prune'], cwd=git_ops.project_root,
+        )
+        callback.assert_not_called()
+
 
 def _write_warm_lane_gc_stub(project_root: Path) -> Path:
     """Write a minimal ``warm-lane-gc.sh`` stub at ``<project_root>/scripts/``.
@@ -191,6 +251,10 @@ class TestWarmLaneGcReclaimGuard:
     async def test_reclaim_skipped_when_storage_absent(self, git_ops: GitOps, caplog):
         git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
         _write_warm_lane_gc_stub(git_ops.project_root)
+        # A pool must be configured for this guard to fire (step-15
+        # review-fix) — see test_prune_skipped_when_storage_absent above for
+        # the full rationale.
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
         assert not git_ops.pool_storage_present()
 
         callback = Mock()
@@ -225,6 +289,33 @@ class TestWarmLaneGcReclaimGuard:
             [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
             cwd=git_ops.project_root,
         )
+
+    async def test_reclaim_runs_when_no_pool_configured(self, git_ops: GitOps):
+        """Step-15 review-fix: same rationale as
+        test_prune_runs_when_no_pool_configured — no pool configured means
+        pool_storage_present() is permanently False by design, not a real
+        mount-down incident; the guard must not fire and reclaim must
+        proceed normally."""
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        script = _write_warm_lane_gc_stub(git_ops.project_root)
+        assert git_ops.warm_lane_pool is None
+        assert git_ops.spec_warm_lane_pool is None
+        assert not git_ops.pool_in_use()
+        assert not git_ops.pool_storage_present()
+
+        callback = Mock()
+        git_ops._on_pool_storage_absent = callback
+        mock_run = AsyncMock(return_value=(0, '', ''))
+
+        with patch('orchestrator.git_ops._run', mock_run):
+            rc = await git_ops._run_warm_lane_gc_reclaim()
+
+        assert rc == 0
+        mock_run.assert_awaited_once_with(
+            [str(script), 'reclaim', '--mount', str(git_ops.worktree_base)],
+            cwd=git_ops.project_root,
+        )
+        callback.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -527,4 +618,33 @@ class TestPoolStorageAbsentEscalationHelperAndResolver:
 
         assert not queue.has_open_l1(Harness._POOL_STORAGE_ABSENT_SENTINEL), (
             'expected no open L1 after resolve'
+        )
+
+
+@pytest.mark.asyncio
+class TestWarmLaneGcPassNoEscalationWhenPoolNotInUse:
+    """Harness._run_warm_lane_gc_pass() must NOT file a pool-storage-absent
+    escalation on a pool-less default host (step-15 review-fix).
+
+    On the DEFAULT config (``warm_lane_pool=False``,
+    ``merge_spec_warm_lane_pool=False``) BOTH ``git_ops.warm_lane_pool`` and
+    ``spec_warm_lane_pool`` are None, so ``.pool-root`` is NEVER written
+    (its only writer, ``_seed_warm_lane`` on ``rc == 0``, requires a pool) —
+    ``pool_storage_present()`` is PERMANENTLY False by design, not because a
+    real mount went down. ``warm_lane_gc_enabled`` defaults True, so this
+    cadence tick fires automatically on every pool-less host; pre-fix it
+    filed a spurious, unresolvable blocking L1 every 600s (the cadence gate
+    at harness.py:4455 is independent of pool presence).
+    """
+
+    async def test_no_escalation_filed(self, tmp_path: Path):
+        harness, queue = _make_harness_with_queue(tmp_path)
+        assert harness.git_ops.warm_lane_pool is None
+        assert harness.git_ops.spec_warm_lane_pool is None
+        assert not harness.git_ops.pool_storage_present()
+
+        await harness._run_warm_lane_gc_pass()
+
+        assert not queue.has_open_l1(Harness._POOL_STORAGE_ABSENT_SENTINEL), (
+            'a pool-less host must never file a pool-storage-absent escalation'
         )
