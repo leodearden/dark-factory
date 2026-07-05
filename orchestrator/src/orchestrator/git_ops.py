@@ -1022,6 +1022,23 @@ class GitOps:
           presence on a different mount says nothing about worktree_base's
           own mount, so a bootstrap there could still create a shadow lane on
           the underlying root fs of an unmounted mountpoint.
+
+        **Spec-only-host caveat (review-fix)**: this same predicate is the
+        bootstrap discriminator for :meth:`acquire_spec_lane`, but it always
+        proxies through the WARM-lane base (``_warm_lane_base_resolvable`` /
+        ``warm_lane_base_target_path``) — there is no spec-pool-specific
+        substrate signal.  On a host that configures
+        ``spec_warm_lane_pool`` without a ``warm_lane_pool``, this means the
+        spec pool's own bootstrap depends on the merge-verify warm base
+        being populated: if that base is empty/absent (no warm-lane seed or
+        ``refresh_warm_base`` has run yet), this returns False and the spec
+        pool's create-once discriminator cold-falls-back indefinitely
+        instead of bootstrapping ``.pool-root`` itself, even though
+        ``worktree_base`` may in fact be mounted.  This is the conservative
+        (never-shadow-an-unmounted-mount) direction, not a correctness bug,
+        but it means a spec-only host stays cold-fallback-only until some
+        other path (e.g. a warm-lane seed) populates the warm base and
+        writes the sentinel.
         """
         if self._warm_lane_base_resolvable() is not WarmBaseHealth.OK:
             return False
@@ -6678,8 +6695,28 @@ class GitOps:
         ``pool_storage_present()`` is permanently False on a pool-less host
         (its only writer never runs without a pool), so that alone must
         never disable ``git worktree prune`` on every default host.
+
+        **Pre-first-seed bootstrap (review-fix)**: a freshly-provisioned
+        pool-configured host that has created ``worktree_base`` (e.g. pool
+        warmup ``mkdir``) but has not yet run a successful seed also has no
+        ``.pool-root`` sentinel — indistinguishable from an unmounted mount
+        by the sentinel alone.  When :meth:`_pool_storage_bootstrap_ok`
+        confirms this is the benign pre-first-seed case (the CoW seed base
+        already resolves under ``worktree_base``), the prune is still
+        skipped (there is nothing to prune yet) but the escalation callback
+        is suppressed so a legitimate cold start does not file operator
+        noise; the sentinel appears for real once the first seed runs.
         """
         if self.pool_in_use() and not self.pool_storage_present():
+            if self._pool_storage_bootstrap_ok():
+                logger.info(
+                    'prune_worktrees: pool storage sentinel absent at %s but '
+                    'the CoW seed base already resolves underneath it — '
+                    'pre-first-seed cold start, not an unmounted mount; '
+                    'skipping prune without escalating',
+                    self.worktree_base,
+                )
+                return
             logger.warning(
                 'prune_worktrees: pool storage absent/unmounted at %s — '
                 'refusing to run `git worktree prune` (would wipe '
