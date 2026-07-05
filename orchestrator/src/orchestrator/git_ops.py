@@ -2377,7 +2377,11 @@ class GitOps:
                             '%s; releasing lane',
                             rc, lane,
                         )
-                    await self.warm_lane_pool.release(lane)
+                    # release_warm_lane (not a bare pool.release) — detaches
+                    # HEAD first so the branch _reset_warm_lane just checked
+                    # out here doesn't leak a "already used by worktree"
+                    # collision for the next acquire (task 2062 mid-run leak).
+                    await self.release_warm_lane(lane, branch_name)
                     return _seed_rc_to_unavailable(rc)
                 # Falls through to shared tail
 
@@ -2871,7 +2875,13 @@ class GitOps:
                     'retry for %s -> FAULT (escalate per 1859)',
                     lane, exc_info=True,
                 )
-                await self.warm_lane_pool.release(lane)
+                # release_warm_lane (not a bare pool.release) — detaches HEAD
+                # first so a branch left checked out by a partially-applied
+                # _reset_warm_lane doesn't leak a collision for the next
+                # acquire (task 2062 mid-run leak).
+                await self.release_warm_lane(
+                    lane, full_branch[len(self.config.branch_prefix):],
+                )
                 return WarmLaneUnavailable.FAULT
 
         # Reset succeeded (attempt 1 or 2).  Run the thin re-seed unchanged.
@@ -2893,7 +2903,13 @@ class GitOps:
                     '%s; releasing lane',
                     rc, lane,
                 )
-            await self.warm_lane_pool.release(lane)
+            # release_warm_lane (not a bare pool.release) — detaches HEAD
+            # first so the branch _reset_warm_lane just checked out here
+            # doesn't leak a collision for the next acquire (task 2062
+            # mid-run leak).
+            await self.release_warm_lane(
+                lane, full_branch[len(self.config.branch_prefix):],
+            )
             return _seed_rc_to_unavailable(rc)
 
         return None  # success — caller falls through to shared tail
