@@ -2081,6 +2081,40 @@ class TestGetEntity:
         service.graphiti.search.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_exact_match_edges_union_across_duplicate_nodes(self, service):
+        """When multiple nodes share an exact name (duplicate-name pathology),
+        edges are fetched for EVERY resolved uuid and unioned, deduped by edge
+        uuid, so `edges` stays consistent with the full `nodes` array.
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[
+            {'uuid': 'u-1', 'name': 'Alice', 'summary': 's1', 'labels': []},
+            {'uuid': 'u-2', 'name': 'Alice', 'summary': 's2', 'labels': []},
+        ])
+
+        edges_by_uuid = {
+            'u-1': [
+                {'uuid': 'e-a', 'fact': 'A', 'name': 'x'},
+                {'uuid': 'e-shared', 'fact': 'S', 'name': 'y'},
+            ],
+            'u-2': [
+                {'uuid': 'e-shared', 'fact': 'S', 'name': 'y'},
+                {'uuid': 'e-b', 'fact': 'B', 'name': 'z'},
+            ],
+        }
+
+        def fake_edges(node_uuid, *, group_id):
+            return edges_by_uuid[node_uuid]
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=fake_edges)
+
+        result = await service.get_entity('Alice', project_id='test')
+
+        assert [e['uuid'] for e in result['edges']] == ['e-a', 'e-shared', 'e-b']
+        service.graphiti.get_valid_edges_for_node.assert_any_await('u-1', group_id='test')
+        service.graphiti.get_valid_edges_for_node.assert_any_await('u-2', group_id='test')
+        assert service.graphiti.get_valid_edges_for_node.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_exact_match_labels_default_empty(self, service):
         """An exact node dict with no/None labels yields labels == [] in the result."""
         service.graphiti.get_nodes_by_exact_name = AsyncMock(
