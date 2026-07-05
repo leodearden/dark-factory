@@ -866,6 +866,14 @@ class TestRecoverCrashedTasksPoolStorageAbsentGuard:
         # remove the sentinel to simulate an unmounted mountpoint with a
         # live, empty (from git's perspective) mount dir.
         (harness.git_ops.worktree_base / POOL_ROOT_SENTINEL).unlink()
+        # A pool must be configured for this guard to fire (step-17
+        # review-fix): pool_storage_present() is permanently False on a
+        # pool-less host by design, so pool_in_use() is what distinguishes
+        # a real mount-down incident from that (see
+        # TestRecoverCrashedTasksNoPoolConfiguredNoOp below).
+        harness.git_ops.warm_lane_pool = WarmLanePool(
+            worktree_base=harness.git_ops.worktree_base, size=1,
+        )
         assert not harness.git_ops.pool_storage_present()
 
         wt = _setup_worktree(harness.git_ops.worktree_base, '36')  # no plan.json
@@ -883,6 +891,9 @@ class TestRecoverCrashedTasksPoolStorageAbsentGuard:
         from orchestrator.git_ops import POOL_ROOT_SENTINEL
 
         (harness.git_ops.worktree_base / POOL_ROOT_SENTINEL).unlink()
+        harness.git_ops.warm_lane_pool = WarmLanePool(
+            worktree_base=harness.git_ops.worktree_base, size=1,
+        )
         assert not harness.git_ops.pool_storage_present()
 
         wt = harness.git_ops.worktree_base / '38'
@@ -908,6 +919,9 @@ class TestRecoverCrashedTasksPoolStorageAbsentGuard:
         from orchestrator.git_ops import POOL_ROOT_SENTINEL
 
         (harness.git_ops.worktree_base / POOL_ROOT_SENTINEL).unlink()
+        harness.git_ops.warm_lane_pool = WarmLanePool(
+            worktree_base=harness.git_ops.worktree_base, size=1,
+        )
         assert not harness.git_ops.pool_storage_present()
 
         plan = _make_plan(steps_done=3, steps_total=5, task_id='35')
@@ -936,3 +950,38 @@ class TestRecoverCrashedTasksPoolStorageAbsentGuard:
         harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
             wt_noplan, '36',
         )
+
+
+@pytest.mark.asyncio
+class TestRecoverCrashedTasksNoPoolConfiguredNoOp:
+    """_recover_crashed_tasks() must proceed normally on a pool-less default
+    host even though `.pool-root` is absent (step-17 review-fix).
+
+    ``create_worktree`` places COLD worktrees directly at
+    ``worktree_base/<branch>`` (git_ops.py:1234), so ``worktree_base.exists()``
+    is True on any pool-disabled host that has ever run a task, while
+    ``.pool-root`` (whose only writer, ``_seed_warm_lane`` on ``rc == 0``,
+    requires a configured pool) is never written. Pre-fix, the guard
+    deferred the ENTIRE recovery pass — destroying no work, but also
+    recovering nothing — at every startup on such a host. Gating on
+    ``pool_in_use()`` (task 2099 step-16) restores normal recovery when no
+    pool is configured.
+    """
+
+    async def test_recovers_normally_when_no_pool_configured(self, harness: Harness):
+        from orchestrator.git_ops import POOL_ROOT_SENTINEL
+
+        (harness.git_ops.worktree_base / POOL_ROOT_SENTINEL).unlink()
+        assert harness.git_ops.warm_lane_pool is None
+        assert harness.git_ops.spec_warm_lane_pool is None
+        assert not harness.git_ops.pool_storage_present()
+
+        wt = _setup_worktree(harness.git_ops.worktree_base, '36')  # no plan.json
+        harness._file_pool_storage_absent_escalation = MagicMock()
+
+        await harness._recover_crashed_tasks()
+
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            wt, '36',
+        )
+        harness._file_pool_storage_absent_escalation.assert_not_called()  # type: ignore[attr-defined]

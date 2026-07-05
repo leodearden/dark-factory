@@ -335,3 +335,42 @@ class TestOrphanReaperPoolStorageAbsentGuard:
 
         harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '500')  # type: ignore[attr-defined]
         harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestOrphanReaperNoPoolConfiguredNoOp:
+    """_reap_orphan_worktrees() must run its NORMAL sweep on a pool-less
+    default host even though `.pool-root` is absent (step-17 review-fix).
+
+    ``create_worktree`` places COLD worktrees directly at
+    ``worktree_base/<branch>`` (git_ops.py:1234), so ``worktree_base.exists()``
+    is True on any pool-disabled host that has ever run a task, while
+    ``.pool-root`` (whose only writer, ``_seed_warm_lane`` on ``rc == 0``,
+    requires a configured pool) is never written. Pre-fix, the guard fired
+    the escalation and aborted the ENTIRE sweep — no DB read, no
+    cleanup/quarantine, no prune — at every startup on such a host. Gating
+    on ``pool_in_use()`` (task 2099 step-16) restores the normal sweep when
+    no pool is configured.
+    """
+
+    async def test_runs_normal_sweep_when_no_pool_configured(self, harness: Harness):
+        from orchestrator.git_ops import POOL_ROOT_SENTINEL
+
+        # The `harness` fixture marks pool storage present by default and
+        # attaches no pool — unlink the sentinel to reproduce a pool-less
+        # host that has run a cold task (worktree_base exists, .pool-root
+        # was never actually written by production code).
+        (harness.git_ops.worktree_base / POOL_ROOT_SENTINEL).unlink()
+        assert harness.git_ops.warm_lane_pool is None
+        assert harness.git_ops.spec_warm_lane_pool is None
+        assert not harness.git_ops.pool_storage_present()
+
+        wt = _mk(harness.git_ops.worktree_base, '500')
+        harness._file_pool_storage_absent_escalation = MagicMock()
+
+        await harness._reap_orphan_worktrees()
+
+        harness.scheduler.get_statuses.assert_awaited()  # type: ignore[attr-defined]
+        harness.git_ops.cleanup_worktree.assert_called_once_with(wt, '500')  # type: ignore[attr-defined]
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+        harness._file_pool_storage_absent_escalation.assert_not_called()  # type: ignore[attr-defined]
