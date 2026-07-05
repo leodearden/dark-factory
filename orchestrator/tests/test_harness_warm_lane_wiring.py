@@ -2405,4 +2405,72 @@ class TestReconcileLaneCheckouts:
 
         git_ops.detach_lane_checkout.assert_not_called()
         pool.restore_assignment.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestMidRunRecycleLeak:
+    """Restart-INDEPENDENT leak: a recycled-lane re-seed failure must not
+    leave the new task's branch checked out at the (now-FREE) lane
+    (step-11 RED / step-12 GREEN — route the bare ``pool.release()`` calls
+    in the recycle/reuse fault paths through ``release_warm_lane`` instead,
+    which detaches before releasing).
+    """
+
+    async def test_reset_in_place_seed_failure_does_not_leak_checkout(
+        self, tmp_path: Path,
+    ):
+        """A recycled FREE lane whose re-seed fails must not leave task/555
+        checked out at the lane afterward — else the next create-once
+        acquire elsewhere collides with "already used by worktree"."""
+        from orchestrator.git_ops import GitOps, WarmLaneUnavailable
+        from orchestrator.git_ops import _run as git_run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_git_repo(repo)
+
+        # Pre-create the default warm-lane CoW seed base so the pre-acquire
+        # base-health gate sees WarmBaseHealth.OK — it runs BEFORE the (here
+        # mocked-out) real seed step either way.
+        default_base = repo / '.worktrees' / '_merge-verify' / 'target'
+        default_base.mkdir(parents=True, exist_ok=True)
+        (default_base / '.keep').write_text('warm base sentinel\n')
+
+        config = OrchestratorConfig(
+            project_root=repo,
+            max_concurrent_tasks=1,
+            git=GitConfig(warm_lane_pool=True),
+        )
+        git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+
+        # _lane-0 is a recycled FREE lane already holding task/555 at the
+        # main tip (NO commits beyond main -> _orphan_has_commits is False
+        # -> the fresh reset-in-place recycle path is taken, not the γ
+        # reattach guard).  Pool state defaults to FREE with no assignment —
+        # exactly the "recycled" shape (a leftover checkout the pool doesn't
+        # know about yet).
+        lane0 = git_ops.worktree_base / '_lane-0'
+        lane0.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await git_run(
+            ['git', 'worktree', 'add', str(lane0), '-b', 'task/555', 'main'], cwd=repo,
+        )
+        assert rc == 0, err
+
+        git_ops._seed_warm_lane = AsyncMock(return_value=1)
+
+        result = await git_ops.acquire_warm_lane('555', 'main')
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'expected FAULT from the forced seed failure, got {result!r}'
+        )
+
+        checkouts = await git_ops.lane_branch_checkouts()
+        assert checkouts is not None
+        assert '555' not in checkouts, (
+            'task/555 must not still be checked out at _lane-0 after the '
+            'failing re-seed — a bare pool.release() without detaching '
+            'leaks the checkout, and a subsequent create-once acquire '
+            'elsewhere would collide with "already used by worktree"'
+        )
         assert pool.assignment_for('3965') is None
