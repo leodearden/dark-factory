@@ -3922,6 +3922,75 @@ class TestReconPoolAutoTag:
         )
 
 
+class TestMissingCycleSummaryKeys:
+    """Module-level _missing_cycle_summary_keys helper (task 2094).
+
+    Returns which required keys among ('stage', 'run_id') are missing/invalid
+    on a cycle_summary write, else []. stage is invalid when absent, non-str,
+    or not a known key in _CYCLE_SUMMARY_STAGE_TO_RECON_POOL. run_id is
+    invalid when absent, non-str, or empty/whitespace-only. Non-cycle_summary
+    kinds (and empty metadata) are never flagged.
+    """
+
+    def test_known_stage1_and_run_id_present_returns_empty(self):
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        meta = {'kind': 'cycle_summary', 'stage': 'memory_consolidator', 'run_id': 'r1'}
+        assert _missing_cycle_summary_keys(meta) == []
+
+    def test_known_stage2_and_run_id_present_returns_empty(self):
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        meta = {'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', 'run_id': 'r1'}
+        assert _missing_cycle_summary_keys(meta) == []
+
+    def test_valid_stage_missing_run_id_flags_run_id(self):
+        meta = {'kind': 'cycle_summary', 'stage': 'memory_consolidator'}
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        assert _missing_cycle_summary_keys(meta) == ['run_id']
+
+    def test_valid_stage_empty_run_id_flags_run_id(self):
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            'run_id': '',
+        }
+        assert _missing_cycle_summary_keys(meta) == ['run_id']
+
+    def test_valid_stage_whitespace_run_id_flags_run_id(self):
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            'run_id': '   ',
+        }
+        assert _missing_cycle_summary_keys(meta) == ['run_id']
+
+    def test_missing_stage_present_run_id_flags_stage(self):
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        meta = {'kind': 'cycle_summary', 'run_id': 'r1'}
+        assert _missing_cycle_summary_keys(meta) == ['stage']
+
+    def test_unknown_stage_present_run_id_flags_stage(self):
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        meta = {'kind': 'cycle_summary', 'stage': 'unknown_stage', 'run_id': 'r1'}
+        assert _missing_cycle_summary_keys(meta) == ['stage']
+
+    def test_both_missing_returns_stable_order(self):
+        """Both absent -> ['stage', 'run_id'], deterministic order."""
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        meta = {'kind': 'cycle_summary'}
+        assert _missing_cycle_summary_keys(meta) == ['stage', 'run_id']
+
+    def test_non_cycle_summary_kind_returns_empty(self):
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        meta = {'kind': 'note'}
+        assert _missing_cycle_summary_keys(meta) == []
+
+    def test_empty_metadata_returns_empty(self):
+        from fused_memory.services.memory_service import _missing_cycle_summary_keys
+        assert _missing_cycle_summary_keys({}) == []
+
+
 class TestReconPoolAutoTagInjection:
     """Integration: add_memory must inject recon_pool into the metadata dict
     handed to mem0.add for cycle_summary writes, server-side, independent of
@@ -4127,6 +4196,87 @@ class TestReconPoolAutoTagMissingStageWarning:
         assert warning_records == [], (
             f'Expected no WARNING when no metadata is supplied, got: '
             f'{[r.message for r in warning_records]}'
+        )
+
+
+class TestCycleSummaryRunIdGuard:
+    """add_memory must warn when metadata.run_id is dropped/empty even though
+    metadata.stage is present and known (task 2094).
+
+    Task 2077/1653 only warned when recon_pool could not be inferred (i.e.
+    stage missing/unknown) via an `elif` gated on `inferred_recon_pool is
+    None`. A write with a VALID stage short-circuits into the `if` branch and
+    never reaches a run_id check, so a dropped/empty run_id sailed through
+    with zero warnings — invisible to the Path-2 triple-filter
+    count_memories_by_metadata({kind, run_id, stage}) pre-check. RED until
+    the guard is decoupled from recon_pool inference (step-4).
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_id_dropped_with_valid_stage_logs_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={'kind': 'cycle_summary', 'stage': 'memory_consolidator'},
+                causation_id='run-x',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for a cycle_summary with a dropped run_id '
+            f'(stage present), got {len(warning_records)}: '
+            f'{[r.message for r in warning_records]}'
+        )
+        record = warning_records[0]
+        assert record.run_id is None
+        assert record.stage == 'memory_consolidator'
+        assert 'run_id' in record.missing_cycle_summary_keys
+
+    @pytest.mark.asyncio
+    async def test_empty_run_id_with_valid_stage_logs_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    'run_id': '',
+                },
+                causation_id='run-x',
+            )
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING for a cycle_summary with an empty run_id '
+            f'(stage present), got {len(warning_records)}: '
+            f'{[r.message for r in warning_records]}'
+        )
+        record = warning_records[0]
+        assert 'run_id' in record.missing_cycle_summary_keys
+
+    @pytest.mark.asyncio
+    async def test_stage_and_run_id_both_present_no_warning(self, service, caplog):
+        """Control: known stage AND present run_id -> silent (happy path)."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    'run_id': 'run-x',
+                },
+                causation_id='run-x',
+            )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING when both stage and run_id are present and valid, '
+            f'got: {[r.message for r in warning_records]}'
         )
 
 

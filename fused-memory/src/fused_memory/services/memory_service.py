@@ -117,6 +117,35 @@ def _infer_recon_pool(meta: dict) -> str | None:
     return _CYCLE_SUMMARY_STAGE_TO_RECON_POOL.get(stage)
 
 
+_REQUIRED_CYCLE_SUMMARY_KEYS: tuple[str, ...] = ('stage', 'run_id')
+
+
+def _missing_cycle_summary_keys(meta: dict) -> list[str]:
+    """Return which required keys among _REQUIRED_CYCLE_SUMMARY_KEYS are
+    missing/invalid on a cycle_summary write; [] for non-cycle_summary kinds
+    (and whenever all required keys are present and valid).
+
+    stage is invalid when absent, non-str, or not a known key in
+    _CYCLE_SUMMARY_STAGE_TO_RECON_POOL — the same "known stage" check
+    _infer_recon_pool uses, so there is one source of truth for the stage
+    set. run_id is invalid when absent, non-str, or empty/whitespace-only
+    (an empty run_id is as useless to the Path-2 triple-filter
+    count_memories_by_metadata({kind, run_id, stage}) pre-check as an absent
+    one). Order is stable: 'stage' before 'run_id'.
+    """
+    if meta.get('kind') != 'cycle_summary':
+        return []
+
+    missing: list[str] = []
+    stage = meta.get('stage')
+    if not isinstance(stage, str) or stage not in _CYCLE_SUMMARY_STAGE_TO_RECON_POOL:
+        missing.append('stage')
+    run_id = meta.get('run_id')
+    if not isinstance(run_id, str) or not run_id.strip():
+        missing.append('run_id')
+    return missing
+
+
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
 
@@ -994,24 +1023,32 @@ class MemoryService:
         inferred_recon_pool = _infer_recon_pool(meta)
         if inferred_recon_pool is not None:
             meta['recon_pool'] = inferred_recon_pool
-        elif meta.get('kind') == 'cycle_summary':
-            # metadata.stage is itself LLM-supplied (see the reconciliation
-            # stage1/stage2 prompts), so a missing/unknown stage means
-            # recon_pool could not be derived server-side either — the same
-            # prompt-compliance failure this task targets, just shifted from
-            # the recon_pool field to the stage field (amendment review,
-            # task 2077). Log so these writes are observable rather than
-            # silently relying on whatever (if anything) the caller passed —
-            # an untagged cycle_summary is invisible to the pool-cap trim and
-            # ops prune script and will regrow unbounded.
+
+        # Server-side cycle_summary metadata guard (task 2094, extending task
+        # 2077): metadata.stage and metadata.run_id are both LLM-supplied
+        # (see the reconciliation stage1/stage2 prompts), so either being
+        # missing/invalid is a prompt-compliance failure this guard makes
+        # observable rather than silently relying on the caller. This check
+        # is deliberately decoupled from the recon_pool inference above —
+        # previously it lived in an `elif` gated on `inferred_recon_pool is
+        # None`, so a valid stage short-circuited past any run_id check
+        # entirely and a dropped/empty run_id sailed through with zero
+        # warnings, invisible to the Path-2 triple-filter
+        # count_memories_by_metadata({kind, run_id, stage}) pre-check.
+        missing_keys = _missing_cycle_summary_keys(meta)
+        if missing_keys:
             logger.warning(
-                'MemoryService.add_memory: cycle_summary write with missing/unknown '
-                'metadata.stage — recon_pool could not be inferred server-side',
+                'MemoryService.add_memory: cycle_summary write missing required '
+                'metadata key(s) %s — stage drives recon_pool (pool-cap trim); '
+                'run_id drives the Path-2 triple-filter verification pre-check',
+                missing_keys,
                 extra={
                     'project_id': project_id,
                     'stage': meta.get('stage'),
+                    'run_id': meta.get('run_id'),
                     'caller_recon_pool': meta.get('recon_pool'),
                     'causation_id': causation_id,
+                    'missing_cycle_summary_keys': missing_keys,
                 },
             )
 
