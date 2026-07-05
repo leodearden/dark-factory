@@ -152,6 +152,92 @@ class TestFindOrphanMarkers:
 
 
 # ===========================================================================
+# Tests: find_taskless_markers
+# ===========================================================================
+
+class TestFindTasklessMarkers:
+    """Tests for the pure function find_taskless_markers(members) (task 2108).
+
+    A marker is "taskless" when its metadata lacks a usable task_id — this
+    is the shape of orphan marker 1e2b9417, which carried source+kind but no
+    task_id and was therefore invisible to find_orphan_markers.
+    """
+
+    def test_missing_task_id_key_is_taskless(self):
+        """A member whose metadata lacks the task_id key entirely is taskless."""
+        member = _taskless('t1')
+        result = _mod.find_taskless_markers([member])
+        assert len(result) == 1
+        assert result[0]['id'] == 't1', f'Expected id=t1, got: {result!r}'
+
+    def test_task_id_none_is_taskless(self):
+        """A member whose metadata.task_id is explicitly None is taskless."""
+        member = {
+            'id': 't2',
+            'created_at': '2026-01-01T00:00:00Z',
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': None,
+            },
+        }
+        result = _mod.find_taskless_markers([member])
+        assert len(result) == 1
+        assert result[0]['id'] == 't2', f'Expected id=t2, got: {result!r}'
+
+    def test_task_id_empty_string_is_taskless(self):
+        """A member whose metadata.task_id is '' is taskless."""
+        member = {
+            'id': 't3',
+            'created_at': '2026-01-01T00:00:00Z',
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': '',
+            },
+        }
+        result = _mod.find_taskless_markers([member])
+        assert len(result) == 1
+        assert result[0]['id'] == 't3', f'Expected id=t3, got: {result!r}'
+
+    def test_real_task_id_is_not_taskless_even_if_kind_missing(self):
+        """A member with a real task_id is NOT taskless, even lacking kind."""
+        member = _orphan('o1')  # kind=None, task_id='1970' (default from _member)
+        result = _mod.find_taskless_markers([member])
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_fp_hash_task_id_is_not_taskless(self):
+        """A member with an fp:-hash task_id carries a valid (non-taskless) task_id."""
+        member = _member('f1', task_id='fp:9a8b7c6d5e4f')
+        result = _mod.find_taskless_markers([member])
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_member_with_no_metadata_is_taskless(self):
+        """A member with missing metadata dict entirely is treated as taskless."""
+        members = [{'id': 'no-meta', 'created_at': '2026-01-01', 'metadata': None}]
+        result = _mod.find_taskless_markers(members)
+        assert len(result) == 1
+        assert result[0]['id'] == 'no-meta'
+
+    def test_empty_input_returns_empty(self):
+        """Empty input list returns empty list."""
+        result = _mod.find_taskless_markers([])
+        assert result == []
+
+    def test_preserves_identity_and_order(self):
+        """Returned dicts are the same objects, in input order."""
+        valid1 = _member('v1')
+        taskless_a = _taskless('ta')
+        valid2 = _member('v2')
+        taskless_b = _taskless('tb')
+        members = [valid1, taskless_a, valid2, taskless_b]
+        result = _mod.find_taskless_markers(members)
+        assert result == [taskless_a, taskless_b], f'Expected [ta, tb], got: {result!r}'
+        assert result[0] is taskless_a, 'Expected same object identity'
+        assert result[1] is taskless_b, 'Expected same object identity'
+
+
+# ===========================================================================
 # Tests: delete_orphan_markers
 # ===========================================================================
 
