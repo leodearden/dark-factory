@@ -5314,8 +5314,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           task_id, branch, state, enqueued_at, age_secs, position,
           waiter_alive, worktree, pre_rebased, request_id, lane.
           host, verify_started_at, verify_age_secs — non-None only on _inflight entries.
-        State values: queued, merging, remerging, awaiting_verify, verifying,
-          passthrough, gate_reverify, finalizing.
+        State values: queued, merging, remerging, awaiting_host, awaiting_verify,
+          verifying, passthrough, gate_reverify, finalizing.
         """
         entries: list[dict] = []
         now = time.time()
@@ -5388,6 +5388,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entries.append(_entry(
                 self._remerging_item, 'remerging',
                 worktree_path=None,
+                position=len(entries),
+            ))
+
+        # 1c. Redispatch window: an item popped from the verifier queue —
+        # either a speculative item bounced back because no host was free
+        # (free_host_count() == 0, verify hosts < speculation_depth) or a
+        # cascade-remerged item awaiting re-dispatch — parked on
+        # self._redispatch, not yet re-appended to self._inflight.  Without
+        # this section the item is invisible to dashboard/heartbeat depth
+        # and occupancy for the whole multi-heartbeat window it spends
+        # parked (task 2068, follow-up from esc-2063-2 / task 2063's I4
+        # speculation-permit conservation characterization — 2063 fixes only
+        # the conservation COUNT via _inflight_speculative_count() and
+        # deliberately does not touch entries; this closes the matching
+        # observability gap). Mirrors 1b (_remerging_item)'s transient-window
+        # side-field pattern. self._redispatch is front-priority (drained by
+        # the verifier loop's DISPATCH-FILL ahead of _verifier_queue), so its
+        # entries are listed here, ahead of the awaiting_verify section below.
+        for _rd_item in self._redispatch:
+            entries.append(_entry(
+                _rd_item.request, 'awaiting_host',
+                worktree_path=item_merge_wt(_rd_item),
                 position=len(entries),
             ))
 
