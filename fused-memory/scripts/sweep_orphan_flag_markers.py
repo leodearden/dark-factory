@@ -228,7 +228,20 @@ async def run(args: Any, memory_service: Any) -> dict:
             '--limit value to ensure all orphans are covered.',
             len(members), total_source, scroll_limit,
         )
-    orphans = find_orphan_markers(members)
+    # Orphans are the id-deduplicated, order-preserving union of the two
+    # independent orphan predicates: missing kind (find_orphan_markers) and
+    # missing task_id (find_taskless_markers, task 2108). A member missing
+    # BOTH is caught by each predicate but must be deleted exactly once.
+    kind_orphans = find_orphan_markers(members)
+    taskless = find_taskless_markers(members)
+
+    orphans: list[dict] = []
+    seen_ids: set = set()
+    for m in (*kind_orphans, *taskless):
+        if m['id'] not in seen_ids:
+            seen_ids.add(m['id'])
+            orphans.append(m)
+
     orphan_ids = [o['id'] for o in orphans]
 
     report: dict = {
@@ -236,6 +249,7 @@ async def run(args: Any, memory_service: Any) -> dict:
         'before': before,
         'orphan_count': len(orphans),
         'orphan_ids': orphan_ids,
+        'taskless_orphan_count': len(taskless),
     }
 
     if args.apply:
