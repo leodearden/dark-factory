@@ -5116,6 +5116,81 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
+    async def reap_orphaned_merge_worktrees(
+        self,
+        *,
+        recovered_branches: Collection[str] = (),
+        now: float | None = None,
+    ) -> dict[str, list[str]]:
+        """Reap aged unregistered on-disk ``_merge-*`` worktrees (I6 leak
+        closure, task 2060).
+
+        The remediation counterpart to :meth:`worktree_ledger_violations`:
+        that method only DETECTS leaked worktrees; this method REMOVES them.
+        Intended to run once at worker construction/recovery time (see
+        ``Harness._reap_orphaned_merge_worktrees``), backstopping two orphan
+        sources — a caller's ``finally`` cleanup skipped by a mid-run SIGTERM,
+        and an orchestrator restart that wipes :attr:`_owned_merge_worktrees`
+        while the on-disk worktree (and its ``.git/worktrees`` admin entry)
+        survives.
+
+        Reuses :meth:`worktree_ledger_violations`'s exact os.scandir discovery
+        so remediation stays symmetric with detection: direct children of
+        ``git_ops.worktree_base`` whose name starts with ``'_merge-'``,
+        excluding the persistent warm worktree
+        (:data:`PERSISTENT_MERGE_WORKTREE_NAME`) and any path already present
+        in :attr:`_owned_merge_worktrees`.  A candidate is only removed (via
+        :meth:`GitOps.cleanup_merge_worktree`) once its mtime age exceeds
+        :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS` — the same grace window
+        :meth:`worktree_ledger_violations` uses — so a worktree from a
+        just-started concurrent merge (register-after-create race) is never
+        touched.
+
+        *recovered_branches* is reserved for re-adoption of worktrees backing
+        recovered in-flight merges; not yet consulted (readopted is always
+        ``[]``).
+
+        *now* is injectable for deterministic tests; defaults to
+        ``time.time()``.
+
+        Returns ``{'readopted': [...], 'reaped': [...]}`` — string paths of
+        every worktree removed this sweep.  Returns
+        ``{'readopted': [], 'reaped': []}`` immediately when ``worktree_base``
+        is missing or not a directory.
+        """
+        readopted: list[str] = []
+        reaped: list[str] = []
+
+        base = getattr(self._git_ops, 'worktree_base', None)
+        if base is None or not base.is_dir():
+            return {'readopted': readopted, 'reaped': reaped}
+
+        effective_now = now if now is not None else time.time()
+        grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        owned = {p.resolve() for p in self._owned_merge_worktrees}
+
+        with os.scandir(base) as it:
+            candidates = list(it)
+        for entry in candidates:
+            name = entry.name
+            if not name.startswith('_merge-') or name == PERSISTENT_MERGE_WORKTREE_NAME:
+                continue
+            try:
+                if not entry.is_dir():
+                    continue
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            path = Path(entry.path).resolve()
+            if path in owned:
+                continue
+            age = effective_now - mtime
+            if age > grace:
+                await self._git_ops.cleanup_merge_worktree(path)
+                reaped.append(str(path))
+
+        return {'readopted': readopted, 'reaped': reaped}
+
     def _warn_if_verify_base_not_frozen_tip(
         self,
         item: SpeculativeItem,
