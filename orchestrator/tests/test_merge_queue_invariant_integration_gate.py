@@ -105,6 +105,7 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeItem,
     SpeculativeMergeWorker,
+    item_merge_wt,
 )
 from orchestrator.run_store import RunStore
 from orchestrator.verify import VerifyResult
@@ -1112,3 +1113,89 @@ class TestScenario56NewSurfaceEscalations:
 
         main_sha = await git_ops.get_main_sha()
         _assert_quiescent(worker, main_sha, [])
+
+
+# ── step-09 RED / step-10 GREEN: Row 7 — ill-formed item raises at construction ──
+
+
+def _real_kwargs() -> dict:
+    """Minimal well-formed RealMergeItem kwargs (mirrors test_merge_types_invariants.py)."""
+    return dict(
+        request=MagicMock(),
+        merge_result=MergeResult(success=True, merge_commit='deadbeef'),
+        merge_wt=Path('/fake/merge-wt'),
+        base_sha='aabbccdd',
+        speculative=False,
+    )
+
+
+def _decided_kwargs() -> dict:
+    """Minimal well-formed DecidedItem kwargs (mirrors test_merge_types_invariants.py)."""
+    return dict(
+        request=MagicMock(),
+        base_sha='aabbccdd',
+        speculative=False,
+        immediate_outcome=MergeOutcome('blocked', reason='test'),
+    )
+
+
+class TestScenario7ItemShape:
+    """Row 7: ill-formed item shape raises at CONSTRUCTION time.
+
+    Post-ο (task 2000 / ο, this task's immediate prereq) RealMergeItem and
+    DecidedItem are structurally disjoint dataclasses: RealMergeItem has no
+    immediate_outcome/already_delivered/failure_diagnostic fields and
+    DecidedItem has no merge_result/merge_wt/merged_branch_tip/
+    counts_against_cap fields. The former task-1990 I2 "REAL xor DECIDED"
+    __post_init__ check therefore retires into type structure — the illegal
+    cross-variant shape can no longer be constructed at all. Passing a field
+    from the other variant is an unknown-kwarg TypeError raised by the
+    dataclass constructor itself, never a runtime ValueError, so this class
+    deliberately does NOT pin a message substring (neither does the
+    precedent module). Model: test_merge_types_invariants.py.
+
+    The InflightEntry.passthrough_outcome shadow invariant (ε=1890) survives
+    this split unchanged as a runtime __post_init__ ValueError — pinned here
+    too, alongside item_merge_wt's exhaustive RealMergeItem/DecidedItem match.
+    """
+
+    def test_real_item_rejects_decided_only_kwarg(self) -> None:
+        """A DECIDED-only field on RealMergeItem is an unknown-kwarg TypeError."""
+        kwargs = _real_kwargs()
+        kwargs['immediate_outcome'] = MergeOutcome('conflict')
+        with pytest.raises(TypeError):
+            RealMergeItem(**kwargs)
+
+    def test_decided_item_rejects_real_only_kwarg(self) -> None:
+        """A REAL-only field on DecidedItem is an unknown-kwarg TypeError."""
+        kwargs = _decided_kwargs()
+        kwargs['merge_result'] = MergeResult(success=True, merge_commit='deadbeef')
+        with pytest.raises(TypeError):
+            DecidedItem(**kwargs)
+
+    def test_valid_shapes_construct_and_item_merge_wt_is_exhaustive(self) -> None:
+        """Both well-formed shapes construct; item_merge_wt matches exhaustively:
+        a RealMergeItem always owns a merge worktree, a DecidedItem never does.
+        """
+        real_kwargs = _real_kwargs()
+        real_item = RealMergeItem(**real_kwargs)
+        decided_item = DecidedItem(**_decided_kwargs())
+
+        assert item_merge_wt(real_item) == real_kwargs['merge_wt']
+        assert item_merge_wt(decided_item) is None
+
+    def test_passthrough_outcome_wrapping_real_item_raises_value_error(self) -> None:
+        """The surviving runtime shape check: passthrough_outcome requires a
+        DecidedItem — wrapping a RealMergeItem is a __post_init__ ValueError.
+        """
+        real_item = RealMergeItem(**_real_kwargs())
+        with pytest.raises(ValueError):
+            InflightEntry(
+                item=real_item,
+                lease=None,
+                verify_task=None,
+                merge_wt=None,
+                was_speculative=False,
+                phase='passthrough',
+                passthrough_outcome=MergeOutcome('conflict'),
+            )
