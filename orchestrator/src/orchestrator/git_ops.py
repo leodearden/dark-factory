@@ -2943,6 +2943,42 @@ class GitOps:
         await self.warm_lane_pool.release(lane_dir)
         logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
 
+    async def detach_lane_checkout(self, lane: Path, bare_id: str) -> bool:
+        """Commit WIP then detach *lane*'s HEAD, preserving branch and worktree.
+
+        Used by :meth:`Harness._reconcile_lane_checkouts` to free git's
+        single-checkout lock on a stale ``task/<bare_id>`` branch without
+        losing uncommitted work: :meth:`commit` snapshots WIP onto the
+        currently-checked-out branch first (mirrors the reclaim/
+        ``_reuse_warm_lane`` commit-before-mutate contract), THEN ``git
+        checkout --detach`` frees the branch for a future ``git worktree
+        add`` elsewhere.
+
+        Does NOT remove the worktree (would dangle the pool's registered
+        lane path) and does NOT delete the branch — the branch is exactly
+        the WIP-recovery handle the next acquire's ``_orphan_has_commits`` →
+        reattach → ``_reuse_warm_lane`` path depends on.
+
+        Returns:
+            True on success.  False (and logs at ERROR) if ``git checkout
+            --detach`` fails — the caller must NOT treat the branch as freed.
+        """
+        # commit() returns None when the tree is already clean — fine.
+        await self.commit(lane, 'chore: save WIP before lane-checkout reconcile detach')
+
+        rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=lane)
+        if rc != 0:
+            logger.error(
+                'detach_lane_checkout: checkout --detach failed for %s (task %s): %s',
+                lane, bare_id, err,
+            )
+            return False
+        logger.info(
+            'detach_lane_checkout: detached %s (task %s) — branch and worktree retained',
+            lane, bare_id,
+        )
+        return True
+
     async def release_lane_for_terminal_task(
         self,
         task_id_or_branch: str,
