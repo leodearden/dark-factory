@@ -4331,6 +4331,20 @@ class TestRedispatchSpeculativeConservation:
                 f'got {parked!r}.'
             )
 
+            # NOTE(test-determinism): from here on this test calls
+            # worker._maybe_log_queue_heartbeat(...) directly from the test
+            # coroutine while worker_task (the real worker.run() loop) keeps
+            # running concurrently. That manual interleaving is only safe
+            # because _maybe_log_queue_heartbeat — and the
+            # _check_resource_audit / snapshot() calls it makes — are fully
+            # synchronous (no `await` anywhere in that call chain), so each
+            # call is atomic with respect to worker_task's own event-loop
+            # iterations and can never observe state torn mid-dispatch. If
+            # any of those methods ever gains an `await`, this interleaving
+            # could start observing torn state and flake intermittently; a
+            # future async refactor of the heartbeat/audit path must
+            # revisit this test.
+            #
             # Sample the audit at several heartbeat-observable points while
             # the speculative item sits parked (the multi-heartbeat window
             # the original false positive persisted across). Check the

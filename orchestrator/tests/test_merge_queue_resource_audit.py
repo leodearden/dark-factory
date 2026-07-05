@@ -267,6 +267,12 @@ class TestRedispatchSpeculativeAccounting:
         assert worker._inflight_speculative_count() == 2
         assert worker.speculation_accounting_violations() == []
         assert worker.snapshot()['resource_audit']['speculation_accounting'] == []
+        # Pin the OTHER consumer of _inflight_speculative_count() too: the
+        # snapshot's 'speculation' key documents (merge_queue.py ~5534-5541)
+        # that inflight_speculative includes _redispatch items, so assert it
+        # directly rather than only exercising it transitively via the
+        # resource_audit key above.
+        assert worker.snapshot()['speculation']['inflight_speculative'] == 2
 
     def test_redispatch_undercount_produces_the_observed_violation_message(
         self, git_ops: GitOps, tmp_path: Path,
