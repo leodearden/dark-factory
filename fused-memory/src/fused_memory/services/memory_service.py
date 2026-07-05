@@ -211,12 +211,21 @@ def _node_to_dict(n: Any) -> dict:
 
 
 def _edge_to_dict(e: Any) -> dict:
-    """Normalize a Graphiti fact-search result into get_entity's edge dict shape.
+    """Normalize a Graphiti edge into get_entity's edge dict shape.
 
-    Shared by both the exact-match and fuzzy branches of get_entity — edges
-    always come from the fuzzy graphiti.search() fact search regardless of
-    how the node was resolved.
+    Accepts either a dict (exact-match path, from graphiti.get_valid_edges_for_node —
+    an EdgeDict {uuid, fact, name} with no temporal fields) or an object with
+    attributes (fuzzy-match path, from graphiti.search — a fact-search result
+    that may carry valid_at/invalid_at). Dict inputs yield temporal=None today
+    since EdgeDict has no valid_at/invalid_at keys; _serialize_temporal is used
+    regardless so this stays forward-compatible if EdgeDict is later enriched.
     """
+    if isinstance(e, dict):
+        return {
+            'uuid': e.get('uuid'),
+            'fact': e.get('fact', ''),
+            'temporal': _serialize_temporal(e.get('valid_at'), e.get('invalid_at')),
+        }
     return {
         'uuid': getattr(e, 'uuid', None),
         'fact': getattr(e, 'fact', str(e)),
