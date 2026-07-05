@@ -1857,6 +1857,12 @@ class GitOps:
                     '_seed_warm_lane: script exited %d for %s (stderr=%r)',
                     rc, lane_dir, err,
                 )
+            else:
+                # task 2099: rc == 0 proves the cp --reflink from the on-mount
+                # base target succeeded, i.e. the pool storage is present and
+                # writable — the ONE chokepoint where the .pool-root sentinel
+                # is safe to (re-)write. See mark_pool_storage_present().
+                self.mark_pool_storage_present()
             return rc
         except Exception:
             logger.warning(
@@ -2153,6 +2159,27 @@ class GitOps:
                 # here — we're the only caller that can be creating this lane.
                 # The lock purely serializes the repo-level git worktree add
                 # against other lanes' concurrent first-time creates.
+                # Pool-storage-absent discriminator (task 2099). This is the
+                # PRIMARY guard for the spec pool — unlike acquire_warm_lane,
+                # acquire_spec_lane has no task-2061 base-health pre-gate, and
+                # without this check `git worktree add --detach` below would
+                # create a shadow lane on the rootfs skeleton during a
+                # mount-down window. Same missing-vs-empty distinction as
+                # acquire_warm_lane's create-once discriminator: base MISSING
+                # => genuinely fresh host => allow create; base EXISTS but
+                # `.pool-root` absent => suspected unmounted mountpoint =>
+                # refuse (release lane, cold fallback).
+                if self.worktree_base.exists() and not self.pool_storage_present():
+                    logger.warning(
+                        'acquire_spec_lane: create-once — pool storage '
+                        'absent/unmounted at %s — refusing to create spec '
+                        'lane %s on the underlying filesystem; cold fallback',
+                        self.worktree_base, lane,
+                    )
+                    self._note_pool_storage_absent()
+                    await self.spec_warm_lane_pool.release(lane)
+                    wt = await self.create_throwaway_verify_worktree(merge_commit)
+                    return wt, False
                 # Self-heal a stale unregistered directory first
                 # (mirrors reset_persistent_merge_worktree's self-heal pattern).
                 if lane.exists():
@@ -2592,6 +2619,28 @@ class GitOps:
             # guard's check and here.
             elif _orphan_confirmed_unregistered or not await self._is_registered_worktree(lane):
                 # ── Create-once branch ────────────────────────────────────
+                # Pool-storage-absent discriminator (task 2099). This is a
+                # BACKSTOP behind the task-2061 base-health gate above
+                # (_warm_lane_base_resolvable), which already short-circuits
+                # the common BASE_ABSENT case before any lane is touched —
+                # this catches its INDETERMINATE fall-through and off-mount-
+                # base configs. worktree_base MISSING => an fstab mountpoint
+                # dir must exist for the mount to attach, so a missing dir
+                # cannot be an unmounted configured mount => genuinely fresh
+                # host => safe to build the skeleton below. worktree_base
+                # EXISTS but `.pool-root` is absent => suspected unmounted
+                # mountpoint => refuse to create a NEW lane on the underlying
+                # root fs.
+                if self.worktree_base.exists() and not self.pool_storage_present():
+                    logger.warning(
+                        'acquire_warm_lane: create-once — pool storage '
+                        'absent/unmounted at %s — refusing to create lane '
+                        '%s on the underlying filesystem',
+                        self.worktree_base, lane,
+                    )
+                    self._note_pool_storage_absent()
+                    await self.release_warm_lane(lane, branch_name)
+                    return WarmLaneUnavailable.BASE_ABSENT
                 # Self-heal: remove a stale unregistered directory so
                 # git worktree add doesn't refuse a non-empty dir.
                 if lane.exists():

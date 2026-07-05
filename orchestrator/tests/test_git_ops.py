@@ -45,10 +45,18 @@ def _seed_default_warm_base(repo: Path) -> None:
     worktree tests in this file assert ``_merge-verify`` does NOT exist before
     it is lazily created, so only warm-lane tests that need a resolvable base
     call this explicitly.
+
+    Task 2099: also marks ``.pool-root`` present so the NEW mount-presence
+    guard on acquire_warm_lane/acquire_spec_lane's create-once discriminator
+    does not false-trip in these warm-lane tests, which simulate an
+    already-running warm-lane host (a resolvable base presupposes prior pool
+    warmup on an already-mounted host) — an orthogonal concern to whether the
+    base itself is buildable.
     """
     default_base = repo / '.worktrees' / '_merge-verify' / 'target'
     default_base.mkdir(parents=True, exist_ok=True)
     (default_base / '.keep').write_text('warm base sentinel\n')
+    (repo / '.worktrees' / '.pool-root').touch()
 
 
 async def _setup_repo(repo: Path):
