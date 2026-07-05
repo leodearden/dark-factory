@@ -822,6 +822,24 @@ class Harness:
                 self._warm_lane_reclaim_candidates
             )
             self.git_ops.warm_lane_dispatched_predicate = self._is_branch_dispatched
+        # Wire the pool-storage-absent callback (task 2099): git_ops guard
+        # sites (prune_worktrees, _run_warm_lane_gc_reclaim, acquire
+        # create-once for both pools) call this best-effort when
+        # pool_storage_present() is False. Declared on git_ops with default
+        # None (byte-identical when unwired) — same declare-in-callee /
+        # install-in-harness pattern as warm_lane_reclaim_candidate_provider.
+        self.git_ops._on_pool_storage_absent = self._file_pool_storage_absent_escalation
+        # In-memory hint gating the orphan-reaper's per-tick resolve scan
+        # (task 2099 review-fix, efficiency). MUST default True ("maybe
+        # pending") rather than False ("never filed") — a fresh process
+        # start needs its first sweep to still scan the escalation queue so
+        # a stale pool-storage-absent L1 left open by a pre-gate build is
+        # auto-cleared across a restart (see _reap_orphan_worktrees). Set
+        # True whenever _file_pool_storage_absent_escalation trips; cleared
+        # to False only by _resolve_pool_storage_absent_escalation once it
+        # confirms zero pending escalations, so the common healthy
+        # steady-state stops paying the per-tick queue-scan cost.
+        self._pool_storage_absent_maybe_pending: bool = True
         self.briefing = BriefingAssembler(config)
         self.report = HarnessReport()
         self._recovered_plans: dict[str, dict] = {}
@@ -1926,6 +1944,28 @@ Output JSON matching the schema. Every task must appear in the output.
         if not worktree_base.exists():
             return
 
+        # Pool-storage guard (task 2099): worktree_base can EXIST as an
+        # unmounted mountpoint dir, making every mount-resident worktree
+        # look planless/corrupt to the scan below — the Jul-3 incident this
+        # guards against. Defer the ENTIRE recovery pass (no cleanup) rather
+        # than destroy recoverable plans that merely appear empty because
+        # the mount has not come up yet. Gated on pool_in_use() (step-16
+        # review-fix): pool_storage_present() is permanently False on a
+        # pool-less host (its only writer never runs without a configured
+        # pool) — e.g. worktree_base.exists() is already True there from a
+        # prior COLD worktree — so without this gate every pool-less host
+        # would defer recovery and file a spurious escalation at every
+        # startup.
+        if self.git_ops.pool_in_use() and not self.git_ops.pool_storage_present():
+            logger.warning(
+                'Crash recovery: pool storage absent/unmounted at %s — '
+                'deferring the ENTIRE recovery pass (no cleanup) to avoid '
+                'destroying recoverable plans on mount-resident worktrees',
+                worktree_base,
+            )
+            self._file_pool_storage_absent_escalation()
+            return
+
         recovered = 0
         cleaned = 0
 
@@ -2427,6 +2467,35 @@ Output JSON matching the schema. Every task must appear in the output.
         worktree_base = self.git_ops.worktree_base
         if not worktree_base.exists():
             return
+
+        # Pool-storage guard (task 2099): worktree_base can EXIST as an
+        # unmounted mountpoint dir, making every mount-resident worktree
+        # APPEAR missing to the checks below — the Jul-3 incident this
+        # guards against. Abort the ENTIRE sweep (no DB read, no
+        # cleanup/quarantine, no prune tail) rather than risk treating a
+        # live lane as an orphan. Gated on pool_in_use() (step-16/17
+        # review-fix): pool_storage_present() is permanently False on a
+        # pool-less host (its only writer never runs without a configured
+        # pool), and cold worktrees at worktree_base/<branch> make
+        # worktree_base.exists() True there too — without this gate, every
+        # pool-less host that has ever run a task would abort its sweep and
+        # file a spurious escalation at every startup. The resolve call
+        # below is gated on _pool_storage_absent_maybe_pending rather than
+        # skipped outright — that flag starts True on every process start,
+        # so a pool-less host on a build that pre-dates this gate can still
+        # auto-clear a stale open L1 on its first post-restart sweep; only
+        # the subsequent, confirmed-clear steady-state ticks skip the scan.
+        if self.git_ops.pool_in_use() and not self.git_ops.pool_storage_present():
+            logger.warning(
+                'Orphan reaper: pool storage absent/unmounted at %s — '
+                'aborting the ENTIRE sweep (no cleanup/quarantine/prune) to '
+                'avoid treating mount-resident worktrees as orphans',
+                worktree_base,
+            )
+            self._file_pool_storage_absent_escalation()
+            return
+        if self._pool_storage_absent_maybe_pending:
+            await self._resolve_pool_storage_absent_escalation()
 
         statuses, err = await self.scheduler.get_statuses()
         if resolver_failed(statuses, err):
@@ -3568,6 +3637,139 @@ Output JSON matching the schema. Every task must appear in the output.
     # guarantees as _NO_LANDINGS_SENTINEL.
     _WARM_BASE_HARD_DOWN_SENTINEL: str = '__warm_base_hard_down__'
     _WARM_BASE_HARD_DOWN_ROLE: str = 'orchestrator-warm-base-hard-down'
+
+    # Synthetic task_id + agent_role for the pool-storage-absent guard (task
+    # 2099).  HOST-SCOPED — one worktree_base mount, so exactly one open L1
+    # at a time, deduped via get_by_task + agent_role filter.  Deliberately
+    # DISTINCT from _WARM_BASE_HARD_DOWN_SENTINEL: that predicate answers "is
+    # the CoW seed base buildable" (can be legitimately absent while the
+    # mount is up); this one answers "is the pool storage mount itself
+    # present" (the `.pool-root` sentinel) — the destructive-sweep guards
+    # (prune_worktrees, _run_warm_lane_gc_reclaim, acquire create-once,
+    # orphan reaper, crash recovery) need the latter, stable signal. Same
+    # class-level immutability guarantees as _WARM_BASE_HARD_DOWN_SENTINEL.
+    _POOL_STORAGE_ABSENT_SENTINEL: str = '__pool_storage_absent__'
+    _POOL_STORAGE_ABSENT_ROLE: str = 'orchestrator-pool-storage-absent'
+
+    def _file_pool_storage_absent_escalation(self) -> None:
+        """File an L1 escalation when pool storage (worktree_base) is absent.
+
+        Installed on ``self.git_ops._on_pool_storage_absent`` (declare-on-
+        callee / install-in-harness — mirrors ``warm_lane_reclaim_candidate_
+        provider``) and also called directly from the orphan-reaper and
+        crash-recovery sweeps when ``pool_storage_present()`` is False.
+
+        Covers the Jul-3 incident class: ``worktree_base`` exists (it is a
+        live mountpoint dir) but is EMPTY because the warm-lanes mount has
+        not come up yet — every destructive sweep site refuses to run and
+        routes here instead of silently wiping ``.git/worktrees`` admin
+        entries. Deduped by ``has_open_l1`` so repeated ticks / multiple
+        tripped sites in the same tick do not stack duplicate L1s: the
+        operator sees exactly one open pool-storage-absent escalation at a
+        time.
+
+        Best-effort: a missing queue (bare-Harness unit tests) or any submit
+        failure is swallowed so escalation filing never breaks the guarded
+        call site.
+
+        Marks ``_pool_storage_absent_maybe_pending`` True unconditionally
+        (even if the queue is missing or the dedup below finds one already
+        open) so the reaper's resolve scan runs again once storage recovers.
+        """
+        self._pool_storage_absent_maybe_pending = True
+        if not self._escalation_queue:        # bare-Harness unit tests stay green
+            return
+        try:
+            if self._escalation_queue.has_open_l1(self._POOL_STORAGE_ABSENT_SENTINEL):
+                return                         # dedup: one open L1 at a time
+            from escalation.models import Escalation  # noqa: PLC0415
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._POOL_STORAGE_ABSENT_SENTINEL),
+                task_id=self._POOL_STORAGE_ABSENT_SENTINEL,
+                agent_role=self._POOL_STORAGE_ABSENT_ROLE,
+                severity='blocking',
+                category='infra_issue',
+                summary=(
+                    'Pool storage absent — worktree_base exists but the '
+                    '.pool-root sentinel is missing (suspected unmounted '
+                    'mount); destructive worktree sweeps are suppressed'
+                )[:200],
+                detail=(
+                    'GitOps.pool_storage_present() returned False: '
+                    'worktree_base exists on disk but its `.pool-root` '
+                    'sentinel is absent, which is exactly what an unmounted '
+                    'warm-lanes mountpoint looks like after a host reboot / '
+                    'crash where this process started before the mount unit. '
+                    'To avoid repeating the Jul-3 incident (an orphan-reaper '
+                    'prune wiped every registered lane + _merge-verify admin '
+                    'entry against an unmounted mount), the orphan reaper, '
+                    'prune_worktrees, the warm-lane GC reclaim pass, crash '
+                    'recovery, and warm/spec-lane acquire create-once all '
+                    'refuse to run against this worktree_base until the '
+                    'sentinel reappears.\n\n'
+                    'Check whether the pool storage mount is up (e.g. '
+                    '`mount | grep <worktree_base>`) and remount it if not. '
+                    'If this is intentionally a fresh, plain-directory '
+                    'worktree_base with no mount involved, restore service '
+                    'by re-running a lane acquire/seed to bootstrap the '
+                    '`.pool-root` sentinel, or create it manually.'
+                ),
+                suggested_action=(
+                    'Verify the warm-lanes mount is present (check the '
+                    'RequiresMountsFor= unit dependency and its sibling '
+                    'mount unit); once remounted, resolve this escalation — '
+                    'the next sweep auto-clears it via '
+                    '_resolve_pool_storage_absent_escalation().'
+                ),
+                level=1,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning('Filed L1 pool-storage-absent escalation %s', esc.id)
+        except Exception:
+            logger.warning('Failed to file pool-storage-absent escalation', exc_info=True)
+
+    async def _resolve_pool_storage_absent_escalation(self) -> None:
+        """Resolve any pending pool-storage-absent L1 (task 2099).
+
+        Called from the orphan-reaper sweep when ``pool_storage_present()``
+        is True, mirroring ``_resolve_warm_base_hard_down`` — resolves ALL
+        pending escalations for the sentinel+role, idempotent
+        (``EscalationQueue.resolve`` is a no-op if already resolved).
+        Best-effort: no-op when ``_escalation_queue`` is None or resolve
+        raises.
+
+        On successful completion (no exception) clears
+        ``_pool_storage_absent_maybe_pending`` to False — this scan has just
+        proven there is nothing left to resolve, so the reaper's caller can
+        skip the next scan(s) until ``_file_pool_storage_absent_escalation``
+        sets the flag True again. Left True on exception (fail-safe: keep
+        re-scanning rather than risk silently never resolving a real L1).
+        """
+        if not self._escalation_queue:
+            return
+        try:
+            pending = [
+                e
+                for e in self._escalation_queue.get_by_task(
+                    self._POOL_STORAGE_ABSENT_SENTINEL, status='pending',
+                )
+                if e.agent_role == self._POOL_STORAGE_ABSENT_ROLE
+            ]
+            for esc in pending:
+                self._escalation_queue.resolve(
+                    esc.id,
+                    'auto-resolved: pool storage is present again',
+                    resolved_by=self._POOL_STORAGE_ABSENT_ROLE,
+                )
+                logger.info(
+                    'Pool-storage-absent: auto-resolved escalation %s', esc.id,
+                )
+            self._pool_storage_absent_maybe_pending = False
+        except Exception:
+            logger.warning(
+                'Pool-storage-absent: failed to resolve escalation(s)',
+                exc_info=True,
+            )
 
     def _file_scheduler_pause_escalation(self, reason: str) -> None:
         """File an L1 escalation when scheduler dispatch is paused.

@@ -299,6 +299,13 @@ def wl_git_repo(tmp_path: Path) -> Path:
     default_base = repo / '.worktrees' / '_merge-verify' / 'target'
     default_base.mkdir(parents=True, exist_ok=True)
     (default_base / '.keep').write_text('warm base sentinel\n')
+    # Task 2099: mark pool storage present so the NEW mount-presence guard on
+    # acquire_warm_lane/acquire_spec_lane's create-once discriminator does not
+    # false-trip for the many tests in this file, which simulate an
+    # already-running warm-lane host — an orthogonal concern to base health
+    # (TestAcquireWarmLaneBaseAbsent overrides warm_lane_base_target_dir only,
+    # not worktree_base itself, so it is unaffected by this default).
+    (repo / '.worktrees' / '.pool-root').touch()
     return repo
 
 

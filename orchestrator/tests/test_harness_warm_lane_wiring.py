@@ -1239,6 +1239,11 @@ class TestRecoveryTerminalTaskLaneRelease:
         git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
         pool = git_ops.warm_lane_pool
         assert pool is not None
+        # Task 2099: mark pool storage present so the mount-presence guard on
+        # _recover_crashed_tasks does not false-trip across these lane pin/
+        # restore-routing tests, which all assume an already-mounted host —
+        # an orthogonal concern to recovery routing.
+        git_ops.mark_pool_storage_present()
 
         harness = _build_harness(config)
         harness.git_ops = git_ops
@@ -2167,6 +2172,9 @@ class TestReconcileLaneCheckouts:
         default_base = repo / '.worktrees' / '_merge-verify' / 'target'
         default_base.mkdir(parents=True, exist_ok=True)
         (default_base / '.keep').write_text('warm base sentinel\n')
+        # Task 2099: mark pool storage present so the create-once discriminator
+        # does not refuse the first lane creation below (mirrors wl_git_repo).
+        (repo / '.worktrees' / '.pool-root').touch()
         scripts_dir = repo / 'scripts'
         scripts_dir.mkdir(parents=True, exist_ok=True)
         seed_script = scripts_dir / 'seed-warm-lane.sh'
@@ -2476,6 +2484,10 @@ class TestMidRunRecycleLeak:
         default_base = repo / '.worktrees' / '_merge-verify' / 'target'
         default_base.mkdir(parents=True, exist_ok=True)
         (default_base / '.keep').write_text('warm base sentinel\n')
+        # Task 2099: mark pool storage present (mirrors wl_git_repo) — belt
+        # and braces even though this test's reset-in-place path does not
+        # exercise the create-once discriminator.
+        (repo / '.worktrees' / '.pool-root').touch()
 
         config = OrchestratorConfig(
             project_root=repo,

@@ -45,6 +45,12 @@ def git_repo(tmp_path: Path) -> Path:
     default_base = repo / '.worktrees' / '_merge-verify' / 'target'
     default_base.mkdir(parents=True, exist_ok=True)
     (default_base / '.keep').write_text('warm base sentinel\n')
+    # Task 2099: mark pool storage present so the NEW mount-presence guard on
+    # prune_worktrees/_run_warm_lane_gc_reclaim/acquire create-once does not
+    # false-trip in these disk-pressure tests, which simulate an
+    # already-running warm-lane host (disk pressure presupposes prior lane
+    # usage) — an orthogonal concern to whether the mount is present.
+    (repo / '.worktrees' / '.pool-root').touch()
     return repo
 
 

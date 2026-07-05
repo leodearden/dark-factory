@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Literal, NamedTuple, TypedDict
+from typing import Any, Literal, NamedTuple, TypedDict
 
 from orchestrator.config import GitConfig
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -166,6 +166,13 @@ PERSISTENT_MERGE_WORKTREE_NAME: str = '_merge-verify'
 # / find_inflight_merge_worktree — the same mechanism that already exempts
 # _spec-*/_lane-*/_solo-* worktrees — with no explicit skip required.
 PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
+
+# Sentinel filename marking worktree_base as backed by live pool storage
+# (task 2099).  Lives ON the pool storage itself (plain dir or real mount
+# alike — substrate-independent, no config knob), so it disappears along
+# with an unmounted mountpoint even though the mountpoint DIR still exists.
+# See GitOps.pool_storage_present() / mark_pool_storage_present().
+POOL_ROOT_SENTINEL: str = '.pool-root'
 
 # The _iact-* band (worktree_base/<iact_prefix><slug>, config.iact_prefix
 # default '_iact-') minted by GitOps.create_interactive_worktree is
@@ -892,9 +899,153 @@ class GitOps:
             Callable[[list[str]], Awaitable[set[str]]] | None
         ) = None
         self.warm_lane_dispatched_predicate: Callable[[str], bool] | None = None
+        # Pool-storage-absent safety-valve callback (task 2099).  Declared
+        # here (default None), installed by Harness.__init__ — mirrors the
+        # declare-on-callee / install-in-harness pattern used by
+        # warm_lane_reclaim_candidate_provider above.  Fired best-effort by
+        # _note_pool_storage_absent() from every destructive-sweep guard site
+        # (prune_worktrees, _run_warm_lane_gc_reclaim, acquire create-once)
+        # when pool_storage_present() is False.  None (unwired) is
+        # byte-identical to today — e.g. cli/recover/evals call sites.
+        self._on_pool_storage_absent: Callable[..., Any] | None = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
+
+    def pool_in_use(self) -> bool:
+        """True iff a warm or spec lane pool is configured on this host (task 2099).
+
+        ``pool_storage_present()``'s only writer (:meth:`_seed_warm_lane` on
+        ``rc == 0``) never runs unless a pool is configured, so on a
+        pool-less host (``warm_lane_pool=False`` and
+        ``merge_spec_warm_lane_pool=False``, the default) ``.pool-root`` is
+        NEVER written and ``pool_storage_present()`` is permanently False by
+        design — not because a mount went down. The destructive-sweep guards
+        gate on ``pool_in_use() and not pool_storage_present()`` rather than
+        ``not pool_storage_present()`` alone so that a pool-less host is
+        never mistaken for a mount-down incident.
+        """
+        return self.warm_lane_pool is not None or self.spec_warm_lane_pool is not None
+
+    def pool_storage_present(self) -> bool:
+        """True iff worktree_base is backed by live pool storage (task 2099).
+
+        Checks for the ``POOL_ROOT_SENTINEL`` (``.pool-root``) sentinel FILE
+        directly inside :attr:`worktree_base`.  The sentinel lives ON the pool
+        storage itself, so it disappears along with an unmounted mountpoint
+        even though the mountpoint directory still exists — unlike
+        ``worktree_base.exists()``, which is True for an empty, unmounted
+        mountpoint dir (the root cause of the Jul-3 incident this guards
+        against).
+
+        Fail-safe: any ``OSError`` (e.g. a torn read racing a concurrent
+        mount transition) is treated as absent.  Never raises.
+        """
+        try:
+            return (self.worktree_base / POOL_ROOT_SENTINEL).is_file()
+        except OSError:
+            logger.debug(
+                'pool_storage_present: stat error checking %s — treating as '
+                'absent (fail-safe)',
+                self.worktree_base,
+                exc_info=True,
+            )
+            return False
+
+    def mark_pool_storage_present(self) -> None:
+        """Write the ``.pool-root`` sentinel marking storage as present.
+
+        Idempotent best-effort: creates :attr:`worktree_base` if missing,
+        then writes the sentinel file (a no-op if it already exists).  Any
+        ``OSError`` is logged and swallowed — never raises, since a failed
+        mark must not block whatever seed/warmup operation triggered it.
+
+        Called from exactly ONE chokepoint — :meth:`_seed_warm_lane` on
+        ``rc == 0`` — because a successful seed proves the mount is present
+        and writable (see that method's docstring for the full rationale).
+        """
+        try:
+            self.worktree_base.mkdir(parents=True, exist_ok=True)
+            (self.worktree_base / POOL_ROOT_SENTINEL).touch(exist_ok=True)
+        except OSError:
+            logger.warning(
+                'mark_pool_storage_present: failed to write sentinel under %s',
+                self.worktree_base,
+                exc_info=True,
+            )
+
+    def _note_pool_storage_absent(self) -> None:
+        """Best-effort dispatch to the injected ``_on_pool_storage_absent`` hook.
+
+        No-op when unwired (default None).  Swallows any exception raised by
+        the callback so a guard site can never be broken by escalation-filing
+        failing — mirrors the other declare-on-callee callback dispatchers in
+        this class.
+        """
+        if self._on_pool_storage_absent is None:
+            return
+        try:
+            self._on_pool_storage_absent()
+        except Exception:
+            logger.warning(
+                '_note_pool_storage_absent: callback raised', exc_info=True,
+            )
+
+    def _pool_storage_bootstrap_ok(self) -> bool:
+        """True iff a missing ``.pool-root`` is a first-seed BOOTSTRAP rather
+        than an unmounted mountpoint (task 2099 review-fix).
+
+        The ``.pool-root`` sentinel has exactly one writer — :meth:`_seed_warm_lane`
+        on ``rc == 0`` — which is reached only AFTER the create-once
+        discriminators (:meth:`acquire_warm_lane` / :meth:`acquire_spec_lane`).
+        Those discriminators refuse when ``worktree_base.exists() and not
+        pool_storage_present()``.  On a genuinely fresh host the sentinel has
+        never been written, so absent a bootstrap escape the very first lane
+        acquisition is refused forever, the seed never runs, the sentinel is
+        never written, and the pool is permanently disabled — a
+        chicken-and-egg deadlock.
+
+        This predicate breaks the cycle by recognising the ONE case where a
+        missing sentinel is provably safe to seed through: the warm-lane CoW
+        seed base resolves ``OK`` (present AND non-empty) AND lives INSIDE
+        :attr:`worktree_base`.  A populated base target under worktree_base
+        cannot exist on an empty, unmounted mountpoint — so its presence is
+        substrate-independent proof that worktree_base's own storage is
+        mounted and writable.  When that holds, the create-once site marks the
+        sentinel and proceeds (a real seed then re-marks it idempotently).
+
+        Fail-safe (returns False → refuse, never bootstrap) when:
+        - the base is ABSENT/INDETERMINATE (empty unmounted mountpoint, or a
+          transient stat/readlink hiccup), or
+        - the base is configured OFF worktree_base
+          (``config.warm_lane_base_target_dir`` points elsewhere) — its
+          presence on a different mount says nothing about worktree_base's
+          own mount, so a bootstrap there could still create a shadow lane on
+          the underlying root fs of an unmounted mountpoint.
+
+        **Spec-only-host caveat (review-fix)**: this same predicate is the
+        bootstrap discriminator for :meth:`acquire_spec_lane`, but it always
+        proxies through the WARM-lane base (``_warm_lane_base_resolvable`` /
+        ``warm_lane_base_target_path``) — there is no spec-pool-specific
+        substrate signal.  On a host that configures
+        ``spec_warm_lane_pool`` without a ``warm_lane_pool``, this means the
+        spec pool's own bootstrap depends on the merge-verify warm base
+        being populated: if that base is empty/absent (no warm-lane seed or
+        ``refresh_warm_base`` has run yet), this returns False and the spec
+        pool's create-once discriminator cold-falls-back indefinitely
+        instead of bootstrapping ``.pool-root`` itself, even though
+        ``worktree_base`` may in fact be mounted.  This is the conservative
+        (never-shadow-an-unmounted-mount) direction, not a correctness bug,
+        but it means a spec-only host stays cold-fallback-only until some
+        other path (e.g. a warm-lane seed) populates the warm base and
+        writes the sentinel.
+        """
+        if self._warm_lane_base_resolvable() is not WarmBaseHealth.OK:
+            return False
+        try:
+            return self.warm_lane_base_target_path.is_relative_to(self.worktree_base)
+        except (OSError, ValueError):
+            return False
 
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
@@ -1777,6 +1928,12 @@ class GitOps:
                     '_seed_warm_lane: script exited %d for %s (stderr=%r)',
                     rc, lane_dir, err,
                 )
+            else:
+                # task 2099: rc == 0 proves the cp --reflink from the on-mount
+                # base target succeeded, i.e. the pool storage is present and
+                # writable — the ONE chokepoint where the .pool-root sentinel
+                # is safe to (re-)write. See mark_pool_storage_present().
+                self.mark_pool_storage_present()
             return rc
         except Exception:
             logger.warning(
@@ -1928,11 +2085,31 @@ class GitOps:
         never raises.  A non-zero exit is logged at WARNING and treated as
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
 
+        **Pool-storage guard (task 2099)**: refuses to spawn the script when
+        a pool is configured (:meth:`pool_in_use`) but :meth:`pool_storage_present`
+        is False — an unmounted mountpoint must never let the GC script
+        reclaim/reset lanes it can only see as missing.  Skipped entirely
+        when no pool is in use: ``pool_storage_present()`` is permanently
+        False on a pool-less host (its only writer never runs without a
+        pool), so that alone must never be treated as a mount-down
+        incident.  Returns the same 127 fail-soft sentinel used for an
+        absent script, so callers treat it identically to 'nothing
+        reclaimed'.
+
         Returns:
             0   — reclaim succeeded.
-            127 — script absent or exception (fail-soft sentinel).
+            127 — script absent, pool storage absent, or exception (fail-soft
+                sentinel).
             other non-zero — reclaim script error (caller still re-checks).
         """
+        if self.pool_in_use() and not self.pool_storage_present():
+            logger.warning(
+                '_run_warm_lane_gc_reclaim: pool storage absent/unmounted at '
+                '%s — refusing to spawn warm-lane-gc.sh reclaim',
+                self.worktree_base,
+            )
+            self._note_pool_storage_absent()
+            return 127
         try:
             script = self.project_root / 'scripts' / 'warm-lane-gc.sh'
             if not script.exists():
@@ -2058,6 +2235,41 @@ class GitOps:
                 # here — we're the only caller that can be creating this lane.
                 # The lock purely serializes the repo-level git worktree add
                 # against other lanes' concurrent first-time creates.
+                # Pool-storage-absent discriminator (task 2099). This is the
+                # PRIMARY guard for the spec pool — unlike acquire_warm_lane,
+                # acquire_spec_lane has no task-2061 base-health pre-gate, and
+                # without this check `git worktree add --detach` below would
+                # create a shadow lane on the rootfs skeleton during a
+                # mount-down window. Same missing-vs-empty distinction as
+                # acquire_warm_lane's create-once discriminator: base MISSING
+                # => genuinely fresh host => allow create; base EXISTS but
+                # `.pool-root` absent => suspected unmounted mountpoint =>
+                # refuse (release lane, cold fallback).
+                if self.worktree_base.exists() and not self.pool_storage_present():
+                    if self._pool_storage_bootstrap_ok():
+                        # First-seed bootstrap (task 2099 review-fix): the CoW
+                        # seed base is present & non-empty INSIDE worktree_base,
+                        # proving the mount is up — a missing sentinel here is a
+                        # fresh host, not an unmounted mountpoint. Mark it now so
+                        # subsequent acquisitions see storage present, then fall
+                        # through to the normal create (the seed re-marks it).
+                        logger.info(
+                            'acquire_spec_lane: create-once — .pool-root absent '
+                            'but warm base present under %s; first-seed bootstrap '
+                            '(marking sentinel, proceeding)', self.worktree_base,
+                        )
+                        self.mark_pool_storage_present()
+                    else:
+                        logger.warning(
+                            'acquire_spec_lane: create-once — pool storage '
+                            'absent/unmounted at %s — refusing to create spec '
+                            'lane %s on the underlying filesystem; cold fallback',
+                            self.worktree_base, lane,
+                        )
+                        self._note_pool_storage_absent()
+                        await self.spec_warm_lane_pool.release(lane)
+                        wt = await self.create_throwaway_verify_worktree(merge_commit)
+                        return wt, False
                 # Self-heal a stale unregistered directory first
                 # (mirrors reset_persistent_merge_worktree's self-heal pattern).
                 if lane.exists():
@@ -2497,6 +2709,45 @@ class GitOps:
             # guard's check and here.
             elif _orphan_confirmed_unregistered or not await self._is_registered_worktree(lane):
                 # ── Create-once branch ────────────────────────────────────
+                # Pool-storage-absent discriminator (task 2099). This is a
+                # BACKSTOP behind the task-2061 base-health gate above
+                # (_warm_lane_base_resolvable), which already short-circuits
+                # the common BASE_ABSENT case before any lane is touched —
+                # this catches its INDETERMINATE fall-through and off-mount-
+                # base configs. worktree_base MISSING => an fstab mountpoint
+                # dir must exist for the mount to attach, so a missing dir
+                # cannot be an unmounted configured mount => genuinely fresh
+                # host => safe to build the skeleton below. worktree_base
+                # EXISTS but `.pool-root` is absent => suspected unmounted
+                # mountpoint => refuse to create a NEW lane on the underlying
+                # root fs.
+                if self.worktree_base.exists() and not self.pool_storage_present():
+                    if self._pool_storage_bootstrap_ok():
+                        # First-seed bootstrap (task 2099 review-fix): the CoW
+                        # seed base is present & non-empty INSIDE worktree_base,
+                        # proving the mount is up — a missing sentinel here is a
+                        # fresh host, not an unmounted mountpoint. Without this
+                        # escape the very first warm lane on a fresh host would
+                        # be refused forever (the sentinel's only writer,
+                        # _seed_warm_lane, lives past this gate). Mark it now,
+                        # then fall through to the normal create (the seed
+                        # re-marks it idempotently).
+                        logger.info(
+                            'acquire_warm_lane: create-once — .pool-root absent '
+                            'but warm base present under %s; first-seed bootstrap '
+                            '(marking sentinel, proceeding)', self.worktree_base,
+                        )
+                        self.mark_pool_storage_present()
+                    else:
+                        logger.warning(
+                            'acquire_warm_lane: create-once — pool storage '
+                            'absent/unmounted at %s — refusing to create lane '
+                            '%s on the underlying filesystem',
+                            self.worktree_base, lane,
+                        )
+                        self._note_pool_storage_absent()
+                        await self.release_warm_lane(lane, branch_name)
+                        return WarmLaneUnavailable.BASE_ABSENT
                 # Self-heal: remove a stale unregistered directory so
                 # git worktree add doesn't refuse a non-empty dir.
                 if lane.exists():
@@ -6433,7 +6684,47 @@ class GitOps:
         Clears the ``.git/worktrees`` administrative records left behind by
         worktrees removed off-band (manual ``rm -rf``, quarantine, reap).
         Never raises.
+
+        **Pool-storage guard (task 2099)**: refuses to run when a pool is
+        configured (:meth:`pool_in_use`) but :meth:`pool_storage_present` is
+        False.  An unmounted mountpoint dir makes every mount-resident
+        worktree APPEAR removed off-band, so an unguarded prune would wipe
+        every registered lane + ``_merge-verify`` admin entry the instant
+        the mount comes back — exactly the Jul-3 incident this guards
+        against.  Skipped entirely when no pool is in use:
+        ``pool_storage_present()`` is permanently False on a pool-less host
+        (its only writer never runs without a pool), so that alone must
+        never disable ``git worktree prune`` on every default host.
+
+        **Pre-first-seed bootstrap (review-fix)**: a freshly-provisioned
+        pool-configured host that has created ``worktree_base`` (e.g. pool
+        warmup ``mkdir``) but has not yet run a successful seed also has no
+        ``.pool-root`` sentinel — indistinguishable from an unmounted mount
+        by the sentinel alone.  When :meth:`_pool_storage_bootstrap_ok`
+        confirms this is the benign pre-first-seed case (the CoW seed base
+        already resolves under ``worktree_base``), the prune is still
+        skipped (there is nothing to prune yet) but the escalation callback
+        is suppressed so a legitimate cold start does not file operator
+        noise; the sentinel appears for real once the first seed runs.
         """
+        if self.pool_in_use() and not self.pool_storage_present():
+            if self._pool_storage_bootstrap_ok():
+                logger.info(
+                    'prune_worktrees: pool storage sentinel absent at %s but '
+                    'the CoW seed base already resolves underneath it — '
+                    'pre-first-seed cold start, not an unmounted mount; '
+                    'skipping prune without escalating',
+                    self.worktree_base,
+                )
+                return
+            logger.warning(
+                'prune_worktrees: pool storage absent/unmounted at %s — '
+                'refusing to run `git worktree prune` (would wipe '
+                '.git/worktrees admin entries for every mount-resident lane)',
+                self.worktree_base,
+            )
+            self._note_pool_storage_absent()
+            return
         try:
             rc, _, err = await _run(
                 ['git', 'worktree', 'prune'], cwd=self.project_root,
