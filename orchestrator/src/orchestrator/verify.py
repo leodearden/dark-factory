@@ -1929,20 +1929,38 @@ class _ClockKw(TypedDict, total=False):
 
 
 def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
-    """Return 'stop', 'heartbeat', or 'start' if *line* contains the respective
-    configured marker string; else None.
+    """Return 'stop', 'heartbeat', or 'start' if *line*, after stripping leading
+    whitespace, STARTS WITH the respective configured marker string; else None.
 
-    Matching is by substring containment of the FULL configured marker string
-    against a complete (newline-delimited) line.  This is tolerant of:
-    - Trailing fields on the marker line  (reason=…, waited=…, pid=…).
-    - A leading harness/log prefix before the marker.
+    Matching is ANCHORED to line start (``line.lstrip().startswith(marker)``), not
+    substring-anywhere.  The reify emitter (``scripts/lib_clock_stop.sh``) always
+    writes a marker at column 0 as the first token of its own line
+    (``@@REIFY_CLOCK_STOP@@ reason=… pid=…``), so anchoring matches every genuine
+    marker while ignoring the token wherever it appears MID-LINE — e.g. quoted in a
+    test's assertion prose (``PASS: … stderr contains @@REIFY_CLOCK_STOP@@ …``).
+
+    Why anchored, not substring (reify task 4998 / esc-4791-52): a per-task verify
+    runs ``run_all.sh`` (``--include-infra``), whose ~100 infra tests exercise the
+    clock-stop machinery and print the marker tokens as assertion text.  Under the
+    old substring match those quotes were misread as REAL STOP/START transitions,
+    leaving this parser wrongly STOPPED going into the heavy ``cargo nextest``
+    compile; a >180s silent native-kernel link gap then tripped the heartbeat-idle
+    backstop and false-killed a healthy, code-complete compile.  Anchoring is the
+    wire-contract fix that defuses quoted-in-prose pollution for every project.
+    (reify ships the complementary Layer-1 fix — run_all.sh neutralizes the tokens
+    it re-emits — so either half alone closes the hole.)
+
+    Tolerant of trailing fields (reason=…/waited=…/pid=…) and of leading
+    WHITESPACE only — deliberately NOT of an arbitrary leading log/harness prefix
+    (the tightening that removes the pollution; if a project ever needs prefix
+    support, add a configurable strip pattern rather than reinstating
+    substring-anywhere).  A hypothetical genuine marker that fails to match
+    degrades gracefully to the wall-clock budget — never a false kill.
 
     The three marker strings are guaranteed pairwise non-substrings (enforced by
-    the ``OrchestratorConfig`` validator when enabled; distinctness alone is
-    insufficient — 'STOP' and 'STOPSTART' are distinct but the former is a
-    substring of the latter, which would cause a START line to match 'stop'
-    first).  This invariant ensures substring matching cannot misclassify for
-    any configured marker family, not just the default @@REIFY_CLOCK_*@@ one.
+    the ``OrchestratorConfig`` validator when enabled), which a fortiori guarantees
+    none is a PREFIX of another — so the stop→heartbeat→start priority order below
+    cannot misclassify one anchored marker as another.
 
     Parameters
     ----------
@@ -1955,11 +1973,12 @@ def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
     -------
     'stop' | 'heartbeat' | 'start' | None
     """
-    if cfg.marker_stop in line:
+    stripped = line.lstrip()
+    if stripped.startswith(cfg.marker_stop):
         return 'stop'
-    if cfg.marker_heartbeat in line:
+    if stripped.startswith(cfg.marker_heartbeat):
         return 'heartbeat'
-    if cfg.marker_start in line:
+    if stripped.startswith(cfg.marker_start):
         return 'start'
     return None
 
