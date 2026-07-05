@@ -5172,7 +5172,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return {'readopted': readopted, 'reaped': reaped}
 
         for branch in recovered_branches:
-            wt = await self._git_ops.find_inflight_merge_worktree(branch)
+            try:
+                wt = await self._git_ops.find_inflight_merge_worktree(branch)
+            except Exception:  # noqa: BLE001
+                # Fail-open: one branch's oracle miss must never abort the
+                # startup sweep (find_inflight_merge_worktree runs git).
+                logger.warning(
+                    'reap_orphaned_merge_worktrees: find_inflight_merge_worktree '
+                    'failed for branch %s — skipping re-adoption',
+                    branch, exc_info=True,
+                )
+                continue
             if wt is not None:
                 self._register_owned_merge_worktree(wt)
                 readopted.append(str(wt.resolve()))
@@ -5200,7 +5210,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 continue
             age = effective_now - mtime
             if age > grace:
-                await self._git_ops.cleanup_merge_worktree(path)
+                try:
+                    await self._git_ops.cleanup_merge_worktree(path)
+                except Exception:  # noqa: BLE001
+                    # Fail-open: one worktree's removal failure must never
+                    # abort the sweep of the remaining orphans.
+                    logger.warning(
+                        'reap_orphaned_merge_worktrees: cleanup_merge_worktree '
+                        'failed for %s — leaving for a later sweep',
+                        path, exc_info=True,
+                    )
+                    continue
                 reaped.append(str(path))
 
         if reaped or readopted:
