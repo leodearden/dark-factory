@@ -721,49 +721,58 @@ class TestScenario1SpeculativeCascade:
             with contextlib.suppress(TimeoutError):
                 outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
 
+            # ── N (head): must FAIL permanently — a genuine VerifyResult
+            # failure is a real chain failure, not a transient
+            # RUNNER_UNAVAILABLE that gets re-dispatched (see
+            # _finalize_inflight's FAIL/skip branch).
+            assert outcome_a is not None and outcome_a.status not in ('done', 'already_merged'), (
+                f'Expected N to fail (genuine VerifyResult failure, not '
+                f'RunnerUnavailable), got {outcome_a!r}.'
+            )
+
+            # ── N+1 (speculative downstream): must land 'done' after
+            # cascade — even though its "head" (N) permanently failed — the
+            # cascade re-merges N+1 against ACTUAL main independently of N's
+            # fate.
+            assert outcome_b is not None and outcome_b.status == 'done', (
+                f'Expected N+1 (speculative downstream) to resolve "done" after '
+                f'cascade re-merge re-dispatch, got {outcome_b!r}. If the cascade '
+                f'did not fire, N+1 would stay in _inflight with a stale '
+                f'speculative commit and eventually fail CAS or time out.'
+            )
+
+            # ── Cascade cancelled N+1's in-flight remote verify ──────────────
+            gated_remote.cancel_verify.assert_called()
+
+            # ── Main has N+1's file but NOT N's (N failed and was never
+            # merged; N+1 landed independently via the cascade re-merge) ────
+            _, main_files, _ = await _run(
+                ['git', 'ls-tree', '-r', '--name-only', 'main'],
+                cwd=git_ops.project_root,
+            )
+            assert 'casc1_a.py' not in main_files, (
+                'N (casc1_a.py) failed verification and must NOT be on main'
+            )
+            assert 'casc1_b.py' in main_files, (
+                'N+1 (casc1_b.py) must be on main after cascade re-merge/re-verify'
+            )
+
+            # ── Quiescence: I4 (speculation accounting) and the other 4
+            # surfaces all hold once the cascade has fully drained. Sampled
+            # HERE — before worker.stop() — while worker._running is still
+            # True: speculation_accounting_violations() and
+            # worktree_ledger_violations() both short-circuit to [] once the
+            # worker is stopped, which would make I4/I6 vacuous (see
+            # _assert_quiescent's docstring). Row 1 is the only scenario
+            # driving the full worker.run() cascade, so it must sample live
+            # state.
+            main_sha = await git_ops.get_main_sha()
+            _assert_quiescent(worker, main_sha, [req_a, req_b])
+
             await worker.stop()
 
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
-
-        # ── N (head): must FAIL permanently — a genuine VerifyResult failure
-        # is a real chain failure, not a transient RUNNER_UNAVAILABLE that
-        # gets re-dispatched (see _finalize_inflight's FAIL/skip branch).
-        assert outcome_a is not None and outcome_a.status not in ('done', 'already_merged'), (
-            f'Expected N to fail (genuine VerifyResult failure, not '
-            f'RunnerUnavailable), got {outcome_a!r}.'
-        )
-
-        # ── N+1 (speculative downstream): must land 'done' after cascade ────
-        # even though its "head" (N) permanently failed — the cascade
-        # re-merges N+1 against ACTUAL main independently of N's fate.
-        assert outcome_b is not None and outcome_b.status == 'done', (
-            f'Expected N+1 (speculative downstream) to resolve "done" after '
-            f'cascade re-merge re-dispatch, got {outcome_b!r}. If the cascade '
-            f'did not fire, N+1 would stay in _inflight with a stale '
-            f'speculative commit and eventually fail CAS or time out.'
-        )
-
-        # ── Cascade cancelled N+1's in-flight remote verify ──────────────────
-        gated_remote.cancel_verify.assert_called()
-
-        # ── Main has N+1's file but NOT N's (N failed and was never merged;
-        # N+1 landed independently via the cascade re-merge) ─────────────────
-        _, main_files, _ = await _run(
-            ['git', 'ls-tree', '-r', '--name-only', 'main'],
-            cwd=git_ops.project_root,
-        )
-        assert 'casc1_a.py' not in main_files, (
-            'N (casc1_a.py) failed verification and must NOT be on main'
-        )
-        assert 'casc1_b.py' in main_files, (
-            'N+1 (casc1_b.py) must be on main after cascade re-merge/re-verify'
-        )
-
-        # ── Quiescence: I4 (speculation accounting) and the other 4 surfaces
-        # all hold once the cascade has fully drained.
-        main_sha = await git_ops.get_main_sha()
-        _assert_quiescent(worker, main_sha, [req_a, req_b])
 
 
 # ── step-05 RED / step-06 GREEN: Rows 2,3,4 — verifier lifecycle faults ─────
