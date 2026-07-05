@@ -1239,6 +1239,11 @@ class TestRecoveryTerminalTaskLaneRelease:
         git_ops = GitOps(config.git, repo, warm_lane_pool_size=1)
         pool = git_ops.warm_lane_pool
         assert pool is not None
+        # Task 2099: mark pool storage present so the mount-presence guard on
+        # _recover_crashed_tasks does not false-trip across these lane pin/
+        # restore-routing tests, which all assume an already-mounted host —
+        # an orthogonal concern to recovery routing.
+        git_ops.mark_pool_storage_present()
 
         harness = _build_harness(config)
         harness.git_ops = git_ops

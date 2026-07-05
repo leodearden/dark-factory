@@ -1100,6 +1100,10 @@ class TestScenario6ParkPrefixDerail:
         reaper_base = tmp_path / "worktrees_reaper"
         reaper_base.mkdir(parents=True, exist_ok=True)
         harness.git_ops.worktree_base = reaper_base
+        # Task 2099: mark pool storage present so the mount-presence guard on
+        # _reap_orphan_worktrees does not false-trip — an orthogonal concern
+        # to this test's live-vs-orphan routing.
+        harness.git_ops.mark_pool_storage_present()
         harness.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=False)
         harness.git_ops.quarantine_worktree = AsyncMock(return_value=tmp_path / "q-dest")
         harness.git_ops.cleanup_worktree = AsyncMock()

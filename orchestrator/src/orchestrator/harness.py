@@ -1933,6 +1933,22 @@ Output JSON matching the schema. Every task must appear in the output.
         if not worktree_base.exists():
             return
 
+        # Pool-storage guard (task 2099): worktree_base can EXIST as an
+        # unmounted mountpoint dir, making every mount-resident worktree
+        # look planless/corrupt to the scan below — the Jul-3 incident this
+        # guards against. Defer the ENTIRE recovery pass (no cleanup) rather
+        # than destroy recoverable plans that merely appear empty because
+        # the mount has not come up yet.
+        if not self.git_ops.pool_storage_present():
+            logger.warning(
+                'Crash recovery: pool storage absent/unmounted at %s — '
+                'deferring the ENTIRE recovery pass (no cleanup) to avoid '
+                'destroying recoverable plans on mount-resident worktrees',
+                worktree_base,
+            )
+            self._file_pool_storage_absent_escalation()
+            return
+
         recovered = 0
         cleaned = 0
 
