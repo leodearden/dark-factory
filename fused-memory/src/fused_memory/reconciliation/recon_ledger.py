@@ -58,6 +58,12 @@ CREATE INDEX IF NOT EXISTS ix_recon_ledger_project_expires
 
 SCHEMA_SQL = TABLE_SQL + INDEX_SQL
 
+# record_kind values that are per-task markers: gc() deletes these when their
+# task_id has gone terminal. stage1_flag_suppression and cycle_summary are
+# NOT per-task markers and are excluded — they expire only via expires_at (or
+# live forever when expires_at is NULL).
+MARKER_KINDS = ('stage1_flag_marker', 'stage2_persistence_marker', 'flag_for_stage2')
+
 
 @dataclass(frozen=True)
 class ReconLedgerRecord:
@@ -239,6 +245,39 @@ class ReconLedgerStore:
         )
         row = await cursor.fetchone()
         return row is not None
+
+    async def gc(
+        self,
+        project_id: str,
+        now: str,
+        terminal_task_ids: list[str] | tuple[str, ...],
+    ) -> int:
+        """Delete expired rows and terminal-task-referenced marker rows.
+
+        A row is deleted when EITHER ``expires_at < now`` (NULL ``expires_at``
+        is never-expire and is naturally excluded — SQL three-valued logic
+        means ``NULL < ?`` evaluates to NULL, not true) OR its ``record_kind``
+        is one of :data:`MARKER_KINDS` and its ``task_id`` is in
+        ``terminal_task_ids``. Returns the number of rows deleted.
+
+        Assumes ``terminal_task_ids`` is non-empty (SQLite rejects an empty
+        ``IN ()`` list); callers with an empty set should use the expiry-only
+        path.
+        """
+        marker_placeholders = ','.join('?' * len(MARKER_KINDS))
+        terminal_placeholders = ','.join('?' * len(terminal_task_ids))
+        async with self._txn() as db:
+            cursor = await db.execute(
+                f"""
+                DELETE FROM recon_ledger
+                WHERE project_id = ? AND (
+                    expires_at < ?
+                    OR (record_kind IN ({marker_placeholders}) AND task_id IN ({terminal_placeholders}))
+                )
+                """,
+                (project_id, now, *MARKER_KINDS, *terminal_task_ids),
+            )
+        return cursor.rowcount
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
