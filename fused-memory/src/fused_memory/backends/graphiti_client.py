@@ -1021,7 +1021,11 @@ class GraphitiBackend:
         2. Redirect all RELATES_TO edges from deprecated to surviving via
            redirect_node_edges.
         3. Delete the deprecated node via delete_entity_node.
-        4. Rebuild the surviving node's summary via refresh_entity_summary.
+        4. Collapse any parallel duplicate edges left on the surviving node via
+           dedup_valid_edges_for_node (task 2118 — redirect_node_edges copies
+           uuids onto redirected edges without checking for an equivalent edge
+           the survivor already has).
+        5. Rebuild the surviving node's summary via refresh_entity_summary.
 
         Args:
             deprecated_uuid: UUID of the entity node to be deleted.
@@ -1030,6 +1034,7 @@ class GraphitiBackend:
         Returns:
             Audit dict with keys: surviving_uuid, surviving_name, deprecated_uuid,
             deprecated_name, edges_redirected (sub-dict with redirect counts),
+            duplicate_edges_removed (count collapsed post-redirect),
             surviving_summary (dict with old/new summary and edge_count).
 
         Raises:
@@ -1048,12 +1053,18 @@ class GraphitiBackend:
         # Delete the deprecated node
         await self.delete_entity_node(deprecated_uuid, group_id=group_id)
 
+        # Collapse parallel duplicates left on the survivor by the redirect above
+        duplicate_edges_removed = await self.dedup_valid_edges_for_node(
+            surviving_uuid, group_id=group_id,
+        )
+
         # Rebuild the surviving node's summary
         refresh_result = await self.refresh_entity_summary(surviving_uuid, group_id=group_id)
 
         logger.info(
-            'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s',
+            'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s duplicate_edges_removed=%d',
             deprecated_uuid, dep_name, surviving_uuid, sur_name, edges_redirected,
+            duplicate_edges_removed,
         )
         return {
             'surviving_uuid': surviving_uuid,
@@ -1061,6 +1072,7 @@ class GraphitiBackend:
             'deprecated_uuid': deprecated_uuid,
             'deprecated_name': dep_name,
             'edges_redirected': edges_redirected,
+            'duplicate_edges_removed': duplicate_edges_removed,
             'surviving_summary': {
                 'before': refresh_result.get('old_summary', ''),
                 'after': refresh_result.get('new_summary', ''),

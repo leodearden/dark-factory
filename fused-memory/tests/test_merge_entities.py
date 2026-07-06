@@ -268,6 +268,7 @@ class TestMergeEntities:
             'inter_node_deleted': 0,
         })
         backend.delete_entity_node = AsyncMock()
+        backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
         backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
             'sur-uuid', 'SurName',
             old_summary='existing summary', new_summary='existing summary', edge_count=1,
