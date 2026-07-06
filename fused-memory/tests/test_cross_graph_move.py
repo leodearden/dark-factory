@@ -15,6 +15,8 @@ the module docstring and ``plans/cross-graph-entity-leak-prd.md`` decision 5.
 """
 from __future__ import annotations
 
+from fused_memory.maintenance.cross_graph_move import parse_compact_vector_reply
+
 # ---------------------------------------------------------------------------
 # Recorded/representative `GRAPH.RO_QUERY ... --compact` vector-reply fixture.
 #
@@ -37,3 +39,36 @@ COMPACT_VECTOR_REPLY_FIXTURE = (
 EXPECTED_VECF32_LITERAL_FIXTURE = (
     'vecf32([0.5, 0.10000000149011611938, -0.987654321098765432])'
 )
+
+
+# ---------------------------------------------------------------------------
+# step-1: parse_compact_vector_reply
+# ---------------------------------------------------------------------------
+
+class TestParseCompactVectorReply:
+    """parse_compact_vector_reply(reply) -> list[str], never coercing via float()."""
+
+    def test_parses_recorded_fixture_into_exact_tokens(self):
+        """Splits the bracketed --compact reply into its exact string tokens."""
+        tokens = parse_compact_vector_reply(COMPACT_VECTOR_REPLY_FIXTURE)
+        assert tokens == ['0.5', '0.10000000149011611938', '-0.987654321098765432']
+
+    def test_high_precision_token_survives_byte_for_byte(self):
+        """The 20-decimal-digit token is preserved verbatim, not float()-truncated.
+
+        A lossy implementation that round-trips through float() (or formats
+        with a fixed 6-decimal precision) would alter this token; asserting
+        exact string equality against the full-precision fixture value is
+        what makes this test genuinely RED against such an implementation.
+        """
+        tokens = parse_compact_vector_reply(COMPACT_VECTOR_REPLY_FIXTURE)
+        assert tokens[1] == '0.10000000149011611938'
+        # Sanity-check the fixture itself is a genuine precision trap: a lossy
+        # %.6f-style truncation of this token collapses to a value that does
+        # not string-match the original -- so the byte-exact assertion above
+        # is the thing actually distinguishing a correct impl from a lossy one.
+        assert f'{float(tokens[1]):.6f}' != tokens[1]
+
+    def test_empty_vector_reply_returns_empty_list(self):
+        """An empty '--compact' vector reply parses to an empty token list."""
+        assert parse_compact_vector_reply('[]') == []
