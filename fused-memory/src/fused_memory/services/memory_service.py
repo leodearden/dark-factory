@@ -39,6 +39,7 @@ from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.utils.async_utils import propagate_cancellations
+from fused_memory.utils.task_naming import canonicalize_task_node_name
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -683,6 +684,126 @@ class MemoryService:
             )
         return restored
 
+    async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
+        """Canonicalize non-canonical task-entity node names to 'Task N'.
+
+        graphiti_core's LLM entity extraction sometimes mints task-entity nodes
+        with non-canonical names (e.g. 'task 132', 'tasks 153') instead of the
+        canonical 'Task N' form. This method scans each distinct entity name
+        this episode touched via ``canonicalize_task_node_name`` (task 2110)
+        and, for every name that canonicalizes to something other than itself,
+        corrects the live node(s):
+
+        - If a canonical 'Task N' node already exists, every bad-named node is
+          MERGED into it via ``merge_entities`` — renaming instead would recreate
+          the exact-name duplicate ``_dedup_episode_nodes`` exists to resolve.
+          Any *other* pre-existing canonical duplicates (e.g. left over from
+          before this hook existed, which this episode never touched) are
+          folded into the same survivor too, so a single hook run fully
+          collapses the canonical-name group rather than only fixing the
+          bad-named arrival.
+        - Otherwise, the bad-named survivor (most valid edges, then oldest, then
+          uuid — same canonical ordering as ``find_duplicate_entity_nodes``) is
+          RENAMED to the canonical name via ``rename_entity_node``, and any
+          remaining bad-named duplicates are merged into it.
+
+        Modelled on ``_dedup_episode_nodes``; handles None / empty result the
+        same way. Each rename/merge is best-effort (mirrors
+        ``_dedup_episode_nodes``): a transient backend error for one name must
+        not fail an already-committed episode write, and must not stop
+        subsequent names from being processed. Untouched bad names simply
+        survive to be healed the next time an episode touches that name.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                    AddEpisodeResults object with a ``nodes`` attribute).
+                    Handles ``None`` and objects with empty/missing nodes
+                    gracefully.
+
+        Returns:
+            Number of nodes successfully renamed or merged into a canonical
+            survivor (0 when nothing to do).
+        """
+        if result is None:
+            return 0
+
+        nodes = getattr(result, 'nodes', None) or []
+        if not nodes:
+            return 0
+
+        canonical_by_bad_name: dict[str, str] = {}
+        for node in nodes:
+            name = getattr(node, 'name', '') or ''
+            if not name or name in canonical_by_bad_name:
+                continue
+            canonical = canonicalize_task_node_name(name)
+            if canonical is None or canonical == name:
+                continue
+            canonical_by_bad_name[name] = canonical
+
+        fixed = 0
+        failed = 0
+        for bad_name, canonical in canonical_by_bad_name.items():
+            try:
+                bad_matches = await self.graphiti.find_duplicate_entity_nodes(
+                    bad_name, group_id=group_id,
+                )
+                if not bad_matches:
+                    continue
+                canon_matches = await self.graphiti.find_duplicate_entity_nodes(
+                    canonical, group_id=group_id,
+                )
+                if canon_matches:
+                    canon_survivor = canon_matches[0]['uuid']
+                    for dup in bad_matches:
+                        await self.graphiti.merge_entities(
+                            dup['uuid'], canon_survivor, group_id=group_id,
+                        )
+                        fixed += 1
+                    # Pre-existing canonical duplicates this episode never
+                    # touched (e.g. left behind before this hook existed)
+                    # would otherwise only get fixed if some future episode
+                    # happens to touch them again — fold them in now too.
+                    for dup in canon_matches[1:]:
+                        await self.graphiti.merge_entities(
+                            dup['uuid'], canon_survivor, group_id=group_id,
+                        )
+                        fixed += 1
+                else:
+                    survivor = bad_matches[0]['uuid']
+                    await self.graphiti.rename_entity_node(
+                        survivor, canonical, group_id=group_id,
+                    )
+                    fixed += 1
+                    for dup in bad_matches[1:]:
+                        await self.graphiti.merge_entities(
+                            dup['uuid'], survivor, group_id=group_id,
+                        )
+                        fixed += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Best-effort: a transient backend error (lock contention,
+                # write timeout) must not fail an already-committed episode
+                # write. Log and continue so the episode reports success.
+                logger.exception(
+                    'Failed to normalize task node name %r -> %r after '
+                    'add_episode; will retry on next episode',
+                    bad_name, canonical,
+                )
+                failed += 1
+
+        if fixed > 0:
+            logger.info(
+                'Normalized %d task-entity node name(s) after add_episode', fixed,
+            )
+        if failed > 0:
+            logger.warning(
+                'Failed to normalize %d task-entity node name(s) after add_episode',
+                failed,
+            )
+        return fixed
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -732,6 +853,9 @@ class MemoryService:
         # Post-write node dedup: merge exact-name duplicate entity nodes that
         # graphiti_core ingestion failed to reuse
         await self._dedup_episode_nodes(result, group_id=payload['group_id'])
+        # Post-write task-node-name canonicalization: rename/merge non-canonical
+        # task-entity node names (e.g. 'task 132') to the canonical 'Task N' form
+        await self._normalize_task_node_names(result, group_id=payload['group_id'])
 
         # Register planning episodes so they can be filtered from search results
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
@@ -2294,6 +2418,96 @@ class MemoryService:
                 except Exception as journal_exc:
                     logger.warning(
                         'set_entity_summary: journal log_write_op failed: %s',
+                        journal_exc,
+                    )
+
+        return result
+
+    async def rename_entity(
+        self,
+        new_name: str | None = None,
+        entity_uuid: str | None = None,
+        entity_name: str | None = None,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Rename a Graphiti entity node to *new_name*, verbatim.
+
+        Operator-facing escape hatch that corrects a mis-cased/mis-pluralized
+        task-entity node name (e.g. 'task 132' -> 'Task 132') minted by
+        graphiti-core's LLM entity extraction, for pre-existing bad nodes an
+        episode may never re-touch (task 2110). Mirrors set_entity_summary's
+        identifier-resolution, validation, and journal-logging contract.
+
+        Accepts either *entity_uuid* (canonical identifier) or *entity_name*
+        (resolved via an exact name lookup). When both are supplied, entity_uuid
+        takes precedence. Raises ValueError if neither is provided, or if
+        new_name is not provided or is empty.
+
+        Args:
+            new_name: Exact new name to write. Must be non-empty.
+            entity_uuid: UUID of the Entity node to rename (optional when entity_name is given).
+            entity_name: Exact entity name to resolve to a UUID (optional when entity_uuid is given).
+            project_id: Project scope (for journal logging and group_id).
+            agent_id: Which agent is calling (optional).
+            session_id: Session context (optional).
+            causation_id: Reconciliation causation ID (optional).
+            _source: Source label for journal entry.
+
+        Returns:
+            Dict from backend: {uuid, old_name, new_name}.
+
+        Raises:
+            ValueError: if new_name is None/empty, or if neither entity_uuid nor
+                        entity_name is provided.
+        """
+        if not new_name:
+            raise ValueError('new_name must be provided')
+        if entity_uuid is None and entity_name is None:
+            raise ValueError('Either entity_uuid or entity_name must be provided')
+
+        # Resolve entity_name → UUID when UUID is not directly supplied
+        if entity_uuid is None:
+            assert entity_name is not None  # guaranteed by the ValueError check above
+            entity_uuid = await self.graphiti.resolve_entity_by_name(
+                entity_name, group_id=project_id
+            )
+
+        write_op_id = str(uuid_mod.uuid4())
+        success = True
+        error_msg = None
+        result: dict = {}
+        journal_params: dict = {'entity_uuid': entity_uuid, 'new_name': new_name}
+        if entity_name is not None:
+            journal_params['entity_name'] = entity_name
+        try:
+            result = await self.graphiti.rename_entity_node(entity_uuid, new_name, group_id=project_id)
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            if self._write_journal:
+                try:
+                    await self._write_journal.log_write_op(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        source=_source,
+                        operation='rename_entity',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params=journal_params,
+                        result_summary=result if success else None,
+                        success=success,
+                        error=error_msg,
+                    )
+                except Exception as journal_exc:
+                    logger.warning(
+                        'rename_entity: journal log_write_op failed: %s',
                         journal_exc,
                     )
 

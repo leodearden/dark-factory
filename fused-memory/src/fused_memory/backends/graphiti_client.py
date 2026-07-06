@@ -1447,6 +1447,70 @@ class GraphitiBackend:
             'new_summary': summary,
         }
 
+    async def rename_entity_node(
+        self,
+        node_uuid: str,
+        new_name: str,
+        *,
+        group_id: str,
+    ) -> dict[str, Any]:
+        """Overwrite an Entity node's name property, then best-effort refresh its embedding.
+
+        Used to correct non-canonical entity node names — e.g. task-entity nodes
+        minted by graphiti-core's LLM extraction as 'task 132' or 'tasks 153'
+        instead of the canonical 'Task 132' form (see
+        ``fused_memory.utils.task_naming.canonicalize_task_node_name``). Both the
+        write-path post-add_episode normalization hook
+        (``MemoryService._normalize_task_node_names``) and the operator-facing
+        ``rename_entity`` MCP tool delegate here.
+
+        Validates that the node exists via ``get_node_text`` (which raises
+        NodeNotFoundError for a missing UUID) before writing, so a bad UUID
+        fails loudly instead of silently matching zero rows.
+
+        After the name property is updated, the node's name_embedding is
+        regenerated so fuzzy hybrid node search reflects the new name. This
+        step is best-effort: an embedder failure is logged and swallowed
+        rather than raised, since the name rewrite itself (the primary fix,
+        which keeps exact-name Cypher lookups correct) has already succeeded.
+
+        Args:
+            node_uuid: UUID of the Entity node to rename.
+            new_name: Exact new name to write.
+            group_id: Project graph to target.
+
+        Returns:
+            Dict with keys: uuid, old_name, new_name.
+
+        Raises:
+            NodeNotFoundError: if no node with that UUID exists.
+            RuntimeError: if the backend is not initialized.
+        """
+        old_name, _ = await self.get_node_text(node_uuid, group_id=group_id)
+        await self.update_node_name(node_uuid, new_name, group_id=group_id)
+        try:
+            embedding = await self._require_client().embedder.create(new_name)
+            await self.update_node_embedding(node_uuid, embedding, group_id=group_id)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # Best-effort: the name property is already updated (the primary
+            # fix); a stale embedding only affects fuzzy hybrid node search.
+            logger.warning(
+                'rename_entity_node: failed to regenerate name_embedding for '
+                'node=%s new_name=%r; name property was still updated',
+                node_uuid, new_name, exc_info=True,
+            )
+        logger.info(
+            'rename_entity_node: node=%s old_name=%r new_name=%r',
+            node_uuid, old_name, new_name,
+        )
+        return {
+            'uuid': node_uuid,
+            'old_name': old_name,
+            'new_name': new_name,
+        }
+
     async def list_entity_nodes(self, *, group_id: str) -> list[dict]:
         """Return all Entity nodes (uuid, name, summary) for a given group_id.
 
@@ -1663,6 +1727,21 @@ class GraphitiBackend:
             'SET n.summary = $summary'
         )
         await graph.query(cypher, {'uuid': uuid, 'summary': summary})
+
+    async def update_node_name(self, uuid: str, name: str, *, group_id: str) -> None:
+        """Update the name property on an Entity node.
+
+        Args:
+            uuid: UUID of the Entity node to update.
+            name: New name text.
+            group_id: Project graph to query.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid}) '
+            'SET n.name = $name'
+        )
+        await graph.query(cypher, {'uuid': uuid, 'name': name})
 
     async def get_edge_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, fact) for the RELATES_TO edge with the given UUID.
