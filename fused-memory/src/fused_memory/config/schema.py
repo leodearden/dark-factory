@@ -414,6 +414,14 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+    # Feature flag gating construction of ReconLedgerStore (task 2219, PRD
+    # plans/recon-reliability-prd.md §8.1) — the SQLite control-plane ledger
+    # for recon markers/suppressions/cycle-summaries. Mirrors the
+    # bulk_reset_guard_enabled / event_queue_watchdog_enabled convention:
+    # defaults on, and only gates whether server/main.py constructs the
+    # store inside the reconciliation-enabled branch.
+    recon_ledger_enabled: bool = Field(default=True)
+
     # Agent settings
     agent_llm_provider: str = Field(default='claude_cli')
     agent_llm_model: str = Field(default='sonnet')
