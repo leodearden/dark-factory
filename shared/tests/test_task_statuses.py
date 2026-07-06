@@ -81,7 +81,7 @@ class TestDerivedFrozensets:
 
     def test_active_parity(self):
         # ACTIVE is the complement of TERMINAL, so it picks up 'infra-hold' too.
-        assert ACTIVE == _LEGACY_ACTIVE | {'infra-hold'}
+        assert _LEGACY_ACTIVE | {'infra-hold'} == ACTIVE
 
     def test_workflow_preserve_parity(self):
         assert WORKFLOW_PRESERVE == _LEGACY_WORKFLOW_PRESERVE
@@ -98,7 +98,7 @@ class TestDerivedFrozensets:
     def test_terminal_active_partition(self):
         # TERMINAL and ACTIVE must exhaustively and disjointly partition the
         # full TaskStatus vocabulary.
-        assert TERMINAL | ACTIVE == set(TaskStatus)
+        assert set(TaskStatus) == TERMINAL | ACTIVE
         assert TERMINAL.isdisjoint(ACTIVE)
 
     def test_infra_hold_is_active_non_terminal_non_dispatchable(self):
@@ -109,5 +109,5 @@ class TestDerivedFrozensets:
         assert TaskStatus.INFRA_HOLD != TaskStatus.PENDING
 
     def test_workflow_preserve_and_status_triggers_are_subsets(self):
-        assert WORKFLOW_PRESERVE <= set(TaskStatus)
-        assert STATUS_TRIGGERS <= set(TaskStatus)
+        assert set(TaskStatus) >= WORKFLOW_PRESERVE
+        assert set(TaskStatus) >= STATUS_TRIGGERS
