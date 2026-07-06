@@ -48,3 +48,55 @@ class TestIdentityLockFor:
         a = backend._identity_lock_for('g1')
         b = backend._identity_lock_for('g2')
         assert a is not b
+
+
+# ---------------------------------------------------------------------------
+# step-3/4: GraphitiBackend._resolve_or_create_entity — 0/1-match resolve path
+# ---------------------------------------------------------------------------
+
+class TestResolveOrCreateEntityResolve:
+    """GraphitiBackend._resolve_or_create_entity(name, *, group_id) — 0/1-match
+    resolve/no-op fast path (no collapse machinery), mirroring the
+    TestMergeEntities.backend_with_mocks orchestration-mock pattern
+    (test_merge_entities.py:154)."""
+
+    @pytest.fixture
+    def backend_with_mocks(self, mock_config, make_backend):
+        """GraphitiBackend with get_nodes_by_exact_name/find_duplicate_entity_nodes/
+        merge_entities mocked as AsyncMocks for orchestration-only testing."""
+        backend = make_backend(mock_config)
+        backend.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        backend.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        backend.merge_entities = AsyncMock()
+        return backend
+
+    @pytest.mark.asyncio
+    async def test_single_match_resolves_without_collapse(self, backend_with_mocks):
+        """Exactly one match: returns its uuid; neither collapse method runs."""
+        backend = backend_with_mocks
+        backend.get_nodes_by_exact_name.return_value = [
+            {'uuid': 'u-1', 'name': 'Foo', 'summary': '', 'labels': []}
+        ]
+        result = await backend._resolve_or_create_entity('Foo', group_id='test')
+        assert result == 'u-1'
+        backend.find_duplicate_entity_nodes.assert_not_awaited()
+        backend.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_zero_matches_returns_none_without_minting(self, backend_with_mocks):
+        """Zero matches: returns None — documented no-op; minting stays
+        graphiti_core's job, this primitive only resolves/collapses."""
+        backend = backend_with_mocks
+        backend.get_nodes_by_exact_name.return_value = []
+        result = await backend._resolve_or_create_entity('Ghost', group_id='test')
+        assert result is None
+        backend.find_duplicate_entity_nodes.assert_not_awaited()
+        backend.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_calls_get_nodes_by_exact_name_with_name_and_group_id(self, backend_with_mocks):
+        """get_nodes_by_exact_name is awaited with the name and group_id."""
+        backend = backend_with_mocks
+        backend.get_nodes_by_exact_name.return_value = []
+        await backend._resolve_or_create_entity('Foo', group_id='proj-x')
+        backend.get_nodes_by_exact_name.assert_awaited_once_with('Foo', group_id='proj-x')
