@@ -228,3 +228,147 @@ class TestRefuseForeignBand:
             'expected a non-direct-child path to fail-open even though its '
             'name matches a protected prefix'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestRefuseForeignBandExactAndConfig — EXACT-name matching (precedence over
+# prefix matching) + config-driven iact_prefix respected at the refusal
+# level (step-5/6).
+# ---------------------------------------------------------------------------
+
+
+class TestRefuseForeignBandExactAndConfig:
+    """RED (against the step-4 prefix-only impl) — exact-name precedence."""
+
+    def test_exact_persistent_name_with_no_matching_prefix_is_refused(
+        self, pp_git_repo: Path, caplog,
+    ) -> None:
+        """(d) `_offline-deep` matches no prefix key, so a prefix-only impl
+        wrongly fails open. Exact-name matching must refuse it + WARNING."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        path = git_ops.worktree_base / PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME
+        path.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = git_ops._refuse_foreign_band(
+                path, frozenset({'_merge-'}), 'test-context',
+            )
+
+        assert result is True, (
+            'expected the exact persistent name _offline-deep to be refused '
+            '(True) even though it matches no prefix key'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, 'expected a WARNING to be logged for the foreign-band refusal'
+        joined = '\n'.join(r.getMessage() for r in warnings)
+        assert PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME in joined, (
+            f'expected the WARNING to name the matched exact token '
+            f'({PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME!r}); got: {joined!r}'
+        )
+        assert 'persistent-offline-deep' in joined, (
+            f'expected the WARNING to name the owner (persistent-offline-deep); '
+            f'got: {joined!r}'
+        )
+
+    def test_exact_name_wins_over_overlapping_prefix_owner(
+        self, pp_git_repo: Path, caplog,
+    ) -> None:
+        """(d) `_merge-verify` matches BOTH the `_merge-` prefix and its own
+        exact name. The exact name must win, so a `_merge-` owner still
+        refuses the persistent merge-verify worktree."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        path = git_ops.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+        path.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = git_ops._refuse_foreign_band(
+                path, frozenset({'_merge-'}), 'test-context',
+            )
+
+        assert result is True, (
+            'expected _merge-verify to be refused (True) to a plain '
+            '`_merge-` owner — the exact name must win over the prefix'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, 'expected a WARNING to be logged for the foreign-band refusal'
+        joined = '\n'.join(r.getMessage() for r in warnings)
+        assert 'persistent-merge-verify' in joined, (
+            f'expected the WARNING to name the owner (persistent-merge-verify); '
+            f'got: {joined!r}'
+        )
+
+    def test_exact_name_not_refused_when_owned_by_its_own_token(
+        self, pp_git_repo: Path, caplog,
+    ) -> None:
+        """A `_merge-verify` dir with owned={'_merge-verify'} (the persistent
+        owner itself) proceeds (False), no WARNING."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        path = git_ops.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+        path.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = git_ops._refuse_foreign_band(
+                path, frozenset({PERSISTENT_MERGE_WORKTREE_NAME}), 'test-context',
+            )
+
+        assert result is False, (
+            'expected the persistent owner itself to proceed (False)'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings, f'expected NO warning for an owned exact band; got {warnings!r}'
+
+    def test_custom_iact_prefix_foreign_refused_with_warning(
+        self, pp_git_repo: Path, caplog,
+    ) -> None:
+        """(e) With a custom iact_prefix, a `_custom-<x>` dir is refused to a
+        non-owning sweep + WARNING (config-driven band respected)."""
+        config = GitConfig(iact_prefix='_custom-')
+        git_ops = GitOps(config, pp_git_repo)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        path = git_ops.worktree_base / '_custom-someone'
+        path.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = git_ops._refuse_foreign_band(
+                path, frozenset({'_merge-'}), 'test-context',
+            )
+
+        assert result is True, (
+            'expected the custom iact band to be refused (True) to a '
+            'non-owning sweep'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, 'expected a WARNING to be logged for the foreign-band refusal'
+        joined = '\n'.join(r.getMessage() for r in warnings)
+        assert '_custom-' in joined, (
+            f'expected the WARNING to name the matched band token (_custom-); '
+            f'got: {joined!r}'
+        )
+
+    def test_custom_iact_prefix_owned_not_refused(
+        self, pp_git_repo: Path, caplog,
+    ) -> None:
+        """(e) With a custom iact_prefix, a `_custom-<x>` dir owned by the
+        matching band proceeds (False), no WARNING."""
+        config = GitConfig(iact_prefix='_custom-')
+        git_ops = GitOps(config, pp_git_repo)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        path = git_ops.worktree_base / '_custom-someone'
+        path.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = git_ops._refuse_foreign_band(
+                path, frozenset({'_custom-'}), 'test-context',
+            )
+
+        assert result is False, (
+            'expected the custom iact band to proceed (False) when owned'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings, f'expected NO warning for an owned custom band; got {warnings!r}'
