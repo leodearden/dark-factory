@@ -123,8 +123,13 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     if now is None:
         now = datetime.now(UTC)
 
-    # Relative: "resets in Xh", "resets in Xm", "resets in Xd"
-    m = re.search(r'resets\s+in\s+(\d+)\s*([hmd])', text, re.IGNORECASE)
+    # Relative: "resets in Xh", "resets in Xm", "resets in Xd" (word forms
+    # like "3 hours" / "45 minutes" / "2 days" match too — only the first
+    # letter of the unit word is read). The (?!onth) guard stops "3 months"
+    # from being misread as "3 minutes": "months" also starts with 'm', but
+    # is not a supported unit, so it must fall through to None (7.1.a)
+    # rather than silently parsing as minutes.
+    m = re.search(r'resets\s+in\s+(\d+)\s*([hmd])(?!onth)', text, re.IGNORECASE)
     if m:
         amount = int(m.group(1))
         unit = m.group(2).lower()
