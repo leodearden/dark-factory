@@ -68,6 +68,7 @@ from fused_memory.services.live_workflow_detector import (
     is_workflow_live_for_task,
 )
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
+from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
 
@@ -1220,23 +1221,26 @@ async def _sweep_stale_fixc_markers(
     if not stale_ids:
         return 0
 
-    results = await asyncio.gather(
-        *(
-            memory_service.delete_memory(
-                memory_id=mid,
-                store='mem0',
-                project_id=project_id,
-                causation_id=run_id,
-                _source=_STAGE2_STALE_FIXC_SWEEP_SOURCE,
-            )
-            for mid in stale_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this delete sweep from silently converting a shutdown
+    # signal into an under-counted deletion tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    results = await gather_collect(
+        memory_service.delete_memory(
+            memory_id=mid,
+            store='mem0',
+            project_id=project_id,
+            causation_id=run_id,
+            _source=_STAGE2_STALE_FIXC_SWEEP_SOURCE,
+        )
+        for mid in stale_ids
     )
 
     success_count = 0
     for mid, result in zip(stale_ids, results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'reconciliation._sweep_stale_fixc_markers: delete failed for memory_id=%s; not counted',
                 mid,
@@ -1398,23 +1402,26 @@ async def _sweep_stale_flag_markers(
             extra={'project_id': project_id, 'run_id': run_id},
         )
 
-    results = await asyncio.gather(
-        *(
-            memory_service.delete_memory(
-                memory_id=mid,
-                store='mem0',
-                project_id=project_id,
-                causation_id=run_id,
-                _source=_STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
-            )
-            for mid in stale_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this delete sweep from silently converting a shutdown
+    # signal into an under-counted deletion tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    results = await gather_collect(
+        memory_service.delete_memory(
+            memory_id=mid,
+            store='mem0',
+            project_id=project_id,
+            causation_id=run_id,
+            _source=_STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
+        )
+        for mid in stale_ids
     )
 
     success_count = 0
     for mid, result in zip(stale_ids, results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'reconciliation._sweep_stale_flag_markers: delete failed for memory_id=%s; not counted',
                 mid,
@@ -1598,23 +1605,26 @@ async def _sweep_terminal_task_flag_markers(
     if not stale_ids:
         return 0
 
-    results = await asyncio.gather(
-        *(
-            memory_service.delete_memory(
-                memory_id=mid,
-                store='mem0',
-                project_id=project_id,
-                causation_id=run_id,
-                _source=_STAGE1_FLAG_MARKER_TERMINAL_GC_SWEEP_SOURCE,
-            )
-            for mid in stale_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this delete sweep from silently converting a shutdown
+    # signal into an under-counted deletion tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    results = await gather_collect(
+        memory_service.delete_memory(
+            memory_id=mid,
+            store='mem0',
+            project_id=project_id,
+            causation_id=run_id,
+            _source=_STAGE1_FLAG_MARKER_TERMINAL_GC_SWEEP_SOURCE,
+        )
+        for mid in stale_ids
     )
 
     success_count = 0
     for mid, result in zip(stale_ids, results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'reconciliation._sweep_terminal_task_flag_markers: delete failed for memory_id=%s; not counted',
                 mid,
@@ -1723,23 +1733,26 @@ async def _sweep_stale_persistence_markers(
     if not stale_ids:
         return 0
 
-    results = await asyncio.gather(
-        *(
-            memory_service.delete_memory(
-                memory_id=mid,
-                store='mem0',
-                project_id=project_id,
-                causation_id=run_id,
-                _source=_STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE,
-            )
-            for mid in stale_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this delete sweep from silently converting a shutdown
+    # signal into an under-counted deletion tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    results = await gather_collect(
+        memory_service.delete_memory(
+            memory_id=mid,
+            store='mem0',
+            project_id=project_id,
+            causation_id=run_id,
+            _source=_STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE,
+        )
+        for mid in stale_ids
     )
 
     success_count = 0
     for mid, result in zip(stale_ids, results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'reconciliation._sweep_stale_persistence_markers: delete failed for memory_id=%s; not counted',
                 mid,
@@ -2191,19 +2204,22 @@ async def _track_flag_persistence(
         return {}
 
     # ── count phase (parallel) ───────────────────────────────────────────────
-    count_results = await asyncio.gather(
-        *(
-            memory_service.count_memories_by_metadata(
-                project_id=project_id,
-                filters={'source': _STAGE2_PERSISTENCE_MARKER_SOURCE, 'flag_id': fid},
-            )
-            for fid in flag_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents the persistence counter from silently converting a shutdown
+    # signal into a wrongly-defaulted prior_count of 0.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    count_results = await gather_collect(
+        memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters={'source': _STAGE2_PERSISTENCE_MARKER_SOURCE, 'flag_id': fid},
+        )
+        for fid in flag_ids
     )
     prior_counts: dict[str, int] = {}
     for fid, result in zip(flag_ids, count_results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'reconciliation._track_flag_persistence: count failed for flag_id=%s; '
                 'treating prior_count as 0',
@@ -2215,26 +2231,29 @@ async def _track_flag_persistence(
             prior_counts[fid] = result
 
     # ── write phase (parallel) ───────────────────────────────────────────────
-    write_results = await asyncio.gather(
-        *(
-            memory_service.add_memory(
-                content=f'Stage 2 flag-persistence marker: flag_id={fid} run={run_id}',
-                category='observations_and_summaries',
-                project_id=project_id,
-                metadata={
-                    'source': _STAGE2_PERSISTENCE_MARKER_SOURCE,
-                    'flag_id': fid,
-                    'run_id': run_id,
-                },
-                causation_id=run_id,
-                _source='stage2_flag_relay',
-            )
-            for fid in flag_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents the persistence marker write from silently converting a
+    # shutdown signal into a silently-dropped marker.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    write_results = await gather_collect(
+        memory_service.add_memory(
+            content=f'Stage 2 flag-persistence marker: flag_id={fid} run={run_id}',
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata={
+                'source': _STAGE2_PERSISTENCE_MARKER_SOURCE,
+                'flag_id': fid,
+                'run_id': run_id,
+            },
+            causation_id=run_id,
+            _source='stage2_flag_relay',
+        )
+        for fid in flag_ids
     )
     for fid, result in zip(flag_ids, write_results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'reconciliation._track_flag_persistence: add_memory failed for flag_id=%s; '
                 'count still returned',
@@ -2266,20 +2285,23 @@ async def _filter_already_escalated_flags(
     if not flag_ids:
         return [], []
 
-    count_results = await asyncio.gather(
-        *(
-            memory_service.count_memories_by_metadata(
-                project_id=project_id,
-                filters={'source': _STAGE2_ESCALATION_MARKER_SOURCE, 'flag_id': fid},
-            )
-            for fid in flag_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this count phase from silently converting a shutdown signal
+    # into a flag wrongly classified as newly-escalating.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    count_results = await gather_collect(
+        memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters={'source': _STAGE2_ESCALATION_MARKER_SOURCE, 'flag_id': fid},
+        )
+        for fid in flag_ids
     )
     newly: list[str] = []
     already: list[str] = []
     for fid, result in zip(flag_ids, count_results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'reconciliation._filter_already_escalated_flags: count failed for '
                 'flag_id=%s; treating as newly-escalating',
@@ -2313,26 +2335,29 @@ async def _write_escalation_markers(
     if not flag_ids:
         return
 
-    write_results = await asyncio.gather(
-        *(
-            memory_service.add_memory(
-                content=(f'Stage 2 escalation marker: flag_id={fid} escalated in run={run_id}'),
-                category='observations_and_summaries',
-                project_id=project_id,
-                metadata={
-                    'source': _STAGE2_ESCALATION_MARKER_SOURCE,
-                    'flag_id': fid,
-                    'run_id': run_id,
-                },
-                causation_id=run_id,
-                _source='stage2_flag_relay',
-            )
-            for fid in flag_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this marker write from silently converting a shutdown signal
+    # into a silently-dropped marker.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    write_results = await gather_collect(
+        memory_service.add_memory(
+            content=(f'Stage 2 escalation marker: flag_id={fid} escalated in run={run_id}'),
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata={
+                'source': _STAGE2_ESCALATION_MARKER_SOURCE,
+                'flag_id': fid,
+                'run_id': run_id,
+            },
+            causation_id=run_id,
+            _source='stage2_flag_relay',
+        )
+        for fid in flag_ids
     )
     for fid, result in zip(flag_ids, write_results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'reconciliation._write_escalation_markers: add_memory failed for '
                 'flag_id=%s; next cycle may re-escalate',
@@ -2802,13 +2827,18 @@ class TaskKnowledgeSync(BaseStage):
 
             if task_ids:
                 task_id_list = list(task_ids)
-                fetch_results = await asyncio.gather(
-                    *(self.taskmaster.get_task(tid, self.project_root) for tid in task_id_list),
-                    return_exceptions=True,
+                # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+                # Pass 1 (inside gather_collect): re-raises structured-cancellation
+                # signals — this preserves the structured-cancellation contract and
+                # prevents this cache-build fetch from silently converting a
+                # shutdown signal into a task silently omitted from status_cache.
+                # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+                fetch_results = await gather_collect(
+                    self.taskmaster.get_task(tid, self.project_root) for tid in task_id_list
                 )
                 status_cache = {}
                 for tid, result in zip(task_id_list, fetch_results, strict=True):
-                    if isinstance(result, BaseException):
+                    if isinstance(result, Exception):
                         logger.warning(
                             'reconciliation._apply_post_flight_guards: '
                             'get_task failed for task_id=%s during cache build; '

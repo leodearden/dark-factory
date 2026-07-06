@@ -57,8 +57,9 @@ Dedup interaction:
 
 from __future__ import annotations
 
-import asyncio
 import logging
+
+from fused_memory.utils.async_utils import gather_collect
 
 try:
     from escalation.models import Escalation  # type: ignore[import-untyped]
@@ -152,22 +153,25 @@ async def track_human_operator_stalls(
         return {}
 
     # ── count phase (parallel) ───────────────────────────────────────────────
-    count_results = await asyncio.gather(
-        *(
-            memory_service.count_memories_by_metadata(
-                project_id=project_id,
-                filters={
-                    'source': _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE,
-                    'task_id': tid,
-                },
-            )
-            for tid in task_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents the stall counter from silently converting a shutdown signal
+    # into a wrongly-defaulted prior_count of 0.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    count_results = await gather_collect(
+        memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters={
+                'source': _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE,
+                'task_id': tid,
+            },
+        )
+        for tid in task_ids
     )
     prior_counts: dict[str, int] = {}
     for tid, result in zip(task_ids, count_results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'stage1_stall_detector: count failed for task_id=%s; treating prior_count as 0',
                 tid,
@@ -178,26 +182,29 @@ async def track_human_operator_stalls(
             prior_counts[tid] = result
 
     # ── write phase (parallel) ───────────────────────────────────────────────
-    write_results = await asyncio.gather(
-        *(
-            memory_service.add_memory(
-                content=f'Stage 1 human-operator stall marker: task={tid} run={run_id}',
-                category='observations_and_summaries',
-                project_id=project_id,
-                metadata={
-                    'source': _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE,
-                    'task_id': tid,
-                    'run_id': run_id,
-                },
-                causation_id=run_id,
-                _source='stage1_stall_detector',
-            )
-            for tid in task_ids
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents the stall marker write from silently converting a shutdown
+    # signal into a silently-dropped marker.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    write_results = await gather_collect(
+        memory_service.add_memory(
+            content=f'Stage 1 human-operator stall marker: task={tid} run={run_id}',
+            category='observations_and_summaries',
+            project_id=project_id,
+            metadata={
+                'source': _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE,
+                'task_id': tid,
+                'run_id': run_id,
+            },
+            causation_id=run_id,
+            _source='stage1_stall_detector',
+        )
+        for tid in task_ids
     )
     for tid, result in zip(task_ids, write_results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'stage1_stall_detector: add_memory failed for task_id=%s; count still returned',
                 tid,
