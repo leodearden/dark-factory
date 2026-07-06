@@ -35,7 +35,9 @@ from under ``shared/src`` (GREEN on impl-contract).
 from __future__ import annotations
 
 import enum
+import os
 import types
+from pathlib import Path
 
 import pytest
 
@@ -348,3 +350,60 @@ class TestOutcomeAllowsStatus:
     def test_unknown_status_raises(self):
         with pytest.raises(ValueError):
             outcome_allows_status('done', 'not-a-status')
+
+
+# ---------------------------------------------------------------------------
+# Pair 6 — module contract: exact __all__, TRANSITIONS completeness, purity
+# (test-contract RED / impl-contract GREEN)
+# ---------------------------------------------------------------------------
+
+_EXPECTED_PUBLIC_API = {
+    'ActorClass',
+    'derive_actor_class',
+    'TRANSITIONS',
+    'is_legal_transition',
+    'outcome_allows_status',
+}
+
+
+class TestModuleContract:
+    def test_all_is_exactly_the_five_names(self):
+        import shared.task_transitions as tt
+
+        assert hasattr(tt, '__all__')
+        assert set(tt.__all__) == _EXPECTED_PUBLIC_API
+
+    def test_no_private_entries_in_all(self):
+        import shared.task_transitions as tt
+
+        assert not any(name.startswith('_') for name in tt.__all__)
+
+    def test_every_all_entry_is_a_real_attribute(self):
+        import shared.task_transitions as tt
+
+        for name in tt.__all__:
+            getattr(tt, name)  # raises AttributeError if missing
+
+    def test_transitions_completeness_over_actor_class(self):
+        for actor in ActorClass:
+            assert actor in TRANSITIONS
+            assert isinstance(TRANSITIONS[actor], frozenset)
+
+    def test_transitions_human_is_the_union(self):
+        assert TRANSITIONS[ActorClass.HUMAN] == TRANSITIONS[ActorClass.ORCHESTRATOR]
+        assert TRANSITIONS[ActorClass.HUMAN] == TRANSITIONS[ActorClass.ESCALATION]
+        assert TRANSITIONS[ActorClass.HUMAN] == TRANSITIONS[ActorClass.DETERMINISTIC]
+
+    def test_transitions_reconciliation_is_a_proper_subset_of_human(self):
+        assert TRANSITIONS[ActorClass.RECONCILIATION] < TRANSITIONS[ActorClass.HUMAN]
+
+    def test_module_loads_from_under_shared_src(self):
+        # shared/tests/conftest.py puts ONLY shared/src on sys.path, so the
+        # mere fact that this import succeeds already proves the module
+        # pulls in nothing from orchestrator/fused-memory. This test makes
+        # that purity guarantee explicit and load-bearing rather than
+        # implicit in every other test's successful collection.
+        import shared.task_transitions as tt
+
+        module_path = Path(tt.__file__).resolve()
+        assert 'shared' + os.sep + 'src' in str(module_path)
