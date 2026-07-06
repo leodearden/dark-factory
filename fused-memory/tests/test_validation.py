@@ -4,8 +4,10 @@ import pytest
 
 from fused_memory.utils.validation import (
     InputValidationError,
+    PathShapedProjectIdError,
     _safe_repr,
     _validate_identifier,
+    canonicalize_project_id,
     require_int_ids,
     require_known_project_id,
     require_project_id,
@@ -1213,3 +1215,52 @@ class TestRequireKnownProjectId:
     def test_none_registry_does_not_raise(self):
         """None registry is treated as empty — permissive, must not raise."""
         require_known_project_id('anything', None)  # must not raise
+
+
+class TestCanonicalizeProjectId:
+    """canonicalize_project_id(raw) -> str — normalizes to the underscore-canonical
+    form, but LOUD-rejects filesystem-path-shaped input rather than mangling it
+    into a wrong canonical key (RCA §4 hazard)."""
+
+    # ── Mapping table ────────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize(('raw', 'expected'), [
+        ('dark-factory', 'dark_factory'),
+        ('KNOW-live', 'know_live'),
+        ('DARK_FACTORY', 'dark_factory'),
+        ('dark_factory', 'dark_factory'),  # already-canonical passthrough
+        ('reify', 'reify'),
+    ])
+    def test_mapping_table(self, raw, expected):
+        assert canonicalize_project_id(raw) == expected
+
+    # ── Idempotency ──────────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize('raw', ['dark-factory', 'KNOW-live', 'dark_factory', 'reify'])
+    def test_idempotent(self, raw):
+        """f(f(x)) == f(x) — canonicalizing an already-canonical id is a no-op."""
+        once = canonicalize_project_id(raw)
+        twice = canonicalize_project_id(once)
+        assert twice == once
+
+    # ── Path-shaped LOUD-reject ──────────────────────────────────────────────
+
+    @pytest.mark.parametrize('raw', [
+        '-home-leo-src-dark-factory',  # leading '-'
+        '/home/leo/src/x',             # leading '/'
+        'a/b',                         # embedded '/'
+    ])
+    def test_path_shaped_input_raises(self, raw):
+        with pytest.raises(PathShapedProjectIdError):
+            canonicalize_project_id(raw)
+
+    def test_path_shaped_error_is_valueerror_subclass(self):
+        assert issubclass(PathShapedProjectIdError, ValueError)
+
+    def test_path_shaped_error_message_contains_offending_value(self):
+        """The raised error message must contain the offending value so
+        callers can diagnose it."""
+        bad = '-home-leo-src-dark-factory'
+        with pytest.raises(PathShapedProjectIdError) as exc_info:
+            canonicalize_project_id(bad)
+        assert bad in str(exc_info.value)
