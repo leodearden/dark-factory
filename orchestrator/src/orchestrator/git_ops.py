@@ -3586,13 +3586,33 @@ class GitOps:
         if self.warm_lane_pool is None:
             return
 
+        full_branch = f'{self.config.branch_prefix}{bare_id}'
+
         # (a) Best-effort WIP snapshot BEFORE any ref movement — mirrors
         # detach_lane_checkout's commit-before-detach contract (never
-        # discard uncommitted WIP). Best-effort: the very fault that
-        # triggered this abort may itself be a commit() failure (e.g. the
-        # _reuse_warm_lane commit() RuntimeError) — never re-raise.
+        # discard uncommitted WIP). Guarded on HEAD actually being on
+        # full_branch: a reattach-guard raise (γ, create-once and
+        # reset-in-place sites) can leave the lane still checked out on a
+        # STALE PREVIOUS OCCUPANT's branch when the reattach itself failed —
+        # committing unconditionally would contaminate that foreign branch
+        # with WIP that was never its own. Skip (fail toward not touching
+        # foreign state) unless HEAD affirmatively resolves to full_branch.
+        # Best-effort: the very fault that triggered this abort may itself
+        # be a commit() failure (e.g. the _reuse_warm_lane commit()
+        # RuntimeError) — never re-raise.
         try:
-            await self.commit(lane, 'chore: save WIP before lane-acquire abort')
+            _rc_head, _cur_branch, _ = await _run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+            )
+            if _rc_head == 0 and _cur_branch.strip() == full_branch:
+                await self.commit(lane, 'chore: save WIP before lane-acquire abort')
+            else:
+                logger.debug(
+                    '_abort_lane_acquisition: lane %s HEAD is not on %s '
+                    '(got %r) — skipping WIP commit to avoid contaminating '
+                    'a foreign branch', lane, full_branch,
+                    _cur_branch.strip() if _rc_head == 0 else None,
+                )
         except Exception:
             logger.warning(
                 '_abort_lane_acquisition: commit error for %s (task %s)',
@@ -3619,7 +3639,6 @@ class GitOps:
         # from create-once-only to every fault route. Both guards are
         # retention-biased (fail-soft False → retain; commit-bearing →
         # retain), so this can never destroy an orphan commit.
-        full_branch = f'{self.config.branch_prefix}{bare_id}'
         try:
             if await self.warm_lane_ref_is_degenerate(bare_id):
                 await self._delete_branch_if_on_main(
