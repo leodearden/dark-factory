@@ -34,7 +34,7 @@ concurrently (PRD G4).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
@@ -386,4 +386,130 @@ async def move_entity_across_graphs(
         target_graph=target_graph,
         edges_moved=edges_moved,
         mentions_moved=mentions_moved,
+    )
+
+
+# ---------------------------------------------------------------------------
+# merge_foreign_duplicate (S6)
+# ---------------------------------------------------------------------------
+
+def classify_unique_wrong_edges(
+    home_edge_uuids: set[str],
+    wrong_edge_uuids: set[str],
+) -> set[str]:
+    """Return edge uuids present on the wrong-graph copy but absent from home.
+
+    Pure set-diff (``wrong_edge_uuids - home_edge_uuids``) over edge UUIDS
+    (not edge objects/rows) -- the classification ``merge_foreign_duplicate``
+    uses to decide which of the wrong-graph copy's edges must be recreated
+    on the home copy before the wrong-graph copy is deleted. Edges present on
+    both copies are already accounted for on home and are left untouched.
+    """
+    return set(wrong_edge_uuids) - set(home_edge_uuids)
+
+
+@dataclass
+class MergeResult:
+    """Result of a ``merge_foreign_duplicate`` call.
+
+    Attributes:
+        uuid: UUID of the Entity node whose wrong-graph duplicate was merged
+            into its home-graph copy.
+        wrong_graph: Graph the foreign (to-be-deleted) duplicate lived in.
+        home_graph: Graph the canonical copy lives in.
+        unique_wrong_edge_uuids: Edge uuids present on the wrong-graph copy
+            but absent from the home copy (``classify_unique_wrong_edges``
+            over both copies' edge-uuid sets).
+        edges_recreated: Count of unique edges recreated on the home copy.
+            Populated by the mutating body (step-19/20); 0 on the read-only
+            skeleton.
+        home_edge_count_before: Home copy's RELATES_TO edge count before the
+            merge.
+        home_edge_count_after: Home copy's RELATES_TO edge count after the
+            merge. Populated by the mutating body (step-19/20); left equal
+            to ``home_edge_count_before`` on the read-only skeleton.
+    """
+
+    uuid: str
+    wrong_graph: str
+    home_graph: str
+    unique_wrong_edge_uuids: frozenset[str] = field(default_factory=frozenset)
+    edges_recreated: int = 0
+    home_edge_count_before: int = 0
+    home_edge_count_after: int = 0
+
+
+async def _read_relates_to_edge_uuids(graph: Any, uuid: str) -> set[str]:
+    """Read the set of RELATES_TO edge uuids incident to Entity *uuid* (either direction).
+
+    Lightweight uuid-only counterpart of the full-property edge read in
+    ``move_entity_across_graphs`` -- used where only set-membership (not the
+    edges' own properties) is needed.
+    """
+    result = await graph.ro_query(
+        'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+        'WITH DISTINCT e '
+        'RETURN e.uuid',
+        {'uuid': uuid},
+    )
+    return {row[0] for row in (result.result_set or [])}
+
+
+async def merge_foreign_duplicate(
+    graphiti: Any,
+    uuid: str,
+    wrong_graph: str,
+    home_graph: str,
+) -> MergeResult:
+    """Merge the *wrong_graph* duplicate of Entity *uuid* into its *home_graph* copy.
+
+    Unique-edge classification (step-17/18): every RELATES_TO edge incident
+    to the node is read (as full property rows) from *wrong_graph*, and (as a
+    lightweight uuid set) from *home_graph*. ``classify_unique_wrong_edges``
+    computes the set-diff -- the edges unique to the wrong-graph copy -- and
+    that set is exposed on the returned ``MergeResult``.
+
+    Recreating those unique edges on the home copy (with byte-exact
+    ``fact_embedding``) and ``DETACH DELETE``-ing the wrong-graph copy are
+    added in step-19/20; this skeleton is READ-ONLY (no mutation).
+
+    Args:
+        graphiti: An initialized GraphitiBackend (or compatible object
+            exposing ``_graph_for`` / ``_require_falkor_client``).
+        uuid: UUID of the Entity node whose duplicate is being merged.
+        wrong_graph: Graph holding the foreign (to-be-deleted) duplicate.
+        home_graph: Graph holding the canonical copy.
+
+    Returns:
+        MergeResult describing the merge.
+    """
+    wrong = graphiti._graph_for(wrong_graph)
+    home = graphiti._graph_for(home_graph)
+
+    wrong_edges_result = await wrong.ro_query(
+        'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+        'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
+        'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
+        '       e.group_id, e.episodes, s.uuid, t.uuid',
+        {'uuid': uuid},
+    )
+    wrong_edge_rows = wrong_edges_result.result_set or []
+    wrong_edge_uuids = {row[0] for row in wrong_edge_rows}
+
+    home_edge_uuids = await _read_relates_to_edge_uuids(home, uuid)
+
+    unique_wrong_edge_uuids = classify_unique_wrong_edges(home_edge_uuids, wrong_edge_uuids)
+
+    logger.info(
+        'merge_foreign_duplicate: classified uuid=%s wrong=%s home=%s '
+        'unique_edges=%d',
+        uuid, wrong_graph, home_graph, len(unique_wrong_edge_uuids),
+    )
+    return MergeResult(
+        uuid=uuid,
+        wrong_graph=wrong_graph,
+        home_graph=home_graph,
+        unique_wrong_edge_uuids=frozenset(unique_wrong_edge_uuids),
+        home_edge_count_before=len(home_edge_uuids),
+        home_edge_count_after=len(home_edge_uuids),
     )
