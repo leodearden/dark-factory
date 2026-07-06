@@ -148,12 +148,12 @@ class ReconLedgerStore:
             raise
 
     async def upsert(self, record: ReconLedgerRecord) -> None:
-        """Insert a ledger record.
+        """Insert or update a ledger record.
 
-        Deliberately a plain ``INSERT`` for now — a duplicate identity raises
-        ``sqlite3.IntegrityError`` on the primary key. The ``ON CONFLICT ...
-        DO UPDATE`` upsert semantics are added in a later step once a test
-        pins the idempotency behaviour.
+        ``ON CONFLICT`` targets the full five-column primary key and
+        overwrites ``payload_json``/``state``/``created_at``/``expires_at``
+        with the new values (last-write-wins) — guarantees exactly one row
+        per identity (journal.py's ``update_watermark`` precedent).
         """
         async with self._txn() as db:
             await db.execute(
@@ -162,6 +162,11 @@ class ReconLedgerStore:
                     (project_id, record_kind, task_id, flag_type, run_id,
                      payload_json, state, created_at, expires_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, record_kind, task_id, flag_type, run_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    state = excluded.state,
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at
                 """,
                 (
                     record.project_id,
