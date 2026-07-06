@@ -4781,7 +4781,7 @@ Output JSON matching the schema. Every task must appear in the output.
         # own — gitops-chokepoints PRD, Mechanism 3); `prune` is registration-global,
         # not band-scoped, so it always runs.
         _cleanup_argvs: list[tuple[str, ...]] = [('git', 'worktree', 'prune')]
-        if not self.git_ops._refuse_foreign_band(
+        if not self.git_ops.refuse_foreign_band(
             gate_path, frozenset({'_substrate-gate-'}), 'substrate-gate-cleanup',
         ):
             _cleanup_argvs.insert(0, ('git', 'worktree', 'remove', '--force', str(gate_path)))

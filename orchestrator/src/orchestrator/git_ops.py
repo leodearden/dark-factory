@@ -1004,6 +1004,24 @@ class GitOps:
         )
         return True
 
+    def refuse_foreign_band(
+        self, path: Path, owned: frozenset[str], context: str,
+    ) -> bool:
+        """Public entry point for the :meth:`_refuse_foreign_band` guard.
+
+        Cross-module callers (e.g. harness.py's substrate-gate pre-clean)
+        should consult the band-ownership guard through this supported
+        public method rather than reaching across the module boundary into
+        the leading-underscore internal name — mirrors
+        :meth:`protected_prefixes`, which is public for the same reason.
+        Delegates to :meth:`_refuse_foreign_band`; see that method's
+        docstring for the full contract (fail-open rules, WARNING
+        semantics, never-raise guarantee). Kept as a thin wrapper (rather
+        than renaming the internal method) so existing intra-class callers
+        and unit tests targeting the primitive directly are undisturbed.
+        """
+        return self._refuse_foreign_band(path, owned, context)
+
     def pool_in_use(self) -> bool:
         """True iff a warm or spec lane pool is configured on this host (task 2099).
 
