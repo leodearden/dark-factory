@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -1345,106 +1346,250 @@ class TestGetPendingParseFailure:
         )
 
 
-class TestMakeIdAcrossArchive:
-    """make_id() must consider archived sequence numbers to avoid post-restart collisions."""
+class TestMakeIdCounter:
+    """make_id() is backed by a single durable per-task_id counter file —
+    NOT a directory/archive scan (PRD task-status-authority-prd.md contract
+    C9 / finding 10.4).  These tests encode PRD boundary test D1: strictly
+    increasing, no collision, no rescan dependence.
+    """
 
-    def test_make_id_does_not_collide_with_archived_after_restart(self, tmp_path: Path):
-        """After all escalations are archived and process restarts, make_id() skips used IDs.
+    def test_make_id_is_durable_across_restart(self, tmp_path: Path):
+        """The counter persists across process restart (fresh EscalationQueue instance).
 
-        Scenario:
-        - Submit esc-42-1 and esc-42-2 for task '42', resolve both (moves to archive).
-        - Simulate restart: create a new EscalationQueue (in-memory _seq resets to 0).
-        - make_id('42') must return 'esc-42-3', NOT 'esc-42-1' which is already in archive.
-        - Submitting that new escalation and calling get_by_task('42') returns three distinct IDs.
+        No submits at all — make_id() alone must persist its issued sequence
+        to disk so a fresh instance continues from where the prior instance
+        left off.
+
+        RED on main: the in-memory _seq resets to 0 on a fresh instance and
+        the queue/archive dirs are empty, so instance2.make_id('cnt') would
+        return 'esc-cnt-1' instead of 'esc-cnt-4'.
         """
         queue_dir = tmp_path / 'queue'
 
-        # First process: submit two escalations and resolve (archive) both.
+        instance1 = EscalationQueue(queue_dir)
+        assert instance1.make_id('cnt') == 'esc-cnt-1'
+        assert instance1.make_id('cnt') == 'esc-cnt-2'
+        assert instance1.make_id('cnt') == 'esc-cnt-3'
+
+        # Simulate restart: fresh instance, no in-memory state carried over.
+        instance2 = EscalationQueue(queue_dir)
+        assert instance2.make_id('cnt') == 'esc-cnt-4'
+
+    def test_make_id_counter_authoritative_over_archive(self, tmp_path: Path):
+        """The counter — not archive contents — determines the next sequence.
+
+        Mint+submit+resolve esc-cnt-1 and esc-cnt-2 (both archived). Mint two
+        more WITHOUT submitting (counter advances to 4, but nothing is
+        written to disk for them). Restart. make_id('cnt') must return
+        'esc-cnt-5' (continuing the durable counter), not re-derive from the
+        archive max.
+
+        RED on main: the archive scan sees max=2 (only esc-cnt-1/2 were ever
+        submitted) -> returns 'esc-cnt-3', colliding with an id already
+        issued (in-memory, pre-restart) but never submitted.
+        """
+        queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
-        queue.submit(_make_escalation('esc-42-1', task_id='42'))
-        queue.submit(_make_escalation('esc-42-2', task_id='42'))
-        queue.resolve('esc-42-1', 'fixed first')
-        queue.resolve('esc-42-2', 'fixed second')
 
-        # Queue root should now be empty for task 42.
-        assert not (queue_dir / 'esc-42-1.json').exists()
-        assert not (queue_dir / 'esc-42-2.json').exists()
+        id1 = queue.make_id('cnt')
+        assert id1 == 'esc-cnt-1'
+        queue.submit(_make_escalation(id1, task_id='cnt'))
+        queue.resolve(id1, 'fixed first')
 
-        # Simulate process restart: fresh EscalationQueue, _seq resets to 0.
+        id2 = queue.make_id('cnt')
+        assert id2 == 'esc-cnt-2'
+        queue.submit(_make_escalation(id2, task_id='cnt'))
+        queue.resolve(id2, 'fixed second')
+
+        # Mint two more WITHOUT submitting — counter advances to 4.
+        assert queue.make_id('cnt') == 'esc-cnt-3'
+        assert queue.make_id('cnt') == 'esc-cnt-4'
+
+        # Simulate restart: fresh instance, no in-memory state carried over.
         queue2 = EscalationQueue(queue_dir)
-
-        # make_id() MUST return 'esc-42-3', not 'esc-42-1'.
-        new_id = queue2.make_id('42')
-        assert new_id == 'esc-42-3', (
-            f'Expected esc-42-3 (avoids archive collision) but got {new_id!r}'
+        id5 = queue2.make_id('cnt')
+        assert id5 == 'esc-cnt-5', (
+            f'Expected esc-cnt-5 (durable counter continues past the '
+            f'minted-but-unsubmitted esc-cnt-3/4) but got {id5!r}'
         )
 
-        # Submit the new escalation and verify all three are visible via get_by_task.
-        new_esc = _make_escalation(new_id, task_id='42')
-        queue2.submit(new_esc)
-
-        all_escs = queue2.get_by_task('42')
-        all_ids = {e.id for e in all_escs}
-        assert all_ids == {'esc-42-1', 'esc-42-2', 'esc-42-3'}, (
-            f'Expected three distinct IDs but got: {all_ids}'
+        queue2.submit(_make_escalation(id5, task_id='cnt'))
+        all_ids = {e.id for e in queue2.get_by_task('cnt')}
+        assert all_ids == {'esc-cnt-1', 'esc-cnt-2', 'esc-cnt-5'}, (
+            f'Expected exactly the three submitted ids with no duplicates, got {all_ids}'
         )
 
-    @pytest.mark.parametrize(
-        'archived_seq, pending_seq, expected_next',
-        [
-            (5, 2, 6),  # archive seq > pending seq (interleaved scenario)
-            (3, 7, 8),  # pending seq > archive seq (symmetric scenario)
-        ],
-    )
-    def test_make_id_takes_max_across_archive_and_pending(
-        self,
-        tmp_path: Path,
-        archived_seq: int,
-        pending_seq: int,
-        expected_next: int,
+    def test_make_id_does_not_scan_archive(self, tmp_path: Path):
+        """make_id() never touches the archive — _iter_archive_paths is not called.
+
+        Seeds an archive file directly (bypassing the queue/counter) so that
+        if make_id() still consulted the archive it would see it. Spies on
+        _iter_archive_paths and asserts it is never invoked.
+
+        RED on main: make_id() calls _scan_archive_max_seq() ->
+        _iter_archive_paths() on the cache miss (the first call for this
+        task_id), so call_count would be >= 1, not 0.
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2025-06-10'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        seeded = _make_escalation('esc-cnt-5', task_id='cnt', status='resolved')
+        (archive_dir / 'esc-cnt-5.json').write_text(seeded.to_json())
+
+        queue = EscalationQueue(queue_dir)
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            queue.make_id('cnt')
+            queue.make_id('cnt')
+
+        assert spy.call_count == 0, (
+            f'make_id() must not scan the archive; _iter_archive_paths called '
+            f'{spy.call_count}x'
+        )
+
+    def test_make_id_corrupt_counter_logs_error_and_resets_to_one(
+        self, tmp_path: Path, caplog,
     ):
-        """make_id() takes max across BOTH archive and queue root in either ordering.
+        """A corrupt/unparseable counter file is treated as 0 and logged as an ERROR.
 
-        The parametrization captures two orderings:
-        - Row (5, 2, 6): archive seq (5) > pending seq (2) → next = 6
-        - Row (3, 7, 8): pending seq (7) > archive seq (3) → next = 8
-
-        In both cases make_id() must return max(archive_max, pending_max) + 1,
-        proving the two-loop scan in queue.py:265-274 works regardless of which
-        source holds the higher sequence number.
-
-        Regression guard for the two-source max logic in make_id().
+        The counter is authoritative with no archive-scan fallback (PRD C9):
+        losing it is unrecoverable data loss, not a routine, self-healing
+        event, so it must be loud (ERROR) rather than a WARNING — a lost
+        counter silently re-mints ids from 1, colliding with any escalations
+        already issued for this task_id.
         """
         queue_dir = tmp_path / 'queue'
-        archived_id = f'esc-42-{archived_seq}'
-        pending_id = f'esc-42-{pending_seq}'
-
-        # First process: submit archived_id and resolve it (moves to archive).
         queue = EscalationQueue(queue_dir)
-        queue.submit(_make_escalation(archived_id, task_id='42'))
-        queue.resolve(archived_id, f'fixed {archived_seq}')
+        (queue_dir / 'esc-cnt.seq').write_text('not-an-int')
 
-        # Submit pending_id and leave it in queue root.
-        queue.submit(_make_escalation(pending_id, task_id='42'))
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            result = queue.make_id('cnt')
 
-        # Sanity: archived_id is in archive, pending_id is in queue root.
-        assert not (queue_dir / f'{archived_id}.json').exists(), (
-            f'{archived_id} should be archived'
+        assert result == 'esc-cnt-1'
+
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
         )
-        assert (queue_dir / f'{pending_id}.json').exists(), (
-            f'{pending_id} should be pending in queue root'
+        assert any('could not parse counter file' in r.message for r in error_records), (
+            f"Expected an ERROR containing 'could not parse counter file'; "
+            f"got: {[r.message for r in error_records]}"
         )
 
-        # Simulate process restart: fresh EscalationQueue, _seq resets to 0.
+    def test_make_id_os_error_on_read_propagates_and_preserves_counter(self, tmp_path: Path):
+        """A transient OSError reading an EXISTING counter file must propagate.
+
+        Unlike a ValueError (unparseable contents, genuinely reset to 0), an
+        OSError here means the file IS present but momentarily unreadable
+        (transient I/O error, EINTR, fd exhaustion, permission flap). Treating
+        that as 0 would mint a colliding id AND durably overwrite the
+        still-valid on-disk counter with '1', turning a recoverable blip into
+        permanent corruption. The mint must instead fail loudly, leaving the
+        durable counter untouched for a retry.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        assert queue.make_id('cnt') == 'esc-cnt-1'
+
+        counter_path = queue_dir / 'esc-cnt.seq'
+        original_read_text = Path.read_text
+
+        def flaky_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == counter_path:
+                raise OSError('simulated transient I/O error')
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', flaky_read_text), pytest.raises(OSError):
+            queue.make_id('cnt')
+
+        # The counter must be untouched by the failed attempt — no collision,
+        # no silent reset — and a subsequent mint continues normally.
+        assert counter_path.read_text().strip() == '1'
+        assert queue.make_id('cnt') == 'esc-cnt-2'
+
+    def test_make_id_missing_counter_with_existing_escalations_logs_error(
+        self, tmp_path: Path, caplog,
+    ):
+        """An absent counter file is logged as an ERROR when the queue root
+        already holds escalations for the task_id.
+
+        Without this check, a lost counter (aggressive cleanup, fresh
+        checkout, disk restore, accidental rm of the non-.json sidecar) is
+        indistinguishable from a legitimately-new task_id and silently
+        re-mints ids that collide with ones already issued — with zero
+        observability. The mint still starts from 0 (no archive-scan
+        fallback survives this check); only the logging changes.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation('esc-cnt-1', task_id='cnt'))
+        assert not (queue_dir / 'esc-cnt.seq').exists()
+
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            result = queue.make_id('cnt')
+
+        assert result == 'esc-cnt-1', (
+            'counter is authoritative with no archive-scan fallback — even when '
+            'suspicious, it must still start from 0, not derive a seq from disk'
+        )
+
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any('counter file' in r.message and 'absent' in r.message for r in error_records), (
+            f'Expected an ERROR about the absent counter file; got: {[r.message for r in error_records]}'
+        )
+
+    def test_make_id_missing_counter_no_existing_escalations_silent(
+        self, tmp_path: Path, caplog,
+    ):
+        """An absent counter file for a genuinely-new task_id logs nothing.
+
+        Complements the previous test: the ERROR is conditional on finding
+        pre-existing root evidence, not fired on every absent counter (which
+        would make the common brand-new-task_id path noisy).
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            result = queue.make_id('fresh')
+
+        assert result == 'esc-fresh-1'
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert not error_records, f'Expected no ERROR logs; got: {[r.message for r in error_records]}'
+
+    def test_make_id_task_id_with_hyphen_uses_correct_counter_file(self, tmp_path: Path):
+        """A task_id containing a hyphen does not confuse the seq separator.
+
+        The retired archive-scan derivation parsed the trailing integer after
+        the last hyphen in an esc-<task_id>-<seq> stem, so a task_id
+        embedding its own hyphen (e.g. '1-2') was a latent correctness risk.
+        The counter design sidesteps this entirely — the counter file is
+        keyed by the full task_id string, never parsed back out of a
+        filename — so this pins the improved, hyphen-safe behavior.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        assert queue.make_id('1-2') == 'esc-1-2-1'
+        assert queue.make_id('1-2') == 'esc-1-2-2'
+        assert (queue_dir / 'esc-1-2.seq').exists()
+
+        # Simulate restart: fresh instance, no in-memory state carried over.
         queue2 = EscalationQueue(queue_dir)
-
-        # make_id() MUST return expected_next: max(archive, pending) + 1.
-        new_id = queue2.make_id('42')
-        assert new_id == f'esc-42-{expected_next}', (
-            f'Expected esc-42-{expected_next} '
-            f'(max across archive={archived_seq} and queue_root={pending_seq}) '
-            f'but got {new_id!r}'
-        )
+        assert queue2.make_id('1-2') == 'esc-1-2-3'
 
 
 class TestIterAllEscalationPaths:
@@ -2628,6 +2773,75 @@ class TestAttachDedupeChildConcurrency:
         )
 
 
+class TestMakeIdCounterConcurrency:
+    """Two-OS-process test: concurrent make_id() for the SAME task_id must not collide.
+
+    The durable per-task_id counter (queue.py make_id()) must serialize its
+    read-modify-write across OS processes via the existing escalation_id_lock
+    sidecar primitive keyed on 'esc-{task_id}.seq'. Submit's own per-escalation-id
+    lock does NOT provide this guarantee — it only serializes writes to the SAME
+    id, not the shared counter read-increment-write that mints DIFFERENT ids.
+    """
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_make_id_no_collision(self, tmp_path: Path):
+        """N=50 make_id()+submit() from two concurrent processes yields 100 distinct, contiguous ids.
+
+        Without a lock guarding the counter RMW, both processes can read the
+        same counter value and mint the same id; the second submit for a
+        duplicate id clobbers the first's file, so fewer than 100 distinct
+        files remain on disk (and/or sequence numbers repeat).
+        """
+        queue_dir = tmp_path / 'queue'
+        EscalationQueue(queue_dir)  # ensure queue_dir exists before spawning children
+        task_id = 'cx'
+
+        # Build env with worktree src on PYTHONPATH so child imports in-tree escalation
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing_pythonpath}' if existing_pythonpath else src_path
+
+        count = 50
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+
+        # Start both child processes concurrently, minting+submitting against the SAME task_id.
+        proc_a = subprocess.Popen(
+            child_args + ['make_id_submit', task_id, 'unused', str(count)],
+            env=env,
+        )
+        proc_b = subprocess.Popen(
+            child_args + ['make_id_submit', task_id, 'unused', str(count)],
+            env=env,
+        )
+
+        # Wait for both to complete; kill any orphaned child on timeout/exception
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        # Read the final state and assert 100 distinct, contiguous sequence numbers.
+        files = list(queue_dir.glob(f'esc-{task_id}-*.json'))
+        seqs = sorted(int(p.stem.rsplit('-', 1)[1]) for p in files)
+        assert len(files) == 100, (
+            f'Expected 100 distinct escalation files, got {len(files)}: seqs={seqs}'
+        )
+        assert len(set(seqs)) == 100, (
+            f'Expected 100 distinct sequence numbers (no collision), got {len(set(seqs))}: {seqs}'
+        )
+        assert seqs == list(range(1, 101)), (
+            f'Expected contiguous sequence 1..100 with no reuse, got {seqs}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Concurrent resolve: exactly-one-archive-copy invariant
 # ---------------------------------------------------------------------------
@@ -2918,109 +3132,4 @@ class TestArchiveListingMemoisation:
         result_after_prune = queue.get('esc-1-1')
         assert result_after_prune is None, (
             f'Expected None after pruning but got {result_after_prune!r}'
-        )
-
-
-class TestMakeIdMaxSeqCache:
-    """make_id() must memoise the archive max_seq per task_id to avoid repeated scans."""
-
-    def _seed_archive_file(self, queue_dir: Path, esc_id: str, task_id: str, date: str) -> None:
-        """Write a resolved escalation directly into the archive (bypasses queue)."""
-        archive_dir = queue_dir / 'archive' / date
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        esc = _make_escalation(esc_id, task_id=task_id, status='resolved')
-        (archive_dir / f'{esc_id}.json').write_text(esc.to_json())
-
-    def test_archive_scanned_at_most_once_per_task_id(self, tmp_path: Path):
-        """make_id() scans the archive at most once per distinct task_id per instance.
-
-        Pre-seed archive: esc-42-5.json (task '42'), esc-99-2.json (task '99').
-        Fresh instance. Spy _iter_archive_paths (wraps).
-        Call make_id('42'), make_id('42'), make_id('99').
-        (a) both make_id('42') return 'esc-42-6' (archive max=5, root empty).
-        (b) make_id('99') returns 'esc-99-3'.
-        (c) spy.call_count <= 2 across all three calls (one scan per distinct task_id).
-
-        RED on main: make_id scans archive on every call → call_count == 3 → fails (c).
-        Note: the SECOND make_id('42') must ALSO return 'esc-42-6' because the first
-        call incremented _seq (via _next_seq), so max(archive_max+1=6, _next_seq()=2)=6.
-        """
-        queue_dir = tmp_path / 'queue'
-
-        # Pre-seed the archive with two files for different task ids.
-        self._seed_archive_file(queue_dir, 'esc-42-5', '42', '2025-06-10')
-        self._seed_archive_file(queue_dir, 'esc-99-2', '99', '2025-06-10')
-
-        # Fresh instance: cache unbuilt.
-        queue = EscalationQueue(queue_dir)
-
-        with patch.object(
-            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
-        ) as spy:
-            id1 = queue.make_id('42')
-            id2 = queue.make_id('42')
-            id3 = queue.make_id('99')
-
-        # (a) Both make_id('42') calls must return esc-42-6.
-        assert id1 == 'esc-42-6', f'First make_id("42") expected esc-42-6, got {id1!r}'
-        assert id2 == 'esc-42-6', (
-            f'Second make_id("42") expected esc-42-6 (cache hit), got {id2!r}'
-        )
-
-        # (b) make_id('99') must return esc-99-3.
-        assert id3 == 'esc-99-3', f'make_id("99") expected esc-99-3, got {id3!r}'
-
-        # (c) Archive scanned at most once per distinct task_id (2 total).
-        assert spy.call_count <= 2, (
-            f'Expected archive scanned <=2x (once per task_id) but '
-            f'_iter_archive_paths called {spy.call_count}x across three make_id() calls'
-        )
-
-    def test_max_seq_cache_bumped_upward_on_archive_write(self, tmp_path: Path):
-        """_archive_resolved must bump the max_seq cache upward for the archived task_id.
-
-        Sequence on a SINGLE instance:
-        1. Pre-seed archive 'esc-42-3' (via direct write; task '42').
-        2. Call make_id('42') to seed the cache (archive_max=3 → returns 'esc-42-4').
-        3. Spy _iter_archive_paths AFTER the cache is seeded.
-        4. Submit 'esc-42-7' (high seq) and resolve it (archives it → bumps cache to 7).
-        5. Call make_id('42').
-        Assert:
-        (a) returns 'esc-42-8' (cache bumped to 7 → next 8).
-        (b) spy.call_count == 0 — value came from bumped cache, not a rescan.
-
-        RED on main-with-step-8 (no bump): cache still holds 3 → make_id returns 'esc-42-4'
-        (stale / would collide with just-archived esc-42-7) → assertion (a) fails.
-        """
-        queue_dir = tmp_path / 'queue'
-        queue = EscalationQueue(queue_dir)
-
-        # Step 1: pre-seed archive with esc-42-3.
-        self._seed_archive_file(queue_dir, 'esc-42-3', '42', '2025-06-10')
-
-        # Step 2: seed the cache with make_id('42'); must return 'esc-42-4'.
-        initial_id = queue.make_id('42')
-        assert initial_id == 'esc-42-4', (
-            f'Setup: expected esc-42-4 to seed cache, got {initial_id!r}'
-        )
-
-        # Step 3: spy _iter_archive_paths AFTER cache is seeded.
-        with patch.object(
-            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
-        ) as spy:
-            # Step 4: submit esc-42-7 (higher seq) and archive it.
-            queue.submit(_make_escalation('esc-42-7', task_id='42'))
-            queue.resolve('esc-42-7', 'high seq resolve')
-
-            # Step 5: make_id('42') must see the newly-archived seq 7.
-            next_id = queue.make_id('42')
-
-        # (a) Must return 'esc-42-8' (bumped cache holds 7 → next 8).
-        assert next_id == 'esc-42-8', (
-            f'Expected esc-42-8 (cache bumped to 7 → next 8), got {next_id!r}'
-        )
-
-        # (b) No rescan: bumped cache was used.
-        assert spy.call_count == 0, (
-            f'Expected 0 archive rescans but _iter_archive_paths called {spy.call_count}x'
         )

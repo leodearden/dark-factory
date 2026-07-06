@@ -141,27 +141,18 @@ class EscalationQueue:
     def __init__(self, queue_dir: Path):
         self.queue_dir = Path(queue_dir)
         self.queue_dir.mkdir(parents=True, exist_ok=True)
-        self._seq = 0
         self._notify_callback: Callable[[Escalation], None] | None = None
         self._resolve_callback: Callable[[Escalation], None] | None = None
-        # Cache 1 — archive listing (serves get()/_locate_path).
+        # Archive listing cache (serves get()/_locate_path).
         # None = not yet built; dict = {dated-subdir-name: set-of-esc-id-stems}.
         # Lazy-built on first archive lookup; incrementally updated in _archive_resolved.
         self._archive_listing: dict[str, set[str]] | None = None
-        # Cache 2 — max_seq per task_id (serves make_id()).
-        # {task_id: max archived seq} — absent key means "not yet scanned".
-        # Upward-only updates in _archive_resolved guarantee no under-estimate.
-        self._archive_max_seq_cache: dict[str, int] = {}
 
     def set_notify_callback(self, callback: Callable[[Escalation], None]) -> None:
         self._notify_callback = callback
 
     def set_resolve_callback(self, callback: Callable[[Escalation], None]) -> None:
         self._resolve_callback = callback
-
-    def _next_seq(self) -> int:
-        self._seq += 1
-        return self._seq
 
     def _scan_archive_listing(self) -> dict[str, set[str]]:
         """Build the archive listing from a single rglob scan.
@@ -183,27 +174,15 @@ class EscalationQueue:
             self._archive_listing = self._scan_archive_listing()
         return self._archive_listing
 
-    def _scan_archive_max_seq(self, prefix: str) -> int:
-        """Scan the archive for the maximum sequence number for *prefix*.
-
-        Iterates _iter_archive_paths(f'{prefix}*.json'), parses the trailing
-        integer from each matching stem, and returns the max found (0 if none).
-        Used by make_id() on a per-task_id cache miss to seed the cache.
-        """
-        max_seq = 0
-        for path in self._iter_archive_paths(f'{prefix}*.json'):
-            suffix = path.stem[len(prefix):]
-            with contextlib.suppress(ValueError):
-                max_seq = max(max_seq, int(suffix))
-        return max_seq
-
     def _iter_archive_paths(self, pattern: str) -> Iterator[Path]:
         """Yield escalation JSON files from the archive subtree matching *pattern*.
 
         Returns an empty iterator when the archive root does not exist, avoiding
         a spurious ``rglob`` call on a missing directory.  Centralising the
-        existence-check + rglob here means get(), get_by_task(), and make_id()
-        all benefit from any future caching or indexing added in one place.
+        existence-check + rglob here means get() and get_by_task() both
+        benefit from any future caching or indexing added in one place.
+        Note: make_id() does NOT use this — its counter is authoritative and
+        never scans the archive.
         """
         archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
         if archive_root.exists():
@@ -906,7 +885,7 @@ class EscalationQueue:
         """
         self._atomic_write_path(self.queue_dir / f'{escalation_id}.json', json_text)
 
-    def _atomic_write_path(self, path: Path, json_text: str) -> None:
+    def _atomic_write_path(self, path: Path, json_text: str, *, durable: bool = False) -> None:
         """Write *json_text* atomically to *path*.
 
         Uses the tmp+rename pattern: the tmp file is created in ``path.parent``
@@ -915,8 +894,14 @@ class EscalationQueue:
         a dated subdir.  On failure the tmp file is cleaned up and the exception
         propagates unchanged.
 
+        When *durable* is True, the tmp file is fsync'd before the rename and
+        the containing directory is fsync'd after the rename — for callers
+        (e.g. ``_write_seq_counter``) that must survive a crash immediately
+        after this call returns.  Plain tmp+rename alone only guarantees the
+        rename is atomic, not that it is durable yet.
+
         Callers: _atomic_write() (root targets), patch_resolution_metadata()
-        (root or archive targets).
+        (root or archive targets), _write_seq_counter() (durable=True).
         """
         fd, tmp_path_str = tempfile.mkstemp(
             suffix='.tmp', prefix=path.stem, dir=str(path.parent)
@@ -924,11 +909,20 @@ class EscalationQueue:
         try:
             with os.fdopen(fd, 'w') as f:
                 f.write(json_text)
+                if durable:
+                    f.flush()
+                    os.fsync(f.fileno())
             os.rename(tmp_path_str, str(path))
         except Exception:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path_str)
             raise
+        if durable:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
     def _archive_resolved(self, escalation_id: str, resolved_at: str) -> None:
         """Best-effort move ``queue_dir/{escalation_id}.json`` into the dated archive subdir.
@@ -949,29 +943,6 @@ class EscalationQueue:
             # id without a full rescan.  Only update if the cache has already been built.
             if self._archive_listing is not None:
                 self._archive_listing.setdefault(archive_dir.name, set()).add(escalation_id)
-            # Upward-bump the max_seq cache for the archived task_id so make_id()
-            # sees the newly-archived seq without a rescan.  Upward-only guarantee:
-            # never lower the cached value (external pruning can only reduce the
-            # true on-disk max, so an over-estimate is always safe; an under-estimate
-            # would cause id reuse/collision).
-            try:
-                # escalation_id is 'esc-<task_id>-<seq>'; strip the 'esc-' prefix.
-                head, tail = escalation_id.rsplit('-', 1)
-                archived_task_id = head[len('esc-'):]
-                archived_seq = int(tail)
-            except (ValueError, IndexError):
-                # Non-conforming id: cannot identify which task_id to update,
-                # so leave all other cached entries intact.  Log a warning so a
-                # genuinely malformed escalation_id is observable.
-                logger.warning(
-                    f'Could not parse task_id/seq from escalation_id {escalation_id!r}; '
-                    'max_seq cache not updated for this archive write'
-                )
-            else:
-                if archived_task_id in self._archive_max_seq_cache:
-                    self._archive_max_seq_cache[archived_task_id] = max(
-                        self._archive_max_seq_cache[archived_task_id], archived_seq
-                    )
         except OSError as exc:
             logger.warning(
                 f'Failed to archive escalation {escalation_id}: {exc}; '
@@ -1005,42 +976,91 @@ class EscalationQueue:
             logger.info(f'Dismissed {count} stale L0 escalation(s): {resolution[:100]}')
         return count
 
-    def make_id(self, task_id: str) -> str:
-        """Generate a unique escalation ID.
+    def _write_seq_counter(self, path: Path, value: int) -> None:
+        """Durably persist *value* as the counter contents at *path*.
 
-        Scans existing files in both the queue root and the archive
-        subdirectory to avoid reusing sequence numbers from escalations
-        that have been archived after resolution (the in-memory counter
-        resets on process restart, so we must re-derive max_seq from disk).
-
-        The queue root is always scanned fresh each call (cheap; reflects
-        just-submitted pending ids and cross-process root writes).  The
-        archive contribution is cached per task_id in _archive_max_seq_cache:
-        on a cache miss, _scan_archive_max_seq() scans the archive once and
-        stores the result; subsequent calls for the same task_id are O(1).
-        _archive_resolved() bumps the cache upward on each archive write.
-
-        Per-instance freshness: the cache is correct only for the
-        single-writer model (one EscalationQueue instance owns a given
-        task_id's escalations).  If a concurrent process archives an
-        escalation for a task_id whose entry is already seeded in this
-        instance's cache, the cache will not reflect that higher seq until
-        this instance's _archive_resolved() runs for that task_id.  In
-        production, harness.py owns a single long-lived EscalationQueue
-        per process and sentinel task_ids are not shared across processes,
-        so this invariant holds.
+        Delegates to ``_atomic_write_path(durable=True)`` — the counter must
+        survive a crash immediately after this call returns (PRD C9:
+        "fsync-incremented").
         """
-        prefix = f'esc-{task_id}-'
-        max_seq = 0
-        for path in self.queue_dir.glob(f'{prefix}*.json'):
-            suffix = path.stem[len(prefix):]
-            with contextlib.suppress(ValueError):
-                max_seq = max(max_seq, int(suffix))
-        # Obtain the archive contribution from the per-task_id cache.
-        # Scan the archive exactly once per task_id per instance (cache miss only).
-        if task_id not in self._archive_max_seq_cache:
-            self._archive_max_seq_cache[task_id] = self._scan_archive_max_seq(prefix)
-        archive_max = self._archive_max_seq_cache[task_id]
-        max_seq = max(max_seq, archive_max)
-        seq = max(max_seq + 1, self._next_seq())
-        return f'{prefix}{seq}'
+        self._atomic_write_path(path, str(value), durable=True)
+
+    def _root_has_existing_escalations(self, task_id: str) -> bool:
+        """Best-effort signal: does the queue ROOT already hold files for task_id?
+
+        Used only to make an absent counter file observable: an absent file
+        is otherwise silently treated as 0, which is indistinguishable from a
+        legitimately-new task_id even though it may actually mean the counter
+        was lost (aggressive cleanup, fresh checkout, disk restore, accidental
+        rm of the non-.json sidecar) despite escalations already existing for
+        this task_id.
+
+        Deliberately root-only — never the archive subtree. make_id() must
+        never scan the archive (PRD C9 / finding 10.4, pinned by
+        ``test_make_id_does_not_scan_archive``), so a task_id whose only
+        surviving evidence is archived (e.g. all its escalations were already
+        resolved) is NOT caught here. This is a cheap, best-effort diagnostic
+        — not a substitute for the counter, and it never changes the returned
+        id.
+        """
+        return any(self.queue_dir.glob(f'esc-{task_id}-*.json'))
+
+    def make_id(self, task_id: str) -> str:
+        """Generate a unique escalation ID from a durable per-task_id counter.
+
+        The counter file ``queue_dir/esc-{task_id}.seq`` holds the
+        last-issued sequence number as plain integer text. This file is the
+        SOLE source of the next sequence: unlike the retired
+        directory/archive-scan derivation, make_id() never globs the archive
+        to "catch up" — the counter is authoritative (PRD
+        task-status-authority-prd.md contract C9 / finding 10.4).
+
+        Two distinct failure modes on read are handled differently:
+
+        - Unparseable contents (``ValueError``) are treated as 0 and logged
+          as an ERROR — loudly observable-but-unrecoverable data loss.
+        - An absent file is treated as 0 (the common case: a legitimately-new
+          task_id). Because the counter has no archive-scan fallback, a LOST
+          counter looks identical to a new task_id on its own; when
+          ``_root_has_existing_escalations`` finds pre-existing files for
+          this task_id in the queue root, that suspicious case is also
+          logged as an ERROR (still starting from 0 — this is observability
+          only, not a scan-derived fallback).
+        - An ``OSError`` while reading an EXISTING file (transient I/O error,
+          EINTR, fd exhaustion, permission flap) is NOT treated as 0 — it is
+          allowed to propagate so the mint fails loudly rather than silently
+          overwriting a still-valid on-disk counter with a colliding
+          restart-from-1.
+
+        The read -> increment -> durable write (tmp+fsync+rename+dir-fsync,
+        see ``_write_seq_counter``) all happen inside
+        ``escalation_id_lock(queue_dir, f'esc-{task_id}.seq')`` so concurrent
+        OS processes minting ids for the SAME task_id serialize on the
+        stable ``esc-{task_id}.seq.json.lock`` sidecar inode and never
+        observe the same counter value.
+        """
+        counter_id = f'esc-{task_id}.seq'
+        counter_path = self.queue_dir / counter_id
+        with escalation_id_lock(self.queue_dir, counter_id):
+            current = 0
+            if counter_path.exists():
+                try:
+                    current = int(counter_path.read_text().strip())
+                except ValueError as e:
+                    logger.error(
+                        f'make_id: could not parse counter file {counter_path}: {e}; '
+                        'treating as 0 — counter is authoritative with no archive-scan '
+                        'fallback, so this WILL mint ids that collide with any already '
+                        f'issued for task_id {task_id!r}'
+                    )
+                    current = 0
+            elif self._root_has_existing_escalations(task_id):
+                logger.error(
+                    f'make_id: counter file {counter_path} is absent but escalations '
+                    f'for task_id {task_id!r} already exist in the queue root; '
+                    'starting from 0 — counter is authoritative with no archive-scan '
+                    'fallback, so this WILL mint ids that collide with already-issued ones'
+                )
+            nxt = current + 1
+            self._write_seq_counter(counter_path, nxt)
+            return f'esc-{task_id}-{nxt}'

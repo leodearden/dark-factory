@@ -19,10 +19,19 @@ op
       on each iteration.
     - ``attach`` — calls ``attach_dedupe_child(parent_id, f'{prefix}-{i}')`` on
       each iteration.
+    - ``make_id_submit`` — calls ``eid = queue.make_id(parent_id)`` (here
+      *parent_id* is reused as the ``task_id`` — no pre-seeded parent
+      escalation is required for this op) then
+      ``queue.submit(Escalation(id=eid, task_id=parent_id, ...))`` on each
+      iteration, minting and submitting one fresh escalation per iteration.
 parent_id
-    The escalation id of the pre-seeded parent (submitted by the parent process).
+    The escalation id of the pre-seeded parent (submitted by the parent
+    process).  For ``make_id_submit`` this slot instead carries the shared
+    ``task_id`` that both child processes mint ids against.
 prefix
     String prefix for the generated child/member ids (e.g. ``'a'`` or ``'b'``).
+    Unused by ``make_id_submit`` (accepted for CLI-argument-count
+    uniformity — pass any placeholder).
 count
     Number of iterations to run.  Each iteration appends exactly ONE element,
     maximising RMW interleaving between the two concurrent child processes.
@@ -42,6 +51,7 @@ _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from escalation.models import Escalation  # noqa: E402  (import after path fix)
 from escalation.queue import EscalationQueue  # noqa: E402  (import after path fix)
 
 
@@ -66,6 +76,20 @@ def main() -> None:
     elif op == 'resolve':
         # count is ignored; call resolve once per process (idempotent after first call).
         queue.resolve(parent_id, f'resolved-by-{prefix}')
+    elif op == 'make_id_submit':
+        # parent_id slot is reused as task_id — no pre-seeded parent required.
+        task_id = parent_id
+        for _ in range(count):
+            eid = queue.make_id(task_id)
+            queue.submit(Escalation(
+                id=eid,
+                task_id=task_id,
+                agent_role='orchestrator',
+                severity='blocking',
+                category='task_failure',
+                summary='concurrent make_id test',
+                level=0,
+            ))
     else:
         print(f'Unknown op: {op!r}', file=sys.stderr)
         sys.exit(2)
