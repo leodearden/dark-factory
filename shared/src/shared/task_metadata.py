@@ -24,6 +24,7 @@ __all__ = [
     'ExternalDep',
     'MemoryHints',
     'RetryLedger',
+    'TaskMetadata',
 ]
 
 
@@ -137,3 +138,28 @@ class RetryLedger(BaseModel):
     consecutive_merge_thrash: int = 0
     last_merge_outcome_signature: str | None = None
     merge_first_enqueued_at: str | None = None
+
+
+class TaskMetadata(BaseModel):
+    """The versioned ``metadata`` JSON blob carried on every task (PRD §5).
+
+    ``extra='allow'`` is load-bearing for I1 (round-trip preservation): any
+    key this schema does not yet know about — a newer writer's field, a
+    caller-private ``x_``-namespaced value — survives untouched through
+    :func:`parse_metadata` rather than being silently dropped.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    schema_version: int = 1
+    task_kind: Literal['normal', 'deterministic'] = 'normal'
+    always_escalates: bool = False
+    before_done: BeforeDone | None = None
+    done_provenance: DoneProvenance | None = None
+    memory_hints: MemoryHints | None = None
+    retry_ledger: RetryLedger | None = None
+    # Canonical "project_id:task_id" wire strings — NOT list[ExternalDep].
+    # Keeping this a list[str] defers typed-vs-string consumption to the
+    # scheduler (PRD Open Q #4); ExternalDep is a parse/render convenience.
+    external_deps: list[str] = Field(default_factory=list)
+    files: list[str] = Field(default_factory=list)
