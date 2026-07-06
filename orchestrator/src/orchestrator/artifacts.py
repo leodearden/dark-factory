@@ -555,13 +555,27 @@ class TaskArtifacts:
         self._write_json(review_path, review)
 
     def read_reviews(self) -> dict[str, dict]:
-        """Read all reviews (new-path-then-old)."""
-        reviews_dir = self._read_path('reviews')
-        if not reviews_dir.exists():
-            return {}
-        reviews = {}
-        for path in reviews_dir.glob('*.json'):
-            reviews[path.stem] = json.loads(path.read_text())
+        """Read all reviews, MERGING the legacy and new reviews/ directories
+        during the compat window (new wins on stem collision).
+
+        Unlike other artifacts, reviews/ is a multi-writer directory (one
+        file per reviewer), so a whole-dir `_read_path` resolution would
+        pick exactly one directory — once any new reviewer writes, the new
+        dir exists and every legacy reviewer would vanish, silently
+        dropping their findings (including blocking issues) from
+        `aggregate_reviews`. Merging keeps every reviewer visible. When
+        `meta_root` was not supplied, both dirs are the same path, so this
+        yields the identical result (byte-identical).
+        """
+        reviews: dict[str, dict] = {}
+        legacy_reviews_dir = self._legacy_root / 'reviews'
+        if legacy_reviews_dir.is_dir():
+            for path in legacy_reviews_dir.glob('*.json'):
+                reviews[path.stem] = json.loads(path.read_text())
+        new_reviews_dir = self.root / 'reviews'
+        if new_reviews_dir.is_dir():
+            for path in new_reviews_dir.glob('*.json'):
+                reviews[path.stem] = json.loads(path.read_text())
         return reviews
 
     def aggregate_reviews(self) -> ReviewAggregation:
