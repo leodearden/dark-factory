@@ -138,7 +138,7 @@ class MoveResult:
         target_graph: Graph the node was moved to.
         already_moved: True when the idempotency probe short-circuited the
             call as a no-op (uuid already present in target, absent from
-            source) -- see step-13/14. Defaults to False.
+            source). Defaults to False.
         edges_moved: Count of RELATES_TO edges reattached to the moved node.
         mentions_moved: Count of Episodic MENTIONS links reattached.
     """
@@ -180,7 +180,15 @@ async def move_entity_across_graphs(
     crash mid-move still leaves a recoverable duplicate rather than losing
     the only copy.
 
-    The idempotency probe is added in a later step (13-14);
+    Idempotency (step-13/14): if the node is absent from source_graph, this
+    is checked against target_graph *before* raising -- if the node is
+    present there, the move already happened (e.g. a prior run completed it,
+    or crashed after the delete) and this call is a no-op: MoveResult is
+    returned with ``already_moved=True`` and neither graph is touched again.
+    This probe runs before any read/write beyond the initial source lookup,
+    so a retry after a completed (or partially-completed-past-the-delete)
+    move never re-creates or re-deletes anything.
+
     ``rewrite_group_id`` substitution for the node/edges/mentions lands in
     step-16 (applied here as a forward-compatible no-op when
     ``rewrite_group_id`` is None).
@@ -211,6 +219,28 @@ async def move_entity_across_graphs(
         {'uuid': uuid},
     )
     if not node_result.result_set:
+        # --- idempotency probe (step-13/14) ---
+        # Absent from source: before treating this as a genuine not-found,
+        # check whether it's already present in target -- i.e. a prior run
+        # already completed (or crashed just past) the move. This probe is
+        # itself read-only and runs before any write, so a retry after a
+        # completed move is a safe no-op rather than a spurious error.
+        target_probe = await target.ro_query(
+            'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid',
+            {'uuid': uuid},
+        )
+        if target_probe.result_set:
+            logger.info(
+                'move_entity_across_graphs: already moved, no-op uuid=%s '
+                'source=%s target=%s',
+                uuid, source_graph, target_graph,
+            )
+            return MoveResult(
+                uuid=uuid,
+                source_graph=source_graph,
+                target_graph=target_graph,
+                already_moved=True,
+            )
         raise NodeNotFoundError(f'Entity node not found in source_graph {source_graph!r}: {uuid}')
     node_uuid, name, group_id, summary, created_at = node_result.result_set[0]
 
