@@ -106,3 +106,38 @@ Wave 2 sessions wire cross-batch deps against the wave-1/agent batches' real tas
   file:line you build a task on (main moves fast here). Statuses checked 2026-07-06:
   2091/2097-2100/2105/1146/1151 all done — the latent bugs in the survey stand DESPITE
   those (e.g. 2091 fixed only the runner's inspector copy, not the harness duplicate).
+
+## FILED — program status as of 2026-07-06 ~16:30
+
+All 16 streams authored, gate-walked, decomposed, and queued (~110 tasks). Anchors
+below; each PRD + capability manifest on main carries the authoritative leaf list
+(locate by PATH — an index race put several under misattributed commit messages).
+
+| Stream | PRD | Task anchors |
+|---|---|---|
+| M1 | plans/gitops-chokepoints-prd.md | 2185(α, in-progress) 2190 2194 2199(δ) 2205(ε) |
+| M2 | plans/supervision-quick-fixes-prd.md | 2119(α, in-progress) 2120 2121 2122 2124 |
+| M3 | plans/dashboard-alignment-prd.md | 2165 2170 2174 2181 2187 2192 2218 |
+| M4 | plans/recon-project-scope-prd.md | 2144 2146 2150 2152 |
+| M5 | plans/fm-cancellederror-convention-prd.md | 2130 2135 2140 2145 2149 2151 |
+| W1 | plans/merge-queue-reliability-prd.md | 15-task linear spine 2153(α=journal)…2183 |
+| W2 | plans/task-status-authority-prd.md | incl. 2163(τ1 StrEnum) 2168 2182 |
+| W3 | plans/task-metadata-schema-prd.md | 2158(α=schema+ext-point)…2184(θ2 enforce-flip gate) |
+| W4 | plans/invocation-outcome-prd.md | 2127(α)…2143(κ); 2128=AccountPhase |
+| W5 | plans/recon-reliability-prd.md | 2219…2233; cross-deps κ/λ→M4 2150/2149 |
+| W6 | plans/fm-memory-identity-prd.md | 2198(α, AMENDED — group_id filter) 2202 2207 2210 2213 |
+| W7 | plans/verify-plan-prd.md | 2123(α)…2148; ζ=2138 BlockRecord |
+| W8 | plans/fm-task-dedup-prd.md | 2186…2212(Z=deterministic deploy) |
+| W9 | plans/workflow-state-machine-prd.md | 2245…2253 (deps → 2153/2168/2123/2127/2138/2158) |
+| W10 | plans/harness-supervision-prd.md | 2235…2244 (deps → 2119/2120/2124, 2153, 2182, 2158) |
+| W11 | plans/worktree-lane-lifecycle-prd.md | 2254…2264 (η=2264 activated, dep→2199) |
+
+Coordinator interventions (2026-07-06 ~16:22): W6-α task 2198 amended pre-dispatch with
+the mandatory `n.group_id = $group_id` property filter (task-2115 cross-graph leak would
+otherwise be destructively auto-merged — see memory project_w6_automerge_hazard_2115);
+2210 got the matching advisory; W11-η 2264 activated per its recorded trigger (M1-δ WAS
+filed as 2199 — a search_tasks/id-range misdiagnosis said otherwise, corrected in
+memory); W11-γ 2256 corrected re M1-ε=2205. Known G6 catch during authoring: the
+survey's "~0.92 Mem0 dedup" premise is FALSE on main (infer=False bypasses dedup) — W5
+anchored its compensation-deletion on ledger authority instead, with an empirical
+verification leaf (2221).
