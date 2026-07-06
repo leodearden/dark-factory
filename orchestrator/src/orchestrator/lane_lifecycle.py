@@ -198,6 +198,7 @@ class LaneLifecycle:
         current_state = current.state if current is not None else None
 
         if (current_state, to) not in LEGAL_TRANSITIONS:
+            self._file_illegal_transition_escalation(lane, current_state, to)
             raise IllegalLaneTransition(
                 f'illegal lane transition for lane {Path(lane).name!r}: '
                 f'{current_state} -> {to}'
@@ -219,3 +220,46 @@ class LaneLifecycle:
 
         self._write(lane, record)
         return record
+
+    def _file_illegal_transition_escalation(
+        self, lane: Path | str, current_state: LaneState | None, to: LaneState,
+    ) -> None:
+        """Best-effort born-at-L2 filer for an illegal transition attempt.
+
+        No-op when no escalation queue is wired (bare unit-test / unwired
+        contexts stay green, mirrors
+        ``Harness._file_pool_storage_absent_escalation``). Any submit failure
+        is swallowed + logged so escalation filing never masks the
+        ``IllegalLaneTransition`` raise.
+        """
+        if self._escalation_queue is None:
+            return
+        try:
+            from escalation.models import Escalation  # noqa: PLC0415
+
+            lane_name = Path(lane).name
+            sentinel_task_id = f'lane-lifecycle-{lane_name}'
+            esc = Escalation(
+                id=self._escalation_queue.make_id(sentinel_task_id),
+                task_id=sentinel_task_id,
+                agent_role=ESCALATION_SENTINEL_ROLE,
+                severity='critical',
+                category='risk_identified',
+                summary=(
+                    f'Illegal lane transition on {lane_name!r}: '
+                    f'{current_state} -> {to}'
+                )[:200],
+                detail=(
+                    f'LaneLifecycle.transition rejected an illegal edge for lane '
+                    f'{lane_name!r}: current state={current_state}, requested '
+                    f'transition to={to}. The durable record was left unchanged '
+                    '(never silent-heal, PRD W11 I2).'
+                ),
+                level=2,
+            )
+            self._escalation_queue.submit(esc)
+        except Exception:
+            logger.warning(
+                'lane_lifecycle: failed to file illegal-transition escalation '
+                'for lane %s', Path(lane).name, exc_info=True,
+            )
