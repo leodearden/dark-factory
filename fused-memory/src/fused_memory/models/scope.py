@@ -1,13 +1,37 @@
-"""Scope model — maps a request to backend-specific identifiers."""
+"""Scope model — maps a request to backend-specific identifiers.
 
+``ProjectId``/``ProjectRoot`` (below) are distinct ``str`` :class:`~typing.NewType`\\ s
+and ``ProjectScope`` is a frozen dataclass pairing them, so a transposed
+``project_id``/``project_root`` argument pair is a pyright error rather than a
+runtime bug.
+
+This module (task α of the recon-project-scope batch; see
+``plans/recon-project-scope-prd.md``) defines the type only — as of this
+change, ``ProjectScope`` is not yet constructed by any production call site.
+It is *intended* to have exactly two sanctioned construction sites, to be
+wired in by follow-up tasks in the same batch —
+``ReconciliationHarness._known_project_root_for`` (``reconciliation/harness.py``,
+the registry-backed cycle entry; task β) and
+``TargetedReconciler.reconcile_task`` (``reconciliation/targeted.py``, after
+its ``require_project_root`` call; task δ). No other call site should
+construct a ``ProjectScope`` directly once those tasks land.
+"""
+
+import dataclasses
 import logging
 import os
 import subprocess
 from pathlib import Path, PurePosixPath
+from typing import NewType
 
 from pydantic import BaseModel, field_validator
 
-from fused_memory.utils.validation import _to_underscore_canonical, canonicalize_project_id
+from fused_memory.utils.validation import (
+    InputValidationError,
+    _to_underscore_canonical,
+    canonicalize_project_id,
+    require_project_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +231,47 @@ def build_known_projects_map(
             continue
         out[pid] = resolved
     return out
+
+
+ProjectId = NewType('ProjectId', str)
+ProjectRoot = NewType('ProjectRoot', str)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ProjectScope:
+    """Type-level pairing of a project's canonical id and filesystem root.
+
+    ``project_id`` and ``project_root`` are distinct ``NewType``\\ s (both
+    backed by ``str``), so passing one where the other is expected is a
+    pyright ``reportArgumentType`` error, not a silent runtime mix-up.
+    Instances are frozen — reassigning either field after construction raises
+    ``dataclasses.FrozenInstanceError`` at runtime and is a pyright
+    ``reportAttributeAccessIssue`` at type-check time.
+
+    Not yet constructed by any production call site. See the module
+    docstring for the two *intended* construction sites, to be wired in by
+    this batch's follow-up tasks.
+    """
+
+    project_id: ProjectId
+    project_root: ProjectRoot
+
+    def __post_init__(self) -> None:
+        # Deliberately a plain non-empty check, NOT require_project_id (which
+        # additionally enforces a safe-identifier charset allowlist). Both
+        # intended construction sites (see class docstring) build project_id
+        # from resolve_project_id/canonicalize_project_id output or an
+        # already registry-resolved value -- always underscore-canonical and
+        # allowlist-safe by construction -- so no caller reaching this
+        # __post_init__ needs the stronger charset check, and applying it
+        # here would over-reject otherwise-legitimate ids. If a future
+        # construction site can pass an uncanonicalized/raw id, prefer
+        # canonicalizing at that call site over widening this check.
+        if not self.project_id:
+            raise InputValidationError(
+                f'project_id must be a non-empty string, got: {self.project_id!r}'
+            )
+        require_project_root(self.project_root)
 
 
 class Scope(BaseModel):
