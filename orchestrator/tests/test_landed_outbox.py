@@ -19,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 import dataclasses
+import stat
 from pathlib import Path
 
 import pytest
@@ -144,3 +145,52 @@ class TestLandedOutboxConsume:
         reopened = LandedOutbox(path)
         assert reopened.lookup('9') is None
         assert reopened.all() == []
+
+
+# ---------------------------------------------------------------------------
+# step-7 — WA-1 fsync durability (executable proxy for crash-durability)
+# ---------------------------------------------------------------------------
+
+
+class TestLandedOutboxFsyncDurability:
+    """record() fsyncs both the row's file and its parent directory (WA-1).
+
+    A unit test cannot trigger real power-loss, so this spies on every
+    os.fsync call record() makes and asserts it touched (at least) one
+    regular file and one directory — the executable proxy for "survives a
+    simulated crash".
+    """
+
+    def test_record_fsyncs_file_and_parent_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import os as os_module
+
+        real_fsync = os_module.fsync
+        captured_modes: list[int] = []
+
+        def _spy_fsync(fd: int) -> None:
+            # Capture the fd's mode AT CALL TIME — before the impl closes it —
+            # then delegate to the real fsync so durability behaviour is
+            # otherwise unchanged.
+            captured_modes.append(os_module.fstat(fd).st_mode)
+            real_fsync(fd)
+
+        monkeypatch.setattr('orchestrator.landed_outbox.os.fsync', _spy_fsync)
+
+        path = tmp_path / 'data' / 'orchestrator' / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        row = LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
+
+        outbox.record(row)
+
+        assert len(captured_modes) >= 2, (
+            f'Expected os.fsync called at least twice (file + dir); '
+            f'got {len(captured_modes)} call(s)'
+        )
+        assert any(stat.S_ISREG(m) for m in captured_modes), (
+            f'Expected at least one fsync on a regular file; modes={captured_modes!r}'
+        )
+        assert any(stat.S_ISDIR(m) for m in captured_modes), (
+            f'Expected at least one fsync on a directory; modes={captured_modes!r}'
+        )
