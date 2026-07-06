@@ -44,6 +44,9 @@ from fused_memory.reconciliation.task_filter import (
 )
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
+    PathShapedProjectIdError,
+    _to_underscore_canonical,
+    canonicalize_project_id,
     validate_int_ids,
     validate_known_project_id,
     validate_project_id,
@@ -385,6 +388,30 @@ def _summarise_ticket_row(row: dict) -> dict:
     }
 
 
+def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] | None]:
+    """Boundary adapter: canonicalize a raw MCP-tool project_id argument.
+
+    Wraps :func:`canonicalize_project_id` (task 2267 / seam S1), converting its
+    raise into the tools' error-dict contract so every memory-tool prologue can
+    use the same two-line idiom as the existing ``if err := validate_project_id(...)``
+    checks:
+
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+
+    On success returns ``(canonical_project_id, None)``. On a path-shaped
+    project_id (e.g. '-home-leo-src-x') returns the ORIGINAL project_id
+    unchanged alongside an error dict — the caller returns the error
+    immediately, so the unchanged value is never actually used, but this
+    keeps the tuple shape total (always a str, never None) for callers.
+    """
+    try:
+        return canonicalize_project_id(project_id), None
+    except PathShapedProjectIdError as e:
+        return project_id, {'error': str(e), 'error_type': type(e).__name__}
+
+
 def _extract_causation(metadata: dict | None, agent_id: str | None) -> tuple[str, str, dict | None]:
     """Extract or generate causation_id, determine source, clean metadata.
 
@@ -675,6 +702,9 @@ def create_mcp_server(
                 the *kind* of episode; reference_time sets the *timestamp*.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
@@ -767,6 +797,9 @@ def create_mcp_server(
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
@@ -1277,6 +1310,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
@@ -1328,6 +1364,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
@@ -1396,6 +1435,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
