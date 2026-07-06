@@ -149,6 +149,13 @@ def harness(tmp_path: Path, mock_orch_config):
     # to exercise the Guard 3 branch-advanced check.
     h.scheduler.get_task = AsyncMock(return_value=None)
 
+    # Default: warm_lane_ref_is_degenerate returns False (task 2112 angle B) so
+    # the metadata-independent fallback never fires for existing tests and the
+    # suite stays deterministic (no real subprocess is ever invoked in unit
+    # tests). Individual tests may override with AsyncMock(return_value=True)
+    # to exercise the primitive-degenerate fallback path.
+    h.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)
+
     return h
 
 
@@ -2644,6 +2651,105 @@ async def test_citation_missing_still_escalates_when_branch_advanced(
         f'got {len(q_d.submissions)}'
     )
     assert q_d.submissions[0].category == 'reconcile_citation_missing'
+    assert tid not in harness._reconcile_skip_counts
+
+
+@pytest.mark.asyncio
+async def test_citation_missing_skipped_for_degenerate_ref_via_primitive(
+    harness: Harness,
+):
+    """Task 2112 angle B: warm_lane_ref_is_degenerate is a metadata-INDEPENDENT
+    fallback for the #1823 degenerate-branch guard.
+
+    Repro: esc-4388-46/esc-4875-7 — a task fault-killed before its metadata
+    write leaves branch_base_sha absent, so the metadata-based
+    _branch_is_degenerate returns False even though the ref is actually
+    degenerate (parked on a foreign merge commit, zero unique commits over
+    main). reify's warm-lane-degenerate-ref-check.sh is metadata-independent
+    and classifies the ref correctly; the reconciler must suppress the
+    citation-missing escalation on its say-so (Phase 1), while a primitive
+    result of False must leave existing behaviour — and the existing
+    escalation — untouched (Phase 2, companion case mirroring Case B of
+    test_citation_missing_still_escalates_when_branch_advanced).
+    """
+    from orchestrator.harness import MAX_RECONCILE_FAILURES
+
+    submissions = []
+
+    class _StubEscalationQueue:
+        def make_id(self, task_id):
+            return f'esc-{task_id}-{len(submissions)}'
+
+        def submit(self, esc):
+            submissions.append(esc)
+
+        def has_open_l1(self, task_id):  # noqa: ARG002
+            return False
+
+    harness._escalation_queue = _StubEscalationQueue()  # type: ignore[assignment]
+
+    tid = '4875'
+
+    harness.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+    harness.git_ops.find_task_citation_commit = AsyncMock(  # type: ignore[attr-defined]
+        return_value=None,  # citation MISS → enters Guard 2's None block
+    )
+    # No branch_base_sha in metadata → metadata-based _branch_is_degenerate
+    # returns False (the actual bug this fallback fixes).
+    harness.scheduler.get_task = AsyncMock(  # type: ignore[attr-defined]
+        return_value={'id': tid, 'metadata': {}},
+    )
+    harness.scheduler.get_statuses.return_value = (  # type: ignore[attr-defined]
+        {tid: 'in-progress'}, None,
+    )
+
+    # ------------------------------------------------------------------
+    # Phase 1: primitive is CERTAIN the ref is degenerate → suppressed.
+    # ------------------------------------------------------------------
+    harness.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(submissions) == 0, (
+        f'primitive-degenerate ref must NOT emit any escalation after '
+        f'{MAX_RECONCILE_FAILURES} sweeps; got {len(submissions)}: '
+        f'{[getattr(s, "category", s) for s in submissions]}'
+    )
+    harness.scheduler.mark_done.assert_not_called()  # type: ignore[attr-defined]
+
+    revert_calls = harness.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+    assert revert_calls, (
+        'primitive-degenerate in-progress task must be reverted to pending, '
+        'not left stranded'
+    )
+    for call in revert_calls:
+        assert call.args == (tid, 'pending'), (
+            f'expected revert to pending, got {call.args}'
+        )
+    assert tid not in harness._reconcile_skip_counts, (
+        f'primitive-degenerate ref must not accrue skip strikes; '
+        f'got count={harness._reconcile_skip_counts.get(tid)}'
+    )
+
+    # ------------------------------------------------------------------
+    # Phase 2 (companion): primitive says NOT degenerate (fail-soft default,
+    # or a live/advanced ref) + missing base_sha → existing behaviour is
+    # untouched; the citation-missing escalation still fires (Case B).
+    # ------------------------------------------------------------------
+    harness.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+    harness.scheduler.set_task_status.reset_mock()  # type: ignore[attr-defined]
+
+    for _ in range(MAX_RECONCILE_FAILURES):
+        await harness._reconcile_stranded_in_progress()
+
+    assert len(submissions) == 1, (
+        f'primitive says not-degenerate + missing base_sha must still '
+        f'escalate; got {len(submissions)}'
+    )
+    esc = submissions[0]
+    assert esc.task_id == tid
+    assert esc.category == 'reconcile_citation_missing'
     assert tid not in harness._reconcile_skip_counts
 
 
