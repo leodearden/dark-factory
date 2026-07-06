@@ -1269,6 +1269,37 @@ class TestReadPlanNewThenOldCompat:
         assert legacy_plan_after['steps'][0]['status'] == 'pending'
         assert legacy_plan_after['steps'][0]['commit'] is None
 
+    def test_normalization_write_back_from_legacy_targets_new_only(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        """read_plan's normalize-on-read write-back is also migrate-on-write:
+        a malformed plan found ONLY at the legacy path is normalized and the
+        corrected plan is written under meta_root, leaving the legacy
+        (still-malformed) copy untouched.
+        """
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        malformed = {
+            'task_id': 'task-1',
+            'tdd_steps': [{'id': 'step-1', 'status': 'pending'}],
+        }
+        (legacy_root / 'plan.json').write_text(json.dumps(malformed))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        plan = ta.read_plan()
+
+        assert 'steps' in plan
+        assert 'tdd_steps' not in plan
+
+        new_plan = json.loads((meta_root / 'plan.json').read_text())
+        assert 'steps' in new_plan
+        assert 'tdd_steps' not in new_plan
+
+        # Legacy copy must be untouched — still malformed, not normalized.
+        legacy_plan_after = json.loads((legacy_root / 'plan.json').read_text())
+        assert 'tdd_steps' in legacy_plan_after
+        assert 'steps' not in legacy_plan_after
+
 
 class TestUniformReadFallback:
     """The new-then-old read compat is uniform across artifact types, not
@@ -1517,6 +1548,32 @@ class TestIterationLogCompatNoSplitBrain:
         entries, corrupted = ta.read_iteration_log()
         notes = [e['note'] for e in entries]
         assert notes == ['legacy-1', 'new-1', 'new-2']
+        assert corrupted == []
+
+    def test_skips_migration_when_new_path_already_exists(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        """When a new-path iterations.jsonl is already present (e.g. from a
+        prior append), append_iteration_log must NOT re-copy the legacy log
+        — the migration branch only fires once, on the first append after
+        the new path is created, not on every subsequent append.
+        """
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'iterations.jsonl').write_text(
+            json.dumps({'note': 'legacy-1'}) + '\n'
+        )
+        meta_root.mkdir(parents=True)
+        (meta_root / 'iterations.jsonl').write_text(
+            json.dumps({'note': 'new-preexisting'}) + '\n'
+        )
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.append_iteration_log({'note': 'new-2'})
+
+        entries, corrupted = ta.read_iteration_log()
+        notes = [e['note'] for e in entries]
+        assert notes == ['new-preexisting', 'new-2']
         assert corrupted == []
 
 
