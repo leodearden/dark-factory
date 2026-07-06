@@ -42,9 +42,26 @@ class StreakCounter:
         self.threshold = threshold
         self.key_fn = key_fn
         self.counts: dict[Any, int] = {}
+        self.causes: dict[Any, str] = {}
 
     def bump(self, key: Any) -> int:
         """Increment the streak for ``key`` and return the new count."""
+        value = self.counts.get(key, 0) + 1
+        self.counts[key] = value
+        return value
+
+    def touch(self, key: Any, *, cause: str) -> int:
+        """Bump the streak for ``key``, resetting it when ``cause`` changes.
+
+        Mirrors ``Scheduler._note_external_hold``: if the last-seen cause
+        for ``key`` differs from ``cause`` (including the first-ever touch,
+        where no cause has been seen), the streak resets to 0 before being
+        bumped — so it always reflects a single consecutive-run cause
+        rather than a mixed accumulation across differing causes.
+        """
+        if self.causes.get(key) != cause:
+            self.counts[key] = 0
+        self.causes[key] = cause
         value = self.counts.get(key, 0) + 1
         self.counts[key] = value
         return value
@@ -54,15 +71,18 @@ class StreakCounter:
         return self.counts.get(key, 0)
 
     def clear(self, key: Any) -> None:
-        """Reset ``key`` — pop it from the backing dict."""
+        """Reset ``key`` — pop it from every backing container."""
         self.counts.pop(key, None)
+        self.causes.pop(key, None)
 
     def gc(self, stale_ids: Iterable[Any]) -> None:
         """Drop every key whose ``key_fn``-extracted task-id is stale.
 
-        Mutates the backing dict IN PLACE — never rebinds — so aliased
-        legacy attributes observe the sweep.
+        Mutates the backing containers IN PLACE — never rebinds — so
+        aliased legacy attributes observe the sweep.
         """
         stale = stale_ids if isinstance(stale_ids, (set, frozenset)) else set(stale_ids)
         for key in [k for k in self.counts if self.key_fn(k) in stale]:
             del self.counts[key]
+        for key in [k for k in self.causes if self.key_fn(k) in stale]:
+            del self.causes[key]
