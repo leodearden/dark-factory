@@ -3023,6 +3023,13 @@ async def _do_train_merge(
     # BEFORE advancing main — single-sourced via the shared helper (task β).
     # branch_tip_sha is best-effort (resolve_branch_sha returns str | None;
     # _do_train_merge has no MergedOk.branch_tip like the single-branch path).
+    # Performance (amendment, task 2154): this costs one extra git subprocess
+    # per train CAS-advance. Nothing upstream in this function already holds
+    # a resolved tip SHA to reuse — rebase_onto_main returns bool only, and
+    # the raw MergeResult from merge_to_main has no branch_tip field (that
+    # field lives only on MergedOk, single-branch's classify_and_merge
+    # result; see git_ops.py:368). The resolve is therefore an accepted,
+    # intentional best-effort cost rather than a deferred TODO.
     _train_branch_tip = await git_ops.resolve_branch_sha(req.branch)
     adv_outcome = await _journal_landed_then_advance(
         getattr(worker, '_landed_outbox', None), git_ops,
@@ -3045,8 +3052,11 @@ async def _do_train_merge(
     # branch here to re-record from (that only exists in _finalize_inflight's
     # while-loop), so re-record now whenever the landed sha differs from what
     # was journaled write-ahead — the row's advanced_sha must always match
-    # what actually landed on main, since consumers key on
-    # task_id + advanced_sha.
+    # what actually landed on main. LandedOutbox is keyed by task_id ALONE
+    # (last-write-wins — see landed_outbox.py's class docstring), so this
+    # re-record OVERWRITES the write-ahead row in place rather than adding a
+    # second (task_id, advanced_sha) entry; any consumer reading the row
+    # after this point sees the landed sha.
     if (
         adv == 'advanced'
         and adv_outcome.advanced_sha is not None
