@@ -578,7 +578,9 @@ class DeterministicRunner:
         """
         from escalation.models import Escalation
 
-        existing_pending = self.escalation_queue.get_by_task(task_id, status='pending')
+        existing_pending = self.escalation_queue.get_by_task(
+            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        )
         if existing_pending:
             logger.info(
                 'DeterministicRunner: task %s already has %d pending escalation(s) — '
@@ -589,7 +591,7 @@ class DeterministicRunner:
             esc = Escalation(
                 id=self.escalation_queue.make_id(task_id),
                 task_id=task_id,
-                agent_role='orchestrator-deterministic',
+                agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
                 category='infra_issue',
                 summary=summary[:200],
@@ -796,7 +798,9 @@ class DeterministicRunner:
         # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
         # failure on the following update_task re-files the gate on next dispatch
         # rather than silently skipping it).
-        existing_pending = self.escalation_queue.get_by_task(task_id, status='pending')
+        existing_pending = self.escalation_queue.get_by_task(
+            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        )
         if existing_pending:
             logger.info(
                 'DeterministicRunner: task %s already has %d pending escalation(s) — '
@@ -807,7 +811,7 @@ class DeterministicRunner:
             esc = Escalation(
                 id=self.escalation_queue.make_id(task_id),
                 task_id=task_id,
-                agent_role='orchestrator-deterministic',
+                agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
                 category='milestone_gate',
                 summary=title[:200],
