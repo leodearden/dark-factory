@@ -14,6 +14,7 @@ strict ``__all__`` union assertion untouched).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Literal
 
@@ -25,8 +26,10 @@ __all__ = [
     'ExternalDep',
     'MemoryHints',
     'RetryLedger',
+    'SchemaWarning',
     'TaskMetadata',
     'apply_migrations',
+    'parse_metadata',
     'register_metadata_submodel',
 ]
 
@@ -262,3 +265,50 @@ def apply_migrations(blob: dict) -> dict:
             break
         current = new_version
     return upgraded
+
+
+class SchemaWarning(BaseModel):
+    """A single non-fatal :func:`parse_metadata` finding.
+
+    ``parse_metadata`` does not know which task a blob belongs to — the
+    fused-memory backend attaches ``task_id`` when it emits the
+    ``task_metadata.schema_warning`` census line (PRD §1/§5).
+    """
+
+    field: str
+    code: str
+    message: str
+
+
+def parse_metadata(
+    blob: dict | str | None,
+    *,
+    direction: Literal['read', 'write'],
+    enforce: bool = False,
+) -> tuple[TaskMetadata, list[SchemaWarning]]:
+    """Parse a task's ``metadata`` JSON blob into a validated :class:`TaskMetadata`.
+
+    The single parser for the ``metadata`` column (PRD §5), replacing eight
+    ad-hoc parsers. ``direction``/``enforce`` govern the failure policy for
+    malformed input — unparseable JSON, invalid typed sub-models, unknown
+    top-level keys — which is layered on top of this happy-path core:
+
+    * ``blob is None`` -> an empty, all-defaults ``TaskMetadata`` (benign-absent).
+    * ``blob`` is a JSON string -> ``json.loads`` then handled as a dict.
+    * ``blob`` is a dict -> migrated (:func:`apply_migrations`), any
+      registered sub-model slice (:data:`_SUBMODEL_REGISTRY`) present in it
+      is validated and swapped in as a typed instance, then the whole thing
+      is validated as :class:`TaskMetadata`.
+    """
+    if blob is None:
+        return TaskMetadata(), []
+
+    if isinstance(blob, str):
+        blob = json.loads(blob)
+
+    blob = apply_migrations(blob)
+    for key, submodel in _SUBMODEL_REGISTRY.items():
+        if key in blob:
+            blob = {**blob, key: submodel(**blob[key])}
+
+    return TaskMetadata(**blob), []
