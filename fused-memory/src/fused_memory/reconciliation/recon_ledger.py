@@ -220,6 +220,26 @@ class ReconLedgerStore:
         rows = await cursor.fetchall()
         return [_record_from_row(row) for row in rows]
 
+    async def is_suppressed(self, project_id: str, task_id: str, flag_type: str) -> bool:
+        """Return True if ``task_id``/``flag_type`` is actively suppressed.
+
+        ``flag_type = ''`` on a suppression row is a blanket/union suppression
+        covering every flag_type for that task — matched here via
+        ``flag_type IN (?, '')``.
+        """
+        db = self._require_db()
+        cursor = await db.execute(
+            """
+            SELECT 1 FROM recon_ledger
+            WHERE project_id = ? AND record_kind = 'stage1_flag_suppression' AND state = 'active'
+              AND task_id = ? AND flag_type IN (?, '')
+            LIMIT 1
+            """,
+            (project_id, task_id, flag_type),
+        )
+        row = await cursor.fetchone()
+        return row is not None
+
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
 
