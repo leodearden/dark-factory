@@ -534,6 +534,75 @@ class TestReadTaskArtifactsTaskMeta:
         assert result[7]['phase'] == 'EXECUTE'
         assert result[7]['plan_progress'] == {'done': 1, 'total': 2}
 
+    def test_reads_iterations_and_reviews_from_task_meta(self, tmp_path):
+        """iterations.jsonl + reviews/*.json under the relocated .task-meta dir are read."""
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        wt = tmp_path / '.worktrees' / '7'
+        wt.mkdir(parents=True)
+        meta = tmp_path / '.worktrees' / '.task-meta' / '7'
+        meta.mkdir(parents=True)
+
+        with open(meta / 'iterations.jsonl', 'w') as f:
+            for i in range(4):
+                f.write(json.dumps({'iteration': i + 1}) + '\n')
+
+        reviews_dir = meta / 'reviews'
+        reviews_dir.mkdir()
+        (reviews_dir / 'reviewer-1.json').write_text(json.dumps({'verdict': 'PASS'}))
+        (reviews_dir / 'reviewer-2.json').write_text(json.dumps({'verdict': 'PASS'}))
+        (reviews_dir / 'reviewer-3.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND'}))
+
+        result = read_task_artifacts(wt)
+
+        assert result['iteration_count'] == 4
+        assert result['review_summary'] == '2/3 passed'
+
+    def test_reviews_dir_resolves_new_then_old(self, tmp_path):
+        """A reviews/ dir present under BOTH .task-meta and legacy .task/ resolves to the new one."""
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        wt = tmp_path / '.worktrees' / '7'
+        wt.mkdir(parents=True)
+        meta = tmp_path / '.worktrees' / '.task-meta' / '7'
+        meta.mkdir(parents=True)
+        legacy = wt / '.task'
+        legacy.mkdir()
+
+        new_reviews = meta / 'reviews'
+        new_reviews.mkdir()
+        (new_reviews / 'reviewer-1.json').write_text(json.dumps({'verdict': 'PASS'}))
+
+        old_reviews = legacy / 'reviews'
+        old_reviews.mkdir()
+        (old_reviews / 'reviewer-1.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND'}))
+        (old_reviews / 'reviewer-2.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND'}))
+
+        result = read_task_artifacts(wt)
+
+        assert result['review_summary'] == '1/1 passed'
+
+    def test_iterations_new_path_wins_over_legacy(self, tmp_path):
+        """iterations.jsonl present under BOTH .task-meta and legacy .task/ resolves to the new copy."""
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        wt = tmp_path / '.worktrees' / '7'
+        wt.mkdir(parents=True)
+        meta = tmp_path / '.worktrees' / '.task-meta' / '7'
+        meta.mkdir(parents=True)
+        legacy = wt / '.task'
+        legacy.mkdir()
+
+        with open(meta / 'iterations.jsonl', 'w') as f:
+            for i in range(3):
+                f.write(json.dumps({'iteration': i + 1}) + '\n')
+        with open(legacy / 'iterations.jsonl', 'w') as f:
+            f.write(json.dumps({'iteration': 1}) + '\n')
+
+        result = read_task_artifacts(wt)
+
+        assert result['iteration_count'] == 3
+
 
 class TestExtractTaskId:
     """Tests for _extract_task_id — normalises worktree directory names to numeric task IDs."""
