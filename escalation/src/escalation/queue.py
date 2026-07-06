@@ -1001,23 +1001,26 @@ class EscalationQueue:
         authoritative (PRD task-status-authority-prd.md contract C9 /
         finding 10.4).
 
-        Read -> increment -> durable write (tmp+fsync+rename+dir-fsync, see
-        ``_write_seq_counter``) -> return.  This does not yet lock the
-        read-modify-write against concurrent processes; cross-process safety
-        is added by a later change wrapping this body in
-        ``escalation_id_lock``.
+        The read -> increment -> durable write (tmp+fsync+rename+dir-fsync,
+        see ``_write_seq_counter``) all happen inside
+        ``escalation_id_lock(queue_dir, f'esc-{task_id}.seq')`` so concurrent
+        OS processes minting ids for the SAME task_id serialize on the
+        stable ``esc-{task_id}.seq.json.lock`` sidecar inode and never
+        observe the same counter value.
         """
-        counter_path = self.queue_dir / f'esc-{task_id}.seq'
-        current = 0
-        if counter_path.exists():
-            try:
-                current = int(counter_path.read_text().strip())
-            except (ValueError, OSError) as e:
-                logger.warning(
-                    f'make_id: could not parse counter file {counter_path}: {e}; '
-                    'treating as 0'
-                )
-                current = 0
-        nxt = current + 1
-        self._write_seq_counter(counter_path, nxt)
-        return f'esc-{task_id}-{nxt}'
+        counter_id = f'esc-{task_id}.seq'
+        counter_path = self.queue_dir / counter_id
+        with escalation_id_lock(self.queue_dir, counter_id):
+            current = 0
+            if counter_path.exists():
+                try:
+                    current = int(counter_path.read_text().strip())
+                except (ValueError, OSError) as e:
+                    logger.warning(
+                        f'make_id: could not parse counter file {counter_path}: {e}; '
+                        'treating as 0'
+                    )
+                    current = 0
+            nxt = current + 1
+            self._write_seq_counter(counter_path, nxt)
+            return f'esc-{task_id}-{nxt}'
