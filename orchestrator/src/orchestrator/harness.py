@@ -4776,10 +4776,16 @@ Output JSON matching the schema. Every task must appear in the output.
         # Best-effort cleanup of any stale gate worktree left by a prior interrupted
         # run.  Without this, 'worktree add' fails with 'already exists' and maps to
         # a spurious FLIP + L1, requiring manual intervention.
-        for _cleanup_argv in (
-            ('git', 'worktree', 'remove', '--force', str(gate_path)),
-            ('git', 'worktree', 'prune'),
+        # The path-scoped `remove` is gated by the foreign-band guard (defense in
+        # depth against this cleanup ever targeting a protected band it does not
+        # own — gitops-chokepoints PRD, Mechanism 3); `prune` is registration-global,
+        # not band-scoped, so it always runs.
+        _cleanup_argvs = [('git', 'worktree', 'prune')]
+        if not self.git_ops._refuse_foreign_band(
+            gate_path, frozenset({'_substrate-gate-'}), 'substrate-gate-cleanup',
         ):
+            _cleanup_argvs.insert(0, ('git', 'worktree', 'remove', '--force', str(gate_path)))
+        for _cleanup_argv in _cleanup_argvs:
             try:
                 _cleanup_proc = await asyncio.create_subprocess_exec(
                     *_cleanup_argv,
