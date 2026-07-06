@@ -224,3 +224,59 @@ def require_known_project_id(
     """
     if err := validate_known_project_id(project_id, known_projects):
         raise InputValidationError(err['error'])
+
+
+def is_path_shaped_name(name: str) -> bool:
+    """True if *name* looks like a mangled filesystem path rather than a
+    clean project key (e.g. '-home-leo-src-dark-factory').
+
+    A mangled absolute path always retains a leading path separator: a raw
+    '/' if unmangled, or the '-' that an absolute path's leading '/'
+    collapses to once mangled into a graph name. The leak verdict is
+    scoped to that structural signal alone. An earlier revision also
+    flagged any name with >=4 hyphen segments containing a filesystem-ish
+    token (home, src, usr, ...), but that heuristic misclassified
+    legitimate multi-word project keys (e.g. 'my-home-src-app') as path
+    leaks purely because they happened to contain such a token; it has
+    been removed in favor of requiring an actual leading separator.
+    """
+    return name.startswith('/') or name.startswith('-') or '/' in name
+
+
+class PathShapedProjectIdError(ValueError):
+    """Raised when a project_id looks like a mangled filesystem path rather
+    than a clean project key (e.g. '-home-leo-src-dark-factory').
+
+    Path-shaped ids must NEVER be silently normalized: lower() +
+    replace('-', '_') would map a mangled path to a NEW, wrong canonical
+    key (e.g. '-home-leo-src-dark-factory' -> '_home_leo_src_dark_factory'),
+    compounding the RCA §4 cross-graph leak hazard instead of fixing it.
+    Callers must reject path-shaped input LOUDLY rather than canonicalizing
+    it. Subclasses ValueError so ``except ValueError`` callers still catch it.
+    """
+
+
+def canonicalize_project_id(raw: str) -> str:
+    """Return the underscore-canonical form of *raw*: lowercased, with
+    hyphens mapped to underscores.
+
+    This is a normalizer, not a validator: it does not reject empty strings
+    or enforce a charset allowlist (see validate_project_id for that). Its
+    only rejection is path-shaped input -- a *raw* that looks like a mangled
+    filesystem path (leading '-' or '/', or an embedded '/') raises
+    PathShapedProjectIdError rather than being normalized, since normalizing
+    a mangled path would produce a NEW, wrong canonical key (RCA §4).
+
+    Idempotent: canonicalize_project_id(canonicalize_project_id(x)) ==
+    canonicalize_project_id(x) for any non-path-shaped x, since lower() and
+    replace('-', '_') are each idempotent and a non-path-shaped input's
+    canonical form is itself never path-shaped.
+    """
+    if is_path_shaped_name(raw):
+        raise PathShapedProjectIdError(
+            f'project_id {raw!r} looks like a filesystem path, not a project '
+            'key -- refusing to normalize it (normalizing a mangled path '
+            'would silently produce a new, wrong canonical key). Pass the '
+            'resolved project_id instead.'
+        )
+    return raw.lower().replace('-', '_')
