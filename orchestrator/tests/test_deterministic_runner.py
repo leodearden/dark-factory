@@ -2382,6 +2382,231 @@ class TestBeforeDoneCrashWindow:
 
 
 # ---------------------------------------------------------------------------
+# Task 2120: escalation-aliasing phantom-done guard.
+#
+# The runner proves "a human resolved the deploy/gate" via task-scoped
+# escalation existence/absence. Without an agent_role filter, ANY escalation
+# sharing the task_id — e.g. one filed by an unrelated starvation-watchdog —
+# aliases as the runner's own dedup/quiescence/resolution-proof signal.
+#
+# These tests are RED until the impl step scopes the section-1 quiescence
+# (:867), before_done quiescence (:928), and ever_escalated (:958) queries to
+# DETERMINISTIC_AGENT_ROLE. The parity tests characterize runner-owned
+# signals and must stay GREEN both before and after that scoping fix.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDeterministicRunnerResolutionProofAliasing:
+    """An unrelated escalation sharing a task_id must never alias as this
+    runner's own resolution-proof/quiescence signal."""
+
+    _UNRELATED_ROLE = 'orchestrator-starvation-watchdog'
+
+    def _seed_resolved(
+        self, queue: EscalationQueue, task_id: str, agent_role: str,
+        category: str = 'infra_issue', level: int = 2,
+    ) -> Escalation:
+        """Submit then resolve (archive) an escalation for task_id/agent_role."""
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role=agent_role,
+            severity='critical',
+            category=category,
+            summary='seeded escalation (resolved)',
+            level=level,
+        )
+        queue.submit(esc)
+        queue.resolve(esc.id, 'resolved for test setup')
+        return esc
+
+    def _seed_pending(
+        self, queue: EscalationQueue, task_id: str, agent_role: str,
+        category: str = 'infra_issue', level: int = 2,
+    ) -> Escalation:
+        """Submit (leave pending) an escalation for task_id/agent_role."""
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role=agent_role,
+            severity='critical',
+            category=category,
+            summary='seeded escalation (pending)',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    # --- test a: ever_escalated (:958) resolution-proof aliasing -----------
+
+    async def test_ever_escalated_ignores_unrelated_resolved_escalation(self, tmp_path: Path):
+        """A RESOLVED unrelated (starvation-watchdog) escalation must NOT count
+        as this runner's own resolution proof.
+
+        Bug trace: pre-fix, `ever_escalated=bool(get_by_task(task_id))` finds
+        the unrelated resolved escalation and takes branch (b) — phantom-done
+        ('resumed after human resolution'). Post-fix, the role mismatch makes
+        ever_escalated False, falling to branch (c): re-escalate (its own
+        infra_issue) and BLOCK — never phantom-done, never re-run (I1).
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='800', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._seed_resolved(queue, '800', self._UNRELATED_ROLE)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, (
+            'An unrelated resolved escalation must NEVER phantom-complete the task'
+        )
+        pending = queue.get_by_task('800', status='pending')
+        assert len(pending) == 1, (
+            f'Runner must file its OWN infra_issue escalation (branch c), got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        assert pending[0].agent_role == 'orchestrator-deterministic'
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    # --- section-1 quiescence (:867) aliasing -------------------------------
+
+    async def test_section1_quiescence_ignores_unrelated_pending_escalation(self, tmp_path: Path):
+        """gate_escalated_at set; the runner's OWN gate is resolved but an
+        UNRELATED escalation for the same task is still pending — must drive
+        to done (its own gate is resolved), not alias on the unrelated one.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='801', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        # Runner's own gate escalation: resolved.
+        self._seed_resolved(queue, '801', 'orchestrator-deterministic', category='milestone_gate')
+        # Unrelated escalation for the SAME task: still pending.
+        self._seed_pending(queue, '801', self._UNRELATED_ROLE)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE, (
+            "An unrelated pending escalation must not alias as this runner's "
+            'own open gate — the gate itself is resolved, so resume must proceed'
+        )
+        scheduler.set_task_status.assert_awaited_once_with('801', 'done')
+
+    # --- before_done quiescence (:928) aliasing -----------------------------
+
+    async def test_before_done_quiescence_ignores_unrelated_pending_escalation(self, tmp_path: Path):
+        """before_done_ran_at + before_done_verified_at set; an UNRELATED
+        escalation is pending — must drive to done via the verified-proof
+        branch (a), not the aliased quiescent BLOCKED.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='802',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            before_done_verified_at='2026-06-23T10:01:00+00:00',
+            before_done_verified_pid=200,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._seed_pending(queue, '802', self._UNRELATED_ROLE)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE, (
+            "An unrelated pending escalation must not alias as this runner's "
+            'own quiescence signal when the deploy is already verified'
+        )
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(done_calls) == 1
+        provenance = done_calls[0].kwargs.get('done_provenance', {})
+        assert provenance.get('note') == 'resumed after verified deploy (crash before done write)'
+
+    # --- parity: runner-owned signals must keep working ---------------------
+
+    async def test_parity_runner_owned_resolved_escalation_still_resumes(self, tmp_path: Path):
+        """Parity: a RESOLVED escalation filed by the runner itself must still
+        prove resolution (branch b). Must stay GREEN before AND after the
+        :958 scoping fix.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='803', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._seed_resolved(queue, '803', 'orchestrator-deterministic')
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(done_calls) == 1
+        assert done_calls[0].kwargs.get('done_provenance', {}).get('note') == 'resumed after human resolution'
+
+    async def test_parity_runner_owned_pending_escalation_still_quiescent(self, tmp_path: Path):
+        """Parity: a PENDING escalation filed by the runner itself must still
+        quiesce (BLOCKED, no re-escalation). Must stay GREEN before AND after
+        the :867/:928 scoping fix.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='804', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._seed_pending(queue, '804', 'orchestrator-deterministic')
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls
+        pending = queue.get_by_task('804', status='pending')
+        assert len(pending) == 1, 'must not file a second escalation'
+
+
+# ---------------------------------------------------------------------------
 # Scheduled-marker resume (amend: Suggestion 2): crash between
 # before_done_scheduled_at stamp and the done write.
 # before_done_scheduled_at set → transient unit registered → drive to done
