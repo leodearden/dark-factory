@@ -5453,6 +5453,10 @@ class GitOps:
         async for wt_path, wt_resolved in self._iter_merge_worktrees():
             if wt_resolved in keep_resolved:
                 continue
+            if self._refuse_foreign_band(
+                wt_path, frozenset({'_merge-'}), 'prune_stale_merge_worktrees',
+            ):
+                continue
             rc_rm, _, err = await _run(
                 ['git', 'worktree', 'remove', '--force', str(wt_path)],
                 cwd=self.project_root,
