@@ -1345,6 +1345,109 @@ class TestGetPendingParseFailure:
         )
 
 
+class TestMakeIdCounter:
+    """make_id() is backed by a single durable per-task_id counter file —
+    NOT a directory/archive scan (PRD task-status-authority-prd.md contract
+    C9 / finding 10.4).  These tests encode PRD boundary test D1: strictly
+    increasing, no collision, no rescan dependence.
+    """
+
+    def test_make_id_is_durable_across_restart(self, tmp_path: Path):
+        """The counter persists across process restart (fresh EscalationQueue instance).
+
+        No submits at all — make_id() alone must persist its issued sequence
+        to disk so a fresh instance continues from where the prior instance
+        left off.
+
+        RED on main: the in-memory _seq resets to 0 on a fresh instance and
+        the queue/archive dirs are empty, so instance2.make_id('cnt') would
+        return 'esc-cnt-1' instead of 'esc-cnt-4'.
+        """
+        queue_dir = tmp_path / 'queue'
+
+        instance1 = EscalationQueue(queue_dir)
+        assert instance1.make_id('cnt') == 'esc-cnt-1'
+        assert instance1.make_id('cnt') == 'esc-cnt-2'
+        assert instance1.make_id('cnt') == 'esc-cnt-3'
+
+        # Simulate restart: fresh instance, no in-memory state carried over.
+        instance2 = EscalationQueue(queue_dir)
+        assert instance2.make_id('cnt') == 'esc-cnt-4'
+
+    def test_make_id_counter_authoritative_over_archive(self, tmp_path: Path):
+        """The counter — not archive contents — determines the next sequence.
+
+        Mint+submit+resolve esc-cnt-1 and esc-cnt-2 (both archived). Mint two
+        more WITHOUT submitting (counter advances to 4, but nothing is
+        written to disk for them). Restart. make_id('cnt') must return
+        'esc-cnt-5' (continuing the durable counter), not re-derive from the
+        archive max.
+
+        RED on main: the archive scan sees max=2 (only esc-cnt-1/2 were ever
+        submitted) -> returns 'esc-cnt-3', colliding with an id already
+        issued (in-memory, pre-restart) but never submitted.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        id1 = queue.make_id('cnt')
+        assert id1 == 'esc-cnt-1'
+        queue.submit(_make_escalation(id1, task_id='cnt'))
+        queue.resolve(id1, 'fixed first')
+
+        id2 = queue.make_id('cnt')
+        assert id2 == 'esc-cnt-2'
+        queue.submit(_make_escalation(id2, task_id='cnt'))
+        queue.resolve(id2, 'fixed second')
+
+        # Mint two more WITHOUT submitting — counter advances to 4.
+        assert queue.make_id('cnt') == 'esc-cnt-3'
+        assert queue.make_id('cnt') == 'esc-cnt-4'
+
+        # Simulate restart: fresh instance, no in-memory state carried over.
+        queue2 = EscalationQueue(queue_dir)
+        id5 = queue2.make_id('cnt')
+        assert id5 == 'esc-cnt-5', (
+            f'Expected esc-cnt-5 (durable counter continues past the '
+            f'minted-but-unsubmitted esc-cnt-3/4) but got {id5!r}'
+        )
+
+        queue2.submit(_make_escalation(id5, task_id='cnt'))
+        all_ids = {e.id for e in queue2.get_by_task('cnt')}
+        assert all_ids == {'esc-cnt-1', 'esc-cnt-2', 'esc-cnt-5'}, (
+            f'Expected exactly the three submitted ids with no duplicates, got {all_ids}'
+        )
+
+    def test_make_id_does_not_scan_archive(self, tmp_path: Path):
+        """make_id() never touches the archive — _iter_archive_paths is not called.
+
+        Seeds an archive file directly (bypassing the queue/counter) so that
+        if make_id() still consulted the archive it would see it. Spies on
+        _iter_archive_paths and asserts it is never invoked.
+
+        RED on main: make_id() calls _scan_archive_max_seq() ->
+        _iter_archive_paths() on the cache miss (the first call for this
+        task_id), so call_count would be >= 1, not 0.
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2025-06-10'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        seeded = _make_escalation('esc-cnt-5', task_id='cnt', status='resolved')
+        (archive_dir / 'esc-cnt-5.json').write_text(seeded.to_json())
+
+        queue = EscalationQueue(queue_dir)
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            queue.make_id('cnt')
+            queue.make_id('cnt')
+
+        assert spy.call_count == 0, (
+            f'make_id() must not scan the archive; _iter_archive_paths called '
+            f'{spy.call_count}x'
+        )
+
+
 class TestMakeIdAcrossArchive:
     """make_id() must consider archived sequence numbers to avoid post-restart collisions."""
 
