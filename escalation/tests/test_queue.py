@@ -1176,6 +1176,141 @@ class TestGetByTaskDedupAcrossArchive:
         )
 
 
+class TestGetByTaskAgentRoleFilter:
+    """get_by_task(agent_role=...) restricts results to escalations filed by that
+    exact agent_role (Task 2120).
+
+    This closes an escalation-aliasing phantom-done vector in DeterministicRunner:
+    without this filter, ANY escalation sharing a task_id — e.g. one filed by an
+    unrelated starvation-watchdog — aliases as the runner's own dedup/quiescence/
+    resolution-proof signal.
+    """
+
+    def _make_esc(
+        self, esc_id: str, task_id: str, agent_role: str,
+        status: str = 'pending', level: int = 0,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role=agent_role,
+            severity='blocking',
+            category='infra_issue',
+            summary='Agent role filter test',
+            level=level,
+        )
+        esc.status = status
+        return esc
+
+    def test_pending_tier_filters_by_matching_agent_role(self, tmp_path: Path):
+        """(1a) Two pending escalations, same task, different roles — agent_role
+        returns only the matching one."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(self._make_esc('esc-42-1', '42', 'orchestrator-deterministic'))
+        queue.submit(self._make_esc('esc-42-2', '42', 'orchestrator-starvation-watchdog'))
+
+        results = queue.get_by_task('42', status='pending', agent_role='orchestrator-deterministic')
+
+        assert {e.id for e in results} == {'esc-42-1'}
+
+    def test_pending_tier_no_match_returns_empty(self, tmp_path: Path):
+        """(1b) A role with no matching escalations returns []."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(self._make_esc('esc-42-1', '42', 'orchestrator-starvation-watchdog'))
+
+        results = queue.get_by_task('42', status='pending', agent_role='orchestrator-deterministic')
+
+        assert results == []
+
+    def test_archive_tier_filters_by_matching_agent_role(self, tmp_path: Path):
+        """(2) Resolved (archived) escalations of role X and role Y — agent_role=X
+        returns X and excludes Y."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(self._make_esc('esc-42-1', '42', 'orchestrator-deterministic'))
+        queue.resolve('esc-42-1', 'fixed x')
+        queue.submit(self._make_esc('esc-42-2', '42', 'orchestrator-starvation-watchdog'))
+        queue.resolve('esc-42-2', 'fixed y')
+
+        results = queue.get_by_task('42', agent_role='orchestrator-deterministic')
+
+        assert {e.id for e in results} == {'esc-42-1'}
+
+    def test_none_agent_role_is_no_filter(self, tmp_path: Path):
+        """(3) agent_role=None (default, and passed explicitly) returns all roles —
+        full backward compatibility for the ~40 existing callers."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(self._make_esc('esc-42-1', '42', 'orchestrator-deterministic'))
+        queue.submit(self._make_esc('esc-42-2', '42', 'orchestrator-starvation-watchdog'))
+
+        default_results = queue.get_by_task('42')
+        explicit_none_results = queue.get_by_task('42', agent_role=None)
+
+        assert {e.id for e in default_results} == {'esc-42-1', 'esc-42-2'}
+        assert {e.id for e in explicit_none_results} == {'esc-42-1', 'esc-42-2'}
+
+    def test_agent_role_combines_conjunctively_with_status_and_level(self, tmp_path: Path):
+        """(4) agent_role applies conjunctively with status='pending' and level=2 —
+        only the escalation matching all three filters is returned."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        # Matching role, wrong level -> excluded by level filter.
+        queue.submit(self._make_esc('esc-42-1', '42', 'orchestrator-deterministic', level=0))
+        # Matching role and level, but resolved -> excluded by status='pending'.
+        queue.submit(self._make_esc('esc-42-2', '42', 'orchestrator-deterministic', level=2))
+        queue.resolve('esc-42-2', 'done')
+        # Wrong role, matching level+status -> excluded by agent_role filter.
+        queue.submit(self._make_esc('esc-42-3', '42', 'orchestrator-starvation-watchdog', level=2))
+        # Matches all three filters.
+        queue.submit(self._make_esc('esc-42-4', '42', 'orchestrator-deterministic', level=2))
+
+        results = queue.get_by_task(
+            '42', status='pending', level=2, agent_role='orchestrator-deterministic',
+        )
+
+        assert {e.id for e in results} == {'esc-42-4'}
+
+    def test_matching_role_dedups_id_across_root_and_archive(self, tmp_path: Path):
+        """(5a) Same id in both root and archive, both copies matching role —
+        dedups to one (queue_dir copy wins, per existing precedence)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(self._make_esc('esc-42-1', '42', 'orchestrator-deterministic'))
+        queue.resolve('esc-42-1', 'original')
+
+        # Simulate crash-mid-resolve: a copy also lands back in queue_dir root.
+        root_copy = self._make_esc('esc-42-1', '42', 'orchestrator-deterministic', status='resolved')
+        root_copy.resolution = 'from_queue_root'
+        (queue.queue_dir / 'esc-42-1.json').write_text(root_copy.to_json())
+
+        results = queue.get_by_task('42', agent_role='orchestrator-deterministic')
+
+        ids = [e.id for e in results]
+        assert ids.count('esc-42-1') == 1
+        assert results[0].resolution == 'from_queue_root'
+
+    def test_non_matching_role_never_shadows_matching_copy(self, tmp_path: Path):
+        """(5b) A non-matching-role copy in one tier must never shadow — via the
+        seen-dedup bookkeeping — a matching-role copy of the SAME id in the other
+        tier. Regression target: if the agent_role filter ran AFTER `seen.add`,
+        the wrong-role root copy (visited first) would mark the id 'seen' and
+        hide the matching archive copy, returning [] instead of one match.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        wrong_role = self._make_esc(
+            'esc-42-1', '42', 'orchestrator-starvation-watchdog', status='resolved',
+        )
+        right_role = self._make_esc(
+            'esc-42-1', '42', 'orchestrator-deterministic', status='resolved',
+        )
+        (queue.queue_dir / 'esc-42-1.json').write_text(wrong_role.to_json())
+        archive_dir = queue.queue_dir / 'archive' / '2025-06-15'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        (archive_dir / 'esc-42-1.json').write_text(right_role.to_json())
+
+        results = queue.get_by_task('42', agent_role='orchestrator-deterministic')
+
+        assert {e.id for e in results} == {'esc-42-1'}
+        assert results[0].agent_role == 'orchestrator-deterministic'
+
+
 class TestGetPendingParseFailure:
     """get_pending() must emit a WARNING when a queue file cannot be parsed."""
 
