@@ -310,3 +310,43 @@ class TestTaskMetadataFields:
         dumped = TaskMetadata(**blob).model_dump()
         for key, value in blob.items():
             assert dumped[key] == value
+
+
+class TestDeterministicInvariants:
+    """The two named cross-field invariants (CLAUDE.md field-combo presets)."""
+
+    _MINIMAL_BEFORE_DONE = {'script': 'scripts/x.sh', 'timeout_secs': 60}
+
+    def test_auto_deploy_accepted(self):
+        # deterministic + before_done + always_escalates=False [auto-deploy]
+        TaskMetadata(
+            task_kind='deterministic',
+            before_done=self._MINIMAL_BEFORE_DONE,
+            always_escalates=False,
+        )
+
+    def test_act_then_ask_accepted(self):
+        # deterministic + before_done + always_escalates=True [act-then-ask]
+        TaskMetadata(
+            task_kind='deterministic',
+            before_done=self._MINIMAL_BEFORE_DONE,
+            always_escalates=True,
+        )
+
+    def test_pure_gate_accepted(self):
+        # deterministic + no before_done + always_escalates=True [pure gate]
+        TaskMetadata(task_kind='deterministic', always_escalates=True)
+
+    def test_normal_default_accepted(self):
+        # task_kind='normal' + no before_done [default]
+        TaskMetadata(task_kind='normal')
+
+    def test_deterministic_ill_formed_no_op_rejected(self):
+        # deterministic + no before_done + always_escalates=False [ill-formed no-op]
+        with pytest.raises(ValidationError):
+            TaskMetadata(task_kind='deterministic', always_escalates=False)
+
+    def test_before_done_only_valid_on_deterministic_rejected(self):
+        # task_kind='normal' + before_done set [before_done only on deterministic]
+        with pytest.raises(ValidationError):
+            TaskMetadata(task_kind='normal', before_done=self._MINIMAL_BEFORE_DONE)
