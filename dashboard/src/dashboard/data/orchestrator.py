@@ -241,9 +241,11 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     docstring's FORMAT COUPLING section) and mirrors
     TaskArtifacts._read_path's new-then-old resolution (metadata.json,
     plan.json, and iterations.jsonl via the _resolve() helper; the reviews/
-    directory via its own is_dir() check, since a directory has no single
-    path to stat). The legacy fallback is retired at task ι once a full
-    compat-window cycle confirms every lane has migrated.
+    directory via its own is_dir()-and-has-entries check, since a directory
+    has no single path to stat and "new wins" must be content-based — an
+    empty .task-meta/reviews dir from a mid-migration state must not shadow
+    a populated legacy one). The legacy fallback is retired at task ι once a
+    full compat-window cycle confirms every lane has migrated.
 
     FUTURE SINGLE OWNER: stream W11's TaskArtifacts — see the module
     docstring's FORMAT COUPLING section.
@@ -302,21 +304,24 @@ def read_task_artifacts(worktree_path: Path) -> dict:
         pass
 
     # Review summary — resolve the reviews/ directory new-then-old (not a
-    # single file, so this doesn't go through _resolve).
+    # single file, so this doesn't go through _resolve). The new dir only
+    # wins once it actually contains review files: an empty .task-meta
+    # reviews/ dir (e.g. mid-migration, before any review has run there)
+    # must not shadow a populated legacy .task/reviews dir.
     review_summary = '—'
     reviews_dir = meta_dir / 'reviews'
-    if not reviews_dir.is_dir():
+    review_files = list(reviews_dir.glob('*.json')) if reviews_dir.is_dir() else []
+    if not review_files:
         reviews_dir = legacy_dir / 'reviews'
-    if reviews_dir.is_dir():
-        review_files = list(reviews_dir.glob('*.json'))
-        if review_files:
-            total_reviews = len(review_files)
-            passed = 0
-            for review_file in review_files:
-                review, _ok = load_json_or_warn(review_file, default=None)
-                if isinstance(review, dict) and review.get('verdict') == 'PASS':
-                    passed += 1
-            review_summary = f'{passed}/{total_reviews} passed'
+        review_files = list(reviews_dir.glob('*.json')) if reviews_dir.is_dir() else []
+    if review_files:
+        total_reviews = len(review_files)
+        passed = 0
+        for review_file in review_files:
+            review, _ok = load_json_or_warn(review_file, default=None)
+            if isinstance(review, dict) and review.get('verdict') == 'PASS':
+                passed += 1
+        review_summary = f'{passed}/{total_reviews} passed'
 
     return {
         'metadata': metadata,
