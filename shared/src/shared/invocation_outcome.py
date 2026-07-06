@@ -222,6 +222,32 @@ NON_CAP_CLI_ERROR_MARKERS = [
     'permission denied',
 ]
 
+# Patterns that indicate a usage cap has been hit (from Claude Code CLI
+# output). Copied from usage_gate.py:48 (CAP_HIT_PREFIXES).
+CAP_HIT_PREFIXES = [
+    "You've hit your",
+    "You've used",
+    "You're out of extra",
+    "You're now using extra",
+]
+# Secondary confirmation — at least one of these keywords must also appear in
+# the same text for a CAP_HIT or NEAR_CAP prefix match to be accepted
+# (defense-in-depth against ambiguous prefix false positives).
+# NOTE: 'upgrade' was narrowed to multi-word phrases because the bare verb is
+# too common in unrelated CLI messaging (e.g. 'Upgrade to v2 for more features')
+# and would effectively reduce the guard to a near-prefix-only match in those
+# cases.  'upgrade your plan' and 'upgrade your subscription' are natural SaaS
+# cap-message phrases unlikely to appear in non-cap contexts.  The primary
+# defense remains the CAP_HIT_PREFIXES / NEAR_CAP_PREFIXES prefix match.
+# Copied from usage_gate.py:78 (CAP_CONFIRM_KEYWORDS).
+CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade your plan", "upgrade your subscription"]
+
+# Patterns for near-cap warnings (pause proactively). Copied from
+# usage_gate.py:81 (NEAR_CAP_PREFIXES).
+NEAR_CAP_PREFIXES = [
+    "You're close to",
+]
+
 
 def _extract_cap_message(text: str, prefix: str) -> str:
     """Extract the full sentence containing the cap-hit prefix."""
@@ -267,5 +293,36 @@ def classify_invocation(
     for marker in NON_CAP_CLI_ERROR_MARKERS:
         if marker in combined_lower:
             return CliLocalError(marker=marker)
+
+    # Claude cap/near-cap detection: require both a prefix match AND a
+    # secondary confirmation keyword (defence against false positives on
+    # generic prefixes like "You've used" or "You're close to") — UNLESS
+    # strict_confirm=False, which skips the confirm-keyword guard entirely.
+    #
+    # NOTE — intentional asymmetry, DO NOT 'fix' by unifying the two regimes:
+    # strict_confirm=True is the detect_cap_hit regime (retry-loop / gate
+    # mutation path): a false-positive cap detection here would wrongly pause
+    # a healthy account, so it demands the extra confirm-keyword evidence.
+    # strict_confirm=False is the DD-2 _run_probe regime: the probe only runs
+    # while an account is ALREADY blocked (capped or auth_failed), so any
+    # whiff of a cap-like prefix means "still capped, do not resume" — a
+    # false positive there just means one extra probe cycle, whereas a false
+    # negative (wrongly resuming a still-capped account) burns quota on a
+    # limited account. The two regimes optimise for different failure costs,
+    # so the guard is intentionally asymmetric. See
+    # test_probe_prefix_only_without_confirm_keyword_still_returns_false in
+    # test_usage_gate_exhaustive.py for the historical rationale.
+    has_confirm_keyword = any(kw in combined_lower for kw in CAP_CONFIRM_KEYWORDS)
+    if not strict_confirm or has_confirm_keyword:
+        for prefix in CAP_HIT_PREFIXES:
+            if prefix.lower() in combined_lower:
+                resets_at = _parse_resets_at(combined)
+                reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
+                return CapHit(resets_at=resets_at, reason=reason)
+
+        for prefix in NEAR_CAP_PREFIXES:
+            if prefix.lower() in combined_lower:
+                reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
+                return NearCap(reason=reason)
 
     return Failure(kind='unclassified')
