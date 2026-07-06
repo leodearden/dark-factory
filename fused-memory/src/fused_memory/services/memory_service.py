@@ -697,6 +697,11 @@ class MemoryService:
         - If a canonical 'Task N' node already exists, every bad-named node is
           MERGED into it via ``merge_entities`` — renaming instead would recreate
           the exact-name duplicate ``_dedup_episode_nodes`` exists to resolve.
+          Any *other* pre-existing canonical duplicates (e.g. left over from
+          before this hook existed, which this episode never touched) are
+          folded into the same survivor too, so a single hook run fully
+          collapses the canonical-name group rather than only fixing the
+          bad-named arrival.
         - Otherwise, the bad-named survivor (most valid edges, then oldest, then
           uuid — same canonical ordering as ``find_duplicate_entity_nodes``) is
           RENAMED to the canonical name via ``rename_entity_node``, and any
@@ -751,6 +756,15 @@ class MemoryService:
                 if canon_matches:
                     canon_survivor = canon_matches[0]['uuid']
                     for dup in bad_matches:
+                        await self.graphiti.merge_entities(
+                            dup['uuid'], canon_survivor, group_id=group_id,
+                        )
+                        fixed += 1
+                    # Pre-existing canonical duplicates this episode never
+                    # touched (e.g. left behind before this hook existed)
+                    # would otherwise only get fixed if some future episode
+                    # happens to touch them again — fold them in now too.
+                    for dup in canon_matches[1:]:
                         await self.graphiti.merge_entities(
                             dup['uuid'], canon_survivor, group_id=group_id,
                         )

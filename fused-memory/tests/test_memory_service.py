@@ -2800,6 +2800,39 @@ class TestNormalizeTaskNodeNames:
         service.graphiti.rename_entity_node.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_merges_extra_preexisting_canonical_duplicates_too(self, service):
+        """When more than one canonical 'Task N' node already exists (a
+        pre-existing duplicate this episode's dedup pass didn't touch), every
+        extra canonical duplicate is folded into the chosen survivor as well
+        — not just the bad-named node this episode introduced. Otherwise
+        those pre-existing canonical duplicates are only ever fixed if some
+        future episode happens to touch them again."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        async def fake_find_duplicates(name, *, group_id):
+            if name == 'tasks 153':
+                return [{'uuid': 'bad-uuid', 'created_at': 100, 'edge_count': 1}]
+            if name == 'Task 153':
+                return [
+                    {'uuid': 'canon-uuid', 'created_at': 50, 'edge_count': 5},
+                    {'uuid': 'canon-dup-uuid', 'created_at': 60, 'edge_count': 2},
+                ]
+            return []
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
+        service.graphiti.rename_entity_node = AsyncMock(return_value={})
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='tasks 153')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 2
+        service.graphiti.merge_entities.assert_any_await('bad-uuid', 'canon-uuid', group_id='test')
+        service.graphiti.merge_entities.assert_any_await('canon-dup-uuid', 'canon-uuid', group_id='test')
+        assert service.graphiti.merge_entities.await_count == 2
+        service.graphiti.rename_entity_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_renames_survivor_and_merges_remaining_dups_when_no_canonical(self, service):
         """(c) Two 'task 132' duplicates with no canonical -> the survivor is
         renamed and the remaining duplicate is merged into it."""
