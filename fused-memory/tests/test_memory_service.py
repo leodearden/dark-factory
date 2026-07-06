@@ -3075,6 +3075,34 @@ class TestExecuteGraphitiWriteWithDedup:
         service._dedup_episode_nodes.assert_awaited_once()
         assert service._dedup_episode_nodes.call_args == ((mock_result,), {'group_id': 'test'})
 
+    @pytest.mark.asyncio
+    async def test_execute_graphiti_write_calls_normalize_task_node_names(self, service):
+        """task 2110 step-7: the task-node-name normalization hook is invoked
+        with the add_episode result and group_id, alongside the edge-dedup/
+        restore/node-dedup sweeps already wired into _execute_graphiti_write."""
+        from unittest.mock import AsyncMock
+
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        mock_result = MockAddEpisodeResult(nodes=[MockNode(name='task 132')])
+
+        service.graphiti.add_episode = AsyncMock(return_value=mock_result)
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+        service._dedup_episode_nodes = AsyncMock(return_value=0)
+        service._normalize_task_node_names = AsyncMock(return_value=0)
+
+        payload = {
+            'name': 'ep_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        service._normalize_task_node_names.assert_awaited_once()
+        assert service._normalize_task_node_names.call_args == ((mock_result,), {'group_id': 'test'})
+
 
 # ---------------------------------------------------------------------------
 # Tests for _dual_write_callback reading result.edges  (step 11)
