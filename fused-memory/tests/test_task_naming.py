@@ -36,6 +36,7 @@ class TestCanonicalizeTaskNodeNameMatches:
         (same string in, same string out) — required for the hook's canonical!=name
         guard to treat already-canonical nodes as untouched."""
         once = canonicalize_task_node_name('task 132')
+        assert once is not None  # narrows str | None -> str for the chained call below
         twice = canonicalize_task_node_name(once)
         assert once == 'Task 132'
         assert twice == 'Task 132'
