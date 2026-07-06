@@ -1300,6 +1300,66 @@ class TestReadPlanNewThenOldCompat:
         assert 'tdd_steps' in legacy_plan_after
         assert 'steps' not in legacy_plan_after
 
+    def test_stamp_plan_provenance_from_legacy_targets_new_only(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        """stamp_plan_provenance reads a legacy-only plan.json via the
+        new-then-old fallback (through read_plan) and writes the
+        provenance-stamped plan under meta_root only, leaving the legacy
+        copy un-stamped.
+        """
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        legacy_plan = {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
+        (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.stamp_plan_provenance('session-abc123')
+
+        new_plan = json.loads((meta_root / 'plan.json').read_text())
+        assert new_plan['_session_id'] == 'session-abc123'
+        assert '_created_at' in new_plan
+        assert '_finalized_at' in new_plan
+
+        # Legacy copy must be untouched — still un-stamped.
+        legacy_plan_after = json.loads((legacy_root / 'plan.json').read_text())
+        assert '_session_id' not in legacy_plan_after
+
+    def test_bump_revalidation_stamp_from_legacy_targets_new_only(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        """bump_revalidation_stamp reads a legacy-only plan.json (via
+        read_plan's new-then-old fallback) and writes the revalidation
+        stamp under meta_root only. Passing base_commit also drives
+        update_base_commit's own migrate-on-write of a legacy-only
+        metadata.json to meta_root. Both legacy copies are left untouched.
+        """
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        legacy_plan = {
+            '_session_id': 'orig-planner',
+            'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
+        }
+        (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
+        (legacy_root / 'metadata.json').write_text(json.dumps({
+            'task_id': 'task-1', 'base_commit': 'old-sha',
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.bump_revalidation_stamp('reval-runner', base_commit='new-sha')
+
+        new_plan = json.loads((meta_root / 'plan.json').read_text())
+        assert new_plan['_revalidated_by_session'] == 'reval-runner'
+        assert new_plan['_session_id'] == 'orig-planner'  # preserved
+        new_metadata = json.loads((meta_root / 'metadata.json').read_text())
+        assert new_metadata['base_commit'] == 'new-sha'
+
+        # Legacy copies must be untouched.
+        legacy_plan_after = json.loads((legacy_root / 'plan.json').read_text())
+        assert '_revalidated_by_session' not in legacy_plan_after
+        legacy_metadata_after = json.loads((legacy_root / 'metadata.json').read_text())
+        assert legacy_metadata_after['base_commit'] == 'old-sha'
+
 
 class TestUniformReadFallback:
     """The new-then-old read compat is uniform across artifact types, not
