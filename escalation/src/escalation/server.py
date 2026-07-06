@@ -15,6 +15,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 
 from escalation import sweep as _sweep
+from escalation.action_effects import effect_for
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
@@ -550,6 +551,28 @@ def create_server(
 
         ``resolved_by`` attributes the resolver (e.g. ``"steward"``, ``"interactive"``).
         ``resolution_turns`` records how many conversation turns resolution took.
+
+        **Table B** (``escalation.action_effects``) is the single authority for
+        action legality, consulted BEFORE any record mutation:
+
+        - ``resume``     -> target_status ``pending``,        disposition ``resume_from_pause``
+        - ``restart``    -> target_status ``pending``,        disposition ``restart_from_scratch``
+        - ``park``       -> target_status ``blocked``,        disposition ``park_kill_block_keep_l2_open``
+        - ``abandon``    -> target_status ``cancelled``,      disposition ``abandon_kill_cancel``
+        - ``close_only`` -> target_status ``None`` (no-op),   disposition ``no_effect``
+
+        An ``(action, level, category)`` with no defined ``TaskEffect`` — today,
+        any ``action`` outside the five above — is rejected loudly:
+        ``{'error': ..., 'code': 'illegal_transition'}``, with NO record change.
+        Level and category never narrow legality today (see the
+        ``escalation.action_effects`` module docstring for the archive
+        verification behind this).
+
+        NOTE: the ``target_status`` values above are not yet written by
+        resolve_issue — this call changes only the escalation record; the
+        task-status effects described in the table earlier in this docstring
+        remain owned by the orchestrator harness. Wiring the harness to
+        consume Table B directly is a separate, out-of-scope follow-up.
         """
         if terminate is not None:
             return {
@@ -559,8 +582,6 @@ def create_server(
                     "— see resolve_issue docstring."
                 )
             }
-        if action not in RESOLVE_ACTIONS:
-            return {'error': f'invalid action {action!r}; expected one of {list(RESOLVE_ACTIONS)}'}
 
         # Connection-capability gate (escalation-connection-capability-guard-prd.md,
         # task alpha). get_http_headers() returns {} outside an ASGI request context
@@ -596,6 +617,26 @@ def create_server(
             # park stamp (below) and the resolve call further down — a caller
             # cannot spoof resolved_by once the connection asserts an identity.
             resolved_by = identity
+
+        # Table B legality gate (plans/task-status-authority-prd.md contract C5,
+        # decisions D1/D2) — the SINGLE authority for resolve_issue action
+        # legality, consulted BEFORE any record mutation. Replaces the old bare
+        # `action not in RESOLVE_ACTIONS` check: an unrecognised action now
+        # returns a typed error (mirroring the capability gate above) instead
+        # of an untyped one; no record is changed either way.
+        rec = queue.get(escalation_id)
+        if rec is None:
+            return {'error': f'Escalation {escalation_id} not found'}
+        effect = effect_for(action, rec.level, rec.category)
+        if effect is None:
+            return {
+                'error': (
+                    f'illegal resolution: no TaskEffect for (action={action!r}, '
+                    f'level={rec.level}, category={rec.category!r}); expected '
+                    f'action in {list(RESOLVE_ACTIONS)}'
+                ),
+                'code': 'illegal_transition',
+            }
 
         if action == 'park':
             # Version-a: park keeps the escalation open at L2.
