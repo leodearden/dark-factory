@@ -47,6 +47,11 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
+from orchestrator.systemd_inspect import (
+    _deterministic_deploy_health_verdict,
+    _INSPECT_TIMEOUT_SECS,
+    inspect_systemd_unit,
+)
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -326,71 +331,25 @@ def _is_valid_sha_40(s: object) -> TypeGuard[str]:
     )
 
 
-def _deterministic_deploy_health_verdict(inspect_result: dict | None) -> str:
-    """Classify a systemd unit-inspector result as 'healthy' or 'unconfirmed'.
-
-    'healthy' iff MainPID is a positive int AND ActiveState == 'active' — a
-    conservative liveness signal (task 2074 design decision: brittle
-    wall-clock ActiveEnterTimestamp comparison is deliberately avoided; the
-    escalation still routes through the existing watcher/human path for final
-    adjudication).  None-safe: a missing/malformed result is 'unconfirmed'.
-
-    CAVEAT (task 2074 amendment): this is a pure liveness check, NOT a
-    freshness check — it does not confirm that *this* deploy's restart is
-    what made the unit active, only that the unit is up right now.  For a
-    long-lived/always-on service unit (the common case — e.g.
-    'fused-memory.service'), the verdict is near-constant 'healthy'
-    regardless of whether the triggering restart actually took effect,
-    because the unit was probably already active before the deploy ran too.
-    DeterministicRunner's own in-run verify path avoids this ambiguity by
-    comparing a freshly-observed ActiveEnterTimestampMonotonic against a
-    baseline captured immediately before the restart — but that baseline is
-    a local variable, never persisted to task metadata, so it does not exist
-    for a task stranded by a PAST run (this sweep's Source-A recovery case,
-    e.g. task 2059) and a retroactive freshness comparison is not possible
-    without touching deterministic_runner.py to persist one going forward
-    (out of scope for task 2074). Callers (Source A's stranded_blocked/resume
-    filing and Source B's auto-resolve) accept this weaker signal: it is
-    still strictly better than the prior silent-strand status quo, and both
-    paths RE-FILE/resolve an escalation rather than flipping task status
-    directly, so a wrong verdict surfaces via the normal escalation/watcher
-    machinery rather than silently corrupting state.
-    """
-    if not inspect_result:
-        return 'unconfirmed'
-    pid = inspect_result.get('MainPID', 0)
-    if isinstance(pid, int) and pid > 0 and inspect_result.get('ActiveState') == 'active':
-        return 'healthy'
-    return 'unconfirmed'
+# _deterministic_deploy_health_verdict is now defined in systemd_inspect.py
+# (task 2119) and imported above verbatim; re-bound to this name so existing
+# `from orchestrator.harness import _deterministic_deploy_health_verdict`
+# call sites (incl. tests) keep working unchanged.
 
 
 async def _recon_inspect_unit(unit: str) -> dict:
     """Query systemctl for unit state fields needed for the recon-sweep health verdict.
 
-    Standalone duplicate of ``DeterministicRunner._default_inspect_unit``'s
-    ``systemctl --user show`` pattern — NOT imported from the runner (task 2074
-    does not modify deterministic_runner.py; the runner's inspector is a
-    private bound method requiring an instance).  Returns a dict with at least
-    MainPID (int) and ActiveState (str); MainPID defaults to 0 on parse failure.
+    Task 2119: thin delegate to the hoisted, hardened
+    ``systemd_inspect.inspect_systemd_unit`` (previously a standalone
+    duplicate of ``DeterministicRunner._default_inspect_unit``'s
+    ``systemctl --user show`` pattern — task 2091's timeout/kill/reap
+    hardening now lives there exactly once, so this sweep gets it too).
+    Uses the module's default timeout (no DeterministicRunner instance is
+    available here). Returns a dict with at least MainPID (int) and
+    ActiveState (str); MainPID defaults to 0 on parse failure.
     """
-    proc = await asyncio.create_subprocess_exec(
-        'systemctl', '--user', 'show', unit,
-        '-p', 'MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic',
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    stdout, _ = await proc.communicate()
-    result: dict = {}
-    for line in (stdout or b'').decode(errors='replace').splitlines():
-        if '=' in line:
-            key, _, val = line.partition('=')
-            result[key.strip()] = val.strip()
-    for numeric_field in ('MainPID', 'ActiveEnterTimestampMonotonic'):
-        try:
-            result[numeric_field] = int(result.get(numeric_field, 0))
-        except (TypeError, ValueError):
-            result[numeric_field] = 0
-    return result
+    return await inspect_systemd_unit(unit, timeout_secs=_INSPECT_TIMEOUT_SECS)
 
 
 def _is_stranded_deterministic_shape(metadata: dict | None) -> bool:
