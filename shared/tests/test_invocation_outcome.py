@@ -316,6 +316,22 @@ class TestClassifyInvocationCliLocalError:
         outcome = classify_invocation(result, strict_confirm=True)
         assert outcome == AuthFailed(status=401)
 
+    def test_success_true_outranks_incidental_cli_marker_text(self):
+        """A successful invocation is authoritative even when its own output
+        happens to quote a CLI-error marker substring (e.g. an agent that ran
+        `ls` on a missing path and echoed "no such file or directory", or
+        discussed a "permission denied" message) — it must not be
+        reclassified as CliLocalError. The legacy `_is_non_cap_cli_error`
+        check this consolidates only ever ran on the failure path; success=
+        True must short-circuit before it runs, exactly as it already does
+        for the fuzzy cap-prefix heuristics."""
+        result = AgentResult(
+            success=True,
+            output='Checked /tmp/x: permission denied, as expected for a locked-down path.',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == OK()
+
 
 class TestClassifyInvocationClaudeCap:
     """Claude CapHit/NearCap detection and the strict_confirm (DD-2) toggle."""

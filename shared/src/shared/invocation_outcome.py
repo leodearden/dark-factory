@@ -292,7 +292,7 @@ def classify_invocation(
     """Classify a CLI agent invocation result into an ``InvocationOutcome``.
 
     Total and pure: every ``AgentResult`` maps to exactly one variant, in
-    precedence order AuthFailed > CliLocalError > OK > CapHit/NearCap >
+    precedence order AuthFailed > OK > CliLocalError > CapHit/NearCap >
     ZeroOutputWedge > Failure. Reads only ``result`` (and ``backend`` /
     ``strict_confirm``) — no I/O, no gate mutation.
     """
@@ -307,6 +307,23 @@ def classify_invocation(
     combined = f'{result.stderr or ""}\n{result.output or ""}'
     combined_lower = combined.lower()
 
+    # OK — a successful invocation short-circuits every remaining
+    # string-based heuristic below: CLI-local-error markers, cap/near-cap
+    # prefixes, and wedge detection alike. Without this, a successful run
+    # whose output happens to *quote* incidental marker text — a CLI-error
+    # marker (e.g. an agent that ran `ls` on a missing path and echoed "no
+    # such file or directory", or discussed a "permission denied" error) or
+    # cap-like text (e.g. echoing a usage-limit string back) — would be
+    # misclassified as CliLocalError/CapHit/NearCap even though nothing
+    # failed. The legacy code only ever ran these checks on the failure path
+    # (``_is_non_cap_cli_error`` / ``detect_cap_hit``), so this restores that
+    # scoping. AuthFailed stays ABOVE this check because it keys off a
+    # structured, exact status code rather than fuzzy substring matching
+    # against free-form text, so it doesn't carry the same false-positive
+    # risk against incidental output.
+    if result.success:
+        return OK()
+
     # CliLocalError — placed ABOVE cap detection. This precedence position IS
     # the reify-3604 structural fix: a local CLI/usage error (e.g. a
     # --session-id collision) must never be treated as a usage cap, even when
@@ -314,20 +331,6 @@ def classify_invocation(
     for marker in NON_CAP_CLI_ERROR_MARKERS:
         if marker in combined_lower:
             return CliLocalError(marker=marker)
-
-    # OK — a successful invocation short-circuits the remaining string-based
-    # cap/wedge heuristics below. Without this, a successful run whose output
-    # happens to *quote* cap-like text (e.g. an agent echoing a usage-limit
-    # string back, or reviewing this very module's string tables) would be
-    # misclassified as CapHit/NearCap even though nothing failed. The legacy
-    # detect_cap_hit path this consolidates only ever ran on failed
-    # invocations, so this restores that scoping. AuthFailed/CliLocalError
-    # stay ABOVE this check because they key off structured signals (an exact
-    # status code, an exact CLI marker substring) rather than the fuzzy
-    # cap-prefix matching below, so they don't carry the same false-positive
-    # risk against incidental output text.
-    if result.success:
-        return OK()
 
     # Backend-specific cap patterns checked first, ahead of the claude prefix
     # logic below (mirrors usage_gate.py:386-397). Codex/Gemini error bodies
