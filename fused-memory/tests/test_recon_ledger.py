@@ -199,3 +199,33 @@ async def test_list_suppressions_returns_only_active_suppressions_for_project(st
     results = await store.list_suppressions('proj-p')
 
     assert results == [suppression_p]
+
+
+@pytest.mark.asyncio
+async def test_is_suppressed_exact_and_blanket_union(store):
+    """is_suppressed treats flag_type='' as a blanket suppression covering every flag_type."""
+    exact = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage1_flag_suppression',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='T1',
+        flag_type='F1',
+    )
+    blanket = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage1_flag_suppression',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='T2',
+        flag_type='',
+    )
+    await store.upsert(exact)
+    await store.upsert(blanket)
+
+    assert await store.is_suppressed('proj-p', 'T1', 'F1') is True
+    assert await store.is_suppressed('proj-p', 'T2', 'anything') is True
+    assert await store.is_suppressed('proj-p', 'T1', 'F2') is False
+    assert await store.is_suppressed('other', 'T1', 'F1') is False
