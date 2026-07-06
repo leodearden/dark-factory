@@ -146,6 +146,42 @@ def _missing_cycle_summary_keys(meta: dict) -> list[str]:
     return missing
 
 
+def _cycle_summary_run_id_backfill(meta: dict, causation_id: str | None) -> str | None:
+    """Return a backfill value for a missing/invalid cycle_summary run_id, or
+    None when there is nothing to repair (task 2109).
+
+    run_id is LLM-supplied (see the reconciliation stage1/stage2 prompts) and
+    empirically gets dropped under prompt-compliance failures. Rather than
+    only warning (the task-2094 behavior), repair it server-side from an
+    authoritative causation id — mirrors the _infer_recon_pool precedent
+    (task 2077): derive/repair authoritatively rather than trust the LLM.
+
+    Two candidate sources are checked, in order:
+      1. meta['_causation_id'] — set by a direct in-process caller (and the
+         literal source the task names).
+      2. the causation_id parameter — the production MCP-boundary path:
+         server/tools.py::_extract_causation pops '_causation_id' out of the
+         metadata dict into this parameter before MemoryService.add_memory
+         runs, so on the real reconciliation stage-agent path
+         meta['_causation_id'] is always absent and the run_id value lives
+         only in this parameter. Checking meta alone would never fire in
+         production.
+
+    Returns None (nothing to backfill) when: kind != 'cycle_summary'; run_id
+    is already a non-empty string (must not clobber a valid value); or
+    neither candidate source is a non-empty string.
+    """
+    if meta.get('kind') != 'cycle_summary':
+        return None
+    run_id = meta.get('run_id')
+    if isinstance(run_id, str) and run_id.strip():
+        return None
+    for candidate in (meta.get('_causation_id'), causation_id):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
 
