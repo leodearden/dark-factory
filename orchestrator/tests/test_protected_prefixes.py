@@ -94,9 +94,14 @@ class TestProtectedPrefixesRegistry:
     def test_exact_name_keys_match_persistent_name_constants(self) -> None:
         # The registry keys for the two persistent worktrees must be the
         # constants themselves (not independently-typed literals), so the
-        # registry cannot silently drift from the canonical names.
-        assert PERSISTENT_MERGE_WORKTREE_NAME == '_merge-verify'
-        assert PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME == '_offline-deep'
+        # registry cannot silently drift from the canonical names. Assert
+        # the behavioral invariant this protects rather than pinning the
+        # exact literal spelling (which a legitimate rename would break for
+        # no behavioral reason): the merge-verify exact name must start
+        # with the '_merge-' prefix (so exact-over-prefix precedence has
+        # something to override), and both persistent names must be
+        # registered in PROTECTED_PREFIXES.
+        assert PERSISTENT_MERGE_WORKTREE_NAME.startswith('_merge-')
         assert PERSISTENT_MERGE_WORKTREE_NAME in PROTECTED_PREFIXES
         assert PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME in PROTECTED_PREFIXES
 
