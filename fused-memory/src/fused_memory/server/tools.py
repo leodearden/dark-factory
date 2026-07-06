@@ -42,6 +42,7 @@ from fused_memory.reconciliation.task_filter import (
     is_count_snapshot,
     is_mixed_temporal_framing,
 )
+from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -2834,6 +2835,7 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def submit_task(
         project_root: str,
         prompt: str | None = None,
@@ -2934,25 +2936,22 @@ def create_mcp_server(
             return _det_err
         metadata = inject_task_kind(metadata, task_kind)
 
-        try:
-            return await task_interceptor.submit_task(
-                project_root=project_root,
-                prompt=prompt,
-                title=title,
-                description=description,
-                details=details,
-                dependencies=dependencies,
-                priority=priority,
-                metadata=metadata,
-                tag=tag,
-                planning_mode=planning_mode,
-                routing_override_reason=routing_override_reason,
-            )
-        except Exception as e:
-            logger.error(f'submit_task error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.submit_task(
+            project_root=project_root,
+            prompt=prompt,
+            title=title,
+            description=description,
+            details=details,
+            dependencies=dependencies,
+            priority=priority,
+            metadata=metadata,
+            tag=tag,
+            planning_mode=planning_mode,
+            routing_override_reason=routing_override_reason,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def resolve_ticket(
         ticket: str,
         project_root: str,
@@ -3004,17 +3003,14 @@ def create_mcp_server(
         # Apply a safe default timeout at the MCP layer so external callers
         # cannot block indefinitely.
         effective_timeout = 115.0 if timeout_seconds is None else timeout_seconds
-        try:
-            return await task_interceptor.resolve_ticket(
-                ticket=ticket,
-                project_root=project_root,
-                timeout_seconds=effective_timeout,
-            )
-        except Exception as e:
-            logger.error(f'resolve_ticket error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.resolve_ticket(
+            ticket=ticket,
+            project_root=project_root,
+            timeout_seconds=effective_timeout,
+        )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def list_tickets(
         project_root: str,
         status: str | None = None,
@@ -3055,16 +3051,12 @@ def create_mcp_server(
                     'error_type': 'ValidationError',
                 }
             since_dt = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
-        try:
-            result = await task_interceptor.list_tickets(
-                project_root=project_root,
-                status=status,
-                since=since_dt,
-                limit=limit,
-            )
-        except Exception as e:
-            logger.exception(f'list_tickets error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        result = await task_interceptor.list_tickets(
+            project_root=project_root,
+            status=status,
+            since=since_dt,
+            limit=limit,
+        )
         if 'error' in result:
             return result
         rows = result.pop('rows', [])
@@ -3123,6 +3115,7 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def cancel_ticket(ticket_id: str) -> dict[str, Any]:
         """Cancel a pending curator ticket by its ticket_id.
 
@@ -3145,11 +3138,7 @@ def create_mcp_server(
         Args:
             ticket_id: The ``tkt_…`` ticket identifier returned by ``submit_task``.
         """
-        try:
-            return await task_interceptor.cancel_ticket(ticket_id=ticket_id)
-        except Exception as e:
-            logger.exception(f'cancel_ticket error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.cancel_ticket(ticket_id=ticket_id)
 
     @mcp.tool()
     async def commit_planning(
