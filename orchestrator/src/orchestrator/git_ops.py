@@ -945,6 +945,54 @@ class GitOps:
         """
         return {**PROTECTED_PREFIXES, self.config.iact_prefix: 'interactive'}
 
+    def _refuse_foreign_band(
+        self, path: Path, owned: frozenset[str], context: str,
+    ) -> bool:
+        """True if *path* belongs to a protected band this sweep does not own.
+
+        Band-ownership guard for destructive worktree cleanup — defense in
+        depth against a filter bug that steers a foreign band's directory
+        into a sweep's removal step (gitops-chokepoints PRD, Mechanism 3).
+        This is a band-ownership check, not a general ACL: it fails OPEN
+        (returns False, i.e. "proceed") for anything outside its narrow
+        scope —
+
+        - *path* is not a direct child of :attr:`worktree_base` (task
+          worktrees, quarantine dirs, and other nested paths are outside
+          this check).
+        - *path*'s name matches no band token in :meth:`protected_prefixes`.
+        - The matched band token is already in *owned*.
+
+        Otherwise this logs a WARNING naming the matched band token, its
+        owner, and *context*, and returns True.  Callers must skip the
+        destructive call for this one candidate (never raise) — every call
+        site sits inside a best-effort / never-raise sweep.
+        """
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved.parent != self.worktree_base:
+            return False
+
+        registry = self.protected_prefixes()
+        name = resolved.name
+        token = next(
+            (key for key in registry if key.endswith('-') and name.startswith(key)),
+            None,
+        )
+        if token is None:
+            return False
+        if token in owned:
+            return False
+
+        logger.warning(
+            '%s: refusing to remove %s — belongs to protected band %r '
+            '(owner=%r), not owned by this sweep (owned=%r)',
+            context, path, token, registry[token], sorted(owned),
+        )
+        return True
+
     def pool_in_use(self) -> bool:
         """True iff a warm or spec lane pool is configured on this host (task 2099).
 
