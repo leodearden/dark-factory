@@ -34,6 +34,7 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _run,
 )
+from orchestrator.landed_outbox import LandedOutbox, MergeProvenance
 from orchestrator.merge_drift import (  # noqa: F401  re-export shim
     _maybe_run_drift_check,
     _run_drift_check,
@@ -3920,6 +3921,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._shadow_state_path: Path | None = (
             _root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
         ) if _root is not None else None
+        # Durable landed-row journal (task 2153 / W1 α): survives until the
+        # scheduler's consult-before-dispatch gate (δ, separate task) confirms
+        # the task is done and calls consume(). None-safe (mirrors
+        # _shadow_state_path above) so bare-worker/bare-harness tests without
+        # project_root stay green. record() is not yet called at any
+        # CAS-advance site — that wiring is task β. Bound onto MergeProvenance
+        # so non-worker callers (e.g. the scheduler gate) can look up landed
+        # rows without holding a reference to this worker.
+        self._landed_outbox: LandedOutbox | None = (
+            LandedOutbox(_root / 'data' / 'orchestrator' / 'landed_outbox.json')
+        ) if _root is not None else None
+        if self._landed_outbox is not None:
+            MergeProvenance.bind(self._landed_outbox)
         # Internal pipeline: Merger → Verifier
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
