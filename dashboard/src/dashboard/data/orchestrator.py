@@ -27,6 +27,11 @@ either upstream format changes, this module must be updated by hand.
    ``status``, top-level ``files`` list), ``iterations.jsonl`` (read as a
    line count), and ``reviews/*.json``'s ``verdict`` field all re-derive the
    artifact layout owned by ``orchestrator/src/orchestrator/artifacts.py``.
+   Note: ``artifacts.py`` tracks step ``status`` across BOTH the
+   ``prerequisites`` and ``steps`` collections (see ``update_step_status``,
+   ``get_pending_steps``, ``get_completed_steps``), but
+   ``read_task_artifacts`` only counts ``steps`` toward ``plan_progress`` —
+   ``prerequisites`` status is intentionally not surfaced here.
    FUTURE SINGLE OWNER: stream W11's ``TaskArtifacts`` (see the seam table
    in ``plans/bug-hotspot-remediation-program-2026-07-06.md``), which also
    plans to relocate ``.task/`` out of the git tree — this doc block is the
@@ -208,9 +213,11 @@ def read_task_artifacts(worktree_path: Path) -> dict:
 
     FORMAT COUPLING: the .task/ layout parsed below (metadata.json,
     plan.json 'steps'/'files', iterations.jsonl, reviews/*.json 'verdict')
-    is owned by orchestrator/src/orchestrator/artifacts.py. FUTURE SINGLE
-    OWNER: stream W11's TaskArtifacts — see the module docstring's FORMAT
-    COUPLING section.
+    is owned by orchestrator/src/orchestrator/artifacts.py. Only plan.json's
+    'steps' collection is counted toward plan_progress; 'prerequisites'
+    status (also tracked by artifacts.py) is intentionally not surfaced.
+    FUTURE SINGLE OWNER: stream W11's TaskArtifacts — see the module
+    docstring's FORMAT COUPLING section.
     """
     task_dir = worktree_path / '.task'
 
