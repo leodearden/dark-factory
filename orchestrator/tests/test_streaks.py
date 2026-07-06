@@ -109,3 +109,80 @@ class TestStreakCounterCountVariant:
         assert counter.value('task-1') == 1
         assert counter.value('task-2') == 0
         assert counter.value('task-3') == 1
+
+
+class TestStreakCounterCauseChangeVariant:
+    """Unit tests for the cause-change-reset variant: touch(key, cause=...).
+
+    Collapses the ``_external_hold_streak`` / ``_external_hold_cause`` pair
+    into one counter.  Mirrors ``Scheduler._note_external_hold``: the streak
+    resets to 0 (then bumps to 1) whenever the cause differs from the
+    last-seen cause for that key; it keeps incrementing across ticks that
+    repeat the same cause.
+    """
+
+    def test_touch_first_call_returns_one(self) -> None:
+        counter = StreakCounter(threshold=3)
+        assert counter.touch('task-1', cause='deps_live') == 1
+
+    def test_touch_same_cause_increments(self) -> None:
+        counter = StreakCounter(threshold=3)
+        assert counter.touch('task-1', cause='deps_live') == 1
+        assert counter.touch('task-1', cause='deps_live') == 2
+        assert counter.touch('task-1', cause='deps_live') == 3
+
+    def test_touch_cause_change_resets_to_one(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counter.touch('task-1', cause='deps_live')
+        counter.touch('task-1', cause='deps_live')
+        assert counter.touch('task-1', cause='deps_live') == 3
+        # Cause changes tick-over-tick — streak drops back to 1, not 4.
+        assert counter.touch('task-1', cause='resolver_degraded') == 1
+
+    def test_touch_records_last_seen_cause(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counter.touch('task-1', cause='deps_live')
+        assert counter.causes['task-1'] == 'deps_live'
+        counter.touch('task-1', cause='resolver_degraded')
+        assert counter.causes['task-1'] == 'resolver_degraded'
+
+    def test_value_reads_the_streak_after_touch(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counter.touch('task-1', cause='deps_live')
+        counter.touch('task-1', cause='deps_live')
+        assert counter.value('task-1') == 2
+
+    def test_counts_and_causes_are_identity_stable_across_calls(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counts_backing = counter.counts
+        causes_backing = counter.causes
+        counter.touch('task-1', cause='deps_live')
+        assert counter.counts is counts_backing
+        assert counter.causes is causes_backing
+        assert causes_backing == {'task-1': 'deps_live'}
+
+    def test_clear_pops_both_counts_and_causes(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counter.touch('task-1', cause='deps_live')
+        counter.clear('task-1')
+        assert 'task-1' not in counter.counts
+        assert 'task-1' not in counter.causes
+        assert counter.value('task-1') == 0
+
+    def test_clear_missing_key_is_a_noop_for_cause_variant(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counter.clear('missing')  # must not raise
+
+    def test_gc_drops_key_from_both_containers_in_place(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counts_backing = counter.counts
+        causes_backing = counter.causes
+        counter.touch('task-1', cause='deps_live')
+        counter.touch('task-2', cause='deps_live')
+        counter.gc({'task-1'})
+        assert counter.counts is counts_backing
+        assert counter.causes is causes_backing
+        assert 'task-1' not in counter.counts
+        assert 'task-1' not in counter.causes
+        assert counter.value('task-2') == 1
+        assert counter.causes['task-2'] == 'deps_live'
