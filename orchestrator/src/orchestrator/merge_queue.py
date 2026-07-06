@@ -29,12 +29,13 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
+    AdvanceOutcome,
     GitOps,
     MergeResult,
     WorktreeMissing,
     _run,
 )
-from orchestrator.landed_outbox import LandedOutbox, MergeProvenance
+from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_drift import (  # noqa: F401  re-export shim
     _maybe_run_drift_check,
     _run_drift_check,
@@ -2675,6 +2676,38 @@ async def classify_and_merge(
             with contextlib.suppress(Exception):
                 await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
         raise
+
+
+async def _journal_landed_then_advance(
+    outbox: LandedOutbox | None,
+    git_ops: Any,
+    *,
+    task_id: str,
+    branch_tip_sha: str | None,
+    advanced_sha: str,
+    merge_wt: Path,
+    **advance_kwargs: Any,
+) -> AdvanceOutcome:
+    """Record a LandedRow, THEN advance main — single-sourced write-ahead
+    ordering (PRD WA-1) shared by BOTH CAS advance sites (single-branch
+    ``_finalize_inflight`` and train ``_do_train_merge``).
+
+    *advanced_sha* is the pre-advance SHA about to become main — the value
+    knowable write-ahead, not ``advance_main``'s return value — and doubles
+    as ``advance_main``'s first positional argument; *merge_wt* is the
+    second. Remaining per-site ``**advance_kwargs`` pass through unchanged,
+    keeping the advance call byte-identical to before this helper existed.
+    A ``None`` *outbox* (no ``project_root``, e.g. bare-worker tests) no-ops
+    the record — the advance still proceeds.
+    """
+    if outbox is not None:
+        outbox.record(LandedRow(
+            task_id=task_id,
+            branch_tip_sha=branch_tip_sha or '',
+            advanced_sha=advanced_sha,
+            landed_at=time.time(),
+        ))
+    return await git_ops.advance_main(advanced_sha, merge_wt, **advance_kwargs)
 
 
 async def _do_train_merge(
