@@ -17,7 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 import shared.task_metadata as task_metadata_module
-from shared.task_metadata import BeforeDone, DoneProvenance, ExternalDep, MemoryHints
+from shared.task_metadata import BeforeDone, DoneProvenance, ExternalDep, MemoryHints, RetryLedger
 
 
 @pytest.fixture(autouse=True)
@@ -201,3 +201,48 @@ class TestExternalDep:
     def test_parse_rejects_malformed(self, malformed):
         with pytest.raises((ValueError, ValidationError)):
             ExternalDep.parse(malformed)
+
+
+class TestRetryLedger:
+    def test_defaults(self):
+        rl = RetryLedger()
+        assert rl.consecutive_no_plan_failures == 0
+        assert rl.total_no_plan_failures == 0
+        assert rl.consecutive_infra_resume_failures == 0
+        assert rl.last_infra_resume_iteration_count == 0
+        assert rl.consecutive_merge_thrash == 0
+        assert rl.last_no_plan_main_sha is None
+        assert rl.last_merge_outcome_signature is None
+        assert rl.merge_first_enqueued_at is None
+
+    def test_explicit_values_construct(self):
+        rl = RetryLedger(
+            consecutive_no_plan_failures=2,
+            total_no_plan_failures=5,
+            last_no_plan_main_sha='abc123',
+            consecutive_infra_resume_failures=1,
+            last_infra_resume_iteration_count=3,
+            consecutive_merge_thrash=4,
+            last_merge_outcome_signature='sig-1',
+            merge_first_enqueued_at='2026-07-06T00:00:00+00:00',
+        )
+        assert rl.consecutive_no_plan_failures == 2
+        assert rl.total_no_plan_failures == 5
+        assert rl.last_no_plan_main_sha == 'abc123'
+        assert rl.consecutive_infra_resume_failures == 1
+        assert rl.last_infra_resume_iteration_count == 3
+        assert rl.consecutive_merge_thrash == 4
+        assert rl.last_merge_outcome_signature == 'sig-1'
+        assert rl.merge_first_enqueued_at == '2026-07-06T00:00:00+00:00'
+
+    def test_model_dump_round_trips_values(self):
+        rl = RetryLedger(consecutive_no_plan_failures=2, last_no_plan_main_sha='abc123')
+        dumped = rl.model_dump()
+        assert dumped['consecutive_no_plan_failures'] == 2
+        assert dumped['last_no_plan_main_sha'] == 'abc123'
+        assert RetryLedger(**dumped) == rl
+
+    def test_unknown_counter_retained_through_round_trip(self):
+        rl = RetryLedger(x_new_counter=3)
+        dumped = rl.model_dump()
+        assert dumped['x_new_counter'] == 3
