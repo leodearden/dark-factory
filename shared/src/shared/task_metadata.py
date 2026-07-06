@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 __all__ = [
     'BeforeDone',
     'DoneProvenance',
+    'ExternalDep',
     'MemoryHints',
 ]
 
@@ -85,3 +86,34 @@ class MemoryHints(BaseModel):
 
     entities: list[str] = Field(default_factory=list)
     queries: list[str] = Field(default_factory=list)
+
+
+class ExternalDep(BaseModel):
+    """A single ``metadata.external_deps`` entry — ``"project_id:task_id"``.
+
+    Validate/normalise-only (PRD Open Q #4): ``task_id`` stays ``str`` and
+    neither field is case- or dash-normalised, so ``parse(s).render() == s``
+    always holds. The stricter numeric/positive/dotted-id/lower-and-dash
+    normalisation rules stay at the fused-memory backend's
+    ``add_dependency`` (``_parse_qualified_dep``); this model only mirrors
+    the structural "exactly two non-empty stripped parts" check.
+    """
+
+    project_id: str
+    task_id: str
+
+    @classmethod
+    def parse(cls, wire: str) -> ExternalDep:
+        malformed = (
+            f'ExternalDep.parse: malformed dependency {wire!r}; expected "project_id:task_id"'
+        )
+        parts = wire.strip().split(':')
+        if len(parts) != 2:
+            raise ValueError(malformed)
+        project_id, task_id = parts[0].strip(), parts[1].strip()
+        if not project_id or not task_id:
+            raise ValueError(malformed)
+        return cls(project_id=project_id, task_id=task_id)
+
+    def render(self) -> str:
+        return f'{self.project_id}:{self.task_id}'
