@@ -155,3 +155,29 @@ class LandedOutbox:
                 os.close(dir_fd)
         except OSError as exc:
             logger.warning('landed_outbox: failed to save outbox: %s', exc)
+
+
+class MergeProvenance:
+    """Process-global façade over the worker's bound LandedOutbox.
+
+    The contract fixes ``lookup`` as a ``@staticmethod`` (PRD §8.2), so
+    binding is done via a class-level reference set by :meth:`bind` rather
+    than the façade holding its own outbox instance. Single-worker-per-
+    process means the last bind wins. ``lookup`` is fail-safe: returns
+    ``None`` when nothing is bound (e.g. a bare-worker/no-worker test
+    context) instead of raising.
+    """
+
+    _outbox: LandedOutbox | None = None
+
+    @classmethod
+    def bind(cls, outbox: LandedOutbox) -> None:
+        """Bind *outbox* as the process-global provenance source."""
+        cls._outbox = outbox
+
+    @staticmethod
+    def lookup(task_id: str) -> LandedRow | None:
+        """Return the landed row for *task_id*, or None if unbound/absent."""
+        if MergeProvenance._outbox is None:
+            return None
+        return MergeProvenance._outbox.lookup(task_id)
