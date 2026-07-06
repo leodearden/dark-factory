@@ -12,10 +12,12 @@ propagation.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
-from dashboard.data.mcp_fanout import first_success
+from dashboard.data.mcp_fanout import TTLCache, first_success
 
 
 def _offline_result(errors: list[str]) -> dict:
@@ -171,3 +173,133 @@ class TestFirstSuccessUncaughtException:
             await first_success(
                 ['http://a'], call, log_label='test', offline_result=_offline_result,
             )
+
+
+# ── TTLCache ═══════════════════════════════════════════════════════
+#
+# Generalizes scheduler.py's _scheduler_cache + _scheduler_refresh_lock +
+# double-checked-locking pattern into a reusable single-flight short-TTL
+# cache keyed by an arbitrary string.
+
+
+# ── (a) fresh hit — second call within TTL does not re-run refresh ──
+
+
+class TestTTLCacheFreshHit:
+    async def test_second_call_within_ttl_does_not_refresh(self):
+        cache = TTLCache(ttl_seconds=60.0)
+        calls = 0
+
+        async def refresh():
+            nonlocal calls
+            calls += 1
+            return {'v': calls}
+
+        first = await cache.get_or_refresh('k', refresh)
+        second = await cache.get_or_refresh('k', refresh)
+
+        assert calls == 1, 'expected refresh to run exactly once for a warm cache'
+        assert first == second == {'v': 1}
+
+
+# ── (b) callable-ttl expiry ───────────────────────────────────────────
+
+
+class TestTTLCacheCallableTTLExpiry:
+    async def test_callable_ttl_expiry_triggers_refetch(self):
+        """Proves the mechanism fetch_tasks relies on for its runtime monkeypatch.
+
+        _FETCH_TASKS_TTL_SECONDS is monkeypatched at runtime in
+        test_tasks.py::test_fetch_tasks_ttl_expiry_refetches; TTLCache must
+        resolve a callable ttl_seconds at each freshness check (not once at
+        construction) for that to keep working.
+        """
+        ttl_box = {'v': 60.0}
+        cache = TTLCache(ttl_seconds=lambda: ttl_box['v'])
+        calls = 0
+
+        async def refresh():
+            nonlocal calls
+            calls += 1
+            return calls
+
+        await cache.get_or_refresh('k', refresh)
+        assert calls == 1
+
+        ttl_box['v'] = 0.0  # every entry is now immediately stale
+        result = await cache.get_or_refresh('k', refresh)
+
+        assert calls == 2, 'expected a re-run once the callable ttl reports 0.0'
+        assert result == 2
+
+
+# ── (c) single-flight (double-checked locking) ────────────────────────
+
+
+class TestTTLCacheSingleFlight:
+    async def test_concurrent_cold_callers_single_flight(self):
+        cache = TTLCache(ttl_seconds=60.0)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def refresh():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return 'value'
+
+        task1 = asyncio.create_task(cache.get_or_refresh('k', refresh))
+        task2 = asyncio.create_task(cache.get_or_refresh('k', refresh))
+
+        await started.wait()
+        # Give the second (would-be-cold) caller a chance to reach the lock
+        # and block on it before we release the in-flight refresh.
+        await asyncio.sleep(0)
+        release.set()
+
+        result1, result2 = await asyncio.gather(task1, task2)
+
+        assert calls == 1, 'only the first caller should have run refresh'
+        assert result1 == result2 == 'value'
+
+
+# ── (d) clear() resets store + locks ──────────────────────────────────
+
+
+class TestTTLCacheClear:
+    async def test_clear_resets_store_and_forces_refetch(self):
+        cache = TTLCache(ttl_seconds=60.0)
+        calls = 0
+
+        async def refresh():
+            nonlocal calls
+            calls += 1
+            return calls
+
+        await cache.get_or_refresh('k', refresh)
+        cache.clear()
+        result = await cache.get_or_refresh('k', refresh)
+
+        assert calls == 2, 'clear() must force the next call to re-run refresh'
+        assert result == 2
+
+
+# ── (e) cache_ok predicate — generalized store-only-on-success ───────
+
+
+class TestTTLCacheCacheOk:
+    async def test_cache_ok_false_does_not_store(self):
+        cache = TTLCache(ttl_seconds=60.0)
+        calls = 0
+
+        async def refresh():
+            nonlocal calls
+            calls += 1
+            return {'offline': True}  # not a list
+
+        await cache.get_or_refresh('k', refresh, cache_ok=lambda v: isinstance(v, list))
+        await cache.get_or_refresh('k', refresh, cache_ok=lambda v: isinstance(v, list))
+
+        assert calls == 2, 'cache_ok=False must prevent storing, forcing a re-run'
