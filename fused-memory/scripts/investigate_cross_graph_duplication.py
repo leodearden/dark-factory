@@ -222,7 +222,12 @@ async def run(args: Any, memory_service: Any) -> dict:
     """Enumerate GRAPH.LIST, detect collisions, probe the target uuid, and
     build the investigation report. Strictly read-only: never issues a
     mutating graph query, memory delete, or edge update."""
-    raise NotImplementedError
+    graphs = await memory_service.graphiti.list_graphs()
+    collision_result = detect_collision_groups(graphs)
+    uuid = getattr(args, 'uuid', None) or TARGET_NODE_UUID
+    presence = await probe_node_across_graphs(memory_service.graphiti, uuid, graphs)
+    verdict = classify_config_routing(collision_result, presence)
+    return build_investigation_report(uuid, graphs, presence, collision_result, verdict)
 
 
 # ---------------------------------------------------------------------------
