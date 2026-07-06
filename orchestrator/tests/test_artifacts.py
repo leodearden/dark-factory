@@ -1701,6 +1701,38 @@ class TestReadReviewsMergesLegacyAndNew:
 
         assert ta.aggregate_reviews().has_blocking_issues is True
 
+    def test_corrupt_legacy_review_file_is_fatal(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        """A corrupt reviewer JSON file is NOT silently tolerated by either
+        side of the merge — this documents the intentional (pre-existing)
+        failure mode rather than adding new tolerance: a malformed review
+        aborts read_reviews (and therefore aggregate_reviews) instead of
+        being skipped. Unlike read_iteration_log (which tolerates corrupted
+        *lines*), read_reviews has no per-file error handling.
+        """
+        worktree.mkdir()
+        (legacy_root / 'reviews').mkdir(parents=True)
+        (legacy_root / 'reviews' / 'reviewer-a.json').write_text('{not valid json')
+
+        ta = TaskArtifacts(worktree, meta_root)
+
+        with pytest.raises(json.JSONDecodeError):
+            ta.read_reviews()
+
+    def test_corrupt_new_review_file_is_fatal(
+        self, worktree: Path, meta_root: Path,
+    ):
+        """Same intentional-fatal contract on the new-path side of the merge."""
+        worktree.mkdir()
+        (meta_root / 'reviews').mkdir(parents=True)
+        (meta_root / 'reviews' / 'reviewer-b.json').write_text('{not valid json')
+
+        ta = TaskArtifacts(worktree, meta_root)
+
+        with pytest.raises(json.JSONDecodeError):
+            ta.read_reviews()
+
 
 class TestValidatePlanOwnerCompat:
     """validate_plan_owner must resolve plan.json via the same new-then-old
