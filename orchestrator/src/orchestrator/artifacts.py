@@ -393,9 +393,27 @@ class TaskArtifacts:
         """Remove ``.task/false_premise.json`` if present."""
         (self.root / 'false_premise.json').unlink(missing_ok=True)
 
+    def _read_path(self, name: str) -> Path:
+        """Resolve *name* new-path-then-old (compat window).
+
+        Returns ``self.root / name`` if it exists, else ``self._legacy_root
+        / name`` if THAT exists, else ``self.root / name`` as the canonical
+        (non-existent) path. When ``meta_root`` was not supplied to the
+        constructor, ``self.root == self._legacy_root`` so this is a no-op.
+        """
+        new = self.root / name
+        if new.exists():
+            return new
+        legacy = self._legacy_root / name
+        if legacy.exists():
+            return legacy
+        return new
+
     def read_plan(self) -> dict:
-        """Read current plan state, auto-normalizing malformed shapes."""
-        plan_path = self.root / 'plan.json'
+        """Read current plan state (new-path-then-old), auto-normalizing
+        malformed shapes.
+        """
+        plan_path = self._read_path('plan.json')
         if not plan_path.exists():
             return {}
         plan = json.loads(plan_path.read_text())
@@ -403,9 +421,9 @@ class TaskArtifacts:
         if modified:
             logger.warning(
                 'Plan normalization applied — writing corrected plan to %s',
-                plan_path,
+                self.root / 'plan.json',
             )
-            self._write_json(plan_path, plan)
+            self._write_json(self.root / 'plan.json', plan)
         return plan
 
     def update_step_status(
