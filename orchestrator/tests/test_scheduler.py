@@ -5952,6 +5952,57 @@ class TestRequeueCooldownGc:
 
 
 # ---------------------------------------------------------------------------
+# metadata.deferred_watch dispatch gate (task 2234)
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredWatchDispatchGate:
+    """A task carrying metadata.deferred_watch=true must be excluded from
+    normal dispatch until an explicit operator reactivation signal is
+    present, regardless of status/deps/cooldown otherwise passing.
+
+    metadata.trigger is human-readable prose (e.g. "graphiti-core upstream
+    release correcting per-node-pair over-invalidation") and is never
+    evaluated by the scheduler — "trigger met" is defined operationally as
+    a truthy metadata.trigger_met, or a hard clear of metadata.deferred_watch
+    itself (see docstring on Scheduler._deferred_watch_gated).
+    """
+
+    def test_pending_deferred_watch_task_with_unmet_trigger_is_ineligible(self):
+        """A pending task with deferred_watch=True and no reactivation signal
+        (metadata.trigger_met absent) must be INELIGIBLE for dispatch.
+
+        This is RED on current code: no deferred_watch gate exists yet, so
+        _eligible_for_dispatch currently returns (True, None) for this task
+        (status=pending, no deps, no requeue/dispatch-cooldown signal).
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        task = {
+            'id': '2217',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': True,
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+            },
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '2217', status_map)
+
+        assert result == (False, None), (
+            f'Expected a pending deferred_watch task with an unmet trigger to '
+            f'be ineligible for dispatch; got: {result}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Park-and-stop pause mechanism (task 1322)
 # ---------------------------------------------------------------------------
 
