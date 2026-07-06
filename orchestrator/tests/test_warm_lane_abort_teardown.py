@@ -21,6 +21,7 @@ from orchestrator.git_ops import (
     WarmLaneUnavailable,
     WorktreeInfo,
     _run,
+    _seed_rc_to_unavailable,
 )
 from orchestrator.warm_lane_pool import LaneState
 
@@ -294,4 +295,78 @@ class TestAcquireWarmLaneReuseFaultRoutesThroughAbort:
         )
         assert 'already used by worktree' not in caplog.text, (
             f'Follow-up acquire must not collide with a leaked checkout:\n{caplog.text}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# _reset_and_seed_recycled_lane's re-seed fault — retention-bias vs the
+# release_warm_lane commits-only gate (step 9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestResetInPlaceReseedFaultRoutesThroughAbort:
+    """The reset-in-place recycle re-seed fault must route through the
+    unified teardown primitive, not call release_warm_lane directly."""
+
+    async def test_recycle_reseed_fault_routes_through_unified_teardown(
+        self, git_repo: Path,
+    ):
+        """A re-seed fault on the reset-in-place recycle path must retain a
+        non-degenerate branch (the primitive's degenerate-gated retention),
+        detach HEAD, and free the pool slot.
+
+        release_warm_lane's unconditional commits-only gate would DELETE
+        task/A (0 commits beyond main) regardless of the degenerate
+        classifier — this is the retention-bias behavior change step-10
+        introduces by routing this site through _abort_lane_acquisition.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        # Seed the pool's only lane via a normal create-once acquire, then
+        # release it back to FREE with a BARE pool release (not
+        # GitOps.release_warm_lane) so the lane stays checked out on
+        # task/seed, still registered on disk — exactly the state a
+        # recycled lane is found in by the next acquire.
+        info_seed = await git_ops.acquire_warm_lane('seed', start_ref)
+        assert isinstance(info_seed, WorktreeInfo), (
+            f'Expected WorktreeInfo; got {info_seed!r}'
+        )
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(info_seed.path)
+
+        # Acquire task 'A' onto the reset-in-place recycle path (the lane is
+        # already a registered worktree; task/A has never existed so the
+        # orphan-has-commits reattach guard does not trigger) while forcing
+        # the post-reset re-seed to fail with rc=127, and forcing the
+        # degenerate classifier False so the retention outcome is
+        # deterministic.
+        with patch.object(
+            git_ops, '_seed_warm_lane', AsyncMock(return_value=127),
+        ), patch.object(
+            git_ops, 'warm_lane_ref_is_degenerate', AsyncMock(return_value=False),
+        ):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert result is _seed_rc_to_unavailable(127), (
+            f'Expected the shared seed-rc sentinel for 127; got {result!r}'
+        )
+        assert result is WarmLaneUnavailable.FAULT
+
+        rc, _, _ = await _run(['git', 'rev-parse', '--verify', 'task/A'], cwd=git_repo)
+        assert rc == 0, (
+            'task/A must be RETAINED (degenerate classifier forced False) — '
+            'release_warm_lane would delete it unconditionally'
+        )
+
+        _, branch, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=info_seed.path,
+        )
+        assert branch.strip() == 'HEAD', (
+            f'Expected detached HEAD after the re-seed fault; got branch={branch.strip()!r}'
+        )
+        assert git_ops.warm_lane_pool.state(info_seed.path) == LaneState.FREE, (
+            'Pool slot must be FREE after the fault teardown'
         )
