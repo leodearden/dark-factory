@@ -256,6 +256,27 @@ class PathShapedProjectIdError(ValueError):
     """
 
 
+def _to_underscore_canonical(raw: str) -> str:
+    """Pure normalization step: lowercase *raw* and map hyphens to underscores.
+
+    No validation or rejection here -- this is only the mapping rule itself,
+    factored out so it has a single source of truth. Shared by:
+
+    - :func:`canonicalize_project_id` below, which applies this AFTER its
+      path-shape guard (raw project_id input may be path-shaped and must be
+      rejected, not normalized).
+    - :func:`fused_memory.models.scope.resolve_project_id`, which applies
+      this to an already-extracted path basename (via ``PurePosixPath(...).name``),
+      where the path-shape guard does not apply -- resolve_project_id's
+      long-standing contract is to always normalize, never raise, and is
+      relied on by ~15 call sites across the codebase.
+
+    Leading underscore marks this as an internal helper for those two known
+    call sites, not a general-purpose public API.
+    """
+    return raw.lower().replace('-', '_')
+
+
 def canonicalize_project_id(raw: str) -> str:
     """Return the underscore-canonical form of *raw*: lowercased, with
     hyphens mapped to underscores.
@@ -279,4 +300,4 @@ def canonicalize_project_id(raw: str) -> str:
             'would silently produce a new, wrong canonical key). Pass the '
             'resolved project_id instead.'
         )
-    return raw.lower().replace('-', '_')
+    return _to_underscore_canonical(raw)
