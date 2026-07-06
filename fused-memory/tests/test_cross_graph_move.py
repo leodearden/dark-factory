@@ -148,7 +148,14 @@ class TestMoveEntityAcrossGraphsNodeCore:
         transport) and CREATEs it in target with a byte-exact vecf32 literal.
         """
         backend = make_backend(mock_config)
-        source_mock = make_graph_mock(ro_rows=[NODE_ROW_FIXTURE])
+        source_mock = make_graph_mock()
+        # ro_query is called twice: (1) node scalar props, (2) this node's
+        # RELATES_TO edges (step-7/8) -- empty here, so no edge is recreated
+        # and the CREATE/embedding-read assertions below are unaffected.
+        source_mock.ro_query = AsyncMock(side_effect=[
+            MagicMock(result_set=[NODE_ROW_FIXTURE]),
+            MagicMock(result_set=[]),
+        ])
         target_mock = make_graph_mock()
         backend._driver._get_graph = _route_graphs({
             SOURCE_GRAPH_FIXTURE: source_mock,
@@ -164,8 +171,8 @@ class TestMoveEntityAcrossGraphsNodeCore:
 
         # (a) reads node props from source via ro_query, and the exact
         # name_embedding from source via the raw transport.
-        source_mock.ro_query.assert_awaited_once()
-        read_params = extract_params(source_mock.ro_query.call_args)
+        assert source_mock.ro_query.await_count == 2
+        read_params = extract_params(source_mock.ro_query.call_args_list[0])
         assert read_params.get('uuid') == NODE_UUID_FIXTURE
         fake_read_compact.assert_awaited_once()
         assert fake_read_compact.call_args.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
@@ -188,3 +195,78 @@ class TestMoveEntityAcrossGraphsNodeCore:
         assert result.uuid == NODE_UUID_FIXTURE
         assert result.source_graph == SOURCE_GRAPH_FIXTURE
         assert result.target_graph == TARGET_GRAPH_FIXTURE
+
+
+# ---------------------------------------------------------------------------
+# step-7: move_entity_across_graphs -- RELATES_TO edge reattachment
+# ---------------------------------------------------------------------------
+
+OTHER_NODE_UUID_FIXTURE = 'node-bbbb-2222'
+EDGE_UUID_FIXTURE = 'edge-cccc-3333'
+
+# (e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, e.group_id,
+#  e.episodes, startNode(e).uuid, endNode(e).uuid) -- an outgoing edge from
+# the moved node to another (unmoved) entity.
+EDGE_ROW_FIXTURE = [
+    EDGE_UUID_FIXTURE, 'is_related_to', 'Alice is related to Bob.',
+    '2026-01-01T00:00:00+00:00', None, '2026-01-01T00:00:00+00:00',
+    SOURCE_GRAPH_FIXTURE, ['episode-uuid-1'],
+    NODE_UUID_FIXTURE, OTHER_NODE_UUID_FIXTURE,
+]
+
+
+class TestMoveEntityAcrossGraphsEdges:
+    """S5 edge reattachment: recreate the moved node's RELATES_TO edges in target."""
+
+    @pytest.mark.asyncio
+    async def test_recreates_relates_to_edge_with_byte_exact_fact_embedding(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(side_effect=[
+            MagicMock(result_set=[NODE_ROW_FIXTURE]),
+            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
+        ])
+        target_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await move_entity_across_graphs(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        # edges are read from source via a second ro_query call
+        assert source_mock.ro_query.await_count == 2
+        edges_read_cypher = extract_cypher(source_mock.ro_query.call_args_list[1])
+        assert 'RELATES_TO' in edges_read_cypher
+        assert 'DISTINCT' in edges_read_cypher
+
+        # fact_embedding is read via the raw transport for the node AND the edge
+        assert fake_read_compact.await_count == 2
+        edge_embed_call = fake_read_compact.call_args_list[1]
+        assert edge_embed_call.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert EDGE_UUID_FIXTURE in edge_embed_call.kwargs.get('cypher', '')
+
+        # target.query is called twice: (1) node CREATE, (2) edge CREATE
+        assert target_mock.query.await_count == 2
+        edge_create_call = target_mock.query.call_args_list[1]
+        cypher = extract_cypher(edge_create_call)
+        params = extract_params(edge_create_call)
+        assert 'CREATE' in cypher
+        assert 'RELATES_TO' in cypher
+        assert EXPECTED_VECF32_LITERAL_FIXTURE in cypher
+        assert params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
+        assert params.get('name') == 'is_related_to'
+        assert params.get('fact') == 'Alice is related to Bob.'
+        assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert params.get('episodes') == ['episode-uuid-1']
+
+        assert result.edges_moved == 1
