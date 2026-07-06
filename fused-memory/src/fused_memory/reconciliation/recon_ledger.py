@@ -82,6 +82,21 @@ class ReconLedgerRecord:
     expires_at: str | None = None
 
 
+def _record_from_row(row: aiosqlite.Row) -> ReconLedgerRecord:
+    """Map a ``recon_ledger`` row to a :class:`ReconLedgerRecord`."""
+    return ReconLedgerRecord(
+        project_id=row['project_id'],
+        record_kind=row['record_kind'],
+        task_id=row['task_id'],
+        flag_type=row['flag_type'],
+        run_id=row['run_id'],
+        payload_json=row['payload_json'],
+        state=row['state'],
+        created_at=row['created_at'],
+        expires_at=row['expires_at'],
+    )
+
+
 class ReconLedgerStore:
     """SQLite-backed control-plane ledger for recon markers/suppressions/summaries."""
 
@@ -131,6 +146,58 @@ class ReconLedgerStore:
             with contextlib.suppress(Exception):
                 await db.rollback()
             raise
+
+    async def upsert(self, record: ReconLedgerRecord) -> None:
+        """Insert a ledger record.
+
+        Deliberately a plain ``INSERT`` for now — a duplicate identity raises
+        ``sqlite3.IntegrityError`` on the primary key. The ``ON CONFLICT ...
+        DO UPDATE`` upsert semantics are added in a later step once a test
+        pins the idempotency behaviour.
+        """
+        async with self._txn() as db:
+            await db.execute(
+                """
+                INSERT INTO recon_ledger
+                    (project_id, record_kind, task_id, flag_type, run_id,
+                     payload_json, state, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.project_id,
+                    record.record_kind,
+                    record.task_id,
+                    record.flag_type,
+                    record.run_id,
+                    record.payload_json,
+                    record.state,
+                    record.created_at,
+                    record.expires_at,
+                ),
+            )
+
+    async def get_by_identity(
+        self,
+        project_id: str,
+        record_kind: str,
+        task_id: str = '',
+        flag_type: str = '',
+        run_id: str = '',
+    ) -> ReconLedgerRecord | None:
+        """Return the record matching the five-part identity, or None."""
+        db = self._require_db()
+        cursor = await db.execute(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ? AND task_id = ?
+              AND flag_type = ? AND run_id = ?
+            """,
+            (project_id, record_kind, task_id, flag_type, run_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _record_from_row(row)
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
