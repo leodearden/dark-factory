@@ -9,7 +9,6 @@ import json
 import shutil
 import subprocess
 import sys
-from collections import Counter
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -104,8 +103,8 @@ def takes_root(r: ProjectRoot) -> None: ...
 takes_root(root)
 """
 
-# Deliberate misuse — must produce exactly 7 pyright errors (6 reportArgumentType
-# + 1 reportAttributeAccessIssue), per the live 2026-07-06 pyright 1.1.408 verification.
+# Deliberate misuse — each line below must produce at least one pyright error
+# of the rule noted in its comment (see _EXPECTED_RULE_BY_MISUSE_LINE below).
 _FIXTURE_MISUSE = """\
 ProjectScope(root, pid)  # transposed positional args -> 2 reportArgumentType
 ProjectScope('dark_factory', '/x')  # bare str, not the NewType -> 2 reportArgumentType
@@ -119,6 +118,24 @@ _FIXTURE_SOURCE = _FIXTURE_VALID_SETUP + '\n' + _FIXTURE_MISUSE
 # 0-indexed (LSP-style) pyright line numbers at or after this value fall in the
 # misuse section; any diagnostic before it would mean pyright rejected the valid setup.
 _VALID_SETUP_LINE_COUNT = len(_FIXTURE_VALID_SETUP.splitlines())
+
+# _FIXTURE_SOURCE joins the two blocks with an extra blank line (the literal
+# '\n' between them), so the misuse block's first source line is one past the
+# valid-setup line count.
+_MISUSE_START_LINE = _VALID_SETUP_LINE_COUNT + 1
+
+# Expected pyright rule for each misuse statement, keyed by its 0-indexed
+# (LSP-style) line number in the full fixture. Checked as "at least one error
+# of this rule on this line" rather than an exact total-error count, so a
+# pyright version bump that splits/merges diagnostics or adds a new inferred
+# error doesn't turn this suite red -- see amendment note on the test below.
+_EXPECTED_RULE_BY_MISUSE_LINE = {
+    _MISUSE_START_LINE + 0: 'reportArgumentType',  # ProjectScope(root, pid) -- transposed
+    _MISUSE_START_LINE + 1: 'reportArgumentType',  # ProjectScope('dark_factory', '/x') -- bare str
+    _MISUSE_START_LINE + 2: 'reportArgumentType',  # takes_root(scope.project_id) -- wrong NewType
+    _MISUSE_START_LINE + 3: 'reportArgumentType',  # takes_root('/plain/str') -- bare str
+    _MISUSE_START_LINE + 4: 'reportAttributeAccessIssue',  # scope.project_root = root -- frozen mutation
+}
 
 
 def _resolve_pyright_launcher() -> list[str] | None:
@@ -184,25 +201,32 @@ class TestProjectScopeTypeGateRejection:
 
         errors = [d for d in payload.get('generalDiagnostics', []) if d.get('severity') == 'error']
 
-        assert len(errors) == 7, (
-            f'Expected exactly 7 pyright errors from the misuse fixture, got {len(errors)}: '
-            f'{[e["message"] for e in errors]}'
+        # (a) Zero errors on the valid-setup lines -- pyright must not reject
+        # correct usage. Asserted directly (not just "every error is past the
+        # boundary") so a missing/empty errors list can't vacuously pass.
+        setup_errors = [
+            e for e in errors if e['range']['start']['line'] < _MISUSE_START_LINE
+        ]
+        assert not setup_errors, (
+            f'pyright reported errors on the valid-setup lines (expected zero): '
+            f'{[(e["range"]["start"]["line"], e["message"]) for e in setup_errors]}'
         )
 
-        rule_counts = Counter(e.get('rule') for e in errors)
-        assert rule_counts['reportArgumentType'] == 6, (
-            f'Expected 6 reportArgumentType errors, got {rule_counts["reportArgumentType"]}: '
-            f'{[e["message"] for e in errors if e.get("rule") == "reportArgumentType"]}'
-        )
-        assert rule_counts['reportAttributeAccessIssue'] == 1, (
-            f'Expected 1 reportAttributeAccessIssue error, got '
-            f'{rule_counts["reportAttributeAccessIssue"]}: '
-            f'{[e["message"] for e in errors if e.get("rule") == "reportAttributeAccessIssue"]}'
-        )
-
+        # (b) Each misuse line produces at least one error of its expected
+        # rule. This checks the essential invariant -- pyright catches every
+        # documented misuse -- without pinning the exact diagnostic count,
+        # which is what made this test brittle across pyright versions
+        # (amendment: relaxed from an exact `len(errors) == 7` +
+        # per-rule-total assertion pinned to a single pyright 1.1.408 run).
+        errors_by_line: dict[int, list[dict]] = {}
         for e in errors:
-            start_line = e['range']['start']['line']
-            assert start_line >= _VALID_SETUP_LINE_COUNT, (
-                f'Unexpected pyright error on the valid-setup lines '
-                f'(0-indexed line {start_line}): {e["message"]}'
+            errors_by_line.setdefault(e['range']['start']['line'], []).append(e)
+
+        for line, expected_rule in _EXPECTED_RULE_BY_MISUSE_LINE.items():
+            line_errors = errors_by_line.get(line, [])
+            matching = [e for e in line_errors if e.get('rule') == expected_rule]
+            assert matching, (
+                f'Expected at least one {expected_rule} error on fixture line {line} '
+                f'({_FIXTURE_MISUSE.splitlines()[line - _MISUSE_START_LINE]!r}), got: '
+                f'{[(e.get("rule"), e["message"]) for e in line_errors]}'
             )
