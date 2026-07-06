@@ -250,7 +250,9 @@ class TaskArtifacts:
         """Update the base_commit in metadata.json after a rebase.
 
         Reads new-path-then-old but always writes back to the new path
-        only (migrate-on-write).
+        only (migrate-on-write) — the legacy metadata.json is left in
+        place, stale, for the rest of the compat window; see
+        ``_read_path`` for why that's safe and when it gets cleaned up.
         """
         meta_path = self._read_path('metadata.json')
         if not meta_path.exists():
@@ -411,6 +413,23 @@ class TaskArtifacts:
         / name`` if THAT exists, else ``self.root / name`` as the canonical
         (non-existent) path. When ``meta_root`` was not supplied to the
         constructor, ``self.root == self._legacy_root`` so this is a no-op.
+
+        Migrate-on-write callers (``update_base_commit``, ``read_plan``'s
+        normalization write-back, ``update_step_status``,
+        ``bump_revalidation_stamp``, ``stamp_plan_provenance``) copy the
+        consolidated artifact to the new path but deliberately leave the
+        legacy copy in place — untouched and increasingly stale — for the
+        rest of the compat window. That's safe as long as every read keeps
+        resolving new-then-old through this helper (the new copy always
+        wins once it exists). It would NOT be safe to re-instantiate
+        ``TaskArtifacts`` for the same worktree with ``meta_root=None``
+        after a partial migration, since that flips resolution to
+        legacy-only and would silently surface the stale copy — but nothing
+        in the codebase does that (``meta_root`` is derived once from
+        config, not toggled per-instantiation). Deleting the legacy copies
+        (and retiring this fallback entirely) is task ι in
+        ``plans/worktree-lane-lifecycle-prd.md``, gated on a full green
+        cycle after θ.
         """
         new = self.root / name
         if new.exists():
@@ -544,6 +563,16 @@ class TaskArtifacts:
         Best-effort: if the artifacts root has been removed (worktree gone
         out-of-band), skip the write rather than raising — the review JSON
         is a debugging aid, not load-bearing for workflow correctness.
+
+        The existence check below is against ``self.root`` (the new path)
+        only, by design — the compat contract is "writes new-path only"
+        (see ``_read_path``), so falling back to the legacy ``reviews/``
+        dir here would violate it. That means this method assumes
+        ``init()`` has already created ``self.root``: reviews are a
+        post-implementation workflow phase, so init() has always run by
+        the time a reviewer's output is written. If ``self.root`` doesn't
+        exist for some other reason, the write is silently skipped rather
+        than resurrected under the legacy dir.
         """
         if not self.root.is_dir():
             logger.info(
