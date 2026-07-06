@@ -788,6 +788,18 @@ class CpuGovernConfig(BaseModel):
         return result
 
 
+# `.task-meta` path-derivation contract (worktree-lane-lifecycle PRD, W11-β):
+# the orchestrator's task-scratch base lives at
+# <worktree_base>/.task-meta/<worktree_name> — a SIBLING of the worktree
+# itself, not nested inside it (unlike the legacy <worktree>/.task).
+# worktree_base already derives from GitConfig.worktree_dir below
+# (git_ops.py: project_root / config.worktree_dir); this constant supplies
+# only the new sibling-dir name, deliberately NOT a pydantic Field (Open Q2:
+# no new knob). TaskArtifacts.meta_root_for() is the single place that joins
+# these two together — see orchestrator/artifacts.py.
+TASK_META_DIRNAME: str = '.task-meta'
+
+
 class GitConfig(BaseModel):
     """Git operations configuration."""
 
