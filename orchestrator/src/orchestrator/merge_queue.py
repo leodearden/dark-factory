@@ -2699,6 +2699,20 @@ async def _journal_landed_then_advance(
     keeping the advance call byte-identical to before this helper existed.
     A ``None`` *outbox* (no ``project_root``, e.g. bare-worker tests) no-ops
     the record — the advance still proceeds.
+
+    CAUTION — the row is recorded UNCONDITIONALLY before the outcome of
+    ``advance_main`` is known. If the returned :class:`AdvanceOutcome`'s
+    ``result`` is anything other than ``'advanced'`` (e.g. ``'cas_failed'``,
+    ``'not_descendant'``, ``'unmerged_state'``, ``'pop_conflict_no_advance'``),
+    the task never actually landed on main, yet its row still persists in
+    the outbox. A recorded row therefore means "write-ahead intent", NOT
+    "confirmed landed" — this helper (and both its call sites) never
+    ``.consume()`` on failure. Any consumer of :class:`LandedOutbox` /
+    :class:`MergeProvenance` (e.g. a startup reconciler or a scheduler
+    consult-before-dispatch gate) MUST treat row presence as provisional:
+    verify the task actually landed (or cross-check ``advanced_sha`` against
+    real main history) before relying on it, and ``.consume()`` a row only
+    once the task is independently confirmed done.
     """
     if outbox is not None:
         outbox.record(LandedRow(
@@ -3021,6 +3035,31 @@ async def _do_train_merge(
         expected_main=main_sha,
     )
     adv = adv_outcome.result
+
+    # Correctness (amendment, task 2154): the train call does not pass
+    # reverify_on_rebase=True (unlike the single-branch site), so
+    # advance_main's OWN internal CAS-retry loop can transparently rebase
+    # merge_commit onto a moved main and land the REBASED sha directly,
+    # returning 'advanced' with advanced_sha != the pre-advance merge_commit
+    # journaled above. There is no caller-level rebased_pending_reverify
+    # branch here to re-record from (that only exists in _finalize_inflight's
+    # while-loop), so re-record now whenever the landed sha differs from what
+    # was journaled write-ahead — the row's advanced_sha must always match
+    # what actually landed on main, since consumers key on
+    # task_id + advanced_sha.
+    if (
+        adv == 'advanced'
+        and adv_outcome.advanced_sha is not None
+        and adv_outcome.advanced_sha != merge_commit
+    ):
+        _train_outbox = getattr(worker, '_landed_outbox', None)
+        if _train_outbox is not None:
+            _train_outbox.record(LandedRow(
+                task_id=req.task_id,
+                branch_tip_sha=_train_branch_tip or '',
+                advanced_sha=adv_outcome.advanced_sha,
+                landed_at=time.time(),
+            ))
 
     await git_ops.cleanup_merge_worktree(merge_wt)
 
