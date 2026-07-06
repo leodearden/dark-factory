@@ -39,7 +39,7 @@ from _orch_helpers import _init_harness_state_for_test
 from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.harness import Harness
+from orchestrator.harness import EventType, Harness
 
 # ---------------------------------------------------------------------------
 # step-1: Config field presence and default
@@ -51,3 +51,147 @@ def test_config_defaults_escalation_revalidation() -> None:
     the single operator kill-switch for both new auto-closure paths."""
     config = OrchestratorConfig()
     assert config.escalation_revalidation_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_harness() -> Harness:
+    """Build a minimal bare Harness for escalation-revalidation-sweep tests."""
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    h.config = OrchestratorConfig()
+    h.scheduler = MagicMock()
+    h._escalation_queue = MagicMock()
+    h._escalation_queue.make_id = MagicMock(return_value='esc-revalidation-1')
+    h.event_store = MagicMock()
+    return h
+
+
+def _make_esc(
+    *,
+    level: int = 2,
+    category: str = 'design_concern',
+    agent_role: str = 'orchestrator-scheduler',
+    esc_id: str = 'esc-tid-1',
+    task_id: str = 'tid',
+    status: str = 'pending',
+) -> Escalation:
+    return Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role=agent_role,
+        severity='critical',
+        category=category,
+        summary='test escalation',
+        level=level,
+        status=status,
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-3: Harness._revalidate_open_l2 — terminal-subject closure (criterion a)
+# ---------------------------------------------------------------------------
+
+
+class TestRevalidateOpenL2:
+    """step-3: _revalidate_open_l2 closes an open L2 whose subject task is
+    terminal (done/cancelled), and leaves everything else untouched."""
+
+    @pytest.mark.asyncio
+    async def test_done_subject_closes_l2(self) -> None:
+        h = _make_harness()
+        esc = _make_esc(level=2, task_id='tid-done')
+        statuses = {'tid-done': 'done'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is True
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert args[0] == esc.id
+        resolution = args[1] if len(args) > 1 else kwargs.get('resolution')
+        assert resolution and isinstance(resolution, str)
+        assert kwargs.get('dismiss') is True
+        assert kwargs.get('resolved_by') == 'harness-escalation-revalidation-sweep'
+        h.event_store.emit.assert_called_once()  # type: ignore[attr-defined]
+        emit_args, emit_kwargs = h.event_store.emit.call_args  # type: ignore[attr-defined]
+        assert emit_args[0] == EventType.escalation_resolved
+        data = emit_kwargs.get('data') or {}
+        assert data.get('escalation_id') == esc.id
+        assert data.get('subject_status') == 'done'
+        assert data.get('reason') == 'terminal-subject'
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_subject_closes_l2(self) -> None:
+        h = _make_harness()
+        esc = _make_esc(level=2, task_id='tid-cancelled')
+        statuses = {'tid-cancelled': 'cancelled'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is True
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        _args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert kwargs.get('dismiss') is True
+        assert kwargs.get('resolved_by') == 'harness-escalation-revalidation-sweep'
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_blocked_subject_leaves_open(self) -> None:
+        h = _make_harness()
+        esc = _make_esc(level=2, task_id='tid-live')
+        statuses = {'tid-live': 'blocked'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is False
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_in_progress_subject_leaves_open(self) -> None:
+        h = _make_harness()
+        esc = _make_esc(level=2, task_id='tid-live')
+        statuses = {'tid-live': 'in-progress'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is False
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_subject_absent_from_statuses_leaves_open(self) -> None:
+        h = _make_harness()
+        esc = _make_esc(level=2, task_id='tid-unknown')
+        statuses: dict[str, str] = {}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is False
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_non_l2_escalation_ignored(self) -> None:
+        h = _make_harness()
+        esc = _make_esc(level=1, task_id='tid-done')
+        statuses = {'tid-done': 'done'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is False
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_config_kill_switch(self) -> None:
+        h = _make_harness()
+        h.config = h.config.model_copy(update={'escalation_revalidation_enabled': False})
+        esc = _make_esc(level=2, task_id='tid-done')
+        statuses = {'tid-done': 'done'}
+
+        result = await h._revalidate_open_l2(esc, statuses)
+
+        assert result is False
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
