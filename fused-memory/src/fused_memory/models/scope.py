@@ -1,13 +1,27 @@
-"""Scope model — maps a request to backend-specific identifiers."""
+"""Scope model — maps a request to backend-specific identifiers.
 
+``ProjectId``/``ProjectRoot`` (below) are distinct ``str`` :class:`~typing.NewType`\\ s
+and ``ProjectScope`` is a frozen dataclass pairing them, so a transposed
+``project_id``/``project_root`` argument pair is a pyright error rather than a
+runtime bug. ``ProjectScope`` has exactly two sanctioned construction sites —
+``ReconciliationHarness._known_project_root_for`` (``reconciliation/harness.py``,
+the registry-backed cycle entry) and ``TargetedReconciler.reconcile_task``
+(``reconciliation/targeted.py``, after its ``require_project_root`` call). No
+other call site should construct a ``ProjectScope`` directly.
+"""
+
+import dataclasses
 import logging
 import os
 import subprocess
 from pathlib import Path, PurePosixPath
+from typing import NewType
 
 from pydantic import BaseModel, field_validator
 
 from fused_memory.utils.validation import _to_underscore_canonical, canonicalize_project_id
+
+from fused_memory.utils.validation import InputValidationError, require_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +221,35 @@ def build_known_projects_map(
             continue
         out[pid] = resolved
     return out
+
+
+ProjectId = NewType('ProjectId', str)
+ProjectRoot = NewType('ProjectRoot', str)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ProjectScope:
+    """Type-level pairing of a project's canonical id and filesystem root.
+
+    ``project_id`` and ``project_root`` are distinct ``NewType``\\ s (both
+    backed by ``str``), so passing one where the other is expected is a
+    pyright ``reportArgumentType`` error, not a silent runtime mix-up.
+    Instances are frozen — reassigning either field after construction raises
+    ``dataclasses.FrozenInstanceError`` at runtime and is a pyright
+    ``reportAttributeAccessIssue`` at type-check time.
+
+    See the module docstring for the two sanctioned construction sites.
+    """
+
+    project_id: ProjectId
+    project_root: ProjectRoot
+
+    def __post_init__(self) -> None:
+        if not self.project_id:
+            raise InputValidationError(
+                f'project_id must be a non-empty string, got: {self.project_id!r}'
+            )
+        require_project_root(self.project_root)
 
 
 class Scope(BaseModel):

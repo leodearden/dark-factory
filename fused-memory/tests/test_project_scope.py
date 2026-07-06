@@ -61,4 +61,6 @@ class TestProjectScopeFrozen:
             ProjectId('dark_factory'), ProjectRoot('/home/leo/src/dark-factory')
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(scope, 'project_id', ProjectId('y'))
+            # setattr, not a direct attribute assignment, so this stays pyright-clean
+            # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
+            setattr(scope, 'project_id', ProjectId('y'))  # noqa: B010
