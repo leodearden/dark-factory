@@ -31,8 +31,11 @@ The standard two-tier guard pattern separates these concerns:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Iterable, Sequence
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def propagate_cancellations(results: Sequence[Any]) -> None:  # Sequence, not list: callers may wrap/slice gather's return value
@@ -98,4 +101,48 @@ async def gather_collect(coros: Iterable[Awaitable[Any]]) -> list:
     """
     results = await asyncio.gather(*coros, return_exceptions=True)
     propagate_cancellations(results)
+    return results
+
+
+async def gather_or_raise(
+    coros: Iterable[Awaitable[Any]],
+    *,
+    label: str,
+    logger: logging.Logger = logger,
+) -> list:
+    """Gather *coros*; log every captured Exception, then raise the first.
+
+    This is the "log-all-then-raise-first" Pass-2 policy (the
+    ``MemoryService.get_entity`` semantics): after Pass 1
+    (:func:`propagate_cancellations`) confirms no bare BaseException
+    (cancellation signal) was captured, every captured ordinary Exception is
+    logged at WARNING — so no failure is silently dropped — and then the
+    positionally-first Exception (input/gather order) is raised.
+
+    Args:
+        coros: An iterable of awaitables to gather.
+        label: Required operation name, prefixed onto each WARNING log line
+            (e.g. ``'get_entity'``), so call sites remain identifiable in logs.
+        logger: Logger to use for the WARNING lines. Defaults to this module's
+            logger; inject a different logger for deterministic test capture.
+
+    Returns:
+        The list returned by ``asyncio.gather(*coros, return_exceptions=True)``,
+        in input order, if no Exception was captured.
+
+    Raises:
+        BaseException: If any coroutine raises a bare BaseException (cancellation
+            signal), it is re-raised via Pass 1 (:func:`propagate_cancellations`)
+            before this function returns, i.e. before any Pass-2 logging.
+        Exception: The positionally-first captured Exception, once every
+            captured Exception has been logged at WARNING.
+    """
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    propagate_cancellations(results)
+    first_exc = next((r for r in results if isinstance(r, Exception)), None)
+    if first_exc is not None:
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning('%s: %s: %s', label, type(r).__name__, r)
+        raise first_exc
     return results
