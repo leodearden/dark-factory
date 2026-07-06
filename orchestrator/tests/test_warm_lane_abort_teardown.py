@@ -8,8 +8,9 @@ scripts rather than depending on test_git_ops.py's module-level helpers.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -153,3 +154,78 @@ class TestAbortLaneAcquisitionDetachAndRelease:
         assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE, (
             'Pool slot must be FREE after abort'
         )
+
+
+# ---------------------------------------------------------------------------
+# _abort_lane_acquisition — WIP-commit + degenerate-gated retention (steps 5-6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAbortLaneAcquisitionWipAndRetention:
+    """_abort_lane_acquisition: commit-WIP-first, then degenerate-gated delete."""
+
+    async def test_abort_commits_wip_before_teardown(self, git_repo: Path):
+        """Uncommitted TRACKED WIP is committed onto the branch before teardown."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        info = await git_ops.acquire_warm_lane('X', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+        # Scrub the seeded (untracked) target/ dir so the only dirty state
+        # left is the tracked-file edit below (mirrors the target/-scrub
+        # idiom used elsewhere in this module, e.g. β re-seed).
+        shutil.rmtree(info.path / 'target', ignore_errors=True)
+        (info.path / 'README.md').write_text('uncommitted WIP\n')
+
+        await git_ops._abort_lane_acquisition(info.path, 'X', remove_worktree=False)
+
+        rc, log, _ = await _run(['git', 'log', '--oneline', 'task/X'], cwd=git_repo)
+        assert rc == 0, 'task/X must still exist (commit-bearing, retained)'
+        assert 'save WIP before lane-acquire abort' in log, (
+            f'Expected a WIP-save commit on task/X; got log:\n{log}'
+        )
+
+    async def test_abort_retains_commit_bearing_branch(self, git_repo: Path):
+        """Even when warm_lane_ref_is_degenerate=True, a commit-bearing branch is retained."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        info = await git_ops.acquire_warm_lane('X', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+        shutil.rmtree(info.path / 'target', ignore_errors=True)
+        (info.path / 'work.txt').write_text('real work\n')
+        await _run(['git', 'add', '-A'], cwd=info.path)
+        await _run(['git', 'commit', '-m', 'real work commit'], cwd=info.path)
+
+        with patch.object(
+            git_ops, 'warm_lane_ref_is_degenerate', AsyncMock(return_value=True),
+        ):
+            await git_ops._abort_lane_acquisition(info.path, 'X', remove_worktree=False)
+
+        rc, _, _ = await _run(['git', 'rev-parse', '--verify', 'task/X'], cwd=git_repo)
+        assert rc == 0, (
+            'Commit-bearing branch must be RETAINED even when flagged degenerate'
+        )
+
+    async def test_abort_deletes_degenerate_ref(self, git_repo: Path):
+        """0-commits-beyond-main + degenerate=True ⇒ branch is deleted."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        info = await git_ops.acquire_warm_lane('X', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+        # No tracked edits and no seeded target/ dirt — task/X sits exactly
+        # at the main tip (0 commits beyond main) going into the abort.
+        shutil.rmtree(info.path / 'target', ignore_errors=True)
+
+        with patch.object(
+            git_ops, 'warm_lane_ref_is_degenerate', AsyncMock(return_value=True),
+        ):
+            await git_ops._abort_lane_acquisition(info.path, 'X', remove_worktree=False)
+
+        rc, _, _ = await _run(['git', 'rev-parse', '--verify', 'task/X'], cwd=git_repo)
+        assert rc != 0, 'Degenerate 0-commits-beyond-main branch must be DELETED'
