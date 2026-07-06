@@ -5815,6 +5815,12 @@ class GitOps:
                 if reason is None:
                     continue
 
+                if self._refuse_foreign_band(
+                    wt_path, frozenset({self.config.iact_prefix}),
+                    'reap_interactive_worktrees',
+                ):
+                    continue
+
                 rc_rm, _, err = await _run(
                     ['git', 'worktree', 'remove', '--force', str(wt_path)],
                     cwd=self.project_root,
