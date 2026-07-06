@@ -175,10 +175,15 @@ async def move_entity_across_graphs(
     recreated in target_graph, provided the episode node already exists
     there (same silent-skip rule as edges; MENTIONS carries no embedding).
 
-    The source ``DETACH DELETE`` and the idempotency probe are added in
-    later steps (11-14); ``rewrite_group_id`` substitution for the
-    node/edges/mentions lands in step-16 (applied here as a
-    forward-compatible no-op when ``rewrite_group_id`` is None).
+    Delete (step-11/12): once every target CREATE above has been awaited,
+    the source node is ``DETACH DELETE``d -- always the LAST mutation, so a
+    crash mid-move still leaves a recoverable duplicate rather than losing
+    the only copy.
+
+    The idempotency probe is added in a later step (13-14);
+    ``rewrite_group_id`` substitution for the node/edges/mentions lands in
+    step-16 (applied here as a forward-compatible no-op when
+    ``rewrite_group_id`` is None).
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
@@ -325,6 +330,16 @@ async def move_entity_across_graphs(
             },
         )
         mentions_moved += 1
+
+    # --- source DETACH DELETE (step-11/12) ---
+    # Always the LAST mutation: every target CREATE (node, edges, mentions)
+    # above has already been awaited, so a crash here still leaves a
+    # recoverable duplicate in target_graph rather than losing the only
+    # copy. Never touches target_graph.
+    await source.query(
+        'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
+        {'uuid': uuid},
+    )
 
     logger.info(
         'move_entity_across_graphs: node moved uuid=%s source=%s target=%s '

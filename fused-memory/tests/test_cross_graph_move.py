@@ -190,8 +190,14 @@ class TestMoveEntityAcrossGraphsNodeCore:
         assert params.get('name') == 'Alice'
         assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
 
-        # never touches source's mutating .query (no delete yet -- step-12)
-        source_mock.query.assert_not_awaited()
+        # source's mutating .query is used solely for the final DETACH
+        # DELETE (step-11/12); ordering vs. the target CREATE is covered in
+        # TestMoveEntityAcrossGraphsOrdering.
+        source_mock.query.assert_awaited_once()
+        delete_cypher = extract_cypher(source_mock.query.call_args)
+        delete_params = extract_params(source_mock.query.call_args)
+        assert 'DETACH DELETE' in delete_cypher
+        assert delete_params.get('uuid') == NODE_UUID_FIXTURE
 
         assert isinstance(result, MoveResult)
         assert result.uuid == NODE_UUID_FIXTURE
