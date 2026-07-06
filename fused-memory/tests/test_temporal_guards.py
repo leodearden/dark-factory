@@ -117,9 +117,12 @@ class TestTemporalGuardRoundTrip:
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-plan-002'
         project_id = 'integ-project'
+        scope = Scope(project_id=project_id)
 
-        # Register episode as planned
-        await reg.register(ep_uuid, project_id)
+        # Register under the same canonical group_id _search_graphiti will look
+        # up (mirrors memory_service.add_episode(), which derives group_id from
+        # this same Scope for both the registry write and the search read).
+        await reg.register(ep_uuid, scope.graphiti_group_id)
 
         # Configure graphiti.search to return an edge with this episode in provenance
         planned_edge = MockEdge(
@@ -129,7 +132,6 @@ class TestTemporalGuardRoundTrip:
         )
         svc.graphiti.search = AsyncMock(return_value=[planned_edge])
 
-        scope = Scope(project_id=project_id)
         results = await svc._search_graphiti(
             'CostStore', scope, limit=10, include_planned=False
         )
@@ -147,8 +149,9 @@ class TestTemporalGuardRoundTrip:
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-plan-003'
         project_id = 'integ-project'
+        scope = Scope(project_id=project_id)
 
-        await reg.register(ep_uuid, project_id)
+        await reg.register(ep_uuid, scope.graphiti_group_id)
 
         planned_edge = MockEdge(
             fact='CostStore extends AgentResult',
@@ -157,7 +160,6 @@ class TestTemporalGuardRoundTrip:
         )
         svc.graphiti.search = AsyncMock(return_value=[planned_edge])
 
-        scope = Scope(project_id=project_id)
         results = await svc._search_graphiti(
             'CostStore', scope, limit=10, include_planned=True
         )
@@ -176,9 +178,10 @@ class TestTemporalGuardRoundTrip:
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-plan-004'
         project_id = 'integ-project'
+        scope = Scope(project_id=project_id)
 
         # Register as planned
-        await reg.register(ep_uuid, project_id)
+        await reg.register(ep_uuid, scope.graphiti_group_id)
 
         planned_edge = MockEdge(
             fact='CostStore extends AgentResult',
@@ -186,8 +189,6 @@ class TestTemporalGuardRoundTrip:
             episodes=[ep_uuid],
         )
         svc.graphiti.search = AsyncMock(return_value=[planned_edge])
-
-        scope = Scope(project_id=project_id)
 
         # Before promotion: excluded
         results = await svc._search_graphiti(
@@ -217,14 +218,18 @@ class TestTemporalGuardRoundTrip:
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-full-001'
         project_id = 'integ-project'
+        scope = Scope(project_id=project_id)
 
-        # Step 1: planning write via _execute_graphiti_write
+        # Step 1: planning write via _execute_graphiti_write. group_id is set
+        # from scope.graphiti_group_id (not the raw project_id), mirroring
+        # memory_service.add_episode()'s real payload construction so the
+        # write and the later search below key off the same canonical value.
         payload = {
             'uuid': ep_uuid,
             'name': 'prd-episode',
             'content': 'PRD: TaskStore manages task lifecycle',
             'source': 'text',
-            'group_id': project_id,
+            'group_id': scope.graphiti_group_id,
             'source_description': '[temporal:planning] PRD',
             'temporal_context': 'planning',
         }
@@ -240,7 +245,6 @@ class TestTemporalGuardRoundTrip:
             episodes=[ep_uuid],
         )
         svc.graphiti.search = AsyncMock(return_value=[edge])
-        scope = Scope(project_id=project_id)
 
         # Step 3: normal search excludes it
         results = await svc._search_graphiti('TaskStore', scope, limit=10, include_planned=False)
