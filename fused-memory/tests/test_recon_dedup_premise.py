@@ -1,36 +1,21 @@
 """Empirical probe (task 2221, W5-γ): does a recon infer=False system write
 ever get silently dedup-dropped by Mem0 (§2.1's '~0.92 cosine' premise)?
 
-FINDING — PREMISE FALSE. Mem0Backend.add pins infer=False (mem0_client.py:84-112),
-and mem0's AsyncMemory._add_to_vector_store infer=False branch (vendored
-mem0/memory/main.py:1589-1624) iterates messages, skips ONLY a message dict
-that is malformed or has role=='system', and otherwise calls _create_memory
-UNCONDITIONALLY for every remaining message. Async _create_memory (main.py:
-2356-2393) mints a fresh memory_id=str(uuid.uuid4()) and inserts a new Qdrant
-point every time — it stores an md5 hash of the content but never searches,
-never compares cosine similarity, and never chooses update-vs-add. That
-near-duplicate/update logic exists ONLY in the infer=True branch (main.py:
-1626+), which this write path never takes. So a successful infer=False write
-always returns exactly one result with a fresh id — precisely the
-_MEM0_ADD_INFER_PINNED_FALSE invariant (memory_service.py:68, task 1974).
+FINDING — PREMISE FALSE. Mem0Backend.add pins infer=False, and mem0's
+infer=False write path never runs a similarity search or an update-vs-add
+choice — it unconditionally mints a fresh id and inserts a new point per
+message. A message is skipped only if it is malformed or has role=='system',
+which recon's plain-string add() calls never produce (mem0 always
+normalizes a str payload to a single role='user' message). So a repeated,
+byte-identical infer=False write is never dropped for being a near-duplicate.
 
-The ONLY way an infer=False write drops a message is if that message dict
-has role=='system' or is malformed (missing role/content) — mem0's own
-str-content normalization (main.py:1542-1543) always wraps a plain string
-in {'role': 'user', 'content': ...}, which recon's string-content call sites
-(e.g. task_knowledge_sync.py's add_memory calls) always produce. So that
-drop condition is unreachable from recon's actual call shape.
-
-Empirically confirmed TWICE below, both against a real Qdrant: (i)
-test_identical_infer_false_writes_all_land_distinct — a hermetic harness
-with a stubbed, IDENTICAL-vector embedder (cosine=1.0, a strictly stronger
-worst case than the survey's ~0.92); and (ii)
-test_identical_writes_land_with_real_openai_embeddings — the same probe
-with genuine OpenAI embeddings (cosine≈1.0 for identical text), when
+Confirmed empirically below against a real Qdrant, twice: once with a
+stubbed, identical-vector embedder (cosine=1.0 — a strictly stronger worst
+case than the survey's ~0.92), and again with real OpenAI embeddings when
 OPENAI_API_KEY is available. In both, every one of N byte-identical
 infer=False writes lands as a distinct point (N distinct ids and
-backend.count(scope)==N) — directly rebutting the '~0.92 cosine dedup'
-observation with real embeddings, not just the code trace.
+backend.count(scope)==N). See task 2221's memory notes for the full
+code-trace citations backing this finding.
 
 Consequence for downstream tasks: δ's add_system_record is a no-op
 hardening (the premise it "fixes" is already false), and λ's deletion
@@ -98,10 +83,29 @@ def clean_collection(recon_scope, mock_config):
 
 
 def _collection_vector_size(collection: str) -> int:
-    """Read back the vector dimension Qdrant actually created for *collection*."""
+    """Read back the vector dimension Qdrant actually created for *collection*.
+
+    This assumes mem0's Qdrant vector store creates the collection eagerly —
+    mem0.vector_stores.qdrant.QdrantDB.__init__ calls create_col()
+    unconditionally, so by the time _build_recon_backend has awaited
+    backend._get_instance(scope), the collection already exists. If a future
+    mem0 release makes collection creation lazy (e.g. deferred to the first
+    add()), fail loudly with a message that explains the assumption instead
+    of leaking a raw 404 traceback.
+    """
     client = QdrantClient(url=QDRANT_URL, timeout=10)
     try:
-        info = client.get_collection(collection)
+        try:
+            info = client.get_collection(collection)
+        except (ResponseHandlingException, UnexpectedResponse) as exc:
+            raise AssertionError(
+                f'collection {collection!r} does not exist yet. This harness '
+                "assumes mem0's AsyncMemory.from_config() eagerly creates the "
+                'Qdrant collection during _get_instance(); if a mem0 upgrade '
+                'made collection creation lazy instead, this stub-dimension '
+                'lookup needs reworking (e.g. force a real add() before '
+                'reading the dimension back).'
+            ) from exc
         vectors = info.config.params.vectors
         # mem0's Qdrant vector store always creates collections with a single
         # unnamed vector config (see mem0.vector_stores.qdrant.create_col), never
@@ -147,6 +151,39 @@ async def _build_recon_backend(mock_config, scope, monkeypatch, *, real_embedder
     return backend
 
 
+async def _assert_all_writes_land_distinct(backend, scope, *, n: int, run_id: str) -> None:
+    """Issue *n* byte-identical infer=False writes and assert none dedup-drop.
+
+    Shared by both tests below: asserts each write returns exactly one
+    result (the infer=False shape), that all *n* returned ids are distinct
+    (no in-place update in lieu of a fresh point), and that the collection's
+    exact point count is exactly *n* (no silent drop).
+    """
+    metadata = {
+        'kind': 'cycle_summary',
+        'stage': 'task_knowledge_sync',
+        'run_id': run_id,
+    }
+    ids = []
+    for _ in range(n):
+        response = await backend.add(
+            content=FIXED_RECON_SUMMARY,
+            scope=scope,
+            metadata=metadata,
+        )
+        results = response.get('results') or []
+        assert len(results) == 1, (
+            f'expected exactly one result under infer=False, got {results!r}'
+        )
+        assert 'id' in results[0]
+        ids.append(results[0]['id'])
+
+    assert len(set(ids)) == n, (
+        f'expected {n} distinct ids (no dedup drop), got {len(set(ids))} distinct: {ids!r}'
+    )
+    assert await backend.count(scope) == n
+
+
 @pytest.mark.asyncio
 async def test_identical_infer_false_writes_all_land_distinct(
     mock_config, recon_scope, clean_collection, monkeypatch,
@@ -160,32 +197,11 @@ async def test_identical_infer_false_writes_all_land_distinct(
     were true, at least one of these 8 writes would return zero results
     and/or the collection would end up with fewer than 8 points.
     """
-    n = 8
     backend = await _build_recon_backend(mock_config, recon_scope, monkeypatch)
     try:
-        ids = []
-        metadata = {
-            'kind': 'cycle_summary',
-            'stage': 'task_knowledge_sync',
-            'run_id': 'task-2221-premise-probe-hermetic',
-        }
-        for _ in range(n):
-            response = await backend.add(
-                content=FIXED_RECON_SUMMARY,
-                scope=recon_scope,
-                metadata=metadata,
-            )
-            results = response.get('results') or []
-            assert len(results) == 1, (
-                f'expected exactly one result under infer=False, got {results!r}'
-            )
-            assert 'id' in results[0]
-            ids.append(results[0]['id'])
-
-        assert len(set(ids)) == n, (
-            f'expected {n} distinct ids (no dedup drop), got {len(set(ids))} distinct: {ids!r}'
+        await _assert_all_writes_land_distinct(
+            backend, recon_scope, n=8, run_id='task-2221-premise-probe-hermetic',
         )
-        assert await backend.count(recon_scope) == n
     finally:
         await backend.close()
 
@@ -205,31 +221,10 @@ async def test_identical_writes_land_with_real_openai_embeddings(
     strongest realistic near-duplicate signal never triggers a drop,
     because the infer=False path never consults embeddings for dedup.
     """
-    n = 5
     backend = await _build_recon_backend(mock_config, recon_scope, monkeypatch, real_embedder=True)
     try:
-        ids = []
-        metadata = {
-            'kind': 'cycle_summary',
-            'stage': 'task_knowledge_sync',
-            'run_id': 'task-2221-premise-probe-real-embedder',
-        }
-        for _ in range(n):
-            response = await backend.add(
-                content=FIXED_RECON_SUMMARY,
-                scope=recon_scope,
-                metadata=metadata,
-            )
-            results = response.get('results') or []
-            assert len(results) == 1, (
-                f'expected exactly one result under infer=False, got {results!r}'
-            )
-            assert 'id' in results[0]
-            ids.append(results[0]['id'])
-
-        assert len(set(ids)) == n, (
-            f'expected {n} distinct ids (no dedup drop), got {len(set(ids))} distinct: {ids!r}'
+        await _assert_all_writes_land_distinct(
+            backend, recon_scope, n=5, run_id='task-2221-premise-probe-real-embedder',
         )
-        assert await backend.count(recon_scope) == n
     finally:
         await backend.close()
