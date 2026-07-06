@@ -109,6 +109,7 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     ),
 }
 
+
 def _validate_exhaustive(enum_cls, policy) -> None:
     """Raise if ``policy`` doesn't have exactly one row per ``enum_cls`` member.
 
@@ -126,3 +127,29 @@ def _validate_exhaustive(enum_cls, policy) -> None:
 
 
 _validate_exhaustive(FailureCategory, CATEGORY_POLICY)
+
+
+# Ordered from highest to lowest severity; used by ``_worst_category``. Derived
+# (not hand-written) so a new category can never drift out of sync with its
+# CATEGORY_POLICY row — see bug_history: task 2048 required 4 registry edits
+# + 2 inline sets for a single category change.
+CATEGORY_PRIORITY: list[FailureCategory] = sorted(
+    FailureCategory, key=lambda c: CATEGORY_POLICY[c].severity_rank,
+)
+
+# Categories that must NOT be auto-archived. Derived from CategoryPolicy.archive.
+ARCHIVE_DENY_LIST: frozenset[FailureCategory] = frozenset(
+    c for c, p in CATEGORY_POLICY.items() if not p.archive
+)
+
+# Categories skipped by the preexisting-main-break probe. Derived from
+# CategoryPolicy.preexisting_probe.
+PREEXISTING_BREAK_SKIP_CATEGORIES: frozenset[FailureCategory] = frozenset(
+    c for c, p in CATEGORY_POLICY.items() if not p.preexisting_probe
+)
+
+# Categories treated as infra-transient by the main-tip sweep (retried rather
+# than reported as drift). Derived from CategoryPolicy.is_infra_transient.
+INFRA_TRANSIENT_CATEGORIES: frozenset[FailureCategory] = frozenset(
+    c for c, p in CATEGORY_POLICY.items() if p.is_infra_transient
+)
