@@ -144,7 +144,7 @@ class TestCrossPackageDriftGuardPlaceholder:
     """Shape of the future guard. Not runnable yet — see the skip reason."""
 
     def test_orchestrator_task_status_matches_shared(self):
-        from orchestrator.task_status import (
+        from orchestrator.task_status import (  # pyright: ignore[reportMissingImports]
             ACTIVE_TASK_STATUSES,
             TERMINAL_STATUSES,
             WORKFLOW_PRESERVE_STATUSES,
@@ -155,12 +155,17 @@ class TestCrossPackageDriftGuardPlaceholder:
         assert WORKFLOW_PRESERVE_STATUSES == WORKFLOW_PRESERVE
 
     def test_fused_memory_task_interceptor_matches_shared(self):
-        from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES, TaskInterceptor
+        from fused_memory.middleware.task_interceptor import (  # pyright: ignore[reportMissingImports]
+            TERMINAL_STATUSES,
+            TaskInterceptor,
+        )
 
         assert TERMINAL_STATUSES == TERMINAL
         assert TaskInterceptor.STATUS_TRIGGERS == STATUS_TRIGGERS
 
     def test_fused_memory_task_filter_matches_shared(self):
-        from fused_memory.reconciliation.task_filter import ACTIVE_TASK_STATUSES
+        from fused_memory.reconciliation.task_filter import (  # pyright: ignore[reportMissingImports]
+            ACTIVE_TASK_STATUSES,
+        )
 
         assert ACTIVE_TASK_STATUSES == ACTIVE
