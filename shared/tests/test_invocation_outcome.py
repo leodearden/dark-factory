@@ -543,10 +543,16 @@ class TestGoldenCorpus:
 
         resets_at_expectation = record.get('resets_at')
         if record['expected'] == 'CapHit' and resets_at_expectation == 'set':
+            # expected_cls above is CapHit at runtime (asserted via isinstance),
+            # but it's a dict-lookup value typed `type[InvocationOutcome]`, so
+            # pyright can't narrow `outcome` through it. Re-assert against the
+            # literal CapHit class so the attribute access below type-checks.
+            assert isinstance(outcome, CapHit)
             assert outcome.resets_at is not None, (
                 f'{record["id"]}: expected resets_at to be set, got None'
             )
         elif record['expected'] == 'CapHit' and resets_at_expectation == 'none':
+            assert isinstance(outcome, CapHit)
             assert outcome.resets_at is None, (
                 f'{record["id"]}: expected resets_at to be None, got {outcome.resets_at!r}'
             )
