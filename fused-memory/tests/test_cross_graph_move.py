@@ -645,10 +645,24 @@ class TestMergeForeignDuplicate:
         wrong_mock.query = AsyncMock(side_effect=_record_wrong_query)
 
         home_mock = make_graph_mock()
+        # Independent before/after re-reads (not a single static
+        # return_value): before-read == 2 edges (shared + home-only);
+        # after-read == 3 edges, reflecting the landed unique-edge recreate.
+        # home_edge_count_after must come from the after-read, not from
+        # arithmetic on home_edge_count_before + edges_recreated.
         home_mock.ro_query = AsyncMock(
-            return_value=MagicMock(
-                result_set=[[SHARED_EDGE_UUID_FIXTURE], [HOME_ONLY_EDGE_UUID_FIXTURE]]
-            )
+            side_effect=[
+                MagicMock(
+                    result_set=[[SHARED_EDGE_UUID_FIXTURE], [HOME_ONLY_EDGE_UUID_FIXTURE]]
+                ),
+                MagicMock(
+                    result_set=[
+                        [SHARED_EDGE_UUID_FIXTURE],
+                        [HOME_ONLY_EDGE_UUID_FIXTURE],
+                        [UNIQUE_WRONG_EDGE_UUID_FIXTURE],
+                    ]
+                ),
+            ]
         )
 
         async def _record_home_query(cypher, params=None):
@@ -694,9 +708,73 @@ class TestMergeForeignDuplicate:
         assert 'DETACH DELETE' in delete_cypher
         assert delete_params.get('uuid') == NODE_UUID_FIXTURE
 
-        # (c) no edge lost, none double-counted.
+        # (c) no edge lost, none double-counted -- home_edge_count_after is
+        # sourced from the independent after-read (3), not the arithmetic
+        # home_edge_count_before + edges_recreated (which would also be 3
+        # here, but for the wrong reason -- see the dedicated mismatch test
+        # below that tells the two apart).
         assert isinstance(result, MergeResult)
         assert result.home_edge_count_before == 2
         assert result.edges_recreated == 1
         assert result.home_edge_count_after == 3
         assert result.unique_wrong_edge_uuids == {UNIQUE_WRONG_EDGE_UUID_FIXTURE}
+
+    @pytest.mark.asyncio
+    async def test_home_edge_count_after_is_independent_reread_not_arithmetic(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """home_edge_count_after must be an INDEPENDENT re-read of home's
+        edge set taken after the recreate loop, not the arithmetic
+        ``home_edge_count_before + edges_recreated``.
+
+        Here the unique edge's CREATE silently matches no endpoint (the
+        documented silent-skip when the other endpoint is absent from
+        home), so a re-read of home after the recreate loop still shows
+        the original 2 edges. A re-read impl reports
+        ``home_edge_count_after == 2``; the arithmetic tautology
+        (2 + 1 == 3) would mask the loss instead of surfacing it. This
+        assertion fails against the current arithmetic impl (which yields
+        3) and passes only for a genuine re-read impl.
+        """
+        backend = make_backend(mock_config)
+
+        wrong_mock = make_graph_mock()
+        wrong_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            )
+        )
+        wrong_mock.query = AsyncMock(return_value=MagicMock())
+
+        home_mock = make_graph_mock()
+        # before-read == 2 edges; after-read STILL == 2 edges -- the unique
+        # edge's CREATE matched no endpoint, so home is unchanged.
+        unchanged_result_set = [
+            [SHARED_EDGE_UUID_FIXTURE], [HOME_ONLY_EDGE_UUID_FIXTURE],
+        ]
+        home_mock.ro_query = AsyncMock(
+            side_effect=[
+                MagicMock(result_set=list(unchanged_result_set)),
+                MagicMock(result_set=list(unchanged_result_set)),
+            ]
+        )
+        home_mock.query = AsyncMock(return_value=MagicMock())
+
+        backend._driver._get_graph = _route_graphs({
+            WRONG_GRAPH_FIXTURE: wrong_mock,
+            HOME_GRAPH_FIXTURE: home_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await merge_foreign_duplicate(
+            backend, NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE,
+        )
+
+        assert result.home_edge_count_before == 2
+        assert result.edges_recreated == 1
+        assert result.home_edge_count_after == 2
+        assert result.home_edge_count_after != (
+            result.home_edge_count_before + result.edges_recreated
+        )
