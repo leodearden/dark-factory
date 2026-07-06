@@ -432,3 +432,87 @@ class TestBuildInvestigationReport:
         r2 = _mod.build_investigation_report('u1', ['reify'], [], collision_result, verdict)
 
         assert r1 == r2
+
+
+# ===========================================================================
+# Tests: run() -- end-to-end orchestration
+# ===========================================================================
+
+class TestRun:
+    """Tests for async run(args, memory_service) -> dict."""
+
+    def _args(self, uuid=None):
+        import types as _types
+        return _types.SimpleNamespace(uuid=uuid)
+
+    def _make_memory_service(self, graphs, presence_rows_by_graph=None):
+        """AsyncMock memory_service with .graphiti wired for list_graphs
+        (GRAPH.LIST) + _graph_for (one stable mock per graph name), and
+        delete_memory/update_edge as AsyncMocks for the read-only guarantee.
+        Returns (memory_service, graph_mocks) so tests can inspect the
+        per-graph mocks directly."""
+        rows_by_graph = presence_rows_by_graph or {}
+        graph_mocks = {name: _make_graph_mock(rows_by_graph.get(name, [])) for name in graphs}
+
+        memory_service = AsyncMock()
+        graphiti = MagicMock()
+        graphiti.list_graphs = AsyncMock(return_value=graphs)
+        graphiti._graph_for = MagicMock(side_effect=lambda name: graph_mocks[name])
+        memory_service.graphiti = graphiti
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.update_edge = AsyncMock(return_value=None)
+        return memory_service, graph_mocks
+
+    @pytest.mark.asyncio
+    async def test_calls_list_graphs_for_graph_list(self):
+        """memory_service.graphiti.list_graphs() enumerates GRAPH.LIST."""
+        memory_service, _ = self._make_memory_service(['reify', 'dark_factory'])
+
+        await _mod.run(self._args(uuid='some-uuid'), memory_service)
+
+        memory_service.graphiti.list_graphs.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_report_built_end_to_end(self):
+        """The returned report has present_in, collision_groups, verdict,
+        and scope -- the full pipeline ran, not a partial stub."""
+        graphs = ['reify', 'dark_factory', 'know_live']
+        rows_by_graph = {
+            'reify': [['target-uuid', 'orchestrator', 'reify']],
+            'dark_factory': [['target-uuid', 'orchestrator', 'reify']],
+            'know_live': [['target-uuid', 'orchestrator', 'reify']],
+        }
+        memory_service, _ = self._make_memory_service(graphs, rows_by_graph)
+
+        report = await _mod.run(self._args(uuid='target-uuid'), memory_service)
+
+        assert report['target_uuid'] == 'target-uuid'
+        assert report['all_graphs'] == graphs
+        assert len(report['present_in']) == 3
+        assert report['collision_groups'] == []
+        assert report['verdict']['confirmed'] is True
+        assert 'cross_graph_node_leak' in report['verdict']['signals']
+        assert report['scope'] == 'single_node'
+
+    @pytest.mark.asyncio
+    async def test_uuid_none_falls_back_to_target_node_uuid(self):
+        """args.uuid=None uses the module's default TARGET_NODE_UUID."""
+        memory_service, _ = self._make_memory_service(['reify'])
+
+        report = await _mod.run(self._args(uuid=None), memory_service)
+
+        assert report['target_uuid'] == _mod.TARGET_NODE_UUID
+
+    @pytest.mark.asyncio
+    async def test_strictly_read_only(self):
+        """run() never issues a mutating graph query, memory delete, or
+        edge update."""
+        graphs = ['reify', 'dark_factory']
+        memory_service, graph_mocks = self._make_memory_service(graphs)
+
+        await _mod.run(self._args(uuid='some-uuid'), memory_service)
+
+        for graph in graph_mocks.values():
+            graph.query.assert_not_called()
+        memory_service.delete_memory.assert_not_called()
+        memory_service.update_edge.assert_not_called()
