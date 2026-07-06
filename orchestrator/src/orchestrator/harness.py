@@ -7574,6 +7574,96 @@ Output JSON matching the schema. Every task must appear in the output.
             esc.id, swept_sha[:12], vr.category,
         )
 
+    async def _close_superseded_main_sweep_escalations(self, clean_sha: str) -> None:
+        """Self-heal: close any main-sweep escalation superseded by a clean PASS (task 2114).
+
+        ``_run_main_tip_sweep`` never closed its own stale failing escalation
+        once a LATER pass verified main clean — this is the pile-up gap.  The
+        only fail-safe positive evidence that the cited defect is actually
+        fixed is a FRESH full-verify PASS at a SHA that is a STRICT
+        descendant of the failed swept SHA (main advanced and now verifies
+        clean).  A bare ``is_ancestor(cited_sha, main)`` is unsafe: the
+        failing SHA is itself an ancestor of an un-advanced (still-broken)
+        main, and ``git merge-base --is-ancestor`` is reflexive (a commit is
+        trivially an ancestor of itself) — so an escalation whose swept SHA
+        equals *clean_sha* at 12-hex precision is explicitly guarded rather
+        than auto-closed, even though ``is_ancestor`` would return True.
+
+        Enumerates every pending escalation and closes (``close_only``, via
+        ``resolve(dismiss=True)`` — never resumed/re-pended) each
+        ``orchestrator-main-sweep`` one whose swept SHA — parsed from its
+        ``main-sweep-<sha12>`` task_id — is a strict ancestor of *clean_sha*.
+        Level-agnostic (acts on an L1 or an auto-watcher-promoted L2 alike),
+        since ``_run_main_tip_sweep`` files at L1 but the auto-watcher may
+        have since promoted it.
+
+        Fail-soft at two layers: a method-level try/except around the whole
+        enumeration (an unconfigured/erroring ``get_pending()`` degrades to a
+        no-op) and a per-item try/except inside the loop (one bad escalation
+        — e.g. a git_ops failure — never blocks the rest of the pass).  This
+        is what keeps the existing main-tip-sweep suite's bare-MagicMock
+        harness inert: called only from the ``vr.passed`` branch, after
+        ``_last_swept_main_sha`` has already been updated.
+        """
+        if not self.config.escalation_revalidation_enabled:
+            return
+        if self._escalation_queue is None:
+            return
+        if not clean_sha:
+            return
+
+        try:
+            for esc in self._escalation_queue.get_pending():
+                try:
+                    if esc.agent_role != 'orchestrator-main-sweep' or esc.status != 'pending':
+                        continue
+                    swept = esc.task_id.removeprefix('main-sweep-')
+                    if not swept or swept == esc.task_id:
+                        continue
+                    if swept == clean_sha[:len(swept)]:
+                        # Equal-sha guard: is_ancestor(X, X) is trivially True
+                        # (reflexive) — a still-broken main re-verified at the
+                        # exact same commit must not be treated as fixed.
+                        continue
+                    if not await self.git_ops.is_ancestor(swept, clean_sha):  # type: ignore[union-attr]
+                        continue
+
+                    resolution = (
+                        f'main-tip-sweep self-heal: main advanced to {clean_sha[:12]} '
+                        f'which verifies clean; swept SHA {swept} failure is '
+                        f'superseded — auto-closed (close_only).'
+                    )
+                    self._escalation_queue.resolve(
+                        esc.id, resolution, dismiss=True,
+                        resolved_by=_MAIN_TIP_SWEEP_SELFHEAL_ROLE,
+                    )
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.escalation_resolved,
+                            task_id=esc.task_id,
+                            data={
+                                'escalation_id': esc.id,
+                                'swept_sha': swept,
+                                'clean_sha': clean_sha[:12],
+                                'reason': 'main-tip-sweep-superseded',
+                            },
+                        )
+                    logger.info(
+                        'Main-tip-sweep self-heal: closed %s — swept SHA %s '
+                        'superseded by clean tip %s',
+                        esc.id, swept, clean_sha[:12],
+                    )
+                except Exception as exc:
+                    logger.error(
+                        'Main-tip-sweep self-heal: failed for escalation %s: %s: %s',
+                        getattr(esc, 'id', '?'), type(exc).__name__, exc,
+                    )
+        except Exception as exc:
+            logger.error(
+                'Main-tip-sweep self-heal: enumeration failed: %s: %s',
+                type(exc).__name__, exc,
+            )
+
     # ------------------------------------------------------------------
     # Deterministic-strand reconciliation sweep (task 2074)
     # ------------------------------------------------------------------
