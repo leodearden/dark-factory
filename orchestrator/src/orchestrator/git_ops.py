@@ -2926,6 +2926,13 @@ class GitOps:
                     # beyond main. Scoped to this create-once seed-fault path
                     # only — the reattach/reuse paths deliberately retain
                     # commit-bearing branches and are untouched.
+                    # Task 2112 amendment: `branch_name` here is acquire_warm_lane's
+                    # own parameter — the BARE task id, e.g. '321', NOT the
+                    # prefixed `full_branch` ('task/321'). warm_lane_ref_is_degenerate
+                    # forwards it verbatim as `--task <branch_name>`, which is the
+                    # flag the reify script expects. Passing full_branch here would
+                    # silently misclassify (the script would look up a ref literally
+                    # named 'task/task/321').
                     if await self.warm_lane_ref_is_degenerate(branch_name):
                         await self._delete_branch_if_on_main(
                             full_branch, context='acquire_warm_lane seed-fault',
