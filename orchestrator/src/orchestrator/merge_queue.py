@@ -3005,8 +3005,17 @@ async def _do_train_merge(
         return verify_outcome
 
     # (f) CAS-advance main.
-    adv_outcome = await git_ops.advance_main(
-        merge_commit, merge_wt,
+    # Write-ahead (PRD WA-1): record a LandedRow into the durable outbox
+    # BEFORE advancing main — single-sourced via the shared helper (task β).
+    # branch_tip_sha is best-effort (resolve_branch_sha returns str | None;
+    # _do_train_merge has no MergedOk.branch_tip like the single-branch path).
+    _train_branch_tip = await git_ops.resolve_branch_sha(req.branch)
+    adv_outcome = await _journal_landed_then_advance(
+        getattr(worker, '_landed_outbox', None), git_ops,
+        task_id=req.task_id,
+        branch_tip_sha=_train_branch_tip,
+        advanced_sha=merge_commit,
+        merge_wt=merge_wt,
         branch=req.branch,
         max_attempts=req.config.max_advance_attempts,
         expected_main=main_sha,
