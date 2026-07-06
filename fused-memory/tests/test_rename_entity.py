@@ -293,3 +293,148 @@ class TestMemoryServiceRenameEntity:
         assert call_kwargs.get('success') is False
         assert call_kwargs.get('error') is not None
         assert 'FalkorDB timeout' in call_kwargs['error']
+
+
+# ---------------------------------------------------------------------------
+# step-11: MCP tool rename_entity
+# ---------------------------------------------------------------------------
+
+
+class TestRenameEntityTool:
+    """MCP tool rename_entity is registered and delegates correctly.
+
+    Mirrors TestSetEntitySummaryMcpTool (test_set_entity_summary.py).
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        """Mock MemoryService for tool registration."""
+        svc = AsyncMock()
+        svc.rename_entity = AsyncMock(
+            return_value={
+                'uuid': 'node-1',
+                'old_name': 'task 132',
+                'new_name': 'Task 132',
+            }
+        )
+        return svc
+
+    @pytest.fixture
+    def mcp_server(self, mock_service):
+        """MCP server with mock memory service."""
+        from fused_memory.server.tools import create_mcp_server
+        return create_mcp_server(mock_service)
+
+    @staticmethod
+    def _parse(result):
+        """Parse FastMCP TextContent list results into a dict, as the sibling tests do."""
+        import json
+        if isinstance(result, list):
+            content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+            return json.loads(content)
+        return result
+
+    @pytest.mark.asyncio
+    async def test_tool_is_registered(self, mcp_server):
+        """(a) 'rename_entity' is registered as an MCP tool."""
+        tool_names = [t.name for t in await mcp_server.list_tools()]
+        assert 'rename_entity' in tool_names
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_memory_service(self, mcp_server, mock_service):
+        """(b) Calling with {entity_uuid, new_name, project_id} delegates to
+        memory_service.rename_entity with those kwargs."""
+        await mcp_server._tool_manager.call_tool(
+            'rename_entity',
+            {'entity_uuid': 'node-1', 'new_name': 'Task 132', 'project_id': 'dark_factory'},
+        )
+        mock_service.rename_entity.assert_awaited_once()
+        call_kwargs = mock_service.rename_entity.call_args[1]
+        assert call_kwargs.get('entity_uuid') == 'node-1'
+        assert call_kwargs.get('new_name') == 'Task 132'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_tool_accepts_entity_name(self, mcp_server, mock_service):
+        """(c) entity_name is accepted and passed through."""
+        await mcp_server._tool_manager.call_tool(
+            'rename_entity',
+            {'entity_name': 'task 132', 'new_name': 'Task 132', 'project_id': 'dark_factory'},
+        )
+        mock_service.rename_entity.assert_awaited_once()
+        call_kwargs = mock_service.rename_entity.call_args[1]
+        assert call_kwargs.get('entity_name') == 'task 132'
+        assert call_kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_empty_project_id_returns_error(self, mcp_server, mock_service):
+        """(d) Empty project_id returns a ValidationError dict; service is not awaited."""
+        result = await mcp_server._tool_manager.call_tool(
+            'rename_entity',
+            {'entity_uuid': 'node-1', 'new_name': 'Task 132', 'project_id': ''},
+        )
+        parsed = self._parse(result)
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.rename_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_new_name_returns_error(self, mcp_server, mock_service):
+        """(e) Missing new_name returns a ValidationError dict; service is not awaited."""
+        result = await mcp_server._tool_manager.call_tool(
+            'rename_entity',
+            {'entity_uuid': 'node-1', 'project_id': 'dark_factory'},
+        )
+        parsed = self._parse(result)
+        assert 'error' in parsed
+        assert parsed.get('error_type') == 'ValidationError'
+        mock_service.rename_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_neither_uuid_nor_name_returns_validation_error(self, mcp_server, mock_service):
+        """(f) Neither entity_uuid nor entity_name returns an error dict; service is not awaited."""
+        result = await mcp_server._tool_manager.call_tool(
+            'rename_entity',
+            {'new_name': 'Task 132', 'project_id': 'dark_factory'},
+        )
+        parsed = self._parse(result)
+        assert 'error' in parsed
+        mock_service.rename_entity.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exception_returns_error_dict(self, mcp_server, mock_service):
+        """A service exception is caught and returned as {error, error_type} (not raised)."""
+        mock_service.rename_entity = AsyncMock(
+            side_effect=RuntimeError('FalkorDB connection failed')
+        )
+        result = await mcp_server._tool_manager.call_tool(
+            'rename_entity',
+            {'entity_uuid': 'node-1', 'new_name': 'Task 132', 'project_id': 'dark_factory'},
+        )
+        parsed = self._parse(result)
+        assert 'error' in parsed
+        assert 'FalkorDB connection failed' in parsed['error']
+
+
+# ---------------------------------------------------------------------------
+# step-11: DISALLOW_MEMORY_WRITES list in cli_stage_runner.py
+# ---------------------------------------------------------------------------
+
+
+class TestDisallowListForRenameEntity:
+    """rename_entity must be in DISALLOW_MEMORY_WRITES (and therefore STAGE3_DISALLOWED).
+
+    Mirrors TestDisallowListForSetEntitySummary (test_set_entity_summary.py).
+    """
+
+    def test_rename_entity_in_disallow_memory_writes(self):
+        """'mcp__fused-memory__rename_entity' must be in DISALLOW_MEMORY_WRITES
+        so Stage 3 (read-only) cannot call it."""
+        from fused_memory.reconciliation.cli_stage_runner import DISALLOW_MEMORY_WRITES
+        assert 'mcp__fused-memory__rename_entity' in DISALLOW_MEMORY_WRITES
+
+    def test_rename_entity_in_stage3_disallowed(self):
+        """Stage 3 must NOT be able to call rename_entity (in STAGE3_DISALLOWED via
+        DISALLOW_MEMORY_WRITES)."""
+        from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+        assert 'mcp__fused-memory__rename_entity' in STAGE3_DISALLOWED
