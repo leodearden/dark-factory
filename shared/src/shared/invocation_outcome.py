@@ -19,6 +19,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+# Real (non-TYPE_CHECKING) import: is_zero_output_timeout is CALLED by the
+# ZeroOutputWedge tier below, not just referenced as a type annotation. This
+# keeps the transcript-authoritative + legacy-fallback wedge definition
+# single-sourced (cli_invoke.py:357) so it cannot drift from this module's
+# copy. Safe: shared.cli_invoke does not import shared.invocation_outcome, so
+# this introduces no import cycle.
+from shared.cli_invoke import is_zero_output_timeout
+
 if TYPE_CHECKING:
     from shared.cli_invoke import AgentResult
 
@@ -344,5 +352,17 @@ def classify_invocation(
             if prefix.lower() in combined_lower:
                 reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
                 return NearCap(reason=reason)
+
+    # ZeroOutputWedge — a full-timeout invocation that produced no transcript
+    # progress. Delegates to is_zero_output_timeout (cli_invoke.py:357) so the
+    # transcript-authoritative (transcript_turns == 0) + legacy fallback
+    # (transcript_turns is None and turns == 0 and cost_usd == 0.0) wedge
+    # definition stays single-sourced. Placed below cap detection so a cap
+    # message on a zero-turn timeout still classifies as CapHit, not a wedge.
+    if is_zero_output_timeout(result):
+        return ZeroOutputWedge()
+
+    if result.success:
+        return OK()
 
     return Failure(kind='unclassified')
