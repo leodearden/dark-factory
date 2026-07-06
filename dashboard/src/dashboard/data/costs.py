@@ -18,19 +18,29 @@ import asyncio
 import json
 import logging
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import aiosqlite
 
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
+from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
 
-def _cutoff(days: int) -> str:
-    """Return ISO-format cutoff datetime for the given look-back window."""
-    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+def _cutoff(days: int, *, now: datetime | None = None) -> str:
+    """Return ISO-format cutoff datetime for the given look-back window.
+
+    Args:
+        days: Look-back window in days.
+        now: Reference timestamp. When None (the default), resolved via
+            :func:`dashboard.data.utils.resolve_now` (which reads
+            ``datetime.now(UTC)``). Pass an explicit value to get
+            deterministic results or to share a single timestamp across
+            concurrent per-DB calls.
+    """
+    return (resolve_now(now) - timedelta(days=days)).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +51,7 @@ async def get_cost_summary(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Per-project cost summary.
 
@@ -52,7 +63,7 @@ async def get_cost_summary(
     *cap_events* is the count of account_events rows with event_type='cap_hit'
     scoped to the same project_id within the window.
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
         inv_rows = await db.execute_fetchall(
@@ -138,13 +149,14 @@ async def get_cost_by_project(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, list[dict]]:
     """Per-project cost broken down by model.
 
     Returns {project_id: [{model: str, total: float}, ...]}.
     Entries are ordered by total descending.
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> dict[str, list[dict]]:
         rows = await db.execute_fetchall(
@@ -175,6 +187,7 @@ async def get_cost_by_account(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Per-account cost summary with availability status.
 
@@ -198,7 +211,7 @@ async def get_cost_by_account(
     latest ``cap_hit`` / ``auth_failed`` details payload is more recent (or
     None when not unavailable / unknown).
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
         # Aggregate spend and invocation count per account
@@ -393,12 +406,13 @@ async def get_cost_by_role(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Per-project cost broken down by role, then model.
 
     Returns {project_id: {role: {model: total}}}.
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
         rows = await db.execute_fetchall(
@@ -430,14 +444,22 @@ async def get_cost_trend(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, list[dict]]:
     """Per-project daily cost totals over the look-back window.
 
     Returns {project_id: [{day: str, total: float}, ...]}.
     Entries cover every calendar day in the window (gaps filled with 0.0),
     ordered chronologically.
+
+    *now* is the reference timestamp for both the SQL cutoff and the
+    gap-filled day list; when None (the default) it is resolved via
+    :func:`dashboard.data.utils.resolve_now`. Unlike the other cost readers,
+    this function does not route through :func:`_cutoff` because it also
+    needs the concrete ``now`` object to build ``all_days``, not just an
+    ISO cutoff string.
     """
-    now = datetime.now(UTC)
+    now = resolve_now(now)
     since = (now - timedelta(days=days)).isoformat()
 
     # Pre-fill all days in the window (today included)
@@ -484,6 +506,7 @@ async def get_account_events(
     *,
     days: int = 7,
     limit: int = 200,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Recent account events (cap_hit, resumed, etc.) within the window.
 
@@ -492,7 +515,7 @@ async def get_account_events(
     *details* is returned as-is (string or None) — callers may parse JSON.
     *limit* caps the number of rows returned (default 200).
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> list[dict]:
         rows = await db.execute_fetchall(
@@ -528,6 +551,7 @@ async def get_run_cost_breakdown(
     *,
     days: int = 7,
     limit: int = 500,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Per-run cost breakdown grouped by task, with invocation detail.
 
@@ -541,7 +565,7 @@ async def get_run_cost_breakdown(
     LEFT JOIN with task_results provides task titles.
     *limit* caps the number of invocation rows fetched from SQL (default 500).
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> list[dict]:
         try:
@@ -631,13 +655,18 @@ async def aggregate_cost_summary(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_cost_summary` results from multiple databases.
 
     Token totals are summed component-wise; per-run costs are concatenated
     across DBs and a single global p95 is computed from the merged list.
+
+    *now* is resolved once and threaded identically to every per-DB call so
+    all queries share a single cutoff, closing the per-DB clock-skew race.
     """
-    results = await asyncio.gather(*(get_cost_summary(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_summary(db, days=days, now=now) for db in dbs))
     merged: dict[str, dict] = {}
     for result in results:
         for pid, info in result.items():
@@ -675,9 +704,11 @@ async def aggregate_cost_by_project(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, list[dict]]:
     """Merge :func:`get_cost_by_project` results from multiple databases."""
-    results = await asyncio.gather(*(get_cost_by_project(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_by_project(db, days=days, now=now) for db in dbs))
     merged: dict[str, list[dict]] = {}
     for result in results:
         for pid, models in result.items():
@@ -692,6 +723,7 @@ async def aggregate_cost_by_account(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_cost_by_account` across databases.
 
@@ -708,8 +740,12 @@ async def aggregate_cost_by_account(
 
     The paired ``resets_at`` travels with whichever of cap_hit / auth_failed
     is globally most recent. Spend/invocations/cap_events are summed.
+
+    *now* is resolved once and threaded identically to every per-DB call so
+    all queries share a single cutoff, closing the per-DB clock-skew race.
     """
-    results = await asyncio.gather(*(get_cost_by_account(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_by_account(db, days=days, now=now) for db in dbs))
     merged: dict[str, dict] = {}
     for result in results:
         for acct, info in result.items():
@@ -778,9 +814,11 @@ async def aggregate_cost_by_role(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_cost_by_role` results from multiple databases."""
-    results = await asyncio.gather(*(get_cost_by_role(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_by_role(db, days=days, now=now) for db in dbs))
     merged: dict[str, dict] = {}
     for result in results:
         for pid, roles in result.items():
@@ -798,9 +836,16 @@ async def aggregate_cost_trend(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, list[dict]]:
-    """Merge :func:`get_cost_trend` results from multiple databases."""
-    results = await asyncio.gather(*(get_cost_trend(db, days=days) for db in dbs))
+    """Merge :func:`get_cost_trend` results from multiple databases.
+
+    *now* is resolved once and threaded identically to every per-DB call so
+    all queries share a single cutoff and day list, closing the per-DB
+    clock-skew race.
+    """
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_trend(db, days=days, now=now) for db in dbs))
     merged: dict[str, list[dict]] = {}
     for result in results:
         for pid, series in result.items():
@@ -822,10 +867,12 @@ async def aggregate_account_events(
     *,
     days: int = 7,
     limit: int = 200,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Merge :func:`get_account_events` from multiple databases."""
+    now = resolve_now(now)
     results = await asyncio.gather(
-        *(get_account_events(db, days=days, limit=limit) for db in dbs),
+        *(get_account_events(db, days=days, limit=limit, now=now) for db in dbs),
     )
     combined: list[dict] = []
     for result in results:
@@ -839,10 +886,21 @@ async def aggregate_run_cost_breakdown(
     *,
     days: int = 7,
     limit: int = 500,
+    now: datetime | None = None,
 ) -> list[dict]:
-    """Merge :func:`get_run_cost_breakdown` from multiple databases."""
+    """Merge :func:`get_run_cost_breakdown` from multiple databases.
+
+    Not currently invoked by any dashboard route (data-layer-only surface
+    as of task 2170 — no reference in ``app.py``); its `now` threading is
+    exercised by ``TestAggregateNowThreading`` at the data layer only. If a
+    future route consumes this aggregator, add a route-level shared-`now`
+    assertion mirroring
+    ``test_costs_route_threads_shared_now_to_all_aggregates`` in
+    ``test_app.py``.
+    """
+    now = resolve_now(now)
     results = await asyncio.gather(
-        *(get_run_cost_breakdown(db, days=days, limit=limit) for db in dbs),
+        *(get_run_cost_breakdown(db, days=days, limit=limit, now=now) for db in dbs),
     )
     combined: list[dict] = []
     for result in results:

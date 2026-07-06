@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import aiosqlite
 import pytest
@@ -231,6 +232,7 @@ async def empty_costs_conn(empty_costs_db):
 # ---------------------------------------------------------------------------
 
 from dashboard.data.costs import (  # noqa: E402
+    _cutoff,
     get_account_events,
     get_cost_by_account,
     get_cost_by_project,
@@ -239,6 +241,35 @@ from dashboard.data.costs import (  # noqa: E402
     get_cost_trend,
     get_run_cost_breakdown,
 )
+
+# ---------------------------------------------------------------------------
+# Test_Cutoff (step-3)
+# ---------------------------------------------------------------------------
+
+class Test_Cutoff:
+    def test_cutoff_uses_provided_now(self):
+        """_cutoff(days=7, now=fixed_dt) returns (fixed_dt - 7d).isoformat()."""
+        fixed_dt = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        expected = (fixed_dt - timedelta(days=7)).isoformat()
+        result = _cutoff(7, now=fixed_dt)
+        assert result == expected
+
+    def test_cutoff_no_now_uses_current_time(self):
+        """Without now, _cutoff derives its cutoff from the current UTC clock.
+
+        Brackets the real clock read with before/after captures (rather than
+        patching a module-level ``datetime`` symbol) because the no-now branch
+        resolves through ``resolve_now`` in ``dashboard.data.utils``, not a
+        clock read local to ``costs.py``.
+        """
+        before = datetime.now(UTC)
+        result = _cutoff(7)
+        after = datetime.now(UTC)
+
+        result_dt = datetime.fromisoformat(result)
+        lower = before - timedelta(days=7) - timedelta(seconds=5)
+        upper = after - timedelta(days=7) + timedelta(seconds=5)
+        assert lower <= result_dt <= upper
 
 
 class TestCostSummary:
@@ -1776,6 +1807,7 @@ CREATE TABLE account_events (
 );
 """
 
+from dashboard.data import costs  # noqa: E402
 from dashboard.data.costs import (  # noqa: E402
     aggregate_account_events,
     aggregate_cost_by_account,
@@ -2161,6 +2193,140 @@ class TestAggregateCostTrend:
         # Each project should have 7 days of data (gap-filled)
         assert len(result['dark_factory']) == 7
         assert len(result['reify']) == 7
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateCostTrendNowThreading (step-7)
+# ---------------------------------------------------------------------------
+
+class TestAggregateCostTrendNowThreading:
+    """aggregate_cost_trend must resolve `now` once and thread the identical
+    value to every per-DB get_cost_trend call.
+
+    get_cost_trend bypasses _cutoff (it also derives all_days from the
+    clock), so — unlike TestAggregateNowThreading — we spy on get_cost_trend
+    itself rather than on _cutoff.
+    """
+
+    @pytest.mark.asyncio
+    async def test_injected_now_threaded_identically(self, two_conns):
+        """now=fixed_now is threaded unchanged to both per-DB get_cost_trend calls."""
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        captured: list = []
+        real_trend = costs.get_cost_trend
+
+        async def spy(db, *, days=7, now=None):
+            captured.append(now)
+            return await real_trend(db, days=days, now=now)
+
+        with patch.object(costs, 'get_cost_trend', side_effect=spy):
+            await aggregate_cost_trend(two_conns, days=7, now=fixed_now)
+
+        assert captured == [fixed_now, fixed_now], (
+            f"Expected both per-DB calls to receive now={fixed_now!r}, got {captured!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_now_resolved_once_and_shared(self, two_conns):
+        """Without now, the aggregator resolves once and threads one shared value."""
+        captured: list = []
+        real_trend = costs.get_cost_trend
+
+        async def spy(db, *, days=7, now=None):
+            captured.append(now)
+            return await real_trend(db, days=days, now=now)
+
+        with patch.object(costs, 'get_cost_trend', side_effect=spy):
+            await aggregate_cost_trend(two_conns, days=7)
+
+        assert len(captured) == 2
+        assert captured[0] is not None
+        assert captured[0] == captured[1], (
+            f"Expected both per-DB calls to share one resolved now, got {captured!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_cost_trend_determinism_with_fixed_now(self, costs_conn):
+        """The day list and the SQL cutoff must derive from the same `now`.
+
+        With days=5 and an injected now, the first day must be
+        (now - 4 days) and the last day must be now's own calendar day —
+        proving get_cost_trend no longer takes two independent clock reads.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        result = await get_cost_trend(costs_conn, days=5, now=fixed_now)
+
+        assert 'dark_factory' in result
+        day_strs = [entry['day'] for entry in result['dark_factory']]
+        assert len(day_strs) == 5
+        assert day_strs[0] == (fixed_now - timedelta(days=4)).strftime('%Y-%m-%d')
+        assert day_strs[-1] == fixed_now.strftime('%Y-%m-%d')
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateNowThreading (step-5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    'fn_under_test',
+    [
+        aggregate_cost_summary,
+        aggregate_cost_by_project,
+        aggregate_cost_by_account,
+        aggregate_cost_by_role,
+        aggregate_account_events,
+        aggregate_run_cost_breakdown,
+    ],
+    ids=lambda fn: fn.__name__,
+)
+class TestAggregateNowThreading:
+    """Each _cutoff-routed aggregator must resolve `now` once and thread the
+    identical value to every per-DB call — not let each per-DB call resolve
+    the clock independently (the exact race this task closes).
+
+    Note: aggregate_run_cost_breakdown is not currently invoked by any
+    dashboard route (no reference in app.py), so its coverage here is
+    data-layer-only — there is no route-level shared-now assertion for it
+    analogous to test_costs_route_threads_shared_now_to_all_aggregates in
+    test_app.py. If a route starts consuming it, add one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_injected_now_threaded_identically(self, fn_under_test, two_conns):
+        """now=fixed_now is threaded unchanged to both per-DB _cutoff calls."""
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        captured: list = []
+        real_cutoff = costs._cutoff
+
+        def spy(days, *, now=None):
+            captured.append(now)
+            return real_cutoff(days, now=now)
+
+        with patch.object(costs, '_cutoff', side_effect=spy):
+            await fn_under_test(two_conns, days=7, now=fixed_now)
+
+        assert captured == [fixed_now, fixed_now], (
+            f"Expected both per-DB calls to receive now={fixed_now!r}, got {captured!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_now_resolved_once_and_shared(self, fn_under_test, two_conns):
+        """Without now, the aggregator resolves once and threads one shared value."""
+        captured: list = []
+        real_cutoff = costs._cutoff
+
+        def spy(days, *, now=None):
+            captured.append(now)
+            return real_cutoff(days, now=now)
+
+        with patch.object(costs, '_cutoff', side_effect=spy):
+            await fn_under_test(two_conns, days=7)
+
+        assert len(captured) == 2
+        assert captured[0] is not None
+        assert captured[0] == captured[1], (
+            f"Expected both per-DB calls to share one resolved now, got {captured!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

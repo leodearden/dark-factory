@@ -73,3 +73,35 @@ def parse_utc(ts: str | None) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def resolve_now(now: datetime | None) -> datetime:
+    """Resolve a request-scoped reference timestamp.
+
+    Returns *now* unchanged when provided, otherwise reads the current UTC
+    clock via ``datetime.now(UTC)``. This is the sanctioned clock-read site
+    for :mod:`dashboard.data.costs`'s aggregate code: callers that need a
+    reference timestamp shared across multiple per-DB calls within one
+    request should resolve it once via this function and thread the
+    concrete value through, rather than letting each per-DB call read the
+    clock independently (which risks two calls straddling a clock boundary
+    and using different cutoffs). Generalizes the task-692 ``effective_now``
+    pattern from :mod:`dashboard.data.merge_queue`.
+
+    Note:
+        :mod:`dashboard.data.merge_queue` and :mod:`dashboard.data.metrics`
+        still inline their own equivalent ``now if now is not None else
+        datetime.now(UTC)`` checks, and :mod:`dashboard.data.cap_history`
+        uses a parallel ``_to_utc`` idiom — none of them have been migrated
+        to call this helper yet. Repo-wide consolidation onto a single
+        clock-read site is tracked as follow-up work, not part of this
+        task.
+
+    Args:
+        now: An explicit reference timestamp, or None to read the current
+            UTC clock.
+
+    Returns:
+        *now* if not None, otherwise ``datetime.now(UTC)``.
+    """
+    return now if now is not None else datetime.now(UTC)
