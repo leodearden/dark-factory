@@ -1437,3 +1437,110 @@ class TestHandleCapDetectedViaTransition:
         await asyncio.sleep(0)
         assert stale_task.cancelled() or stale_task.done()
         assert acct.phase == AccountPhase.CAPPED
+
+
+# ---------------------------------------------------------------------------
+# step-7/8: _handle_auth_failure migrated onto _transition (sole writer).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHandleAuthFailureViaTransition:
+    """step-7: _handle_auth_failure routes through _transition."""
+
+    async def test_marks_phase_auth_failed_and_stamps_auth_failed_at(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+
+        result = gate._handle_auth_failure('403 forbidden', acct.token)
+
+        assert result is True
+        assert acct.phase == AccountPhase.AUTH_FAILED
+        assert acct.auth_failed_at is not None
+
+    async def test_starts_auth_reprobe_task(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+
+        gate._handle_auth_failure('403 forbidden', acct.token)
+
+        assert acct.auth_reprobe_task is not None
+        await _drain_task(acct.auth_reprobe_task)
+
+    async def test_fires_exactly_one_auth_failed_event(self):
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=cost_store)
+        acct = gate._accounts[0]
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_auth_failure('403 forbidden', acct.token)
+
+        mock_fire.assert_called_once()
+        _, event_type, _ = mock_fire.call_args[0]
+        assert event_type == 'auth_failed'
+
+    async def test_event_details_include_resets_at_only_when_reason_mentions_resets(self):
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=cost_store)
+        acct = gate._accounts[0]
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_auth_failure(
+                "HTTP 429: You're out of extra usage · resets in 3h", acct.token,
+            )
+
+        _, _, details_json = mock_fire.call_args[0]
+        details = json.loads(details_json)
+        assert 'resets_at' in details
+
+    async def test_event_details_omit_resets_at_for_pure_auth_error(self):
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=cost_store)
+        acct = gate._accounts[0]
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_auth_failure('HTTP 403: token has been revoked', acct.token)
+
+        _, _, details_json = mock_fire.call_args[0]
+        details = json.loads(details_json)
+        assert 'resets_at' not in details
+
+    async def test_open_recomputed_centrally_single_account_clears(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+
+        gate._handle_auth_failure('403 forbidden', acct.token)
+
+        assert gate._open.is_set() is False
+
+    async def test_open_recomputed_centrally_sibling_available_stays_set(self):
+        gate = make_gate(['acct-A', 'acct-B'], wait_for_reset=False, cost_store=None)
+        a, b = gate._accounts
+
+        gate._handle_auth_failure('403 forbidden', a.token)
+
+        assert b.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+
+    async def test_repeat_call_on_same_account_does_not_raise(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+
+        gate._handle_auth_failure('first', acct.token)
+        result = gate._handle_auth_failure('second', acct.token)  # must not raise
+
+        assert result is True
+        assert acct.phase == AccountPhase.AUTH_FAILED
+
+    async def test_repeat_call_on_auth_failed_account_fires_event_only_once(self):
+        """Mirrors the cap_hit idempotency fix: the old handler re-fired
+        auth_failed on every repeat detection with no guard at all."""
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=cost_store)
+        acct = gate._accounts[0]
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_auth_failure('first', acct.token)
+            gate._handle_auth_failure('second', acct.token)
+
+        assert mock_fire.call_count == 1
