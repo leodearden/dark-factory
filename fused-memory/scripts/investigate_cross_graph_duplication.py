@@ -55,12 +55,6 @@ from fused_memory.models.scope import resolve_project_id
 
 TARGET_NODE_UUID: str = 'f02a32ea-0efd-4865-94b4-97a412d8ffda'
 
-# Filesystem-ish tokens that, combined with >=4 '-'-segments, mark a name as
-# a mangled absolute path (e.g. '-home-leo-src-dark-factory' ->
-# ['', 'home', 'leo', 'src', 'dark', 'factory']) rather than a clean project
-# key that merely happens to have several hyphen-separated words.
-_PATH_TOKENS: frozenset[str] = frozenset({'home', 'src', 'usr', 'opt', 'users', 'var', 'tmp'})
-
 logger = logging.getLogger('investigate_cross_graph_duplication')
 
 
@@ -70,13 +64,19 @@ logger = logging.getLogger('investigate_cross_graph_duplication')
 
 def is_path_shaped_name(name: str) -> bool:
     """True if *name* looks like a mangled filesystem path rather than a
-    clean project key (e.g. '-home-leo-src-dark-factory')."""
-    if '/' in name:
-        return True
-    if name.startswith('-') or name.startswith('/'):
-        return True
-    segments = name.split('-')
-    return len(segments) >= 4 and any(seg in _PATH_TOKENS for seg in segments)
+    clean project key (e.g. '-home-leo-src-dark-factory').
+
+    A mangled absolute path always retains a leading path separator: a raw
+    '/' if unmangled, or the '-' that an absolute path's leading '/'
+    collapses to once mangled into a graph name. The leak verdict is
+    scoped to that structural signal alone. An earlier revision also
+    flagged any name with >=4 hyphen segments containing a filesystem-ish
+    token (home, src, usr, ...), but that heuristic misclassified
+    legitimate multi-word project keys (e.g. 'my-home-src-app') as path
+    leaks purely because they happened to contain such a token; it has
+    been removed in favor of requiring an actual leading separator.
+    """
+    return name.startswith('/') or name.startswith('-') or '/' in name
 
 
 def detect_collision_groups(graph_names: list[str]) -> dict:

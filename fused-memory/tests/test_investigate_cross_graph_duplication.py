@@ -84,6 +84,18 @@ class TestIsPathShapedName:
         """Clean project keys (no path shape) are detected as False."""
         assert _mod.is_path_shaped_name(name) is False
 
+    @pytest.mark.parametrize('name', [
+        'my-home-src-app',
+        'user-var-config-service',
+    ])
+    def test_multiword_clean_keys_with_filesystem_tokens_are_not_false_positives(self, name):
+        """Regression: a legitimate multi-word project key that happens to
+        contain filesystem-ish tokens (home/src/var/...) across >=4 hyphen
+        segments is NOT a path leak. Only an actual leading separator (or
+        an embedded '/') makes a name path-shaped -- these names have
+        neither, so they must not be pulled out of collision detection."""
+        assert _mod.is_path_shaped_name(name) is False
+
 
 # ===========================================================================
 # Tests: detect_collision_groups
