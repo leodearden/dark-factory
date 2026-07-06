@@ -158,3 +158,60 @@ class TestCategoryPolicyGoldenRows:
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         row = CATEGORY_POLICY[FailureCategory.NONE]
         assert row.severity_rank == 11
+
+
+# ---------------------------------------------------------------------------
+# step-3: _validate_exhaustive reusable guard
+# ---------------------------------------------------------------------------
+
+
+class TestValidateExhaustive:
+    """F1 exhaustiveness as a reusable, unit-testable function.
+
+    RED today: ``_validate_exhaustive`` is not a named/exported function yet
+    (the real module only has an inline ``assert`` at import time).
+    """
+
+    def _make_synth_policy(self):
+        from enum import StrEnum
+
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            CategoryPolicy,
+            FailureCategory,
+        )
+
+        class _Synth(StrEnum):
+            A = 'a'
+            B = 'b'
+
+        any_row = next(iter(CATEGORY_POLICY.values()))
+        return _Synth, any_row
+
+    def test_missing_member_raises_and_names_it(self):
+        from orchestrator.verify_categories import _validate_exhaustive
+
+        _Synth, any_row = self._make_synth_policy()
+        with pytest.raises(AssertionError, match='B'):
+            _validate_exhaustive(_Synth, {_Synth.A: any_row})
+
+    def test_stray_policy_key_raises(self):
+        from orchestrator.verify_categories import _validate_exhaustive
+
+        _Synth, any_row = self._make_synth_policy()
+        policy = {_Synth.A: any_row, _Synth.B: any_row, 'stray': any_row}
+        with pytest.raises(AssertionError, match='stray'):
+            _validate_exhaustive(_Synth, policy)
+
+    def test_matching_sets_do_not_raise(self):
+        from orchestrator.verify_categories import _validate_exhaustive
+
+        _Synth, any_row = self._make_synth_policy()
+        _validate_exhaustive(_Synth, {_Synth.A: any_row, _Synth.B: any_row})
+
+    def test_real_module_import_satisfies_its_own_guard(self):
+        # Importing the real module must succeed — its shipped table already
+        # satisfies _validate_exhaustive (this is F1 firing at import time).
+        import orchestrator.verify_categories as vc
+
+        vc._validate_exhaustive(vc.FailureCategory, vc.CATEGORY_POLICY)
