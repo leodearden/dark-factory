@@ -207,6 +207,22 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     return None
 
 
+# Concrete CLI/usage errors that exit instantly with no output but are NOT
+# usage caps. Matched case-insensitively against stderr/output so the
+# zero-cost cap heuristic doesn't misfire (and loop forever) on a local CLI
+# failure. Copied from cli_invoke.py:120 (NON_CAP_CLI_ERROR_MARKERS) — this
+# module owns the classification decision now, but that module's copy stays
+# in place until the beta (consumer-rewire) task removes it.
+NON_CAP_CLI_ERROR_MARKERS = [
+    'is already in use',        # --session-id collision (reify-3604)
+    'unrecognized arguments',
+    'unknown option',
+    'invalid value',
+    'no such file or directory',
+    'permission denied',
+]
+
+
 def _extract_cap_message(text: str, prefix: str) -> str:
     """Extract the full sentence containing the cap-hit prefix."""
     lower = text.lower()
@@ -240,5 +256,16 @@ def classify_invocation(
     # (mirrors cli_invoke.py:799-805).
     if result.api_error_status in (401, 403):
         return AuthFailed(status=result.api_error_status)
+
+    combined = f'{result.stderr or ""}\n{result.output or ""}'
+    combined_lower = combined.lower()
+
+    # CliLocalError — placed ABOVE cap detection. This precedence position IS
+    # the reify-3604 structural fix: a local CLI/usage error (e.g. a
+    # --session-id collision) must never be treated as a usage cap, even when
+    # the same output also happens to contain cap-like text.
+    for marker in NON_CAP_CLI_ERROR_MARKERS:
+        if marker in combined_lower:
+            return CliLocalError(marker=marker)
 
     return Failure(kind='unclassified')
