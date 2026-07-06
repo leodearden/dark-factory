@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import enum
 
-from shared.task_statuses import TaskStatus
+from shared.task_statuses import ACTIVE, STATUS_TRIGGERS, TERMINAL, WORKFLOW_PRESERVE, TaskStatus
 
 # ---------------------------------------------------------------------------
 # Legacy literal sets — verified verbatim against the working tree 2026-07-06.
@@ -68,3 +68,46 @@ class TestTaskStatusEnum:
         # value (D3) == exactly the 9-member TaskStatus vocabulary.
         assert {s.value for s in TaskStatus} == _LEGACY_VALID | {'infra-hold'}
         assert len(TaskStatus) == 9
+
+
+# ---------------------------------------------------------------------------
+# Pair 2 — derived frozensets (step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedFrozensets:
+    def test_terminal_parity(self):
+        assert TERMINAL == _LEGACY_TERMINAL
+
+    def test_active_parity(self):
+        # ACTIVE is the complement of TERMINAL, so it picks up 'infra-hold' too.
+        assert ACTIVE == _LEGACY_ACTIVE | {'infra-hold'}
+
+    def test_workflow_preserve_parity(self):
+        assert WORKFLOW_PRESERVE == _LEGACY_WORKFLOW_PRESERVE
+
+    def test_status_triggers_parity(self):
+        assert STATUS_TRIGGERS == _LEGACY_STATUS_TRIGGERS
+
+    def test_all_four_are_frozensets(self):
+        assert isinstance(TERMINAL, frozenset)
+        assert isinstance(ACTIVE, frozenset)
+        assert isinstance(WORKFLOW_PRESERVE, frozenset)
+        assert isinstance(STATUS_TRIGGERS, frozenset)
+
+    def test_terminal_active_partition(self):
+        # TERMINAL and ACTIVE must exhaustively and disjointly partition the
+        # full TaskStatus vocabulary.
+        assert TERMINAL | ACTIVE == set(TaskStatus)
+        assert TERMINAL.isdisjoint(ACTIVE)
+
+    def test_infra_hold_is_active_non_terminal_non_dispatchable(self):
+        # D3: infra-hold is active, non-terminal, and NOT the same as 'pending'
+        # (dispatch legality itself lives in the scheduler, not here).
+        assert TaskStatus.INFRA_HOLD in ACTIVE
+        assert TaskStatus.INFRA_HOLD not in TERMINAL
+        assert TaskStatus.INFRA_HOLD != TaskStatus.PENDING
+
+    def test_workflow_preserve_and_status_triggers_are_subsets(self):
+        assert WORKFLOW_PRESERVE <= set(TaskStatus)
+        assert STATUS_TRIGGERS <= set(TaskStatus)
