@@ -104,3 +104,40 @@ async def test_wraps_preserves_metadata():
     assert wrapped.__doc__ == "h's docstring."
     assert wrapped.__wrapped__ is h
     assert inspect.signature(wrapped) == inspect.signature(h)
+
+
+# ---------------------------------------------------------------------------
+# Marker + operation-label override (step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_marker_is_stamped_on_wrapper():
+    """The wrapper carries __mcp_tool_errors__ = True so a registry walker
+    (task ε) can confirm every handler is decorated.
+    """
+
+    @mcp_tool_errors()
+    async def h():
+        return {}
+
+    assert getattr(h, '__mcp_tool_errors__', False) is True
+
+
+@pytest.mark.asyncio
+async def test_operation_override_relabels_log_message(caplog):
+    """mcp_tool_errors(operation=...) relabels the log message prefix while
+    leaving the returned error-dict shape unchanged.
+    """
+
+    @mcp_tool_errors(operation='custom_op')
+    async def h():
+        raise RuntimeError('boom')
+
+    with caplog.at_level(logging.ERROR, logger='fused_memory.server.tool_errors'):
+        result = await h()
+
+    assert result == {'error': 'boom', 'error_type': 'RuntimeError'}
+    matched = [r for r in caplog.records if r.name == 'fused_memory.server.tool_errors']
+    assert len(matched) == 1
+    assert matched[0].getMessage().startswith('custom_op error:')
