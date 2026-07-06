@@ -123,3 +123,40 @@ async def test_get_by_identity_unknown_identity_returns_none(store):
     """An identity with no matching row returns None rather than raising."""
     fetched = await store.get_by_identity('proj-unknown', 'stage1_flag_marker')
     assert fetched is None
+
+
+@pytest.mark.asyncio
+async def test_double_upsert_same_identity_keeps_one_row_last_write_wins(store):
+    """upsert() on the same identity twice must leave exactly one row, with the
+    last write's payload_json/state/created_at/expires_at all winning."""
+    identity = dict(
+        project_id='proj-a',
+        record_kind='stage1_flag_marker',
+        task_id='task-1',
+        flag_type='drift_flag',
+        run_id='run-1',
+    )
+    first = ReconLedgerRecord(
+        **identity,
+        payload_json='{"v": 1}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-07-15T00:00:00+00:00',
+    )
+    second = ReconLedgerRecord(
+        **identity,
+        payload_json='{"v": 2}',
+        state='addressed',
+        created_at='2026-07-02T00:00:00+00:00',
+        expires_at='2026-07-20T00:00:00+00:00',
+    )
+    await store.upsert(first)
+    await store.upsert(second)
+
+    db = store._db
+    cursor = await db.execute('SELECT COUNT(*) FROM recon_ledger')
+    row = await cursor.fetchone()
+    assert row[0] == 1
+
+    fetched = await store.get_by_identity(**identity)
+    assert fetched == second
