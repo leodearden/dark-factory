@@ -372,3 +372,75 @@ class TestRefuseForeignBandExactAndConfig:
         )
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert not warnings, f'expected NO warning for an owned custom band; got {warnings!r}'
+
+
+# ---------------------------------------------------------------------------
+# TestPruneStaleMergeForeignBandRefusal — sweep integration (step-7/8).
+#
+# The foreign candidate must be a REAL registered git worktree, not a bare
+# directory: `git worktree remove --force` on a path git does not recognize
+# as a worktree fails closed on its own (exit 128, "is not a working tree")
+# without touching the directory — so a bare foreign directory would survive
+# the sweep even with no guard wired at all, making it a false RED. Using a
+# real (but foreign-band-named) registered worktree means the pre-guard
+# `git worktree remove --force` call actually succeeds and deletes it,
+# reproducing the filter-bug hazard honestly: RED (foreign genuinely removed)
+# before step-8, GREEN (guard `continue`s before the removal call) after.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPruneStaleMergeForeignBandRefusal:
+    """RED — prune_stale_merge_worktrees consults _refuse_foreign_band (step-7/8)."""
+
+    async def test_foreign_band_survives_filter_bug_owned_still_removed(
+        self, pp_git_repo: Path, monkeypatch, caplog,
+    ) -> None:
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+
+        # Owned candidate: a real registered `_merge-<id>` worktree.
+        merge_wt, _ = await git_ops._create_merge_worktree()
+        assert merge_wt.exists()
+
+        # Foreign candidate: a real registered worktree under a FOREIGN band
+        # name (`_iact-`), simulating a filter bug that steers a foreign
+        # band's worktree into the merge sweep's removal step.
+        foreign_wt = git_ops.worktree_base / '_iact-foreign'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(foreign_wt), config.main_branch],
+            cwd=pp_git_repo,
+        )
+        assert rc == 0, f'failed to set up foreign worktree fixture: {err}'
+        assert foreign_wt.exists()
+
+        async def _fake_iter_merge_worktrees():
+            yield merge_wt, merge_wt.resolve()
+            yield foreign_wt, foreign_wt.resolve()
+
+        monkeypatch.setattr(git_ops, '_iter_merge_worktrees', _fake_iter_merge_worktrees)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            removed = await git_ops.prune_stale_merge_worktrees()
+
+        # Case (a): foreign band survives, is not reported removed, and a
+        # WARNING names its band.
+        assert foreign_wt.exists(), (
+            'expected the foreign _iact- worktree to survive the sweep '
+            '(refused), but it was removed from disk'
+        )
+        assert str(foreign_wt) not in removed, (
+            f'expected the foreign worktree NOT to appear in the removed list: {removed}'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        joined = '\n'.join(r.getMessage() for r in warnings)
+        assert '_iact-' in joined, (
+            f'expected a WARNING naming the foreign band token (_iact-); got: {joined!r}'
+        )
+
+        # Case (b): owned band still proceeds — removed from disk and
+        # reported in the removed list.
+        assert str(merge_wt) in removed, (
+            f'expected the owned _merge- worktree to be removed; got: {removed}'
+        )
+        assert not merge_wt.exists(), 'expected the owned worktree to be gone from disk'
