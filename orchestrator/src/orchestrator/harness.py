@@ -169,6 +169,17 @@ _DETERMINISTIC_ESCALATION_SENTINEL_ROLES: frozenset[str] = frozenset({
     'harness-deterministic-recon-sweep',
 })
 
+# resolved_by sentinel for the generalized escalation-revalidation sweep
+# (task 2114): terminal-subject L2 closures (Source C, hosted inside
+# _run_deterministic_recon_sweep) are attributed to this role in the audit
+# trail, distinguishing them from a human/steward resolve.
+_ESCALATION_REVALIDATION_SWEEP_ROLE: str = 'harness-escalation-revalidation-sweep'
+
+# resolved_by sentinel for the main-tip-sweep self-heal (task 2114): closes a
+# pending orchestrator-main-sweep escalation once a later full-verify PASS
+# supersedes its (now-fixed) swept SHA.
+_MAIN_TIP_SWEEP_SELFHEAL_ROLE: str = 'harness-main-tip-sweep-selfheal'
+
 # Bound on the thread-off load_config() call inside reload_config() (PRD
 # plans/config-hot-reload-prd.md Open Q3). load_config() runs
 # _discover_module_configs, a filesystem walk that can wedge; this keeps a
@@ -7734,6 +7745,65 @@ Output JSON matching the schema. Every task must appear in the output.
             '— live unit %s healthy, auto-resolved (stale failure)',
             esc.id, esc.task_id, target_unit,
         )
+
+    async def _revalidate_open_l2(self, esc, statuses: dict[str, str]) -> bool:
+        """Close an open L2 escalation whose SUBJECT task has gone terminal (task 2114).
+
+        Generalizes task 2074's revalidation machinery beyond the
+        blocked-deterministic subset: ANY pending level-2 escalation whose
+        subject task status (read from a batch ``scheduler.get_statuses``
+        call by the caller) is ``done`` or ``cancelled`` is moot — the human
+        decision it was waiting on no longer matters — and is auto-closed via
+        ``close_only`` (dismiss=True), never resumed/re-pended.
+
+        Deliberately conservative: only ``{'done', 'cancelled'}`` count as
+        terminal here.  ``deferred`` is excluded (a deferred task can be
+        un-deferred) and any live status (``blocked``, ``in-progress``,
+        ``pending``, …) or an unknown/absent subject leaves the escalation
+        untouched — preserving ambiguous cases (e.g. a design_concern on a
+        still-live task) for a human to triage, per this task's conservatism
+        requirement.
+
+        Returns True when the escalation was closed this call (the caller
+        uses this to skip further per-item handling for the same escalation
+        in the same pass), False otherwise.
+        """
+        if not self.config.escalation_revalidation_enabled:
+            return False
+        if self._escalation_queue is None:
+            return False
+        if getattr(esc, 'level', None) != 2:
+            return False
+        if esc.status != 'pending':
+            return False
+
+        subject_status = statuses.get(esc.task_id)
+        if subject_status not in ('done', 'cancelled'):
+            return False
+
+        resolution = (
+            f'escalation-revalidation-sweep: subject task {esc.task_id} is '
+            f'{subject_status} (terminal) — escalation moot, auto-closed (close_only).'
+        )
+        self._escalation_queue.resolve(
+            esc.id, resolution, dismiss=True, resolved_by=_ESCALATION_REVALIDATION_SWEEP_ROLE,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_resolved,
+                task_id=esc.task_id,
+                data={
+                    'escalation_id': esc.id,
+                    'subject_status': subject_status,
+                    'reason': 'terminal-subject',
+                },
+            )
+        logger.info(
+            'Escalation-revalidation-sweep: closed L2 %s — subject task %s is '
+            '%s (terminal), close_only',
+            esc.id, esc.task_id, subject_status,
+        )
+        return True
 
     async def _run_deterministic_recon_sweep(self) -> None:
         """Single testable pass of the deterministic-strand reconciliation sweep.
