@@ -47,7 +47,7 @@ import logging
 import sys
 from typing import Any
 
-from fused_memory.models.scope import resolve_project_id  # noqa: F401
+from fused_memory.models.scope import resolve_project_id
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -86,7 +86,26 @@ def detect_collision_groups(graph_names: list[str]) -> dict:
 
     Returns a dict shaped ``{'collisions': [...], 'suspected_path_leaks': [...]}``.
     """
-    raise NotImplementedError
+    path_leaks: list[str] = []
+    buckets: dict[str, set[str]] = {}
+    for name in graph_names:
+        if is_path_shaped_name(name):
+            path_leaks.append(name)
+            continue
+        canonical = resolve_project_id(name)
+        buckets.setdefault(canonical, set()).add(name)
+
+    collisions = [
+        {'canonical': canonical, 'variants': sorted(variants), 'count': len(variants)}
+        for canonical, variants in buckets.items()
+        if len(variants) > 1
+    ]
+    collisions.sort(key=lambda c: c['canonical'])
+
+    return {
+        'collisions': collisions,
+        'suspected_path_leaks': sorted(path_leaks),
+    }
 
 
 # ---------------------------------------------------------------------------
