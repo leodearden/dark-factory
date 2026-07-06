@@ -707,31 +707,20 @@ class UsageGate:
             logger.warning(f'Auth failure but no matching account: {reason}')
             return False
 
-        acct.auth_failed = True
-        acct.auth_failed_at = datetime.now(UTC)
-        acct.probe_in_flight = False
-        acct.probing = False
         logger.warning(f'Account {acct.name} AUTH-FAILED: {reason}')
-        if self._cost_store:
+        if acct.phase != AccountPhase.AUTH_FAILED:
             # In production, HTTP 429 with "out of extra usage" carries a
             # "resets ..." phrase in the body — parse and persist it so the
             # dashboard can surface a reset ETA without re-parsing reason
             # strings downstream. Skip the 1h fallback when there's no
             # "resets" hint at all (true 401/403 token revocation).
-            details: dict[str, str] = {'reason': reason}
-            if 'resets' in reason.lower():
-                details['resets_at'] = _parse_resets_at(reason).isoformat()
-            self._fire_cost_event(
-                acct.name, 'auth_failed', json.dumps(details),
-            )
-        self._start_auth_reprobe(acct)
-
-        if all(a.capped or a.auth_failed for a in self._accounts):
-            self._open.clear()
-            self._paused_reason = f'All accounts unavailable (last: {reason})'
-            if self._pause_started_at is None:
-                self._pause_started_at = datetime.now(UTC)
-            logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
+            resets_at = _parse_resets_at(reason) if 'resets' in reason.lower() else None
+            # _transition owns: the phase write, near_cap clear, the
+            # centralized _open recompute, cancelling/starting the
+            # opposite/matching background task, the auth_failed cost event,
+            # and gate-level pause bookkeeping. A same-phase repeat call
+            # (already AUTH_FAILED) is a pure no-op here.
+            self._transition(acct, AccountPhase.AUTH_FAILED, resets_at=resets_at, reason=reason)
         return True
 
     def _start_auth_reprobe(self, acct: AccountState) -> None:
