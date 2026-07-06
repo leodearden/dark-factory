@@ -239,21 +239,25 @@ class TaskArtifacts:
         self._write_json(self.root / 'metadata.json', metadata)
 
     def read_base_commit(self) -> str | None:
-        """Read the base commit SHA stored at init time."""
-        meta_path = self.root / 'metadata.json'
+        """Read the base commit SHA stored at init time (new-path-then-old)."""
+        meta_path = self._read_path('metadata.json')
         if not meta_path.exists():
             return None
         metadata = json.loads(meta_path.read_text())
         return metadata.get('base_commit')
 
     def update_base_commit(self, new_base: str) -> None:
-        """Update the base_commit in metadata.json after a rebase."""
-        meta_path = self.root / 'metadata.json'
+        """Update the base_commit in metadata.json after a rebase.
+
+        Reads new-path-then-old but always writes back to the new path
+        only (migrate-on-write).
+        """
+        meta_path = self._read_path('metadata.json')
         if not meta_path.exists():
             return
         metadata = json.loads(meta_path.read_text())
         metadata['base_commit'] = new_base
-        self._write_json(meta_path, metadata)
+        self._write_json(self.root / 'metadata.json', metadata)
 
     def write_plan(self, plan: dict) -> None:
         """Write .task/plan.json — the structured plan."""
@@ -284,9 +288,9 @@ class TaskArtifacts:
 
     def read_blocking_dependency(self) -> dict | None:
         """Return the parsed ``.task/blocking_dependency.json`` artifact if
-        present, else ``None``.
+        present (new-path-then-old), else ``None``.
         """
-        path = self.root / 'blocking_dependency.json'
+        path = self._read_path('blocking_dependency.json')
         if not path.exists():
             return None
         return json.loads(path.read_text())
@@ -324,8 +328,10 @@ class TaskArtifacts:
         self._write_json(self.root / 'already_done.json', data)
 
     def read_already_done(self) -> dict | None:
-        """Return the parsed ``.task/already_done.json`` artifact if present."""
-        path = self.root / 'already_done.json'
+        """Return the parsed ``.task/already_done.json`` artifact if present
+        (new-path-then-old).
+        """
+        path = self._read_path('already_done.json')
         if not path.exists():
             return None
         return json.loads(path.read_text())
@@ -350,8 +356,10 @@ class TaskArtifacts:
         self._write_json(self.root / 'unactionable_task.json', data)
 
     def read_unactionable_task(self) -> dict | None:
-        """Return the parsed ``.task/unactionable_task.json`` artifact if present."""
-        path = self.root / 'unactionable_task.json'
+        """Return the parsed ``.task/unactionable_task.json`` artifact if
+        present (new-path-then-old).
+        """
+        path = self._read_path('unactionable_task.json')
         if not path.exists():
             return None
         return json.loads(path.read_text())
@@ -383,8 +391,10 @@ class TaskArtifacts:
         self._write_json(self.root / 'false_premise.json', data)
 
     def read_false_premise(self) -> dict | None:
-        """Return the parsed ``.task/false_premise.json`` artifact if present."""
-        path = self.root / 'false_premise.json'
+        """Return the parsed ``.task/false_premise.json`` artifact if present
+        (new-path-then-old).
+        """
+        path = self._read_path('false_premise.json')
         if not path.exists():
             return None
         return json.loads(path.read_text())
@@ -473,12 +483,13 @@ class TaskArtifacts:
             f.write(json.dumps(entry) + '\n')
 
     def read_iteration_log(self) -> tuple[list[dict], list[str]]:
-        """Read all iteration log entries, skipping corrupted lines.
+        """Read all iteration log entries (new-path-then-old), skipping
+        corrupted lines.
 
         Returns (entries, corrupted) where corrupted contains raw lines that
         failed JSON parsing.
         """
-        log_path = self.root / 'iterations.jsonl'
+        log_path = self._read_path('iterations.jsonl')
         if not log_path.exists():
             return [], []
         entries = []
@@ -511,8 +522,8 @@ class TaskArtifacts:
         self._write_json(review_path, review)
 
     def read_reviews(self) -> dict[str, dict]:
-        """Read all reviews."""
-        reviews_dir = self.root / 'reviews'
+        """Read all reviews (new-path-then-old)."""
+        reviews_dir = self._read_path('reviews')
         if not reviews_dir.exists():
             return {}
         reviews = {}
@@ -703,8 +714,10 @@ class TaskArtifacts:
         (self.root / 'agent_session.json').unlink(missing_ok=True)
 
     def read_agent_session(self) -> dict | None:
-        """Return parsed ``.task/agent_session.json``, or ``None`` if missing/corrupt."""
-        path = self.root / 'agent_session.json'
+        """Return parsed ``.task/agent_session.json`` (new-path-then-old),
+        or ``None`` if missing/corrupt.
+        """
+        path = self._read_path('agent_session.json')
         if not path.exists():
             return None
         try:
