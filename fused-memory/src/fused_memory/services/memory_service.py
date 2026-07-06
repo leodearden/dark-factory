@@ -41,7 +41,7 @@ from fused_memory.reconciliation.recon_pool_map import (
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
-from fused_memory.utils.async_utils import propagate_cancellations
+from fused_memory.utils.async_utils import gather_or_raise, propagate_cancellations
 from fused_memory.utils.task_naming import canonicalize_task_node_name
 
 if TYPE_CHECKING:
@@ -1856,28 +1856,18 @@ class MemoryService:
         exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
         if exact:
             uuids = [uuid for n in exact if (uuid := n.get('uuid'))]
-            edge_results = await asyncio.gather(
-                *(self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
-                return_exceptions=True,
+            # Two-tier check via gather_or_raise (fused_memory.utils.async_utils),
+            # mirroring the fuzzy fallback below: return_exceptions=True ensures a
+            # transient failure in one concurrent get_valid_edges_for_node call
+            # cannot leave sibling coroutines running as orphaned background
+            # tasks. Pass 1 re-raises structured-cancellation signals; Pass 2
+            # logs every exception, then raises the first (get_entity's local
+            # Pass-2 semantics — see async_utils docstring).
+            edge_results = await gather_or_raise(
+                (self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
+                label='get_entity: get_valid_edges_for_node failed',
+                logger=logger,
             )
-            # Two-tier check (see async_utils.propagate_cancellations), mirroring
-            # the fuzzy fallback below: return_exceptions=True ensures a transient
-            # failure in one concurrent get_valid_edges_for_node call cannot leave
-            # sibling coroutines running as orphaned background tasks. Pass 1
-            # re-raises structured-cancellation signals; Pass 2 logs every
-            # exception, then raises the first (get_entity's local Pass-2
-            # semantics — see async_utils docstring).
-            propagate_cancellations(edge_results)
-            first_exc = next((r for r in edge_results if isinstance(r, Exception)), None)
-            if first_exc is not None:
-                for r in edge_results:
-                    if isinstance(r, Exception):
-                        logger.warning(
-                            'get_entity: get_valid_edges_for_node failed: %s: %s',
-                            type(r).__name__,
-                            r,
-                        )
-                raise first_exc
             edge_lists = cast(list, edge_results)
             # Duplicate-name matches each contribute their own edges; dedup by
             # edge uuid so `edges` stays consistent with the (possibly
