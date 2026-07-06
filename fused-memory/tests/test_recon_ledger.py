@@ -160,3 +160,42 @@ async def test_double_upsert_same_identity_keeps_one_row_last_write_wins(store):
 
     fetched = await store.get_by_identity(**identity)
     assert fetched == second
+
+
+@pytest.mark.asyncio
+async def test_list_suppressions_returns_only_active_suppressions_for_project(store):
+    """list_suppressions(P) excludes non-suppression records and other projects."""
+    suppression_p = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage1_flag_suppression',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='task-1',
+        flag_type='drift_flag',
+    )
+    marker_p = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='task-2',
+        flag_type='drift_flag',
+    )
+    suppression_q = ReconLedgerRecord(
+        project_id='proj-q',
+        record_kind='stage1_flag_suppression',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='task-3',
+        flag_type='drift_flag',
+    )
+    await store.upsert(suppression_p)
+    await store.upsert(marker_p)
+    await store.upsert(suppression_q)
+
+    results = await store.list_suppressions('proj-p')
+
+    assert results == [suppression_p]
