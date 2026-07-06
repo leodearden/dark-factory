@@ -17,16 +17,19 @@ The standard two-tier guard pattern separates these concerns:
       results.  This must happen BEFORE any per-result logging or accumulation,
       so that structured-concurrency shutdown signals are never silently swallowed.
 
-  Pass 2 (implemented inline at each callsite):
-      Handle regular Exception subclasses according to local semantics — which
-      vary by site:
-        - ``MemoryService.get_entity``:      log all Exceptions, raise the first.
-        - ``GraphitiBackend.rebuild_entity_summaries``: accumulate as per-entity
-          error detail entries, continue to next entity.
-        - ``ContextAssembler.assemble``:     degrade each failed fetch to an empty
-          context list, log a warning.
+  Pass 2 (choose a named policy, or implement inline for a bespoke site):
+      Handle regular Exception subclasses according to local semantics. Two
+      shared, named Pass-2 policies cover the common cases:
+        - :func:`gather_or_raise`: log every captured Exception at WARNING,
+          then raise the positionally-first one (the ``MemoryService.get_entity``
+          semantics).
+        - :func:`gather_collect`: return the per-item value-or-Exception list
+          for the caller to classify (the ``GraphitiBackend.rebuild_entity_summaries``
+          / ``ContextAssembler.assemble`` / best-effort-sweep semantics).
 
-  Pass 2 is intentionally NOT shared because the semantics differ per site.
+  For a rare bespoke site that doesn't fit either named policy,
+  :func:`propagate_cancellations` remains exported so Pass 1 can still be
+  called directly ahead of hand-rolled Pass-2 logic.
 """
 from __future__ import annotations
 
