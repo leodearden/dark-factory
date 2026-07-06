@@ -122,6 +122,31 @@ _FRESH_UNIT_STATE: dict = {
 }
 
 
+def _seed_escalation(
+    queue: EscalationQueue, task_id: str, agent_role: str, *,
+    resolved: bool = False, category: str = 'infra_issue', level: int = 2,
+) -> Escalation:
+    """Submit (and optionally resolve/archive) an escalation for task_id/agent_role.
+
+    Shared by the Task 2120 escalation-aliasing test classes below so each one
+    doesn't re-declare its own near-identical Escalation(...) + submit()/
+    resolve() seeding helper.
+    """
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=agent_role,
+        severity='critical',
+        category=category,
+        summary=f"seeded escalation ({'resolved' if resolved else 'pending'})",
+        level=level,
+    )
+    queue.submit(esc)
+    if resolved:
+        queue.resolve(esc.id, 'resolved for test setup')
+    return esc
+
+
 # ---------------------------------------------------------------------------
 # Step-5: pure-gate path (B2/I3)
 # (RED until step-6 creates deterministic_runner.py)
@@ -2389,10 +2414,11 @@ class TestBeforeDoneCrashWindow:
 # sharing the task_id — e.g. one filed by an unrelated starvation-watchdog —
 # aliases as the runner's own dedup/quiescence/resolution-proof signal.
 #
-# These tests are RED until the impl step scopes the section-1 quiescence
-# (:867), before_done quiescence (:928), and ever_escalated (:958) queries to
+# These tests fail if run()'s section-1 gate quiescence branch, its
+# before_done quiescence branch, or its ever_escalated resolution-proof check
+# regress to scanning get_by_task() without scoping to
 # DETERMINISTIC_AGENT_ROLE. The parity tests characterize runner-owned
-# signals and must stay GREEN both before and after that scoping fix.
+# signals and must stay GREEN regardless of that scoping.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -2402,42 +2428,7 @@ class TestDeterministicRunnerResolutionProofAliasing:
 
     _UNRELATED_ROLE = 'orchestrator-starvation-watchdog'
 
-    def _seed_resolved(
-        self, queue: EscalationQueue, task_id: str, agent_role: str,
-        category: str = 'infra_issue', level: int = 2,
-    ) -> Escalation:
-        """Submit then resolve (archive) an escalation for task_id/agent_role."""
-        esc = Escalation(
-            id=queue.make_id(task_id),
-            task_id=task_id,
-            agent_role=agent_role,
-            severity='critical',
-            category=category,
-            summary='seeded escalation (resolved)',
-            level=level,
-        )
-        queue.submit(esc)
-        queue.resolve(esc.id, 'resolved for test setup')
-        return esc
-
-    def _seed_pending(
-        self, queue: EscalationQueue, task_id: str, agent_role: str,
-        category: str = 'infra_issue', level: int = 2,
-    ) -> Escalation:
-        """Submit (leave pending) an escalation for task_id/agent_role."""
-        esc = Escalation(
-            id=queue.make_id(task_id),
-            task_id=task_id,
-            agent_role=agent_role,
-            severity='critical',
-            category=category,
-            summary='seeded escalation (pending)',
-            level=level,
-        )
-        queue.submit(esc)
-        return esc
-
-    # --- test a: ever_escalated (:958) resolution-proof aliasing -----------
+    # --- test a: run()'s ever_escalated resolution-proof aliasing -----------
 
     async def test_ever_escalated_ignores_unrelated_resolved_escalation(self, tmp_path: Path):
         """A RESOLVED unrelated (starvation-watchdog) escalation must NOT count
@@ -2455,7 +2446,7 @@ class TestDeterministicRunnerResolutionProofAliasing:
         task = _deploy_task(task_id='800', before_done_ran_at='2026-06-23T10:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        self._seed_resolved(queue, '800', self._UNRELATED_ROLE)
+        _seed_escalation(queue, '800', self._UNRELATED_ROLE, resolved=True)
         scheduler = _mock_scheduler(task)
 
         unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
@@ -2481,7 +2472,7 @@ class TestDeterministicRunnerResolutionProofAliasing:
         assert pending[0].agent_role == 'orchestrator-deterministic'
         assert outcome == WorkflowOutcome.BLOCKED
 
-    # --- section-1 quiescence (:867) aliasing -------------------------------
+    # --- run()'s section-1 gate quiescence aliasing -------------------------
 
     async def test_section1_quiescence_ignores_unrelated_pending_escalation(self, tmp_path: Path):
         """gate_escalated_at set; the runner's OWN gate is resolved but an
@@ -2495,9 +2486,9 @@ class TestDeterministicRunnerResolutionProofAliasing:
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
         # Runner's own gate escalation: resolved.
-        self._seed_resolved(queue, '801', 'orchestrator-deterministic', category='milestone_gate')
+        _seed_escalation(queue, '801', 'orchestrator-deterministic', resolved=True, category='milestone_gate')
         # Unrelated escalation for the SAME task: still pending.
-        self._seed_pending(queue, '801', self._UNRELATED_ROLE)
+        _seed_escalation(queue, '801', self._UNRELATED_ROLE)
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -2509,7 +2500,7 @@ class TestDeterministicRunnerResolutionProofAliasing:
         )
         scheduler.set_task_status.assert_awaited_once_with('801', 'done')
 
-    # --- before_done quiescence (:928) aliasing -----------------------------
+    # --- run()'s before_done quiescence aliasing -----------------------------
 
     async def test_before_done_quiescence_ignores_unrelated_pending_escalation(self, tmp_path: Path):
         """before_done_ran_at + before_done_verified_at set; an UNRELATED
@@ -2527,7 +2518,7 @@ class TestDeterministicRunnerResolutionProofAliasing:
         )
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        self._seed_pending(queue, '802', self._UNRELATED_ROLE)
+        _seed_escalation(queue, '802', self._UNRELATED_ROLE)
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -2546,8 +2537,8 @@ class TestDeterministicRunnerResolutionProofAliasing:
 
     async def test_parity_runner_owned_resolved_escalation_still_resumes(self, tmp_path: Path):
         """Parity: a RESOLVED escalation filed by the runner itself must still
-        prove resolution (branch b). Must stay GREEN before AND after the
-        :958 scoping fix.
+        prove resolution (branch b). Must stay GREEN regardless of the
+        ever_escalated agent_role scoping.
         """
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
@@ -2555,7 +2546,7 @@ class TestDeterministicRunnerResolutionProofAliasing:
         task = _deploy_task(task_id='803', before_done_ran_at='2026-06-23T10:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        self._seed_resolved(queue, '803', 'orchestrator-deterministic')
+        _seed_escalation(queue, '803', 'orchestrator-deterministic', resolved=True)
         scheduler = _mock_scheduler(task)
 
         unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
@@ -2576,8 +2567,8 @@ class TestDeterministicRunnerResolutionProofAliasing:
 
     async def test_parity_runner_owned_pending_escalation_still_quiescent(self, tmp_path: Path):
         """Parity: a PENDING escalation filed by the runner itself must still
-        quiesce (BLOCKED, no re-escalation). Must stay GREEN before AND after
-        the :867/:928 scoping fix.
+        quiesce (BLOCKED, no re-escalation). Must stay GREEN regardless of
+        the section-1 gate / before_done quiescence agent_role scoping.
         """
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
@@ -2585,7 +2576,7 @@ class TestDeterministicRunnerResolutionProofAliasing:
         task = _deploy_task(task_id='804', before_done_ran_at='2026-06-23T10:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        self._seed_pending(queue, '804', 'orchestrator-deterministic')
+        _seed_escalation(queue, '804', 'orchestrator-deterministic')
         scheduler = _mock_scheduler(task)
 
         unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
@@ -2609,14 +2600,14 @@ class TestDeterministicRunnerResolutionProofAliasing:
 # ---------------------------------------------------------------------------
 # Task 2120: escalation-aliasing suppress-direction guard.
 #
-# The dedup guards in _file_infra_issue_and_block (:581) and
-# _file_milestone_gate_and_block (:799) must scope their "already pending?"
-# check to the runner's own DETERMINISTIC_AGENT_ROLE — otherwise an unrelated
+# The dedup guards in _file_infra_issue_and_block and
+# _file_milestone_gate_and_block must scope their "already pending?" check
+# to the runner's own DETERMINISTIC_AGENT_ROLE — otherwise an unrelated
 # PENDING escalation (e.g. a starvation-watchdog filing) falsely suppresses
 # the runner's own gate/infra filing, silently swallowing a required L2.
 # Two pending escalations may legitimately coexist for one task.
 #
-# (RED until the impl step scopes :581/:799 to DETERMINISTIC_AGENT_ROLE)
+# These tests fail if either dedup guard's agent_role scoping regresses.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -2626,23 +2617,7 @@ class TestDeterministicRunnerDedupGuardScoping:
 
     _UNRELATED_ROLE = 'orchestrator-starvation-watchdog'
 
-    def _seed_pending(
-        self, queue: EscalationQueue, task_id: str, agent_role: str,
-        category: str = 'infra_issue', level: int = 2,
-    ) -> Escalation:
-        esc = Escalation(
-            id=queue.make_id(task_id),
-            task_id=task_id,
-            agent_role=agent_role,
-            severity='critical',
-            category=category,
-            summary='seeded escalation (pending)',
-            level=level,
-        )
-        queue.submit(esc)
-        return esc
-
-    # --- test b: gate-filing dedup guard (:799) aliasing -------------------
+    # --- test b: _file_milestone_gate_and_block dedup-guard aliasing -------
 
     async def test_gate_filing_still_files_despite_unrelated_pending_escalation(self, tmp_path: Path):
         """Pure-gate task, no gate_escalated_at yet; an UNRELATED escalation is
@@ -2654,7 +2629,7 @@ class TestDeterministicRunnerDedupGuardScoping:
         task = _gate_task(task_id='900')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        self._seed_pending(queue, '900', self._UNRELATED_ROLE)
+        _seed_escalation(queue, '900', self._UNRELATED_ROLE)
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -2669,7 +2644,7 @@ class TestDeterministicRunnerDedupGuardScoping:
         assert len(own) == 1
         assert own[0].category == 'milestone_gate'
 
-    # --- infra dedup (:581) aliasing ----------------------------------------
+    # --- _file_infra_issue_and_block dedup-guard aliasing -------------------
 
     async def test_infra_filing_still_files_despite_unrelated_pending_escalation(self, tmp_path: Path):
         """before_done_ran_at set, crash window (no verify, no runner-owned
@@ -2682,7 +2657,7 @@ class TestDeterministicRunnerDedupGuardScoping:
         task = _deploy_task(task_id='901', before_done_ran_at='2026-06-23T10:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        self._seed_pending(queue, '901', self._UNRELATED_ROLE)
+        _seed_escalation(queue, '901', self._UNRELATED_ROLE)
         scheduler = _mock_scheduler(task)
 
         unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
@@ -2712,14 +2687,14 @@ class TestDeterministicRunnerDedupGuardScoping:
         """Parity: a runner-owned PENDING escalation (e.g. from a prior
         crash-safe re-dispatch before gate_escalated_at was stamped) must
         still suppress a second filing — dedup fires for a matching role.
-        Must stay GREEN before AND after the :799 scoping fix.
+        Must stay GREEN regardless of the dedup guard's agent_role scoping.
         """
         from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _gate_task(task_id='902')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
-        self._seed_pending(queue, '902', 'orchestrator-deterministic', category='milestone_gate')
+        _seed_escalation(queue, '902', 'orchestrator-deterministic', category='milestone_gate')
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
