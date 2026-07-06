@@ -858,6 +858,52 @@ class GraphitiBackend:
         await graph.query(delete_cypher, {'uuids': uuids})
         return found
 
+    async def dedup_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> int:
+        """Collapse post-merge parallel duplicate valid edges incident to a node.
+
+        Task 2118: ``redirect_node_edges`` (the ``merge_entities`` helper)
+        redirects a deprecated node's edges onto the surviving node by
+        blindly copying ``old.uuid`` onto the recreated edge, without
+        checking whether the survivor already has an equivalent edge to the
+        same neighbor. When the deprecated/surviving pair started as
+        exact-name duplicate nodes each holding their own copy of the same
+        fact, this leaves the survivor with two distinct-uuid ``RELATES_TO``
+        edges to the same neighbor sharing an identical (normalized) fact
+        and ``valid_at`` — a duplicate that neither the pre-merge
+        ``MemoryService._dedup_episode_edges`` sweep nor graphiti-core's
+        ``resolve_extracted_edges`` fast-path can catch, since those only
+        see the edges before they converge onto the same node pair.
+
+        Queries the node's currently-valid (``invalid_at IS NULL``)
+        incident edges (undirected, so directed and reverse-directed exact
+        duplicates both collapse), delegates grouping + survivor selection
+        to ``_duplicate_edge_uuids``, and deletes any non-survivor uuids via
+        ``bulk_remove_edges``.
+
+        Args:
+            node_uuid: UUID of the Entity node whose valid edges to dedup
+                (typically the surviving node of a merge).
+            group_id: Project graph to query.
+
+        Returns:
+            Number of duplicate edges removed. 0 when there is nothing to
+            dedup — ``bulk_remove_edges`` is not called in that case.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+            'WHERE e.invalid_at IS NULL '
+            'RETURN m.uuid, e.uuid, e.fact, e.valid_at'
+        )
+        result = await graph.ro_query(cypher, {'uuid': node_uuid})
+        duplicate_uuids = self._duplicate_edge_uuids(result.result_set or [])
+        if not duplicate_uuids:
+            return 0
+        return await self.bulk_remove_edges(duplicate_uuids, group_id=group_id)
+
     async def redirect_node_edges(
         self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
     ) -> dict:
