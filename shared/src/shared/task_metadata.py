@@ -23,6 +23,7 @@ __all__ = [
     'DoneProvenance',
     'ExternalDep',
     'MemoryHints',
+    'RetryLedger',
 ]
 
 
@@ -117,3 +118,22 @@ class ExternalDep(BaseModel):
 
     def render(self) -> str:
         return f'{self.project_id}:{self.task_id}'
+
+
+class RetryLedger(BaseModel):
+    """``metadata.retry_ledger`` — anti-thrash counters (PRD §5).
+
+    ``extra='allow'`` so a future 9th counter survives round-trip without a
+    schema bump.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    consecutive_no_plan_failures: int = 0
+    total_no_plan_failures: int = 0
+    last_no_plan_main_sha: str | None = None
+    consecutive_infra_resume_failures: int = 0
+    last_infra_resume_iteration_count: int = 0
+    consecutive_merge_thrash: int = 0
+    last_merge_outcome_signature: str | None = None
+    merge_first_enqueued_at: str | None = None
