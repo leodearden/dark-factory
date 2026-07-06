@@ -1323,6 +1323,7 @@ class TestUniformReadFallback:
 
         ta = TaskArtifacts(worktree, meta_root)
         session = ta.read_agent_session()
+        assert session is not None
         assert session['session_id'] == 'legacy-session'
 
     def test_read_reviews_falls_back_to_legacy(
