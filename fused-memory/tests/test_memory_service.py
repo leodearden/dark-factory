@@ -4166,6 +4166,88 @@ class TestMissingCycleSummaryKeys:
         assert _missing_cycle_summary_keys({}) == []
 
 
+class TestCycleSummaryRunIdBackfillHelper:
+    """Module-level _cycle_summary_run_id_backfill pure helper (task 2109).
+
+    Auto-backfills a missing/invalid cycle_summary run_id from an
+    authoritative causation id, server-side, independent of LLM prompt
+    compliance — mirrors the _infer_recon_pool precedent (task 2077).
+
+    Two candidate sources are checked, in order:
+      1. meta['_causation_id'] — the task's literal wording; also what a
+         direct in-process caller would set.
+      2. the causation_id parameter — the production MCP-boundary path:
+         server/tools.py::_extract_causation pops '_causation_id' out of the
+         metadata dict into this parameter before MemoryService.add_memory
+         runs, so on the real reconciliation stage-agent path
+         meta['_causation_id'] is always absent and the run_id value lives
+         only in this parameter.
+
+    RED: the helper does not exist yet (ImportError).
+    """
+
+    def test_missing_run_id_backfills_from_meta_causation_id(self):
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            '_causation_id': 'run-a',
+        }
+        assert _cycle_summary_run_id_backfill(meta, None) == 'run-a'
+
+    def test_missing_run_id_backfills_from_causation_id_param(self):
+        """The production MCP-boundary path: _extract_causation already
+        popped _causation_id out of metadata into the causation_id
+        parameter, so meta has no '_causation_id' key at all."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {'kind': 'cycle_summary', 'stage': 'memory_consolidator'}
+        assert _cycle_summary_run_id_backfill(meta, 'run-b') == 'run-b'
+
+    def test_both_sources_present_prefers_meta_causation_id(self):
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            '_causation_id': 'run-a',
+        }
+        assert _cycle_summary_run_id_backfill(meta, 'run-b') == 'run-a'
+
+    def test_run_id_already_valid_returns_none(self):
+        """Nothing to repair — must not clobber a valid caller-supplied run_id."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            'run_id': 'r1',
+            '_causation_id': 'run-a',
+        }
+        assert _cycle_summary_run_id_backfill(meta, 'run-b') is None
+
+    def test_empty_or_whitespace_run_id_backfills_stripped_value(self):
+        """run_id present but empty/whitespace-only is treated as missing,
+        and the backfilled value is stripped."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            'run_id': '   ',
+        }
+        assert _cycle_summary_run_id_backfill(meta, '  run-c  ') == 'run-c'
+
+    def test_no_source_available_returns_none(self):
+        """run_id absent AND no causation source anywhere -> unrepairable, None."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {'kind': 'cycle_summary', 'stage': 'memory_consolidator'}
+        assert _cycle_summary_run_id_backfill(meta, None) is None
+
+    def test_non_cycle_summary_kind_returns_none(self):
+        """Only kind == 'cycle_summary' writes are ever touched, even when a
+        causation source is available."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {'kind': 'note'}
+        assert _cycle_summary_run_id_backfill(meta, 'run-b') is None
+
+
 class TestReconPoolAutoTagInjection:
     """Integration: add_memory must inject recon_pool into the metadata dict
     handed to mem0.add for cycle_summary writes, server-side, independent of
