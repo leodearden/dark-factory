@@ -24,13 +24,23 @@ import aiosqlite
 
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
+from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
 
-def _cutoff(days: int) -> str:
-    """Return ISO-format cutoff datetime for the given look-back window."""
-    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+def _cutoff(days: int, *, now: datetime | None = None) -> str:
+    """Return ISO-format cutoff datetime for the given look-back window.
+
+    Args:
+        days: Look-back window in days.
+        now: Reference timestamp. When None (the default), resolved via
+            :func:`dashboard.data.utils.resolve_now` (which reads
+            ``datetime.now(UTC)``). Pass an explicit value to get
+            deterministic results or to share a single timestamp across
+            concurrent per-DB calls.
+    """
+    return (resolve_now(now) - timedelta(days=days)).isoformat()
 
 
 # ---------------------------------------------------------------------------
