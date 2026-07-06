@@ -45,6 +45,7 @@ import os
 import pytest
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+from qdrant_client.models import VectorParams
 
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.models.scope import Scope
@@ -101,7 +102,15 @@ def _collection_vector_size(collection: str) -> int:
     client = QdrantClient(url=QDRANT_URL, timeout=10)
     try:
         info = client.get_collection(collection)
-        return info.config.params.vectors.size
+        vectors = info.config.params.vectors
+        # mem0's Qdrant vector store always creates collections with a single
+        # unnamed vector config (see mem0.vector_stores.qdrant.create_col), never
+        # named vectors or none — assert that so a future mem0 change that breaks
+        # this assumption fails loudly here instead of silently misreading dims.
+        assert isinstance(vectors, VectorParams), (
+            f'expected an unnamed VectorParams config, got {vectors!r}'
+        )
+        return vectors.size
     finally:
         client.close()
 
