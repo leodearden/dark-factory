@@ -32,6 +32,7 @@ This file covers:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -285,6 +286,111 @@ class TestReconSweepSourceC:
 
         await h._run_deterministic_recon_sweep()  # must not raise
 
+        h._revalidate_open_l2.assert_awaited_once_with(esc, {})
+        h._revalidate_open_deterministic_escalation.assert_awaited_once_with(
+            esc, task, task['metadata']
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_revalidate_open_l2_closes_via_sweep_end_to_end(self) -> None:
+        """Integration: drive the REAL (unmocked) _revalidate_open_l2 through
+        _run_deterministic_recon_sweep, proving the batch get_statuses result
+        actually reaches queue.resolve(dismiss=True) end-to-end — not just
+        that the wiring calls a mocked stand-in with the right arguments."""
+        h = _make_harness()
+        esc = _make_esc(
+            level=2, category='milestone_gate', task_id='tid-done-e2e',
+            esc_id='esc-l2-done-e2e',
+        )
+        h.scheduler.get_tasks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        h.scheduler.get_statuses = AsyncMock(  # type: ignore[method-assign]
+            return_value=({esc.task_id: 'done'}, None)
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+        # _revalidate_open_l2 is deliberately LEFT REAL (not mocked) here.
+
+        await h._run_deterministic_recon_sweep()
+
+        h.scheduler.get_statuses.assert_awaited_once_with([esc.task_id])  # type: ignore[attr-defined]
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert args[0] == esc.id
+        assert kwargs.get('dismiss') is True
+        assert kwargs.get('resolved_by') == 'harness-escalation-revalidation-sweep'
+        h._revalidate_open_deterministic_escalation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_config_skips_get_statuses_source_b_still_runs(self) -> None:
+        """Sweep-level kill-switch: with escalation_revalidation_enabled=False,
+        the batch scheduler.get_statuses() call must be skipped entirely
+        (guarded by `if self.config.escalation_revalidation_enabled and
+        l2_ids`), and Source B must still run exactly as before."""
+        h = _make_harness()
+        h.config = h.config.model_copy(update={'escalation_revalidation_enabled': False})
+        esc = _make_esc(
+            level=2, category='infra_issue', agent_role='orchestrator-deterministic',
+            task_id='tid-live', esc_id='esc-l2-live',
+        )
+        task = {
+            'id': 'tid-live', 'status': 'in-progress',
+            'metadata': {'task_kind': 'deterministic'},
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        h.scheduler.get_task = AsyncMock(return_value=task)  # type: ignore[method-assign]
+        h.scheduler.get_statuses = AsyncMock(  # type: ignore[method-assign]
+            return_value=({esc.task_id: 'done'}, None)
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        h._revalidate_open_l2 = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        await h._run_deterministic_recon_sweep()
+
+        h.scheduler.get_statuses.assert_not_awaited()  # type: ignore[attr-defined]
+        h._revalidate_open_l2.assert_awaited_once_with(esc, {})
+        h._revalidate_open_deterministic_escalation.assert_awaited_once_with(
+            esc, task, task['metadata']
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_resolver_error_logs_and_degrades_to_empty(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """get_statuses never raises on failure — it returns ({}, exception)
+        — so the bare except branch alone can't distinguish a genuine no-op
+        pass (no L2 subjects are terminal) from a swallowed transient
+        resolver failure.  Source C must log when the tuple's error
+        component is non-None, even though statuses degrades to {} either
+        way, and Source B must still run unaffected."""
+        h = _make_harness()
+        esc = _make_esc(
+            level=2, category='infra_issue', agent_role='orchestrator-deterministic',
+            task_id='tid-live', esc_id='esc-l2-live',
+        )
+        task = {
+            'id': 'tid-live', 'status': 'in-progress',
+            'metadata': {'task_kind': 'deterministic'},
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        h.scheduler.get_task = AsyncMock(return_value=task)  # type: ignore[method-assign]
+        h.scheduler.get_statuses = AsyncMock(  # type: ignore[method-assign]
+            return_value=({}, OSError('transient'))
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        h._revalidate_open_l2 = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.INFO):
+            await h._run_deterministic_recon_sweep()  # must not raise
+
+        assert 'resolver error' in caplog.text
         h._revalidate_open_l2.assert_awaited_once_with(esc, {})
         h._revalidate_open_deterministic_escalation.assert_awaited_once_with(
             esc, task, task['metadata']
