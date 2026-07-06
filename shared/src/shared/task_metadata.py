@@ -25,6 +25,7 @@ __all__ = [
     'MemoryHints',
     'RetryLedger',
     'TaskMetadata',
+    'register_metadata_submodel',
 ]
 
 
@@ -171,3 +172,24 @@ class TaskMetadata(BaseModel):
         if self.before_done is not None and self.task_kind != 'deterministic':
             raise ValueError('before_done is only valid on deterministic tasks')
         return self
+
+
+# W10 extension point: lets a later task register its own typed metadata
+# sub-model (e.g. a future "deploy_state" slice) without this module having
+# to know about it in advance. Keyed by the top-level metadata field name.
+_SUBMODEL_REGISTRY: dict[str, type[BaseModel]] = {}
+
+
+def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
+    """Register ``model`` as the typed shape for ``metadata[key]``.
+
+    Idempotent when re-registering the *same* model object under the same
+    key (e.g. a module reloaded/imported twice). Raises ``ValueError`` when a
+    *different* model is registered for a key that already has one — this is
+    a loud, fail-fast conflict intended to surface at import time.
+    """
+
+    existing = _SUBMODEL_REGISTRY.get(key)
+    if existing is not None and existing is not model:
+        raise ValueError(f'metadata sub-model already registered for {key!r}')
+    _SUBMODEL_REGISTRY[key] = model
