@@ -47,6 +47,9 @@ from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
 )
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
+from fused_memory.reconciliation.recon_pool_map import (
+    STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+)
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.summary_pool import (
     enforce_summary_pool_cap,
@@ -1121,10 +1124,11 @@ _STAGE2_STALE_FIXC_SWEEP_SOURCE = 'stage2_stale_fixc_sweep'
 
 # Stage 2 per-cycle summary pool cap and related constants.
 # Every per-cycle summary add_memory call is tagged recon_pool='stage2_cycle_summary'
-# (producer contract: Stage 2 prompt).  After the LLM writes its summary,
+# (producer contract: Stage 2 prompt) — _STAGE2_CYCLE_SUMMARY_RECON_POOL is
+# imported above from the shared leaf module recon_pool_map.py (task 2140),
+# not redefined here.  After the LLM writes its summary,
 # _enforce_stage2_summary_pool_cap trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
-_STAGE2_CYCLE_SUMMARY_RECON_POOL = 'stage2_cycle_summary'
 STAGE2_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE = 'stage2_cycle_summary_trim'
 

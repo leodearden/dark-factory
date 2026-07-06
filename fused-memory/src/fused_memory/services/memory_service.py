@@ -35,6 +35,9 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.models.scope import Scope
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_STAGE_TO_RECON_POOL as _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+)
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
@@ -75,31 +78,12 @@ def _is_dependency_fact(fact: str | None) -> bool:
 
 
 # Canonical stage -> recon_pool map for per-cycle reconciliation summaries
-# (metadata.kind == 'cycle_summary'). recon_pool is the only key the pool-cap
-# trim and ops prune script filter on (reconciliation/summary_pool.py,
-# scripts/prune_recon_cycle_summaries.py), so this map is what makes tagging
-# independent of LLM prompt compliance (task 2077). These values MUST stay in
-# sync with the per-stage _STAGE1_CYCLE_SUMMARY_RECON_POOL /
-# _STAGE2_CYCLE_SUMMARY_RECON_POOL constants in reconciliation/stages/*.py —
-# a drift-guard test asserts the equality.
-#
-# Importing those constants directly here (instead of duplicating the
-# strings) was considered during task 2077 amendment review and confirmed —
-# empirically, not just by inspection — to create a real circular import:
-# fused_memory.reconciliation.stages.memory_consolidator imports
-# task_knowledge_sync, which imports fused_memory.services.
-# live_workflow_detector; fused_memory/services/__init__.py imports this
-# module (memory_service) first, before anything else. So an entry point
-# that imports memory_consolidator before fused_memory.services has been
-# touched raises "ImportError: cannot import name
-# '_STAGE1_CYCLE_SUMMARY_RECON_POOL' from partially initialized module ...
-# (most likely due to a circular import)". services.memory_service is a
-# lower layer than reconciliation.stages.*; keep the duplicated map plus the
-# drift-guard test rather than inverting that dependency direction.
-_CYCLE_SUMMARY_STAGE_TO_RECON_POOL: dict[str, str] = {
-    'memory_consolidator': 'stage1_cycle_summary',
-    'task_knowledge_sync': 'stage2_cycle_summary',
-}
+# (metadata.kind == 'cycle_summary'), imported above from the leaf module
+# reconciliation/recon_pool_map.py (task 2140) so this map and the per-stage
+# _STAGE1_CYCLE_SUMMARY_RECON_POOL / _STAGE2_CYCLE_SUMMARY_RECON_POOL
+# constants in reconciliation/stages/*.py are literally the same object —
+# see recon_pool_map.py for why importing it here doesn't recreate the
+# circular import that used to force a duplicated dict.
 
 
 def _infer_recon_pool(meta: dict) -> str | None:

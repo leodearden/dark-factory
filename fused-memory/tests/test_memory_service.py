@@ -4594,8 +4594,14 @@ class TestReconPoolAutoTag:
         assert _infer_recon_pool({}) is None
 
     def test_map_matches_canonical_per_stage_constants(self):
-        """Drift guard: the map's values must equal the per-stage canonical constants
-        that stage1/stage2 themselves emit, so the two copies can't silently diverge."""
+        """Drift guard: the per-stage constants and the map's values must be the
+        SAME object (identity), not merely equal strings — all three are aliases
+        of the single leaf-module source of truth (recon_pool_map.py, task 2140),
+        so they cannot silently diverge."""
+        from fused_memory.reconciliation.recon_pool_map import (
+            STAGE1_CYCLE_SUMMARY_RECON_POOL,
+            STAGE2_CYCLE_SUMMARY_RECON_POOL,
+        )
         from fused_memory.reconciliation.stages.memory_consolidator import (
             _STAGE1_CYCLE_SUMMARY_RECON_POOL,
         )
@@ -4605,14 +4611,27 @@ class TestReconPoolAutoTag:
         from fused_memory.services.memory_service import (
             _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
         )
+        assert _STAGE1_CYCLE_SUMMARY_RECON_POOL is STAGE1_CYCLE_SUMMARY_RECON_POOL
+        assert _STAGE2_CYCLE_SUMMARY_RECON_POOL is STAGE2_CYCLE_SUMMARY_RECON_POOL
         assert (
             _CYCLE_SUMMARY_STAGE_TO_RECON_POOL['memory_consolidator']
-            == _STAGE1_CYCLE_SUMMARY_RECON_POOL
+            is _STAGE1_CYCLE_SUMMARY_RECON_POOL
         )
         assert (
             _CYCLE_SUMMARY_STAGE_TO_RECON_POOL['task_knowledge_sync']
-            == _STAGE2_CYCLE_SUMMARY_RECON_POOL
+            is _STAGE2_CYCLE_SUMMARY_RECON_POOL
         )
+
+    def test_map_is_the_shared_recon_pool_map_object(self):
+        """_CYCLE_SUMMARY_STAGE_TO_RECON_POOL is imported from, not a copy of,
+        the leaf module's canonical dict (task 2140)."""
+        from fused_memory.reconciliation.recon_pool_map import (
+            CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+        )
+        from fused_memory.services.memory_service import (
+            _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+        )
+        assert _CYCLE_SUMMARY_STAGE_TO_RECON_POOL is CYCLE_SUMMARY_STAGE_TO_RECON_POOL
 
 
 class TestMissingCycleSummaryKeys:
