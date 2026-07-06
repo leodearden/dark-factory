@@ -261,6 +261,56 @@ class TestProbeNodeAcrossGraphs:
         assert result == []
         graphiti._graph_for.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_continues_past_raising_graph_and_records_error(self):
+        """A graph whose ro_query raises (e.g. a malformed/inaccessible
+        path-leak graph) is skipped and recorded into *errors* -- it does
+        not abort the probe of the remaining graphs."""
+        graphiti = MagicMock()
+
+        def _graph_for(name):
+            if name == '-home-leo-src-dark-factory':
+                graph = MagicMock()
+                graph.ro_query = AsyncMock(side_effect=RuntimeError('graph key not found'))
+                graph.query = AsyncMock()
+                return graph
+            return _make_graph_mock([['target-uuid', 'orchestrator', 'reify']])
+
+        graphiti._graph_for = MagicMock(side_effect=_graph_for)
+        errors: list = []
+
+        result = await _mod.probe_node_across_graphs(
+            graphiti, 'target-uuid',
+            ['reify', '-home-leo-src-dark-factory', 'dark_factory'],
+            errors=errors,
+        )
+
+        assert result == [
+            {'graph': 'reify', 'uuid': 'target-uuid', 'name': 'orchestrator', 'group_id': 'reify'},
+            {'graph': 'dark_factory', 'uuid': 'target-uuid', 'name': 'orchestrator', 'group_id': 'reify'},
+        ]
+        assert errors == [{'graph': '-home-leo-src-dark-factory', 'error': 'graph key not found'}]
+
+    @pytest.mark.asyncio
+    async def test_raising_graph_is_swallowed_when_errors_not_supplied(self):
+        """If the caller doesn't pass an *errors* accumulator, a raising
+        graph is still skipped rather than propagating -- the *errors*
+        param is optional, not required for the read-only guarantee."""
+        graphiti = MagicMock()
+
+        def _graph_for(name):
+            if name == 'bad-graph':
+                graph = MagicMock()
+                graph.ro_query = AsyncMock(side_effect=RuntimeError('boom'))
+                return graph
+            return _make_graph_mock([])
+
+        graphiti._graph_for = MagicMock(side_effect=_graph_for)
+
+        result = await _mod.probe_node_across_graphs(graphiti, 'uuid-1', ['bad-graph', 'reify'])
+
+        assert result == []
+
 
 # ===========================================================================
 # Tests: classify_config_routing
@@ -433,6 +483,29 @@ class TestBuildInvestigationReport:
 
         assert r1 == r2
 
+    def test_errors_defaults_to_empty_list_when_omitted(self):
+        """No *errors* argument -> report['errors'] == [] (never missing,
+        never None)."""
+        collision_result = {'collisions': [], 'suspected_path_leaks': []}
+        verdict = {'confirmed': False, 'signals': [], 'rationale': 'none'}
+
+        report = _mod.build_investigation_report('u1', ['reify'], [], collision_result, verdict)
+
+        assert report['errors'] == []
+
+    def test_errors_are_surfaced_verbatim_when_supplied(self):
+        """A non-empty *errors* list (recorded by probe_node_across_graphs)
+        is threaded through to the report unchanged."""
+        collision_result = {'collisions': [], 'suspected_path_leaks': []}
+        verdict = {'confirmed': False, 'signals': [], 'rationale': 'none'}
+        errors = [{'graph': 'bad-graph', 'error': 'boom'}]
+
+        report = _mod.build_investigation_report(
+            'u1', ['reify', 'bad-graph'], [], collision_result, verdict, errors=errors,
+        )
+
+        assert report['errors'] == errors
+
 
 # ===========================================================================
 # Tests: run() -- end-to-end orchestration
@@ -516,3 +589,19 @@ class TestRun:
             graph.query.assert_not_called()
         memory_service.delete_memory.assert_not_called()
         memory_service.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_surfaced_in_report_without_aborting_run(self):
+        """A single graph raising on probe does not abort run(): the
+        failure is surfaced under report['errors'] and the report is still
+        built from the remaining, healthy graphs."""
+        graphs = ['reify', 'bad-graph']
+        rows_by_graph = {'reify': [['target-uuid', 'orchestrator', 'reify']]}
+        memory_service, graph_mocks = self._make_memory_service(graphs, rows_by_graph)
+        graph_mocks['bad-graph'].ro_query = AsyncMock(side_effect=RuntimeError('no such graph'))
+
+        report = await _mod.run(self._args(uuid='target-uuid'), memory_service)
+
+        assert report['errors'] == [{'graph': 'bad-graph', 'error': 'no such graph'}]
+        assert len(report['present_in']) == 1
+        assert report['present_in'][0]['graph'] == 'reify'

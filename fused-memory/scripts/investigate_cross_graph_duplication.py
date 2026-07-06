@@ -116,19 +116,35 @@ async def probe_node_across_graphs(
     graphiti: Any,
     uuid: str,
     graph_names: list[str],
+    errors: list[dict] | None = None,
 ) -> list[dict]:
     """Read-only probe for *uuid* across every graph in *graph_names*.
 
     Returns one ``{'graph', 'uuid', 'name', 'group_id'}`` entry per graph in
     which the node was found. Uses ``ro_query`` only -- never ``query``.
+
+    A graph whose ``ro_query`` raises (e.g. a malformed/inaccessible
+    path-leak graph -- exactly the kind of graph this tool exists to
+    surface) is logged and skipped rather than aborting the whole probe, so
+    one bad graph cannot sink the investigation. If *errors* is supplied,
+    a ``{'graph', 'error'}`` entry is appended to it for each failing graph.
     """
     entries: list[dict] = []
     for name in graph_names:
         graph = graphiti._graph_for(name)
-        result = await graph.ro_query(
-            'MATCH (n {uuid: $uuid}) RETURN n.uuid, n.name, n.group_id',
-            {'uuid': uuid},
-        )
+        try:
+            result = await graph.ro_query(
+                'MATCH (n {uuid: $uuid}) RETURN n.uuid, n.name, n.group_id',
+                {'uuid': uuid},
+            )
+        except Exception as e:
+            logger.warning(
+                "investigate_cross_graph_duplication: failed to probe graph "
+                "'%s' for uuid %s: %s", name, uuid, e,
+            )
+            if errors is not None:
+                errors.append({'graph': name, 'error': str(e)})
+            continue
         rows = result.result_set or []
         for row in rows:
             entries.append(
@@ -194,9 +210,16 @@ def build_investigation_report(
     presence: list[dict],
     collision_result: dict,
     verdict: dict,
+    errors: list[dict] | None = None,
 ) -> dict:
     """Assemble the final investigation report dict from already-computed
-    inputs. No I/O."""
+    inputs. No I/O.
+
+    *errors* (if any per-graph probe failures were recorded by
+    ``probe_node_across_graphs``) is surfaced verbatim under the
+    ``'errors'`` key so a partial probe failure is visible in the manifest
+    rather than silently discarded.
+    """
     scope = (
         'systemic'
         if collision_result['collisions'] or collision_result['suspected_path_leaks']
@@ -211,6 +234,7 @@ def build_investigation_report(
         'suspected_path_leaks': collision_result['suspected_path_leaks'],
         'verdict': verdict,
         'scope': scope,
+        'errors': errors or [],
     }
 
 
@@ -225,9 +249,10 @@ async def run(args: Any, memory_service: Any) -> dict:
     graphs = await memory_service.graphiti.list_graphs()
     collision_result = detect_collision_groups(graphs)
     uuid = getattr(args, 'uuid', None) or TARGET_NODE_UUID
-    presence = await probe_node_across_graphs(memory_service.graphiti, uuid, graphs)
+    errors: list[dict] = []
+    presence = await probe_node_across_graphs(memory_service.graphiti, uuid, graphs, errors=errors)
     verdict = classify_config_routing(collision_result, presence)
-    return build_investigation_report(uuid, graphs, presence, collision_result, verdict)
+    return build_investigation_report(uuid, graphs, presence, collision_result, verdict, errors=errors)
 
 
 # ---------------------------------------------------------------------------
