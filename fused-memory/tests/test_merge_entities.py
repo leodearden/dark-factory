@@ -349,6 +349,43 @@ class TestDuplicateEdgeUuids:
         ]
         assert GraphitiBackend._duplicate_edge_uuids(rows) == ['e-2']
 
+    def test_self_loop_double_match_returns_empty(self):
+        """The undirected Cypher MATCH in dedup_valid_edges_for_node
+        double-matches a self-loop edge (A)-[e]-(A), surfacing the same
+        (neighbor_uuid, edge_uuid, fact, valid_at) row twice. The edge-uuid
+        dedup guard (rows deduplicated by edge_uuid before grouping) must
+        fold these back into a single row so the lone self-loop edge is not
+        mistaken for a duplicate pair and returned for deletion. A
+        regression that removed the edge-uuid dedup would risk exactly that
+        for a self-loop with no other edges to disambiguate it."""
+        rows = [
+            ['A-uuid', 'e-1', self._FACT, self._VALID_AT],
+            ['A-uuid', 'e-1', self._FACT, self._VALID_AT],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+    def test_collapses_reverse_direction_duplicate_by_design(self):
+        """The (neighbor_uuid, fact, valid_at) grouping key carries no edge
+        direction, so a forward edge A->B and a reverse edge B->A sharing an
+        identical fact and valid_at collapse into a single survivor exactly
+        like a same-direction parallel duplicate would. This is deliberate,
+        not an oversight (see task 2118's design decision to use an
+        undirected MATCH): the merge scenario this helper targets only ever
+        mints same-direction duplicates, and the undirected Cypher query in
+        dedup_valid_edges_for_node reports the neighbor via `m.uuid`
+        regardless of which side the edge originates from, so direction
+        isn't even available to key on. Pinned here so a future change to
+        add direction-sensitivity is a conscious, test-visible decision
+        rather than a silent behavior change."""
+        rows = [
+            # Forward edge A->B, as seen from A's undirected query (m=B).
+            ['B-uuid', 'e-2', 'Auth depends on Redis.', self._VALID_AT],
+            # Reverse edge B->A, also surfaced with neighbor_uuid='B-uuid'
+            # from A's perspective since the MATCH is undirected.
+            ['B-uuid', 'e-1', 'Auth depends on Redis.', self._VALID_AT],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == ['e-2']
+
 
 # ---------------------------------------------------------------------------
 # task 2118 step-5/6: GraphitiBackend.dedup_valid_edges_for_node
