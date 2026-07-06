@@ -9,36 +9,44 @@ do not need to be re-keyed.
 
 Network errors are caught and surfaced as ``{'offline': True, 'error': ...}``;
 the caller turns that into a per-project skip plus a Tasks-tab banner.
+
+Note: the three failover loops below raise ``ValueError`` from within their
+``_call`` closures on a "soft failure" (malformed/errored MCP result), which
+``mcp_fanout.first_success`` treats the same as a transport error — including
+invalidating that URL's cached session. Previously a soft failure here fell
+through with a bare ``continue`` and no session teardown; see
+``mcp_fanout``'s module docstring for why this normalization is intentional.
 """
 
 from __future__ import annotations
 
-import logging
 import os
-import time
 from collections.abc import Mapping
 from typing import Any
 
 import httpx
 
 from dashboard.config import DashboardConfig
-from dashboard.data.memory import _sessions, mcp_tool_call
-
-logger = logging.getLogger(__name__)
+from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.memory import mcp_tool_call
 
 # ---------------------------------------------------------------------------
 # Per-project_root TTL cache for fetch_tasks
 # (mirrors app._load_task_cards / merge_queue.load_task_titles pattern)
 #
-# Code-duplication note: this is now the third copy of the
-# {TTL constant, dict[str, tuple[float, list[dict]]], _clear() hook,
-# store-only-on-success, list()-copy} pattern alongside
-# app._task_cards_cache and merge_queue._task_titles_cache.  Extracting a
-# shared TTLCache helper would require changes to app.py and merge_queue.py,
+# Code-duplication note: fetch_tasks's own copy of the {TTL constant, store,
+# _clear() hook, store-only-on-success, list()-copy} pattern is now extracted
+# into dashboard.data.mcp_fanout.TTLCache (this task).  app._task_cards_cache
+# and merge_queue._task_titles_cache still implement the pattern inline —
+# extracting a shared helper there would require changes to those modules,
 # which fall outside this task's module lock.  Both caller caches are now
 # primarily redundant for MCP de-duplication (the 20 s inner TTL handles it);
 # they remain for legacy shaping-cost avoidance and are outside this task's
 # scope to remove.
+#
+# Keyed by project_root_str — a small, bounded set in practice — which
+# satisfies TTLCache's documented "bounded key space" assumption (it never
+# evicts individual store/lock entries short of a blanket .clear()).
 # ---------------------------------------------------------------------------
 
 # Within the PRD's recommended 15-30 s staleness window.  Slightly longer than
@@ -52,7 +60,9 @@ logger = logging.getLogger(__name__)
 # ≈ 10 s + 20 s = 30 s — at the PRD's upper bound; intentional for a
 # monitoring view where brief staleness is preferable to MCP hammering.
 _FETCH_TASKS_TTL_SECONDS = 20.0
-_fetch_tasks_cache: dict[str, tuple[float, list[dict]]] = {}
+_fetch_tasks_cache: TTLCache[list[dict] | dict] = TTLCache(
+    ttl_seconds=lambda: _FETCH_TASKS_TTL_SECONDS
+)
 
 
 def _fetch_tasks_cache_clear() -> None:
@@ -140,27 +150,14 @@ async def fetch_tasks(
     caller caches had this property at a narrower window; the 20 s inner cache
     widens it uniformly across all callers.
     """
-    errors: list[str] = []
     project_root_str = str(project_root)
-    now = time.monotonic()
-    cached = _fetch_tasks_cache.get(project_root_str)
-    if cached is not None and (now - cached[0]) < _FETCH_TASKS_TTL_SECONDS:
-        return list(cached[1])
-    for url in config.fused_memory_urls:
-        try:
-            result = await mcp_tool_call(
-                client, url, 'get_tasks', {'project_root': project_root_str},
-            )
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
-            logger.debug('fetch_tasks failed for %s: %s', url, e)
-            errors.append(f'{url}: {e}')
-            _sessions.pop(url.rstrip('/'), None)
-            continue
 
+    async def _call(url: str) -> list[dict]:
+        result = await mcp_tool_call(
+            client, url, 'get_tasks', {'project_root': project_root_str},
+        )
         if 'error' in result and 'tasks' not in result:
-            errors.append(f'{url}: {result.get("error")}')
-            continue
+            raise ValueError(str(result.get('error')))
 
         raw_tasks = result.get('tasks') or []
         shaped: list[dict] = []
@@ -168,10 +165,20 @@ async def fetch_tasks(
             row = _shape_task(task)
             if row is not None:
                 shaped.append(row)
-        _fetch_tasks_cache[project_root_str] = (now, shaped)
-        return list(shaped)
+        return shaped
 
-    return {'offline': True, 'error': '; '.join(errors)}
+    async def _refresh() -> list[dict] | dict:
+        return await first_success(
+            config.fused_memory_urls,
+            _call,
+            log_label='fetch_tasks',
+            offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
+        )
+
+    result = await _fetch_tasks_cache.get_or_refresh(
+        project_root_str, _refresh, cache_ok=lambda v: isinstance(v, list),
+    )
+    return list(result) if isinstance(result, list) else result
 
 
 async def fetch_external_statuses(
@@ -191,33 +198,23 @@ async def fetch_external_statuses(
     if not deps:
         return {}
 
-    errors: list[str] = []
-    for url in config.fused_memory_urls:
-        try:
-            result = await mcp_tool_call(
-                client, url, 'get_external_statuses', {'deps': deps},
-            )
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
-            logger.debug('fetch_external_statuses failed for %s: %s', url, e)
-            errors.append(f'{url}: {e}')
-            _sessions.pop(url.rstrip('/'), None)
-            continue
-
+    async def _call(url: str) -> dict[str, str | bool]:
+        result = await mcp_tool_call(
+            client, url, 'get_external_statuses', {'deps': deps},
+        )
         if not isinstance(result, dict):
-            logger.debug('fetch_external_statuses: unexpected result type %s from %s', type(result), url)
-            errors.append(f'{url}: unexpected result type {type(result).__name__}')
-            continue
-
+            raise ValueError(f'unexpected result type {type(result).__name__}')
         if 'error' in result or not result:
             # Structured error dict or empty result (e.g. parse failure) — try next URL.
-            logger.debug('fetch_external_statuses: soft failure from %s: %s', url, result)
-            errors.append(f'{url}: {result.get("error", "empty result") if isinstance(result, dict) else "empty result"}')
-            continue
-
+            raise ValueError(str(result.get('error', 'empty result')))
         return result  # bare {dep: status} map
 
-    return {'offline': True, 'error': '; '.join(errors)}
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label='fetch_external_statuses',
+        offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
+    )
 
 
 async def fetch_statuses(
@@ -230,23 +227,14 @@ async def fetch_statuses(
     Used by the burndown collector — ~95% smaller than ``fetch_tasks``.
     Returns ``{'offline': True, 'error': str}`` if every server fails.
     """
-    errors: list[str] = []
     project_root_str = str(project_root)
-    for url in config.fused_memory_urls:
-        try:
-            result = await mcp_tool_call(
-                client, url, 'get_statuses', {'project_root': project_root_str},
-            )
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
-            logger.debug('fetch_statuses failed for %s: %s', url, e)
-            errors.append(f'{url}: {e}')
-            _sessions.pop(url.rstrip('/'), None)
-            continue
 
+    async def _call(url: str) -> dict[int, str]:
+        result = await mcp_tool_call(
+            client, url, 'get_statuses', {'project_root': project_root_str},
+        )
         if 'error' in result and 'statuses' not in result:
-            errors.append(f'{url}: {result.get("error")}')
-            continue
+            raise ValueError(str(result.get('error')))
 
         raw = result.get('statuses') or {}
         out: dict[int, str] = {}
@@ -257,4 +245,9 @@ async def fetch_statuses(
                 continue
         return out
 
-    return {'offline': True, 'error': '; '.join(errors)}
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label='fetch_statuses',
+        offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
+    )

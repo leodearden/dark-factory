@@ -6,6 +6,7 @@ fetch_external_statuses short-circuit + fail-safe semantics.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -506,3 +507,44 @@ class TestFetchTasksCache:
             'list() is shallow — inner dict mutation is shared with the cache; '
             'callers must not mutate returned task dicts in place'
         )
+
+    async def test_fetch_tasks_concurrent_cold_callers_single_flight(
+        self, dummy_client, dummy_config
+    ):
+        """Two concurrent fetch_tasks calls on a cold cache collapse onto ONE MCP call.
+
+        A shared asyncio.Event gates mcp_tool_call so both coroutines genuinely
+        overlap while the cache is cold, rather than serializing by accident.
+
+        RED until step-7: fetch_tasks has no single-flight lock today, so both
+        cold callers reach mcp_tool_call independently (call_count == 2). GREEN
+        once fetch_tasks routes through TTLCache.get_or_refresh, whose per-key
+        lock makes the second caller wait for (and then reuse) the first
+        caller's in-flight result instead of issuing its own MCP call.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        gate = asyncio.Event()
+
+        async def _gated(client, url, tool, args):
+            await gate.wait()
+            return _CANNED_GET_TASKS_RESULT
+
+        mock_mcp = AsyncMock(side_effect=_gated)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            task1 = asyncio.create_task(fetch_tasks(dummy_client, dummy_config, '/proj/SF'))
+            task2 = asyncio.create_task(fetch_tasks(dummy_client, dummy_config, '/proj/SF'))
+
+            # Let both coroutines reach mcp_tool_call (or block behind the
+            # single-flight lock) before releasing the gate.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            gate.set()
+
+            result1, result2 = await asyncio.gather(task1, task2)
+
+        assert mock_mcp.call_count == 1, (
+            f'expected single-flight (1 MCP call for 2 concurrent cold callers '
+            f'on the same project_root), got {mock_mcp.call_count}'
+        )
+        assert result1 == result2

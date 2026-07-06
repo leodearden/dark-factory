@@ -13,6 +13,7 @@ import logging
 import httpx
 
 from dashboard.config import DashboardConfig
+from dashboard.data.mcp_fanout import first_success
 
 logger = logging.getLogger(__name__)
 
@@ -200,16 +201,12 @@ async def _first_success(
     ``get_curator_state``); aggregating helpers (``get_queue_stats``,
     ``get_wal_status``) handle their own per-URL loops.
     """
-    errors: list[str] = []
-    for url in config.fused_memory_urls:
-        try:
-            return await mcp_tool_call(client, url, tool_name, args)
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
-            logger.debug('%s failed for %s: %s', log_label, url, e)
-            errors.append(f'{url}: {e}')
-            invalidate_session(url)
-    return {'offline': True, 'error': '; '.join(errors)}
+    return await first_success(
+        config.fused_memory_urls,
+        lambda url: mcp_tool_call(client, url, tool_name, args),
+        log_label=log_label,
+        offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
+    )
 
 
 async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
@@ -220,6 +217,8 @@ async def get_memory_status(client: httpx.AsyncClient, config: DashboardConfig) 
     return await _first_success(client, config, 'get_status', {}, 'get_status')
 
 
+# Intentionally NOT converted to first_success: sums/collects across ALL
+# configured URLs rather than short-circuiting on the first success.
 async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
     """Fetch and aggregate write-queue stats from all configured servers.
 
@@ -251,6 +250,8 @@ async def get_queue_stats(client: httpx.AsyncClient, config: DashboardConfig) ->
     return {'counts': merged_counts, 'oldest_pending_age_seconds': oldest_age}
 
 
+# Intentionally NOT converted to first_success: collects a per-URL entry from
+# ALL configured URLs rather than short-circuiting on the first success.
 async def get_wal_status(client: httpx.AsyncClient, config: DashboardConfig) -> dict:
     """Fetch per-store WAL checkpoint status from each fused-memory server.
 
