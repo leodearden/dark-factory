@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 from pydantic import BaseModel
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
@@ -483,3 +484,47 @@ async def submit_and_resolve(
         f'submit_and_resolve: ticket {ticket!r} resolved with no result_json '
         f'(resolve_result={resolve_result!r})'
     )
+
+
+# ---------------------------------------------------------------------------
+# Shared Qdrant test scaffolding (task 2277)
+# ---------------------------------------------------------------------------
+#
+# De-duplicates the _qdrant_available()/QDRANT_URL/skip-marker trio that was
+# previously copy-pasted verbatim in test_recon_dedup_premise.py and
+# test_mem0_qdrant_integration.py (flagged by esc-2221-26).
+# ---------------------------------------------------------------------------
+
+QDRANT_URL = 'http://localhost:6333'
+
+
+def _qdrant_available() -> bool:
+    """Probe whether a Qdrant instance is reachable at QDRANT_URL.
+
+    Imports QdrantClient lazily (rather than at module scope) so that
+    importing this module — which conftest.py does every test session —
+    never pulls in qdrant_client, and so tests can deterministically patch
+    ``qdrant_client.QdrantClient``.
+    """
+    from qdrant_client import QdrantClient
+
+    try:
+        client = QdrantClient(url=QDRANT_URL, timeout=2)
+        client.get_collections()
+        client.close()
+        return True
+    except Exception:
+        return False
+
+
+def qdrant_skipif(reason: str = 'Qdrant not reachable'):
+    """Return a ``pytest.mark.skipif`` marker gated on `_qdrant_available()`.
+
+    A factory rather than a module-level marker constant: _fm_helpers is
+    imported by conftest.py on every test session, so evaluating the probe at
+    import time would run it even for test sessions that never touch Qdrant.
+    Calling this from a module's ``pytestmark`` instead defers the probe to
+    that module's own collection time — identical timing to each file's
+    previous local copy.
+    """
+    return pytest.mark.skipif(not _qdrant_available(), reason=reason)
