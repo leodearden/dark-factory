@@ -231,16 +231,18 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     'steps' collection is counted toward plan_progress; 'prerequisites'
     status (also tracked by artifacts.py) is intentionally not surfaced.
 
-    metadata.json and plan.json are resolved new-then-old: read from the
+    All four artifact reads — metadata.json, plan.json, iterations.jsonl,
+    and the reviews/ directory — are resolved new-then-old: read from the
     relocated <worktree_base>/.task-meta/<worktree_name> dir
     (worktree_path.parent / '.task-meta' / worktree_path.name) when present,
     else fall back to the legacy <worktree>/.task dir. This hand-derives the
     path shape owned by TaskArtifacts.meta_root_for / config.TASK_META_DIRNAME
     (the dashboard cannot import the orchestrator package — see the module
     docstring's FORMAT COUPLING section) and mirrors
-    TaskArtifacts._read_path's new-then-old resolution. iterations.jsonl and
-    reviews/ are relocated in a follow-up step; until then they read the
-    legacy path only. The legacy fallback is retired at task ι once a full
+    TaskArtifacts._read_path's new-then-old resolution (metadata.json,
+    plan.json, and iterations.jsonl via the _resolve() helper; the reviews/
+    directory via its own is_dir() check, since a directory has no single
+    path to stat). The legacy fallback is retired at task ι once a full
     compat-window cycle confirms every lane has migrated.
 
     FUTURE SINGLE OWNER: stream W11's TaskArtifacts — see the module
