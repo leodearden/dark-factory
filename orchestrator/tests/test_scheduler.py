@@ -6065,6 +6065,68 @@ class TestDeferredWatchDispatchGate:
             f'dispatch; got: {result}'
         )
 
+    def test_pending_deferred_watch_task_with_timestamp_trigger_met_is_eligible(self):
+        """metadata.trigger_met is documented as accepting a timestamp string
+        (an operator recording *when* they confirmed the upstream condition),
+        not just bool True. Any truthy value must count as the reactivation
+        signal.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        task = {
+            'id': '2217',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': True,
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+                'trigger_met': '2026-07-06T00:00:00Z',
+            },
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '2217', status_map)
+
+        assert result == (True, None), (
+            f'Expected a deferred_watch task with a timestamp-string '
+            f'trigger_met to be eligible for dispatch; got: {result}'
+        )
+
+    def test_pending_task_with_truthy_non_bool_deferred_watch_is_gated(self):
+        """metadata.deferred_watch is documented as accepting any truthy
+        value, not just bool True (e.g. a non-empty string). Plain
+        truthiness must gate the task the same as bool True would.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        task = {
+            'id': '2217',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': 'yes',
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+            },
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '2217', status_map)
+
+        assert result == (False, None), (
+            f'Expected a truthy non-bool deferred_watch value to gate the '
+            f'task same as bool True; got: {result}'
+        )
+
     @pytest.mark.asyncio
     async def test_acquire_next_skips_deferred_watch_task_and_dispatches_normal_task(
         self, monkeypatch
