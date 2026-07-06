@@ -68,6 +68,7 @@ from orchestrator.git_ops import (  # noqa: F401
     WorktreeInfo,
     _run,
 )
+from orchestrator.landed_outbox import LandedOutbox  # noqa: F401
 from orchestrator.merge_queue import (  # noqa: F401
     InflightEntry,
     InflightVerifyResult,
@@ -3247,4 +3248,160 @@ class TestLateArrivalSubmissionOrderCAS:
             'fired.  Without this, B may have been prefetched normally by the '
             'look-ahead, bypassing the late-arrival path the submission-order '
             'CAS test is designed to exercise.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 2154 (W1 β): write-ahead landed-outbox wiring at both CAS advance sites
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestJournalLandedThenAdvanceHelper:
+    """Step-1 (RED) — shared write-ahead helper: record() precedes advance_main.
+
+    ``_journal_landed_then_advance`` is the single ordering point (PRD WA-1)
+    that BOTH CAS advance sites route through: record a LandedRow into the
+    outbox, THEN await ``git_ops.advance_main``. RED until step-2 adds the
+    helper to merge_queue.py (import error).
+    """
+
+    async def test_records_before_advance(self, tmp_path: Path) -> None:
+        """The row must already be visible from inside advance_main's own call."""
+        from orchestrator.merge_queue import _journal_landed_then_advance
+
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        merge_wt = tmp_path / '_merge-wt'
+        captured: dict[str, Any] = {}
+
+        async def _fake_advance_main(*args: Any, **kwargs: Any) -> AdvanceOutcome:
+            # WA-1: captured HERE, at call time — proves record() precedes advance.
+            captured['row'] = outbox.lookup('t1')
+            return AdvanceOutcome('advanced', advanced_sha='mergesha')
+
+        git_ops = MagicMock()
+        git_ops.advance_main = AsyncMock(side_effect=_fake_advance_main)
+
+        result = await _journal_landed_then_advance(
+            outbox, git_ops,
+            task_id='t1',
+            branch_tip_sha='tipsha',
+            advanced_sha='mergesha',
+            merge_wt=merge_wt,
+            branch='task/1',
+            max_attempts=3,
+            expected_main='base',
+        )
+
+        row = captured.get('row')
+        assert row is not None, (
+            'LandedRow must be recorded before advance_main is invoked (WA-1)'
+        )
+        assert row.task_id == 't1'
+        assert row.branch_tip_sha == 'tipsha'
+        assert row.advanced_sha == 'mergesha'
+        assert isinstance(row.landed_at, float)
+
+        assert result == AdvanceOutcome('advanced', advanced_sha='mergesha')
+        git_ops.advance_main.assert_awaited_once_with(
+            'mergesha', merge_wt,
+            branch='task/1', max_attempts=3, expected_main='base',
+        )
+
+    async def test_none_outbox_does_not_crash(self, tmp_path: Path) -> None:
+        """outbox=None (no project_root) must no-op the record, not raise."""
+        from orchestrator.merge_queue import _journal_landed_then_advance
+
+        merge_wt = tmp_path / '_merge-wt2'
+        git_ops = MagicMock()
+        git_ops.advance_main = AsyncMock(
+            return_value=AdvanceOutcome('advanced', advanced_sha='mergesha2')
+        )
+
+        result = await _journal_landed_then_advance(
+            None, git_ops,
+            task_id='t2',
+            branch_tip_sha=None,
+            advanced_sha='mergesha2',
+            merge_wt=merge_wt,
+            branch='task/2',
+            max_attempts=3,
+            expected_main='base2',
+        )
+
+        assert result == AdvanceOutcome('advanced', advanced_sha='mergesha2')
+        git_ops.advance_main.assert_awaited_once_with(
+            'mergesha2', merge_wt,
+            branch='task/2', max_attempts=3, expected_main='base2',
+        )
+
+
+@pytest.mark.asyncio
+class TestFinalizeInflightJournalsLandedRow:
+    """Step-3 (RED) — B6 single-branch: LandedRow visible at advance_main call time.
+
+    ``_finalize_inflight`` still calls ``self._git_ops.advance_main(...)``
+    directly (no write-ahead record).  RED until step-4 routes the CAS
+    advance through ``_journal_landed_then_advance``, which records into
+    ``worker._landed_outbox`` before awaiting advance_main.
+    """
+
+    async def test_finalize_inflight_journals_landed_row_before_advance(
+        self, tmp_path: Path,
+    ) -> None:
+        """The row must already be visible from inside advance_main's own call.
+
+        RED: no row is recorded before advance_main is invoked → captured['row']
+        stays None (worker._landed_outbox.lookup('b6-single') finds nothing yet).
+        GREEN (step-4): _finalize_inflight routes the CAS advance through
+        _journal_landed_then_advance, which records first.
+        """
+        from dataclasses import replace as _replace
+
+        cfg = OrchestratorConfig(project_root=tmp_path, git=_make_spec_git_config(on=True))
+        worker, mock_git_ops = _make_finalize_test_worker(tmp_path)
+
+        item = _make_spec_item(tmp_path, cfg, speculative=True)
+        item.request.task_id = 'b6-single'
+        item = _replace(item, merged_branch_tip='cafe' * 10)
+
+        vr = InflightVerifyResult(outcome=None, merge_wt=item.merge_wt, spec_warm=False)
+        entry = _build_entry(item, vr, merge_wt=item.merge_wt)
+
+        captured: dict[str, Any] = {}
+
+        async def _fake_advance_main(current_sha: str, merge_wt: Path, **kwargs: Any) -> AdvanceOutcome:
+            # WA-1: captured HERE, at call time — proves record() precedes advance.
+            assert worker._landed_outbox is not None, (
+                'worker must have a real _landed_outbox (project_root is set)'
+            )
+            captured['row'] = worker._landed_outbox.lookup('b6-single')
+            return AdvanceOutcome('advanced', advanced_sha=current_sha)
+
+        mock_git_ops.advance_main.side_effect = _fake_advance_main
+
+        with (
+            patch(
+                'orchestrator.merge_queue._finalize_advanced_merge',
+                new=AsyncMock(return_value=MergeOutcome(
+                    'done', merge_sha=item.merge_result.merge_commit,
+                )),
+            ),
+            patch('orchestrator.merge_queue._maybe_schedule_shadow_compare', new=AsyncMock()),
+            patch('orchestrator.merge_queue._maybe_run_drift_check', new=AsyncMock()),
+        ):
+            await worker._finalize_inflight(entry)
+
+        row = captured.get('row')
+        assert row is not None, (
+            'LandedRow must be recorded into worker._landed_outbox before '
+            'advance_main is invoked (WA-1) at the single-branch CAS site'
+        )
+        assert row.advanced_sha == item.merge_result.merge_commit, (
+            f'Expected advanced_sha={item.merge_result.merge_commit!r}, '
+            f'got {row.advanced_sha!r}'
+        )
+        assert row.branch_tip_sha == item.merged_branch_tip, (
+            f'Expected branch_tip_sha={item.merged_branch_tip!r}, '
+            f'got {row.branch_tip_sha!r}'
         )

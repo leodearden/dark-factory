@@ -29,12 +29,13 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
+    AdvanceOutcome,
     GitOps,
     MergeResult,
     WorktreeMissing,
     _run,
 )
-from orchestrator.landed_outbox import LandedOutbox, MergeProvenance
+from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_drift import (  # noqa: F401  re-export shim
     _maybe_run_drift_check,
     _run_drift_check,
@@ -2677,6 +2678,52 @@ async def classify_and_merge(
         raise
 
 
+async def _journal_landed_then_advance(
+    outbox: LandedOutbox | None,
+    git_ops: Any,
+    *,
+    task_id: str,
+    branch_tip_sha: str | None,
+    advanced_sha: str,
+    merge_wt: Path,
+    **advance_kwargs: Any,
+) -> AdvanceOutcome:
+    """Record a LandedRow, THEN advance main — single-sourced write-ahead
+    ordering (PRD WA-1) shared by BOTH CAS advance sites (single-branch
+    ``_finalize_inflight`` and train ``_do_train_merge``).
+
+    *advanced_sha* is the pre-advance SHA about to become main — the value
+    knowable write-ahead, not ``advance_main``'s return value — and doubles
+    as ``advance_main``'s first positional argument; *merge_wt* is the
+    second. Remaining per-site ``**advance_kwargs`` pass through unchanged,
+    keeping the advance call byte-identical to before this helper existed.
+    A ``None`` *outbox* (no ``project_root``, e.g. bare-worker tests) no-ops
+    the record — the advance still proceeds.
+
+    CAUTION — the row is recorded UNCONDITIONALLY before the outcome of
+    ``advance_main`` is known. If the returned :class:`AdvanceOutcome`'s
+    ``result`` is anything other than ``'advanced'`` (e.g. ``'cas_failed'``,
+    ``'not_descendant'``, ``'unmerged_state'``, ``'pop_conflict_no_advance'``),
+    the task never actually landed on main, yet its row still persists in
+    the outbox. A recorded row therefore means "write-ahead intent", NOT
+    "confirmed landed" — this helper (and both its call sites) never
+    ``.consume()`` on failure. Any consumer of :class:`LandedOutbox` /
+    :class:`MergeProvenance` (e.g. a startup reconciler or a scheduler
+    consult-before-dispatch gate) MUST treat row presence as provisional:
+    verify the task actually landed (or cross-check ``advanced_sha`` against
+    real main history) before relying on it, and ``.consume()`` a row only
+    once the task is independently confirmed done.
+    """
+    if outbox is not None:
+        outbox.record(LandedRow(
+            task_id=task_id,
+            branch_tip_sha=branch_tip_sha or '',
+            advanced_sha=advanced_sha,
+            landed_at=time.time(),
+        ))
+    return await git_ops.advance_main(advanced_sha, merge_wt, **advance_kwargs)
+
+
 async def _do_train_merge(
     worker: _TrainMergeHost,
     req: GroupMergeRequest,
@@ -2972,13 +3019,57 @@ async def _do_train_merge(
         return verify_outcome
 
     # (f) CAS-advance main.
-    adv_outcome = await git_ops.advance_main(
-        merge_commit, merge_wt,
+    # Write-ahead (PRD WA-1): record a LandedRow into the durable outbox
+    # BEFORE advancing main — single-sourced via the shared helper (task β).
+    # branch_tip_sha is best-effort (resolve_branch_sha returns str | None;
+    # _do_train_merge has no MergedOk.branch_tip like the single-branch path).
+    # Performance (amendment, task 2154): this costs one extra git subprocess
+    # per train CAS-advance. Nothing upstream in this function already holds
+    # a resolved tip SHA to reuse — rebase_onto_main returns bool only, and
+    # the raw MergeResult from merge_to_main has no branch_tip field (that
+    # field lives only on MergedOk, single-branch's classify_and_merge
+    # result; see git_ops.py:368). The resolve is therefore an accepted,
+    # intentional best-effort cost rather than a deferred TODO.
+    _train_branch_tip = await git_ops.resolve_branch_sha(req.branch)
+    adv_outcome = await _journal_landed_then_advance(
+        getattr(worker, '_landed_outbox', None), git_ops,
+        task_id=req.task_id,
+        branch_tip_sha=_train_branch_tip,
+        advanced_sha=merge_commit,
+        merge_wt=merge_wt,
         branch=req.branch,
         max_attempts=req.config.max_advance_attempts,
         expected_main=main_sha,
     )
     adv = adv_outcome.result
+
+    # Correctness (amendment, task 2154): the train call does not pass
+    # reverify_on_rebase=True (unlike the single-branch site), so
+    # advance_main's OWN internal CAS-retry loop can transparently rebase
+    # merge_commit onto a moved main and land the REBASED sha directly,
+    # returning 'advanced' with advanced_sha != the pre-advance merge_commit
+    # journaled above. There is no caller-level rebased_pending_reverify
+    # branch here to re-record from (that only exists in _finalize_inflight's
+    # while-loop), so re-record now whenever the landed sha differs from what
+    # was journaled write-ahead — the row's advanced_sha must always match
+    # what actually landed on main. LandedOutbox is keyed by task_id ALONE
+    # (last-write-wins — see landed_outbox.py's class docstring), so this
+    # re-record OVERWRITES the write-ahead row in place rather than adding a
+    # second (task_id, advanced_sha) entry; any consumer reading the row
+    # after this point sees the landed sha.
+    if (
+        adv == 'advanced'
+        and adv_outcome.advanced_sha is not None
+        and adv_outcome.advanced_sha != merge_commit
+    ):
+        _train_outbox = getattr(worker, '_landed_outbox', None)
+        if _train_outbox is not None:
+            _train_outbox.record(LandedRow(
+                task_id=req.task_id,
+                branch_tip_sha=_train_branch_tip or '',
+                advanced_sha=adv_outcome.advanced_sha,
+                landed_at=time.time(),
+            ))
 
     await git_ops.cleanup_merge_worktree(merge_wt)
 
@@ -8811,8 +8902,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entry.phase = 'finalizing'   # per-entry source of truth for snapshot()
             current_sha = merge_commit
             while True:
-                adv_outcome = await self._git_ops.advance_main(
-                    current_sha, merge_wt,
+                # Write-ahead (PRD WA-1): record a LandedRow into the durable
+                # outbox BEFORE advancing main — single-sourced via the shared
+                # helper (task β).  Re-recorded each loop iteration so a
+                # rebased retry's current_sha stays in sync (idempotent
+                # last-write-wins, WA-2).
+                adv_outcome = await _journal_landed_then_advance(
+                    self._landed_outbox, self._git_ops,
+                    task_id=req.task_id,
+                    branch_tip_sha=item.merged_branch_tip,
+                    advanced_sha=current_sha,
+                    merge_wt=merge_wt,
                     branch=req.branch,
                     max_attempts=req.config.max_advance_attempts,
                     expected_main=item.base_sha,
