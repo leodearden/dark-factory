@@ -35,6 +35,7 @@ in-batch task (β).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -77,6 +78,13 @@ class LandedOutbox:
         # time. All mutations go through this dict so lookup()/all() never
         # re-read the file — mirrors MergeQueueStore's _cache pattern.
         self._cache: dict[str, dict[str, Any]] = self._load_raw()
+        # Observability counter: bumped each time _save_raw fail-opens on an
+        # OSError, i.e. record()/consume() returned normally but the row was
+        # NOT durably flushed (still only in self._cache). record()/consume()
+        # deliberately never raise for this (never block the merge
+        # pipeline), so this counter is the only in-process signal that
+        # durability was lost — callers/metrics may poll it.
+        self.save_failures: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -123,11 +131,36 @@ class LandedOutbox:
     # ------------------------------------------------------------------
 
     def _load_raw(self) -> dict[str, dict[str, Any]]:
-        """Load the JSON map from disk; return {} on any error (fail-open)."""
+        """Load the JSON map from disk; return {} on any error (fail-open).
+
+        A row that is valid JSON but schema-drifted (not a dict, or missing/
+        extra keys relative to :class:`LandedRow`'s fields) is dropped
+        individually with a WARNING rather than left in the cache — without
+        this guard, ``lookup()``/``all()`` would raise ``TypeError`` the
+        first time they reconstructed that row via
+        ``LandedRow(task_id=k, **v)``, defeating the fail-open contract for
+        callers like the scheduler's consult-before-dispatch gate.
+        """
         data, ok = load_json_or_warn(self._path, default={}, on_corrupt='warn')
         if not ok or not isinstance(data, dict):
             return {}
-        return data
+        clean: dict[str, dict[str, Any]] = {}
+        for task_id, value in data.items():
+            if not isinstance(value, dict):
+                logger.warning(
+                    'landed_outbox: dropping non-dict row for task_id=%r', task_id,
+                )
+                continue
+            try:
+                LandedRow(task_id=task_id, **value)
+            except TypeError as exc:
+                logger.warning(
+                    'landed_outbox: dropping schema-drifted row for task_id=%r: %s',
+                    task_id, exc,
+                )
+                continue
+            clean[task_id] = value
+        return clean
 
     def _save_raw(self, state: dict[str, Any]) -> None:
         """Atomically AND durably write *state* to disk (WA-1).
@@ -136,13 +169,17 @@ class LandedOutbox:
         parent directory's fd AFTER — a rename without a directory fsync can
         be lost on crash (the directory-entry update is a separate
         durability domain from the file's own contents on most
-        filesystems). Fail-open: any OSError is logged as a WARNING, never
-        raised, so a transient disk failure never blocks the merge
-        pipeline.
+        filesystems). Fail-open: any OSError is logged at ERROR (this is a
+        lost-durability event, not a benign condition) and counted in
+        ``self.save_failures``, but never raised — a transient disk failure
+        must never block the merge pipeline. On failure, best-effort cleans
+        up the sibling ``.json.tmp`` so a partial-write failure doesn't
+        leave an orphan file behind (the tmp is otherwise consumed by
+        ``os.replace`` on the success path).
         """
+        tmp = self._path.with_suffix('.json.tmp')
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix('.json.tmp')
             with open(tmp, 'w', encoding='utf-8') as f:
                 f.write(json.dumps(state))
                 f.flush()
@@ -154,7 +191,14 @@ class LandedOutbox:
             finally:
                 os.close(dir_fd)
         except OSError as exc:
-            logger.warning('landed_outbox: failed to save outbox: %s', exc)
+            self.save_failures += 1
+            logger.error(
+                'landed_outbox: failed to durably save outbox (row may only'
+                ' be held in memory): %s', exc,
+            )
+            # Best-effort cleanup; the save failure is already reported above.
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
 
 
 class MergeProvenance:

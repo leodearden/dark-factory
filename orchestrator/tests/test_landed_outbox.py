@@ -14,12 +14,21 @@ Covers:
   step-11: SpeculativeMergeWorker constructs and holds a LandedOutbox
            (None-safe when git_ops has no project_root) and binds it to
            MergeProvenance.
+
+Amendment pass (review of task 2153):
+  Suggestion 1: a schema-drifted on-disk row is dropped at load time (with
+                a WARNING) instead of raising out of lookup()/all().
+  Suggestion 3: executable coverage for the fail-open invariants asserted
+                in the module docstring — a corrupt file yields an empty
+                store, and a failed durable write does not raise.
+  Suggestion 4: a failed save does not leave an orphaned '.json.tmp'.
 """
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import stat
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -282,3 +291,147 @@ class TestSpeculativeMergeWorkerHoldsLandedOutbox:
         worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
 
         assert worker._landed_outbox is None
+
+
+# ---------------------------------------------------------------------------
+# amend: Suggestion 1 — schema-drifted on-disk rows are dropped, not raised
+# ---------------------------------------------------------------------------
+
+
+class TestLandedOutboxSchemaDrift:
+    """A row that is valid JSON but schema-drifted (relative to LandedRow's
+    fields) must not raise out of lookup()/all() — it is dropped at load
+    time with a WARNING instead, so one bad row can't defeat the fail-open
+    contract for readers like the scheduler's consult-before-dispatch gate.
+    """
+
+    def test_row_missing_a_field_is_dropped(self, tmp_path: Path) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        path.write_text(
+            json.dumps({
+                'good': {'branch_tip_sha': 'a', 'advanced_sha': 'b', 'landed_at': 1.0},
+                'bad-missing-field': {'branch_tip_sha': 'a', 'advanced_sha': 'b'},
+            }),
+            encoding='utf-8',
+        )
+
+        outbox = LandedOutbox(path)
+
+        assert outbox.lookup('bad-missing-field') is None
+        assert outbox.lookup('good') == LandedRow(
+            task_id='good', branch_tip_sha='a', advanced_sha='b', landed_at=1.0,
+        )
+        assert {r.task_id for r in outbox.all()} == {'good'}
+
+    def test_row_with_an_extra_field_is_dropped(self, tmp_path: Path) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        path.write_text(
+            json.dumps({
+                'bad-extra-field': {
+                    'branch_tip_sha': 'a',
+                    'advanced_sha': 'b',
+                    'landed_at': 1.0,
+                    'unexpected_key': 'surprise',
+                },
+            }),
+            encoding='utf-8',
+        )
+
+        outbox = LandedOutbox(path)
+
+        assert outbox.lookup('bad-extra-field') is None
+        assert outbox.all() == []
+
+    def test_non_dict_row_is_dropped(self, tmp_path: Path) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        path.write_text(json.dumps({'bad-non-dict': 'not-a-dict'}), encoding='utf-8')
+
+        outbox = LandedOutbox(path)
+
+        assert outbox.lookup('bad-non-dict') is None
+        assert outbox.all() == []
+
+
+# ---------------------------------------------------------------------------
+# amend: Suggestion 3 — executable coverage for fail-open branches
+# ---------------------------------------------------------------------------
+
+
+class TestLandedOutboxFailOpenBranches:
+    """Executable coverage for the fail-open invariants asserted in the
+    module docstring but previously untested: a corrupt file yields a
+    silent empty store, and a failed durable write does not raise (the row
+    stays cache-only until a later successful flush)."""
+
+    def test_corrupt_json_file_yields_empty_store(self, tmp_path: Path) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        path.write_text('not json {{{{', encoding='utf-8')
+
+        outbox = LandedOutbox(path)
+
+        assert outbox.all() == []
+        assert outbox.lookup('anything') is None
+
+    def test_save_failure_does_not_raise_and_row_stays_in_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        row = LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            raise OSError('disk full simulated failure')
+
+        monkeypatch.setattr('orchestrator.landed_outbox.os.replace', _boom)
+
+        outbox.record(row)  # must not raise, despite the durable flush failing
+
+        # Visible from the in-memory cache even though the flush failed —
+        # record() must never block the merge pipeline on a disk error.
+        assert outbox.lookup('1') == row
+        assert outbox.save_failures == 1
+        # ...but the failed write must genuinely not have landed on disk.
+        assert not path.exists()
+
+    def test_save_failure_counter_increments_per_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            raise OSError('disk full simulated failure')
+
+        monkeypatch.setattr('orchestrator.landed_outbox.os.replace', _boom)
+
+        outbox.record(LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0))
+        outbox.record(LandedRow(task_id='2', branch_tip_sha='c', advanced_sha='d', landed_at=2.0))
+
+        assert outbox.save_failures == 2
+
+
+# ---------------------------------------------------------------------------
+# amend: Suggestion 4 — a failed save must not orphan a '.json.tmp' file
+# ---------------------------------------------------------------------------
+
+
+class TestLandedOutboxTmpFileCleanup:
+    """A failed _save_raw must not leave a stale '.json.tmp' sibling behind."""
+
+    def test_failed_save_cleans_up_tmp_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        tmp_sibling = path.with_suffix('.json.tmp')
+        outbox = LandedOutbox(path)
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            raise OSError('disk full simulated failure')
+
+        monkeypatch.setattr('orchestrator.landed_outbox.os.replace', _boom)
+
+        outbox.record(LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0))
+
+        assert not tmp_sibling.exists(), (
+            f'Expected no orphaned tmp file after a failed save; found {tmp_sibling}'
+        )
