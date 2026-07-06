@@ -330,6 +330,62 @@ class TestDuplicateEdgeUuids:
 
 
 # ---------------------------------------------------------------------------
+# task 2118 step-5/6: GraphitiBackend.dedup_valid_edges_for_node
+# ---------------------------------------------------------------------------
+
+class TestDedupValidEdgesForNode:
+    """GraphitiBackend.dedup_valid_edges_for_node(node_uuid, *, group_id) reads
+    the node's valid incident edges and deletes non-survivor duplicates via
+    bulk_remove_edges."""
+
+    @pytest.mark.asyncio
+    async def test_removes_duplicate_edges_and_returns_count(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """One duplicate group (uuids 'e-2' and 'e-1') collapses to the
+        non-survivor 'e-2'; an unrelated distinct edge is left alone."""
+        backend = make_backend(mock_config)
+        valid_at = '2026-07-06T00:00:00+00:00'
+        rows = [
+            ['B-uuid', 'e-2', 'Some fact.', valid_at],
+            ['B-uuid', 'e-1', 'Some fact.', valid_at],
+            ['C-uuid', 'e-3', 'Unrelated fact.', valid_at],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.bulk_remove_edges = AsyncMock(return_value=1)
+
+        result = await backend.dedup_valid_edges_for_node('A-uuid', group_id='test')
+
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert '-[e:RELATES_TO]-' in cypher
+        assert 'invalid_at IS NULL' in cypher
+        params = extract_params(graph.ro_query.call_args)
+        assert params.get('uuid') == 'A-uuid'
+        backend.bulk_remove_edges.assert_awaited_once_with(['e-2'], group_id='test')
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_no_duplicates_returns_zero_without_deleting(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """All-distinct rows -> returns 0 and bulk_remove_edges is never called."""
+        backend = make_backend(mock_config)
+        rows = [
+            ['B-uuid', 'e-1', 'Fact one.', '2026-07-06T00:00:00+00:00'],
+            ['C-uuid', 'e-2', 'Fact two.', '2026-07-06T01:00:00+00:00'],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.bulk_remove_edges = AsyncMock(return_value=0)
+
+        result = await backend.dedup_valid_edges_for_node('A-uuid', group_id='test')
+
+        assert result == 0
+        backend.bulk_remove_edges.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # task 2073 step-1/2: GraphitiBackend.find_duplicate_entity_nodes
 # ---------------------------------------------------------------------------
 
