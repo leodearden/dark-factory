@@ -23,6 +23,7 @@ import ...``), consistent with the ``task_statuses``/``mcp_envelope``/
 from __future__ import annotations
 
 import enum
+from typing import cast
 
 from shared.task_statuses import TERMINAL, TaskStatus
 
@@ -204,7 +205,14 @@ def is_legal_transition(
         return True
     if frm in TERMINAL:
         return bool(reopen)
-    return (frm, to) in TRANSITIONS.get(actor, _UNION)
+    # Unlike frm/to, an unrecognized actor is deliberately NOT coerced via
+    # ActorClass(actor) (which would raise ValueError) — safe-open (D5) means
+    # an unattributed/unrecognized actor must fall back to _UNION, not be
+    # rejected. ActorClass is a StrEnum, so TRANSITIONS.get(...) matches a raw
+    # string actor against the real ActorClass keys by value (e.g. "human" ==
+    # ActorClass.HUMAN) and otherwise falls through to the _UNION default;
+    # the cast only satisfies the type checker; it changes no runtime lookup.
+    return (frm, to) in TRANSITIONS.get(cast(ActorClass, actor), _UNION)
 
 
 # ---------------------------------------------------------------------------
