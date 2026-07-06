@@ -214,11 +214,17 @@ class TestNoRawGatherReturnExceptionsOutsideHelperOrAllowlist:
                 continue
             rel = path.relative_to(SRC_ROOT.parent).as_posix()
             for lineno, func in _gather_return_exceptions_sites(path):
+                if func is None:
+                    # A module-level gather(...) call can never match an
+                    # ALLOWLIST entry (every key names a real enclosing
+                    # function), so it is always an offender.
+                    offenders.append(f'{rel}:{lineno}:<module>')
+                    continue
                 key = (rel, func)
                 if key in DRAIN_ALLOWLIST:
                     allowlisted_sites.setdefault(key, []).append(lineno)
                 else:
-                    offenders.append(f'{rel}:{lineno}:{func or "<module>"}')
+                    offenders.append(f'{rel}:{lineno}:{func}')
 
         assert not offenders, (
             'Found raw gather(..., return_exceptions=True) call site(s) outside '
