@@ -20,7 +20,11 @@ from fused_memory.backends.sqlite_task_backend import (
     _parse_task_id,
     _resolve_metadata_mode,
 )
-from fused_memory.backends.task_backend_errors import TaskmasterError
+from fused_memory.backends.task_backend_errors import (
+    DoneProvenanceWriteAuthorityError,
+    TaskmasterError,
+    done_provenance_via_update_task_error,
+)
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
 
@@ -769,6 +773,63 @@ async def test_update_task_status_rejection_precedes_connection_error(tmp_path, 
         await closed_backend.update_task('1', project_root=project_root, status='done')
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'set_task_status' in exc.value.message
+
+
+# ── update_task: done_provenance write-authority floor ─────────────
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_done_provenance_in_metadata(backend, project_root):
+    """Backend floor: update_task must raise DoneProvenanceWriteAuthorityError
+    when metadata parses to a dict containing 'done_provenance', and the
+    write must be blocked entirely."""
+    await backend.add_task(project_root=project_root, title='x')
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'done_provenance': {'kind': 'merged', 'commit': 'abc'}}),
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert 'done_provenance' not in task['metadata']
+
+
+@pytest.mark.asyncio
+async def test_update_task_done_provenance_rejection_precedes_existence_check(backend, project_root):
+    """done_provenance guard runs BEFORE the task SELECT, so rejection beats 'No tasks found'."""
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root,
+            metadata=json.dumps({'done_provenance': {'kind': 'merged', 'commit': 'abc'}}),
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('999')
+    assert 'No tasks found' not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_update_task_allows_metadata_without_done_provenance(backend, project_root):
+    """Regression guard: metadata lacking the 'done_provenance' key merges normally."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['src']}),
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['files'] == ['src']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_metadata', ['not json{', json.dumps(['a', 'list'])])
+async def test_update_task_done_provenance_floor_skips_unparseable_metadata(
+    backend, project_root, bad_metadata,
+):
+    """Parse-safety guard: unparseable or non-dict metadata does not trip the
+    done_provenance floor — mirrors the interceptor's
+    _reject_done_provenance_in_update_metadata, which returns None (no
+    reject) on a JSON error or non-dict payload."""
+    await backend.add_task(project_root=project_root, title='x')
+    # Must not raise DoneProvenanceWriteAuthorityError.
+    await backend.update_task('1', project_root=project_root, metadata=bad_metadata)
 
 
 @pytest.mark.asyncio
