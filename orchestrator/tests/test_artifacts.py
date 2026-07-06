@@ -1583,3 +1583,47 @@ class TestReadReviewsMergesLegacyAndNew:
         ta.write_review('reviewer-b', {'verdict': 'PASS', 'issues': []})
 
         assert ta.aggregate_reviews().has_blocking_issues is True
+
+
+class TestValidatePlanOwnerCompat:
+    """validate_plan_owner must resolve plan.json via the same new-then-old
+    fallback as read_plan — otherwise a legacy-only plan.json (mid-
+    migration) is falsely reported as an ownership mismatch, even though
+    read_plan() would load it fine.
+    """
+
+    @pytest.fixture
+    def meta_root(self, worktree: Path) -> Path:
+        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+    @pytest.fixture
+    def legacy_root(self, worktree: Path) -> Path:
+        return worktree / '.task'
+
+    def test_validates_legacy_only_plan_by_session_id(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'plan.json').write_text(json.dumps({
+            '_session_id': 'sess-1',
+            'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        assert ta.validate_plan_owner('sess-1') is True
+        assert ta.validate_plan_owner('other-sess') is False
+
+    def test_validates_legacy_only_plan_by_revalidated_session(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'plan.json').write_text(json.dumps({
+            '_session_id': 'sess-1',
+            '_revalidated_by_session': 'sess-2',
+            'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        assert ta.validate_plan_owner('sess-2') is True
