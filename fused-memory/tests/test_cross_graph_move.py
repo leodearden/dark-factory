@@ -23,6 +23,7 @@ from _fm_helpers import extract_cypher, extract_params
 from fused_memory.maintenance import cross_graph_move
 from fused_memory.maintenance.cross_graph_move import (
     MoveResult,
+    classify_unique_wrong_edges,
     format_vecf32_literal,
     move_entity_across_graphs,
     parse_compact_vector_reply,
@@ -557,3 +558,25 @@ class TestMoveEntityAcrossGraphsRewriteGroupId:
         assert node_params.get('group_id') == SOURCE_GRAPH_FIXTURE
         assert edge_params.get('group_id') == SOURCE_GRAPH_FIXTURE
         assert mention_params.get('group_id') == SOURCE_GRAPH_FIXTURE
+
+
+# ---------------------------------------------------------------------------
+# step-17: merge_foreign_duplicate -- unique-edge classification (pure)
+# ---------------------------------------------------------------------------
+
+class TestClassifyUniqueWrongEdges:
+    """classify_unique_wrong_edges(home, wrong) -> wrong-only edge uuids (set-diff)."""
+
+    def test_returns_edges_unique_to_wrong_copy(self):
+        """Given home={a,b} and wrong={b,c,d}, unique(wrong) == {c,d}."""
+        home_edge_uuids = {'a', 'b'}
+        wrong_edge_uuids = {'b', 'c', 'd'}
+        assert classify_unique_wrong_edges(home_edge_uuids, wrong_edge_uuids) == {'c', 'd'}
+
+    def test_empty_when_wrong_copy_has_no_edges(self):
+        """An empty wrong-copy edge set classifies as no unique edges."""
+        assert classify_unique_wrong_edges({'a', 'b'}, set()) == set()
+
+    def test_empty_when_all_wrong_edges_already_on_home(self):
+        """Every wrong-copy edge already present on home classifies as empty."""
+        assert classify_unique_wrong_edges({'a', 'b', 'c'}, {'a', 'b'}) == set()
