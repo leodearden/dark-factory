@@ -164,6 +164,12 @@ _RUN_TIMEOUT_GRACE_SECS: float = 30.0
 # filed).  10s comfortably covers a normal `systemctl show` round trip.
 _INSPECT_TIMEOUT_SECS: float = 10.0
 
+# Task 2120: sentinel agent_role the runner stamps on its own escalations and
+# scopes all its get_by_task queries to — an unrelated escalation with the
+# same task_id (e.g. a starvation-watchdog filing) must never alias as this
+# runner's own dedup/quiescence/resolution-proof signal.
+DETERMINISTIC_AGENT_ROLE: str = 'orchestrator-deterministic'
+
 
 class DeterministicRunner:
     """Per-slot runner for deterministic gate tasks.
