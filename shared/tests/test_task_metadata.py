@@ -14,6 +14,7 @@ Built bottom-up in TDD order (see plans/task-metadata-schema-prd.md §5):
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -27,6 +28,7 @@ from shared.task_metadata import (
     RetryLedger,
     TaskMetadata,
     apply_migrations,
+    parse_metadata,
     register_metadata_submodel,
 )
 
@@ -430,3 +432,61 @@ class TestMigrations:
         original = copy.deepcopy(blob)
         apply_migrations(blob)
         assert blob == original
+
+
+class TestParseMetadataCore:
+    """parse_metadata's happy path for both directions.
+
+    The direction/enforce failure-policy matrix is TestParseMetadataFailurePolicy;
+    this class covers only the paths that never warn.
+    """
+
+    def test_none_blob_read_direction_is_benign_absent(self):
+        model, warnings = parse_metadata(None, direction='read')
+        assert model == TaskMetadata()
+        assert warnings == []
+
+    def test_none_blob_write_direction_is_benign_absent(self):
+        model, warnings = parse_metadata(None, direction='write')
+        assert model == TaskMetadata()
+        assert warnings == []
+
+    def test_valid_dict_returns_typed_model_no_warnings(self):
+        model, warnings = parse_metadata({'task_kind': 'normal'}, direction='read')
+        assert isinstance(model, TaskMetadata)
+        assert model.task_kind == 'normal'
+        assert warnings == []
+
+    def test_valid_json_string_parses_to_same_model(self):
+        blob = {'task_kind': 'normal'}
+        model, warnings = parse_metadata(json.dumps(blob), direction='read')
+        assert model == TaskMetadata(**blob)
+        assert warnings == []
+
+    def test_migration_applied_end_to_end_for_legacy_memory_hints(self):
+        model, warnings = parse_metadata(
+            {'memory_hints': [{'entity': 'E', 'query': 'Q'}]}, direction='read'
+        )
+        assert model.memory_hints.entities == ['E']
+        assert model.memory_hints.queries == ['Q']
+        assert warnings == []
+
+    def test_registered_submodel_slice_validated_and_attached_no_warnings(self):
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        model, warnings = parse_metadata({'deploy_state': {'phase': 'rollout'}}, direction='write')
+        assert isinstance(model.deploy_state, _DeployStateStub)
+        assert model.deploy_state.phase == 'rollout'
+        assert warnings == []
+
+    def test_unknown_top_level_key_survives_round_trip(self):
+        # x_-prefixed is the sanctioned silent namespace regardless of the
+        # failure-policy matrix landing later, so this stays stable.
+        model, _ = parse_metadata({'x_foo': 1}, direction='write')
+        assert model.model_dump()['x_foo'] == 1
+
+    def test_return_type_is_always_model_warnings_tuple(self):
+        result = parse_metadata(None, direction='read')
+        assert isinstance(result, tuple)
+        model, warnings = result
+        assert isinstance(model, TaskMetadata)
+        assert isinstance(warnings, list)
