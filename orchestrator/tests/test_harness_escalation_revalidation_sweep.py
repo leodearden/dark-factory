@@ -195,3 +195,95 @@ class TestRevalidateOpenL2:
 
         assert result is False
         h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# step-5: _run_deterministic_recon_sweep — Source-C wiring
+# ---------------------------------------------------------------------------
+
+
+class TestReconSweepSourceC:
+    """step-5: _run_deterministic_recon_sweep's new Source-C wiring — a batch
+    get_statuses read over pending L2s feeds _revalidate_open_l2 per pending
+    escalation, and Source B is skipped for whichever escalation Source C
+    just closed."""
+
+    @pytest.mark.asyncio
+    async def test_closed_l2_skips_source_b(self) -> None:
+        h = _make_harness()
+        esc = _make_esc(level=2, task_id='tid-done', esc_id='esc-l2-done')
+        h.scheduler.get_tasks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        h.scheduler.get_statuses = AsyncMock(  # type: ignore[method-assign]
+            return_value=({esc.task_id: 'done'}, None)
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        h._revalidate_open_l2 = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        await h._run_deterministic_recon_sweep()
+
+        h.scheduler.get_statuses.assert_awaited_once_with([esc.task_id])  # type: ignore[attr-defined]
+        h._revalidate_open_l2.assert_awaited_once_with(esc, {esc.task_id: 'done'})
+        h._revalidate_open_deterministic_escalation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_open_l2_falls_through_to_source_b(self) -> None:
+        h = _make_harness()
+        esc = _make_esc(
+            level=2, category='infra_issue', agent_role='orchestrator-deterministic',
+            task_id='tid-live', esc_id='esc-l2-live',
+        )
+        task = {
+            'id': 'tid-live', 'status': 'in-progress',
+            'metadata': {'task_kind': 'deterministic'},
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        h.scheduler.get_task = AsyncMock(return_value=task)  # type: ignore[method-assign]
+        h.scheduler.get_statuses = AsyncMock(  # type: ignore[method-assign]
+            return_value=({esc.task_id: 'in-progress'}, None)
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        h._revalidate_open_l2 = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        await h._run_deterministic_recon_sweep()
+
+        h._revalidate_open_l2.assert_awaited_once_with(esc, {esc.task_id: 'in-progress'})
+        h._revalidate_open_deterministic_escalation.assert_awaited_once_with(
+            esc, task, task['metadata']
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_error_degrades_to_empty_and_source_b_still_runs(self) -> None:
+        """DEFENSIVE: get_statuses raising must not abort the pass — statuses
+        degrades to {} and Source B still runs.  This is the property that
+        keeps the existing 2074 suite green (its bare MagicMock scheduler has
+        no get_statuses configured, so the real call raises TypeError)."""
+        h = _make_harness()
+        esc = _make_esc(
+            level=2, category='infra_issue', agent_role='orchestrator-deterministic',
+            task_id='tid-live', esc_id='esc-l2-live',
+        )
+        task = {
+            'id': 'tid-live', 'status': 'in-progress',
+            'metadata': {'task_kind': 'deterministic'},
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        h.scheduler.get_task = AsyncMock(return_value=task)  # type: ignore[method-assign]
+        h.scheduler.get_statuses = AsyncMock(side_effect=RuntimeError('boom'))  # type: ignore[method-assign]
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._recover_stranded_deterministic_task = AsyncMock()  # type: ignore[method-assign]
+        h._revalidate_open_l2 = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        await h._run_deterministic_recon_sweep()  # must not raise
+
+        h._revalidate_open_l2.assert_awaited_once_with(esc, {})
+        h._revalidate_open_deterministic_escalation.assert_awaited_once_with(
+            esc, task, task['metadata']
+        )
