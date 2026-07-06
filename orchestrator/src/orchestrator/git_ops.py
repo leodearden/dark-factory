@@ -3195,7 +3195,7 @@ class GitOps:
             logger.warning(
                 'acquire_warm_lane: unexpected error for %s; releasing', lane, exc_info=True,
             )
-            await self.warm_lane_pool.release(lane)
+            await self._abort_lane_acquisition(lane, branch_name, remove_worktree=False)
             return WarmLaneUnavailable.FAULT
 
     async def _reuse_warm_lane(
