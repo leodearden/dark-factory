@@ -1324,3 +1324,116 @@ class TestTransitionSideEffectsLifecycle:
             gate._transition(acct, AccountPhase.AVAILABLE)
 
         mock_fire.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# step-5/6: _handle_cap_detected migrated onto _transition (sole writer) —
+# the ~10 inline flag writes + open-recompute + cost-event firing this
+# handler used to own directly are retired in favor of one _transition call.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHandleCapDetectedViaTransition:
+    """step-5: _handle_cap_detected routes through _transition."""
+
+    async def test_marks_phase_capped_and_starts_resume_task(self):
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+        resets_at = datetime.now(UTC) + timedelta(hours=1)
+
+        result = gate._handle_cap_detected('usage limit', resets_at, acct.token)
+
+        assert result is True
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.resume_task is not None
+        await _drain_task(acct.resume_task)
+
+    async def test_fires_exactly_one_cap_hit_event(self):
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=cost_store)
+        acct = gate._accounts[0]
+        resets_at = datetime.now(UTC) + timedelta(hours=1)
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_cap_detected('usage limit', resets_at, acct.token)
+
+        mock_fire.assert_called_once()
+        _, event_type, _ = mock_fire.call_args[0]
+        assert event_type == 'cap_hit'
+
+    async def test_open_recomputed_centrally_single_account_clears(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+
+        gate._handle_cap_detected('usage limit', None, acct.token)
+
+        assert gate._open.is_set() is False
+
+    async def test_open_recomputed_centrally_sibling_available_stays_set(self):
+        gate = make_gate(['acct-A', 'acct-B'], wait_for_reset=False, cost_store=None)
+        a, b = gate._accounts
+
+        gate._handle_cap_detected('usage limit', None, a.token)
+
+        assert b.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+
+    async def test_repeat_call_on_same_account_does_not_raise(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+
+        gate._handle_cap_detected('first', None, acct.token)
+        result = gate._handle_cap_detected('second', None, acct.token)  # must not raise
+
+        assert result is True
+        assert acct.phase == AccountPhase.CAPPED
+
+    async def test_repeat_call_on_capped_account_fires_cap_hit_only_once(self):
+        """The old hand-rolled handler re-fired cap_hit on every repeat
+        detection (no idempotency check). Routing through _transition's
+        legality guard makes a same-phase repeat call a pure no-op."""
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=cost_store)
+        acct = gate._accounts[0]
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._handle_cap_detected('first', None, acct.token)
+            gate._handle_cap_detected('second', None, acct.token)
+
+        assert mock_fire.call_count == 1
+
+    async def test_demotes_auth_failed_account_to_capped_with_auth_cleared(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        assert acct.phase == AccountPhase.AUTH_FAILED
+
+        result = gate._handle_cap_detected('usage limit', None, acct.token)
+
+        assert result is True
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.auth_failed is False
+
+    async def test_demotes_auth_failed_account_cancels_stale_auth_reprobe_task(self):
+        """The old handler never cancelled a running auth_reprobe_task on
+        demotion. Routing through _transition's entering-CAPPED effects must
+        cancel it — mirrors test_transition_to_capped_cancels_pending_auth_reprobe_task."""
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        gate._transition(acct, AccountPhase.AUTH_FAILED)
+        stale_task = acct.auth_reprobe_task
+        assert stale_task is not None
+        # Let the reprobe task actually start running and suspend inside its
+        # `await asyncio.sleep(interval)` (interval defaults to 3600s) —
+        # otherwise it never gets a chance to run before the phase flips and
+        # its own `while acct.auth_failed` guard would trivially end it,
+        # masking whether _transition's entering-CAPPED effects truly cancel it.
+        await asyncio.sleep(0)
+        assert stale_task.done() is False
+
+        gate._handle_cap_detected('usage limit', None, acct.token)
+
+        await asyncio.sleep(0)
+        assert stale_task.cancelled() or stale_task.done()
+        assert acct.phase == AccountPhase.CAPPED
