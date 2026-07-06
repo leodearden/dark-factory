@@ -12,6 +12,7 @@ plans/dashboard-alignment-prd.md).
 
 from __future__ import annotations
 
+import ast
 import sqlite3
 from pathlib import Path
 
@@ -127,3 +128,92 @@ class TestOutcomeKindFrozenContract:
     def test_non_terminal_set_is_frozen(self) -> None:
         non_terminal = {m for m in OutcomeKind if not m.is_terminal}
         assert non_terminal == {OutcomeKind(v) for v in _NON_TERMINAL_VALUES}
+
+
+# ---------------------------------------------------------------------------
+# AST call-site boundary — every _emit_merge_attempt(...) call site in the
+# three source modules passes an OutcomeKind member, never a bare string.
+# ---------------------------------------------------------------------------
+
+_SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'
+_CALL_SITE_FILES = ['merge_queue.py', 'merge_gates.py', 'workflow.py']
+
+
+def _is_outcome_kind_attribute(node: ast.expr) -> bool:
+    """``OutcomeKind.<member>`` — an attribute access off the ``OutcomeKind`` name."""
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == 'OutcomeKind'
+    )
+
+
+def _is_allowed_outcome_arg(node: ast.expr) -> bool:
+    """The three shapes a converted outcome arg may take.
+
+    (a) an ``OutcomeKind.<member>`` attribute access; (b) a conditional
+    expression choosing between two such accesses (merge_queue.py's
+    ``'conflict' if merge_result.conflicts else 'merge_failed'`` site); or
+    (c) a bare ``Name`` — the ``emit_subtype`` local passthrough
+    (merge_gates.py:618), which is guard-narrowed to ``OutcomeKind`` before
+    the call and is typed, not literal, so it is exempt from the
+    bare-string check below.
+    """
+    if _is_outcome_kind_attribute(node):
+        return True
+    if isinstance(node, ast.IfExp):
+        return _is_outcome_kind_attribute(node.body) and _is_outcome_kind_attribute(node.orelse)
+    return isinstance(node, ast.Name)
+
+
+def _emit_merge_attempt_outcome_args(path: Path) -> list[tuple[int, ast.expr]]:
+    """Return ``(lineno, outcome_arg)`` for every ``_emit_merge_attempt(...)`` call in *path*.
+
+    The outcome arg is always positional ``args[2]`` (no call site anywhere
+    in src passes ``outcome=`` as a keyword) — asserted here rather than
+    silently mis-indexing if that convention is ever broken.
+    """
+    tree = ast.parse(path.read_text(), filename=str(path))
+    calls = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == '_emit_merge_attempt'
+        ):
+            assert not any(kw.arg == 'outcome' for kw in node.keywords), (
+                f'{path.name}:{node.lineno} passes outcome= as a keyword; '
+                'the AST scan assumes positional args[2]'
+            )
+            assert len(node.args) >= 3, (
+                f'{path.name}:{node.lineno} has fewer than 3 positional args'
+            )
+            calls.append((node.lineno, node.args[2]))
+    return calls
+
+
+class TestOutcomeKindCallSiteBoundary:
+    """Every _emit_merge_attempt call site passes an OutcomeKind member, never a bare string.
+
+    This is the durable seam invariant — not "must literally be
+    ``OutcomeKind.<member>``", which would false-fail two legitimate sites
+    (merge_queue.py's conditional conflict/merge_failed pick, and
+    merge_gates.py's ``emit_subtype`` local passthrough). pyright enforces
+    member-typedness at the call; this test enforces that a bare string
+    literal never reappears at any of these call sites. Parametrized per
+    file so each reports independently.
+    """
+
+    @pytest.mark.parametrize('filename', _CALL_SITE_FILES)
+    def test_no_bare_string_outcome_args(self, filename: str) -> None:
+        path = _SRC_DIR / filename
+        for lineno, arg in _emit_merge_attempt_outcome_args(path):
+            location = f'{filename}:{lineno}'
+            assert not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)), (
+                f'{location} passes a bare string literal as the outcome arg; '
+                'use an OutcomeKind member instead'
+            )
+            assert _is_allowed_outcome_arg(arg), (
+                f'{location}: outcome arg is not an OutcomeKind attribute access, '
+                f'a conditional over two such accesses, or a Name — got {ast.dump(arg)}'
+            )
