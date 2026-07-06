@@ -204,6 +204,22 @@ class ReconLedgerStore:
             return None
         return _record_from_row(row)
 
+    async def list_suppressions(self, project_id: str) -> list[ReconLedgerRecord]:
+        """Return the active ``stage1_flag_suppression`` rows for a project.
+
+        Satisfied by the ``(project_id, record_kind, state)`` index.
+        """
+        db = self._require_db()
+        cursor = await db.execute(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = 'stage1_flag_suppression' AND state = 'active'
+            """,
+            (project_id,),
+        )
+        rows = await cursor.fetchall()
+        return [_record_from_row(row) for row in rows]
+
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
 
