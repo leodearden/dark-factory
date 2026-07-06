@@ -13,27 +13,17 @@ import contextlib
 from typing import cast
 
 import pytest
+from _fm_helpers import QDRANT_URL, qdrant_skipif
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.models import Distance, VectorParams
 
-QDRANT_URL = 'http://localhost:6333'
 _COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
 VECTOR_DIM = 8  # tiny vectors for speed
 
 
-def _qdrant_available() -> bool:
-    try:
-        client = QdrantClient(url=QDRANT_URL, timeout=2)
-        client.get_collections()
-        client.close()
-        return True
-    except Exception:
-        return False
-
-
 pytestmark = [
-    pytest.mark.skipif(not _qdrant_available(), reason='Qdrant not reachable'),
+    qdrant_skipif(),
     pytest.mark.timeout(30),
 ]
 
