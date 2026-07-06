@@ -443,6 +443,59 @@ class TestReadTaskArtifactsTaskMeta:
     by the pair added alongside step-4's implementation.
     """
 
+    def test_metadata_new_path_wins_over_legacy(self, tmp_path):
+        """metadata.json present under BOTH .task-meta and legacy .task/ resolves to the new copy."""
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        wt = tmp_path / '.worktrees' / '7'
+        wt.mkdir(parents=True)
+        meta = tmp_path / '.worktrees' / '.task-meta' / '7'
+        meta.mkdir(parents=True)
+        legacy = wt / '.task'
+        legacy.mkdir()
+
+        new_metadata = {'task_id': '7', 'title': 'New title'}
+        (meta / 'metadata.json').write_text(json.dumps(new_metadata))
+
+        old_metadata = {'task_id': '7', 'title': 'Old title'}
+        (legacy / 'metadata.json').write_text(json.dumps(old_metadata))
+
+        result = read_task_artifacts(wt)
+
+        assert result['metadata'] == new_metadata
+
+    def test_mixed_layout_resolves_each_artifact_independently(self, tmp_path):
+        """Different artifacts living in different dirs (mid-migration) each resolve independently.
+
+        This is the exact state the compat window produces: migrate-on-write can
+        legitimately leave metadata.json on the legacy path while plan.json is
+        already relocated to .task-meta. Per-file resolution (not per-directory
+        selection) must pick up each artifact from wherever it actually lives.
+        """
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        wt = tmp_path / '.worktrees' / '7'
+        wt.mkdir(parents=True)
+        meta = tmp_path / '.worktrees' / '.task-meta' / '7'
+        meta.mkdir(parents=True)
+        legacy = wt / '.task'
+        legacy.mkdir()
+
+        # metadata.json only in legacy
+        legacy_metadata = {'task_id': '7', 'title': 'Legacy title'}
+        (legacy / 'metadata.json').write_text(json.dumps(legacy_metadata))
+
+        # plan.json only in .task-meta
+        steps = [{'id': 'step-1', 'status': 'done'}, {'id': 'step-2', 'status': 'pending'}]
+        (meta / 'plan.json').write_text(json.dumps({'steps': steps, 'files': ['dashboard']}))
+
+        result = read_task_artifacts(wt)
+
+        assert result['metadata'] == legacy_metadata
+        assert result['plan_progress'] == {'done': 1, 'total': 2}
+        assert result['phase'] == 'EXECUTE'
+        assert result['files'] == ['dashboard']
+
     def test_reads_metadata_and_plan_from_task_meta(self, tmp_path):
         """metadata.json + plan.json under the relocated .task-meta dir are read."""
         from dashboard.data.orchestrator import read_task_artifacts
@@ -581,6 +634,28 @@ class TestReadTaskArtifactsTaskMeta:
         result = read_task_artifacts(wt)
 
         assert result['review_summary'] == '1/1 passed'
+
+    def test_empty_new_reviews_dir_does_not_shadow_legacy(self, tmp_path):
+        """An empty .task-meta reviews/ dir (mid-migration) must not shadow a populated legacy one."""
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        wt = tmp_path / '.worktrees' / '7'
+        wt.mkdir(parents=True)
+        meta = tmp_path / '.worktrees' / '.task-meta' / '7'
+        meta.mkdir(parents=True)
+        legacy = wt / '.task'
+        legacy.mkdir()
+
+        (meta / 'reviews').mkdir()  # present but empty
+
+        old_reviews = legacy / 'reviews'
+        old_reviews.mkdir()
+        (old_reviews / 'reviewer-1.json').write_text(json.dumps({'verdict': 'PASS'}))
+        (old_reviews / 'reviewer-2.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND'}))
+
+        result = read_task_artifacts(wt)
+
+        assert result['review_summary'] == '1/2 passed'
 
     def test_iterations_new_path_wins_over_legacy(self, tmp_path):
         """iterations.jsonl present under BOTH .task-meta and legacy .task/ resolves to the new copy."""
