@@ -1464,3 +1464,57 @@ class TestClearRemovesLegacyDuringCompat:
 
         assert not (legacy_root / 'agent_session.json').exists()
         assert ta.read_agent_session() is None
+
+
+class TestIterationLogCompatNoSplitBrain:
+    """append_iteration_log must migrate legacy history into the new path on
+    first append, so read_iteration_log (via `_read_path`) never silently
+    drops legacy entries once the new file exists — otherwise the first
+    new-path append creates a new-only file and `_read_path` resolves to it
+    exclusively, dropping every legacy entry (split-brain data loss).
+    """
+
+    @pytest.fixture
+    def meta_root(self, worktree: Path) -> Path:
+        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+    @pytest.fixture
+    def legacy_root(self, worktree: Path) -> Path:
+        return worktree / '.task'
+
+    def test_first_append_preserves_legacy_history(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'iterations.jsonl').write_text(
+            json.dumps({'note': 'legacy-1'}) + '\n'
+        )
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        ta.append_iteration_log({'note': 'new-1'})
+
+        entries, corrupted = ta.read_iteration_log()
+        notes = [e['note'] for e in entries]
+        assert notes == ['legacy-1', 'new-1']
+        assert corrupted == []
+
+    def test_second_append_keeps_all_prior_entries(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'iterations.jsonl').write_text(
+            json.dumps({'note': 'legacy-1'}) + '\n'
+        )
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        ta.append_iteration_log({'note': 'new-1'})
+        ta.append_iteration_log({'note': 'new-2'})
+
+        entries, corrupted = ta.read_iteration_log()
+        notes = [e['note'] for e in entries]
+        assert notes == ['legacy-1', 'new-1', 'new-2']
+        assert corrupted == []
