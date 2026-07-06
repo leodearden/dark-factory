@@ -54,3 +54,47 @@ class TestLandedOutboxRecordLookupRoundtrip:
         row = LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
         with pytest.raises(dataclasses.FrozenInstanceError):
             row.task_id = '2'  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# step-3 — all() + WA-2 last-write-wins
+# ---------------------------------------------------------------------------
+
+
+class TestLandedOutboxAllAndLastWriteWins:
+    """all() lists every landed row; re-recording a task_id overwrites in place."""
+
+    def test_fresh_store_all_is_empty(self, tmp_path: Path) -> None:
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        assert outbox.all() == []
+
+    def test_all_returns_distinct_rows(self, tmp_path: Path) -> None:
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        row_a = LandedRow(task_id='a', branch_tip_sha='sha-a', advanced_sha='adv-a', landed_at=1.0)
+        row_b = LandedRow(task_id='b', branch_tip_sha='sha-b', advanced_sha='adv-b', landed_at=2.0)
+
+        outbox.record(row_a)
+        outbox.record(row_b)
+
+        all_rows = outbox.all()
+        assert len(all_rows) == 2
+        assert {r.task_id for r in all_rows} == {'a', 'b'}
+        assert row_a in all_rows
+        assert row_b in all_rows
+
+    def test_record_overwrites_by_task_id(self, tmp_path: Path) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        first = LandedRow(task_id='x', branch_tip_sha='sha-1', advanced_sha='adv-1', landed_at=1.0)
+        second = LandedRow(task_id='x', branch_tip_sha='sha-1', advanced_sha='adv-2', landed_at=2.0)
+
+        outbox.record(first)
+        outbox.record(second)
+
+        all_rows = outbox.all()
+        assert len(all_rows) == 1, f'Expected exactly one entry for task_id="x"; got {all_rows!r}'
+        assert outbox.lookup('x') == second
+
+        # The overwrite must persist across a re-open, not just in the cache.
+        reopened = LandedOutbox(path)
+        assert reopened.lookup('x') == second
