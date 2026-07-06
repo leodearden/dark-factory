@@ -152,3 +152,33 @@ class TestSafeGatherResult:
             safe_gather_result(SystemExit(0), 'default', 'myop')
 
 
+class TestResolveNow:
+    """Tests for the resolve_now public helper in dashboard.data.utils."""
+
+    def test_returns_provided_now(self):
+        """resolve_now(fixed_dt) returns fixed_dt unchanged (identity)."""
+        from datetime import UTC as _UTC
+        from datetime import datetime
+
+        from dashboard.data.utils import resolve_now
+
+        fixed_dt = datetime(2026, 4, 11, 12, 0, 0, tzinfo=_UTC)
+        result = resolve_now(fixed_dt)
+        assert result is fixed_dt
+
+    def test_returns_current_utc_when_none(self):
+        """resolve_now(None) returns a UTC-aware datetime close to datetime.now(UTC)."""
+        from datetime import UTC as _UTC
+        from datetime import datetime, timedelta
+
+        from dashboard.data.utils import resolve_now
+
+        before = datetime.now(_UTC)
+        result = resolve_now(None)
+        after = datetime.now(_UTC)
+
+        assert result.tzinfo is not None
+        assert result.tzinfo == _UTC
+        assert before - timedelta(seconds=5) <= result <= after + timedelta(seconds=5)
+
+
