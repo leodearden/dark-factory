@@ -381,6 +381,17 @@ class UsageGate:
         replacing the ~10 scattered ``self._open.set()``/``.clear()`` call
         sites this method's callers used to own directly.
 
+        Also owns the per-phase side effects that used to be scattered
+        across callers: starting/cancelling the resume and auth-reprobe
+        background tasks, firing the ``cap_hit``/``auth_failed`` cost
+        events (entering CAPPED/AUTH_FAILED), stamping gate-level
+        ``_pause_started_at``/``_paused_reason`` when the edge closes the
+        gate for every account, and recovery bookkeeping when leaving a
+        blocked phase (probe_count reset, pause-time consumption into
+        ``_total_pause_secs``, ``auth_failed_at`` clearing). The
+        ``resumed``/``auth_resumed`` cost events are NOT fired here — they
+        stay in the async callers that carry a probe-count label.
+
         Raises :class:`IllegalTransitionError` — without mutating any state
         — if ``new_phase`` is not a legal edge from ``acct.phase`` per
         ``_LEGAL_TRANSITIONS``, unless ``force=True`` (reserved for
@@ -396,9 +407,29 @@ class UsageGate:
                 f'{acct.phase} -> {new_phase}'
             )
 
+        old_phase = acct.phase
         acct.phase = new_phase
         acct.near_cap = False
 
+        # --- Recovery bookkeeping for the edge just taken -----------------
+        if (
+            old_phase == AccountPhase.CAPPED
+            and new_phase != AccountPhase.CAPPED
+            and acct.pause_started_at is not None
+        ):
+            self._total_pause_secs += (
+                datetime.now(UTC) - acct.pause_started_at
+            ).total_seconds()
+            acct.pause_started_at = None
+        if old_phase == AccountPhase.AUTH_FAILED and new_phase != AccountPhase.AUTH_FAILED:
+            acct.auth_failed_at = None
+        if (
+            (old_phase == AccountPhase.CAPPED and new_phase == AccountPhase.PROBING)
+            or (old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase == AccountPhase.AVAILABLE)
+        ):
+            acct.probe_count = 0
+
+        # --- Centralized _open recompute (DD-5) ---------------------------
         if any(
             a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING)
             for a in self._accounts
@@ -406,18 +437,34 @@ class UsageGate:
             self._open.set()
         else:
             self._open.clear()
+            if self._pause_started_at is None:
+                self._pause_started_at = datetime.now(UTC)
+            self._paused_reason = reason
+            # else: gate already paused for a prior reason — SIGHUP is the
+            # sole clearer of _paused_reason (see _on_sighup_async).
 
+        # --- Enter-phase side effects: task lifecycle + cost event --------
         if new_phase == AccountPhase.CAPPED:
             if acct.pause_started_at is None:
                 acct.pause_started_at = datetime.now(UTC)
             if acct.auth_reprobe_task is not None and not acct.auth_reprobe_task.done():
                 acct.auth_reprobe_task.cancel()
             self._start_account_resume_probe(acct)
+            if self._cost_store:
+                details: dict[str, str] = {'reason': reason}
+                if resets_at is not None:
+                    details['resets_at'] = resets_at.isoformat()
+                self._fire_cost_event(acct.name, 'cap_hit', json.dumps(details))
         elif new_phase == AccountPhase.AUTH_FAILED:
             acct.auth_failed_at = datetime.now(UTC)
             if acct.resume_task is not None and not acct.resume_task.done():
                 acct.resume_task.cancel()
             self._start_auth_reprobe(acct)
+            if self._cost_store:
+                details = {'reason': reason}
+                if resets_at is not None:
+                    details['resets_at'] = resets_at.isoformat()
+                self._fire_cost_event(acct.name, 'auth_failed', json.dumps(details))
 
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
