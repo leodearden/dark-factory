@@ -38,7 +38,8 @@ import enum
 
 import pytest
 
-from shared.task_transitions import ActorClass, derive_actor_class
+from shared.task_statuses import TaskStatus
+from shared.task_transitions import TRANSITIONS, ActorClass, derive_actor_class, is_legal_transition
 
 # ---------------------------------------------------------------------------
 # Pair 1 — ActorClass StrEnum (test-actorclass RED / impl-actorclass GREEN)
@@ -110,3 +111,110 @@ class TestDeriveActorClass:
     def test_returns_actor_class_instance(self):
         assert isinstance(derive_actor_class('claude-task-2168-architect'), ActorClass)
         assert isinstance(derive_actor_class(None), ActorClass)
+
+
+# ---------------------------------------------------------------------------
+# Pair 3 — is_legal_transition core rules + TRANSITIONS union derivation
+# (test-transitions-core RED / impl-transitions-core GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestIsLegalTransitionCore:
+    def test_same_status_always_legal(self):
+        # Mirrors the interceptor's status==old_status early-return
+        # (task_interceptor.py:645) — a no-op write is never illegal.
+        assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.IN_PROGRESS, ActorClass.HUMAN) is True
+        assert is_legal_transition(TaskStatus.DONE, TaskStatus.DONE, ActorClass.HUMAN) is True
+
+    def test_dispatch_and_completion_legal(self):
+        assert is_legal_transition(TaskStatus.PENDING, TaskStatus.IN_PROGRESS, ActorClass.ORCHESTRATOR) is True
+        assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.DONE, ActorClass.ORCHESTRATOR) is True
+
+    def test_non_terminal_source_to_terminal_needs_no_reopen(self):
+        # merge-deferred -> done is a normal completion path (workflow.py:1015
+        # /6424, harness.py:619/646) — reopen is only about LEAVING a
+        # terminal status, not entering one.
+        assert is_legal_transition(TaskStatus.MERGE_DEFERRED, TaskStatus.DONE, ActorClass.HUMAN) is True
+
+    def test_terminal_exit_without_reopen_illegal(self):
+        # frm in TERMINAL -> bool(reopen); default reopen=False rejects every
+        # exit from done/cancelled, matching task_interceptor.py:702.
+        assert is_legal_transition(TaskStatus.DONE, TaskStatus.PENDING, ActorClass.HUMAN) is False
+        assert is_legal_transition(TaskStatus.DONE, TaskStatus.BLOCKED, ActorClass.HUMAN) is False
+        assert is_legal_transition(TaskStatus.CANCELLED, TaskStatus.PENDING, ActorClass.HUMAN) is False
+
+    def test_terminal_exit_with_reopen_legal(self):
+        assert is_legal_transition(TaskStatus.DONE, TaskStatus.PENDING, ActorClass.HUMAN, reopen=True) is True
+        assert (
+            is_legal_transition(TaskStatus.DONE, TaskStatus.BLOCKED, ActorClass.ORCHESTRATOR, reopen=True) is True
+        )
+        assert (
+            is_legal_transition(TaskStatus.CANCELLED, TaskStatus.IN_PROGRESS, ActorClass.HUMAN, reopen=True) is True
+        )
+
+    def test_non_enumerated_non_terminal_move_illegal(self):
+        # Deferred must go via pending — it cannot jump straight back to
+        # in-progress.
+        assert is_legal_transition(TaskStatus.DEFERRED, TaskStatus.IN_PROGRESS, ActorClass.HUMAN) is False
+        # pending -> merge-deferred is not an enumerated call site.
+        assert is_legal_transition(TaskStatus.PENDING, TaskStatus.MERGE_DEFERRED, ActorClass.HUMAN) is False
+
+
+# Core enumerated (from, to) pairs, grouped by kind, each with its call-site
+# anchor — verified verbatim against the working tree on 2026-07-06. This
+# documents the DERIVATION (not the full union: forward-compat infra-hold
+# edges and soak-validated review/deferred edges live in the implementation
+# but are not re-derived here) and pins that every one of these pairs is
+# legal for an unrestricted actor (HUMAN gets the full union, D5 safe-open).
+_CORE_UNION_PAIRS = [
+    # dispatch
+    (TaskStatus.PENDING, TaskStatus.IN_PROGRESS, 'dispatch: workflow.py:1510'),
+    # completion
+    (TaskStatus.IN_PROGRESS, TaskStatus.DONE, 'completion: merged workflow.py:1380, found_on_main workflow.py:3809/7396/harness.py:3623'),
+    (TaskStatus.MERGE_DEFERRED, TaskStatus.DONE, 'completion: workflow.py:1015/6424, harness.py:619/646'),
+    (TaskStatus.BLOCKED, TaskStatus.DONE, 'completion: train attribution workflow.py:6424'),
+    # park
+    (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED, 'park: workflow.py:867/896'),
+    # requeue
+    (
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.PENDING,
+        'requeue: workflow.py:2464/3755, blast-radius scheduler.py:4484, stranded-revert harness.py:3487/3567',
+    ),
+    (
+        TaskStatus.BLOCKED,
+        TaskStatus.PENDING,
+        'requeue: steward re-pend workflow.py:8007, escalation resume harness.py:8739',
+    ),
+    (TaskStatus.MERGE_DEFERRED, TaskStatus.PENDING, 'requeue: re-drive harness.py:682'),
+    (TaskStatus.DEFERRED, TaskStatus.PENDING, 'requeue: deferred resumption, stage2 commit_planning'),
+    # block
+    (
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.BLOCKED,
+        '_mark_blocked workflow.py:7758, retry-cap scheduler.py:4659, substrate harness.py:4687, dep harness.py:3905',
+    ),
+    (TaskStatus.MERGE_DEFERRED, TaskStatus.BLOCKED, 'block: train failer workflow.py:6464'),
+    (TaskStatus.DEFERRED, TaskStatus.BLOCKED, 'block: recon targeted.py:1041'),
+    # cancel
+    (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED, 'cancel: abandon harness.py:8417'),
+    (TaskStatus.BLOCKED, TaskStatus.CANCELLED, 'cancel: harness.py:8417'),
+    (TaskStatus.DEFERRED, TaskStatus.CANCELLED, 'cancel: recon targeted.py:1001'),
+]
+
+
+class TestTransitionsUnionDerivation:
+    def test_core_pairs_are_legal_for_human(self):
+        for frm, to, anchor in _CORE_UNION_PAIRS:
+            assert (frm, to) in TRANSITIONS[ActorClass.HUMAN], (frm, to, anchor)
+
+    def test_transitions_human_is_frozenset_of_status_pairs(self):
+        union = TRANSITIONS[ActorClass.HUMAN]
+        assert isinstance(union, frozenset)
+        assert all(
+            isinstance(pair, tuple)
+            and len(pair) == 2
+            and isinstance(pair[0], TaskStatus)
+            and isinstance(pair[1], TaskStatus)
+            for pair in union
+        )
