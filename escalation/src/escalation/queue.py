@@ -985,18 +985,52 @@ class EscalationQueue:
         """
         self._atomic_write_path(path, str(value), durable=True)
 
+    def _root_has_existing_escalations(self, task_id: str) -> bool:
+        """Best-effort signal: does the queue ROOT already hold files for task_id?
+
+        Used only to make an absent counter file observable: an absent file
+        is otherwise silently treated as 0, which is indistinguishable from a
+        legitimately-new task_id even though it may actually mean the counter
+        was lost (aggressive cleanup, fresh checkout, disk restore, accidental
+        rm of the non-.json sidecar) despite escalations already existing for
+        this task_id.
+
+        Deliberately root-only — never the archive subtree. make_id() must
+        never scan the archive (PRD C9 / finding 10.4, pinned by
+        ``test_make_id_does_not_scan_archive``), so a task_id whose only
+        surviving evidence is archived (e.g. all its escalations were already
+        resolved) is NOT caught here. This is a cheap, best-effort diagnostic
+        — not a substitute for the counter, and it never changes the returned
+        id.
+        """
+        return any(self.queue_dir.glob(f'esc-{task_id}-*.json'))
+
     def make_id(self, task_id: str) -> str:
         """Generate a unique escalation ID from a durable per-task_id counter.
 
         The counter file ``queue_dir/esc-{task_id}.seq`` holds the
-        last-issued sequence number as plain integer text (0 if the file is
-        absent, or on a parse failure — logged as an ERROR, since it is
-        loudly observable-but-unrecoverable data loss, and treated as 0).
-        This file is the SOLE source of the next sequence: unlike the
-        retired directory/archive-scan derivation, make_id() never globs the
-        queue root or the archive to "catch up" — the counter is
-        authoritative (PRD task-status-authority-prd.md contract C9 /
-        finding 10.4).
+        last-issued sequence number as plain integer text. This file is the
+        SOLE source of the next sequence: unlike the retired
+        directory/archive-scan derivation, make_id() never globs the archive
+        to "catch up" — the counter is authoritative (PRD
+        task-status-authority-prd.md contract C9 / finding 10.4).
+
+        Two distinct failure modes on read are handled differently:
+
+        - Unparseable contents (``ValueError``) are treated as 0 and logged
+          as an ERROR — loudly observable-but-unrecoverable data loss.
+        - An absent file is treated as 0 (the common case: a legitimately-new
+          task_id). Because the counter has no archive-scan fallback, a LOST
+          counter looks identical to a new task_id on its own; when
+          ``_root_has_existing_escalations`` finds pre-existing files for
+          this task_id in the queue root, that suspicious case is also
+          logged as an ERROR (still starting from 0 — this is observability
+          only, not a scan-derived fallback).
+        - An ``OSError`` while reading an EXISTING file (transient I/O error,
+          EINTR, fd exhaustion, permission flap) is NOT treated as 0 — it is
+          allowed to propagate so the mint fails loudly rather than silently
+          overwriting a still-valid on-disk counter with a colliding
+          restart-from-1.
 
         The read -> increment -> durable write (tmp+fsync+rename+dir-fsync,
         see ``_write_seq_counter``) all happen inside
@@ -1012,7 +1046,7 @@ class EscalationQueue:
             if counter_path.exists():
                 try:
                     current = int(counter_path.read_text().strip())
-                except (ValueError, OSError) as e:
+                except ValueError as e:
                     logger.error(
                         f'make_id: could not parse counter file {counter_path}: {e}; '
                         'treating as 0 — counter is authoritative with no archive-scan '
@@ -1020,6 +1054,13 @@ class EscalationQueue:
                         f'issued for task_id {task_id!r}'
                     )
                     current = 0
+            elif self._root_has_existing_escalations(task_id):
+                logger.error(
+                    f'make_id: counter file {counter_path} is absent but escalations '
+                    f'for task_id {task_id!r} already exist in the queue root; '
+                    'starting from 0 — counter is authoritative with no archive-scan '
+                    'fallback, so this WILL mint ids that collide with already-issued ones'
+                )
             nxt = current + 1
             self._write_seq_counter(counter_path, nxt)
             return f'esc-{task_id}-{nxt}'

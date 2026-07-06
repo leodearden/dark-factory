@@ -1479,6 +1479,117 @@ class TestMakeIdCounter:
             f"got: {[r.message for r in error_records]}"
         )
 
+    def test_make_id_os_error_on_read_propagates_and_preserves_counter(self, tmp_path: Path):
+        """A transient OSError reading an EXISTING counter file must propagate.
+
+        Unlike a ValueError (unparseable contents, genuinely reset to 0), an
+        OSError here means the file IS present but momentarily unreadable
+        (transient I/O error, EINTR, fd exhaustion, permission flap). Treating
+        that as 0 would mint a colliding id AND durably overwrite the
+        still-valid on-disk counter with '1', turning a recoverable blip into
+        permanent corruption. The mint must instead fail loudly, leaving the
+        durable counter untouched for a retry.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        assert queue.make_id('cnt') == 'esc-cnt-1'
+
+        counter_path = queue_dir / 'esc-cnt.seq'
+        original_read_text = Path.read_text
+
+        def flaky_read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self == counter_path:
+                raise OSError('simulated transient I/O error')
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', flaky_read_text), pytest.raises(OSError):
+            queue.make_id('cnt')
+
+        # The counter must be untouched by the failed attempt — no collision,
+        # no silent reset — and a subsequent mint continues normally.
+        assert counter_path.read_text().strip() == '1'
+        assert queue.make_id('cnt') == 'esc-cnt-2'
+
+    def test_make_id_missing_counter_with_existing_escalations_logs_error(
+        self, tmp_path: Path, caplog,
+    ):
+        """An absent counter file is logged as an ERROR when the queue root
+        already holds escalations for the task_id.
+
+        Without this check, a lost counter (aggressive cleanup, fresh
+        checkout, disk restore, accidental rm of the non-.json sidecar) is
+        indistinguishable from a legitimately-new task_id and silently
+        re-mints ids that collide with ones already issued — with zero
+        observability. The mint still starts from 0 (no archive-scan
+        fallback survives this check); only the logging changes.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation('esc-cnt-1', task_id='cnt'))
+        assert not (queue_dir / 'esc-cnt.seq').exists()
+
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            result = queue.make_id('cnt')
+
+        assert result == 'esc-cnt-1', (
+            'counter is authoritative with no archive-scan fallback — even when '
+            'suspicious, it must still start from 0, not derive a seq from disk'
+        )
+
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any('counter file' in r.message and 'absent' in r.message for r in error_records), (
+            f'Expected an ERROR about the absent counter file; got: {[r.message for r in error_records]}'
+        )
+
+    def test_make_id_missing_counter_no_existing_escalations_silent(
+        self, tmp_path: Path, caplog,
+    ):
+        """An absent counter file for a genuinely-new task_id logs nothing.
+
+        Complements the previous test: the ERROR is conditional on finding
+        pre-existing root evidence, not fired on every absent counter (which
+        would make the common brand-new-task_id path noisy).
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            result = queue.make_id('fresh')
+
+        assert result == 'esc-fresh-1'
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert not error_records, f'Expected no ERROR logs; got: {[r.message for r in error_records]}'
+
+    def test_make_id_task_id_with_hyphen_uses_correct_counter_file(self, tmp_path: Path):
+        """A task_id containing a hyphen does not confuse the seq separator.
+
+        The retired archive-scan derivation parsed the trailing integer after
+        the last hyphen in an esc-<task_id>-<seq> stem, so a task_id
+        embedding its own hyphen (e.g. '1-2') was a latent correctness risk.
+        The counter design sidesteps this entirely — the counter file is
+        keyed by the full task_id string, never parsed back out of a
+        filename — so this pins the improved, hyphen-safe behavior.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+
+        assert queue.make_id('1-2') == 'esc-1-2-1'
+        assert queue.make_id('1-2') == 'esc-1-2-2'
+        assert (queue_dir / 'esc-1-2.seq').exists()
+
+        # Simulate restart: fresh instance, no in-memory state carried over.
+        queue2 = EscalationQueue(queue_dir)
+        assert queue2.make_id('1-2') == 'esc-1-2-3'
+
 
 class TestIterAllEscalationPaths:
     """iter_all_escalation_paths(escalations_dir) yields all esc-*.json paths,
