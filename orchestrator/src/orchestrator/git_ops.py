@@ -3586,6 +3586,22 @@ class GitOps:
         if self.warm_lane_pool is None:
             return
 
+        # (a) Best-effort WIP snapshot BEFORE any ref movement — mirrors
+        # detach_lane_checkout's commit-before-detach contract (never
+        # discard uncommitted WIP). Best-effort: the very fault that
+        # triggered this abort may itself be a commit() failure (e.g. the
+        # _reuse_warm_lane commit() RuntimeError) — never re-raise.
+        try:
+            await self.commit(lane, 'chore: save WIP before lane-acquire abort')
+        except Exception:
+            logger.warning(
+                '_abort_lane_acquisition: commit error for %s (task %s)',
+                lane, bare_id, exc_info=True,
+            )
+
+        # (b) Detach HEAD — frees git's single-checkout lock (the task-2062
+        # fix: a lane must never be released FREE while task/<bare_id> is
+        # still checked out).
         try:
             rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=lane)
             if rc != 0:
@@ -3597,6 +3613,22 @@ class GitOps:
             logger.warning(
                 '_abort_lane_acquisition: checkout --detach error for %s '
                 '(task %s)', lane, bare_id, exc_info=True,
+            )
+
+        # (c) Degenerate-gated retention — upgrades the task-2112 classifier
+        # from create-once-only to every fault route. Both guards are
+        # retention-biased (fail-soft False → retain; commit-bearing →
+        # retain), so this can never destroy an orphan commit.
+        full_branch = f'{self.config.branch_prefix}{bare_id}'
+        try:
+            if await self.warm_lane_ref_is_degenerate(bare_id):
+                await self._delete_branch_if_on_main(
+                    full_branch, context='acquire_warm_lane abort',
+                )
+        except Exception:
+            logger.warning(
+                '_abort_lane_acquisition: degenerate-check/delete error for '
+                '%s (task %s)', full_branch, bare_id, exc_info=True,
             )
 
         if remove_worktree:
