@@ -31,6 +31,7 @@ __all__ = [
     "derive_actor_class",
     "TRANSITIONS",
     "is_legal_transition",
+    "outcome_allows_status",
 ]
 
 
@@ -204,3 +205,52 @@ def is_legal_transition(
     if frm in TERMINAL:
         return bool(reopen)
     return (frm, to) in TRANSITIONS.get(actor, _UNION)
+
+
+# ---------------------------------------------------------------------------
+# outcome_allows_status — the WorkflowOutcome -> TaskStatus consistency map.
+# Keys MIRROR the 8 WorkflowOutcome string values (orchestrator/workflow.py:
+# 337-345) as inline literals, since shared/ must NOT import orchestrator
+# (layering). A future WorkflowOutcome addition that isn't mirrored here
+# fails loudly via the drift guard in test-outcome
+# (test_recognized_outcome_keys_match_mirrored_workflow_outcomes).
+#
+# Several rows are intentionally loose sets rather than a single dominant
+# status: W9's SM-2 invariant checks outcome_allows_status(report.outcome,
+# last_status_row) holds at EVERY run() exit, and the traced code shows each
+# of these outcomes can legitimately coexist with more than one status row
+# at exit.
+# ---------------------------------------------------------------------------
+
+_OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
+    "done": frozenset({TaskStatus.DONE}),
+    # Internal-only sub-phase — the task stays claimed (in-progress).
+    "planned": frozenset({TaskStatus.IN_PROGRESS}),
+    "blocked": frozenset({TaskStatus.BLOCKED}),
+    # Self-repend / deferred-to-stranded-sweep window / requeue-cap
+    # exhausted -> blocked.
+    "requeued": frozenset({TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED}),
+    # Dominant _mark_blocked + open L1 / merge-gating bail preserves
+    # in-progress.
+    "escalated": frozenset({TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS}),
+    "cancelled": frozenset({TaskStatus.CANCELLED}),
+    "merge-deferred": frozenset({TaskStatus.MERGE_DEFERRED}),
+    # preserved / release_workflow park->blocked / stranded-sweep->pending.
+    "soft-cancelled": frozenset({TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, TaskStatus.PENDING}),
+}
+
+
+def outcome_allows_status(outcome: object, status: TaskStatus | str) -> bool:
+    """Is ``status`` a consistent run()-exit row for ``outcome``?
+
+    ``outcome`` may be a plain string or any object exposing a ``.value``
+    attribute (e.g. a ``WorkflowOutcome`` instance) — normalized via
+    ``getattr(outcome, 'value', outcome)`` so callers never need to unwrap
+    it themselves. Raises ``ValueError`` loudly on an unrecognized outcome
+    or an out-of-vocabulary status (no silent fallthrough, matching the
+    repo's loud-escalation norm).
+    """
+    key = str(getattr(outcome, "value", outcome))
+    if key not in _OUTCOME_ALLOWED:
+        raise ValueError(f"unknown workflow outcome: {outcome!r}")
+    return TaskStatus(status) in _OUTCOME_ALLOWED[key]
