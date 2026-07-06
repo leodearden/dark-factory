@@ -568,6 +568,14 @@ def create_server(
         ``escalation.action_effects`` module docstring for the archive
         verification behind this).
 
+        **Gate precedence**: the connection-capability gate (``bad_capability_header``
+        / ``level_forbidden``, checked first) runs BEFORE this Table B legality
+        gate. A caller that both asserts a forbidden/unparseable capability
+        header AND passes an illegal ``action`` receives the capability error,
+        not ``illegal_transition`` — no record is mutated by either gate, so
+        this ordering is an error-reporting precedence only, not a correctness
+        difference.
+
         NOTE: the ``target_status`` values above are not yet written by
         resolve_issue — this call changes only the escalation record; the
         task-status effects described in the table earlier in this docstring
@@ -624,6 +632,13 @@ def create_server(
         # `action not in RESOLVE_ACTIONS` check: an unrecognised action now
         # returns a typed error (mirroring the capability gate above) instead
         # of an untyped one; no record is changed either way.
+        #
+        # Precedence note: this gate runs AFTER the connection-capability gate
+        # above, so a caller that fails BOTH gates (a forbidden/unparseable
+        # capability header AND an illegal action) sees 'bad_capability_header'
+        # / 'level_forbidden', not 'illegal_transition'. Neither gate mutates
+        # the record, so this is an error-reporting precedence only — see the
+        # "Gate precedence" note in the resolve_issue docstring.
         rec = queue.get(escalation_id)
         if rec is None:
             return {'error': f'Escalation {escalation_id} not found'}
@@ -654,12 +669,13 @@ def create_server(
         # Pre-stamp resolution_action on the pending record so resolve()'s
         # read-modify-write carries it into the archived JSON (C1 persistence).
         # Guard: only rewrite pending records — archived records must not be resurrected.
-        pending = queue.get(escalation_id)
-        if pending is None:
-            return {'error': f'Escalation {escalation_id} not found'}
-        if pending.status == 'pending':
-            pending.resolution_action = action
-            queue._rewrite(escalation_id, pending)
+        # Reuses `rec` fetched above for the Table B gate instead of re-reading
+        # from disk: queue.get() is a pure read and nothing mutates the record
+        # between that fetch and here (the park branch above already returned),
+        # so `rec` is still current and a second queue.get() would be redundant.
+        if rec.status == 'pending':
+            rec.resolution_action = action
+            queue._rewrite(escalation_id, rec)
         dismiss = action in _DISMISS_ACTIONS
         esc = queue.resolve(
             escalation_id, resolution, dismiss=dismiss,
