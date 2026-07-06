@@ -168,3 +168,48 @@ async def test_identical_infer_false_writes_all_land_distinct(
         assert await backend.count(recon_scope) == n
     finally:
         await backend.close()
+
+
+@pytest.mark.skipif(not os.environ.get('OPENAI_API_KEY'), reason='real embedder needs OPENAI_API_KEY')
+@pytest.mark.asyncio
+async def test_identical_writes_land_with_real_openai_embeddings(
+    mock_config, recon_scope, clean_collection, monkeypatch,
+):
+    """Real-OpenAI-embedder confirmation: identical text still never dedups.
+
+    Same byte-identical-write probe as
+    test_identical_infer_false_writes_all_land_distinct, but with NO
+    embedder stub — genuine OpenAI embeddings for identical input text
+    land at real cosine≈1.0. This directly, empirically rebuts the
+    survey's '~0.92 cosine similarity dedup' observation: even the
+    strongest realistic near-duplicate signal never triggers a drop,
+    because the infer=False path never consults embeddings for dedup.
+    """
+    n = 5
+    backend = await _build_recon_backend(mock_config, recon_scope, monkeypatch, real_embedder=True)
+    try:
+        ids = []
+        metadata = {
+            'kind': 'cycle_summary',
+            'stage': 'task_knowledge_sync',
+            'run_id': 'task-2221-premise-probe-real-embedder',
+        }
+        for _ in range(n):
+            response = await backend.add(
+                content=FIXED_RECON_SUMMARY,
+                scope=recon_scope,
+                metadata=metadata,
+            )
+            results = response.get('results') or []
+            assert len(results) == 1, (
+                f'expected exactly one result under infer=False, got {results!r}'
+            )
+            assert 'id' in results[0]
+            ids.append(results[0]['id'])
+
+        assert len(set(ids)) == n, (
+            f'expected {n} distinct ids (no dedup drop), got {len(set(ids))} distinct: {ids!r}'
+        )
+        assert await backend.count(recon_scope) == n
+    finally:
+        await backend.close()
