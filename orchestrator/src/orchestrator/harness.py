@@ -163,11 +163,27 @@ _BG_LOOP_FAILURE_BACKOFF_SECS: float = 60.0
 # task 2074): the runner's own sentinel role for deploy infra_issue escalations,
 # plus this sweep's own role so a previously-unconfirmed L1 it filed self-heals
 # once the unit recovers.  Any other role (or category != 'infra_issue') is left
-# untouched — in particular milestone_gate escalations are NEVER auto-resolved.
+# untouched — in particular milestone_gate escalations are NEVER auto-resolved
+# by Source B while the subject task remains live.  (Source C — task 2114,
+# see _revalidate_open_l2 below — is a separate, later mechanism that DOES
+# close a milestone_gate/design_concern/etc. L2 once its SUBJECT task goes
+# terminal; that is a deliberate, category-agnostic broadening, not a
+# contradiction of this guarantee.)
 _DETERMINISTIC_ESCALATION_SENTINEL_ROLES: frozenset[str] = frozenset({
     'orchestrator-deterministic',
     'harness-deterministic-recon-sweep',
 })
+
+# resolved_by sentinel for the generalized escalation-revalidation sweep
+# (task 2114): terminal-subject L2 closures (Source C, hosted inside
+# _run_deterministic_recon_sweep) are attributed to this role in the audit
+# trail, distinguishing them from a human/steward resolve.
+_ESCALATION_REVALIDATION_SWEEP_ROLE: str = 'harness-escalation-revalidation-sweep'
+
+# resolved_by sentinel for the main-tip-sweep self-heal (task 2114): closes a
+# pending orchestrator-main-sweep escalation once a later full-verify PASS
+# supersedes its (now-fixed) swept SHA.
+_MAIN_TIP_SWEEP_SELFHEAL_ROLE: str = 'harness-main-tip-sweep-selfheal'
 
 # Bound on the thread-off load_config() call inside reload_config() (PRD
 # plans/config-hot-reload-prd.md Open Q3). load_config() runs
@@ -7492,6 +7508,11 @@ Output JSON matching the schema. Every task must appear in the output.
         When ``_escalation_queue`` is None the drift is logged but not submitted.
         See ``_start_main_tip_sweep`` / ``_main_tip_sweep_loop`` for the periodic
         invocation context.
+
+        On a PASS (task 2114), also self-heals: calls
+        ``_close_superseded_main_sweep_escalations`` with the just-verified
+        clean SHA to auto-close any prior main-sweep escalation whose swept
+        SHA this clean tip has superseded.  Never called on the failure path.
         """
         from orchestrator import verify as verify_mod  # noqa: PLC0415
 
@@ -7518,6 +7539,7 @@ Output JSON matching the schema. Every task must appear in the output.
         self._last_swept_main_sha = swept_sha
 
         if vr.passed:
+            await self._close_superseded_main_sweep_escalations(swept_sha)
             return
 
         # Drift detected: file one L1 escalation per distinct bad SHA.
@@ -7562,6 +7584,96 @@ Output JSON matching the schema. Every task must appear in the output.
             'Main-tip integrity sweep: filed L1 escalation %s for SHA %s (%s)',
             esc.id, swept_sha[:12], vr.category,
         )
+
+    async def _close_superseded_main_sweep_escalations(self, clean_sha: str) -> None:
+        """Self-heal: close any main-sweep escalation superseded by a clean PASS (task 2114).
+
+        ``_run_main_tip_sweep`` never closed its own stale failing escalation
+        once a LATER pass verified main clean — this is the pile-up gap.  The
+        only fail-safe positive evidence that the cited defect is actually
+        fixed is a FRESH full-verify PASS at a SHA that is a STRICT
+        descendant of the failed swept SHA (main advanced and now verifies
+        clean).  A bare ``is_ancestor(cited_sha, main)`` is unsafe: the
+        failing SHA is itself an ancestor of an un-advanced (still-broken)
+        main, and ``git merge-base --is-ancestor`` is reflexive (a commit is
+        trivially an ancestor of itself) — so an escalation whose swept SHA
+        equals *clean_sha* at 12-hex precision is explicitly guarded rather
+        than auto-closed, even though ``is_ancestor`` would return True.
+
+        Enumerates every pending escalation and closes (``close_only``, via
+        ``resolve(dismiss=True)`` — never resumed/re-pended) each
+        ``orchestrator-main-sweep`` one whose swept SHA — parsed from its
+        ``main-sweep-<sha12>`` task_id — is a strict ancestor of *clean_sha*.
+        Level-agnostic (acts on an L1 or an auto-watcher-promoted L2 alike),
+        since ``_run_main_tip_sweep`` files at L1 but the auto-watcher may
+        have since promoted it.
+
+        Fail-soft at two layers: a method-level try/except around the whole
+        enumeration (an unconfigured/erroring ``get_pending()`` degrades to a
+        no-op) and a per-item try/except inside the loop (one bad escalation
+        — e.g. a git_ops failure — never blocks the rest of the pass).  This
+        is what keeps the existing main-tip-sweep suite's bare-MagicMock
+        harness inert: called only from the ``vr.passed`` branch, after
+        ``_last_swept_main_sha`` has already been updated.
+        """
+        if not self.config.escalation_revalidation_enabled:
+            return
+        if self._escalation_queue is None:
+            return
+        if not clean_sha:
+            return
+
+        try:
+            for esc in self._escalation_queue.get_pending():
+                try:
+                    if esc.agent_role != 'orchestrator-main-sweep' or esc.status != 'pending':
+                        continue
+                    swept = esc.task_id.removeprefix('main-sweep-')
+                    if not swept or swept == esc.task_id:
+                        continue
+                    if swept == clean_sha[:len(swept)]:
+                        # Equal-sha guard: is_ancestor(X, X) is trivially True
+                        # (reflexive) — a still-broken main re-verified at the
+                        # exact same commit must not be treated as fixed.
+                        continue
+                    if not await self.git_ops.is_ancestor(swept, clean_sha):  # type: ignore[union-attr]
+                        continue
+
+                    resolution = (
+                        f'main-tip-sweep self-heal: main advanced to {clean_sha[:12]} '
+                        f'which verifies clean; swept SHA {swept} failure is '
+                        f'superseded — auto-closed (close_only).'
+                    )
+                    self._escalation_queue.resolve(
+                        esc.id, resolution, dismiss=True,
+                        resolved_by=_MAIN_TIP_SWEEP_SELFHEAL_ROLE,
+                    )
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.escalation_resolved,
+                            task_id=esc.task_id,
+                            data={
+                                'escalation_id': esc.id,
+                                'swept_sha': swept,
+                                'clean_sha': clean_sha[:12],
+                                'reason': 'main-tip-sweep-superseded',
+                            },
+                        )
+                    logger.info(
+                        'Main-tip-sweep self-heal: closed %s — swept SHA %s '
+                        'superseded by clean tip %s',
+                        esc.id, swept, clean_sha[:12],
+                    )
+                except Exception as exc:
+                    logger.error(
+                        'Main-tip-sweep self-heal: failed for escalation %s: %s: %s',
+                        getattr(esc, 'id', '?'), type(exc).__name__, exc,
+                    )
+        except Exception as exc:
+            logger.error(
+                'Main-tip-sweep self-heal: enumeration failed: %s: %s',
+                type(exc).__name__, exc,
+            )
 
     # ------------------------------------------------------------------
     # Deterministic-strand reconciliation sweep (task 2074)
@@ -7735,6 +7847,78 @@ Output JSON matching the schema. Every task must appear in the output.
             esc.id, esc.task_id, target_unit,
         )
 
+    async def _revalidate_open_l2(self, esc, statuses: dict[str, str]) -> bool:
+        """Close an open L2 escalation whose SUBJECT task has gone terminal (task 2114).
+
+        Generalizes task 2074's revalidation machinery beyond the
+        blocked-deterministic subset: ANY pending level-2 escalation whose
+        subject task status (read from a batch ``scheduler.get_statuses``
+        call by the caller) is ``done`` or ``cancelled`` is moot — the human
+        decision it was waiting on no longer matters — and is auto-closed via
+        ``close_only`` (dismiss=True), never resumed/re-pended.
+
+        Deliberately conservative: only ``{'done', 'cancelled'}`` count as
+        terminal here.  ``deferred`` is excluded (a deferred task can be
+        un-deferred) and any live status (``blocked``, ``in-progress``,
+        ``pending``, …) or an unknown/absent subject leaves the escalation
+        untouched — preserving ambiguous cases (e.g. a design_concern on a
+        still-live task) for a human to triage, per this task's conservatism
+        requirement.
+
+        Category-agnostic BY DESIGN (task 2114 design_decisions[3] in
+        .task/plan.json): this closes a terminal-subject L2 regardless of
+        ``category``, INCLUDING human-decision categories such as
+        ``milestone_gate`` and ``design_concern``.  Confirmed during the
+        2114 review pass rather than left implicit: once the SUBJECT task
+        itself has gone ``done``/``cancelled`` there is by construction
+        nothing left for a human to gate — a cancelled task cannot proceed
+        no matter what the pending decision was, and a done task already
+        completed via some other path — so the open L2 no longer blocks
+        anything real. This is distinct from (and does not affect) the
+        live-subject case, which always leaves the escalation open for a
+        human to triage.
+
+        Returns True when the escalation was closed this call (the caller
+        uses this to skip further per-item handling for the same escalation
+        in the same pass), False otherwise.
+        """
+        if not self.config.escalation_revalidation_enabled:
+            return False
+        if self._escalation_queue is None:
+            return False
+        if getattr(esc, 'level', None) != 2:
+            return False
+        if esc.status != 'pending':
+            return False
+
+        subject_status = statuses.get(esc.task_id)
+        if subject_status not in ('done', 'cancelled'):
+            return False
+
+        resolution = (
+            f'escalation-revalidation-sweep: subject task {esc.task_id} is '
+            f'{subject_status} (terminal) — escalation moot, auto-closed (close_only).'
+        )
+        self._escalation_queue.resolve(
+            esc.id, resolution, dismiss=True, resolved_by=_ESCALATION_REVALIDATION_SWEEP_ROLE,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_resolved,
+                task_id=esc.task_id,
+                data={
+                    'escalation_id': esc.id,
+                    'subject_status': subject_status,
+                    'reason': 'terminal-subject',
+                },
+            )
+        logger.info(
+            'Escalation-revalidation-sweep: closed L2 %s — subject task %s is '
+            '%s (terminal), close_only',
+            esc.id, esc.task_id, subject_status,
+        )
+        return True
+
     async def _run_deterministic_recon_sweep(self) -> None:
         """Single testable pass of the deterministic-strand reconciliation sweep.
 
@@ -7747,6 +7931,19 @@ Output JSON matching the schema. Every task must appear in the output.
         that doesn't match).  Reuses Source A's task map as a fast path,
         falling back to ``scheduler.get_task`` for an escalation whose task
         wasn't in the blocked set.
+
+        Source C (task 2114): before Source B handles a pending escalation,
+        first offer it to ``_revalidate_open_l2`` — the generalized
+        terminal-subject closure (any L2 whose subject task has gone
+        done/cancelled).  Evidence is a single batch ``scheduler.get_statuses``
+        read over every pending L2's task-id, taken once per pass; the read
+        is defensively wrapped so a scheduler that can't answer (unconfigured
+        mock, transient error) degrades to an empty statuses dict rather than
+        aborting the pass — Source C then closes nothing and Source B runs
+        exactly as before.  When Source C closes an escalation, Source B is
+        skipped for it (``continue``); this composes with the existing
+        per-item fail-soft try/except so one bad escalation never blocks
+        the rest.
 
         A and B are mutually exclusive per task ACROSS passes by construction
         (A requires an empty pending queue; B requires an open escalation) —
@@ -7799,10 +7996,44 @@ Output JSON matching the schema. Every task must appear in the output.
                     tid, type(exc).__name__, exc,
                 )
 
-        for esc in self._escalation_queue.get_pending():
+        pending = self._escalation_queue.get_pending()
+
+        statuses: dict[str, str] = {}
+        l2_ids = sorted({
+            e.task_id for e in pending if getattr(e, 'level', None) == 2
+        })
+        if self.config.escalation_revalidation_enabled and l2_ids:
+            try:
+                statuses, statuses_err = await self.scheduler.get_statuses(l2_ids)
+                if statuses_err is not None:
+                    # get_statuses never raises on failure — it returns
+                    # ({}, exception) — so this is the ONLY signal that
+                    # distinguishes "no L2 subjects are terminal" (a genuine
+                    # no-op pass) from "the status read itself failed"
+                    # (statuses is already {} either way; log so an
+                    # operator can tell the two apart instead of Source C
+                    # silently closing nothing every pass).
+                    logger.info(
+                        'Deterministic-recon-sweep: Source-C get_statuses '
+                        'returned a resolver error for %d L2 escalation(s) '
+                        '(degrading to no terminal statuses this pass): '
+                        '%s: %s',
+                        len(l2_ids), type(statuses_err).__name__, statuses_err,
+                    )
+            except Exception as exc:
+                logger.error(
+                    'Deterministic-recon-sweep: Source-C get_statuses failed '
+                    'for %d L2 escalation(s): %s: %s',
+                    len(l2_ids), type(exc).__name__, exc,
+                )
+                statuses = {}
+
+        for esc in pending:
             if esc.task_id in recovered_this_pass:
                 continue
             try:
+                if await self._revalidate_open_l2(esc, statuses):
+                    continue
                 task = task_by_id.get(esc.task_id)
                 if task is None:
                     task = await self.scheduler.get_task(esc.task_id)

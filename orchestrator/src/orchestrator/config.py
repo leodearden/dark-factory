@@ -1909,6 +1909,17 @@ class OrchestratorConfig(BaseSettings):
     deterministic_recon_sweep_enabled: bool = Field(default=True)
     deterministic_recon_sweep_interval_secs: float = Field(default=900.0)
 
+    # Generalized escalation-revalidation sweep (task 2114): single operator
+    # kill-switch gating the harness auto-closing STALE OPEN escalations on
+    # POSITIVE, fail-safe evidence — (a) the escalation's subject task has
+    # become terminal (done/cancelled), read via scheduler.get_statuses and
+    # closed as a new Source C inside _run_deterministic_recon_sweep; and
+    # (b) a main-tip-sweep infra_issue escalation's swept SHA is superseded
+    # by a later clean full-verify PASS, closed as a self-heal inside
+    # _run_main_tip_sweep's passed branch.  Default-on, mirrors
+    # main_tip_sweep_enabled's operator kill-switch convention.
+    escalation_revalidation_enabled: bool = Field(default=True)
+
     # Warm-lane auto-GC cadence loop (task 1926).
     # Periodic unconditional invocation of scripts/warm-lane-gc.sh reclaim to
     # bound FREE _lane-*/_spec-* target/ re-accretion.  gc.sh only resets FREE
