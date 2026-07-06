@@ -164,9 +164,17 @@ async def move_entity_across_graphs(
     Node-core (step-5/6): reads the node's scalar props from source via the
     normal (non-lossy) ``ro_query`` path, reads its exact ``name_embedding``
     via the raw ``--compact`` transport, and ``CREATE``s the node in target
-    with a byte-exact ``vecf32([...])`` literal. Edge/mentions reattachment,
-    the source ``DETACH DELETE``, and the idempotency probe are added in
-    later steps (7-14); ``rewrite_group_id`` substitution lands in step-16.
+    with a byte-exact ``vecf32([...])`` literal.
+
+    Edges (step-7/8): every RELATES_TO edge incident to the node (either
+    direction) is recreated on the corresponding target-graph node with a
+    byte-exact ``fact_embedding``, provided the OTHER endpoint already
+    exists in target_graph (silently skipped otherwise -- see inline note).
+
+    Mentions reattachment, the source ``DETACH DELETE``, and the idempotency
+    probe are added in later steps (9-14); ``rewrite_group_id`` substitution
+    for the node/edges lands in step-16 (applied here as a forward-compatible
+    no-op when ``rewrite_group_id`` is None).
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
@@ -224,8 +232,72 @@ async def move_entity_across_graphs(
         },
     )
 
-    logger.info(
-        'move_entity_across_graphs: node moved uuid=%s source=%s target=%s',
-        uuid, source_graph, target_graph,
+    # --- RELATES_TO edges (step-7/8) ---
+    # Undirected match + WITH DISTINCT e mirrors GraphitiBackend.get_valid_edges_for_node's
+    # established self-loop dedup idiom; startNode()/endNode() recover the edge's TRUE
+    # direction regardless of which side matched $uuid, so it can be preserved on recreate.
+    edges_result = await source.ro_query(
+        'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+        'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
+        'RETURN e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, '
+        '       e.group_id, e.episodes, s.uuid, t.uuid',
+        {'uuid': uuid},
     )
-    return MoveResult(uuid=uuid, source_graph=source_graph, target_graph=target_graph)
+    edges_moved = 0
+    for row in edges_result.result_set or []:
+        (edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
+         _edge_group_id, episodes, src_uuid, dst_uuid) = row
+
+        edge_embedding_cypher = (
+            f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+            'RETURN e.fact_embedding'
+        )
+        edge_embedding_reply = await _read_compact_vector(
+            falkor_client, group_id=source_graph, cypher=edge_embedding_cypher,
+        )
+        edge_embedding_literal = format_vecf32_literal(
+            parse_compact_vector_reply(edge_embedding_reply)
+        )
+
+        # Both endpoints are MATCHed (never CREATEd) by uuid: the moved node was
+        # just created above, and the other endpoint must already exist in
+        # target_graph for the edge to be recreated -- otherwise this MATCH
+        # yields no rows and the edge is silently skipped (left for the
+        # caller to move the other endpoint too, or accept the drop).
+        await target.query(
+            'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+            'CREATE (a)-[r:RELATES_TO]->(b) '
+            'SET r.uuid = $edge_uuid, '
+            '    r.name = $name, '
+            '    r.fact = $fact, '
+            '    r.valid_at = $valid_at, '
+            '    r.invalid_at = $invalid_at, '
+            '    r.created_at = $created_at, '
+            '    r.group_id = $group_id, '
+            '    r.episodes = $episodes, '
+            f'    r.fact_embedding = {edge_embedding_literal}',
+            {
+                'src_uuid': src_uuid,
+                'dst_uuid': dst_uuid,
+                'edge_uuid': edge_uuid,
+                'name': edge_name,
+                'fact': fact,
+                'valid_at': valid_at,
+                'invalid_at': invalid_at,
+                'created_at': edge_created_at,
+                'group_id': new_group_id,
+                'episodes': episodes,
+            },
+        )
+        edges_moved += 1
+
+    logger.info(
+        'move_entity_across_graphs: node moved uuid=%s source=%s target=%s edges_moved=%d',
+        uuid, source_graph, target_graph, edges_moved,
+    )
+    return MoveResult(
+        uuid=uuid,
+        source_graph=source_graph,
+        target_graph=target_graph,
+        edges_moved=edges_moved,
+    )
