@@ -147,7 +147,45 @@ def classify_config_routing(collision_result: dict, presence: list[dict]) -> dic
 
     Returns a dict shaped ``{'confirmed': bool, 'signals': [...], 'rationale': str}``.
     """
-    raise NotImplementedError
+    signals: list[str] = []
+
+    if collision_result['collisions']:
+        signals.append('name_normalization_collision')
+    if collision_result['suspected_path_leaks']:
+        signals.append('suspected_path_leak')
+    if len(presence) >= 2 or any(
+        resolve_project_id(entry['graph']) != entry['group_id'] for entry in presence
+    ):
+        signals.append('cross_graph_node_leak')
+
+    confirmed = bool(signals)
+    if not confirmed:
+        rationale = (
+            'No routing anomaly detected: no name-normalization collisions, '
+            'no suspected path leaks, and the probed node (if found) is '
+            "confined to a single graph consistent with its group_id."
+        )
+    else:
+        signal_summaries = {
+            'name_normalization_collision': (
+                f"{len(collision_result['collisions'])} graph name-normalization "
+                'collision group(s) found (distinct raw graph names collapse '
+                'to the same canonical project key)'
+            ),
+            'suspected_path_leak': (
+                f"{len(collision_result['suspected_path_leaks'])} filesystem-"
+                'path-shaped graph name(s) found (a project_root leaked into '
+                'the FalkorDB graph name instead of a project_id)'
+            ),
+            'cross_graph_node_leak': (
+                f'target node present in {len(presence)} graph(s), including '
+                "one whose canonical key does not match the node's recorded "
+                'group_id'
+            ),
+        }
+        rationale = '; '.join(signal_summaries[signal] for signal in signals) + '.'
+
+    return {'confirmed': confirmed, 'signals': signals, 'rationale': rationale}
 
 
 def build_investigation_report(
