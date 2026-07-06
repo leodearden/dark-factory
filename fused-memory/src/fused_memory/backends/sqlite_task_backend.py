@@ -27,7 +27,11 @@ from shared.task_metadata import (
 )
 from shared.task_statuses import TaskStatus
 
-from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError, TaskmasterError
+from fused_memory.backends.task_backend_errors import (
+    DoneProvenanceWriteAuthorityError,
+    DuplicateCandidateKeyError,
+    TaskmasterError,
+)
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
     DependencyResult,
@@ -1484,12 +1488,13 @@ class SqliteTaskBackend:
         status: str | None = None,
         dependencies: list[str] | None = None,
     ) -> UpdateTaskResult:
-        # Backend floor mirroring the server/tools.py + interceptor ceiling
-        # (2026-05-08 forensics). set_task_status is the only sanctioned status
-        # writer — it enforces the terminal-exit, phantom-done, and
-        # done-provenance gates. Reject unconditionally, before ensure_connected()
-        # and the task SELECT, so status rejection takes precedence over any
-        # existence or connection error.
+        # Write-authority floors mirroring the server/tools.py + interceptor
+        # ceiling (2026-05-08 forensics). set_task_status is the only
+        # sanctioned writer for status AND metadata.done_provenance — it
+        # enforces the terminal-exit, phantom-done, and done-provenance
+        # gates. Both floors reject unconditionally, before ensure_connected()
+        # and the task SELECT, so a write-authority rejection takes
+        # precedence over any existence or connection error.
         if status is not None:
             raise TaskmasterError(
                 'TASKMASTER_TOOL_ERROR',
@@ -1497,6 +1502,13 @@ class SqliteTaskBackend:
                 'Use set_task_status(status=…) instead — it enforces the '
                 'terminal-exit, phantom-done, and done-provenance gates.',
             )
+        if metadata is not None:
+            try:
+                parsed_metadata = json.loads(metadata)
+            except (ValueError, TypeError):
+                parsed_metadata = None
+            if isinstance(parsed_metadata, dict) and 'done_provenance' in parsed_metadata:
+                raise DoneProvenanceWriteAuthorityError(task_id)
         # Structured fields (title/description/details/priority/dependencies)
         # land deterministically — any non-None value overrides the current row.
         # ``prompt`` is kept for backward compatibility: when no explicit
