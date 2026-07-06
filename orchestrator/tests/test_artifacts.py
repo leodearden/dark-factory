@@ -1518,3 +1518,68 @@ class TestIterationLogCompatNoSplitBrain:
         notes = [e['note'] for e in entries]
         assert notes == ['legacy-1', 'new-1', 'new-2']
         assert corrupted == []
+
+
+class TestReadReviewsMergesLegacyAndNew:
+    """read_reviews merges the legacy and new reviews/ directories during
+    the compat window (new wins on stem collision) instead of selecting a
+    single directory — otherwise, once any new reviewer writes, the new
+    reviews/ dir exists and a whole-dir `_read_path` resolution would make
+    every legacy reviewer vanish from the gate decision.
+    """
+
+    @pytest.fixture
+    def meta_root(self, worktree: Path) -> Path:
+        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+    @pytest.fixture
+    def legacy_root(self, worktree: Path) -> Path:
+        return worktree / '.task'
+
+    def test_merges_legacy_and_new(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        (legacy_root / 'reviews').mkdir(parents=True)
+        (legacy_root / 'reviews' / 'reviewer-a.json').write_text(json.dumps({
+            'verdict': 'CHANGES',
+            'issues': [{'severity': 'blocking', 'description': 'x'}],
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        ta.write_review('reviewer-b', {'verdict': 'PASS', 'issues': []})
+
+        assert set(ta.read_reviews()) == {'reviewer-a', 'reviewer-b'}
+
+    def test_new_wins_on_stem_collision(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        (legacy_root / 'reviews').mkdir(parents=True)
+        (legacy_root / 'reviews' / 'reviewer-a.json').write_text(json.dumps({
+            'verdict': 'OLD',
+            'issues': [],
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        ta.write_review('reviewer-a', {'verdict': 'NEW', 'issues': []})
+
+        assert ta.read_reviews()['reviewer-a']['verdict'] == 'NEW'
+
+    def test_aggregate_surfaces_legacy_blocking(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        (legacy_root / 'reviews').mkdir(parents=True)
+        (legacy_root / 'reviews' / 'reviewer-a.json').write_text(json.dumps({
+            'verdict': 'CHANGES',
+            'issues': [{'severity': 'blocking', 'description': 'x'}],
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        ta.write_review('reviewer-b', {'verdict': 'PASS', 'issues': []})
+
+        assert ta.aggregate_reviews().has_blocking_issues is True
