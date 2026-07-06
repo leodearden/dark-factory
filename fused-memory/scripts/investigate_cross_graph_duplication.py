@@ -122,7 +122,19 @@ async def probe_node_across_graphs(
     Returns one ``{'graph', 'uuid', 'name', 'group_id'}`` entry per graph in
     which the node was found. Uses ``ro_query`` only -- never ``query``.
     """
-    raise NotImplementedError
+    entries: list[dict] = []
+    for name in graph_names:
+        graph = graphiti._graph_for(name)
+        result = await graph.ro_query(
+            'MATCH (n {uuid: $uuid}) RETURN n.uuid, n.name, n.group_id',
+            {'uuid': uuid},
+        )
+        rows = result.result_set or []
+        for row in rows:
+            entries.append(
+                {'graph': name, 'uuid': row[0], 'name': row[1], 'group_id': row[2]}
+            )
+    return entries
 
 
 # ---------------------------------------------------------------------------
