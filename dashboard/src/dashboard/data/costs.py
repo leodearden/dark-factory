@@ -51,6 +51,7 @@ async def get_cost_summary(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Per-project cost summary.
 
@@ -62,7 +63,7 @@ async def get_cost_summary(
     *cap_events* is the count of account_events rows with event_type='cap_hit'
     scoped to the same project_id within the window.
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
         inv_rows = await db.execute_fetchall(
@@ -148,13 +149,14 @@ async def get_cost_by_project(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, list[dict]]:
     """Per-project cost broken down by model.
 
     Returns {project_id: [{model: str, total: float}, ...]}.
     Entries are ordered by total descending.
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> dict[str, list[dict]]:
         rows = await db.execute_fetchall(
@@ -185,6 +187,7 @@ async def get_cost_by_account(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Per-account cost summary with availability status.
 
@@ -208,7 +211,7 @@ async def get_cost_by_account(
     latest ``cap_hit`` / ``auth_failed`` details payload is more recent (or
     None when not unavailable / unknown).
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
         # Aggregate spend and invocation count per account
@@ -403,12 +406,13 @@ async def get_cost_by_role(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Per-project cost broken down by role, then model.
 
     Returns {project_id: {role: {model: total}}}.
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
         rows = await db.execute_fetchall(
@@ -494,6 +498,7 @@ async def get_account_events(
     *,
     days: int = 7,
     limit: int = 200,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Recent account events (cap_hit, resumed, etc.) within the window.
 
@@ -502,7 +507,7 @@ async def get_account_events(
     *details* is returned as-is (string or None) — callers may parse JSON.
     *limit* caps the number of rows returned (default 200).
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> list[dict]:
         rows = await db.execute_fetchall(
@@ -538,6 +543,7 @@ async def get_run_cost_breakdown(
     *,
     days: int = 7,
     limit: int = 500,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Per-run cost breakdown grouped by task, with invocation detail.
 
@@ -551,7 +557,7 @@ async def get_run_cost_breakdown(
     LEFT JOIN with task_results provides task titles.
     *limit* caps the number of invocation rows fetched from SQL (default 500).
     """
-    since = _cutoff(days)
+    since = _cutoff(days, now=now)
 
     async def _query(db: aiosqlite.Connection) -> list[dict]:
         try:
