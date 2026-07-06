@@ -22,8 +22,8 @@ either upstream format changes, this module must be updated by hand.
    Anyone renaming the ``run`` command or its ``--prd``/``--config`` flags
    must update ``find_running_orchestrators`` to match.
 
-2. ``.task/`` artifact layout (:func:`read_task_artifacts`) — the
-   ``metadata.json`` shape, ``plan.json``'s ``steps`` list (per-step
+2. ``.task/``/``.task-meta/`` artifact layout (:func:`read_task_artifacts`) —
+   the ``metadata.json`` shape, ``plan.json``'s ``steps`` list (per-step
    ``status``, top-level ``files`` list), ``iterations.jsonl`` (read as a
    line count), and ``reviews/*.json``'s ``verdict`` field all re-derive the
    artifact layout owned by ``orchestrator/src/orchestrator/artifacts.py``.
@@ -32,10 +32,24 @@ either upstream format changes, this module must be updated by hand.
    ``get_pending_steps``, ``get_completed_steps``), but
    ``read_task_artifacts`` only counts ``steps`` toward ``plan_progress`` —
    ``prerequisites`` status is intentionally not surfaced here.
+
+   W11-β relocated these artifacts to a SIBLING
+   ``<worktree_base>/.task-meta/<worktree_name>`` dir (owned by
+   ``TaskArtifacts.meta_root_for``; dirname owned by
+   ``config.TASK_META_DIRNAME``). ``read_task_artifacts`` re-derives that
+   path shape BY HAND (``worktree_path.parent / '.task-meta' /
+   worktree_path.name``) since it cannot import the orchestrator package,
+   and resolves each artifact new-then-old (the new path wins once it
+   exists, else the legacy ``<worktree>/.task`` path), mirroring
+   ``TaskArtifacts._read_path``. As of W11-ε2, ``metadata.json`` and
+   ``plan.json`` resolve new-then-old; ``iterations.jsonl`` and
+   ``reviews/*.json`` still read the legacy path only (relocated in a
+   follow-up step). The legacy fallback is dropped entirely at task ι
+   after a full green compat-window cycle.
    FUTURE SINGLE OWNER: stream W11's ``TaskArtifacts`` (see the seam table
-   in ``plans/bug-hotspot-remediation-program-2026-07-06.md``), which also
-   plans to relocate ``.task/`` out of the git tree — this doc block is the
-   marker W11 greps for to find and migrate this dashboard reader.
+   in ``plans/bug-hotspot-remediation-program-2026-07-06.md``) — this doc
+   block is the marker W11 greps for to find and migrate this dashboard
+   reader.
 """
 
 from __future__ import annotations
@@ -202,7 +216,8 @@ def find_running_orchestrators() -> list[dict]:
 
 
 def read_task_artifacts(worktree_path: Path) -> dict:
-    """Read .task/ artifacts from a worktree directory.
+    """Read task artifacts for a worktree — from the relocated .task-meta/
+    dir (new) or the legacy .task/ dir (old).
 
     Returns a dict with keys:
     - metadata: parsed metadata.json dict, or None
@@ -211,18 +226,49 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     - iteration_count: number of lines in iterations.jsonl
     - review_summary: 'N/M passed' or '—' if no reviews
 
-    FORMAT COUPLING: the .task/ layout parsed below (metadata.json,
+    FORMAT COUPLING: the artifact layout parsed below (metadata.json,
     plan.json 'steps'/'files', iterations.jsonl, reviews/*.json 'verdict')
     is owned by orchestrator/src/orchestrator/artifacts.py. Only plan.json's
     'steps' collection is counted toward plan_progress; 'prerequisites'
     status (also tracked by artifacts.py) is intentionally not surfaced.
+
+    metadata.json and plan.json are resolved new-then-old: read from the
+    relocated <worktree_base>/.task-meta/<worktree_name> dir
+    (worktree_path.parent / '.task-meta' / worktree_path.name) when present,
+    else fall back to the legacy <worktree>/.task dir. This hand-derives the
+    path shape owned by TaskArtifacts.meta_root_for / config.TASK_META_DIRNAME
+    (the dashboard cannot import the orchestrator package — see the module
+    docstring's FORMAT COUPLING section) and mirrors
+    TaskArtifacts._read_path's new-then-old resolution. iterations.jsonl and
+    reviews/ are relocated in a follow-up step; until then they read the
+    legacy path only. The legacy fallback is retired at task ι once a full
+    compat-window cycle confirms every lane has migrated.
+
     FUTURE SINGLE OWNER: stream W11's TaskArtifacts — see the module
     docstring's FORMAT COUPLING section.
     """
-    task_dir = worktree_path / '.task'
+    legacy_dir = worktree_path / '.task'
+    meta_dir = worktree_path.parent / '.task-meta' / worktree_path.name
+
+    def _resolve(name: str) -> Path:
+        """Resolve *name* new-then-old (compat window).
+
+        Returns meta_dir/name if it exists, else legacy_dir/name if THAT
+        exists, else meta_dir/name as the canonical (non-existent) path —
+        mirrors TaskArtifacts._read_path. Returning the canonical new path
+        when neither copy exists keeps load_json_or_warn silent on
+        benign-absent artifacts.
+        """
+        new_path = meta_dir / name
+        if new_path.exists():
+            return new_path
+        legacy_path = legacy_dir / name
+        if legacy_path.exists():
+            return legacy_path
+        return new_path
 
     # Metadata
-    metadata, _meta_ok = load_json_or_warn(task_dir / 'metadata.json', default=None)
+    metadata, _meta_ok = load_json_or_warn(_resolve('metadata.json'), default=None)
     if not isinstance(metadata, dict):
         metadata = None
 
@@ -230,7 +276,7 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     done_count = 0
     total_count = 0
     files: list[str] = []
-    plan_data, _ok = load_json_or_warn(task_dir / 'plan.json', default=None)
+    plan_data, _ok = load_json_or_warn(_resolve('plan.json'), default=None)
     if isinstance(plan_data, dict):
         steps = plan_data.get('steps', [])
         if isinstance(steps, list):
@@ -249,14 +295,14 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     # Iteration count
     iteration_count = 0
     try:
-        with open(task_dir / 'iterations.jsonl') as f:
+        with open(legacy_dir / 'iterations.jsonl') as f:
             iteration_count = sum(1 for _ in f)
     except FileNotFoundError:
         pass
 
     # Review summary
     review_summary = '—'
-    reviews_dir = task_dir / 'reviews'
+    reviews_dir = legacy_dir / 'reviews'
     if reviews_dir.is_dir():
         review_files = list(reviews_dir.glob('*.json'))
         if review_files:
