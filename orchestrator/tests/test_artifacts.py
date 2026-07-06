@@ -1268,3 +1268,93 @@ class TestReadPlanNewThenOldCompat:
         legacy_plan_after = json.loads((legacy_root / 'plan.json').read_text())
         assert legacy_plan_after['steps'][0]['status'] == 'pending'
         assert legacy_plan_after['steps'][0]['commit'] is None
+
+
+class TestUniformReadFallback:
+    """The new-then-old read compat is uniform across artifact types, not
+    just plan.json.
+    """
+
+    @pytest.fixture
+    def meta_root(self, worktree: Path) -> Path:
+        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+    @pytest.fixture
+    def legacy_root(self, worktree: Path) -> Path:
+        return worktree / '.task'
+
+    def test_read_base_commit_falls_back_to_legacy(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'metadata.json').write_text(
+            json.dumps({'task_id': 'x', 'base_commit': 'legacy-sha'})
+        )
+
+        ta = TaskArtifacts(worktree, meta_root)
+        assert ta.read_base_commit() == 'legacy-sha'
+
+    def test_read_iteration_log_falls_back_to_legacy(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'iterations.jsonl').write_text(
+            json.dumps({'note': 'legacy-entry'}) + '\n'
+        )
+
+        ta = TaskArtifacts(worktree, meta_root)
+        entries, corrupted = ta.read_iteration_log()
+        assert entries == [{'note': 'legacy-entry'}]
+        assert corrupted == []
+
+    def test_read_agent_session_falls_back_to_legacy(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'agent_session.json').write_text(json.dumps({
+            'session_id': 'legacy-session',
+            'role': 'implementer',
+            'started_at': 'now',
+            'owner_pid': 123,
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        session = ta.read_agent_session()
+        assert session['session_id'] == 'legacy-session'
+
+    def test_read_reviews_falls_back_to_legacy(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        (legacy_root / 'reviews').mkdir(parents=True)
+        (legacy_root / 'reviews' / 'reviewer-a.json').write_text(
+            json.dumps({'verdict': 'PASS', 'issues': []})
+        )
+
+        ta = TaskArtifacts(worktree, meta_root)
+        reviews = ta.read_reviews()
+        assert reviews == {'reviewer-a': {'verdict': 'PASS', 'issues': []}}
+
+    def test_update_base_commit_reads_legacy_writes_new(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'metadata.json').write_text(
+            json.dumps({'task_id': 'x', 'base_commit': 'old-sha'})
+        )
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.update_base_commit('new-sha')
+
+        assert ta.read_base_commit() == 'new-sha'
+        new_metadata = json.loads((meta_root / 'metadata.json').read_text())
+        assert new_metadata['base_commit'] == 'new-sha'
+        assert new_metadata['task_id'] == 'x'
+
+        # Legacy copy must be untouched by the write-back.
+        legacy_metadata = json.loads((legacy_root / 'metadata.json').read_text())
+        assert legacy_metadata['base_commit'] == 'old-sha'
