@@ -1,11 +1,16 @@
 """Canonical stage -> recon_pool map for per-cycle reconciliation summaries.
 
 LEAF module: must NOT import anything from ``fused_memory`` (not even
-``fused_memory.reconciliation``). ``recon_pool`` is the only key the
-pool-cap trim and ops prune script filter on for
-``metadata.kind == 'cycle_summary'`` writes (reconciliation/summary_pool.py,
-scripts/prune_recon_cycle_summaries.py), so this single map is what makes
-tagging independent of LLM prompt compliance (task 2077).
+``fused_memory.reconciliation``). This map has two independent consumers,
+each keying on a different half of it, for ``metadata.kind ==
+'cycle_summary'`` writes: reconciliation/summary_pool.py trims a pool by
+the ``recon_pool`` *value* (passed in as a parameter — see
+``filters={'recon_pool': recon_pool}``), while
+scripts/prune_recon_cycle_summaries.py buckets records by
+``metadata.stage`` against this map's *keys* (``_POOL_STAGES =
+('memory_consolidator', 'task_knowledge_sync')``). Both derive from this
+single map, which is what makes tagging independent of LLM prompt
+compliance (task 2077).
 
 Before task 2140 these values were duplicated three ways — once here (well,
 once in services/memory_service.py) and once each in

@@ -4594,10 +4594,20 @@ class TestReconPoolAutoTag:
         assert _infer_recon_pool({}) is None
 
     def test_map_matches_canonical_per_stage_constants(self):
-        """Drift guard: the per-stage constants and the map's values must be the
-        SAME object (identity), not merely equal strings — all three are aliases
-        of the single leaf-module source of truth (recon_pool_map.py, task 2140),
-        so they cannot silently diverge."""
+        """Sanity check: the per-stage constants and the map's values must be
+        the SAME object (identity) as the leaf-module source of truth
+        (recon_pool_map.py, task 2140) — i.e. every site aliases those
+        objects today rather than defining its own copy.
+
+        Caveat: 'stage1_cycle_summary' / 'stage2_cycle_summary' are
+        identifier-like literals that CPython typically interns, so `is`
+        can still hold even if a stage re-introduced its own literal
+        definition — this assertion alone does not prove duplication is
+        impossible. The real duplication guards are the
+        `== 'stage1_cycle_summary'` / `== 'stage2_cycle_summary'` pins on
+        the stage constants plus TestReconPoolMapImportOrder's fresh-
+        subprocess import-order check; this test only pins that today's
+        objects are aliased, not redefined."""
         from fused_memory.reconciliation.recon_pool_map import (
             STAGE1_CYCLE_SUMMARY_RECON_POOL,
             STAGE2_CYCLE_SUMMARY_RECON_POOL,
