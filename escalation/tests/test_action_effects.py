@@ -12,6 +12,13 @@ from __future__ import annotations
 
 import pytest
 
+# TEST-TIME only import: dark-factory-shared is already a declared workspace
+# dependency of escalation/pyproject.toml, so this resolves without adding a
+# new production dependency. action_effects.py itself does NOT import shared
+# (see its module docstring / the plan's reuse notes) — it keeps plain
+# lowercase status-string literals.
+from shared.task_statuses import TaskStatus
+
 from escalation.action_effects import (
     ACTION_EFFECTS,
     ANY,
@@ -19,13 +26,6 @@ from escalation.action_effects import (
     TaskEffect,
     effect_for,
 )
-
-# TEST-TIME only import: dark-factory-shared is already a declared workspace
-# dependency of escalation/pyproject.toml, so this resolves without adding a
-# new production dependency. action_effects.py itself does NOT import shared
-# (see its module docstring / the plan's reuse notes) — it keeps plain
-# lowercase status-string literals.
-from shared.task_statuses import TaskStatus
 
 # Behaviour-preserving mapping transcribed from
 # orchestrator/src/orchestrator/harness.py:8259-8325 (_ACTION_TARGETS /
