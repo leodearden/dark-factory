@@ -5,7 +5,9 @@ import os
 import subprocess
 from pathlib import Path, PurePosixPath
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +207,17 @@ class Scope(BaseModel):
     project_id: str
     agent_id: str | None = None
     session_id: str | None = None
+
+    @field_validator('project_id')
+    @classmethod
+    def _canonicalize_project_id(cls, v: str) -> str:
+        """Canonicalize project_id at construction (mode='after' — v is a
+        guaranteed str post type-coercion) so every field derived from it
+        (graphiti_group_id, mem0_collection_name, mem0_user_id) is always
+        canonical too. Path-shaped input raises PathShapedProjectIdError
+        (a ValueError subclass), which pydantic surfaces as a
+        ValidationError at Scope() construction."""
+        return canonicalize_project_id(v)
 
     @property
     def graphiti_group_id(self) -> str:
