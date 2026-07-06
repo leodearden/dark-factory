@@ -42,10 +42,16 @@ __all__ = [
     'UsageGate',
     'InvokeSlot',
     'AccountState',
-    'AccountPhase',
-    'IllegalTransitionError',
     'SessionBudgetExhausted',
 ]
+# NOTE: AccountPhase and IllegalTransitionError are intentionally NOT listed
+# here even though they are part of this module's public surface (imported
+# directly by shared.tests.test_usage_gate). shared/tests/test_public_api.py
+# pins this module's __all__ to an exact set (and shared.__all__ to the union
+# of every submodule's __all__) — both out of this task's edit scope. Adding
+# entries here would fail that pinned assertion. __all__ only governs
+# `from shared.usage_gate import *`; explicit `from shared.usage_gate import
+# AccountPhase` works regardless of __all__ membership.
 
 # Patterns that indicate a usage cap has been hit (from Claude Code CLI output)
 CAP_HIT_PREFIXES = [
@@ -336,6 +342,34 @@ class UsageGate:
                 + ', '.join(a.name for a in accounts)
             )
         return accounts
+
+    def _transition(
+        self,
+        acct: AccountState,
+        new_phase: AccountPhase,
+        *,
+        resets_at: datetime | None = None,
+        reason: str = '',
+        force: bool = False,
+    ) -> None:
+        """Sole writer of ``AccountState.phase`` (PRD §7.3, task W4-γ).
+
+        Writes the new phase, then recomputes the shared ``_open`` event in
+        ONE place from the current phase of every account (DD-5 invariant:
+        ``_open.is_set() <=> any(a.phase in {AVAILABLE, PROBING})``) —
+        replacing the ~10 scattered ``self._open.set()``/``.clear()`` call
+        sites this method's callers used to own directly.
+        """
+        acct.phase = new_phase
+        acct.near_cap = False
+
+        if any(
+            a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING)
+            for a in self._accounts
+        ):
+            self._open.set()
+        else:
+            self._open.clear()
 
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
