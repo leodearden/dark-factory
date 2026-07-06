@@ -468,3 +468,92 @@ class TestMoveEntityAcrossGraphsIdempotency:
         assert result.source_graph == SOURCE_GRAPH_FIXTURE
         assert result.target_graph == TARGET_GRAPH_FIXTURE
         assert result.already_moved is True
+
+
+# ---------------------------------------------------------------------------
+# step-15: move_entity_across_graphs -- rewrite_group_id
+# ---------------------------------------------------------------------------
+
+class TestMoveEntityAcrossGraphsRewriteGroupId:
+    """S5 rewrite_group_id: rewrites (or preserves) group_id on node/edge/mention."""
+
+    @pytest.mark.asyncio
+    async def test_rewrite_group_id_applies_to_node_edge_and_mention(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """When rewrite_group_id is given, the recreated node's CREATE sets
+        group_id to the rewritten value, and the recreated edge/mention
+        (both of which store a group_id) carry the SAME rewritten value --
+        never the source's original group_id.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(side_effect=[
+            MagicMock(result_set=[NODE_ROW_FIXTURE]),
+            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
+            MagicMock(result_set=[MENTION_ROW_FIXTURE]),
+        ])
+        target_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        rewritten_group_id = 'know_live'
+        await move_entity_across_graphs(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            rewrite_group_id=rewritten_group_id,
+        )
+
+        assert target_mock.query.await_count == 3
+        node_params = extract_params(target_mock.query.call_args_list[0])
+        edge_params = extract_params(target_mock.query.call_args_list[1])
+        mention_params = extract_params(target_mock.query.call_args_list[2])
+
+        assert node_params.get('group_id') == rewritten_group_id
+        assert edge_params.get('group_id') == rewritten_group_id
+        assert mention_params.get('group_id') == rewritten_group_id
+        # never the source's original group_id
+        assert SOURCE_GRAPH_FIXTURE not in (
+            node_params.get('group_id'), edge_params.get('group_id'), mention_params.get('group_id'),
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_rewrite_preserves_original_group_id(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """When rewrite_group_id is None (the Phase-1 default), the node's
+        original group_id property is preserved unchanged on the recreated
+        node/edge/mention.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(side_effect=[
+            MagicMock(result_set=[NODE_ROW_FIXTURE]),
+            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
+            MagicMock(result_set=[MENTION_ROW_FIXTURE]),
+        ])
+        target_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        await move_entity_across_graphs(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        assert target_mock.query.await_count == 3
+        node_params = extract_params(target_mock.query.call_args_list[0])
+        edge_params = extract_params(target_mock.query.call_args_list[1])
+        mention_params = extract_params(target_mock.query.call_args_list[2])
+
+        assert node_params.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert edge_params.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert mention_params.get('group_id') == SOURCE_GRAPH_FIXTURE
