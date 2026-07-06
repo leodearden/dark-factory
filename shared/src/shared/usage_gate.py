@@ -1014,16 +1014,13 @@ class UsageGate:
                 continue
             if acct.resets_at is not None and now >= acct.resets_at:
                 logger.info(f'Account {acct.name}: reset time passed — uncapping (probing)')
-                acct.capped = False
-                acct.near_cap = False
-                acct.probing = True  # gate: one task confirms before opening to all
-                if acct.pause_started_at:
-                    self._total_pause_secs += (now - acct.pause_started_at).total_seconds()
-                acct.pause_started_at = None
+                # _transition owns: the phase write, near_cap clear, probe_count
+                # reset, pause-time consumption into _total_pause_secs, and the
+                # centralized _open recompute (gate: one task confirms before
+                # opening to all — PROBING, not AVAILABLE).
+                self._transition(acct, AccountPhase.PROBING)
                 any_uncapped = True
 
-        if any_uncapped:
-            self._open.set()
         return any_uncapped
 
     def on_agent_complete(self, cost: float) -> None:
@@ -1075,18 +1072,15 @@ class UsageGate:
             ok = await self._run_probe(acct)
 
             if ok:
+                # Captured before _transition resets probe_count — the event
+                # label below reports the probe number that confirmed.
                 confirmed_probe_num = acct.probe_count
-                acct.capped = False
-                acct.near_cap = False
-                acct.probing = True  # gate: let one real task confirm first
-                acct.probe_count = 0
-                if acct.pause_started_at:
-                    self._total_pause_secs += (
-                        datetime.now(UTC) - acct.pause_started_at
-                    ).total_seconds()
-                acct.pause_started_at = None
+                # _transition owns: the phase write (-> PROBING, gate: let one
+                # real task confirm first), near_cap clear, probe_count reset,
+                # pause-time consumption into _total_pause_secs, and the
+                # centralized _open recompute.
+                self._transition(acct, AccountPhase.PROBING)
                 logger.info(f'Account {acct.name} RESUMED (probe confirmed)')
-                self._open.set()
                 if self._cost_store:
                     await self._write_cost_event(
                         acct.name, 'resumed',
