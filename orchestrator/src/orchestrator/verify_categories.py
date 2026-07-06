@@ -153,3 +153,17 @@ PREEXISTING_BREAK_SKIP_CATEGORIES: frozenset[FailureCategory] = frozenset(
 INFRA_TRANSIENT_CATEGORIES: frozenset[FailureCategory] = frozenset(
     c for c, p in CATEGORY_POLICY.items() if p.is_infra_transient
 )
+
+
+def should_archive(category: str) -> bool:
+    """Return True when *category* warrants durable human-triage archival.
+
+    Pure CATEGORY_POLICY table lookup — no ``endswith('_error')`` heuristic.
+    A category outside the known 12 (e.g. a verify_runner UNSCOPED_TYPECHECK_*
+    sentinel, or any other unrecognized string) defaults to False.
+    """
+    try:
+        member = FailureCategory(category)
+    except ValueError:
+        return False
+    return CATEGORY_POLICY[member].archive
