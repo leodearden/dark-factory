@@ -3,11 +3,18 @@
 ``ProjectId``/``ProjectRoot`` (below) are distinct ``str`` :class:`~typing.NewType`\\ s
 and ``ProjectScope`` is a frozen dataclass pairing them, so a transposed
 ``project_id``/``project_root`` argument pair is a pyright error rather than a
-runtime bug. ``ProjectScope`` has exactly two sanctioned construction sites —
+runtime bug.
+
+This module (task α of the recon-project-scope batch; see
+``plans/recon-project-scope-prd.md``) defines the type only — as of this
+change, ``ProjectScope`` is not yet constructed by any production call site.
+It is *intended* to have exactly two sanctioned construction sites, to be
+wired in by follow-up tasks in the same batch —
 ``ReconciliationHarness._known_project_root_for`` (``reconciliation/harness.py``,
-the registry-backed cycle entry) and ``TargetedReconciler.reconcile_task``
-(``reconciliation/targeted.py``, after its ``require_project_root`` call). No
-other call site should construct a ``ProjectScope`` directly.
+the registry-backed cycle entry; task β) and
+``TargetedReconciler.reconcile_task`` (``reconciliation/targeted.py``, after
+its ``require_project_root`` call; task δ). No other call site should
+construct a ``ProjectScope`` directly once those tasks land.
 """
 
 import dataclasses
@@ -241,13 +248,25 @@ class ProjectScope:
     ``dataclasses.FrozenInstanceError`` at runtime and is a pyright
     ``reportAttributeAccessIssue`` at type-check time.
 
-    See the module docstring for the two sanctioned construction sites.
+    Not yet constructed by any production call site. See the module
+    docstring for the two *intended* construction sites, to be wired in by
+    this batch's follow-up tasks.
     """
 
     project_id: ProjectId
     project_root: ProjectRoot
 
     def __post_init__(self) -> None:
+        # Deliberately a plain non-empty check, NOT require_project_id (which
+        # additionally enforces a safe-identifier charset allowlist). Both
+        # intended construction sites (see class docstring) build project_id
+        # from resolve_project_id/canonicalize_project_id output or an
+        # already registry-resolved value -- always underscore-canonical and
+        # allowlist-safe by construction -- so no caller reaching this
+        # __post_init__ needs the stronger charset check, and applying it
+        # here would over-reject otherwise-legitimate ids. If a future
+        # construction site can pass an uncanonicalized/raw id, prefer
+        # canonicalizing at that call site over widening this check.
         if not self.project_id:
             raise InputValidationError(
                 f'project_id must be a non-empty string, got: {self.project_id!r}'
