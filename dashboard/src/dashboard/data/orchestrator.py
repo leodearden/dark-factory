@@ -41,11 +41,10 @@ either upstream format changes, this module must be updated by hand.
    worktree_path.name``) since it cannot import the orchestrator package,
    and resolves each artifact new-then-old (the new path wins once it
    exists, else the legacy ``<worktree>/.task`` path), mirroring
-   ``TaskArtifacts._read_path``. As of W11-ε2, ``metadata.json`` and
-   ``plan.json`` resolve new-then-old; ``iterations.jsonl`` and
-   ``reviews/*.json`` still read the legacy path only (relocated in a
-   follow-up step). The legacy fallback is dropped entirely at task ι
-   after a full green compat-window cycle.
+   ``TaskArtifacts._read_path``. As of W11-ε2, all four artifact reads —
+   ``metadata.json``, ``plan.json``, ``iterations.jsonl``, and the
+   ``reviews/`` directory — resolve new-then-old. The legacy fallback is
+   dropped entirely at task ι after a full green compat-window cycle.
    FUTURE SINGLE OWNER: stream W11's ``TaskArtifacts`` (see the seam table
    in ``plans/bug-hotspot-remediation-program-2026-07-06.md``) — this doc
    block is the marker W11 greps for to find and migrate this dashboard
@@ -295,14 +294,17 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     # Iteration count
     iteration_count = 0
     try:
-        with open(legacy_dir / 'iterations.jsonl') as f:
+        with open(_resolve('iterations.jsonl')) as f:
             iteration_count = sum(1 for _ in f)
     except FileNotFoundError:
         pass
 
-    # Review summary
+    # Review summary — resolve the reviews/ directory new-then-old (not a
+    # single file, so this doesn't go through _resolve).
     review_summary = '—'
-    reviews_dir = legacy_dir / 'reviews'
+    reviews_dir = meta_dir / 'reviews'
+    if not reviews_dir.is_dir():
+        reviews_dir = legacy_dir / 'reviews'
     if reviews_dir.is_dir():
         review_files = list(reviews_dir.glob('*.json'))
         if review_files:
