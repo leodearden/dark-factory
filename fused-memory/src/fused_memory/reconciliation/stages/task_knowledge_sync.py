@@ -1550,7 +1550,7 @@ async def _sweep_terminal_task_flag_markers(
         try:
             return await taskmaster.get_task(component, project_root)
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 'reconciliation._sweep_terminal_task_flag_markers: '
                 'get_task failed for task_id=%s: %s',
                 component, exc,
