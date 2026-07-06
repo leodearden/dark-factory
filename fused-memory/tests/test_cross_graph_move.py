@@ -22,9 +22,11 @@ from _fm_helpers import extract_cypher, extract_params
 
 from fused_memory.maintenance import cross_graph_move
 from fused_memory.maintenance.cross_graph_move import (
+    MergeResult,
     MoveResult,
     classify_unique_wrong_edges,
     format_vecf32_literal,
+    merge_foreign_duplicate,
     move_entity_across_graphs,
     parse_compact_vector_reply,
 )
@@ -580,3 +582,120 @@ class TestClassifyUniqueWrongEdges:
     def test_empty_when_all_wrong_edges_already_on_home(self):
         """Every wrong-copy edge already present on home classifies as empty."""
         assert classify_unique_wrong_edges({'a', 'b', 'c'}, {'a', 'b'}) == set()
+
+
+# ---------------------------------------------------------------------------
+# step-19: merge_foreign_duplicate -- recreate-then-delete, no edge lost
+# ---------------------------------------------------------------------------
+
+HOME_GRAPH_FIXTURE = SOURCE_GRAPH_FIXTURE
+WRONG_GRAPH_FIXTURE = TARGET_GRAPH_FIXTURE
+
+SHARED_EDGE_UUID_FIXTURE = 'edge-shared-9999'
+HOME_ONLY_EDGE_UUID_FIXTURE = 'edge-home-only-8888'
+UNIQUE_WRONG_EDGE_UUID_FIXTURE = 'edge-unique-wrong-7777'
+
+# Full-property row for the edge shared by both copies (already accounted
+# for on home) -- must NOT be recreated.
+SHARED_EDGE_ROW_FIXTURE = [
+    SHARED_EDGE_UUID_FIXTURE, 'is_related_to', 'Alice is related to Bob.',
+    '2026-01-01T00:00:00+00:00', None, '2026-01-01T00:00:00+00:00',
+    WRONG_GRAPH_FIXTURE, ['episode-uuid-1'],
+    NODE_UUID_FIXTURE, OTHER_NODE_UUID_FIXTURE,
+]
+# Full-property row for the wrong-copy's edge that's UNIQUE to it (absent
+# from home) -- must be recreated on home with a byte-exact fact_embedding.
+UNIQUE_WRONG_EDGE_ROW_FIXTURE = [
+    UNIQUE_WRONG_EDGE_UUID_FIXTURE, 'is_related_to', 'Alice is related to Carol.',
+    '2026-01-02T00:00:00+00:00', None, '2026-01-02T00:00:00+00:00',
+    WRONG_GRAPH_FIXTURE, ['episode-uuid-2'],
+    NODE_UUID_FIXTURE, OTHER_NODE_UUID_FIXTURE,
+]
+
+
+class TestMergeForeignDuplicate:
+    """S6 merge: recreate the wrong-copy's unique edges on home, then delete wrong."""
+
+    @pytest.mark.asyncio
+    async def test_recreates_unique_edges_then_deletes_wrong_copy_no_edge_lost(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """home has 2 edges (one shared with wrong, one home-only); wrong has
+        2 edges (the shared one + one unique to it). Only the unique edge
+        should be recreated on home -- with a byte-exact fact_embedding --
+        and the wrong-graph-copy DETACH DELETE must run strictly after that
+        recreate. Post: home_edge_count_after == home_edge_count_before + 1,
+        matching len(unique(wrong)); the shared edge is counted once, not
+        duplicated.
+        """
+        backend = make_backend(mock_config)
+        call_order: list[tuple[str, str, dict]] = []
+
+        wrong_mock = make_graph_mock()
+        wrong_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            )
+        )
+
+        async def _record_wrong_query(cypher, params=None):
+            call_order.append(('wrong', cypher, params or {}))
+            return MagicMock()
+
+        wrong_mock.query = AsyncMock(side_effect=_record_wrong_query)
+
+        home_mock = make_graph_mock()
+        home_mock.ro_query = AsyncMock(
+            return_value=MagicMock(
+                result_set=[[SHARED_EDGE_UUID_FIXTURE], [HOME_ONLY_EDGE_UUID_FIXTURE]]
+            )
+        )
+
+        async def _record_home_query(cypher, params=None):
+            call_order.append(('home', cypher, params or {}))
+            return MagicMock()
+
+        home_mock.query = AsyncMock(side_effect=_record_home_query)
+
+        backend._driver._get_graph = _route_graphs({
+            WRONG_GRAPH_FIXTURE: wrong_mock,
+            HOME_GRAPH_FIXTURE: home_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await merge_foreign_duplicate(
+            backend, NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE,
+        )
+
+        # (a) exactly one mutating home call (the unique edge's CREATE) and
+        # one mutating wrong call (the DETACH DELETE) -- the shared edge is
+        # NOT recreated.
+        assert len(call_order) == 2
+        create_role, create_cypher, create_params = call_order[0]
+        assert create_role == 'home'
+        assert 'CREATE' in create_cypher
+        assert 'RELATES_TO' in create_cypher
+        assert EXPECTED_VECF32_LITERAL_FIXTURE in create_cypher
+        assert create_params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        assert create_params.get('src_uuid') == NODE_UUID_FIXTURE
+        assert create_params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
+        assert create_params.get('fact') == 'Alice is related to Carol.'
+
+        fake_read_compact.assert_awaited_once()
+        assert fake_read_compact.call_args.kwargs.get('group_id') == WRONG_GRAPH_FIXTURE
+        assert UNIQUE_WRONG_EDGE_UUID_FIXTURE in fake_read_compact.call_args.kwargs.get('cypher', '')
+
+        # (b) the wrong-graph-copy DETACH DELETE runs strictly AFTER the
+        # recreate, and is scoped to wrong_graph (never home_graph).
+        delete_role, delete_cypher, delete_params = call_order[1]
+        assert delete_role == 'wrong'
+        assert 'DETACH DELETE' in delete_cypher
+        assert delete_params.get('uuid') == NODE_UUID_FIXTURE
+
+        # (c) no edge lost, none double-counted.
+        assert result.home_edge_count_before == 2
+        assert result.edges_recreated == 1
+        assert result.home_edge_count_after == 3
+        assert result.unique_wrong_edge_uuids == {UNIQUE_WRONG_EDGE_UUID_FIXTURE}
