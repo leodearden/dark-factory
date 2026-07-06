@@ -1364,7 +1364,10 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
     assert 'parent_id' not in tasks_cols, f'tasks still has parent_id column: {tasks_cols}'
     assert 'parent_id' not in deps_cols, f'dependencies still has parent_id column: {deps_cols}'
     assert 'parent_id' not in counters_cols, f'id_counters still has parent_id column: {counters_cols}'
-    assert user_version == 1, f'Expected user_version=1 after migration; got {user_version}'
+    assert user_version == 2, f'Expected user_version=2 after migration; got {user_version}'
+    assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
+        f'Expected claimant_run_id/heartbeat_at columns after full-rebuild migration; got {tasks_cols}'
+    )
     assert 'ix_tasks_parent' not in indexes, f'ix_tasks_parent should be gone: {indexes}'
     assert any('ix_tasks_status' in idx for idx in indexes), f'ix_tasks_status missing: {indexes}'
     titles = [r[0] for r in surviving_rows]
@@ -1373,7 +1376,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
 
 @pytest.mark.asyncio
 async def test_migration_idempotent_second_open(tmp_path):
-    """Opening an already-migrated DB a second time is a no-op: user_version stays 1."""
+    """Opening an already-migrated DB a second time is a no-op: user_version stays 2."""
     import sqlite3
 
     project_root = str(tmp_path / 'proj')
@@ -1400,12 +1403,13 @@ async def test_migration_idempotent_second_open(tmp_path):
     finally:
         conn.close()
 
-    assert user_version == 1
+    assert user_version == 2
     assert 'parent_id' not in tasks_cols
+    assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_has_no_parent_id_and_user_version_1(tmp_path):
+async def test_fresh_db_has_no_parent_id_and_user_version_2(tmp_path):
     """A brand-new DB is created with the post-migration schema from the start."""
     import sqlite3
 
@@ -1431,7 +1435,100 @@ async def test_fresh_db_has_no_parent_id_and_user_version_1(tmp_path):
         conn.close()
 
     assert 'parent_id' not in tasks_cols, f'New DB should not have parent_id; got {tasks_cols}'
-    assert user_version == 1, f'Fresh DB should have user_version=1; got {user_version}'
+    assert user_version == 2, f'Fresh DB should have user_version=2; got {user_version}'
+    assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
+        f'Expected claimant_run_id/heartbeat_at columns in fresh schema; got {tasks_cols}'
+    )
+
+
+def _make_v1_schema_db(db_path: Path) -> None:
+    """Create a tasks.db with the CURRENT v1 schema: no parent_id, NO claimant columns.
+
+    Mirrors ``_SCHEMA_SQL`` as it existed before this task added the claimant
+    columns, stamped ``user_version = 1``. This is the common production
+    shape (parent_id already dropped by a prior deploy, claimant columns not
+    yet added) that the v1->v2 ALTER-TABLE migration branch must handle.
+    """
+    import sqlite3
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag           TEXT NOT NULL DEFAULT 'master',
+            id            INTEGER NOT NULL,
+            title         TEXT NOT NULL,
+            description   TEXT,
+            details       TEXT,
+            test_strategy TEXT,
+            status        TEXT NOT NULL,
+            priority      TEXT,
+            metadata      TEXT,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (tag, id)
+        );
+
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO tasks (tag, id, title, status, updated_at) "
+        "VALUES ('master', 1, 'v1 task', 'pending', '2026-01-01T00:00:00.000Z')",
+    )
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
+    """Opening an already-migrated v1 DB ALTERs in the claimant columns and stamps v2.
+
+    This is the common production case: parent_id is already gone (a prior
+    deploy ran the v0->v1 rebuild), but claimant_run_id/heartbeat_at don't
+    exist yet. Distinct from test_migration_drops_parent_id_column_and_straggler
+    above, which exercises the v0->v2 full-rebuild path for DBs that still have
+    parent_id.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v1_schema_db(db_path)
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        listing = await b.get_tasks(project_root=project_root)  # triggers connection-open + migration
+    finally:
+        await b.close()
+
+    # Pre-existing row survives the ALTER untouched.
+    assert listing['tasks'][0]['title'] == 'v1 task'
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tasks_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
+        f'Expected ALTER TABLE to add claimant_run_id/heartbeat_at; got {tasks_cols}'
+    )
+    assert user_version == 2, f'Expected user_version=2 after v1->v2 ALTER migration; got {user_version}'
 
 
 # ── Concurrency ────────────────────────────────────────────────────
