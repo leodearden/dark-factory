@@ -18,13 +18,17 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import stat
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
+from orchestrator.git_ops import GitOps
 from orchestrator.landed_outbox import LandedOutbox, LandedRow
+from orchestrator.merge_queue import SpeculativeMergeWorker
 
 # ---------------------------------------------------------------------------
 # step-1 — record() + lookup() round-trip across a simulated restart
@@ -242,3 +246,39 @@ class TestMergeProvenanceFacade:
 
         assert MergeProvenance.lookup('42') == row
         assert MergeProvenance.lookup('unknown') is None
+
+
+# ---------------------------------------------------------------------------
+# step-11 — SpeculativeMergeWorker holds a LandedOutbox instance
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeMergeWorkerHoldsLandedOutbox:
+    """SpeculativeMergeWorker.__init__ constructs + binds a LandedOutbox
+    (None-safe when git_ops has no project_root, mirroring _shadow_state_path)."""
+
+    def test_worker_holds_and_binds_landed_outbox(
+        self, tmp_path: Path, _restore_merge_provenance_binding: None,
+    ) -> None:
+        from orchestrator.landed_outbox import MergeProvenance
+
+        git_ops = MagicMock(spec=GitOps)
+        git_ops.project_root = tmp_path
+
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+
+        assert isinstance(worker._landed_outbox, LandedOutbox)
+
+        row = LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
+        worker._landed_outbox.record(row)
+
+        assert MergeProvenance.lookup('1') == row
+
+    def test_worker_landed_outbox_none_when_no_project_root(
+        self, _restore_merge_provenance_binding: None,
+    ) -> None:
+        # Intentionally bare: project_root is NOT set on this mock.
+        git_ops = MagicMock(spec=GitOps)
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+
+        assert worker._landed_outbox is None
