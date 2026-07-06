@@ -6,6 +6,31 @@ server (which is the source of truth post-2026-05-02 SQLite cutover).
 ``discover_orchestrators`` is async because the MCP call is async; the
 process-scanning and worktree-artifact helpers remain sync and run via
 ``asyncio.to_thread`` from the async caller.
+
+FORMAT COUPLING
+================
+This module re-derives two formats it does not own. It does NOT import the
+``orchestrator`` package on purpose — ``dashboard/pyproject.toml`` depends
+only on ``escalation`` + ``dark-factory-shared``, and import unification was
+evaluated and rejected (see ``plans/dashboard-alignment-prd.md`` task ζ). If
+either upstream format changes, this module must be updated by hand.
+
+1. ps-scan launch patterns (:func:`find_running_orchestrators`) — the
+   ``'orchestrator run'`` substring match and the ``--prd``/``--config``
+   regexes re-derive the CLI surface of the ``run`` command defined in
+   ``orchestrator/src/orchestrator/cli.py`` (options at cli.py:168-183).
+   Anyone renaming the ``run`` command or its ``--prd``/``--config`` flags
+   must update ``find_running_orchestrators`` to match.
+
+2. ``.task/`` artifact layout (:func:`read_task_artifacts`) — the
+   ``metadata.json`` shape, ``plan.json``'s ``steps`` list (per-step
+   ``status``, top-level ``files`` list), ``iterations.jsonl`` (read as a
+   line count), and ``reviews/*.json``'s ``verdict`` field all re-derive the
+   artifact layout owned by ``orchestrator/src/orchestrator/artifacts.py``.
+   FUTURE SINGLE OWNER: stream W11's ``TaskArtifacts`` (see the seam table
+   in ``plans/bug-hotspot-remediation-program-2026-07-06.md``), which also
+   plans to relocate ``.task/`` out of the git tree — this doc block is the
+   marker W11 greps for to find and migrate this dashboard reader.
 """
 
 from __future__ import annotations
@@ -122,6 +147,10 @@ def find_running_orchestrators() -> list[dict]:
     Returns a list of dicts with keys: pid (int), prd (str | None),
     config_path (str | None), running (bool), started (str).
     Returns [] on subprocess failure or if no orchestrators found.
+
+    FORMAT COUPLING: the patterns below re-derive the ``run`` command's CLI
+    surface from orchestrator/src/orchestrator/cli.py (options at
+    cli.py:168-183). See the module docstring's FORMAT COUPLING section.
     """
     try:
         result = subprocess.run(
@@ -176,6 +205,12 @@ def read_task_artifacts(worktree_path: Path) -> dict:
     - plan_progress: {'done': int, 'total': int}
     - iteration_count: number of lines in iterations.jsonl
     - review_summary: 'N/M passed' or '—' if no reviews
+
+    FORMAT COUPLING: the .task/ layout parsed below (metadata.json,
+    plan.json 'steps'/'files', iterations.jsonl, reviews/*.json 'verdict')
+    is owned by orchestrator/src/orchestrator/artifacts.py. FUTURE SINGLE
+    OWNER: stream W11's TaskArtifacts — see the module docstring's FORMAT
+    COUPLING section.
     """
     task_dir = worktree_path / '.task'
 
