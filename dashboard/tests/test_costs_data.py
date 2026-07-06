@@ -2197,6 +2197,74 @@ class TestAggregateCostTrend:
 
 
 # ---------------------------------------------------------------------------
+# TestAggregateCostTrendNowThreading (step-7)
+# ---------------------------------------------------------------------------
+
+class TestAggregateCostTrendNowThreading:
+    """aggregate_cost_trend must resolve `now` once and thread the identical
+    value to every per-DB get_cost_trend call.
+
+    get_cost_trend bypasses _cutoff (it also derives all_days from the
+    clock), so — unlike TestAggregateNowThreading — we spy on get_cost_trend
+    itself rather than on _cutoff.
+    """
+
+    @pytest.mark.asyncio
+    async def test_injected_now_threaded_identically(self, two_conns):
+        """now=fixed_now is threaded unchanged to both per-DB get_cost_trend calls."""
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        captured: list = []
+        real_trend = costs.get_cost_trend
+
+        async def spy(db, *, days=7, now=None):
+            captured.append(now)
+            return await real_trend(db, days=days, now=now)
+
+        with patch.object(costs, 'get_cost_trend', side_effect=spy):
+            await aggregate_cost_trend(two_conns, days=7, now=fixed_now)
+
+        assert captured == [fixed_now, fixed_now], (
+            f"Expected both per-DB calls to receive now={fixed_now!r}, got {captured!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_now_resolved_once_and_shared(self, two_conns):
+        """Without now, the aggregator resolves once and threads one shared value."""
+        captured: list = []
+        real_trend = costs.get_cost_trend
+
+        async def spy(db, *, days=7, now=None):
+            captured.append(now)
+            return await real_trend(db, days=days, now=now)
+
+        with patch.object(costs, 'get_cost_trend', side_effect=spy):
+            await aggregate_cost_trend(two_conns, days=7)
+
+        assert len(captured) == 2
+        assert captured[0] is not None
+        assert captured[0] == captured[1], (
+            f"Expected both per-DB calls to share one resolved now, got {captured!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_cost_trend_determinism_with_fixed_now(self, costs_conn):
+        """The day list and the SQL cutoff must derive from the same `now`.
+
+        With days=5 and an injected now, the first day must be
+        (now - 4 days) and the last day must be now's own calendar day —
+        proving get_cost_trend no longer takes two independent clock reads.
+        """
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        result = await get_cost_trend(costs_conn, days=5, now=fixed_now)
+
+        assert 'dark_factory' in result
+        day_strs = [entry['day'] for entry in result['dark_factory']]
+        assert len(day_strs) == 5
+        assert day_strs[0] == (fixed_now - timedelta(days=4)).strftime('%Y-%m-%d')
+        assert day_strs[-1] == fixed_now.strftime('%Y-%m-%d')
+
+
+# ---------------------------------------------------------------------------
 # TestAggregateNowThreading (step-5)
 # ---------------------------------------------------------------------------
 
