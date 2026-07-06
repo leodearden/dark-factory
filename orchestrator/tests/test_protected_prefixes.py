@@ -530,3 +530,143 @@ class TestReapInteractiveForeignBandRefusal:
             f'expected the owned _iact- worktree to be reaped; got: {reaped!r}'
         )
         assert not info.path.exists(), 'expected the owned worktree to be gone from disk'
+
+
+# ---------------------------------------------------------------------------
+# TestSelfHealRmtreeGuards — point-site wiring (step-11/12).
+#
+# create_worktree and create_interactive_worktree each self-heal a stale,
+# unregistered directory via `shutil.rmtree` before creating a fresh worktree
+# in its place. Real candidates are always non-band (create_worktree) or the
+# caller's own iact band (create_interactive_worktree), so the guard's
+# foreign-refusal branch is unreachable through real call patterns at these
+# two sites — proven here via a spy forced to return True, per the plan's
+# design_decisions rationale for the point-site tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSelfHealRmtreeGuards:
+    """RED — create_worktree / create_interactive_worktree consult
+    _refuse_foreign_band before their self-heal rmtree (step-11/12)."""
+
+    async def test_create_worktree_happy_path_self_heals_non_band_dir(
+        self, pp_git_repo: Path,
+    ) -> None:
+        """Regression: a stale non-band dir is still self-healed unguarded —
+        owned=frozenset() does not refuse create_worktree's own (non-band)
+        target."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        worktree_path = git_ops.worktree_base / 'stale-taskid'
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        (worktree_path / '.task').mkdir()
+        (worktree_path / '.task' / 'state.json').write_text('{}')
+
+        info = await git_ops.create_worktree('stale-taskid')
+
+        assert info.path == worktree_path
+        assert info.path.exists()
+        assert (info.path / 'README.md').exists(), (
+            'expected the stale dir to be replaced by a real worktree checkout'
+        )
+
+    async def test_create_worktree_guard_consulted_refusal_prevents_rmtree(
+        self, pp_git_repo: Path, monkeypatch,
+    ) -> None:
+        """A refusing spy must prevent the rmtree (dir survives intact) and
+        must be consulted with (worktree_path, owned=frozenset(), ...)."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        worktree_path = git_ops.worktree_base / 'stale-guarded'
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        (worktree_path / '.task').mkdir()
+        (worktree_path / '.task' / 'state.json').write_text('{}')
+
+        calls: list[tuple] = []
+
+        def _spy(path, owned, context):
+            calls.append((path, owned, context))
+            return True
+
+        monkeypatch.setattr(git_ops, '_refuse_foreign_band', _spy)
+
+        with pytest.raises(RuntimeError):
+            # Falls through to `git worktree add` on the still-non-empty
+            # stale dir, which fails — proving the rmtree never ran (a
+            # successful self-heal would instead return WorktreeInfo).
+            await git_ops.create_worktree('stale-guarded')
+
+        assert worktree_path.exists(), (
+            'expected the stale dir to survive — the rmtree must be gated '
+            'by a refusing _refuse_foreign_band'
+        )
+        assert (worktree_path / '.task' / 'state.json').exists(), (
+            'expected the stale dir contents to be untouched'
+        )
+        assert calls, 'expected _refuse_foreign_band to be consulted before the rmtree'
+        called_path, called_owned, _called_context = calls[0]
+        assert called_path == worktree_path
+        assert called_owned == frozenset(), (
+            f'expected create_worktree self-heal to pass owned=frozenset(); '
+            f'got {called_owned!r}'
+        )
+
+    async def test_create_interactive_worktree_happy_path_self_heals_iact_dir(
+        self, pp_git_repo: Path,
+    ) -> None:
+        """Regression: a stale unregistered _iact-<slug> dir is still
+        self-healed unguarded — owned={iact_prefix} does not refuse
+        create_interactive_worktree's own band."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        path = git_ops.worktree_base / f'{config.iact_prefix}staleslug'
+        path.mkdir(parents=True, exist_ok=True)
+        (path / 'leftover.txt').write_text('stale\n')
+
+        info = await git_ops.create_interactive_worktree('staleslug')
+
+        assert info.path == path
+        assert info.path.exists()
+        assert (info.path / 'README.md').exists(), (
+            'expected the stale dir to be replaced by a real worktree checkout'
+        )
+
+    async def test_create_interactive_worktree_guard_consulted_refusal_prevents_rmtree(
+        self, pp_git_repo: Path, monkeypatch,
+    ) -> None:
+        """A refusing spy must prevent the rmtree (dir survives intact) and
+        must be consulted with (path, owned={iact_prefix}, ...)."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        path = git_ops.worktree_base / f'{config.iact_prefix}staleguarded'
+        path.mkdir(parents=True, exist_ok=True)
+        (path / 'leftover.txt').write_text('stale\n')
+
+        calls: list[tuple] = []
+
+        def _spy(p, owned, context):
+            calls.append((p, owned, context))
+            return True
+
+        monkeypatch.setattr(git_ops, '_refuse_foreign_band', _spy)
+
+        with pytest.raises(RuntimeError):
+            # Falls through to `git worktree add` on the still-non-empty
+            # stale dir, which fails — proving the rmtree never ran.
+            await git_ops.create_interactive_worktree('staleguarded')
+
+        assert path.exists(), (
+            'expected the stale dir to survive — the rmtree must be gated '
+            'by a refusing _refuse_foreign_band'
+        )
+        assert (path / 'leftover.txt').exists(), (
+            'expected the stale dir contents to be untouched'
+        )
+        assert calls, 'expected _refuse_foreign_band to be consulted before the rmtree'
+        called_path, called_owned, _called_context = calls[0]
+        assert called_path == path
+        assert called_owned == frozenset({config.iact_prefix}), (
+            f'expected create_interactive_worktree self-heal to pass '
+            f'owned={{config.iact_prefix}}; got {called_owned!r}'
+        )
