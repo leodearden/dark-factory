@@ -323,9 +323,15 @@ def parse_metadata(
 
     warnings: list[SchemaWarning] = []
 
+    # A dedicated, non-Optional-and-non-str local: reassigning the `blob`
+    # parameter itself (declared `dict | str | None`) would reset pyright's
+    # narrowed type back to the full declared union on every assignment
+    # (json.loads returns `Any`, and assigning `Any` to a declared-type
+    # variable narrows to the *declared* type, not to `dict`).
+    parsed: dict
     if isinstance(blob, str):
         try:
-            blob = json.loads(blob)
+            parsed = json.loads(blob)
         except ValueError as exc:
             if direction == 'write' and enforce:
                 raise
@@ -337,49 +343,58 @@ def parse_metadata(
                 )
             )
             return TaskMetadata(), warnings
+    else:
+        parsed = blob
 
-    blob = apply_migrations(blob)
+    parsed = apply_migrations(parsed)
 
     for key, submodel in _SUBMODEL_REGISTRY.items():
-        if key not in blob:
+        if key not in parsed:
             continue
         try:
-            blob = {**blob, key: submodel(**blob[key])}
+            parsed = {**parsed, key: submodel(**parsed[key])}
         except ValidationError as exc:
             if direction == 'write' and enforce:
                 raise
             warnings.append(SchemaWarning(field=key, code='invalid_submodel', message=str(exc)))
 
     try:
-        model = TaskMetadata(**blob)
+        model = TaskMetadata(**parsed)
     except ValidationError as exc:
         if direction == 'write' and enforce:
             raise
-        offending = {loc[0] for loc in (err['loc'] for err in exc.errors()) if loc}
+        # loc[0] is only ever a top-level dict key (hence `str`) for a
+        # per-field error on this model; a whole-model error (e.g. the
+        # deterministic invariant) has an empty loc, filtered out by `if loc`.
+        offending = {
+            loc[0]
+            for loc in (err['loc'] for err in exc.errors())
+            if loc and isinstance(loc[0], str)
+        }
         if offending:
-            remainder = {k: v for k, v in blob.items() if k not in offending}
+            remainder = {k: v for k, v in parsed.items() if k not in offending}
             try:
                 model = TaskMetadata(**remainder)
             except ValidationError:
                 # Popping the offending keys wasn't sufficient (e.g. a second,
                 # independent invariant still trips) — fall back to a fully
                 # raw, unvalidated model rather than raising.
-                model = TaskMetadata.model_construct(**blob)
+                model = TaskMetadata.model_construct(**parsed)
             else:
                 # Reattach the raw values via model_extra so model_dump
                 # re-emits them verbatim (I1), rather than losing them to
                 # the popped-and-revalidated remainder.
-                for key in offending:
-                    model.__pydantic_extra__[key] = blob[key]
+                extra = model.__pydantic_extra__
+                if extra is not None:
+                    for key in offending:
+                        extra[key] = parsed[key]
             for key in offending:
-                warnings.append(
-                    SchemaWarning(field=str(key), code='invalid_field', message=str(exc))
-                )
+                warnings.append(SchemaWarning(field=key, code='invalid_field', message=str(exc)))
         else:
             # A whole-model error (e.g. the deterministic cross-field
             # invariant) has no single offending key to pop; skip validation
             # entirely but keep every given value.
-            model = TaskMetadata.model_construct(**blob)
+            model = TaskMetadata.model_construct(**parsed)
             warnings.append(
                 SchemaWarning(
                     field=_WHOLE_METADATA_FIELD, code='invalid_metadata', message=str(exc)
@@ -387,7 +402,7 @@ def parse_metadata(
             )
 
     known_fields = set(TaskMetadata.model_fields) | set(_SUBMODEL_REGISTRY)
-    for key in blob:
+    for key in parsed:
         if key in known_fields or key.startswith('x_'):
             continue
         warnings.append(

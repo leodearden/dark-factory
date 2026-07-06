@@ -83,7 +83,7 @@ class TestBeforeDone:
 
     def test_script_required(self):
         with pytest.raises(ValidationError):
-            BeforeDone(timeout_secs=60)
+            BeforeDone(timeout_secs=60)  # type: ignore[call-arg]
 
     def test_script_must_be_non_empty(self):
         with pytest.raises(ValidationError):
@@ -91,7 +91,7 @@ class TestBeforeDone:
 
     def test_timeout_secs_required(self):
         with pytest.raises(ValidationError):
-            BeforeDone(script='scripts/x.sh')
+            BeforeDone(script='scripts/x.sh')  # type: ignore[call-arg]
 
     @pytest.mark.parametrize('bad_timeout', [0, -1])
     def test_timeout_secs_must_be_positive(self, bad_timeout):
@@ -99,7 +99,7 @@ class TestBeforeDone:
             BeforeDone(script='scripts/x.sh', timeout_secs=bad_timeout)
 
     def test_unknown_subfield_retained_and_reemitted(self):
-        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, x_extra='keep-me')
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, x_extra='keep-me')  # type: ignore[call-arg]
         dumped = bd.model_dump()
         assert dumped['x_extra'] == 'keep-me'
 
@@ -131,14 +131,14 @@ class TestDoneProvenance:
 
     def test_bogus_kind_rejected(self):
         with pytest.raises(ValidationError):
-            DoneProvenance(kind='bogus')
+            DoneProvenance(kind='bogus')  # type: ignore[arg-type]
 
     def test_extra_subfields_retained_through_round_trip(self):
         dp = DoneProvenance(
             kind='deterministic-deploy-scheduled',
             unit='fused-memory.service',
-            transient_unit='fused-memory-restart-1234.service',
-            fire_delay_secs=5,
+            transient_unit='fused-memory-restart-1234.service',  # type: ignore[call-arg]
+            fire_delay_secs=5,  # type: ignore[call-arg]
         )
         dumped = dp.model_dump()
         assert dumped['transient_unit'] == 'fused-memory-restart-1234.service'
@@ -176,11 +176,11 @@ class TestMemoryHints:
 
     def test_non_list_entities_rejected(self):
         with pytest.raises(ValidationError):
-            MemoryHints(entities='not-a-list')
+            MemoryHints(entities='not-a-list')  # type: ignore[arg-type]
 
     def test_wrong_element_type_rejected(self):
         with pytest.raises(ValidationError):
-            MemoryHints(entities=[123])
+            MemoryHints(entities=[123])  # type: ignore[arg-type]
 
 
 class TestExternalDep:
@@ -256,7 +256,7 @@ class TestRetryLedger:
         assert RetryLedger(**dumped) == rl
 
     def test_unknown_counter_retained_through_round_trip(self):
-        rl = RetryLedger(x_new_counter=3)
+        rl = RetryLedger(x_new_counter=3)  # type: ignore[call-arg]
         dumped = rl.model_dump()
         assert dumped['x_new_counter'] == 3
 
@@ -277,10 +277,10 @@ class TestTaskMetadataFields:
     def test_nested_dicts_coerce_to_typed_submodels(self):
         tm = TaskMetadata(
             task_kind='deterministic',
-            before_done={'script': 'scripts/x.sh', 'timeout_secs': 60},
-            done_provenance={'kind': 'merged', 'commit': 'abc123'},
-            memory_hints={'entities': ['E'], 'queries': ['Q']},
-            retry_ledger={'consecutive_no_plan_failures': 2},
+            before_done={'script': 'scripts/x.sh', 'timeout_secs': 60},  # type: ignore[arg-type]
+            done_provenance={'kind': 'merged', 'commit': 'abc123'},  # type: ignore[arg-type]
+            memory_hints={'entities': ['E'], 'queries': ['Q']},  # type: ignore[arg-type]
+            retry_ledger={'consecutive_no_plan_failures': 2},  # type: ignore[arg-type]
         )
         assert isinstance(tm.before_done, BeforeDone)
         assert isinstance(tm.done_provenance, DoneProvenance)
@@ -299,13 +299,13 @@ class TestTaskMetadataFields:
     def test_deterministic_task_kind_with_before_done_accepted(self):
         tm = TaskMetadata(
             task_kind='deterministic',
-            before_done={'script': 'scripts/x.sh', 'timeout_secs': 60},
+            before_done={'script': 'scripts/x.sh', 'timeout_secs': 60},  # type: ignore[arg-type]
         )
         assert tm.task_kind == 'deterministic'
 
     def test_bad_task_kind_rejected(self):
         with pytest.raises(ValidationError):
-            TaskMetadata(task_kind='weird')
+            TaskMetadata(task_kind='weird')  # type: ignore[arg-type]
 
     def test_unknown_top_level_keys_round_trip(self):
         blob = {
@@ -328,7 +328,7 @@ class TestDeterministicInvariants:
         # deterministic + before_done + always_escalates=False [auto-deploy]
         TaskMetadata(
             task_kind='deterministic',
-            before_done=self._MINIMAL_BEFORE_DONE,
+            before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
             always_escalates=False,
         )
 
@@ -336,7 +336,7 @@ class TestDeterministicInvariants:
         # deterministic + before_done + always_escalates=True [act-then-ask]
         TaskMetadata(
             task_kind='deterministic',
-            before_done=self._MINIMAL_BEFORE_DONE,
+            before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
             always_escalates=True,
         )
 
@@ -356,7 +356,10 @@ class TestDeterministicInvariants:
     def test_before_done_only_valid_on_deterministic_rejected(self):
         # task_kind='normal' + before_done set [before_done only on deterministic]
         with pytest.raises(ValidationError):
-            TaskMetadata(task_kind='normal', before_done=self._MINIMAL_BEFORE_DONE)
+            TaskMetadata(
+                task_kind='normal',
+                before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+            )
 
 
 class _DeployStateStub(BaseModel):
@@ -460,13 +463,14 @@ class TestParseMetadataCore:
     def test_valid_json_string_parses_to_same_model(self):
         blob = {'task_kind': 'normal'}
         model, warnings = parse_metadata(json.dumps(blob), direction='read')
-        assert model == TaskMetadata(**blob)
+        assert model == TaskMetadata(**blob)  # type: ignore[arg-type]
         assert warnings == []
 
     def test_migration_applied_end_to_end_for_legacy_memory_hints(self):
         model, warnings = parse_metadata(
             {'memory_hints': [{'entity': 'E', 'query': 'Q'}]}, direction='read'
         )
+        assert model.memory_hints is not None
         assert model.memory_hints.entities == ['E']
         assert model.memory_hints.queries == ['Q']
         assert warnings == []
@@ -474,8 +478,8 @@ class TestParseMetadataCore:
     def test_registered_submodel_slice_validated_and_attached_no_warnings(self):
         register_metadata_submodel('deploy_state', _DeployStateStub)
         model, warnings = parse_metadata({'deploy_state': {'phase': 'rollout'}}, direction='write')
-        assert isinstance(model.deploy_state, _DeployStateStub)
-        assert model.deploy_state.phase == 'rollout'
+        assert isinstance(model.deploy_state, _DeployStateStub)  # type: ignore[attr-defined]
+        assert model.deploy_state.phase == 'rollout'  # type: ignore[attr-defined]
         assert warnings == []
 
     def test_unknown_top_level_key_survives_round_trip(self):
