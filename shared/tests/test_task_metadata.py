@@ -17,7 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 import shared.task_metadata as task_metadata_module
-from shared.task_metadata import BeforeDone, DoneProvenance, MemoryHints
+from shared.task_metadata import BeforeDone, DoneProvenance, ExternalDep, MemoryHints
 
 
 @pytest.fixture(autouse=True)
@@ -168,3 +168,36 @@ class TestMemoryHints:
     def test_wrong_element_type_rejected(self):
         with pytest.raises(ValidationError):
             MemoryHints(entities=[123])
+
+
+class TestExternalDep:
+    def test_constructs_from_fields(self):
+        dep = ExternalDep(project_id='dark_factory', task_id='42')
+        assert dep.project_id == 'dark_factory'
+        assert dep.task_id == '42'
+
+    def test_parse_splits_wire_form(self):
+        dep = ExternalDep.parse('dark_factory:42')
+        assert dep.project_id == 'dark_factory'
+        assert dep.task_id == '42'
+
+    def test_render_reproduces_wire_form(self):
+        dep = ExternalDep(project_id='dark_factory', task_id='42')
+        assert dep.render() == 'dark_factory:42'
+
+    @pytest.mark.parametrize('wire', ['dark_factory:42', 'a:b', 'proj-1:99'])
+    def test_parse_render_round_trips(self, wire):
+        assert ExternalDep.parse(wire).render() == wire
+
+    def test_parse_strips_whitespace(self):
+        dep = ExternalDep.parse('  a:b ')
+        assert dep.project_id == 'a'
+        assert dep.task_id == 'b'
+
+    @pytest.mark.parametrize(
+        'malformed',
+        ['foo', ':42', 'foo:', 'a:b:c', '', '   '],
+    )
+    def test_parse_rejects_malformed(self, malformed):
+        with pytest.raises((ValueError, ValidationError)):
+            ExternalDep.parse(malformed)
