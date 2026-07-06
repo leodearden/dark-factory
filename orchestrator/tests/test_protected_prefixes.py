@@ -15,7 +15,9 @@ pattern (``_init_repo`` via ``orchestrator.git_ops._run``,
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,7 @@ from orchestrator.git_ops import (
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME,
     PROTECTED_PREFIXES,
     GitOps,
+    ReapedInteractiveWorktree,
     _run,
 )
 
@@ -444,3 +447,86 @@ class TestPruneStaleMergeForeignBandRefusal:
             f'expected the owned _merge- worktree to be removed; got: {removed}'
         )
         assert not merge_wt.exists(), 'expected the owned worktree to be gone from disk'
+
+
+# ---------------------------------------------------------------------------
+# TestReapInteractiveForeignBandRefusal — sweep integration (step-9/10).
+#
+# Same false-RED pitfall as the prune sweep applies here: the foreign
+# candidate must be a REAL registered git worktree so the pre-guard
+# `git worktree remove --force` call actually succeeds and removes it
+# (reap_interactive_worktrees additionally falls through its
+# missing-`.task/interactive.json`-stamp branch to `reason='stale_no_stamp'`
+# for such a foreign worktree, so it reaches the removal call today).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapInteractiveForeignBandRefusal:
+    """RED — reap_interactive_worktrees consults _refuse_foreign_band (step-9/10)."""
+
+    async def test_foreign_band_survives_filter_bug_owned_still_reaped(
+        self, pp_git_repo: Path, monkeypatch, caplog,
+    ) -> None:
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+
+        # Owned candidate: a real, reapable `_iact-<slug>` worktree —
+        # backdated stamp so it is TTL-idle at `now`.
+        info = await git_ops.create_interactive_worktree('someslug')
+        now = datetime.now(UTC)
+        stamp_path = info.path / '.task' / 'interactive.json'
+        stamp = json.loads(stamp_path.read_text())
+        stamp['created_at'] = (
+            now - timedelta(seconds=config.interactive_worktree_ttl + 3600)
+        ).isoformat()
+        stamp_path.write_text(json.dumps(stamp))
+
+        # Foreign candidate: a real registered worktree under a FOREIGN band
+        # name (`_lane-`), simulating a filter bug that steers a foreign
+        # band's worktree into the reap sweep's removal step.
+        foreign_wt = git_ops.worktree_base / '_lane-foreign'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(foreign_wt), config.main_branch],
+            cwd=pp_git_repo,
+        )
+        assert rc == 0, f'failed to set up foreign worktree fixture: {err}'
+        assert foreign_wt.exists()
+
+        async def _fake_iter_interactive_worktrees():
+            yield info.path, info.path.resolve()
+            yield foreign_wt, foreign_wt.resolve()
+
+        monkeypatch.setattr(
+            git_ops, '_iter_interactive_worktrees', _fake_iter_interactive_worktrees,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        # Case (a): foreign band survives, is not reported reaped, and a
+        # WARNING from _refuse_foreign_band (not the unrelated "unreadable
+        # stamp" warning, which also happens to mention the path) names its
+        # band.
+        assert foreign_wt.exists(), (
+            'expected the foreign _lane- worktree to survive the sweep '
+            '(refused), but it was removed from disk'
+        )
+        assert not any(r.path == foreign_wt for r in reaped), (
+            f'expected the foreign worktree NOT to appear in the reaped list: {reaped!r}'
+        )
+        assert all(isinstance(r, ReapedInteractiveWorktree) for r in reaped)
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'belongs to protected band' in r.getMessage() and '_lane-' in r.getMessage()
+            for r in warnings
+        ), (
+            f'expected a _refuse_foreign_band WARNING naming the foreign '
+            f'band token (_lane-); got: {[r.getMessage() for r in warnings]!r}'
+        )
+
+        # Case (b): owned band still proceeds — reaped and removed from disk.
+        assert any(r.path == info.path for r in reaped), (
+            f'expected the owned _iact- worktree to be reaped; got: {reaped!r}'
+        )
+        assert not info.path.exists(), 'expected the owned worktree to be gone from disk'
