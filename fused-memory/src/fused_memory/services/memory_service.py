@@ -41,7 +41,7 @@ from fused_memory.reconciliation.recon_pool_map import (
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
-from fused_memory.utils.async_utils import gather_or_raise, propagate_cancellations
+from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.task_naming import canonicalize_task_node_name
 
 if TYPE_CHECKING:
@@ -2611,10 +2611,10 @@ class MemoryService:
         1. Target selection — entity_uuids (targeted, bypasses detection) takes
            precedence over detect_stale_with_edges (force=False) or
            list_entity_nodes (force=True).
-        2. Fan-out — asyncio.Semaphore(20) + asyncio.gather(return_exceptions=True)
+        2. Fan-out — asyncio.Semaphore(20) + gather_collect (fused_memory.utils.async_utils)
            calling graphiti.rebuild_entity_from_edges for each target.
-        3. Error accumulation — two-tier: propagate_cancellations (Pass 1) then
-           per-entity dict accumulation (Pass 2).
+        3. Error accumulation — two-tier: gather_collect's Pass 1 (cancellation
+           propagation) then per-entity dict accumulation (Pass 2).
 
         Logs the operation via write journal if available.
 
@@ -2717,13 +2717,9 @@ class MemoryService:
                             old_summary=t['old_summary'],
                         )
 
-                gather_results = await asyncio.gather(
-                    *(_rebuild_one(t) for t in targets), return_exceptions=True
-                )
-
                 # Pass 1: propagate CancelledError before per-entity accumulation.
                 try:
-                    propagate_cancellations(gather_results)
+                    gather_results = await gather_collect(_rebuild_one(t) for t in targets)
                 except BaseException as e:
                     if not isinstance(e, Exception):
                         logger.warning(
