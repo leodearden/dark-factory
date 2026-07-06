@@ -5952,6 +5952,265 @@ class TestRequeueCooldownGc:
 
 
 # ---------------------------------------------------------------------------
+# metadata.deferred_watch dispatch gate (task 2234)
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredWatchDispatchGate:
+    """A task carrying metadata.deferred_watch=true must be excluded from
+    normal dispatch until an explicit operator reactivation signal is
+    present, regardless of status/deps/cooldown otherwise passing.
+
+    metadata.trigger is human-readable prose (e.g. "graphiti-core upstream
+    release correcting per-node-pair over-invalidation") and is never
+    evaluated by the scheduler — "trigger met" is defined operationally as
+    a truthy metadata.trigger_met, or a hard clear of metadata.deferred_watch
+    itself (see docstring on Scheduler._deferred_watch_gated).
+    """
+
+    def test_pending_deferred_watch_task_with_unmet_trigger_is_ineligible(self):
+        """A pending task with deferred_watch=True and no reactivation signal
+        (metadata.trigger_met absent) must be INELIGIBLE for dispatch.
+
+        This is RED on current code: no deferred_watch gate exists yet, so
+        _eligible_for_dispatch currently returns (True, None) for this task
+        (status=pending, no deps, no requeue/dispatch-cooldown signal).
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        task = {
+            'id': '2217',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': True,
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+            },
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '2217', status_map)
+
+        assert result == (False, None), (
+            f'Expected a pending deferred_watch task with an unmet trigger to '
+            f'be ineligible for dispatch; got: {result}'
+        )
+
+    def test_pending_deferred_watch_task_with_trigger_met_is_eligible(self):
+        """A deferred_watch task with a truthy metadata.trigger_met (the
+        operator reactivation signal) must be ELIGIBLE for dispatch, even
+        though deferred_watch itself is still True (kept as provenance).
+
+        This is RED against step-2's minimal gate, which blocks any truthy
+        deferred_watch unconditionally — it does not yet consult trigger_met.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        task = {
+            'id': '2217',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': True,
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+                'trigger_met': True,
+            },
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '2217', status_map)
+
+        assert result == (True, None), (
+            f'Expected a deferred_watch task with trigger_met=True to be '
+            f'eligible for dispatch; got: {result}'
+        )
+
+    def test_pending_task_with_deferred_watch_cleared_is_eligible(self):
+        """A task with deferred_watch=False (a hard manual un-defer) must be
+        ELIGIBLE for dispatch — clearing deferred_watch releases the gate
+        without requiring trigger_met.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        task = {
+            'id': '2217',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': False,
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+            },
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '2217', status_map)
+
+        assert result == (True, None), (
+            f'Expected a task with deferred_watch cleared to be eligible for '
+            f'dispatch; got: {result}'
+        )
+
+    def test_pending_deferred_watch_task_with_timestamp_trigger_met_is_eligible(self):
+        """metadata.trigger_met is documented as accepting a timestamp string
+        (an operator recording *when* they confirmed the upstream condition),
+        not just bool True. Any truthy value must count as the reactivation
+        signal.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        task = {
+            'id': '2217',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': True,
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+                'trigger_met': '2026-07-06T00:00:00Z',
+            },
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '2217', status_map)
+
+        assert result == (True, None), (
+            f'Expected a deferred_watch task with a timestamp-string '
+            f'trigger_met to be eligible for dispatch; got: {result}'
+        )
+
+    def test_pending_task_with_truthy_non_bool_deferred_watch_is_gated(self):
+        """metadata.deferred_watch is documented as accepting any truthy
+        value, not just bool True (e.g. a non-empty string). Plain
+        truthiness must gate the task the same as bool True would.
+        """
+        now = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=lambda: now)
+
+        task = {
+            'id': '2217',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': 'yes',
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+            },
+        }
+        status_map: dict[str, str] = {}
+
+        result = scheduler._eligible_for_dispatch(task, '2217', status_map)
+
+        assert result == (False, None), (
+            f'Expected a truthy non-bool deferred_watch value to gate the '
+            f'task same as bool True; got: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_skips_deferred_watch_task_and_dispatches_normal_task(
+        self, monkeypatch
+    ):
+        """acquire_next must never select a pending deferred_watch task with
+        an unmet trigger, even with a normal pending task co-present that
+        gets dispatched instead.
+
+        Because the gate lives inside _eligible_for_dispatch — the single
+        source of truth used by both the scored-candidate loop and the
+        pin-dispatch loop — the deferred_watch task never enters
+        acquire_next's `candidates` list. It is therefore invisible to the
+        starvation watchdog and files no dispatch/lock/starvation event: the
+        user-observable acceptance signal from the task description (no more
+        spurious L1->L2 escalations like esc-2217-10).
+
+        This test passes immediately given the step-4 gate already wired
+        through _eligible_for_dispatch; it pins the acquire_next-level wiring
+        as a regression guard.
+        """
+        import json as _json
+
+        base_time = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(
+            config,
+            event_store=event_store,  # type: ignore[arg-type]
+            time_source=lambda: base_time,
+        )
+
+        deferred_task = {
+            'id': '2217',
+            'title': 'Deferred-watch task (unmet trigger)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': True,
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+                'files': ['fused-memory'],
+            },
+        }
+        normal_task = {
+            'id': '99',
+            'title': 'Normal pending task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend']},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': _json.dumps({'tasks': [deferred_task, normal_task]}),
+                    }
+                ]
+            }
+        }
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None and result.task_id == '99', (
+            f'Expected the normal task (99) to be dispatched, never the '
+            f'deferred_watch task (2217); got: {result}'
+        )
+
+        events_for_deferred_task = [
+            e for e in event_store.events if e[1].get('task_id') == '2217'
+        ]
+        assert events_for_deferred_task == [], (
+            f'Expected NO events recorded for the gated deferred_watch task '
+            f'2217 (it never enters the candidate pool, so it must file no '
+            f'dispatch/lock/starvation event); got: {events_for_deferred_task}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Park-and-stop pause mechanism (task 1322)
 # ---------------------------------------------------------------------------
 

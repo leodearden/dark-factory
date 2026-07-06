@@ -2744,6 +2744,39 @@ class Scheduler:
             if deadline <= now:
                 del self._requeue_until[tid]
 
+    def _deferred_watch_gated(self, task: dict) -> bool:
+        """Return True when *task* must be withheld from dispatch as a
+        deferred-watch item (task 2234).
+
+        ``metadata.trigger`` is human-readable prose describing an upstream
+        reactivation condition (e.g. "graphiti-core upstream release
+        correcting per-node-pair over-invalidation") and is never parsed or
+        evaluated here — the scheduler cannot judge prose. Instead, "trigger
+        met" is defined operationally as an explicit operator action, one of:
+
+        - setting ``metadata.trigger_met`` to a truthy value (bool ``True``
+          or a timestamp string), reactivating dispatch while leaving
+          ``deferred_watch`` in place as durable provenance that this was a
+          watch item; or
+        - clearing/removing ``metadata.deferred_watch`` entirely, a hard
+          manual un-defer.
+
+        Plain truthiness is used throughout (matching the codebase's existing
+        metadata-flag convention) so bool ``True``, ``1``, and non-empty
+        timestamp strings all count as "set".
+
+        Operator footgun: truthiness here is Python's, not English's.
+        ``metadata.deferred_watch = "false"`` is a non-empty string and is
+        therefore truthy — it still gates the task. Conversely
+        ``metadata.trigger_met = ""`` is falsy and will NOT reactivate
+        dispatch. To un-defer, either clear ``deferred_watch`` (set it to
+        bool ``False`` or remove the key) or set ``trigger_met`` to a
+        genuinely truthy value such as bool ``True`` or a non-empty
+        timestamp string.
+        """
+        metadata = task.get('metadata') or {}
+        return bool(metadata.get('deferred_watch')) and not metadata.get('trigger_met')
+
     def _eligible_for_dispatch(
         self,
         task: dict,
@@ -2788,6 +2821,8 @@ class Scheduler:
         if task.get('status') != 'pending':
             return False, None
         if tid in self._dispatched:
+            return False, None
+        if self._deferred_watch_gated(task):
             return False, None
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
