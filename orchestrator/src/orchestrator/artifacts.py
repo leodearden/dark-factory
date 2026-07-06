@@ -162,8 +162,21 @@ class ReviewAggregation:
 class TaskArtifacts:
     """Manages .task/ directory in a worktree."""
 
-    def __init__(self, worktree: Path):
-        self.root = worktree / '.task'
+    def __init__(self, worktree: Path, meta_root: Path | None = None):
+        """
+        Args:
+            worktree: The task's git worktree.
+            meta_root: Optional `.task-meta` root (see ``meta_root_for``).
+                When omitted (``None``), ``self.root`` falls back to the
+                legacy ``<worktree>/.task`` path and this class behaves
+                byte-identically to before this argument existed. When
+                supplied, all writes target ``meta_root`` and reads fall
+                back to the legacy path only when the new path is absent
+                (see ``_read_path``).
+        """
+        self.worktree = worktree
+        self._legacy_root = worktree / '.task'
+        self.root = meta_root if meta_root is not None else self._legacy_root
 
     @staticmethod
     def meta_root_for(worktree_base: Path, worktree_name: str) -> Path:
