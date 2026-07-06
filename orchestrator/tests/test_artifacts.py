@@ -1359,3 +1359,108 @@ class TestUniformReadFallback:
         # Legacy copy must be untouched by the write-back.
         legacy_metadata = json.loads((legacy_root / 'metadata.json').read_text())
         assert legacy_metadata['base_commit'] == 'old-sha'
+
+
+class TestClearRemovesLegacyDuringCompat:
+    """clear_* must remove the artifact from BOTH the new and legacy paths
+    during the compat window — otherwise a clear that only unlinks the new
+    (absent) path is a no-op on a legacy-only artifact, and the paired
+    read_*() resurrects it via the new-then-old fallback.
+    """
+
+    @pytest.fixture
+    def meta_root(self, worktree: Path) -> Path:
+        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+    @pytest.fixture
+    def legacy_root(self, worktree: Path) -> Path:
+        return worktree / '.task'
+
+    def test_clear_blocking_dependency_removes_legacy(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'blocking_dependency.json').write_text(json.dumps({
+            'depends_on_task_id': 'task-9',
+            'reason': 'blocked',
+            'main_sha_at_report': 'sha1',
+            'reported_at': 'now',
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.clear_blocking_dependency()
+
+        assert not (legacy_root / 'blocking_dependency.json').exists()
+        assert ta.read_blocking_dependency() is None
+
+    def test_clear_already_done_removes_legacy(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'already_done.json').write_text(json.dumps({
+            'commit': 'abc123',
+            'evidence': 'already merged',
+            'reported_at': 'now',
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.clear_already_done()
+
+        assert not (legacy_root / 'already_done.json').exists()
+        assert ta.read_already_done() is None
+
+    def test_clear_unactionable_task_removes_legacy(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'unactionable_task.json').write_text(json.dumps({
+            'reason': 'false premise',
+            'evidence': 'contradiction',
+            'reported_at': 'now',
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.clear_unactionable_task()
+
+        assert not (legacy_root / 'unactionable_task.json').exists()
+        assert ta.read_unactionable_task() is None
+
+    def test_clear_false_premise_removes_legacy(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'false_premise.json').write_text(json.dumps({
+            'classification': 'unreachable',
+            'premise': 'the RED test premise',
+            'evidence': 'evidence text',
+            'proposed_resolution': 'respec',
+            'reported_at': 'now',
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.clear_false_premise()
+
+        assert not (legacy_root / 'false_premise.json').exists()
+        assert ta.read_false_premise() is None
+
+    def test_clear_agent_session_removes_legacy(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        (legacy_root / 'agent_session.json').write_text(json.dumps({
+            'session_id': 'legacy-session',
+            'role': 'implementer',
+            'started_at': 'now',
+            'owner_pid': 123,
+        }))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.clear_agent_session()
+
+        assert not (legacy_root / 'agent_session.json').exists()
+        assert ta.read_agent_session() is None
