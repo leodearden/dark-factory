@@ -261,3 +261,107 @@ class TestClassifyInvocationCliLocalError:
         )
         outcome = classify_invocation(result, strict_confirm=True)
         assert outcome == AuthFailed(status=401)
+
+
+class TestClassifyInvocationClaudeCap:
+    """Claude CapHit/NearCap detection and the strict_confirm (DD-2) toggle."""
+
+    def test_relative_hours_cap_with_confirm_keyword(self):
+        result = AgentResult(
+            success=False,
+            output="You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CapHit)
+        assert outcome.resets_at is not None
+
+    def test_cap_prefix_with_no_parseable_reset_time_yields_resets_at_none(self):
+        result = AgentResult(
+            success=False,
+            output="You've used all available credits. Upgrade your plan for more capacity.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CapHit)
+        assert outcome.resets_at is None
+
+    def test_out_of_extra_usage_prefix_is_cap_hit(self):
+        result = AgentResult(
+            success=False,
+            output="You're out of extra usage for this billing period. Your plan resets in 2h.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CapHit)
+        assert outcome.resets_at is not None
+
+    def test_now_using_extra_prefix_is_cap_hit(self):
+        result = AgentResult(
+            success=False,
+            output="You're now using extra compute credits. Your plan resets in 1h.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CapHit)
+
+    def test_absolute_date_reset_is_cap_hit_with_resets_at(self):
+        result = AgentResult(
+            success=False,
+            output=(
+                "You've hit your usage limit for Claude Pro. "
+                'Your plan resets on Apr 10, 9pm (UTC).'
+            ),
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CapHit)
+        assert outcome.resets_at is not None
+
+    def test_near_cap_close_to_usage_limit(self):
+        result = AgentResult(
+            success=False,
+            output="You're close to reaching your usage limit. Your plan resets in 1h.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, NearCap)
+
+    def test_near_cap_close_to_plan_limit(self):
+        result = AgentResult(
+            success=False,
+            output="You're close to reaching your plan limit. Your plan resets in 5h.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, NearCap)
+
+    def test_strict_confirm_true_prefix_without_confirm_keyword_is_failure(self):
+        """Prefix present ('You're out of extra') but no CAP_CONFIRM_KEYWORDS hit."""
+        result = AgentResult(
+            success=False,
+            output="You're out of extra usage for this billing period.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, Failure)
+
+    def test_strict_confirm_false_accepts_prefix_only(self):
+        """DD-2: the probe regime (strict_confirm=False) skips the confirm-keyword guard."""
+        result = AgentResult(
+            success=False,
+            output="You're out of extra usage for this billing period.",
+        )
+        outcome = classify_invocation(result, strict_confirm=False)
+        assert isinstance(outcome, CapHit)
+        assert outcome.resets_at is None
+
+    def test_negative_hit_the_nail_no_prefix_match(self):
+        result = AgentResult(success=False, output="You've hit the nail on the head")
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, Failure)
+
+    def test_negative_bare_upgrade_without_plan_or_subscription(self):
+        result = AgentResult(
+            success=False,
+            output="You've used all available credits. Upgrade for more capacity.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, Failure)
+
+    def test_negative_close_to_finish_line_without_confirm_keyword(self):
+        result = AgentResult(success=False, output="You're close to the finish line")
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, Failure)
