@@ -76,6 +76,18 @@ class IllegalLaneTransition(Exception):
     """
 
 
+class CorruptLaneRecord(Exception):
+    """Raised internally when a lane's record file exists but fails to parse.
+
+    Distinct from "no record yet" (``None``): a corrupt record must never be
+    silently treated as a fresh, pre-record lane (PRD I2, never silent-heal).
+    ``LaneLifecycle.read()`` still maps this to ``None`` for callers that only
+    care about "current state or absent", but ``transition()`` catches it
+    separately so it can refuse (and escalate) rather than fall through to
+    the ``None``-origin legal-transition logic.
+    """
+
+
 @dataclass
 class LaneRecord:
     """Durable per-lane record (PRD W11 Contract): ``.lane-state/<lane>.json``.
@@ -150,16 +162,29 @@ class LaneLifecycle:
 
     def read(self, lane: Path | str) -> LaneRecord | None:
         """Return the durable record for *lane*, or ``None`` if absent/corrupt."""
+        try:
+            return self._read_or_raise(lane)
+        except CorruptLaneRecord:
+            logger.warning(
+                'lane_lifecycle: failed to parse record for lane %s',
+                Path(lane).name, exc_info=True,
+            )
+            return None
+
+    def _read_or_raise(self, lane: Path | str) -> LaneRecord | None:
+        """Return the durable record for *lane*, or ``None`` if no file exists.
+
+        Raises ``CorruptLaneRecord`` (instead of returning ``None``) when a
+        record file exists but fails to parse, so ``transition()`` can tell
+        "no record yet" apart from "record present but unreadable".
+        """
         path = self._record_path(lane)
         if not path.is_file():
             return None
         try:
             return LaneRecord.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            logger.warning(
-                'lane_lifecycle: failed to parse record at %s', path, exc_info=True,
-            )
-            return None
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise CorruptLaneRecord(f'unparseable lane record at {path}') from exc
 
     def _write(self, lane: Path | str, record: LaneRecord) -> None:
         """Atomically write *record* for *lane* (tmp file + os.replace).
@@ -185,19 +210,49 @@ class LaneLifecycle:
     def transition(self, lane: Path | str, to: LaneState, **fields: object) -> LaneRecord:
         """The one mutator: validate (from, to), persist, return the new record.
 
-        On an illegal edge: files a best-effort born-at-L2 escalation (if an
+        Rejects unknown ``**fields`` keys with ``TypeError`` before doing any
+        I/O, so a caller typo (e.g. ``seeded_sha=`` instead of
+        ``seeded_from_sha=``) fails loudly instead of silently vanishing on
+        persist (``to_dict``/``asdict`` only ever see declared fields).
+
+        On an illegal edge, or a *corrupt* on-disk record (see
+        ``CorruptLaneRecord``) when ``to`` is anything other than
+        ``QUARANTINED``: files a best-effort born-at-L2 escalation (if an
         escalation queue is wired) and raises ``IllegalLaneTransition``
-        WITHOUT touching the on-disk record (PRD I2, never silent-heal).
+        WITHOUT touching the on-disk record (PRD I2, never silent-heal). A
+        corrupt record is never silently treated as a fresh, ``None``-origin
+        lane.
 
         On a legal edge: merges **fields onto the current record (or an
-        all-``None`` base if this is the first transition), stamps ``state``
+        all-``None`` base if this is the first transition, or if the prior
+        record was corrupt and ``to`` is ``QUARANTINED``), stamps ``state``
         and ``updated_at``, clears ``task_id``/``title`` on the ``RELEASED``
         edge, atomically writes, and returns the new record.
         """
-        current = self.read(lane)
+        unknown_fields = set(fields) - set(LaneRecord.__dataclass_fields__)
+        if unknown_fields:
+            raise TypeError(
+                f'LaneLifecycle.transition: unknown LaneRecord field(s) '
+                f'{sorted(unknown_fields)!r}'
+            )
+
+        try:
+            current = self._read_or_raise(lane)
+            corrupt = False
+        except CorruptLaneRecord:
+            current = None
+            corrupt = True
+
         current_state = current.state if current is not None else None
 
-        if (current_state, to) not in LEGAL_TRANSITIONS:
+        if corrupt and to is not LaneState.QUARANTINED:
+            self._file_corrupt_record_escalation(lane, to)
+            raise IllegalLaneTransition(
+                f'lane {Path(lane).name!r} has a corrupt durable record; '
+                f'refusing transition to {to} (repair or quarantine required)'
+            )
+
+        if not corrupt and (current_state, to) not in LEGAL_TRANSITIONS:
             self._file_illegal_transition_escalation(lane, current_state, to)
             raise IllegalLaneTransition(
                 f'illegal lane transition for lane {Path(lane).name!r}: '
@@ -221,15 +276,14 @@ class LaneLifecycle:
         self._write(lane, record)
         return record
 
-    def _file_illegal_transition_escalation(
-        self, lane: Path | str, current_state: LaneState | None, to: LaneState,
-    ) -> None:
-        """Best-effort born-at-L2 filer for an illegal transition attempt.
+    def _file_escalation(self, lane: Path | str, *, summary: str, detail: str) -> None:
+        """Best-effort born-at-L2 filer shared by the illegal-transition and
+        corrupt-record paths.
 
         No-op when no escalation queue is wired (bare unit-test / unwired
         contexts stay green, mirrors
         ``Harness._file_pool_storage_absent_escalation``). Any submit failure
-        is swallowed + logged so escalation filing never masks the
+        is swallowed + logged so escalation filing never masks the caller's
         ``IllegalLaneTransition`` raise.
         """
         if self._escalation_queue is None:
@@ -237,32 +291,54 @@ class LaneLifecycle:
         try:
             from escalation.models import Escalation  # noqa: PLC0415
 
-            lane_name = Path(lane).name
-            sentinel_task_id = f'lane-lifecycle-{lane_name}'
+            sentinel_task_id = f'lane-lifecycle-{Path(lane).name}'
             esc = Escalation(
                 id=self._escalation_queue.make_id(sentinel_task_id),
                 task_id=sentinel_task_id,
                 agent_role=ESCALATION_SENTINEL_ROLE,
                 severity='critical',
                 category='risk_identified',
-                summary=(
-                    f'Illegal lane transition on {lane_name!r}: '
-                    f'{current_state} -> {to}'
-                )[:200],
-                detail=(
-                    f'LaneLifecycle.transition rejected an illegal edge for lane '
-                    f'{lane_name!r}: current state={current_state}, requested '
-                    f'transition to={to}. The durable record was left unchanged '
-                    '(never silent-heal, PRD W11 I2).'
-                ),
+                summary=summary[:200],
+                detail=detail,
                 level=2,
             )
             self._escalation_queue.submit(esc)
         except Exception:
             logger.warning(
-                'lane_lifecycle: failed to file illegal-transition escalation '
-                'for lane %s', Path(lane).name, exc_info=True,
+                'lane_lifecycle: failed to file escalation for lane %s',
+                Path(lane).name, exc_info=True,
             )
+
+    def _file_illegal_transition_escalation(
+        self, lane: Path | str, current_state: LaneState | None, to: LaneState,
+    ) -> None:
+        """Best-effort born-at-L2 filer for an illegal transition attempt."""
+        lane_name = Path(lane).name
+        self._file_escalation(
+            lane,
+            summary=f'Illegal lane transition on {lane_name!r}: {current_state} -> {to}',
+            detail=(
+                f'LaneLifecycle.transition rejected an illegal edge for lane '
+                f'{lane_name!r}: current state={current_state}, requested '
+                f'transition to={to}. The durable record was left unchanged '
+                '(never silent-heal, PRD W11 I2).'
+            ),
+        )
+
+    def _file_corrupt_record_escalation(self, lane: Path | str, to: LaneState) -> None:
+        """Best-effort born-at-L2 filer for a corrupt on-disk record."""
+        lane_name = Path(lane).name
+        self._file_escalation(
+            lane,
+            summary=f'Corrupt lane record for {lane_name!r}; refused transition to {to}',
+            detail=(
+                f'LaneLifecycle.transition found an unparseable durable record '
+                f'for lane {lane_name!r} and refused the requested transition '
+                f'to {to} rather than silently treating it as a fresh '
+                '(None-origin) lane. Manual repair or quarantine (any -> '
+                'QUARANTINED is always legal) is required.'
+            ),
+        )
 
     async def quarantine(self, lane: Path | str, branch: str, reason: str) -> Path | None:
         """Delegate the git-side relocation, then record the QUARANTINED edge.
@@ -270,8 +346,19 @@ class LaneLifecycle:
         Requires an injected ``quarantine_worktree`` callable (raises
         ``RuntimeError`` if unwired). ``any -> QUARANTINED`` is always legal
         (see ``LEGAL_TRANSITIONS``), so the durable record transition below
-        never raises ``IllegalLaneTransition``; it is preserved beside the
-        relocated worktree.
+        never raises ``IllegalLaneTransition``.
+
+        The durable record's on-disk location never moves: it always stays
+        at ``<worktree_base>/.lane-state/<lane>.json`` (keyed by lane name).
+        It is NOT written beside the relocated worktree, even though
+        ``quarantine_worktree`` moves the git worktree elsewhere (typically
+        under ``GitOps.quarantine_base``).
+
+        Ordering caveat: the git-side relocation happens first and the
+        ``QUARANTINED`` record write second. If relocation succeeds but the
+        subsequent ``transition()`` write then fails, there is a transient
+        window where the worktree has already moved while the durable record
+        still reflects its pre-quarantine state.
         """
         if self._quarantine_worktree is None:
             raise RuntimeError(
