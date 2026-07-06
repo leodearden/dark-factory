@@ -8,6 +8,7 @@ scripts rather than depending on test_git_ops.py's module-level helpers.
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -229,3 +230,68 @@ class TestAbortLaneAcquisitionWipAndRetention:
 
         rc, _, _ = await _run(['git', 'rev-parse', '--verify', 'task/X'], cwd=git_repo)
         assert rc != 0, 'Degenerate 0-commits-beyond-main branch must be DELETED'
+
+
+# ---------------------------------------------------------------------------
+# acquire_warm_lane's top-level except — load-bearing PRD fault-injection
+# (task-2062 residual: a commit() fault inside the in-memory reuse path must
+# not leak a checked-out branch into the FREE pool) (step 7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcquireWarmLaneReuseFaultRoutesThroughAbort:
+    """acquire_warm_lane's top-level except must detach before releasing."""
+
+    async def test_reuse_path_commit_fault_detaches_and_no_collision(
+        self, git_repo: Path, caplog,
+    ):
+        """A commit() fault inside the in-memory reuse path (_reuse_warm_lane
+        -> commit() -> RuntimeError) must be caught by acquire_warm_lane's
+        top-level except and routed through _abort_lane_acquisition, so the
+        lane's HEAD is detached (not left checked out on task/R) before the
+        pool slot is freed — otherwise a follow-up acquire can collide with
+        'already used by worktree'.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        # Create-once: seeds the lane and maps 'R' -> lane in the pool.
+        info = await git_ops.acquire_warm_lane('R', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+
+        # Second acquire of the SAME task, no release between: in-memory
+        # reuse -> _reuse_warm_lane -> commit() raises -> propagates to the
+        # top-level except.
+        with patch.object(
+            git_ops, 'commit', side_effect=RuntimeError('Commit failed: injected'),
+        ):
+            result = await git_ops.acquire_warm_lane('R', start_ref)
+
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'Expected FAULT from the injected commit() failure; got {result!r}'
+        )
+
+        _, branch, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=info.path,
+        )
+        assert branch.strip() == 'HEAD', (
+            f'Expected detached HEAD after the reuse-path fault; got branch={branch.strip()!r}'
+        )
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE, (
+            'Pool slot must be FREE after the fault teardown'
+        )
+
+        # Outside the patch: a follow-up acquire must succeed cleanly, with
+        # no 'already used by worktree' collision logged.
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            followup = await git_ops.acquire_warm_lane('R', start_ref)
+
+        assert isinstance(followup, WorktreeInfo), (
+            f'Expected the follow-up acquire to succeed; got {followup!r}'
+        )
+        assert 'already used by worktree' not in caplog.text, (
+            f'Follow-up acquire must not collide with a leaked checkout:\n{caplog.text}'
+        )
