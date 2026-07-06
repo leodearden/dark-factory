@@ -19,9 +19,12 @@ from typing import NewType
 
 from pydantic import BaseModel, field_validator
 
-from fused_memory.utils.validation import _to_underscore_canonical, canonicalize_project_id
-
-from fused_memory.utils.validation import InputValidationError, require_project_root
+from fused_memory.utils.validation import (
+    InputValidationError,
+    _to_underscore_canonical,
+    canonicalize_project_id,
+    require_project_root,
+)
 
 logger = logging.getLogger(__name__)
 
