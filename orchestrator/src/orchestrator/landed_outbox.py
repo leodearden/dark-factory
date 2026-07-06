@@ -102,6 +102,10 @@ class LandedOutbox:
             return None
         return LandedRow(task_id=task_id, **value)
 
+    def all(self) -> list[LandedRow]:
+        """Return every landed row currently in the outbox (for the startup reconciler)."""
+        return [LandedRow(task_id=k, **v) for k, v in self._cache.items()]
+
     # ------------------------------------------------------------------
     # Internal I/O (mirrors merge_queue_store._load_raw/_save_raw)
     # ------------------------------------------------------------------
