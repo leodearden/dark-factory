@@ -897,7 +897,14 @@ class TestRunSlotSubstrateGateWiring:
     Tests verify the gate integration in _run_slot BEFORE TaskWorkflow construction:
     (a) FLIP → TaskWorkflow never constructed / workflow.run never awaited, cooldown armed.
     (b) PASS → TaskWorkflow IS constructed and workflow.run IS awaited.
-    (c) NO-PROBE → gate never invoked (carries_substrate_probe=False), workflow proceeds.
+    (c) NO-PROBE → gate never invoked (task metadata carries no substrate_probe key), workflow proceeds.
+
+    Task 2121: _run_slot's dispatch gate now calls substrate_gate.carries_substrate_probe
+    (module-level, key-presence) directly on assignment.task instead of consulting
+    Scheduler.carries_substrate_probe (deleted — it diverged from the module predicate
+    and is why task 2121 exists). Gate routing below is therefore driven entirely by the
+    task metadata _make_assignment(probe=...) builds; no scheduler-level stub is needed
+    or consulted.
     """
 
     @pytest.mark.asyncio
@@ -905,7 +912,6 @@ class TestRunSlotSubstrateGateWiring:
         """(a) FLIP: TaskWorkflow must NOT be constructed when gate returns False."""
         h = _make_slot_harness(tmp_path)
         assignment = _make_assignment(probe=True)
-        h.scheduler.carries_substrate_probe = MagicMock(return_value=True)
         h._run_substrate_gate = AsyncMock(return_value=False)
         # _block_and_escalate_substrate_flip is called inside _run_substrate_gate (already mocked);
         # stub it here too so the gate-returning-False path is clean.
@@ -940,7 +946,6 @@ class TestRunSlotSubstrateGateWiring:
         """(b) PASS: TaskWorkflow MUST be constructed and workflow.run awaited."""
         h = _make_slot_harness(tmp_path)
         assignment = _make_assignment(probe=True)
-        h.scheduler.carries_substrate_probe = MagicMock(return_value=True)
         h._run_substrate_gate = AsyncMock(return_value=True)
 
         sem = MagicMock()
@@ -965,7 +970,6 @@ class TestRunSlotSubstrateGateWiring:
         """(c) NO-PROBE: gate must NOT be invoked when carries_substrate_probe is False."""
         h = _make_slot_harness(tmp_path)
         assignment = _make_assignment(probe=False)
-        h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
         gate_mock = AsyncMock(return_value=True)
         h._run_substrate_gate = gate_mock
 
