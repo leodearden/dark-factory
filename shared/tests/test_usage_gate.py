@@ -999,3 +999,106 @@ class TestTransitionCore:
         assert a.phase == AccountPhase.CAPPED
         assert b.phase == AccountPhase.AVAILABLE
         assert gate._open.is_set() is True
+
+
+# ---------------------------------------------------------------------------
+# step-05/06: _transition legality — _LEGAL_TRANSITIONS table (PRD §7.3),
+# raise-before-mutate on illegal edges (B1), and the force=True escape hatch
+# reserved for _on_sighup_async's operator-driven hard reset.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTransitionLegality:
+    """step-05: illegal edges raise IllegalTransitionError; state unchanged."""
+
+    async def test_illegal_edge_raises_and_state_unchanged(self):
+        """AUTH_FAILED -> PROBE_IN_FLIGHT is not in the legal-transitions table."""
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        open_before = gate._open.is_set()
+
+        with pytest.raises(IllegalTransitionError):
+            gate._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
+
+        assert acct.phase == AccountPhase.AUTH_FAILED
+        assert gate._open.is_set() == open_before
+
+    async def test_capped_to_available_without_force_raises(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+
+        with pytest.raises(IllegalTransitionError):
+            gate._transition(acct, AccountPhase.AVAILABLE)
+
+        assert acct.phase == AccountPhase.CAPPED
+
+    async def test_capped_self_loop_raises(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+
+        with pytest.raises(IllegalTransitionError):
+            gate._transition(acct, AccountPhase.CAPPED)
+
+        assert acct.phase == AccountPhase.CAPPED
+
+    async def test_available_to_probing_raises(self):
+        """AVAILABLE may only go to CAPPED or AUTH_FAILED — PROBING is only
+        reachable from CAPPED (post-reset) or PROBE_IN_FLIGHT (demotion)."""
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        assert acct.phase == AccountPhase.AVAILABLE
+
+        with pytest.raises(IllegalTransitionError):
+            gate._transition(acct, AccountPhase.PROBING)
+
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    async def test_illegal_edge_logs_error(self, caplog):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+
+        with (
+            caplog.at_level(logging.ERROR, logger='shared.usage_gate'),
+            pytest.raises(IllegalTransitionError),
+        ):
+            gate._transition(acct, AccountPhase.AVAILABLE)
+
+        assert any(
+            'capped' in record.message.lower()
+            and 'available' in record.message.lower()
+            and acct.name in record.message
+            for record in caplog.records
+        ), (
+            f'Expected a logger.error naming the illegal edge, '
+            f'got: {[r.message for r in caplog.records]}'
+        )
+
+    async def test_force_bypasses_legality_check(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        gate._open.clear()
+
+        gate._transition(acct, AccountPhase.AVAILABLE, force=True)  # must not raise
+
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+
+    async def test_legal_edges_from_transition_core_still_do_not_raise(self):
+        """Regression guard: the full legal chain from TestTransitionCore
+        (AVAILABLE -> CAPPED -> PROBING -> PROBE_IN_FLIGHT -> AVAILABLE)
+        must not raise now that legality is enforced."""
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+
+        gate._transition(acct, AccountPhase.CAPPED)
+        gate._transition(acct, AccountPhase.PROBING)
+        gate._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
+        gate._transition(acct, AccountPhase.AVAILABLE)
+
+        assert acct.phase == AccountPhase.AVAILABLE
