@@ -2282,7 +2282,14 @@ class TestAggregateCostTrendNowThreading:
 class TestAggregateNowThreading:
     """Each _cutoff-routed aggregator must resolve `now` once and thread the
     identical value to every per-DB call — not let each per-DB call resolve
-    the clock independently (the exact race this task closes)."""
+    the clock independently (the exact race this task closes).
+
+    Note: aggregate_run_cost_breakdown is not currently invoked by any
+    dashboard route (no reference in app.py), so its coverage here is
+    data-layer-only — there is no route-level shared-now assertion for it
+    analogous to test_costs_route_threads_shared_now_to_all_aggregates in
+    test_app.py. If a route starts consuming it, add one.
+    """
 
     @pytest.mark.asyncio
     async def test_injected_now_threaded_identically(self, fn_under_test, two_conns):

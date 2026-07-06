@@ -888,7 +888,16 @@ async def aggregate_run_cost_breakdown(
     limit: int = 500,
     now: datetime | None = None,
 ) -> list[dict]:
-    """Merge :func:`get_run_cost_breakdown` from multiple databases."""
+    """Merge :func:`get_run_cost_breakdown` from multiple databases.
+
+    Not currently invoked by any dashboard route (data-layer-only surface
+    as of task 2170 — no reference in ``app.py``); its `now` threading is
+    exercised by ``TestAggregateNowThreading`` at the data layer only. If a
+    future route consumes this aggregator, add a route-level shared-`now`
+    assertion mirroring
+    ``test_costs_route_threads_shared_now_to_all_aggregates`` in
+    ``test_app.py``.
+    """
     now = resolve_now(now)
     results = await asyncio.gather(
         *(get_run_cost_breakdown(db, days=days, limit=limit, now=now) for db in dbs),
