@@ -24,7 +24,7 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.utils.async_utils import propagate_cancellations
+from fused_memory.utils.async_utils import gather_or_raise
 
 logger = logging.getLogger(__name__)
 
@@ -1734,18 +1734,20 @@ class GraphitiBackend:
             async with sem:
                 return await self.get_valid_edges_for_node(entity['uuid'], group_id=group_id)
 
-        gather_results = await asyncio.gather(
-            *(_fetch_one(e) for e in fetch_entities), return_exceptions=True
+        # Two-tier check via gather_or_raise (fused_memory.utils.async_utils).
+        # Pass 1 (inside gather_or_raise): propagates CancelledError / KeyboardInterrupt
+        # before accumulation. Pass 2 (inside gather_or_raise): logs every captured
+        # Exception at WARNING, then re-raises the positionally-first — raise-first
+        # semantics are unchanged from the hand-rolled version, with per-failure
+        # WARNING logging added.
+        gather_results = await gather_or_raise(
+            (_fetch_one(e) for e in fetch_entities),
+            label='detect_stale_dry_run: get_valid_edges_for_node failed',
+            logger=logger,
         )
 
-        # Pass 1: propagate CancelledError / KeyboardInterrupt before accumulation.
-        propagate_cancellations(gather_results)
-
-        # Pass 2: re-raise first application-level exception; collect stale entries.
         stale: list[dict] = []
         for entity, result in zip(fetch_entities, gather_results, strict=True):
-            if isinstance(result, BaseException):
-                raise result
             entry = self._build_stale_entry(entity, result)
             if entry is not None:
                 stale.append(entry)
