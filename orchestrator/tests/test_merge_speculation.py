@@ -3372,6 +3372,9 @@ class TestFinalizeInflightJournalsLandedRow:
 
         async def _fake_advance_main(current_sha: str, merge_wt: Path, **kwargs: Any) -> AdvanceOutcome:
             # WA-1: captured HERE, at call time — proves record() precedes advance.
+            assert worker._landed_outbox is not None, (
+                'worker must have a real _landed_outbox (project_root is set)'
+            )
             captured['row'] = worker._landed_outbox.lookup('b6-single')
             return AdvanceOutcome('advanced', advanced_sha=current_sha)
 
