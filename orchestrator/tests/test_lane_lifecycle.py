@@ -9,12 +9,25 @@ Step test-quarantine: RED — quarantine method absent.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
+from pathlib import Path
+
 from orchestrator.lane_lifecycle import (
     ESCALATION_SENTINEL_ROLE,
     LEGAL_TRANSITIONS,
     IllegalLaneTransition,
+    LaneLifecycle,
     LaneState,
 )
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+
+def _lifecycle(tmp_path: Path, **kwargs) -> LaneLifecycle:
+    return LaneLifecycle(worktree_base=tmp_path, **kwargs)
 
 # ---------------------------------------------------------------------------
 # Static contract
@@ -58,3 +71,73 @@ class TestStaticContract:
     def test_escalation_sentinel_role(self):
         assert ESCALATION_SENTINEL_ROLE == 'harness-lane-lifecycle'
         assert ESCALATION_SENTINEL_ROLE.startswith('harness-')
+
+
+# ---------------------------------------------------------------------------
+# Legal-transition durable-record round-trip (user-observable signal, half 1)
+# ---------------------------------------------------------------------------
+
+
+class TestLegalRoundtrip:
+    def test_legal_sequence_persists_and_reads_back(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+
+        record = lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        assert record.state == LaneState.SEED
+        assert record.seeded_from_sha == 'abc123'
+        assert lifecycle.read(lane) == record
+
+        record = lifecycle.transition(lane, LaneState.REGISTERED, branch='task/foo')
+        assert record.state == LaneState.REGISTERED
+        assert record.branch == 'task/foo'
+        assert record.seeded_from_sha == 'abc123'  # carried forward
+        assert lifecycle.read(lane) == record
+
+        record = lifecycle.transition(
+            lane, LaneState.ASSIGNED, task_id='2254', title='demo',
+        )
+        assert record.state == LaneState.ASSIGNED
+        assert record.task_id == '2254'
+        assert record.title == 'demo'
+        assert lifecycle.read(lane) == record
+
+        record = lifecycle.transition(lane, LaneState.IN_USE)
+        assert record.state == LaneState.IN_USE
+        assert record.task_id == '2254'  # carried forward, unchanged
+        assert record.title == 'demo'
+        assert lifecycle.read(lane) == record
+
+        record = lifecycle.transition(lane, LaneState.RELEASED)
+        assert record.state == LaneState.RELEASED
+        assert record.task_id is None  # cleared on the RELEASED edge
+        assert record.title is None
+        assert record.branch == 'task/foo'  # branch is NOT cleared
+        assert lifecycle.read(lane) == record
+
+    def test_record_file_path_and_json_shape(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        assert record_path.is_file()
+        data = json.loads(record_path.read_text())
+        assert data['state'] == 'seed'
+        assert data['seeded_from_sha'] == 'abc123'
+        # updated_at must be a parseable ISO timestamp.
+        datetime.fromisoformat(data['updated_at'])
+
+    def test_no_leftover_tmp_files(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/foo')
+
+        leftovers = list((tmp_path / '.lane-state').glob('*.tmp'))
+        assert leftovers == []
+
+    def test_read_returns_none_when_no_record(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        assert lifecycle.read(lane) is None
