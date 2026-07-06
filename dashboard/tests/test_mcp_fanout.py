@@ -265,6 +265,56 @@ class TestTTLCacheSingleFlight:
         assert result1 == result2 == 'value'
 
 
+# ── (c2) non-cacheable results do not single-flight ────────────────────
+
+
+class TestTTLCacheNonCacheableConcurrency:
+    """Pins a documented caveat: single-flight collapse requires cache_ok.
+
+    When cache_ok(value) is False (e.g. an offline/error marker), nothing
+    is stored, so a lock-queued waiter's post-lock freshness re-check still
+    misses and it reruns refresh itself. Concurrent cold callers during an
+    outage therefore each perform their own refresh — serialized one at a
+    time by the per-key lock, not collapsed onto a single call — rather
+    than sharing one in-flight result the way cacheable values do (see
+    TestTTLCacheSingleFlight above).
+    """
+
+    async def test_non_cacheable_concurrent_callers_each_rerun_refresh(self):
+        cache = TTLCache(ttl_seconds=60.0)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def refresh():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return {'offline': True}
+
+        task1 = asyncio.create_task(
+            cache.get_or_refresh('k', refresh, cache_ok=lambda v: False)
+        )
+        task2 = asyncio.create_task(
+            cache.get_or_refresh('k', refresh, cache_ok=lambda v: False)
+        )
+
+        await started.wait()
+        # Give the second (lock-queued) caller a chance to block on the
+        # per-key lock before the first in-flight refresh is released.
+        await asyncio.sleep(0)
+        release.set()
+
+        result1, result2 = await asyncio.gather(task1, task2)
+
+        assert calls == 2, (
+            'a non-cacheable result must not be reused by the next lock '
+            'waiter — each one reruns refresh since nothing was stored'
+        )
+        assert result1 == result2 == {'offline': True}
+
+
 # ── (d) clear() resets store + locks ──────────────────────────────────
 
 
