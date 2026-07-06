@@ -19,7 +19,11 @@ task epsilon and task 2124.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable
+import logging
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class StreakCounter:
@@ -115,3 +119,73 @@ class StreakCounter:
             del self.first_seen[key]
         for key in [k for k in self.escalated if self.key_fn(k) in stale]:
             self.escalated.discard(key)
+
+
+class StreakRegistry:
+    """Registry of StreakCounters swept together on every GC tick.
+
+    Replaces the manual per-dict enumeration previously duplicated at each
+    GC call site in ``Scheduler.acquire_next`` with one consolidated sweep,
+    e.g. ``await registry.gc(_stale_ids, extra={'starvation': _non_eligible})``.
+    The registry owns GC ONLY — counting and fire/escalate/resolve decisions
+    stay with the counters and their call sites.
+    """
+
+    def __init__(self) -> None:
+        self._counters: dict[str, tuple[StreakCounter, Callable[[Any], Awaitable[None]] | None]] = {}
+
+    def register(
+        self,
+        name: str,
+        counter: StreakCounter,
+        *,
+        on_gc: Callable[[Any], Awaitable[None]] | None = None,
+    ) -> None:
+        """Register ``counter`` under ``name`` for future ``gc()`` sweeps.
+
+        ``on_gc``, if given, is awaited once per currently-escalated key
+        being cleared by a sweep (see ``gc()``) — mirrors the starvation
+        watchdog's resolve-then-discard GC behaviour.
+        """
+        self._counters[name] = (counter, on_gc)
+
+    async def gc(
+        self,
+        stale_ids: Iterable[Any],
+        *,
+        extra: dict[str, Iterable[Any]] | None = None,
+    ) -> None:
+        """Sweep every registered counter, dropping stale (+ extra) ids.
+
+        Each counter's sweep set is ``stale_ids``, unioned with
+        ``extra[name]`` when the counter's registered name is a key in
+        ``extra`` (e.g. the starvation counter's non-eligible-status ids).
+        For a counter registered with ``on_gc``, the callback is awaited
+        once for every key in ``counter.escalated`` whose ``key_fn``-
+        extracted task-id falls in that counter's sweep set — BEFORE the
+        counter itself is cleared, so the callback still observes the
+        pre-GC state. A raising callback is logged and does not abort the
+        sweep or skip clearing that key.
+        """
+        base_stale = stale_ids if isinstance(stale_ids, (set, frozenset)) else set(stale_ids)
+        extra = extra or {}
+        for name, (counter, on_gc) in self._counters.items():
+            sweep_ids = base_stale | set(extra[name]) if name in extra else base_stale
+            if not sweep_ids:
+                continue
+            if on_gc is not None:
+                cleared_escalated = [
+                    key for key in counter.escalated if counter.key_fn(key) in sweep_ids
+                ]
+                for key in cleared_escalated:
+                    try:
+                        await on_gc(key)
+                    except Exception:
+                        logger.warning(
+                            'StreakRegistry on_gc callback for counter=%r key=%r '
+                            'raised — continuing GC normally',
+                            name,
+                            key,
+                            exc_info=True,
+                        )
+            counter.gc(sweep_ids)
