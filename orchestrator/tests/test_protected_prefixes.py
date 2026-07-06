@@ -95,8 +95,8 @@ class TestProtectedPrefixesRegistry:
         # The registry keys for the two persistent worktrees must be the
         # constants themselves (not independently-typed literals), so the
         # registry cannot silently drift from the canonical names.
-        assert '_merge-verify' == PERSISTENT_MERGE_WORKTREE_NAME
-        assert '_offline-deep' == PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME
+        assert PERSISTENT_MERGE_WORKTREE_NAME == '_merge-verify'
+        assert PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME == '_offline-deep'
         assert PERSISTENT_MERGE_WORKTREE_NAME in PROTECTED_PREFIXES
         assert PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME in PROTECTED_PREFIXES
 

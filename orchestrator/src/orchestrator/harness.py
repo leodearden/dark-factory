@@ -4780,7 +4780,7 @@ Output JSON matching the schema. Every task must appear in the output.
         # depth against this cleanup ever targeting a protected band it does not
         # own — gitops-chokepoints PRD, Mechanism 3); `prune` is registration-global,
         # not band-scoped, so it always runs.
-        _cleanup_argvs = [('git', 'worktree', 'prune')]
+        _cleanup_argvs: list[tuple[str, ...]] = [('git', 'worktree', 'prune')]
         if not self.git_ops._refuse_foreign_band(
             gate_path, frozenset({'_substrate-gate-'}), 'substrate-gate-cleanup',
         ):
