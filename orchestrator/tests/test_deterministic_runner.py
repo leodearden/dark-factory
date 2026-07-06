@@ -1492,6 +1492,46 @@ class TestInspectUnitTimeoutHardening:
 
 
 # ---------------------------------------------------------------------------
+# Task 2119 — _default_inspect_unit delegates to systemd_inspect.inspect_systemd_unit
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDefaultInspectUnitDelegatesToModule:
+    """DeterministicRunner._default_inspect_unit is a thin delegate (task 2119)."""
+
+    async def test_default_inspect_unit_delegates_to_module(self, tmp_path: Path):
+        """_default_inspect_unit must forward to the hoisted
+        systemd_inspect.inspect_systemd_unit, passing this instance's
+        injected timeout/reap-grace seams through unchanged.
+
+        RED today: `orchestrator.deterministic_runner` has no
+        `inspect_systemd_unit` name bound in its own module namespace yet
+        (it only holds a `systemd_inspect` submodule reference and calls
+        through it qualified) -- patching the direct name raises AttributeError.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=queue,
+            inspect_timeout_secs=7.0,
+            reap_grace_secs=3.0,
+        )
+
+        mock_inspect = AsyncMock(return_value={'MainPID': 999, 'ActiveState': 'active'})
+        with patch('orchestrator.deterministic_runner.inspect_systemd_unit', mock_inspect):
+            result = await runner._default_inspect_unit('orchestrator-reify.service')
+
+        assert result == {'MainPID': 999, 'ActiveState': 'active'}
+        mock_inspect.assert_awaited_once_with(
+            'orchestrator-reify.service', timeout_secs=7.0, reap_grace_secs=3.0,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 2090 — Layer B: outer wall-clock guard around the cross-unit run_fn call
 # ---------------------------------------------------------------------------
 
