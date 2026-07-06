@@ -18,7 +18,7 @@ import asyncio
 import json
 import logging
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import aiosqlite
 
@@ -444,14 +444,22 @@ async def get_cost_trend(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, list[dict]]:
     """Per-project daily cost totals over the look-back window.
 
     Returns {project_id: [{day: str, total: float}, ...]}.
     Entries cover every calendar day in the window (gaps filled with 0.0),
     ordered chronologically.
+
+    *now* is the reference timestamp for both the SQL cutoff and the
+    gap-filled day list; when None (the default) it is resolved via
+    :func:`dashboard.data.utils.resolve_now`. Unlike the other cost readers,
+    this function does not route through :func:`_cutoff` because it also
+    needs the concrete ``now`` object to build ``all_days``, not just an
+    ISO cutoff string.
     """
-    now = datetime.now(UTC)
+    now = resolve_now(now)
     since = (now - timedelta(days=days)).isoformat()
 
     # Pre-fill all days in the window (today included)
@@ -828,9 +836,16 @@ async def aggregate_cost_trend(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, list[dict]]:
-    """Merge :func:`get_cost_trend` results from multiple databases."""
-    results = await asyncio.gather(*(get_cost_trend(db, days=days) for db in dbs))
+    """Merge :func:`get_cost_trend` results from multiple databases.
+
+    *now* is resolved once and threaded identically to every per-DB call so
+    all queries share a single cutoff and day list, closing the per-DB
+    clock-skew race.
+    """
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_trend(db, days=days, now=now) for db in dbs))
     merged: dict[str, list[dict]] = {}
     for result in results:
         for pid, series in result.items():
