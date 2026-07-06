@@ -411,3 +411,60 @@ class TestMoveEntityAcrossGraphsOrdering:
         assert final_role == 'source'
         assert 'DETACH DELETE' in final_cypher
         assert final_params.get('uuid') == NODE_UUID_FIXTURE
+
+
+# ---------------------------------------------------------------------------
+# step-13: move_entity_across_graphs -- idempotency short-circuit
+# ---------------------------------------------------------------------------
+
+class TestMoveEntityAcrossGraphsIdempotency:
+    """S5 idempotency: already-moved (present in target, absent in source) is a no-op."""
+
+    @pytest.mark.asyncio
+    async def test_already_moved_short_circuits_before_any_write(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """When the uuid is already present in target_graph and absent from
+        source_graph, the call performs NO CREATE and NO DETACH DELETE, never
+        touches the raw --compact embedding transport, and returns a
+        MoveResult flagged already-moved. The already-moved probe (reading
+        target) must run before any write -- there must be zero mutating
+        calls on either graph.
+        """
+        backend = make_backend(mock_config)
+
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+
+        target_mock = make_graph_mock()
+        target_mock.ro_query = AsyncMock(
+            return_value=MagicMock(result_set=[[NODE_UUID_FIXTURE]])
+        )
+
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await move_entity_across_graphs(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        # the probe reads target for presence ...
+        target_mock.ro_query.assert_awaited_once()
+        probe_params = extract_params(target_mock.ro_query.call_args)
+        assert probe_params.get('uuid') == NODE_UUID_FIXTURE
+
+        # ... and short-circuits before any mutation or embedding read.
+        target_mock.query.assert_not_awaited()
+        source_mock.query.assert_not_awaited()
+        fake_read_compact.assert_not_awaited()
+
+        assert isinstance(result, MoveResult)
+        assert result.uuid == NODE_UUID_FIXTURE
+        assert result.source_graph == SOURCE_GRAPH_FIXTURE
+        assert result.target_graph == TARGET_GRAPH_FIXTURE
+        assert result.already_moved is True
