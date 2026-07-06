@@ -526,10 +526,14 @@ class TestParseMetadataFailurePolicy:
     # sub-model fails — the outer cross-field invariant never enters into it.
     _INVALID_SUBMODEL_CASES = [
         pytest.param(
-            {'done_provenance': {'kind': 'bogus'}}, 'done_provenance', id='done_provenance_bogus_kind'
+            {'done_provenance': {'kind': 'bogus'}},
+            'done_provenance',
+            id='done_provenance_bogus_kind',
         ),
         pytest.param(
-            {'before_done': {'script': 'scripts/x.sh'}}, 'before_done', id='before_done_missing_timeout'
+            {'before_done': {'script': 'scripts/x.sh'}},
+            'before_done',
+            id='before_done_missing_timeout',
         ),
     ]
 

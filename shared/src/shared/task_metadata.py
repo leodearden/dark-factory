@@ -172,7 +172,11 @@ class TaskMetadata(BaseModel):
 
     @model_validator(mode='after')
     def _deterministic_invariants(self) -> TaskMetadata:
-        if self.task_kind == 'deterministic' and self.before_done is None and not self.always_escalates:
+        if (
+            self.task_kind == 'deterministic'
+            and self.before_done is None
+            and not self.always_escalates
+        ):
             raise ValueError('deterministic task requires before_done or always_escalates')
         if self.before_done is not None and self.task_kind != 'deterministic':
             raise ValueError('before_done is only valid on deterministic tasks')
@@ -280,6 +284,12 @@ class SchemaWarning(BaseModel):
     message: str
 
 
+# Sentinel `field` for a SchemaWarning that cannot be pinned to one top-level
+# key: a whole-blob JSON parse failure, or a whole-model cross-field
+# invariant violation (PRD §5 `_deterministic_invariants`, `loc == ()`).
+_WHOLE_METADATA_FIELD = '<metadata>'
+
+
 def parse_metadata(
     blob: dict | str | None,
     *,
@@ -299,16 +309,91 @@ def parse_metadata(
       registered sub-model slice (:data:`_SUBMODEL_REGISTRY`) present in it
       is validated and swapped in as a typed instance, then the whole thing
       is validated as :class:`TaskMetadata`.
+
+    Failure policy (never the old silent-``{}`` discard — I4): ``write`` with
+    ``enforce=True`` raises (``ValueError``/``ValidationError``) on malformed
+    input; every other case (``read``, or ``write`` with ``enforce=False``)
+    emits a :class:`SchemaWarning` and returns a best-effort model that
+    retains the raw offending value so round-trip preservation (I1) holds.
+    Unknown top-level keys are never rejected — only warned (``x_``-prefixed
+    keys are the silent forward-compat namespace).
     """
     if blob is None:
         return TaskMetadata(), []
 
+    warnings: list[SchemaWarning] = []
+
     if isinstance(blob, str):
-        blob = json.loads(blob)
+        try:
+            blob = json.loads(blob)
+        except ValueError as exc:
+            if direction == 'write' and enforce:
+                raise
+            warnings.append(
+                SchemaWarning(
+                    field=_WHOLE_METADATA_FIELD,
+                    code='unparseable_json',
+                    message=f'metadata is not valid JSON: {exc}',
+                )
+            )
+            return TaskMetadata(), warnings
 
     blob = apply_migrations(blob)
-    for key, submodel in _SUBMODEL_REGISTRY.items():
-        if key in blob:
-            blob = {**blob, key: submodel(**blob[key])}
 
-    return TaskMetadata(**blob), []
+    for key, submodel in _SUBMODEL_REGISTRY.items():
+        if key not in blob:
+            continue
+        try:
+            blob = {**blob, key: submodel(**blob[key])}
+        except ValidationError as exc:
+            if direction == 'write' and enforce:
+                raise
+            warnings.append(SchemaWarning(field=key, code='invalid_submodel', message=str(exc)))
+
+    try:
+        model = TaskMetadata(**blob)
+    except ValidationError as exc:
+        if direction == 'write' and enforce:
+            raise
+        offending = {loc[0] for loc in (err['loc'] for err in exc.errors()) if loc}
+        if offending:
+            remainder = {k: v for k, v in blob.items() if k not in offending}
+            try:
+                model = TaskMetadata(**remainder)
+            except ValidationError:
+                # Popping the offending keys wasn't sufficient (e.g. a second,
+                # independent invariant still trips) — fall back to a fully
+                # raw, unvalidated model rather than raising.
+                model = TaskMetadata.model_construct(**blob)
+            else:
+                # Reattach the raw values via model_extra so model_dump
+                # re-emits them verbatim (I1), rather than losing them to
+                # the popped-and-revalidated remainder.
+                for key in offending:
+                    model.__pydantic_extra__[key] = blob[key]
+            for key in offending:
+                warnings.append(
+                    SchemaWarning(field=str(key), code='invalid_field', message=str(exc))
+                )
+        else:
+            # A whole-model error (e.g. the deterministic cross-field
+            # invariant) has no single offending key to pop; skip validation
+            # entirely but keep every given value.
+            model = TaskMetadata.model_construct(**blob)
+            warnings.append(
+                SchemaWarning(
+                    field=_WHOLE_METADATA_FIELD, code='invalid_metadata', message=str(exc)
+                )
+            )
+
+    known_fields = set(TaskMetadata.model_fields) | set(_SUBMODEL_REGISTRY)
+    for key in blob:
+        if key in known_fields or key.startswith('x_'):
+            continue
+        warnings.append(
+            SchemaWarning(
+                field=key, code='unknown_key', message=f'unrecognised metadata key {key!r}'
+            )
+        )
+
+    return model, warnings
