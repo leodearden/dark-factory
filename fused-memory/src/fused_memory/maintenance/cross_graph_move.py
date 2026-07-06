@@ -618,6 +618,16 @@ async def merge_foreign_duplicate(
         )
         edges_recreated += 1
 
+    # --- independent re-read (step-21/22) ---
+    # home_edge_count_after is a genuine re-read of home's RELATES_TO edge
+    # set, taken after the recreate loop above -- NOT derived arithmetically
+    # from home_edge_count_before + edges_recreated. A recreate whose CREATE
+    # silently matched no endpoint (the documented silent-skip when the
+    # edge's other endpoint is absent from home) would leave home's actual
+    # edge count unchanged; only an independent re-read surfaces that
+    # mismatch instead of masking it behind arithmetic.
+    home_edge_uuids_after = await _read_relates_to_edge_uuids(home, uuid)
+
     # --- wrong-graph-copy DETACH DELETE (step-19/20) ---
     # Always the LAST mutation: every home-copy recreate above has already
     # been awaited. Never touches home_graph.
@@ -638,5 +648,5 @@ async def merge_foreign_duplicate(
         unique_wrong_edge_uuids=frozenset(unique_wrong_edge_uuids),
         edges_recreated=edges_recreated,
         home_edge_count_before=len(home_edge_uuids),
-        home_edge_count_after=len(home_edge_uuids) + edges_recreated,
+        home_edge_count_after=len(home_edge_uuids_after),
     )
