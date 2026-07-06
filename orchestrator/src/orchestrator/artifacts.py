@@ -189,6 +189,20 @@ class TaskArtifacts:
         nested inside it like the legacy ``<worktree>/.task``.  Callers
         (γ/ε1/ε2/δ) must call this instead of joining ``'.task'`` (or
         ``'.task-meta'``) by hand.
+
+        Lane-reuse note for whichever of γ/ε1/ε2/δ first constructs
+        ``TaskArtifacts`` with a real ``meta_root``: because this path lives
+        OUTSIDE the worktree, it survives a worktree reset/``git clean`` that
+        would wipe a legacy ``<worktree>/.task``. With a pooled/reused lane
+        (e.g. the ``_lane-0``-style names used in this module's tests), a new
+        task assigned a previously-used lane name could otherwise see the
+        PRIOR task's leftover ``.task-meta/<name>`` artifacts — either
+        directly, or resurrected via ``_read_path``'s new-then-old fallback
+        (a stale ``blocking_dependency``/``already_done``/``false_premise``
+        report). Nothing in β triggers this today (no caller passes
+        ``meta_root`` yet); the first caller that does so for a pooled lane
+        is responsible for clearing/re-initializing ``.task-meta/<name>`` on
+        lane acquisition. See ``plans/worktree-lane-lifecycle-prd.md``.
         """
         return worktree_base / TASK_META_DIRNAME / worktree_name
 
@@ -593,8 +607,10 @@ class TaskArtifacts:
         dir exists and every legacy reviewer would vanish, silently
         dropping their findings (including blocking issues) from
         `aggregate_reviews`. Merging keeps every reviewer visible. When
-        `meta_root` was not supplied, both dirs are the same path, so this
-        yields the identical result (byte-identical).
+        `meta_root` was not supplied, both dirs are the same path, so the
+        second loop below is skipped (not merely redundant) and this
+        yields the identical result (byte-identical) without re-globbing
+        or re-parsing every reviewer file a second time.
         """
         reviews: dict[str, dict] = {}
         legacy_reviews_dir = self._legacy_root / 'reviews'
@@ -602,7 +618,12 @@ class TaskArtifacts:
             for path in legacy_reviews_dir.glob('*.json'):
                 reviews[path.stem] = json.loads(path.read_text())
         new_reviews_dir = self.root / 'reviews'
-        if new_reviews_dir.is_dir():
+        # Guard against re-reading the SAME directory twice: when meta_root
+        # was not supplied (still true for every caller today), new_reviews_dir
+        # == legacy_reviews_dir, and without this check every reviewer file
+        # would be globbed and json.loads'd a second time on the hot
+        # review-aggregation path for no benefit.
+        if new_reviews_dir != legacy_reviews_dir and new_reviews_dir.is_dir():
             for path in new_reviews_dir.glob('*.json'):
                 reviews[path.stem] = json.loads(path.read_text())
         return reviews
