@@ -35,11 +35,19 @@ from under ``shared/src`` (GREEN on impl-contract).
 from __future__ import annotations
 
 import enum
+import types
 
 import pytest
 
 from shared.task_statuses import TaskStatus
-from shared.task_transitions import TRANSITIONS, ActorClass, derive_actor_class, is_legal_transition
+from shared.task_transitions import (
+    _OUTCOME_ALLOWED,
+    TRANSITIONS,
+    ActorClass,
+    derive_actor_class,
+    is_legal_transition,
+    outcome_allows_status,
+)
 
 # ---------------------------------------------------------------------------
 # Pair 1 — ActorClass StrEnum (test-actorclass RED / impl-actorclass GREEN)
@@ -258,3 +266,85 @@ class TestActorRestriction:
 
     def test_reconciliation_is_strict_subset_of_human(self):
         assert TRANSITIONS[ActorClass.RECONCILIATION] < TRANSITIONS[ActorClass.HUMAN]
+
+
+# ---------------------------------------------------------------------------
+# Pair 5 — outcome_allows_status: WorkflowOutcome -> TaskStatus consistency
+# map (test-outcome RED / impl-outcome GREEN)
+# ---------------------------------------------------------------------------
+
+# The 8 WorkflowOutcome string values, verified verbatim against
+# orchestrator/src/orchestrator/workflow.py:337-345 on 2026-07-06. shared/
+# must not import orchestrator (layering, program decision #4), so these are
+# mirrored literals — test_recognized_outcome_keys_match_mirrored_workflow_outcomes
+# below is the drift guard that catches a future WorkflowOutcome addition that
+# isn't mirrored here.
+_WORKFLOW_OUTCOME_VALUES = {
+    'done',
+    'planned',
+    'blocked',
+    'requeued',
+    'escalated',
+    'cancelled',
+    'merge-deferred',
+    'soft-cancelled',
+}
+
+
+class TestOutcomeAllowsStatus:
+    def test_done_outcome(self):
+        assert outcome_allows_status('done', TaskStatus.DONE) is True
+        assert outcome_allows_status('done', 'done') is True
+        assert outcome_allows_status('done', 'blocked') is False
+
+    def test_blocked_outcome(self):
+        assert outcome_allows_status('blocked', 'blocked') is True
+
+    def test_escalated_outcome(self):
+        # Dominant _mark_blocked+open-L1 path, and the merge-gating bail
+        # that preserves in-progress.
+        assert outcome_allows_status('escalated', 'blocked') is True
+        assert outcome_allows_status('escalated', 'in-progress') is True
+
+    def test_requeued_outcome(self):
+        # Self-repend / deferred-to-stranded-sweep window / requeue-cap
+        # exhausted -> blocked.
+        assert outcome_allows_status('requeued', 'pending') is True
+        assert outcome_allows_status('requeued', 'in-progress') is True
+        assert outcome_allows_status('requeued', 'blocked') is True
+        assert outcome_allows_status('requeued', 'done') is False
+
+    def test_cancelled_outcome(self):
+        assert outcome_allows_status('cancelled', 'cancelled') is True
+
+    def test_merge_deferred_outcome(self):
+        assert outcome_allows_status('merge-deferred', 'merge-deferred') is True
+
+    def test_planned_outcome(self):
+        # Internal-only sub-phase — the task stays claimed (in-progress).
+        assert outcome_allows_status('planned', 'in-progress') is True
+        assert outcome_allows_status('planned', 'done') is False
+
+    def test_soft_cancelled_outcome(self):
+        # preserved / release_workflow park->blocked / stranded-sweep->pending.
+        assert outcome_allows_status('soft-cancelled', 'in-progress') is True
+        assert outcome_allows_status('soft-cancelled', 'blocked') is True
+        assert outcome_allows_status('soft-cancelled', 'pending') is True
+
+    def test_normalizes_value_attribute(self):
+        # W9 may pass a real WorkflowOutcome instance rather than a plain
+        # string; proves the getattr(outcome, 'value', outcome)
+        # normalization path without importing orchestrator.
+        stub = types.SimpleNamespace(value='done')
+        assert outcome_allows_status(stub, 'done') is True
+
+    def test_recognized_outcome_keys_match_mirrored_workflow_outcomes(self):
+        assert set(_OUTCOME_ALLOWED.keys()) == _WORKFLOW_OUTCOME_VALUES
+
+    def test_unknown_outcome_raises(self):
+        with pytest.raises(ValueError):
+            outcome_allows_status('bogus-outcome', 'done')
+
+    def test_unknown_status_raises(self):
+        with pytest.raises(ValueError):
+            outcome_allows_status('done', 'not-a-status')
