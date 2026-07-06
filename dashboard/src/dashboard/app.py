@@ -710,13 +710,14 @@ async def api_costs(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     days = _parse_window(request.query_params)
     dbs = await _cost_dbs(config, pool)
+    now = datetime.now(UTC)
     summary, by_project, by_account, by_role, trend, events = await asyncio.gather(
-        aggregate_cost_summary(dbs, days=days),
-        aggregate_cost_by_project(dbs, days=days),
-        aggregate_cost_by_account(dbs, days=days),
-        aggregate_cost_by_role(dbs, days=days),
-        aggregate_cost_trend(dbs, days=days),
-        aggregate_account_events(dbs, days=days),
+        aggregate_cost_summary(dbs, days=days, now=now),
+        aggregate_cost_by_project(dbs, days=days, now=now),
+        aggregate_cost_by_account(dbs, days=days, now=now),
+        aggregate_cost_by_role(dbs, days=days, now=now),
+        aggregate_cost_trend(dbs, days=days, now=now),
+        aggregate_account_events(dbs, days=days, now=now),
         return_exceptions=True,
     )
     return JSONResponse(
