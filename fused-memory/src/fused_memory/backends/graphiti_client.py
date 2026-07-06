@@ -1276,6 +1276,57 @@ class GraphitiBackend:
         }
 
     @staticmethod
+    def _duplicate_edge_uuids(rows: Sequence[Sequence[Any]]) -> list[str]:
+        """Return non-survivor edge uuids from valid-edge rows sharing a duplicate key.
+
+        Task 2118: after ``redirect_node_edges`` (the ``merge_entities`` helper)
+        blindly copies ``old.uuid`` onto redirected edges, a surviving node can
+        end up with two distinct-uuid ``RELATES_TO`` edges to the same neighbor
+        carrying an identical fact and ``valid_at`` — a parallel duplicate that
+        neither the pre-merge ``MemoryService._dedup_episode_edges`` sweep nor
+        graphiti-core's ``resolve_extracted_edges`` fast-path can catch, since
+        they only converge onto the same node pair *after* the merge.
+
+        Args:
+            rows: Iterable of positional rows ``(neighbor_uuid, edge_uuid, fact,
+                valid_at)`` — the shape returned by
+                ``dedup_valid_edges_for_node``'s Cypher query.
+
+        Returns:
+            Sorted list of edge uuids to delete (empty when no group has a
+            duplicate). For each group of rows sharing the same
+            ``(neighbor_uuid, fact, valid_at)`` key, the lexicographically
+            lowest edge uuid is kept as the survivor and every other uuid in
+            the group is returned for deletion.
+
+        Note:
+            Rows are first deduplicated by edge uuid (keeping the first
+            occurrence) so that an undirected Cypher MATCH double-matching a
+            self-loop edge doesn't fabricate a spurious duplicate pair.
+        """
+        seen_edge_uuids: set[str] = set()
+        deduped_rows: list[Sequence[Any]] = []
+        for row in rows:
+            edge_uuid = row[1]
+            if edge_uuid in seen_edge_uuids:
+                continue
+            seen_edge_uuids.add(edge_uuid)
+            deduped_rows.append(row)
+
+        groups: dict[tuple[str, str, str], list[str]] = {}
+        for row in deduped_rows:
+            neighbor_uuid, edge_uuid, fact, valid_at = row[0], row[1], row[2], row[3]
+            key = (neighbor_uuid, fact, str(valid_at))
+            groups.setdefault(key, []).append(edge_uuid)
+
+        duplicates: list[str] = []
+        for uuids in groups.values():
+            if len(uuids) > 1:
+                survivor = min(uuids)
+                duplicates.extend(u for u in uuids if u != survivor)
+        return sorted(duplicates)
+
+    @staticmethod
     def _canonical_facts(edges: Sequence[Mapping[str, Any]]) -> list[str]:
         """Deduplicate edge facts preserving insertion order, skipping non-string, empty, and whitespace-only values.
 
