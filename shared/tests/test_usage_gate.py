@@ -1544,3 +1544,82 @@ class TestHandleAuthFailureViaTransition:
             gate._handle_auth_failure('second', acct.token)
 
         assert mock_fire.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# step-9/10: the CAPPED->PROBING uncap paths (_refresh_capped_accounts and
+# _account_resume_probe_loop success) migrated onto _transition.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestUncapViaTransition:
+    """step-9: _refresh_capped_accounts and _account_resume_probe_loop route
+    the CAPPED->PROBING uncap edge through _transition (probe_count reset +
+    pause-time consumption + centralized _open recompute owned by _transition,
+    replacing the two sites' own inline field writes)."""
+
+    async def test_refresh_capped_accounts_past_reset_transitions_to_probing(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        acct.probe_count = 3
+        acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
+        acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=120)
+        gate._total_pause_secs = 0.0
+
+        result = await gate._refresh_capped_accounts()
+
+        assert result is True
+        assert acct.phase == AccountPhase.PROBING
+        assert acct.probe_count == 0
+        assert acct.pause_started_at is None
+        assert 119 <= gate._total_pause_secs <= 121
+        assert gate._open.is_set() is True
+
+    async def test_refresh_capped_accounts_future_reset_stays_capped(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        acct.resets_at = datetime.now(UTC) + timedelta(hours=1)
+
+        result = await gate._refresh_capped_accounts()
+
+        assert result is False
+        assert acct.phase == AccountPhase.CAPPED
+
+    async def test_probe_loop_success_transitions_to_probing_via_transition(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        acct.probe_count = 0
+        acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
+        acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=60)
+        gate._total_pause_secs = 0.0
+        gate._run_probe = AsyncMock(return_value=True)
+
+        await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
+
+        assert acct.phase == AccountPhase.PROBING
+        assert acct.probe_count == 0
+        assert acct.pause_started_at is None
+        assert gate._total_pause_secs >= 59
+        assert gate._open.is_set() is True
+
+    async def test_probe_loop_success_still_fires_labeled_resumed_event(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=make_mock_cost_store())
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        acct.probe_count = 0
+        acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
+        gate._run_probe = AsyncMock(return_value=True)
+
+        with patch.object(gate, '_write_cost_event', new_callable=AsyncMock) as mock_write:
+            await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
+
+        mock_write.assert_awaited_once()
+        account_name, event_type, details_json = mock_write.call_args[0]
+        assert account_name == acct.name
+        assert event_type == 'resumed'
+        details = json.loads(details_json)
+        assert details['label'] == 'probe #1 confirmed'
