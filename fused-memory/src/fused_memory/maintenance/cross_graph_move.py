@@ -421,13 +421,12 @@ class MergeResult:
             but absent from the home copy (``classify_unique_wrong_edges``
             over both copies' edge-uuid sets).
         edges_recreated: Count of unique edges recreated on the home copy.
-            Populated by the mutating body (step-19/20); 0 on the read-only
-            skeleton.
         home_edge_count_before: Home copy's RELATES_TO edge count before the
             merge.
         home_edge_count_after: Home copy's RELATES_TO edge count after the
-            merge. Populated by the mutating body (step-19/20); left equal
-            to ``home_edge_count_before`` on the read-only skeleton.
+            merge -- always ``home_edge_count_before + edges_recreated``, so
+            comparing the two attributes is a direct no-edge-lost /
+            no-double-count invariant check.
     """
 
     uuid: str
@@ -469,9 +468,16 @@ async def merge_foreign_duplicate(
     computes the set-diff -- the edges unique to the wrong-graph copy -- and
     that set is exposed on the returned ``MergeResult``.
 
-    Recreating those unique edges on the home copy (with byte-exact
-    ``fact_embedding``) and ``DETACH DELETE``-ing the wrong-graph copy are
-    added in step-19/20; this skeleton is READ-ONLY (no mutation).
+    Recreate-then-delete (step-19/20): each unique edge is recreated on the
+    home copy with a byte-exact ``fact_embedding`` (read via the same raw
+    ``--compact`` transport ``move_entity_across_graphs`` uses -- see the
+    module docstring), preserving every other property (including the
+    edge's own ``group_id``) unchanged -- S6 has no ``rewrite_group_id``
+    analogue, unlike S5. Only once every recreate has been awaited is the
+    wrong-graph copy ``DETACH DELETE``d -- CREATE-BEFORE-DELETE, same
+    crash-safety rationale as ``move_entity_across_graphs``: a crash
+    mid-merge leaves a recoverable duplicate rather than losing an edge.
+    Edges already shared between both copies are left untouched on home.
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
@@ -481,7 +487,9 @@ async def merge_foreign_duplicate(
         home_graph: Graph holding the canonical copy.
 
     Returns:
-        MergeResult describing the merge.
+        MergeResult describing the merge -- ``home_edge_count_after`` ==
+        ``home_edge_count_before + edges_recreated``, i.e. no edge lost and
+        none double-counted.
     """
     wrong = graphiti._graph_for(wrong_graph)
     home = graphiti._graph_for(home_graph)
@@ -494,22 +502,80 @@ async def merge_foreign_duplicate(
         {'uuid': uuid},
     )
     wrong_edge_rows = wrong_edges_result.result_set or []
-    wrong_edge_uuids = {row[0] for row in wrong_edge_rows}
+    wrong_rows_by_uuid = {row[0]: row for row in wrong_edge_rows}
+    wrong_edge_uuids = set(wrong_rows_by_uuid)
 
     home_edge_uuids = await _read_relates_to_edge_uuids(home, uuid)
 
     unique_wrong_edge_uuids = classify_unique_wrong_edges(home_edge_uuids, wrong_edge_uuids)
 
+    falkor_client = graphiti._require_falkor_client()
+    edges_recreated = 0
+    for edge_uuid in unique_wrong_edge_uuids:
+        (_edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
+         edge_group_id, episodes, src_uuid, dst_uuid) = wrong_rows_by_uuid[edge_uuid]
+
+        edge_embedding_cypher = (
+            f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
+            'RETURN e.fact_embedding'
+        )
+        edge_embedding_reply = await _read_compact_vector(
+            falkor_client, group_id=wrong_graph, cypher=edge_embedding_cypher,
+        )
+        edge_embedding_literal = format_vecf32_literal(
+            parse_compact_vector_reply(edge_embedding_reply)
+        )
+
+        # Both endpoints are MATCHed (never CREATEd): the home copy of the
+        # moved-duplicate's node and the edge's other endpoint must already
+        # exist in home_graph, or this MATCH yields no rows and the edge is
+        # silently skipped (same convention as move_entity_across_graphs).
+        await home.query(
+            'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
+            'CREATE (a)-[r:RELATES_TO]->(b) '
+            'SET r.uuid = $edge_uuid, '
+            '    r.name = $name, '
+            '    r.fact = $fact, '
+            '    r.valid_at = $valid_at, '
+            '    r.invalid_at = $invalid_at, '
+            '    r.created_at = $created_at, '
+            '    r.group_id = $group_id, '
+            '    r.episodes = $episodes, '
+            f'    r.fact_embedding = {edge_embedding_literal}',
+            {
+                'src_uuid': src_uuid,
+                'dst_uuid': dst_uuid,
+                'edge_uuid': edge_uuid,
+                'name': edge_name,
+                'fact': fact,
+                'valid_at': valid_at,
+                'invalid_at': invalid_at,
+                'created_at': edge_created_at,
+                'group_id': edge_group_id,
+                'episodes': episodes,
+            },
+        )
+        edges_recreated += 1
+
+    # --- wrong-graph-copy DETACH DELETE (step-19/20) ---
+    # Always the LAST mutation: every home-copy recreate above has already
+    # been awaited. Never touches home_graph.
+    await wrong.query(
+        'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
+        {'uuid': uuid},
+    )
+
     logger.info(
-        'merge_foreign_duplicate: classified uuid=%s wrong=%s home=%s '
-        'unique_edges=%d',
-        uuid, wrong_graph, home_graph, len(unique_wrong_edge_uuids),
+        'merge_foreign_duplicate: merged uuid=%s wrong=%s home=%s '
+        'edges_recreated=%d',
+        uuid, wrong_graph, home_graph, edges_recreated,
     )
     return MergeResult(
         uuid=uuid,
         wrong_graph=wrong_graph,
         home_graph=home_graph,
         unique_wrong_edge_uuids=frozenset(unique_wrong_edge_uuids),
+        edges_recreated=edges_recreated,
         home_edge_count_before=len(home_edge_uuids),
-        home_edge_count_after=len(home_edge_uuids),
+        home_edge_count_after=len(home_edge_uuids) + edges_recreated,
     )
