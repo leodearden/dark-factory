@@ -54,7 +54,6 @@ from fused_memory.models.scope import resolve_project_id
 # ---------------------------------------------------------------------------
 
 TARGET_NODE_UUID: str = 'f02a32ea-0efd-4865-94b4-97a412d8ffda'
-DEFAULT_LIMIT: int = 100000
 
 # Filesystem-ish tokens that, combined with >=4 '-'-segments, mark a name as
 # a mangled absolute path (e.g. '-home-leo-src-dark-factory' ->
