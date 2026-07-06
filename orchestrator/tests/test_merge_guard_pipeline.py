@@ -321,6 +321,64 @@ class TestClassifyAndMergeSpeculativeWorker:
         assert result.outcome.status == 'already_merged'
         assert _merge_attempt_subtypes(es.db_path) == ['already_merged']
 
+    async def test_stale_ancestor_effective_tip_is_not_treated_as_already_merged(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """task 5026 regression: a stale ``effective_tip`` that is an ancestor
+        of main must NOT short-circuit to already_merged when the LIVE branch
+        still carries an unmerged unique commit and nothing on main cites it.
+
+        Repro of the live failure: task/5026 was born a zero-commit branch
+        whose base was an old main tip; a merge_request's ``snapshot_tip`` was
+        captured as that base (an ancestor of current main), while the branch
+        later gained its real commit.  ``is_ancestor(snapshot_tip, main)`` was
+        trivially True, so the worker emitted a terminal ``already_merged`` and
+        ejected the task from the queue with its work unmerged.  The guard must
+        instead recognise the false positive and proceed to merge.
+        """
+        from orchestrator.merge_queue import classify_and_merge
+
+        # base_m0 = the branch's base = current main tip.
+        base_m0 = await git_ops.get_main_sha()
+
+        # Branch gains a REAL unique commit R (evict.py) on top of base_m0.
+        worktree = await _make_branch_with_file(
+            git_ops, 'evict-5026', 'evict.py', 'evicted = True\n',
+        )
+
+        # Advance main with an UNRELATED commit so base_m0 becomes a strict
+        # ancestor of the new main (mirrors the branch being cut from an old
+        # main tip) while R stays off main and does not conflict.
+        (git_ops.project_root / 'other.py').write_text('other = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Unrelated main advance'], cwd=git_ops.project_root)
+        main_m1 = await git_ops.get_main_sha()
+
+        # Sanity: base is an ancestor of main; the real branch tip is not.
+        assert await git_ops.is_ancestor(base_m0, main_m1)
+        branch_sha = await git_ops.resolve_branch_sha('task/evict-5026')
+        assert branch_sha is not None
+        assert not await git_ops.is_ancestor(branch_sha, main_m1)
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('evict-5026', 'evict-5026', worktree, config)
+        req.snapshot_tip = base_m0  # the STALE base tip (ancestor of main)
+
+        result = await classify_and_merge(
+            worker, req, main_m1, speculative=False, started_monotonic=time.monotonic(),
+        )
+
+        # Must NOT be a terminal already_merged — the guard proceeds to merge
+        # and the real commit lands.
+        assert isinstance(result, MergedOk), (
+            f'expected the merge to proceed (MergedOk), not a false-positive '
+            f'already_merged; got {result!r}'
+        )
+        assert result.merge_result.success
+        assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
+
     async def test_real_conflict_returns_decided_conflict_and_records_drift_sample(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):

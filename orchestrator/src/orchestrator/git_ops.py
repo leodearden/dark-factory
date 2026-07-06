@@ -4001,7 +4001,9 @@ class GitOps:
             return branch
         return None
 
-    async def find_merge_marker(self, branch: str) -> str | None:
+    async def find_merge_marker(
+        self, branch: str, *, gate_on_existing_ref: bool = True,
+    ) -> str | None:
         """Search main's history for a merge commit whose subject matches
         ``Merge {branch} into {main_branch}``.
 
@@ -4009,11 +4011,20 @@ class GitOps:
         branch ref has already been deleted (e.g., ``cleanup_worktree`` ran
         after ``advance_main`` but before ``set_task_status('done')``).
 
-        **Branch-existence gate**: calls ``resolve_branch_sha(branch)`` first.
-        If it returns non-None the branch still exists, so this method returns
-        None immediately — the caller should rely on ``is_ancestor`` instead.
-        This prevents finding a stale merge marker from a *previous* run of a
-        re-opened task that shared the same branch name.
+        **Branch-existence gate**: by default calls ``resolve_branch_sha(branch)``
+        first.  If it returns non-None the branch still exists, so this method
+        returns None immediately — the caller should rely on ``is_ancestor``
+        instead.  This prevents finding a stale merge marker from a *previous*
+        run of a re-opened task that shared the same branch name.
+
+        **gate_on_existing_ref=False**: skip that gate and grep main
+        unconditionally.  Used by ``classify_and_merge``'s already-merged
+        false-positive guard (task 5026), where the branch ref legitimately
+        still exists (its tip may have diverged post-merge, the task-1917
+        ``honors_snapshot_tip`` shape) yet a positive merge-subject marker on
+        main is exactly the evidence that the work landed.  This branch-keyed
+        marker is robust when ``task_id != branch`` (the merge subject is keyed
+        off the branch, not the task id).
 
         **Subject pattern**: the exact output of ``_merge_subject(branch,
         self.config.main_branch)`` matched with ``--fixed-strings`` (literal
@@ -4034,8 +4045,9 @@ class GitOps:
             still exists, the branch never existed, or no matching marker was
             found on main.
         """
-        # Gate: if the branch ref still exists, caller should use is_ancestor.
-        if await self.resolve_branch_sha(branch) is not None:
+        # Gate: if the branch ref still exists, caller should use is_ancestor
+        # (unless the caller opted out — see gate_on_existing_ref).
+        if gate_on_existing_ref and await self.resolve_branch_sha(branch) is not None:
             return None
 
         # Branch is gone — search main for a merge commit with the expected subject.
