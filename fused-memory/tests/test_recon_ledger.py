@@ -229,3 +229,94 @@ async def test_is_suppressed_exact_and_blanket_union(store):
     assert await store.is_suppressed('proj-p', 'T2', 'anything') is True
     assert await store.is_suppressed('proj-p', 'T1', 'F2') is False
     assert await store.is_suppressed('other', 'T1', 'F1') is False
+
+
+@pytest.mark.asyncio
+async def test_gc_deletes_expired_and_terminal_referenced_rows(store):
+    """gc() deletes (a) expired rows and (b) marker-kind rows whose task_id is
+    terminal; it keeps (c) live rows, (d) never-expire rows, and rows in other
+    projects, returning the count of deleted rows (user-observable signal #3)."""
+    expired_marker = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-expired',
+        flag_type='drift_flag',
+        expires_at='2026-06-15T00:00:00+00:00',
+    )
+    terminal_marker = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage2_persistence_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-terminal',
+        flag_type='persistence_flag',
+        expires_at='2026-12-01T00:00:00+00:00',
+    )
+    live_marker = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-live',
+        flag_type='drift_flag',
+        expires_at='2026-12-01T00:00:00+00:00',
+    )
+    never_expire = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='cycle_summary',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-never',
+    )
+    other_project_row = ReconLedgerRecord(
+        project_id='proj-q',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-expired',
+        flag_type='drift_flag',
+        expires_at='2026-06-15T00:00:00+00:00',
+    )
+    await store.upsert(expired_marker)
+    await store.upsert(terminal_marker)
+    await store.upsert(live_marker)
+    await store.upsert(never_expire)
+    await store.upsert(other_project_row)
+
+    deleted_count = await store.gc(
+        'proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=['task-terminal']
+    )
+
+    assert deleted_count == 2
+    assert (
+        await store.get_by_identity(
+            'proj-p', 'stage1_flag_marker', task_id='task-expired', flag_type='drift_flag'
+        )
+        is None
+    )
+    assert (
+        await store.get_by_identity(
+            'proj-p', 'stage2_persistence_marker', task_id='task-terminal', flag_type='persistence_flag'
+        )
+        is None
+    )
+    assert (
+        await store.get_by_identity(
+            'proj-p', 'stage1_flag_marker', task_id='task-live', flag_type='drift_flag'
+        )
+        is not None
+    )
+    assert await store.get_by_identity('proj-p', 'cycle_summary', task_id='task-never') is not None
+    assert (
+        await store.get_by_identity(
+            'proj-q', 'stage1_flag_marker', task_id='task-expired', flag_type='drift_flag'
+        )
+        is not None
+    )
