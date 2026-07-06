@@ -231,6 +231,7 @@ async def empty_costs_conn(empty_costs_db):
 # ---------------------------------------------------------------------------
 
 from dashboard.data.costs import (  # noqa: E402
+    _cutoff,
     get_account_events,
     get_cost_by_account,
     get_cost_by_project,
@@ -239,6 +240,36 @@ from dashboard.data.costs import (  # noqa: E402
     get_cost_trend,
     get_run_cost_breakdown,
 )
+
+
+# ---------------------------------------------------------------------------
+# Test_Cutoff (step-3)
+# ---------------------------------------------------------------------------
+
+class Test_Cutoff:
+    def test_cutoff_uses_provided_now(self):
+        """_cutoff(days=7, now=fixed_dt) returns (fixed_dt - 7d).isoformat()."""
+        fixed_dt = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        expected = (fixed_dt - timedelta(days=7)).isoformat()
+        result = _cutoff(7, now=fixed_dt)
+        assert result == expected
+
+    def test_cutoff_no_now_uses_current_time(self):
+        """Without now, _cutoff derives its cutoff from the current UTC clock.
+
+        Brackets the real clock read with before/after captures (rather than
+        patching a module-level ``datetime`` symbol) because the no-now branch
+        resolves through ``resolve_now`` in ``dashboard.data.utils``, not a
+        clock read local to ``costs.py``.
+        """
+        before = datetime.now(UTC)
+        result = _cutoff(7)
+        after = datetime.now(UTC)
+
+        result_dt = datetime.fromisoformat(result)
+        lower = before - timedelta(days=7) - timedelta(seconds=5)
+        upper = after - timedelta(days=7) + timedelta(seconds=5)
+        assert lower <= result_dt <= upper
 
 
 class TestCostSummary:
