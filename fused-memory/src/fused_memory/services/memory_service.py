@@ -170,6 +170,27 @@ def _cycle_summary_run_id_backfill(meta: dict, causation_id: str | None) -> str 
     Returns None (nothing to backfill) when: kind != 'cycle_summary'; run_id
     is already a non-empty string (must not clobber a valid value); or
     neither candidate source is a non-empty string.
+
+    KNOWN LIMITATION (flagged in task 2109 amendment review): the
+    causation_id parameter is authoritative BY CONVENTION, not by proof.
+    server/tools.py::_extract_causation never actually passes None through —
+    when '_causation_id' is absent from metadata it synthesizes a fresh
+    str(uuid4()) on the spot (tools.py ~398-399). This function cannot tell
+    that call-scoped synthetic UUID apart from a genuine run-scoped
+    causation id (reconciliation/harness.py generates run_id the same way,
+    via str(uuid4())), so a cycle_summary write that drops BOTH run_id and
+    '_causation_id' before reaching the MCP boundary still gets a
+    plausible-looking run_id backfilled here — silently suppressing the
+    fallback warning that would otherwise flag the fully-dropped case, and
+    handing the Path-2 triple-filter count_memories_by_metadata pre-check a
+    run_id that will never match any sibling write from the same real run.
+    Closing this gap requires _extract_causation to flag whether it
+    synthesized (vs. received) the id and, for a synthesized id, skip this
+    backfill in favor of the warning — a change to
+    fused_memory/server/tools.py, outside this task's locked module scope.
+    See TestCycleSummaryRunIdBackfillToolsBoundary in
+    tests/test_memory_service.py, which pins today's behavior so this stays
+    a tracked, visible follow-up rather than silent debt.
     """
     if meta.get('kind') != 'cycle_summary':
         return None
@@ -1079,6 +1100,12 @@ class MemoryService:
         # or the causation_id parameter (the production MCP-boundary path,
         # where server/tools.py::_extract_causation has already popped
         # '_causation_id' out of metadata into that parameter).
+        # KNOWN LIMITATION: causation_id is never actually None on the MCP
+        # path — _extract_causation synthesizes a fresh UUID when
+        # '_causation_id' was absent, and that's indistinguishable here from
+        # a genuine run id. See _cycle_summary_run_id_backfill's docstring
+        # and TestCycleSummaryRunIdBackfillToolsBoundary for the tracked gap
+        # (fix requires a server/tools.py change outside this task's scope).
         backfilled_run_id = _cycle_summary_run_id_backfill(meta, causation_id)
         if backfilled_run_id is not None:
             meta['run_id'] = backfilled_run_id
