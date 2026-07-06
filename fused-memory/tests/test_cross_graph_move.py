@@ -15,8 +15,16 @@ the module docstring and ``plans/cross-graph-entity-leak-prd.md`` decision 5.
 """
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from _fm_helpers import extract_cypher, extract_params
+
+from fused_memory.maintenance import cross_graph_move
 from fused_memory.maintenance.cross_graph_move import (
+    MoveResult,
     format_vecf32_literal,
+    move_entity_across_graphs,
     parse_compact_vector_reply,
 )
 
@@ -103,3 +111,80 @@ class TestFormatVecf32Literal:
         """
         tokens = parse_compact_vector_reply(COMPACT_VECTOR_REPLY_FIXTURE)
         assert format_vecf32_literal(tokens) == EXPECTED_VECF32_LITERAL_FIXTURE
+
+
+# ---------------------------------------------------------------------------
+# move_entity_across_graphs (S5) fixtures + shared test helper
+# ---------------------------------------------------------------------------
+
+NODE_UUID_FIXTURE = 'node-aaaa-1111'
+SOURCE_GRAPH_FIXTURE = 'dark_factory'
+TARGET_GRAPH_FIXTURE = 'know_live'
+
+# (uuid, name, group_id, summary, created_at) -- the scalar Entity props
+# returned by the plain (non-lossy) ro_query read.
+NODE_ROW_FIXTURE = [
+    NODE_UUID_FIXTURE, 'Alice', SOURCE_GRAPH_FIXTURE, 'Alice is a person.', '2026-01-01T00:00:00+00:00',
+]
+
+
+def _route_graphs(mapping: dict) -> MagicMock:
+    """MagicMock side_effect routing backend._driver._get_graph(name) -> mapping[name]."""
+    return MagicMock(side_effect=lambda name: mapping[name])
+
+
+# ---------------------------------------------------------------------------
+# step-5: move_entity_across_graphs -- node core
+# ---------------------------------------------------------------------------
+
+class TestMoveEntityAcrossGraphsNodeCore:
+    """S5 node-move core: read node props + exact name_embedding, CREATE in target."""
+
+    @pytest.mark.asyncio
+    async def test_creates_node_in_target_with_byte_exact_name_embedding(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Reads the node from source (props via ro_query, embedding via the raw
+        transport) and CREATEs it in target with a byte-exact vecf32 literal.
+        """
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock(ro_rows=[NODE_ROW_FIXTURE])
+        target_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await move_entity_across_graphs(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        # (a) reads node props from source via ro_query, and the exact
+        # name_embedding from source via the raw transport.
+        source_mock.ro_query.assert_awaited_once()
+        read_params = extract_params(source_mock.ro_query.call_args)
+        assert read_params.get('uuid') == NODE_UUID_FIXTURE
+        fake_read_compact.assert_awaited_once()
+        assert fake_read_compact.call_args.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+
+        # (b) issues a CREATE against target_graph carrying the byte-exact
+        # vecf32 literal plus the node's uuid/name/group_id params.
+        target_mock.query.assert_awaited_once()
+        cypher = extract_cypher(target_mock.query.call_args)
+        params = extract_params(target_mock.query.call_args)
+        assert 'CREATE' in cypher
+        assert EXPECTED_VECF32_LITERAL_FIXTURE in cypher
+        assert params.get('uuid') == NODE_UUID_FIXTURE
+        assert params.get('name') == 'Alice'
+        assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
+
+        # never touches source's mutating .query (no delete yet -- step-12)
+        source_mock.query.assert_not_awaited()
+
+        assert isinstance(result, MoveResult)
+        assert result.uuid == NODE_UUID_FIXTURE
+        assert result.source_graph == SOURCE_GRAPH_FIXTURE
+        assert result.target_graph == TARGET_GRAPH_FIXTURE
