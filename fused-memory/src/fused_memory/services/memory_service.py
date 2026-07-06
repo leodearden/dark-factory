@@ -146,6 +146,63 @@ def _missing_cycle_summary_keys(meta: dict) -> list[str]:
     return missing
 
 
+def _cycle_summary_run_id_backfill(meta: dict, causation_id: str | None) -> str | None:
+    """Return a backfill value for a missing/invalid cycle_summary run_id, or
+    None when there is nothing to repair (task 2109).
+
+    run_id is LLM-supplied (see the reconciliation stage1/stage2 prompts) and
+    empirically gets dropped under prompt-compliance failures. Rather than
+    only warning (the task-2094 behavior), repair it server-side from an
+    authoritative causation id — mirrors the _infer_recon_pool precedent
+    (task 2077): derive/repair authoritatively rather than trust the LLM.
+
+    Two candidate sources are checked, in order:
+      1. meta['_causation_id'] — set by a direct in-process caller (and the
+         literal source the task names).
+      2. the causation_id parameter — the production MCP-boundary path:
+         server/tools.py::_extract_causation pops '_causation_id' out of the
+         metadata dict into this parameter before MemoryService.add_memory
+         runs, so on the real reconciliation stage-agent path
+         meta['_causation_id'] is always absent and the run_id value lives
+         only in this parameter. Checking meta alone would never fire in
+         production.
+
+    Returns None (nothing to backfill) when: kind != 'cycle_summary'; run_id
+    is already a non-empty string (must not clobber a valid value); or
+    neither candidate source is a non-empty string.
+
+    KNOWN LIMITATION (flagged in task 2109 amendment review): the
+    causation_id parameter is authoritative BY CONVENTION, not by proof.
+    server/tools.py::_extract_causation never actually passes None through —
+    when '_causation_id' is absent from metadata it synthesizes a fresh
+    str(uuid4()) on the spot (tools.py ~398-399). This function cannot tell
+    that call-scoped synthetic UUID apart from a genuine run-scoped
+    causation id (reconciliation/harness.py generates run_id the same way,
+    via str(uuid4())), so a cycle_summary write that drops BOTH run_id and
+    '_causation_id' before reaching the MCP boundary still gets a
+    plausible-looking run_id backfilled here — silently suppressing the
+    fallback warning that would otherwise flag the fully-dropped case, and
+    handing the Path-2 triple-filter count_memories_by_metadata pre-check a
+    run_id that will never match any sibling write from the same real run.
+    Closing this gap requires _extract_causation to flag whether it
+    synthesized (vs. received) the id and, for a synthesized id, skip this
+    backfill in favor of the warning — a change to
+    fused_memory/server/tools.py, outside this task's locked module scope.
+    See TestCycleSummaryRunIdBackfillToolsBoundary in
+    tests/test_memory_service.py, which pins today's behavior so this stays
+    a tracked, visible follow-up rather than silent debt.
+    """
+    if meta.get('kind') != 'cycle_summary':
+        return None
+    run_id = meta.get('run_id')
+    if isinstance(run_id, str) and run_id.strip():
+        return None
+    for candidate in (meta.get('_causation_id'), causation_id):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
 class MemoryNotFoundError(Exception):
     """Raised when a mem0 memory id is not found."""
 
@@ -1033,10 +1090,33 @@ class MemoryService:
         if inferred_recon_pool is not None:
             meta['recon_pool'] = inferred_recon_pool
 
+        # Server-side cycle_summary run_id auto-backfill (task 2109,
+        # replacing the warn-only guard from task 2094): run_id is
+        # LLM-supplied (see the reconciliation stage1/stage2 prompts) and a
+        # dropped/empty value has been observed to recur every cycle.
+        # Repair it authoritatively from the causation id — mirroring the
+        # _infer_recon_pool precedent above — instead of only warning about
+        # it. Sourced from meta['_causation_id'] (direct in-process callers)
+        # or the causation_id parameter (the production MCP-boundary path,
+        # where server/tools.py::_extract_causation has already popped
+        # '_causation_id' out of metadata into that parameter).
+        # KNOWN LIMITATION: causation_id is never actually None on the MCP
+        # path — _extract_causation synthesizes a fresh UUID when
+        # '_causation_id' was absent, and that's indistinguishable here from
+        # a genuine run id. See _cycle_summary_run_id_backfill's docstring
+        # and TestCycleSummaryRunIdBackfillToolsBoundary for the tracked gap
+        # (fix requires a server/tools.py change outside this task's scope).
+        backfilled_run_id = _cycle_summary_run_id_backfill(meta, causation_id)
+        if backfilled_run_id is not None:
+            meta['run_id'] = backfilled_run_id
+
         # Server-side cycle_summary metadata guard (task 2094, extending task
-        # 2077): metadata.stage and metadata.run_id are both LLM-supplied
-        # (see the reconciliation stage1/stage2 prompts), so either being
-        # missing/invalid is a prompt-compliance failure this guard makes
+        # 2077), now a FALLBACK for residual unrepairable cases (task 2109):
+        # metadata.stage and metadata.run_id are both LLM-supplied (see the
+        # reconciliation stage1/stage2 prompts). stage is not backfillable
+        # (no authoritative server-side source) and run_id can only be
+        # backfilled when a causation id is available, so this guard warns
+        # on whatever remains missing/invalid after the backfill above —
         # observable rather than silently relying on the caller. This check
         # is deliberately decoupled from the recon_pool inference above —
         # previously it lived in an `elif` gated on `inferred_recon_pool is

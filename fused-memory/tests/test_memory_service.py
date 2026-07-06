@@ -4166,6 +4166,88 @@ class TestMissingCycleSummaryKeys:
         assert _missing_cycle_summary_keys({}) == []
 
 
+class TestCycleSummaryRunIdBackfillHelper:
+    """Module-level _cycle_summary_run_id_backfill pure helper (task 2109).
+
+    Auto-backfills a missing/invalid cycle_summary run_id from an
+    authoritative causation id, server-side, independent of LLM prompt
+    compliance — mirrors the _infer_recon_pool precedent (task 2077).
+
+    Two candidate sources are checked, in order:
+      1. meta['_causation_id'] — the task's literal wording; also what a
+         direct in-process caller would set.
+      2. the causation_id parameter — the production MCP-boundary path:
+         server/tools.py::_extract_causation pops '_causation_id' out of the
+         metadata dict into this parameter before MemoryService.add_memory
+         runs, so on the real reconciliation stage-agent path
+         meta['_causation_id'] is always absent and the run_id value lives
+         only in this parameter.
+
+    RED: the helper does not exist yet (ImportError).
+    """
+
+    def test_missing_run_id_backfills_from_meta_causation_id(self):
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            '_causation_id': 'run-a',
+        }
+        assert _cycle_summary_run_id_backfill(meta, None) == 'run-a'
+
+    def test_missing_run_id_backfills_from_causation_id_param(self):
+        """The production MCP-boundary path: _extract_causation already
+        popped _causation_id out of metadata into the causation_id
+        parameter, so meta has no '_causation_id' key at all."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {'kind': 'cycle_summary', 'stage': 'memory_consolidator'}
+        assert _cycle_summary_run_id_backfill(meta, 'run-b') == 'run-b'
+
+    def test_both_sources_present_prefers_meta_causation_id(self):
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            '_causation_id': 'run-a',
+        }
+        assert _cycle_summary_run_id_backfill(meta, 'run-b') == 'run-a'
+
+    def test_run_id_already_valid_returns_none(self):
+        """Nothing to repair — must not clobber a valid caller-supplied run_id."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            'run_id': 'r1',
+            '_causation_id': 'run-a',
+        }
+        assert _cycle_summary_run_id_backfill(meta, 'run-b') is None
+
+    def test_empty_or_whitespace_run_id_backfills_stripped_value(self):
+        """run_id present but empty/whitespace-only is treated as missing,
+        and the backfilled value is stripped."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {
+            'kind': 'cycle_summary',
+            'stage': 'memory_consolidator',
+            'run_id': '   ',
+        }
+        assert _cycle_summary_run_id_backfill(meta, '  run-c  ') == 'run-c'
+
+    def test_no_source_available_returns_none(self):
+        """run_id absent AND no causation source anywhere -> unrepairable, None."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {'kind': 'cycle_summary', 'stage': 'memory_consolidator'}
+        assert _cycle_summary_run_id_backfill(meta, None) is None
+
+    def test_non_cycle_summary_kind_returns_none(self):
+        """Only kind == 'cycle_summary' writes are ever touched, even when a
+        causation source is available."""
+        from fused_memory.services.memory_service import _cycle_summary_run_id_backfill
+        meta = {'kind': 'note'}
+        assert _cycle_summary_run_id_backfill(meta, 'run-b') is None
+
+
 class TestReconPoolAutoTagInjection:
     """Integration: add_memory must inject recon_pool into the metadata dict
     handed to mem0.add for cycle_summary writes, server-side, independent of
@@ -4375,20 +4457,30 @@ class TestReconPoolAutoTagMissingStageWarning:
 
 
 class TestCycleSummaryRunIdGuard:
-    """add_memory must warn when metadata.run_id is dropped/empty even though
-    metadata.stage is present and known (task 2094).
+    """add_memory's cycle_summary run_id guard (task 2094), updated for the
+    task-2109 auto-backfill.
 
     Task 2077/1653 only warned when recon_pool could not be inferred (i.e.
     stage missing/unknown) via an `elif` gated on `inferred_recon_pool is
     None`. A write with a VALID stage short-circuits into the `if` branch and
     never reaches a run_id check, so a dropped/empty run_id sailed through
     with zero warnings — invisible to the Path-2 triple-filter
-    count_memories_by_metadata({kind, run_id, stage}) pre-check. RED until
-    the guard is decoupled from recon_pool inference (step-4).
+    count_memories_by_metadata({kind, run_id, stage}) pre-check. Task 2094
+    decoupled the check so it always ran, but only WARNED about the drop.
+
+    Task 2109 replaces that warn-only behavior with server-side auto-backfill
+    (see TestCycleSummaryRunIdBackfillInjection for the full backfill
+    contract): a dropped/empty run_id with a usable causation_id ('run-x'
+    here) is now REPAIRED rather than merely logged, so the two tests below
+    assert the repair and the absence of a warning. The remaining control
+    test documents the still-silent happy path (stage and run_id both
+    present and valid).
     """
 
     @pytest.mark.asyncio
-    async def test_run_id_dropped_with_valid_stage_logs_warning(self, service, caplog):
+    async def test_run_id_dropped_with_valid_stage_is_backfilled(self, service, caplog):
+        """Superseded by task 2109: a dropped run_id is now backfilled from
+        causation_id rather than merely warned about."""
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             await service.add_memory(
                 content='Cycle 3 summary: completed steps 1-4',
@@ -4398,19 +4490,18 @@ class TestCycleSummaryRunIdGuard:
                 causation_id='run-x',
             )
 
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['run_id'] == 'run-x'
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warning_records) == 1, (
-            f'Expected exactly 1 WARNING for a cycle_summary with a dropped run_id '
-            f'(stage present), got {len(warning_records)}: '
-            f'{[r.message for r in warning_records]}'
+        assert warning_records == [], (
+            f'Expected no WARNING once the dropped run_id is backfilled from '
+            f'causation_id, got: {[r.message for r in warning_records]}'
         )
-        record = warning_records[0]
-        assert record.run_id is None
-        assert record.stage == 'memory_consolidator'
-        assert 'run_id' in record.missing_cycle_summary_keys
 
     @pytest.mark.asyncio
-    async def test_empty_run_id_with_valid_stage_logs_warning(self, service, caplog):
+    async def test_empty_run_id_with_valid_stage_is_backfilled(self, service, caplog):
+        """Superseded by task 2109: an empty run_id is now backfilled from
+        causation_id rather than merely warned about."""
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             await service.add_memory(
                 content='Cycle 3 summary: completed steps 1-4',
@@ -4424,14 +4515,13 @@ class TestCycleSummaryRunIdGuard:
                 causation_id='run-x',
             )
 
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['run_id'] == 'run-x'
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warning_records) == 1, (
-            f'Expected exactly 1 WARNING for a cycle_summary with an empty run_id '
-            f'(stage present), got {len(warning_records)}: '
-            f'{[r.message for r in warning_records]}'
+        assert warning_records == [], (
+            f'Expected no WARNING once the empty run_id is backfilled from '
+            f'causation_id, got: {[r.message for r in warning_records]}'
         )
-        record = warning_records[0]
-        assert 'run_id' in record.missing_cycle_summary_keys
 
     @pytest.mark.asyncio
     async def test_stage_and_run_id_both_present_no_warning(self, service, caplog):
@@ -4452,6 +4542,197 @@ class TestCycleSummaryRunIdGuard:
         assert warning_records == [], (
             f'Expected no WARNING when both stage and run_id are present and valid, '
             f'got: {[r.message for r in warning_records]}'
+        )
+
+
+class TestCycleSummaryRunIdBackfillInjection:
+    """Integration: add_memory must auto-backfill metadata.run_id for
+    cycle_summary writes from an authoritative causation id, server-side,
+    independent of LLM prompt compliance (task 2109 — replaces the
+    warn-only guard from task 2094; see TestCycleSummaryRunIdGuard).
+
+    RED until _cycle_summary_run_id_backfill is wired into add_memory
+    (step-4).
+    """
+
+    @pytest.mark.asyncio
+    async def test_backfills_from_meta_causation_id_no_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='test',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    '_causation_id': 'run-a',
+                },
+            )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['run_id'] == 'run-a'
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING once run_id is backfilled from '
+            f"meta['_causation_id'], got: {[r.message for r in warning_records]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_backfills_from_causation_id_param_production_path(self, service, caplog):
+        """The production MCP path: _extract_causation already popped
+        _causation_id out of metadata into the causation_id parameter, so
+        meta itself carries no '_causation_id' key."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='test',
+                metadata={'kind': 'cycle_summary', 'stage': 'memory_consolidator'},
+                causation_id='run-b',
+            )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['run_id'] == 'run-b'
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING once run_id is backfilled from the '
+            f'causation_id parameter, got: {[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_run_id_backfilled_from_causation_id_param(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='test',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    'run_id': '',
+                },
+                causation_id='run-c',
+            )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['run_id'] == 'run-c'
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            f'Expected no WARNING once the empty run_id is backfilled, got: '
+            f'{[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_causation_source_falls_back_to_warning(self, service, caplog):
+        """Unrepairable: no meta['_causation_id'] and no causation_id param ->
+        the pre-task-2109 warn-only fallback still fires."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='test',
+                metadata={'kind': 'cycle_summary', 'stage': 'memory_consolidator'},
+            )
+        call_kwargs = service.mem0.add.call_args[1]
+        run_id = call_kwargs['metadata'].get('run_id')
+        assert not (isinstance(run_id, str) and run_id.strip()), (
+            f'Expected no valid run_id when no causation source is available, '
+            f'got {run_id!r}'
+        )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 fallback WARNING when run_id is unrepairable, '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+        assert 'run_id' in warning_records[0].missing_cycle_summary_keys
+
+    @pytest.mark.asyncio
+    async def test_backfill_does_not_suppress_missing_stage_warning(self, service, caplog):
+        """run_id is backfillable, but stage is NOT — the fallback WARNING
+        must still fire, scoped to ['stage'] only (run_id must no longer be
+        flagged once repaired)."""
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='test',
+                metadata={'kind': 'cycle_summary', '_causation_id': 'run-z'},
+            )
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['run_id'] == 'run-z'
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 WARNING (stage still missing/unrepairable), '
+            f'got {len(warning_records)}: {[r.message for r in warning_records]}'
+        )
+        assert warning_records[0].missing_cycle_summary_keys == ['stage']
+
+
+class TestCycleSummaryRunIdBackfillToolsBoundary:
+    """Boundary-level coverage between server/tools.py::_extract_causation's
+    UUID-generation fallback and the task-2109 run_id auto-backfill
+    (reviewer finding from the task 2109 amendment pass).
+
+    _extract_causation never actually passes a None causation_id through:
+    when metadata carries no '_causation_id' (e.g. the reconciliation stage
+    agent dropped it under the same kind of prompt-compliance failure this
+    task's run_id backfill exists to paper over), it synthesizes a fresh
+    str(uuid4()) on the spot (tools.py ~398-399). MemoryService.add_memory
+    has no signal to tell that call-scoped synthetic value apart from a
+    genuine run-scoped causation id — reconciliation/harness.py generates
+    run_id the same way, via str(uuid4()) — so
+    `_cycle_summary_run_id_backfill` backfills run_id from it regardless.
+
+    This is a KNOWN, ACCEPTED-FOR-NOW LIMITATION, not intended long-term
+    behavior: the write stops warning (looks healthy), but the backfilled
+    run_id is a meaningless per-call value that will never match any
+    sibling cycle_summary write from the same actual reconciliation run in
+    the Path-2 triple-filter count_memories_by_metadata({kind, run_id,
+    stage}) pre-check. Closing the gap requires _extract_causation to flag
+    whether it synthesized (vs. received) the id and, for a synthesized id,
+    skip the run_id backfill in favor of the fallback warning — a change to
+    fused_memory/server/tools.py, outside this task's locked module scope
+    (fused_memory/services + this test file). Tracked as a follow-up; this
+    test pins today's (masking) behavior so a future fix must consciously
+    come back and update it rather than silently regress.
+    """
+
+    @pytest.mark.asyncio
+    async def test_synthesized_causation_id_is_still_backfilled_as_run_id(self, service, caplog):
+        """Neither run_id nor metadata['_causation_id'] survive to the MCP
+        boundary -> _extract_causation synthesizes a fresh UUID -> today
+        that synthetic value is (mis)backfilled into run_id with no
+        warning. See class docstring for why this is a tracked gap rather
+        than intended behavior."""
+        from fused_memory.server.tools import _extract_causation
+
+        causation_id, _source, cleaned_meta = _extract_causation(
+            {'kind': 'cycle_summary', 'stage': 'memory_consolidator'},
+            'recon-stage-memory_consolidator',
+        )
+        assert cleaned_meta is not None
+        assert '_causation_id' not in cleaned_meta, (
+            "_extract_causation is expected to pop '_causation_id' out of "
+            'metadata before returning it — this test only exercises the '
+            'no-_causation_id-supplied fallback path.'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='test',
+                metadata=cleaned_meta,
+                causation_id=causation_id,
+            )
+
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['run_id'] == causation_id, (
+            'Documents the known gap: a causation_id synthesized by '
+            '_extract_causation (no real relationship to any reconciliation '
+            'run) is currently backfilled into run_id verbatim.'
+        )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            'The write looks healthy (no warning) despite run_id being a '
+            f'meaningless synthetic id, got: {[r.message for r in warning_records]}'
         )
 
 
