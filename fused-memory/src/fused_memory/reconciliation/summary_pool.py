@@ -12,9 +12,10 @@ lives here once, parametrized, and both stages delegate to it (task 1942).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime
+
+from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
 
@@ -104,23 +105,26 @@ async def enforce_summary_pool_cap(
     sorted_members = sorted(members, key=_sort_key)
     to_delete = sorted_members[: len(sorted_members) - cap]
 
-    results = await asyncio.gather(
-        *(
-            memory_service.delete_memory(
-                memory_id=m['id'],
-                store='mem0',
-                project_id=project_id,
-                causation_id=run_id,
-                _source=trim_source,
-            )
-            for m in to_delete
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents the trim sweep from silently converting a shutdown signal
+    # into an under-counted deletion tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    results = await gather_collect(
+        memory_service.delete_memory(
+            memory_id=m['id'],
+            store='mem0',
+            project_id=project_id,
+            causation_id=run_id,
+            _source=trim_source,
+        )
+        for m in to_delete
     )
 
     success_count = 0
     for m, result in zip(to_delete, results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             logger.warning(
                 'reconciliation.enforce_summary_pool_cap: '
                 'delete failed for memory_id=%s recon_pool=%s; not counted',
