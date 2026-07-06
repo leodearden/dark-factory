@@ -8844,8 +8844,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entry.phase = 'finalizing'   # per-entry source of truth for snapshot()
             current_sha = merge_commit
             while True:
-                adv_outcome = await self._git_ops.advance_main(
-                    current_sha, merge_wt,
+                # Write-ahead (PRD WA-1): record a LandedRow into the durable
+                # outbox BEFORE advancing main — single-sourced via the shared
+                # helper (task β).  Re-recorded each loop iteration so a
+                # rebased retry's current_sha stays in sync (idempotent
+                # last-write-wins, WA-2).
+                adv_outcome = await _journal_landed_then_advance(
+                    self._landed_outbox, self._git_ops,
+                    task_id=req.task_id,
+                    branch_tip_sha=item.merged_branch_tip,
+                    advanced_sha=current_sha,
+                    merge_wt=merge_wt,
                     branch=req.branch,
                     max_attempts=req.config.max_advance_attempts,
                     expected_main=item.base_sha,
