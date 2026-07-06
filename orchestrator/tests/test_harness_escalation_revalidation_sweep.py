@@ -67,6 +67,7 @@ def _make_harness() -> Harness:
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-revalidation-1')
     h.event_store = MagicMock()
+    h.git_ops = MagicMock()
     return h
 
 
@@ -287,3 +288,159 @@ class TestReconSweepSourceC:
         h._revalidate_open_deterministic_escalation.assert_awaited_once_with(
             esc, task, task['metadata']
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7: Harness._close_superseded_main_sweep_escalations
+# ---------------------------------------------------------------------------
+
+
+class TestCloseSupersededMainSweepEscalations:
+    """step-7: main-tip-sweep self-heal — closes a pending
+    ``orchestrator-main-sweep`` escalation once a later clean full-verify
+    PASS supersedes its (now-fixed) swept SHA."""
+
+    @pytest.mark.asyncio
+    async def test_closes_l1_when_swept_sha_is_strict_ancestor_of_clean_tip(self) -> None:
+        h = _make_harness()
+        h.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        esc = _make_esc(
+            level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
+            task_id='main-sweep-deadbeef1234', esc_id='esc-main-sweep-1',
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+        clean_sha = 'f' * 40
+
+        await h._close_superseded_main_sweep_escalations(clean_sha)
+
+        h.git_ops.is_ancestor.assert_awaited_once_with('deadbeef1234', clean_sha)  # type: ignore[attr-defined]
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert args[0] == esc.id
+        resolution = args[1] if len(args) > 1 else kwargs.get('resolution')
+        assert resolution and isinstance(resolution, str)
+        assert kwargs.get('dismiss') is True
+        assert kwargs.get('resolved_by') == 'harness-main-tip-sweep-selfheal'
+        h.event_store.emit.assert_called_once()  # type: ignore[attr-defined]
+        emit_args, _emit_kwargs = h.event_store.emit.call_args  # type: ignore[attr-defined]
+        assert emit_args[0] == EventType.escalation_resolved
+
+    @pytest.mark.asyncio
+    async def test_closes_l2_main_sweep_escalation_too(self) -> None:
+        """level-agnostic: an L2 main-sweep escalation closes the same way —
+        a main-sweep escalation may have been promoted to L2 by the
+        auto-watcher, and the self-heal must still reach it."""
+        h = _make_harness()
+        h.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        esc = _make_esc(
+            level=2, category='infra_issue', agent_role='orchestrator-main-sweep',
+            task_id='main-sweep-deadbeef1234', esc_id='esc-main-sweep-l2',
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+
+        await h._close_superseded_main_sweep_escalations('f' * 40)
+
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        _args, kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert kwargs.get('dismiss') is True
+        assert kwargs.get('resolved_by') == 'harness-main-tip-sweep-selfheal'
+
+    @pytest.mark.asyncio
+    async def test_not_yet_superseded_leaves_open(self) -> None:
+        h = _make_harness()
+        h.git_ops.is_ancestor = AsyncMock(return_value=False)  # type: ignore[attr-defined]
+        esc = _make_esc(
+            level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
+            task_id='main-sweep-deadbeef1234', esc_id='esc-main-sweep-2',
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+
+        await h._close_superseded_main_sweep_escalations('f' * 40)
+
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_non_main_sweep_role_skipped(self) -> None:
+        h = _make_harness()
+        h.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        esc = _make_esc(
+            level=1, category='infra_issue', agent_role='orchestrator-deterministic',
+            task_id='main-sweep-deadbeef1234', esc_id='esc-not-main-sweep',
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+
+        await h._close_superseded_main_sweep_escalations('f' * 40)
+
+        h.git_ops.is_ancestor.assert_not_awaited()  # type: ignore[attr-defined]
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_equal_sha_guard_skips(self) -> None:
+        """The escalation's swept SHA is the SAME sha as the clean tip —
+        is_ancestor(X, X) is trivially True (git merge-base --is-ancestor is
+        reflexive), so this must be guarded rather than treated as a real
+        strict-descendant fix (a still-broken main re-verified at the exact
+        same commit must NOT auto-close)."""
+        h = _make_harness()
+        h.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        clean_sha = 'deadbeef1234' + '0' * 28
+        esc = _make_esc(
+            level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
+            task_id='main-sweep-deadbeef1234', esc_id='esc-same-sha',
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+
+        await h._close_superseded_main_sweep_escalations(clean_sha)
+
+        h.git_ops.is_ancestor.assert_not_awaited()  # type: ignore[attr-defined]
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_fail_soft_one_bad_esc_does_not_abort_pass(self) -> None:
+        h = _make_harness()
+
+        async def _is_ancestor(ancestor: str, _descendant: str) -> bool:
+            if ancestor == 'baaaaaaaaaa1':
+                raise RuntimeError('boom')
+            return True
+
+        h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)  # type: ignore[attr-defined]
+        bad_esc = _make_esc(
+            level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
+            task_id='main-sweep-baaaaaaaaaa1', esc_id='esc-bad',
+        )
+        good_esc = _make_esc(
+            level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
+            task_id='main-sweep-deadbeef1234', esc_id='esc-good',
+        )
+        h._escalation_queue.get_pending = MagicMock(  # type: ignore[union-attr]
+            return_value=[bad_esc, good_esc]
+        )
+
+        await h._close_superseded_main_sweep_escalations('f' * 40)  # must not raise
+
+        h._escalation_queue.resolve.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        args, _kwargs = h._escalation_queue.resolve.call_args  # type: ignore[union-attr, attr-defined]
+        assert args[0] == good_esc.id
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_config_kill_switch(self) -> None:
+        h = _make_harness()
+        h.config = h.config.model_copy(update={'escalation_revalidation_enabled': False})
+        h.git_ops.is_ancestor = AsyncMock(return_value=True)  # type: ignore[attr-defined]
+        esc = _make_esc(
+            level=1, category='infra_issue', agent_role='orchestrator-main-sweep',
+            task_id='main-sweep-deadbeef1234', esc_id='esc-disabled',
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[esc])  # type: ignore[union-attr]
+
+        await h._close_superseded_main_sweep_escalations('f' * 40)
+
+        h._escalation_queue.resolve.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_no_escalation_queue_does_not_raise(self) -> None:
+        h = _make_harness()
+        h._escalation_queue = None
+
+        await h._close_superseded_main_sweep_escalations('f' * 40)  # must not raise
