@@ -74,12 +74,6 @@ __all__ = [
 ]
 
 
-# Server-side terminal statuses (mirrors fused-memory's TERMINAL_STATUSES).
-# Used to classify a ``terminal_exit_rejected`` response as a logical
-# contradiction (terminal -> non-terminal with no reopen_reason) versus a
-# benign side-effect of an idempotent terminal -> terminal write.
-_TERMINAL_STATUSES = frozenset({'done', 'cancelled'})
-
 # Non-terminal but non-candidate statuses for the starvation watchdog GC.
 # Tasks in these states leave the dispatch-eligible candidate pool without
 # going terminal, so the dispatch-site resolve and the _stale_ids sweep would
@@ -1629,7 +1623,9 @@ class Scheduler:
                     else ''
                 )
                 if error_code == 'terminal_exit_rejected':
-                    if status in _TERMINAL_STATUSES or reopen_reason is not None:
+                    # Terminal classification reuses the shared TERMINAL_STATUSES
+                    # set (imported above) rather than a separate local copy.
+                    if status in TERMINAL_STATUSES or reopen_reason is not None:
                         logger.warning(
                             'set_task_status(%s, %s) rejected by fused-memory: %s',
                             task_id, status, rejection,
