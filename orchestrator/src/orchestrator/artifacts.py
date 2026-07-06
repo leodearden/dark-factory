@@ -722,7 +722,7 @@ class TaskArtifacts:
         escalation path rather than a generic BLOCKED error.
         """
         try:
-            plan_path = self.root / 'plan.json'
+            plan_path = self._read_path('plan.json')
             data = json.loads(plan_path.read_text())
             if data.get('_session_id') == session_id:
                 return True
