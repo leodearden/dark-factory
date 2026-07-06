@@ -6065,6 +6065,86 @@ class TestDeferredWatchDispatchGate:
             f'dispatch; got: {result}'
         )
 
+    @pytest.mark.asyncio
+    async def test_acquire_next_skips_deferred_watch_task_and_dispatches_normal_task(
+        self, monkeypatch
+    ):
+        """acquire_next must never select a pending deferred_watch task with
+        an unmet trigger, even with a normal pending task co-present that
+        gets dispatched instead.
+
+        Because the gate lives inside _eligible_for_dispatch — the single
+        source of truth used by both the scored-candidate loop and the
+        pin-dispatch loop — the deferred_watch task never enters
+        acquire_next's `candidates` list. It is therefore invisible to the
+        starvation watchdog and files no dispatch/lock/starvation event: the
+        user-observable acceptance signal from the task description (no more
+        spurious L1->L2 escalations like esc-2217-10).
+
+        This test passes immediately given the step-4 gate already wired
+        through _eligible_for_dispatch; it pins the acquire_next-level wiring
+        as a regression guard.
+        """
+        import json as _json
+
+        base_time = 1_000_000.0
+        config = OrchestratorConfig(max_per_module=1)
+        event_store = _RecordingEventStore()
+        scheduler = Scheduler(
+            config, event_store=event_store, time_source=lambda: base_time
+        )
+
+        deferred_task = {
+            'id': '2217',
+            'title': 'Deferred-watch task (unmet trigger)',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {
+                'deferred_watch': True,
+                'trigger': (
+                    'graphiti-core upstream release correcting per-node-pair '
+                    'over-invalidation'
+                ),
+                'files': ['fused-memory'],
+            },
+        }
+        normal_task = {
+            'id': '99',
+            'title': 'Normal pending task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'files': ['backend']},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': _json.dumps({'tasks': [deferred_task, normal_task]}),
+                    }
+                ]
+            }
+        }
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None and result.task_id == '99', (
+            f'Expected the normal task (99) to be dispatched, never the '
+            f'deferred_watch task (2217); got: {result}'
+        )
+
+        events_for_deferred_task = [
+            e for e in event_store.events if e[1].get('task_id') == '2217'
+        ]
+        assert events_for_deferred_task == [], (
+            f'Expected NO events recorded for the gated deferred_watch task '
+            f'2217 (it never enters the candidate pool, so it must file no '
+            f'dispatch/lock/starvation event); got: {events_for_deferred_task}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Park-and-stop pause mechanism (task 1322)
