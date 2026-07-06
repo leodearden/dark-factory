@@ -2629,6 +2629,75 @@ class TestAttachDedupeChildConcurrency:
         )
 
 
+class TestMakeIdCounterConcurrency:
+    """Two-OS-process test: concurrent make_id() for the SAME task_id must not collide.
+
+    The durable per-task_id counter (queue.py make_id()) must serialize its
+    read-modify-write across OS processes via the existing escalation_id_lock
+    sidecar primitive keyed on 'esc-{task_id}.seq'. Submit's own per-escalation-id
+    lock does NOT provide this guarantee — it only serializes writes to the SAME
+    id, not the shared counter read-increment-write that mints DIFFERENT ids.
+    """
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_make_id_no_collision(self, tmp_path: Path):
+        """N=50 make_id()+submit() from two concurrent processes yields 100 distinct, contiguous ids.
+
+        Without a lock guarding the counter RMW, both processes can read the
+        same counter value and mint the same id; the second submit for a
+        duplicate id clobbers the first's file, so fewer than 100 distinct
+        files remain on disk (and/or sequence numbers repeat).
+        """
+        queue_dir = tmp_path / 'queue'
+        EscalationQueue(queue_dir)  # ensure queue_dir exists before spawning children
+        task_id = 'cx'
+
+        # Build env with worktree src on PYTHONPATH so child imports in-tree escalation
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing_pythonpath = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing_pythonpath}' if existing_pythonpath else src_path
+
+        count = 50
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+
+        # Start both child processes concurrently, minting+submitting against the SAME task_id.
+        proc_a = subprocess.Popen(
+            child_args + ['make_id_submit', task_id, 'unused', str(count)],
+            env=env,
+        )
+        proc_b = subprocess.Popen(
+            child_args + ['make_id_submit', task_id, 'unused', str(count)],
+            env=env,
+        )
+
+        # Wait for both to complete; kill any orphaned child on timeout/exception
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        # Read the final state and assert 100 distinct, contiguous sequence numbers.
+        files = list(queue_dir.glob(f'esc-{task_id}-*.json'))
+        seqs = sorted(int(p.stem.rsplit('-', 1)[1]) for p in files)
+        assert len(files) == 100, (
+            f'Expected 100 distinct escalation files, got {len(files)}: seqs={seqs}'
+        )
+        assert len(set(seqs)) == 100, (
+            f'Expected 100 distinct sequence numbers (no collision), got {len(set(seqs))}: {seqs}'
+        )
+        assert seqs == list(range(1, 101)), (
+            f'Expected contiguous sequence 1..100 with no reuse, got {seqs}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Concurrent resolve: exactly-one-archive-copy invariant
 # ---------------------------------------------------------------------------
