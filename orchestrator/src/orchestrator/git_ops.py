@@ -977,10 +977,21 @@ class GitOps:
 
         registry = self.protected_prefixes()
         name = resolved.name
-        token = next(
+        exact_match = next(
+            (key for key in registry if not key.endswith('-') and name == key),
+            None,
+        )
+        prefix_match = next(
             (key for key in registry if key.endswith('-') and name.startswith(key)),
             None,
         )
+        # Exact-name keys take precedence over prefix keys: e.g. the
+        # persistent `_merge-verify` worktree matches both its own exact
+        # name and the `_merge-` prefix, and must resolve to the exact
+        # persistent-merge-verify token so a plain `_merge-` owner still
+        # refuses it (see the design_decisions entry on exact-first
+        # precedence).
+        token = exact_match if exact_match is not None else prefix_match
         if token is None:
             return False
         if token in owned:
