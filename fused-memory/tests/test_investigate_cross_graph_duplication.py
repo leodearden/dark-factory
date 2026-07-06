@@ -7,6 +7,8 @@ test_purge_knowlive_namespace.py.
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -617,3 +619,90 @@ class TestRun:
         assert report['errors'] == [{'graph': 'bad-graph', 'error': 'no such graph'}]
         assert len(report['present_in']) == 1
         assert report['present_in'][0]['graph'] == 'reify'
+
+
+# ===========================================================================
+# Tests: main() -- CLI / live-wiring layer
+# ===========================================================================
+
+class _StubConfig:
+    """Lightweight stand-in for FusedMemoryConfig -- main() only needs to
+    be able to construct one and hand it to MemoryService."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class _StubMemoryService:
+    """Lightweight stand-in for MemoryService -- wires a .graphiti mock
+    sufficient for run() to complete end-to-end without a live FalkorDB."""
+
+    def __init__(self, config):
+        self.config = config
+        graphiti = MagicMock()
+        graphiti.list_graphs = AsyncMock(return_value=['reify'])
+        graphiti._graph_for = MagicMock(return_value=_make_graph_mock([]))
+        self.graphiti = graphiti
+
+    async def initialize(self):
+        return None
+
+    async def close(self):
+        return None
+
+
+class TestMainCliWiring:
+    """Tests for main()/_run_live(): argparse default resolution, --config
+    -> CONFIG_PATH env wiring, and the report being JSON-serialized to
+    stdout. Every other test in this module hits the pure/orchestration
+    core directly via mocks; main() itself -- the thing an operator
+    actually runs -- was previously untested."""
+
+    def _patch_live_deps(self, monkeypatch):
+        monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', _StubConfig)
+        monkeypatch.setattr('fused_memory.services.memory_service.MemoryService', _StubMemoryService)
+
+    def test_default_uuid_falls_back_to_target_node_uuid_and_prints_json(self, monkeypatch, capsys):
+        """No --uuid on argv -> argparse's own default (TARGET_NODE_UUID)
+        flows through end-to-end, and stdout is valid JSON matching the
+        report shape."""
+        self._patch_live_deps(monkeypatch)
+        monkeypatch.setattr(sys, 'argv', ['investigate_cross_graph_duplication.py'])
+
+        rc = _mod.main()
+
+        assert rc == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report['target_uuid'] == _mod.TARGET_NODE_UUID
+        assert report['all_graphs'] == ['reify']
+        assert 'verdict' in report
+        assert 'scope' in report
+
+    def test_uuid_flag_overrides_default(self, monkeypatch, capsys):
+        """--uuid on argv overrides the TARGET_NODE_UUID default end-to-end."""
+        self._patch_live_deps(monkeypatch)
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate_cross_graph_duplication.py', '--uuid', 'custom-uuid'],
+        )
+
+        _mod.main()
+
+        report = json.loads(capsys.readouterr().out)
+        assert report['target_uuid'] == 'custom-uuid'
+
+    def test_config_flag_sets_config_path_env_var(self, monkeypatch, capsys):
+        """--config <path> sets os.environ['CONFIG_PATH'] before the live
+        config/MemoryService are constructed."""
+        self._patch_live_deps(monkeypatch)
+        monkeypatch.delenv('CONFIG_PATH', raising=False)
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate_cross_graph_duplication.py', '--config', '/tmp/some-config.yaml'],
+        )
+
+        try:
+            _mod.main()
+            assert os.environ['CONFIG_PATH'] == '/tmp/some-config.yaml'
+        finally:
+            os.environ.pop('CONFIG_PATH', None)
