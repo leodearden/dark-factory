@@ -260,3 +260,95 @@ class TestProbeNodeAcrossGraphs:
 
         assert result == []
         graphiti._graph_for.assert_not_called()
+
+
+# ===========================================================================
+# Tests: classify_config_routing
+# ===========================================================================
+
+class TestClassifyConfigRouting:
+    """Tests for classify_config_routing(collision_result, presence) -> dict."""
+
+    NO_COLLISIONS = {'collisions': [], 'suspected_path_leaks': []}
+
+    def test_confirmed_cross_graph_node_leak_when_present_in_multiple_graphs(self):
+        """Task scenario: node present in 3 graphs with group_id='reify' in
+        all of them -> CONFIRMED with 'cross_graph_node_leak'."""
+        presence = [
+            {'graph': 'reify', 'uuid': 'u1', 'name': 'orchestrator', 'group_id': 'reify'},
+            {'graph': 'dark_factory', 'uuid': 'u1', 'name': 'orchestrator', 'group_id': 'reify'},
+            {'graph': 'know_live', 'uuid': 'u1', 'name': 'orchestrator', 'group_id': 'reify'},
+        ]
+
+        verdict = _mod.classify_config_routing(self.NO_COLLISIONS, presence)
+
+        assert verdict['confirmed'] is True
+        assert 'cross_graph_node_leak' in verdict['signals']
+
+    def test_single_graph_but_mismatched_group_id_still_confirms(self):
+        """Even with the node present in only one graph, a mismatch between
+        that graph's canonical key and the node's recorded group_id is
+        itself a routing leak signal."""
+        presence = [
+            {'graph': 'dark_factory', 'uuid': 'u1', 'name': 'orchestrator', 'group_id': 'reify'},
+        ]
+
+        verdict = _mod.classify_config_routing(self.NO_COLLISIONS, presence)
+
+        assert verdict['confirmed'] is True
+        assert 'cross_graph_node_leak' in verdict['signals']
+
+    def test_confirmed_name_normalization_collision_when_collisions_present(self):
+        """Non-empty collisions -> CONFIRMED with 'name_normalization_collision',
+        independent of presence (which here is consistent + <=1 graph)."""
+        collision_result = {
+            'collisions': [
+                {'canonical': 'dark_factory', 'variants': ['dark-factory', 'dark_factory'], 'count': 2},
+            ],
+            'suspected_path_leaks': [],
+        }
+        presence = [{'graph': 'reify', 'uuid': 'u1', 'name': 'orchestrator', 'group_id': 'reify'}]
+
+        verdict = _mod.classify_config_routing(collision_result, presence)
+
+        assert verdict['confirmed'] is True
+        assert 'name_normalization_collision' in verdict['signals']
+        assert 'cross_graph_node_leak' not in verdict['signals']
+
+    def test_confirmed_suspected_path_leak_when_path_leaks_present(self):
+        """Non-empty suspected_path_leaks -> CONFIRMED with 'suspected_path_leak',
+        independent of presence/collisions."""
+        collision_result = {'collisions': [], 'suspected_path_leaks': ['-home-leo-src-dark-factory']}
+        presence = [{'graph': 'reify', 'uuid': 'u1', 'name': 'orchestrator', 'group_id': 'reify'}]
+
+        verdict = _mod.classify_config_routing(collision_result, presence)
+
+        assert verdict['confirmed'] is True
+        assert 'suspected_path_leak' in verdict['signals']
+        assert 'cross_graph_node_leak' not in verdict['signals']
+        assert 'name_normalization_collision' not in verdict['signals']
+
+    def test_denied_when_no_signals_present(self):
+        """No collisions, no path leaks, node present in exactly one graph
+        consistent with its own group_id -> DENIED with empty signals and
+        an explanatory rationale."""
+        presence = [{'graph': 'reify', 'uuid': 'u1', 'name': 'orchestrator', 'group_id': 'reify'}]
+
+        verdict = _mod.classify_config_routing(self.NO_COLLISIONS, presence)
+
+        assert verdict['confirmed'] is False
+        assert verdict['signals'] == []
+        assert 'no routing anomaly detected' in verdict['rationale'].lower()
+
+    def test_denied_when_node_not_found_anywhere(self):
+        """An empty presence list (with no collisions/leaks) is also a denial."""
+        verdict = _mod.classify_config_routing(self.NO_COLLISIONS, [])
+
+        assert verdict['confirmed'] is False
+        assert verdict['signals'] == []
+
+    def test_return_shape_has_exactly_the_three_keys(self):
+        """The verdict dict has exactly {confirmed, signals, rationale}."""
+        verdict = _mod.classify_config_routing(self.NO_COLLISIONS, [])
+
+        assert set(verdict.keys()) == {'confirmed', 'signals', 'rationale'}
