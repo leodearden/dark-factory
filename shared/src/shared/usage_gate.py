@@ -407,6 +407,18 @@ class UsageGate:
         else:
             self._open.clear()
 
+        if new_phase == AccountPhase.CAPPED:
+            if acct.pause_started_at is None:
+                acct.pause_started_at = datetime.now(UTC)
+            if acct.auth_reprobe_task is not None and not acct.auth_reprobe_task.done():
+                acct.auth_reprobe_task.cancel()
+            self._start_account_resume_probe(acct)
+        elif new_phase == AccountPhase.AUTH_FAILED:
+            acct.auth_failed_at = datetime.now(UTC)
+            if acct.resume_task is not None and not acct.resume_task.done():
+                acct.resume_task.cancel()
+            self._start_auth_reprobe(acct)
+
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
 
@@ -687,6 +699,10 @@ class UsageGate:
 
     def _start_auth_reprobe(self, acct: AccountState) -> None:
         """Schedule a background re-probe loop for an auth_failed account."""
+        # getattr default: some test fixtures construct UsageGate via
+        # __new__ (bypassing __init__) and predate this field.
+        if getattr(self, '_shutting_down', False):
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -895,6 +911,10 @@ class UsageGate:
 
     def _start_account_resume_probe(self, acct: AccountState) -> None:
         """Start an async resume probe for a specific account."""
+        # getattr default: some test fixtures construct UsageGate via
+        # __new__ (bypassing __init__) and predate this field.
+        if getattr(self, '_shutting_down', False):
+            return
         if not self._config.wait_for_reset:
             return
         try:
