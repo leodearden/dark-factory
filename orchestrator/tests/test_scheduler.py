@@ -6091,7 +6091,9 @@ class TestDeferredWatchDispatchGate:
         config = OrchestratorConfig(max_per_module=1)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(
-            config, event_store=event_store, time_source=lambda: base_time
+            config,
+            event_store=event_store,  # type: ignore[arg-type]
+            time_source=lambda: base_time,
         )
 
         deferred_task = {
