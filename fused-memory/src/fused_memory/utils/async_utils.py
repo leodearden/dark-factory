@@ -30,7 +30,8 @@ The standard two-tier guard pattern separates these concerns:
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+import asyncio
+from collections.abc import Awaitable, Iterable, Sequence
 from typing import Any
 
 
@@ -69,3 +70,32 @@ def propagate_cancellations(results: Sequence[Any]) -> None:  # Sequence, not li
     for r in results:
         if isinstance(r, BaseException) and not isinstance(r, Exception):
             raise r
+
+
+async def gather_collect(coros: Iterable[Awaitable[Any]]) -> list:
+    """Gather *coros*, then return per-item value-or-Exception for the caller.
+
+    This is the "collect" Pass-2 policy: after Pass 1
+    (:func:`propagate_cancellations`) confirms no bare BaseException (cancellation
+    signal) was captured, the raw per-item results — values and captured
+    Exceptions alike — are returned as-is for the caller to classify (e.g. via
+    ``isinstance(r, Exception)`` accumulation). This matches the semantics used
+    by ``GraphitiBackend.rebuild_entity_summaries``, ``ContextAssembler.assemble``,
+    and best-effort sweep sites.
+
+    Args:
+        coros: An iterable of awaitables to gather.
+
+    Returns:
+        The list returned by ``asyncio.gather(*coros, return_exceptions=True)``,
+        in input order — each element is either the coroutine's result value or
+        the Exception it raised.
+
+    Raises:
+        BaseException: If any coroutine raises a bare BaseException (cancellation
+            signal), it is re-raised via Pass 1 (:func:`propagate_cancellations`)
+            before this function returns, i.e. before any Pass-2 accumulation.
+    """
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    propagate_cancellations(results)
+    return results
