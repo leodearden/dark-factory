@@ -215,3 +215,51 @@ class TestValidateExhaustive:
         import orchestrator.verify_categories as vc
 
         vc._validate_exhaustive(vc.FailureCategory, vc.CATEGORY_POLICY)
+
+
+# ---------------------------------------------------------------------------
+# step-5: derived registries match today's verify.py literals byte-for-byte
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedRegistriesByteIdentity:
+    """The four registries verify.py hand-syncs today must be DERIVED from
+    CATEGORY_POLICY and reproduce the current literals exactly (plain-str
+    goldens — StrEnum == str makes equality hold across the enum/str boundary).
+    """
+
+    def test_category_priority_matches_legacy_order(self):
+        from orchestrator.verify_categories import CATEGORY_PRIORITY
+        assert CATEGORY_PRIORITY == [
+            'infra_timeout',
+            'cargo_cli_error',
+            'compile_error',
+            'tree_sitter_generate_error',
+            'flock_error',
+            'npm_error',
+            'pytest_internalerror',
+            'env_transient',
+            'test_failure',
+            'unknown_test_failure',
+            'passed',
+            '',
+        ]
+
+    def test_archive_deny_list_matches_legacy_set(self):
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST
+        assert ARCHIVE_DENY_LIST == frozenset({
+            'compile_error', 'test_failure', 'infra_timeout', 'passed', '',
+            'pytest_internalerror', 'env_transient',
+        })
+
+    def test_preexisting_break_skip_categories_matches_legacy_set(self):
+        from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
+        assert PREEXISTING_BREAK_SKIP_CATEGORIES == frozenset({
+            'infra_timeout', 'flock_error', 'pytest_internalerror', 'env_transient',
+        })
+
+    def test_infra_transient_categories_matches_legacy_sweep_set(self):
+        from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
+        assert INFRA_TRANSIENT_CATEGORIES == frozenset({
+            'pytest_internalerror', 'env_transient',
+        })
