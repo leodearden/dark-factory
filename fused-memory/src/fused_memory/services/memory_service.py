@@ -1069,10 +1069,27 @@ class MemoryService:
         if inferred_recon_pool is not None:
             meta['recon_pool'] = inferred_recon_pool
 
+        # Server-side cycle_summary run_id auto-backfill (task 2109,
+        # replacing the warn-only guard from task 2094): run_id is
+        # LLM-supplied (see the reconciliation stage1/stage2 prompts) and a
+        # dropped/empty value has been observed to recur every cycle.
+        # Repair it authoritatively from the causation id — mirroring the
+        # _infer_recon_pool precedent above — instead of only warning about
+        # it. Sourced from meta['_causation_id'] (direct in-process callers)
+        # or the causation_id parameter (the production MCP-boundary path,
+        # where server/tools.py::_extract_causation has already popped
+        # '_causation_id' out of metadata into that parameter).
+        backfilled_run_id = _cycle_summary_run_id_backfill(meta, causation_id)
+        if backfilled_run_id is not None:
+            meta['run_id'] = backfilled_run_id
+
         # Server-side cycle_summary metadata guard (task 2094, extending task
-        # 2077): metadata.stage and metadata.run_id are both LLM-supplied
-        # (see the reconciliation stage1/stage2 prompts), so either being
-        # missing/invalid is a prompt-compliance failure this guard makes
+        # 2077), now a FALLBACK for residual unrepairable cases (task 2109):
+        # metadata.stage and metadata.run_id are both LLM-supplied (see the
+        # reconciliation stage1/stage2 prompts). stage is not backfillable
+        # (no authoritative server-side source) and run_id can only be
+        # backfilled when a causation id is available, so this guard warns
+        # on whatever remains missing/invalid after the backfill above —
         # observable rather than silently relying on the caller. This check
         # is deliberately decoupled from the recon_pool inference above —
         # previously it lived in an `elif` gated on `inferred_recon_pool is
