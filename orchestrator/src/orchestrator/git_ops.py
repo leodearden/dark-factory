@@ -3567,6 +3567,40 @@ class GitOps:
         )
         return True
 
+    async def _abort_lane_acquisition(
+        self, lane: Path, bare_id: str, *, remove_worktree: bool,
+    ) -> None:
+        """Never-raise teardown for any :meth:`acquire_warm_lane` fault exit.
+
+        Task 2199 (task-2062 residual): every fault-exit path in
+        ``acquire_warm_lane`` and its recycle/reset helpers routes through
+        this single primitive so a partially-acquired lane is always left in
+        a consistent state before its pool slot is freed — in particular,
+        HEAD must be detached before the lane is released, or a requeue can
+        collide with "already used by worktree".
+
+        Never raises. ``self.warm_lane_pool.release(lane)`` is always the
+        LAST action, so the slot is never marked FREE while lane git state
+        is still being mutated.
+        """
+        if self.warm_lane_pool is None:
+            return
+
+        try:
+            rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=lane)
+            if rc != 0:
+                logger.warning(
+                    '_abort_lane_acquisition: checkout --detach failed for '
+                    '%s (task %s): %s', lane, bare_id, err,
+                )
+        except Exception:
+            logger.warning(
+                '_abort_lane_acquisition: checkout --detach error for %s '
+                '(task %s)', lane, bare_id, exc_info=True,
+            )
+
+        await self.warm_lane_pool.release(lane)
+
     async def release_lane_for_terminal_task(
         self,
         task_id_or_branch: str,
