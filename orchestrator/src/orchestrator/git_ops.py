@@ -2914,6 +2914,22 @@ class GitOps:
                         cwd=self.project_root,
                     )
                     await self.warm_lane_pool.release(lane)
+                    # Task 2112 / angle A-2 — delete the degenerate task-branch
+                    # ref residue. `git worktree add -b full_branch <lane>
+                    # start_ref` (above) already created full_branch — often
+                    # at a foreign 'Merge task/<other> into main' commit — and
+                    # `git worktree remove --force` only drops the worktree
+                    # directory, leaving that zero-commit branch ref parked.
+                    # Gated on the read-only primitive (fail-soft False on any
+                    # doubt); _delete_branch_if_on_main is a second guard that
+                    # retains (never deletes) any branch carrying commits
+                    # beyond main. Scoped to this create-once seed-fault path
+                    # only — the reattach/reuse paths deliberately retain
+                    # commit-bearing branches and are untouched.
+                    if await self.warm_lane_ref_is_degenerate(branch_name):
+                        await self._delete_branch_if_on_main(
+                            full_branch, context='acquire_warm_lane seed-fault',
+                        )
                     return _seed_rc_to_unavailable(seed_rc)
             else:
                 # ── Already-registered lane — check on-disk backstop first ─
