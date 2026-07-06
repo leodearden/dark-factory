@@ -3599,6 +3599,23 @@ class GitOps:
                 '(task %s)', lane, bare_id, exc_info=True,
             )
 
+        if remove_worktree:
+            try:
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'remove', '--force', str(lane)],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    logger.warning(
+                        '_abort_lane_acquisition: worktree remove --force '
+                        'failed for %s (task %s): %s', lane, bare_id, err,
+                    )
+            except Exception:
+                logger.warning(
+                    '_abort_lane_acquisition: worktree remove error for %s '
+                    '(task %s)', lane, bare_id, exc_info=True,
+                )
+
         await self.warm_lane_pool.release(lane)
 
     async def release_lane_for_terminal_task(
