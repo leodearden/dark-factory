@@ -24,12 +24,18 @@ class TestProjectIdAndProjectRoot:
 
     def test_project_id_is_a_str_newtype(self):
         """ProjectId.__supertype__ is str, and calling it is the str identity."""
-        assert ProjectId.__supertype__ is str
+        # __supertype__ exists at runtime for any NewType, but pyright's basic-mode
+        # model of NewType doesn't expose it as a known attribute (it types the
+        # NewType callable as a plain function) — a documented pyright limitation,
+        # not a bug in this code.
+        assert ProjectId.__supertype__ is str  # pyright: ignore[reportFunctionMemberAccess]
         assert ProjectId('dark_factory') == 'dark_factory'
 
     def test_project_root_is_a_str_newtype(self):
         """ProjectRoot.__supertype__ is str, and calling it is the str identity."""
-        assert ProjectRoot.__supertype__ is str
+        # See test_project_id_is_a_str_newtype above: pyright doesn't model
+        # NewType.__supertype__ even though it exists at runtime.
+        assert ProjectRoot.__supertype__ is str  # pyright: ignore[reportFunctionMemberAccess]
         assert ProjectRoot('/home/leo/src/dark-factory') == '/home/leo/src/dark-factory'
 
 
