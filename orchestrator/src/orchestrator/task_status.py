@@ -24,14 +24,17 @@ transition to 'done').
 
 from __future__ import annotations
 
-from shared.task_statuses import (
-    ACTIVE as ACTIVE_TASK_STATUSES,
-)
-from shared.task_statuses import (
-    TERMINAL as TERMINAL_STATUSES,
-)
-from shared.task_statuses import (
-    WORKFLOW_PRESERVE as WORKFLOW_PRESERVE_STATUSES,
-)
+from shared.task_statuses import ACTIVE, TERMINAL, WORKFLOW_PRESERVE
+
+# Re-exported as `frozenset[str]` (rather than the shared `frozenset[TaskStatus]`
+# StrEnum type) so pyright's `x in TERMINAL_STATUSES`-style containment checks
+# keep narrowing `str | None` down to `str` at the many existing call sites
+# (workflow.py, harness.py, scheduler.py). `frozenset` is covariant, so this
+# annotation is a pure static-typing restatement — same objects, same members,
+# no behaviour change. TaskStatus is a StrEnum, so its members are genuine
+# `str` instances either way.
+TERMINAL_STATUSES: frozenset[str] = TERMINAL
+ACTIVE_TASK_STATUSES: frozenset[str] = ACTIVE
+WORKFLOW_PRESERVE_STATUSES: frozenset[str] = WORKFLOW_PRESERVE
 
 __all__ = ['TERMINAL_STATUSES', 'ACTIVE_TASK_STATUSES', 'WORKFLOW_PRESERVE_STATUSES']
