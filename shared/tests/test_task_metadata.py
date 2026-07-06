@@ -13,6 +13,8 @@ Built bottom-up in TDD order (see plans/task-metadata-schema-prd.md §5):
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 from pydantic import BaseModel, ValidationError
 
@@ -24,6 +26,7 @@ from shared.task_metadata import (
     MemoryHints,
     RetryLedger,
     TaskMetadata,
+    apply_migrations,
     register_metadata_submodel,
 )
 
@@ -379,3 +382,51 @@ class TestSubmodelRegistry:
         register_metadata_submodel('deploy_state', _DeployStateStub)
         with pytest.raises(ValueError):
             register_metadata_submodel('deploy_state', _OtherDeployStateStub)
+
+
+class TestMigrations:
+    """The versioned v0->v1 migration registry (PRD §3/§5).
+
+    The memory_hints legacy-list normalisation is ported verbatim from the
+    fused-memory backend's ``_normalize_legacy_memory_hints_value``
+    (sqlite_task_backend.py:1320): entities/queries are deduped
+    independently (not per-pair), preserving first-seen order.
+    """
+
+    def test_legacy_memory_hints_list_deduped_to_canonical_dict(self):
+        blob = {'memory_hints': [{'entity': 'E', 'query': 'Q'}, {'entity': 'E', 'query': 'Q2'}]}
+        upgraded = apply_migrations(blob)
+        assert upgraded['memory_hints'] == {'entities': ['E'], 'queries': ['Q', 'Q2']}
+
+    def test_legacy_memory_hints_skips_non_dict_and_invalid_entries(self):
+        blob = {
+            'memory_hints': [
+                'not-a-dict',
+                {'entity': '', 'query': ''},
+                {'entity': 123, 'query': 456},
+                {},
+                {'entity': 'E', 'query': 'Q'},
+            ]
+        }
+        upgraded = apply_migrations(blob)
+        assert upgraded['memory_hints'] == {'entities': ['E'], 'queries': ['Q']}
+
+    def test_already_canonical_memory_hints_dict_unchanged(self):
+        blob = {'memory_hints': {'entities': ['E'], 'queries': ['Q']}}
+        upgraded = apply_migrations(blob)
+        assert upgraded['memory_hints'] == {'entities': ['E'], 'queries': ['Q']}
+
+    def test_missing_schema_version_treated_as_v0_and_stamped_to_1(self):
+        upgraded = apply_migrations({})
+        assert upgraded['schema_version'] == 1
+
+    def test_already_v1_blob_returned_untouched(self):
+        blob = {'schema_version': 1, 'memory_hints': [{'entity': 'E', 'query': 'Q'}]}
+        upgraded = apply_migrations(blob)
+        assert upgraded == blob
+
+    def test_does_not_mutate_caller_input(self):
+        blob = {'memory_hints': [{'entity': 'E', 'query': 'Q'}]}
+        original = copy.deepcopy(blob)
+        apply_migrations(blob)
+        assert blob == original
