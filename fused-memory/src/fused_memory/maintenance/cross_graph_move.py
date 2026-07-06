@@ -189,9 +189,13 @@ async def move_entity_across_graphs(
     so a retry after a completed (or partially-completed-past-the-delete)
     move never re-creates or re-deletes anything.
 
-    ``rewrite_group_id`` substitution for the node/edges/mentions lands in
-    step-16 (applied here as a forward-compatible no-op when
-    ``rewrite_group_id`` is None).
+    Group-id rewrite (step-15/16): ``new_group_id`` (rewrite_group_id if
+    given, else the source node's own group_id) is applied uniformly to the
+    recreated node's ``group_id`` property AND to every recreated edge's/
+    mention's ``group_id`` property -- so a caller rewriting the node's home
+    graph gets a consistent group_id across the whole moved subgraph, not
+    just the node itself. When ``rewrite_group_id`` is None (the Phase-1
+    default), this is a no-op: every group_id is carried through unchanged.
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
