@@ -3090,6 +3090,46 @@ Output JSON matching the schema. Every task must appear in the output.
                     return None
                 # -------------------------------------------------------
 
+                # Task 2112 / angle B — metadata-independent degenerate-ref
+                # classifier fallback. _branch_is_degenerate (above) only
+                # fires when metadata['branch_base_sha'] is present and a
+                # valid 40-hex SHA; a task fault-killed before its metadata
+                # write leaves branch_base_sha absent/malformed, so the
+                # metadata check returns False even though the ref is
+                # actually degenerate (parked on a foreign merge commit,
+                # zero unique commits over main). Repro: esc-4388-46 /
+                # esc-4875-7. warm_lane_ref_is_degenerate wraps reify's
+                # metadata-independent classifier (count==0 over main AND
+                # tip does not cite this task) that catches that gap. It is
+                # fail-soft (False on any doubt — absent script, live/
+                # advanced/landed/absent classification, or exception), so
+                # this fallback can only ever suppress a spurious escalation
+                # when the primitive is CERTAIN the ref is degenerate; any
+                # uncertainty falls through to the existing skip-count path
+                # below, unchanged.
+                if await self.git_ops.warm_lane_ref_is_degenerate(tid):
+                    self._reconcile_skip_counts.pop(tid, None)
+                    if status == 'in-progress':
+                        logger.info(
+                            'Reconcile: task %s branch is degenerate per '
+                            'warm-lane-degenerate-ref-check.sh (metadata '
+                            'branch_base_sha absent/malformed); reverting '
+                            'stranded in-progress to pending (provisioning-only '
+                            'branch, no work landed)',
+                            tid,
+                        )
+                        return await self._revert_in_progress_if_no_live_claimant(
+                            tid, mid_run=mid_run, metadata=metadata,
+                        )
+                    logger.info(
+                        'Reconcile: task %s branch is degenerate per '
+                        'warm-lane-degenerate-ref-check.sh (metadata '
+                        'branch_base_sha absent/malformed); skipping '
+                        'citation-missing escalation (status=%s)',
+                        tid, status,
+                    )
+                    return None
+
                 count = self._reconcile_skip_counts.get(tid, 0) + 1
                 self._reconcile_skip_counts[tid] = count
                 logger.info(
