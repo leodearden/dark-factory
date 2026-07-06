@@ -2371,6 +2371,85 @@ async def reverify_member_solo(
     )
 
 
+async def _already_merged_is_genuine(
+    git_ops: GitOps,
+    req: MergeRequest,
+    branch_head: str,
+    actual_main: str,
+) -> bool:
+    """Corroborate an ``is_ancestor(effective_tip, main)`` hit before skipping.
+
+    ``effective_tip`` (``req.snapshot_tip or branch_head``) being an ancestor
+    of main is NECESSARY but NOT SUFFICIENT to conclude the task's work is
+    merged (task 5026).  A branch cut from main has a *base* commit that is
+    trivially an ancestor of current main; if ``effective_tip`` resolves to
+    that base — via a stale ``snapshot_tip`` captured while the branch was
+    still zero-commit, or a ``None`` snapshot falling back to a worktree HEAD
+    parked on a recycled lane at/under main — ``is_ancestor`` returns True
+    even though the branch's real unique commit was never landed.  The
+    short-circuit then returns a terminal ``already_merged`` that permanently
+    ejects the task from the queue with its work still unmerged.
+
+    This is the SAME false positive the reconciler already rejects for the
+    degenerate zero-commit-branch shape (harness Guard-2, #1823): require
+    POSITIVE evidence the work is on main before declaring already-merged.
+
+    Returns ``True`` (genuinely merged — safe to skip) when ANY of:
+
+      * the LIVE branch ref (or, when the ref is absent, the worktree HEAD) is
+        itself an ancestor of main — the branch tip actually landed; OR
+      * a merge-subject marker for this branch exists on main
+        (``find_merge_marker``, ungated) — the work landed via a no-ff merge
+        even though the branch tip diverged afterwards (the task-1917
+        ``honors_snapshot_tip`` shape: ``snapshot_tip`` is the merged tip, the
+        worktree/branch was rewritten to a divergent commit post-merge, and the
+        on-main merge subject is what proves the work is safely on main).  The
+        marker is keyed off the BRANCH, so it stays correct when
+        ``task_id != branch``; OR
+      * a commit on main cites this task id (``find_task_citation_commit``) —
+        catches squash/cite merges whose subject is not the no-ff form.
+
+    Returns ``False`` (false positive — caller must NOT skip) only when the
+    branch still carries unique commits absent from main AND nothing on main
+    cites the task.  Proceeding to merge in that case is always safe: if the
+    commits truly were merged under a different sha the downstream rebase/merge
+    no-ops, and a genuine merge cannot ghost-loop because a real merge leaves a
+    citation that flips this guard back to ``True`` on the next pass.
+
+    Note: on a project that has DISABLED citations (empty
+    ``commit_citation_pattern``) ``find_task_citation_commit`` always returns
+    None, so the rare post-merge-divergence shape degrades to a redundant
+    (harmless) re-merge rather than a skip — the same limitation the reconciler
+    carries.
+    """
+    branch_ref = await git_ops.resolve_queued_branch_ref(req.branch)
+    branch_sha = (
+        await git_ops.resolve_branch_sha(branch_ref)
+        if branch_ref is not None else None
+    )
+    # Prefer the LIVE branch ref as the branch's real tip; fall back to the
+    # worktree HEAD when the ref is absent (detached / lost-ref work).  This
+    # deliberately does NOT consult the possibly-stale ``effective_tip``.
+    candidate_tip = branch_sha or branch_head
+    if await git_ops.is_ancestor(candidate_tip, actual_main):
+        return True
+    # candidate tip carries commits beyond main — only genuinely merged if
+    # main carries positive evidence the work landed.  Prefer the branch-keyed
+    # merge-subject marker (ungated: the branch ref legitimately still exists
+    # here) so this stays correct when task_id != branch; fall back to the
+    # task-id citation (parity with harness Guard-2, #1823) for squash/cite
+    # merges whose subject is not the no-ff form.
+    if branch_ref is not None and await git_ops.find_merge_marker(
+        branch_ref, gate_on_existing_ref=False,
+    ) is not None:
+        return True
+    citation = await git_ops.find_task_citation_commit(
+        req.task_id,
+        pattern_template=git_ops.config.commit_citation_pattern,
+    )
+    return citation is not None
+
+
 async def classify_and_merge(
     worker: _TrainMergeHost,
     req: MergeRequest,
@@ -2460,6 +2539,22 @@ async def classify_and_merge(
             logger.warning(
                 'Task %s: branch is ancestor of main but worktree has '
                 'uncommitted changes — not skipping merge', req.task_id,
+            )
+        elif not await _already_merged_is_genuine(
+            git_ops, req, branch_head, actual_main,
+        ):
+            # False-positive guard (task 5026): effective_tip is an ancestor of
+            # main, but the LIVE branch still carries unmerged unique commits
+            # and no commit on main cites the task — effective_tip was a stale
+            # base (zero-commit branch base / recycled-lane worktree HEAD /
+            # stale snapshot_tip), NOT proof the work landed.  Do NOT emit a
+            # terminal already_merged (which would eject the task from the
+            # queue with its work unmerged); fall through and merge.
+            logger.warning(
+                'Task %s: effective_tip %s is an ancestor of main but the '
+                'branch still has unmerged commits with no on-main citation '
+                '— treating already-merged as a FALSE POSITIVE and merging',
+                req.task_id, effective_tip[:12],
             )
         else:
             logger.info(
