@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -1497,7 +1498,7 @@ class TestMakeIdCounter:
         counter_path = queue_dir / 'esc-cnt.seq'
         original_read_text = Path.read_text
 
-        def flaky_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        def flaky_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
             if self == counter_path:
                 raise OSError('simulated transient I/O error')
             return original_read_text(self, *args, **kwargs)
