@@ -130,11 +130,28 @@ class LandedOutbox:
         return data
 
     def _save_raw(self, state: dict[str, Any]) -> None:
-        """Atomically write *state* to disk (tmp + os.replace)."""
+        """Atomically AND durably write *state* to disk (WA-1).
+
+        fsyncs the temp file's fd BEFORE ``os.replace``, then fsyncs the
+        parent directory's fd AFTER — a rename without a directory fsync can
+        be lost on crash (the directory-entry update is a separate
+        durability domain from the file's own contents on most
+        filesystems). Fail-open: any OSError is logged as a WARNING, never
+        raised, so a transient disk failure never blocks the merge
+        pipeline.
+        """
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix('.json.tmp')
-            tmp.write_text(json.dumps(state), encoding='utf-8')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(state))
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(str(tmp), str(self._path))
+            dir_fd = os.open(str(self._path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except OSError as exc:
             logger.warning('landed_outbox: failed to save outbox: %s', exc)
