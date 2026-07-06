@@ -26,6 +26,7 @@ import enum
 
 __all__ = [
     "ActorClass",
+    "derive_actor_class",
 ]
 
 
@@ -41,3 +42,38 @@ class ActorClass(enum.StrEnum):
     ESCALATION = "escalation"
     DETERMINISTIC = "deterministic"
     HUMAN = "human"
+
+
+def derive_actor_class(agent_id: str | None) -> ActorClass:
+    """Classify a write's ``agent_id`` into its :class:`ActorClass` (D5).
+
+    Ordering is CRITICAL — later rules would otherwise be shadowed by an
+    earlier, broader prefix:
+
+    1. ``None`` (header-less write; orchestrator pipeline/scheduler/harness
+       callbacks/deterministic_runner/crash-recovery all write without a
+       per-write ``agent_id`` today) -> HUMAN, the safe-open default (D5).
+    2. ``recon-stage-*`` (live prefix, verified at
+       fused-memory/reconciliation/stages/task_knowledge_sync.py:2787) or the
+       defensive doc-convention variant ``reconciliation-stage*`` ->
+       RECONCILIATION.
+    3. ``orchestrator-deterministic*`` (``DETERMINISTIC_AGENT_ROLE``, verified
+       at orchestrator/deterministic_runner.py:171) -> DETERMINISTIC. This
+       MUST be checked before rule 4 — it is a more specific prefix of the
+       plain ``orchestrator*`` rule.
+    4. ``orchestrator*`` / ``harness*`` / ``steward*`` -> ORCHESTRATOR.
+    5. ``escalation*`` -> ESCALATION.
+    6. Anything else (e.g. a ``claude-task-*`` interactive/agent session) ->
+       HUMAN, the safe-open default (D5).
+    """
+    if agent_id is None:
+        return ActorClass.HUMAN
+    if agent_id.startswith(("recon-stage-", "reconciliation-stage")):
+        return ActorClass.RECONCILIATION
+    if agent_id.startswith("orchestrator-deterministic"):
+        return ActorClass.DETERMINISTIC
+    if agent_id.startswith(("orchestrator", "harness", "steward")):
+        return ActorClass.ORCHESTRATOR
+    if agent_id.startswith("escalation"):
+        return ActorClass.ESCALATION
+    return ActorClass.HUMAN
