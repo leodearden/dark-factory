@@ -259,6 +259,48 @@ class TestMergeEntities:
 
 
 # ---------------------------------------------------------------------------
+# task 2118 step-1/3: GraphitiBackend._duplicate_edge_uuids (pure helper)
+# ---------------------------------------------------------------------------
+
+class TestDuplicateEdgeUuids:
+    """GraphitiBackend._duplicate_edge_uuids(rows) groups valid-edge rows shaped
+    [neighbor_uuid, edge_uuid, fact, valid_at] by (neighbor_uuid, normalized fact,
+    valid_at) and returns the non-survivor edge uuids to delete, keeping the
+    lexicographically-lowest uuid per group as the survivor."""
+
+    _FACT = (
+        'The fix requires adding the _finalizing_head term to '
+        '_inflight_speculative_count().'
+    )
+    _VALID_AT = '2026-07-06T00:00:00+00:00'
+
+    def test_returns_non_survivor_uuids_for_duplicate_group(self):
+        """Three edges from A to the same neighbor B, identical fact and
+        valid_at (mirrors the real aec7014f/735efe05 case) -> the two higher
+        uuids are returned; the lowest uuid ('e-1') survives."""
+        rows = [
+            ['B-uuid', 'e-3', self._FACT, self._VALID_AT],
+            ['B-uuid', 'e-1', self._FACT, self._VALID_AT],
+            ['B-uuid', 'e-2', self._FACT, self._VALID_AT],
+        ]
+        result = GraphitiBackend._duplicate_edge_uuids(rows)
+        assert result == ['e-2', 'e-3']
+
+    def test_single_edge_returns_empty(self):
+        """A lone edge has nothing to dedup against."""
+        rows = [['B-uuid', 'e-1', self._FACT, self._VALID_AT]]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+    def test_all_distinct_returns_empty(self):
+        """Edges with distinct neighbor/fact/valid_at are all preserved."""
+        rows = [
+            ['B-uuid', 'e-1', 'fact one', '2026-07-06T00:00:00+00:00'],
+            ['C-uuid', 'e-2', 'fact two', '2026-07-06T01:00:00+00:00'],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+
+# ---------------------------------------------------------------------------
 # task 2073 step-1/2: GraphitiBackend.find_duplicate_entity_nodes
 # ---------------------------------------------------------------------------
 
