@@ -36,3 +36,28 @@ from __future__ import annotations
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Byte-exact vecf32 passthrough (pure functions -- never call float() here)
+# ---------------------------------------------------------------------------
+
+def parse_compact_vector_reply(reply: str) -> list[str]:
+    """Parse a ``GRAPH.RO_QUERY ... --compact`` vector reply into exact tokens.
+
+    *reply* is the bracketed, comma-separated vector text as read from the
+    raw compact transport (e.g. ``'[0.5, -0.25]'``). Returns each element as
+    its verbatim string token -- whitespace-stripped, but otherwise untouched.
+
+    Never calls ``float()`` (or any other numeric coercion) on a token: the
+    whole point of this function is to preserve the exact float32 decimal
+    string as it existed on the wire, since the alternative (decoded/textual)
+    read path is lossy (see module docstring).
+    """
+    text = reply.strip()
+    if text.startswith('[') and text.endswith(']'):
+        text = text[1:-1]
+    text = text.strip()
+    if not text:
+        return []
+    return [token.strip() for token in text.split(',')]
