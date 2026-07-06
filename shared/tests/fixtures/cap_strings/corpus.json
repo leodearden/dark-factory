@@ -1,0 +1,353 @@
+[
+  {
+    "id": "claude_cap_relative_hours",
+    "backend": "claude",
+    "output": "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "set",
+    "provenance": "ba38ce4ee1; test_usage_gate_exhaustive.py::test_realistic_cap_messages[cap_hit_prefix_hit_your]"
+  },
+  {
+    "id": "claude_cap_no_resets_upgrade",
+    "backend": "claude",
+    "output": "You've used all available credits. Upgrade your plan for more capacity.",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "e3df395c9f,77d1d18c49,66daedbc76 (upgrade your plan narrowing); PRD 7.1.a (resets_at=None on parse failure)"
+  },
+  {
+    "id": "claude_cap_out_of_extra_usage",
+    "backend": "claude",
+    "output": "You're out of extra usage for this billing period. Your plan resets in 2h.",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "set",
+    "provenance": "b88b4625d5 (extra usage prefixes)"
+  },
+  {
+    "id": "claude_cap_now_using_extra",
+    "backend": "claude",
+    "output": "You're now using extra compute credits. Your plan resets in 1h.",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "set",
+    "provenance": "ba38ce4ee1 (reclassify 'You're now using extra' as CAP)"
+  },
+  {
+    "id": "claude_cap_absolute_date",
+    "backend": "claude",
+    "output": "You've hit your usage limit for Claude Pro. Your plan resets on Apr 10, 9pm (UTC).",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "set",
+    "provenance": "test_usage_gate_exhaustive.py::test_realistic_cap_hit_pro_plan_date_format"
+  },
+  {
+    "id": "claude_near_cap_close_to_usage_limit",
+    "backend": "claude",
+    "output": "You're close to reaching your usage limit. Your plan resets in 1h.",
+    "strict_confirm": true,
+    "expected": "NearCap",
+    "provenance": "test_usage_gate_exhaustive.py::test_realistic_near_cap_close_to_limit"
+  },
+  {
+    "id": "claude_near_cap_close_to_plan_limit",
+    "backend": "claude",
+    "output": "You're close to reaching your plan limit. Your plan resets in 5h.",
+    "strict_confirm": true,
+    "expected": "NearCap",
+    "provenance": "test_usage_gate_exhaustive.py::test_realistic_cap_messages[near_cap_prefix_close_to]"
+  },
+  {
+    "id": "claude_toggle_strict_true_non_cap",
+    "backend": "claude",
+    "output": "You're out of extra usage for this billing period.",
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "b88b4625d5 (prefix present, no CAP_CONFIRM_KEYWORDS hit -> strict regime rejects)"
+  },
+  {
+    "id": "claude_toggle_strict_false_cap",
+    "backend": "claude",
+    "output": "You're out of extra usage for this billing period.",
+    "strict_confirm": false,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py _run_probe asymmetry (DD-2): prefix-only acceptance when strict_confirm=False"
+  },
+  {
+    "id": "claude_negative_hit_the_nail",
+    "backend": "claude",
+    "output": "You've hit the nail on the head",
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "test_usage_gate_exhaustive.py::test_no_false_positive_partial_match"
+  },
+  {
+    "id": "claude_negative_bare_upgrade",
+    "backend": "claude",
+    "output": "You've used all available credits. Upgrade for more capacity.",
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "e3df395c9f,77d1d18c49,66daedbc76 (task-662 bare-upgrade negative)"
+  },
+  {
+    "id": "claude_negative_close_to_finish_line",
+    "backend": "claude",
+    "output": "You're close to the finish line",
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "CAP_CONFIRM_KEYWORDS guard (near-prefix without confirm keyword)"
+  },
+  {
+    "id": "codex_usage_limit_reached",
+    "backend": "codex",
+    "output": "Error: usage limit reached",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py CODEX_CAP_PATTERNS"
+  },
+  {
+    "id": "codex_rate_limit",
+    "backend": "codex",
+    "output": "Error: rate limit",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py CODEX_CAP_PATTERNS"
+  },
+  {
+    "id": "codex_quota_exceeded",
+    "backend": "codex",
+    "output": "Error: quota exceeded",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py CODEX_CAP_PATTERNS"
+  },
+  {
+    "id": "codex_insufficient_quota",
+    "backend": "codex",
+    "output": "Error: insufficient_quota",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py CODEX_CAP_PATTERNS"
+  },
+  {
+    "id": "codex_rate_limit_exceeded",
+    "backend": "codex",
+    "output": "Error: rate_limit_exceeded",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py CODEX_CAP_PATTERNS"
+  },
+  {
+    "id": "gemini_quota_exceeded",
+    "backend": "gemini",
+    "output": "Error: quota exceeded",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py GEMINI_CAP_PATTERNS"
+  },
+  {
+    "id": "gemini_rate_limit",
+    "backend": "gemini",
+    "output": "Error: rate limit",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py GEMINI_CAP_PATTERNS"
+  },
+  {
+    "id": "gemini_resource_exhausted_lower",
+    "backend": "gemini",
+    "output": "Error: resource exhausted",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py GEMINI_CAP_PATTERNS"
+  },
+  {
+    "id": "gemini_resource_exhausted_exact_case",
+    "backend": "gemini",
+    "output": "Error: RESOURCE_EXHAUSTED",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "test_usage_gate_exhaustive.py::test_gemini_resource_exhausted_exact_case"
+  },
+  {
+    "id": "gemini_quota_exceeded_underscored",
+    "backend": "gemini",
+    "output": "Error: quota_exceeded",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "none",
+    "provenance": "usage_gate.py GEMINI_CAP_PATTERNS"
+  },
+  {
+    "id": "cli_error_session_id_in_use",
+    "backend": "claude",
+    "stderr": "Error: Session ID abc-123 is already in use.",
+    "strict_confirm": true,
+    "expected": "CliLocalError",
+    "provenance": "7d1fa90075 (reify-3604)"
+  },
+  {
+    "id": "cli_error_unrecognized_arguments",
+    "backend": "claude",
+    "stderr": "error: unrecognized arguments: --foo",
+    "strict_confirm": true,
+    "expected": "CliLocalError",
+    "provenance": "cli_invoke.py NON_CAP_CLI_ERROR_MARKERS"
+  },
+  {
+    "id": "cli_error_unknown_option",
+    "backend": "claude",
+    "stderr": "unknown option '--bar'",
+    "strict_confirm": true,
+    "expected": "CliLocalError",
+    "provenance": "cli_invoke.py NON_CAP_CLI_ERROR_MARKERS"
+  },
+  {
+    "id": "cli_error_invalid_value",
+    "backend": "claude",
+    "stderr": "invalid value for '--model'",
+    "strict_confirm": true,
+    "expected": "CliLocalError",
+    "provenance": "cli_invoke.py NON_CAP_CLI_ERROR_MARKERS"
+  },
+  {
+    "id": "cli_error_no_such_file",
+    "backend": "claude",
+    "stderr": "no such file or directory: /tmp/x",
+    "strict_confirm": true,
+    "expected": "CliLocalError",
+    "provenance": "cli_invoke.py NON_CAP_CLI_ERROR_MARKERS"
+  },
+  {
+    "id": "cli_error_permission_denied",
+    "backend": "claude",
+    "stderr": "permission denied: /tmp/x",
+    "strict_confirm": true,
+    "expected": "CliLocalError",
+    "provenance": "cli_invoke.py NON_CAP_CLI_ERROR_MARKERS"
+  },
+  {
+    "id": "cli_error_outranks_cap",
+    "backend": "claude",
+    "stderr": "Error: Session ID abc-123 is already in use.",
+    "output": "You've hit your usage limit. Your plan resets in 3h.",
+    "strict_confirm": true,
+    "expected": "CliLocalError",
+    "provenance": "7d1fa90075 (reify-3604 structural fix: CliLocalError precedes CapHit)"
+  },
+  {
+    "id": "auth_failed_401",
+    "backend": "claude",
+    "api_error_status": 401,
+    "strict_confirm": true,
+    "expected": "AuthFailed",
+    "provenance": "cli_invoke.py:805"
+  },
+  {
+    "id": "auth_failed_403",
+    "backend": "claude",
+    "api_error_status": 403,
+    "strict_confirm": true,
+    "expected": "AuthFailed",
+    "provenance": "cli_invoke.py:805"
+  },
+  {
+    "id": "auth_status_429_with_cap_text_is_cap_not_auth",
+    "backend": "claude",
+    "api_error_status": 429,
+    "output": "You're out of extra usage for this billing period. Your plan resets in 2h.",
+    "strict_confirm": true,
+    "expected": "CapHit",
+    "resets_at": "set",
+    "provenance": "cli_invoke.py:799-805 (429 deliberately excluded from AuthFailed); b5f6b04ac1"
+  },
+  {
+    "id": "auth_status_429_alone_is_failure",
+    "backend": "claude",
+    "api_error_status": 429,
+    "output": "some unrelated text",
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "cli_invoke.py:799-805"
+  },
+  {
+    "id": "auth_failed_outranks_cap_text",
+    "backend": "claude",
+    "api_error_status": 401,
+    "output": "You've hit your usage limit. Your plan resets in 3h.",
+    "strict_confirm": true,
+    "expected": "AuthFailed",
+    "provenance": "AuthFailed is highest precedence (step-5)"
+  },
+  {
+    "id": "wedge_transcript_zero",
+    "backend": "claude",
+    "timed_out": true,
+    "transcript_turns": 0,
+    "strict_confirm": true,
+    "expected": "ZeroOutputWedge",
+    "provenance": "cli_invoke.py:357 is_zero_output_timeout (transcript-authoritative)"
+  },
+  {
+    "id": "wedge_legacy_fallback",
+    "backend": "claude",
+    "timed_out": true,
+    "turns": 0,
+    "cost_usd": 0.0,
+    "transcript_turns": null,
+    "strict_confirm": true,
+    "expected": "ZeroOutputWedge",
+    "provenance": "cli_invoke.py:357 legacy turns==0 and cost_usd==0.0 fallback"
+  },
+  {
+    "id": "not_wedge_transcript_progress",
+    "backend": "claude",
+    "timed_out": true,
+    "transcript_turns": 5,
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "reify-4415; cli_invoke.py:357 (transcript_turns>0 -> not a wedge)"
+  },
+  {
+    "id": "cap_outranks_wedge",
+    "backend": "claude",
+    "timed_out": true,
+    "transcript_turns": 0,
+    "output": "You're out of extra usage for this billing period. Your plan resets in 2h.",
+    "strict_confirm": false,
+    "expected": "CapHit",
+    "resets_at": "set",
+    "provenance": "PRD 7.2 precedence (CapHit ranks above ZeroOutputWedge)"
+  },
+  {
+    "id": "ok_success",
+    "backend": "claude",
+    "success": true,
+    "output": "done",
+    "strict_confirm": true,
+    "expected": "OK",
+    "provenance": "AgentResult.success=True -> OK tail"
+  },
+  {
+    "id": "failure_tail_unknown",
+    "backend": "claude",
+    "success": false,
+    "output": "generic failure, no signal",
+    "strict_confirm": true,
+    "expected": "Failure",
+    "provenance": "Failure tail (no auth/cli-error/cap/wedge signal)"
+  }
+]
