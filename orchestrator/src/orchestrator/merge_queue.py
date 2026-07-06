@@ -2724,6 +2724,60 @@ async def _journal_landed_then_advance(
     return await git_ops.advance_main(advanced_sha, merge_wt, **advance_kwargs)
 
 
+async def reconcile_landed_row(
+    row: LandedRow,
+    *,
+    git_ops: Any,
+    scheduler: Any,
+    outbox: LandedOutbox,
+    main_sha: str,
+) -> str:
+    """Reconcile a single :class:`LandedRow` against RC-1/RC-2/RC-3 (task 2155, W1 γ).
+
+    A landed row is write-ahead INTENT, not confirmed landed (see
+    ``_journal_landed_then_advance``'s docstring) — this is the shared
+    per-row routine that closes the crash window between a merge advancing
+    main and the task being marked done. Returns a disposition string used
+    by :func:`reconcile_landed_outbox` to tally its report:
+
+    * ``'pruned_not_landed'`` (RC-1) — ``row.advanced_sha`` is NOT an
+      ancestor of ``main_sha``: the process crashed between the fsync'd
+      record and the CAS advance, so the task never actually landed. Do NOT
+      mark done; prune the row so the task re-dispatches through normal
+      channels (no phantom done).
+    """
+    if not await git_ops.is_ancestor(row.advanced_sha, main_sha):
+        outbox.consume(row.task_id)
+        return 'pruned_not_landed'
+
+
+async def reconcile_landed_outbox(
+    outbox: LandedOutbox,
+    git_ops: Any,
+    scheduler: Any,
+) -> dict[str, int]:
+    """Scan *outbox* at startup and reconcile every unconsumed row (task 2155, W1 γ).
+
+    Resolves ``main_sha`` once for the whole scan, then delegates each row to
+    :func:`reconcile_landed_row`, tallying dispositions into the returned
+    report (mirrors ``recover_pending_merges``'s count-report shape).
+    """
+    report = {
+        'pruned_not_landed': 0,
+        'marked_done': 0,
+        'already_done_pruned': 0,
+        'skipped': 0,
+        'errors': 0,
+    }
+    main_sha = await git_ops.get_main_sha()
+    for row in outbox.all():
+        disposition = await reconcile_landed_row(
+            row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
+        )
+        report[disposition] += 1
+    return report
+
+
 async def _do_train_merge(
     worker: _TrainMergeHost,
     req: GroupMergeRequest,
