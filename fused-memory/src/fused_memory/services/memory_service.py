@@ -2409,6 +2409,96 @@ class MemoryService:
 
         return result
 
+    async def rename_entity(
+        self,
+        new_name: str | None = None,
+        entity_uuid: str | None = None,
+        entity_name: str | None = None,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Rename a Graphiti entity node to *new_name*, verbatim.
+
+        Operator-facing escape hatch that corrects a mis-cased/mis-pluralized
+        task-entity node name (e.g. 'task 132' -> 'Task 132') minted by
+        graphiti-core's LLM entity extraction, for pre-existing bad nodes an
+        episode may never re-touch (task 2110). Mirrors set_entity_summary's
+        identifier-resolution, validation, and journal-logging contract.
+
+        Accepts either *entity_uuid* (canonical identifier) or *entity_name*
+        (resolved via an exact name lookup). When both are supplied, entity_uuid
+        takes precedence. Raises ValueError if neither is provided, or if
+        new_name is not provided or is empty.
+
+        Args:
+            new_name: Exact new name to write. Must be non-empty.
+            entity_uuid: UUID of the Entity node to rename (optional when entity_name is given).
+            entity_name: Exact entity name to resolve to a UUID (optional when entity_uuid is given).
+            project_id: Project scope (for journal logging and group_id).
+            agent_id: Which agent is calling (optional).
+            session_id: Session context (optional).
+            causation_id: Reconciliation causation ID (optional).
+            _source: Source label for journal entry.
+
+        Returns:
+            Dict from backend: {uuid, old_name, new_name}.
+
+        Raises:
+            ValueError: if new_name is None/empty, or if neither entity_uuid nor
+                        entity_name is provided.
+        """
+        if not new_name:
+            raise ValueError('new_name must be provided')
+        if entity_uuid is None and entity_name is None:
+            raise ValueError('Either entity_uuid or entity_name must be provided')
+
+        # Resolve entity_name → UUID when UUID is not directly supplied
+        if entity_uuid is None:
+            assert entity_name is not None  # guaranteed by the ValueError check above
+            entity_uuid = await self.graphiti.resolve_entity_by_name(
+                entity_name, group_id=project_id
+            )
+
+        write_op_id = str(uuid_mod.uuid4())
+        success = True
+        error_msg = None
+        result: dict = {}
+        journal_params: dict = {'entity_uuid': entity_uuid, 'new_name': new_name}
+        if entity_name is not None:
+            journal_params['entity_name'] = entity_name
+        try:
+            result = await self.graphiti.rename_entity_node(entity_uuid, new_name, group_id=project_id)
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            if self._write_journal:
+                try:
+                    await self._write_journal.log_write_op(
+                        write_op_id=write_op_id,
+                        causation_id=causation_id,
+                        source=_source,
+                        operation='rename_entity',
+                        project_id=project_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        params=journal_params,
+                        result_summary=result if success else None,
+                        success=success,
+                        error=error_msg,
+                    )
+                except Exception as journal_exc:
+                    logger.warning(
+                        'rename_entity: journal log_write_op failed: %s',
+                        journal_exc,
+                    )
+
+        return result
+
     async def rebuild_entity_summaries(
         self,
         project_id: str = 'main',
