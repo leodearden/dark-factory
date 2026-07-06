@@ -40,6 +40,7 @@ from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import EventType, Harness
+from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
 # step-1: Config field presence and default
@@ -444,3 +445,71 @@ class TestCloseSupersededMainSweepEscalations:
         h._escalation_queue = None
 
         await h._close_superseded_main_sweep_escalations('f' * 40)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# step-9: _run_main_tip_sweep — self-heal wiring (PASS branch only)
+# ---------------------------------------------------------------------------
+
+
+def _make_main_tip_harness(*, main_sha: str) -> Harness:
+    """Build a minimal bare Harness for main-tip-sweep self-heal wiring tests."""
+    h = Harness.__new__(Harness)
+    _init_harness_state_for_test(h)
+    h.config = OrchestratorConfig()
+    h.git_ops = MagicMock()
+    h.git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+    h._escalation_queue = MagicMock()
+    h._escalation_queue.make_id = MagicMock(return_value='esc-sweep-1')
+    h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    h._main_tip_sweep_task = None
+    # Distinct from main_sha so the SHA-dedup gate does not short-circuit
+    # before verify.run_main_tip_sweep is even called.
+    h._last_swept_main_sha = 'stale-' + main_sha[:6]
+    return h
+
+
+class TestMainTipSweepSelfHealWiring:
+    """step-9: _run_main_tip_sweep invokes the self-heal ONLY on a real PASS."""
+
+    @pytest.mark.asyncio
+    async def test_pass_invokes_self_heal_with_clean_sha(self) -> None:
+        from orchestrator import verify as verify_module
+
+        clean_sha = 'c' * 40
+        h = _make_main_tip_harness(main_sha=clean_sha)
+        h._close_superseded_main_sweep_escalations = AsyncMock()  # type: ignore[method-assign]
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='all checks passed',
+        )
+
+        with patch.object(
+            verify_module, 'run_main_tip_sweep',
+            new=AsyncMock(return_value=(clean_sha, passing)),
+        ):
+            await h._run_main_tip_sweep()
+
+        h._close_superseded_main_sweep_escalations.assert_awaited_once_with(clean_sha)  # type: ignore[attr-defined]
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_fail_does_not_invoke_self_heal(self) -> None:
+        from orchestrator import verify as verify_module
+
+        main_sha = 'd' * 40
+        h = _make_main_tip_harness(main_sha=main_sha)
+        h._close_superseded_main_sweep_escalations = AsyncMock()  # type: ignore[method-assign]
+        failing = VerifyResult(
+            passed=False, test_output='FAILED test_x', lint_output='', type_output='',
+            summary='test_failure', cause_hint='FAILED test_x', category='test_failure',
+        )
+
+        with patch.object(
+            verify_module, 'run_main_tip_sweep',
+            new=AsyncMock(return_value=(main_sha, failing)),
+        ):
+            await h._run_main_tip_sweep()
+
+        h._close_superseded_main_sweep_escalations.assert_not_awaited()  # type: ignore[attr-defined]
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
