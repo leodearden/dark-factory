@@ -67,6 +67,16 @@ TERMINAL: frozenset[TaskStatus] = frozenset({TaskStatus.DONE, TaskStatus.CANCELL
 # infra-hold (D3) is active and non-terminal but NOT dispatchable — dispatch
 # legality ("scheduler dispatches only 'pending'") is owned by the scheduler,
 # not this module.
+#
+# MIGRATION HAZARD for rho1a/omega2: every legacy ACTIVE_TASK_STATUSES copy
+# (orchestrator/task_status.py, fused_memory/reconciliation/task_filter.py)
+# has exactly 6 members and excludes infra-hold. Once a call site is rewired
+# to import this ACTIVE constant instead, infra-hold tasks newly satisfy
+# `status in ACTIVE_TASK_STATUSES` — e.g. task_filter.py's classification
+# branches at lines 365, 463, and 625, and any scheduler dispatch filter that
+# treats "active" as "fetch-worthy". Confirm each such branch is meant to see
+# infra-hold before switching it to this constant, rather than inheriting the
+# new member by accident of the complement.
 ACTIVE: frozenset[TaskStatus] = frozenset(TaskStatus) - TERMINAL
 
 # Parity: orchestrator/task_status.py WORKFLOW_PRESERVE_STATUSES.
