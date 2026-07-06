@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from datetime import UTC, datetime, timedelta
@@ -1102,3 +1103,87 @@ class TestTransitionLegality:
         gate._transition(acct, AccountPhase.AVAILABLE)
 
         assert acct.phase == AccountPhase.AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# step-07/08: _transition owns per-phase side effects — background-task
+# lifecycle (start resume/reprobe task on entering CAPPED/AUTH_FAILED, stamp
+# pause_started_at/auth_failed_at) and the B10 shutdown guard (no new
+# probe/reprobe task starts while gate._shutting_down is True).
+# ---------------------------------------------------------------------------
+
+
+async def _drain_task(task: asyncio.Task | None) -> None:
+    """Cancel *task* and await its settling, so a background task started by
+    _transition doesn't leak past the end of the current test."""
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+class TestTransitionSideEffectsLifecycle:
+    """step-07: _transition starts the per-phase background task and stamps
+    the matching timestamp; _shutting_down suppresses both starts (B10)."""
+
+    async def test_transition_to_capped_starts_resume_task_and_stamps_pause(self):
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+        assert acct.resume_task is None
+        assert acct.pause_started_at is None
+
+        gate._transition(acct, AccountPhase.CAPPED)
+
+        assert acct.resume_task is not None
+        assert acct.pause_started_at is not None
+        await _drain_task(acct.resume_task)
+
+    async def test_transition_to_auth_failed_starts_reprobe_task_and_stamps_auth_failed_at(self):
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+        assert acct.auth_reprobe_task is None
+        assert acct.auth_failed_at is None
+
+        gate._transition(acct, AccountPhase.AUTH_FAILED)
+
+        assert acct.auth_reprobe_task is not None
+        assert acct.auth_failed_at is not None
+        await _drain_task(acct.auth_reprobe_task)
+
+    async def test_transition_to_capped_cancels_pending_auth_reprobe_task(self):
+        """AUTH_FAILED -> CAPPED (the sole demotion edge) must cancel the
+        now-stale auth_reprobe_task rather than leave it running."""
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+        gate._transition(acct, AccountPhase.AUTH_FAILED)
+        stale_reprobe_task = acct.auth_reprobe_task
+        assert stale_reprobe_task is not None
+
+        gate._transition(acct, AccountPhase.CAPPED)
+
+        await asyncio.sleep(0)
+        assert stale_reprobe_task.cancelled() or stale_reprobe_task.done()
+        await _drain_task(acct.resume_task)
+
+    async def test_shutting_down_blocks_new_resume_task_on_capped(self):
+        """B10: _shutting_down=True => a CapHit transition spawns no probe task."""
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+        gate._shutting_down = True
+
+        gate._transition(acct, AccountPhase.CAPPED)
+
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.resume_task is None
+
+    async def test_shutting_down_blocks_new_reprobe_task_on_auth_failed(self):
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+        gate._shutting_down = True
+
+        gate._transition(acct, AccountPhase.AUTH_FAILED)
+
+        assert acct.phase == AccountPhase.AUTH_FAILED
+        assert acct.auth_reprobe_task is None
