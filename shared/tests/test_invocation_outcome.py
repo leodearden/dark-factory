@@ -415,3 +415,55 @@ class TestClassifyInvocationBackends:
         result = AgentResult(success=False, output='', stderr='Error: quota exceeded')
         outcome = classify_invocation(result, strict_confirm=True, backend='codex')
         assert isinstance(outcome, CapHit)
+
+
+class TestClassifyInvocationWedgeOkFailure:
+    """ZeroOutputWedge + OK + Failure tail, and the full precedence chain."""
+
+    def test_timed_out_zero_transcript_turns_is_wedge(self):
+        """Transcript-authoritative: transcript_turns == 0 -> ZeroOutputWedge."""
+        result = AgentResult(success=False, output='', timed_out=True, transcript_turns=0)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == ZeroOutputWedge()
+
+    def test_timed_out_legacy_fallback_zero_turns_and_cost_is_wedge(self):
+        """transcript_turns=None -> legacy turns==0 and cost_usd==0.0 fallback."""
+        result = AgentResult(
+            success=False,
+            output='',
+            timed_out=True,
+            turns=0,
+            cost_usd=0.0,
+            transcript_turns=None,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == ZeroOutputWedge()
+
+    def test_timed_out_with_transcript_progress_is_not_a_wedge(self):
+        """reify-4415: transcript_turns > 0 means real work happened -> not a wedge."""
+        result = AgentResult(success=False, output='', timed_out=True, transcript_turns=5)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert not isinstance(outcome, ZeroOutputWedge)
+        assert isinstance(outcome, Failure)
+
+    def test_cap_hit_outranks_zero_output_wedge(self):
+        """A cap message on a zero-turn timeout must classify as CapHit, not a wedge."""
+        result = AgentResult(
+            success=False,
+            output="You're out of extra usage for this billing period. Your plan resets in 2h.",
+            timed_out=True,
+            transcript_turns=0,
+        )
+        outcome = classify_invocation(result, strict_confirm=False)
+        assert isinstance(outcome, CapHit)
+        assert not isinstance(outcome, ZeroOutputWedge)
+
+    def test_success_true_is_ok(self):
+        result = AgentResult(success=True, output='done')
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == OK()
+
+    def test_no_signal_at_all_falls_to_failure_tail(self):
+        result = AgentResult(success=False, output='generic failure, no signal')
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, Failure)
