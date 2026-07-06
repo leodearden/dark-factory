@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import enum
 
-from shared.task_transitions import ActorClass
+import pytest
+
+from shared.task_transitions import ActorClass, derive_actor_class
 
 # ---------------------------------------------------------------------------
 # Pair 1 — ActorClass StrEnum (test-actorclass RED / impl-actorclass GREEN)
@@ -67,3 +69,44 @@ class TestActorClass:
     def test_members_are_genuine_str(self):
         assert ActorClass.HUMAN == 'human'
         assert isinstance(ActorClass.ORCHESTRATOR, str)
+
+
+# ---------------------------------------------------------------------------
+# Pair 2 — derive_actor_class (test-derive RED / impl-derive GREEN)
+# ---------------------------------------------------------------------------
+
+# Live agent_id prefixes verified verbatim against the working tree
+# 2026-07-06: recon-stage-{stage_id} at
+# fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py:2787;
+# DETERMINISTIC_AGENT_ROLE = 'orchestrator-deterministic' at
+# orchestrator/src/orchestrator/deterministic_runner.py:171.
+_DERIVE_CASES = [
+    # (agent_id, expected ActorClass) — order matters: prefix PRECEDENCE below.
+    (None, ActorClass.HUMAN),
+    ('', ActorClass.HUMAN),
+    ('recon-stage-memory_consolidator', ActorClass.RECONCILIATION),
+    ('recon-stage-task_knowledge_sync', ActorClass.RECONCILIATION),
+    # Defensive doc-convention variant (not a live prefix, but matched anyway).
+    ('reconciliation-stage-1', ActorClass.RECONCILIATION),
+    # orchestrator-deterministic MUST win over the plain orchestrator* rule.
+    ('orchestrator-deterministic', ActorClass.DETERMINISTIC),
+    ('orchestrator-deterministic-7', ActorClass.DETERMINISTIC),
+    ('orchestrator', ActorClass.ORCHESTRATOR),
+    # Starts with 'orchestrator' but NOT 'orchestrator-deterministic'.
+    ('orchestrator-escalation-watcher-auto', ActorClass.ORCHESTRATOR),
+    ('harness-abc', ActorClass.ORCHESTRATOR),
+    ('steward', ActorClass.ORCHESTRATOR),
+    ('steward-9', ActorClass.ORCHESTRATOR),
+    ('escalation-server', ActorClass.ESCALATION),
+    ('claude-task-2168-architect', ActorClass.HUMAN),
+]
+
+
+class TestDeriveActorClass:
+    @pytest.mark.parametrize('agent_id, expected', _DERIVE_CASES)
+    def test_prefix_mapping(self, agent_id, expected):
+        assert derive_actor_class(agent_id) is expected
+
+    def test_returns_actor_class_instance(self):
+        assert isinstance(derive_actor_class('claude-task-2168-architect'), ActorClass)
+        assert isinstance(derive_actor_class(None), ActorClass)
