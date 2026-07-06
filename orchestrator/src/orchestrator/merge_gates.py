@@ -34,7 +34,12 @@ from typing import TYPE_CHECKING
 
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_types import MergeOutcome, MergeRequest, TerminalOutcomeRetention
+from orchestrator.merge_types import (
+    MergeOutcome,
+    MergeRequest,
+    OutcomeKind,
+    TerminalOutcomeRetention,
+)
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -287,7 +292,7 @@ class GateVerdict:
     passed: bool
     reason: str | None = None
     merge_sha: str | None = None
-    emit_subtype: str | None = None
+    emit_subtype: OutcomeKind | None = None
 
     @classmethod
     def ok(cls) -> GateVerdict:
@@ -295,7 +300,7 @@ class GateVerdict:
         return cls(passed=True)
 
     @classmethod
-    def block(cls, *, reason: str, merge_sha: str | None, emit_subtype: str) -> GateVerdict:
+    def block(cls, *, reason: str, merge_sha: str | None, emit_subtype: OutcomeKind) -> GateVerdict:
         """The gate blocked the merge.
 
         *reason* becomes the terminal ``MergeOutcome.reason``, *merge_sha*
@@ -384,7 +389,7 @@ async def _run_equivalence_gate(ctx: _PostAdvanceContext) -> GateVerdict:
             f'task branch tip.'
         ),
         merge_sha=ctx.advanced_sha,
-        emit_subtype='post_merge_equivalence_failed',
+        emit_subtype=OutcomeKind.post_merge_equivalence_failed,
     )
 
 
@@ -420,7 +425,7 @@ async def _auto_chain_on_equivalence_blocked(ctx: _PostAdvanceContext) -> MergeO
 
     _emit_merge_attempt(
         ctx.event_store, ctx.req.task_id,
-        'post_merge_generation_chained',
+        OutcomeKind.post_merge_generation_chained,
         duration_ms=_elapsed_ms(ctx.started_monotonic),
         train_id=ctx.train_id,
         member_task_ids=ctx.member_task_ids,
@@ -459,7 +464,7 @@ async def _run_pyright_gate(ctx: _PostAdvanceContext) -> GateVerdict:
             f'on {ctx.advanced_sha[:12]}. {pyright_result.detail}'
         ),
         merge_sha=ctx.advanced_sha,
-        emit_subtype='post_merge_pyright_broken',
+        emit_subtype=OutcomeKind.post_merge_pyright_broken,
     )
 
 
@@ -642,7 +647,7 @@ async def _finalize_advanced_merge(
 
     logger.info(f'Task {req.task_id}: merged to main successfully')
     _emit_merge_attempt(
-        event_store, req.task_id, 'done',
+        event_store, req.task_id, OutcomeKind.done,
         duration_ms=_elapsed_ms(started_monotonic),
         train_id=train_id,
         member_task_ids=member_task_ids,

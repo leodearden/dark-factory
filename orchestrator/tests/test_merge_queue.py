@@ -5923,12 +5923,12 @@ class TestEmitMergeAttemptHelper:
         self, tmp_path: Path,
     ):
         """Call with outcome and duration_ms — row has no 'attempt' key."""
-        from orchestrator.merge_queue import _emit_merge_attempt
+        from orchestrator.merge_queue import OutcomeKind, _emit_merge_attempt
 
         db_path = tmp_path / 'eh_a.db'
         es = EventStore(db_path=db_path, run_id='eh-run')
 
-        _emit_merge_attempt(es, 'task-1', 'conflict', duration_ms=42)
+        _emit_merge_attempt(es, 'task-1', OutcomeKind.conflict, duration_ms=42)
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
@@ -5949,12 +5949,12 @@ class TestEmitMergeAttemptHelper:
         self, tmp_path: Path,
     ):
         """Call with outcome, attempt, and duration_ms — row includes 'attempt'."""
-        from orchestrator.merge_queue import _emit_merge_attempt
+        from orchestrator.merge_queue import OutcomeKind, _emit_merge_attempt
 
         db_path = tmp_path / 'eh_b.db'
         es = EventStore(db_path=db_path, run_id='eh-run')
 
-        _emit_merge_attempt(es, 'task-2', 'cas_retry', attempt=3, duration_ms=500)
+        _emit_merge_attempt(es, 'task-2', OutcomeKind.cas_retry, attempt=3, duration_ms=500)
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
@@ -5975,12 +5975,12 @@ class TestEmitMergeAttemptHelper:
         self, tmp_path: Path,
     ):
         """Call with duration_ms=None — duration_ms column is NULL."""
-        from orchestrator.merge_queue import _emit_merge_attempt
+        from orchestrator.merge_queue import OutcomeKind, _emit_merge_attempt
 
         db_path = tmp_path / 'eh_c.db'
         es = EventStore(db_path=db_path, run_id='eh-run')
 
-        _emit_merge_attempt(es, 'task-3', 'done', duration_ms=None)
+        _emit_merge_attempt(es, 'task-3', OutcomeKind.done, duration_ms=None)
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
@@ -5998,20 +5998,20 @@ class TestEmitMergeAttemptHelper:
         """Call with a real (mock) store — emit is invoked exactly once."""
         from unittest.mock import MagicMock
 
-        from orchestrator.merge_queue import _emit_merge_attempt
+        from orchestrator.merge_queue import OutcomeKind, _emit_merge_attempt
 
         mock_es = MagicMock()
-        _emit_merge_attempt(mock_es, 'task-check', 'done', duration_ms=1)
+        _emit_merge_attempt(mock_es, 'task-check', OutcomeKind.done, duration_ms=1)
         mock_es.emit.assert_called_once()
 
     def test_emit_merge_attempt_noop_when_event_store_is_none(self):
         """Call with event_store=None — no exception, emit never invoked."""
         from unittest.mock import MagicMock
 
-        from orchestrator.merge_queue import _emit_merge_attempt
+        from orchestrator.merge_queue import OutcomeKind, _emit_merge_attempt
 
         mock_es = MagicMock()
-        _emit_merge_attempt(None, 'task-4', 'done', duration_ms=1)
+        _emit_merge_attempt(None, 'task-4', OutcomeKind.done, duration_ms=1)
         mock_es.emit.assert_not_called()
 
 

@@ -307,6 +307,7 @@ def test_gate_verdict_value_type() -> None:
     import dataclasses
 
     from orchestrator.merge_gates import GateVerdict
+    from orchestrator.merge_types import OutcomeKind
 
     ok = GateVerdict.ok()
     assert ok.passed is True
@@ -314,11 +315,13 @@ def test_gate_verdict_value_type() -> None:
     assert ok.merge_sha is None
     assert ok.emit_subtype is None
 
-    blocked = GateVerdict.block(reason='r', merge_sha='s', emit_subtype='t')
+    blocked = GateVerdict.block(
+        reason='r', merge_sha='s', emit_subtype=OutcomeKind.post_merge_pyright_broken,
+    )
     assert blocked.passed is False
     assert blocked.reason == 'r'
     assert blocked.merge_sha == 's'
-    assert blocked.emit_subtype == 't'
+    assert blocked.emit_subtype == OutcomeKind.post_merge_pyright_broken
 
     # Frozen: dataclasses.replace works (produces a new instance)...
     replaced = dataclasses.replace(ok, reason='changed')
