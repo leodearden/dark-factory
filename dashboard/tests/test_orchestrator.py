@@ -431,6 +431,110 @@ class TestReadTaskArtifacts:
         assert not warnings, f'expected no WARNING for absent plan.json, got: {warnings}'
 
 
+class TestReadTaskArtifactsTaskMeta:
+    """Tests for read_task_artifacts' new-then-old .task-meta relocation.
+
+    Mirrors TestReadTaskArtifacts's tmp_path pattern, but writes fixtures
+    under the SIBLING ``<worktree_base>/.task-meta/<name>`` dir that
+    orchestrator's ``TaskArtifacts.meta_root_for`` derives, instead of
+    ``<worktree>/.task/``, proving the dashboard's by-hand derivation
+    resolves new-then-old. This half covers metadata.json + plan.json
+    (phase/plan_progress/files); iterations.jsonl + reviews/ are covered
+    by the pair added alongside step-4's implementation.
+    """
+
+    def test_reads_metadata_and_plan_from_task_meta(self, tmp_path):
+        """metadata.json + plan.json under the relocated .task-meta dir are read."""
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        wt = tmp_path / '.worktrees' / '7'
+        wt.mkdir(parents=True)
+        meta = tmp_path / '.worktrees' / '.task-meta' / '7'
+        meta.mkdir(parents=True)
+
+        metadata = {'task_id': '7', 'title': 'Build widget', 'base_commit': 'abc123'}
+        (meta / 'metadata.json').write_text(json.dumps(metadata))
+
+        steps = [
+            {'id': f'step-{i}', 'status': 'done'} for i in range(1, 3)
+        ] + [
+            {'id': f'step-{i}', 'status': 'pending'} for i in range(3, 5)
+        ]
+        (meta / 'plan.json').write_text(json.dumps({'steps': steps, 'files': ['dashboard']}))
+
+        result = read_task_artifacts(wt)
+
+        assert result['metadata'] == metadata
+        assert result['phase'] == 'EXECUTE'
+        assert result['plan_progress'] == {'done': 2, 'total': 4}
+        assert result['files'] == ['dashboard']
+
+    def test_plan_new_path_wins_over_legacy(self, tmp_path):
+        """plan.json present under BOTH .task-meta and legacy .task/ resolves to the new copy."""
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        wt = tmp_path / '.worktrees' / '7'
+        wt.mkdir(parents=True)
+        meta = tmp_path / '.worktrees' / '.task-meta' / '7'
+        meta.mkdir(parents=True)
+        legacy = wt / '.task'
+        legacy.mkdir()
+
+        new_steps = [{'id': f'step-{i}', 'status': 'pending'} for i in range(1, 4)]
+        (meta / 'plan.json').write_text(json.dumps({'steps': new_steps}))
+
+        old_steps = [{'id': 'step-1', 'status': 'done'}]
+        (legacy / 'plan.json').write_text(json.dumps({'steps': old_steps}))
+
+        result = read_task_artifacts(wt)
+
+        assert result['plan_progress']['total'] == 3
+
+    def test_legacy_only_still_parses(self, tmp_path):
+        """A lane with only the legacy .task/ layout (no .task-meta sibling) still parses.
+
+        Compat-window regression guard: existing lanes that haven't migrated yet
+        must keep working exactly as before.
+        """
+        from dashboard.data.orchestrator import read_task_artifacts
+
+        wt = tmp_path / '.worktrees' / '7'
+        legacy = wt / '.task'
+        legacy.mkdir(parents=True)
+
+        steps = [{'id': 'step-1', 'status': 'done'}, {'id': 'step-2', 'status': 'pending'}]
+        (legacy / 'plan.json').write_text(json.dumps({'steps': steps}))
+
+        result = read_task_artifacts(wt)
+
+        assert result['plan_progress'] == {'done': 1, 'total': 2}
+        assert result['phase'] == 'EXECUTE'
+
+    def test_scan_worktrees_reads_meta_layout(self, tmp_path):
+        """_scan_worktrees derives worktree_base correctly end-to-end.
+
+        A lane whose only artifacts live under the .task-meta sibling still
+        surfaces correct phase/progress, and the .task-meta sibling itself is
+        never surfaced as a phantom lane.
+        """
+        from dashboard.data.orchestrator import _scan_worktrees
+
+        wt_base = tmp_path / '.worktrees'
+        wt_base.mkdir()
+        (wt_base / '7').mkdir()  # empty worktree dir, no .task/ subdir
+
+        meta = wt_base / '.task-meta' / '7'
+        meta.mkdir(parents=True)
+        steps = [{'id': 'step-1', 'status': 'done'}, {'id': 'step-2', 'status': 'pending'}]
+        (meta / 'plan.json').write_text(json.dumps({'steps': steps}))
+
+        result = _scan_worktrees(wt_base)
+
+        assert list(result.keys()) == [7]
+        assert result[7]['phase'] == 'EXECUTE'
+        assert result[7]['plan_progress'] == {'done': 1, 'total': 2}
+
+
 class TestExtractTaskId:
     """Tests for _extract_task_id — normalises worktree directory names to numeric task IDs."""
 
