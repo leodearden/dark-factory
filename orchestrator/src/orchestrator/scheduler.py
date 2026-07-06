@@ -2744,6 +2744,30 @@ class Scheduler:
             if deadline <= now:
                 del self._requeue_until[tid]
 
+    def _deferred_watch_gated(self, task: dict) -> bool:
+        """Return True when *task* must be withheld from dispatch as a
+        deferred-watch item (task 2234).
+
+        ``metadata.trigger`` is human-readable prose describing an upstream
+        reactivation condition (e.g. "graphiti-core upstream release
+        correcting per-node-pair over-invalidation") and is never parsed or
+        evaluated here — the scheduler cannot judge prose. Instead, "trigger
+        met" is defined operationally as an explicit operator action, one of:
+
+        - setting ``metadata.trigger_met`` to a truthy value (bool ``True``
+          or a timestamp string), reactivating dispatch while leaving
+          ``deferred_watch`` in place as durable provenance that this was a
+          watch item; or
+        - clearing/removing ``metadata.deferred_watch`` entirely, a hard
+          manual un-defer.
+
+        Plain truthiness is used throughout (matching the codebase's existing
+        metadata-flag convention) so bool ``True``, ``1``, and non-empty
+        timestamp strings all count as "set".
+        """
+        metadata = task.get('metadata') or {}
+        return bool(metadata.get('deferred_watch')) and not metadata.get('trigger_met')
+
     def _eligible_for_dispatch(
         self,
         task: dict,
@@ -2789,15 +2813,7 @@ class Scheduler:
             return False, None
         if tid in self._dispatched:
             return False, None
-        # metadata.deferred_watch (task 2234): metadata.trigger is human-authored
-        # prose describing an upstream reactivation condition (e.g. "graphiti-core
-        # upstream release correcting per-node-pair over-invalidation") and is
-        # never evaluated here. This is a minimal, deliberately over-broad gate —
-        # it blocks dispatch whenever deferred_watch is truthy, full stop. The
-        # narrower "released by an explicit operator reactivation signal"
-        # exception is added in a follow-up refinement.
-        metadata = task.get('metadata') or {}
-        if metadata.get('deferred_watch'):
+        if self._deferred_watch_gated(task):
             return False, None
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
