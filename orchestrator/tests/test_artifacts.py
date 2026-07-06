@@ -1162,3 +1162,37 @@ class TestMetaRootDerivation:
         assert TaskArtifacts.meta_root_for(Path('/other/base'), 'task-42') == (
             Path('/other/base/.task-meta/task-42')
         )
+
+
+class TestMetaRootConstructor:
+    """`meta_root` is an OPTIONAL 2nd constructor arg. Supplying it activates
+    the `.task-meta` relocation; writes must land there and NEVER under the
+    legacy `<worktree>/.task` path.
+    """
+
+    @pytest.fixture
+    def meta_root(self, worktree: Path) -> Path:
+        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+    def test_root_is_meta_root_when_supplied(self, worktree: Path, meta_root: Path):
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        assert ta.root == meta_root
+
+    def test_init_and_write_plan_land_under_meta_root_only(
+        self, worktree: Path, meta_root: Path
+    ):
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'A test task description')
+        ta.write_plan({
+            'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
+        })
+
+        assert (meta_root / 'metadata.json').exists()
+        assert (meta_root / 'reviews').is_dir()
+        assert (meta_root / '.gitignore').exists()
+        assert (meta_root / 'plan.json').exists()
+
+        # Writes are new-path ONLY — the legacy `.task` dir must not appear.
+        assert not (worktree / '.task').exists()
