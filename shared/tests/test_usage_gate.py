@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import AccountState, UsageGate
+from shared.usage_gate import AccountPhase, AccountState, IllegalTransitionError, UsageGate
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -928,3 +928,74 @@ class TestAccountPhaseScaffolding:
     def test_usage_gate_has_shutting_down_flag_defaulting_false(self):
         gate = make_gate(['acct-A'])
         assert gate._shutting_down is False
+
+
+# ---------------------------------------------------------------------------
+# step-03/04: UsageGate._transition — sole-writer phase mutation + centralized
+# _open recompute (DD-5: gate._open.is_set() <=> any account in
+# {AVAILABLE, PROBING}). No legality checking yet (added step-05/06); every
+# edge exercised here is legal per the eventual _LEGAL_TRANSITIONS table so
+# these assertions keep holding once legality lands.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestTransitionCore:
+    """step-03: _transition phase-write + centralized _open recompute (DD-5)."""
+
+    async def test_transition_to_capped_clears_open_and_near_cap(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.near_cap = True  # AVAILABLE -> CAPPED is a legal edge
+
+        gate._transition(acct, AccountPhase.CAPPED)
+
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.near_cap is False
+        assert gate._open.is_set() is False
+
+    async def test_transition_to_probing_opens_gate(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        gate._open.clear()
+
+        gate._transition(acct, AccountPhase.PROBING)  # CAPPED -> PROBING
+
+        assert acct.phase == AccountPhase.PROBING
+        assert gate._open.is_set() is True
+
+    async def test_transition_to_probe_in_flight_closes_gate(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.PROBING
+
+        gate._transition(acct, AccountPhase.PROBE_IN_FLIGHT)  # PROBING -> PROBE_IN_FLIGHT
+
+        assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+        assert gate._open.is_set() is False
+
+    async def test_transition_to_available_opens_gate(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.PROBE_IN_FLIGHT
+        gate._open.clear()
+
+        gate._transition(acct, AccountPhase.AVAILABLE)  # PROBE_IN_FLIGHT -> AVAILABLE
+
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+
+    async def test_multi_account_open_stays_set_when_sibling_available(self):
+        """Capping account A must not close the gate while B is still
+        AVAILABLE — the centralized recompute considers ALL accounts, not
+        just the one just mutated (unlike the old unconditional _open.clear()
+        sprinkled across ~10 call sites)."""
+        gate = make_gate(['acct-A', 'acct-B'], wait_for_reset=False, cost_store=None)
+        a, b = gate._accounts
+
+        gate._transition(a, AccountPhase.CAPPED)  # AVAILABLE -> CAPPED
+
+        assert a.phase == AccountPhase.CAPPED
+        assert b.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
