@@ -491,9 +491,27 @@ class TaskArtifacts:
         return completed
 
     def append_iteration_log(self, entry: dict) -> None:
-        """Append to .task/iterations.jsonl — one JSON object per line."""
+        """Append to .task/iterations.jsonl — one JSON object per line.
+
+        Migrate-on-first-append: if the new path's log does not exist yet
+        but a legacy log does, the legacy history is copied into the new
+        path BEFORE the new entry is appended. This consolidates all
+        history under the new path so `read_iteration_log` (via
+        `_read_path`) does not silently drop legacy entries once the new
+        file exists (split-brain). When `meta_root` was not supplied,
+        `self.root == self._legacy_root` so this branch is skipped
+        (byte-identical).
+        """
         entry['timestamp'] = datetime.now(UTC).isoformat()
         log_path = self.root / 'iterations.jsonl'
+        legacy_log_path = self._legacy_root / 'iterations.jsonl'
+        if (
+            log_path != legacy_log_path
+            and not log_path.exists()
+            and legacy_log_path.exists()
+        ):
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(legacy_log_path.read_text())
         with open(log_path, 'a') as f:
             f.write(json.dumps(entry) + '\n')
 
