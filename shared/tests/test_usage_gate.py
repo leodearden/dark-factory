@@ -1623,3 +1623,176 @@ class TestUncapViaTransition:
         assert event_type == 'resumed'
         details = json.loads(details_json)
         assert details['label'] == 'probe #1 confirmed'
+
+
+# ---------------------------------------------------------------------------
+# step-11/12: the auth-recovery (_reprobe_account) and demotion (_run_probe)
+# paths migrated onto _transition.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAuthRecoveryViaTransition:
+    """step-11: _reprobe_account and _run_probe's demotion branch route the
+    AUTH_FAILED->AVAILABLE and AUTH_FAILED->CAPPED edges through _transition."""
+
+    async def test_reprobe_account_success_transitions_auth_failed_to_available(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.AUTH_FAILED
+        acct.auth_failed_at = datetime.now(UTC)
+        gate._run_probe = AsyncMock(return_value=True)
+
+        await gate._reprobe_account(acct)
+
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.auth_failed_at is None
+        assert gate._open.is_set() is True
+
+    async def test_reprobe_account_success_still_fires_auth_resumed_event(self):
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=cost_store)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.AUTH_FAILED
+        gate._run_probe = AsyncMock(return_value=True)
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            await gate._reprobe_account(acct)
+
+        mock_fire.assert_called_once()
+        account_name, event_type, _ = mock_fire.call_args[0]
+        assert account_name == acct.name
+        assert event_type == 'auth_resumed'
+
+    async def test_reprobe_account_repeat_call_fires_auth_resumed_only_once(self):
+        """The old handler unconditionally rewrote auth_failed/auth_failed_at
+        and re-fired 'auth_resumed' on every successful reprobe call, even
+        once the account was already AVAILABLE from a prior success — the
+        same class of repeat-call bug fixed for _handle_cap_detected (step-6)
+        and _handle_auth_failure (step-8)."""
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=cost_store)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.AUTH_FAILED
+        gate._run_probe = AsyncMock(return_value=True)
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            await gate._reprobe_account(acct)
+            await gate._reprobe_account(acct)
+
+        assert mock_fire.call_count == 1
+
+    async def test_reprobe_account_on_already_available_account_is_noop(self):
+        """SIGHUP's fan-out calls _reprobe_account on EVERY account after
+        force-resetting them all to AVAILABLE — including ones that were
+        never auth_failed. Must not raise IllegalTransitionError."""
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        assert acct.phase == AccountPhase.AVAILABLE
+        gate._run_probe = AsyncMock(return_value=True)
+
+        await gate._reprobe_account(acct)  # must not raise
+
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    async def test_run_probe_demotion_transitions_auth_failed_to_capped(self):
+        """Mirrors the out-of-scope
+        test_usage_gate_exhaustive.TestAuthReprobeDemoteOnCapMessage contract:
+        an AUTH_FAILED account whose reprobe output contains a cap prefix is
+        demoted to CAPPED (the single legal AUTH_FAILED->CAPPED edge)."""
+        gate = make_gate(['a'], wait_for_reset=True, cost_store=make_mock_cost_store())
+        del gate._run_probe  # fall back to the real method under test
+        gate._probe_config_dir = MagicMock()
+        gate._probe_config_dir.path = Path('/tmp/probe-test')
+        gate._probe_config_dir.write_credentials = MagicMock()
+
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.AUTH_FAILED
+        acct.auth_failed_at = datetime.now(UTC)
+
+        async def _idle_loop() -> None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.sleep(60)
+        stale_reprobe_task = asyncio.get_event_loop().create_task(_idle_loop())
+        acct.auth_reprobe_task = stale_reprobe_task
+
+        cap_stderr = b"You're out of extra usage \xc2\xb7 resets in 2h"
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.pid = 12345
+        proc.communicate = AsyncMock(return_value=(b'', cap_stderr))
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec', return_value=proc):
+            ok = await gate._run_probe(acct)
+
+        assert ok is False
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.auth_failed_at is None
+        assert acct.resets_at is not None
+        delta = acct.resets_at - datetime.now(UTC)
+        assert timedelta(minutes=90) < delta < timedelta(hours=3)
+        # Re-read acct.auth_reprobe_task (not the captured stale_reprobe_task
+        # local) — this mirrors exactly what the sibling test asserts: the
+        # *field* must end up None or settled, not merely that the original
+        # task object was asked to cancel (cancellation only takes effect at
+        # the task's next suspension point, which may not have happened yet).
+        assert (
+            acct.auth_reprobe_task is None
+            or acct.auth_reprobe_task.cancelled()
+            or acct.auth_reprobe_task.done()
+        )
+        assert stale_reprobe_task is not None  # sanity: it really was set
+        assert acct.resume_task is not None
+        await _drain_task(acct.resume_task)
+
+    async def test_run_probe_demotion_fires_cap_hit_event(self):
+        gate = make_gate(['a'], wait_for_reset=True, cost_store=make_mock_cost_store())
+        del gate._run_probe
+        gate._probe_config_dir = MagicMock()
+        gate._probe_config_dir.path = Path('/tmp/probe-test')
+        gate._probe_config_dir.write_credentials = MagicMock()
+
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.AUTH_FAILED
+
+        cap_stderr = b"You're out of extra usage \xc2\xb7 resets in 2h"
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.pid = 12345
+        proc.communicate = AsyncMock(return_value=(b'', cap_stderr))
+
+        with (
+            patch('shared.usage_gate.asyncio.create_subprocess_exec', return_value=proc),
+            patch.object(gate, '_fire_cost_event') as mock_fire,
+        ):
+            await gate._run_probe(acct)
+
+        mock_fire.assert_called_once()
+        _, event_type, _ = mock_fire.call_args[0]
+        assert event_type == 'cap_hit'
+        await _drain_task(acct.resume_task)
+
+    async def test_run_probe_still_returns_false_on_cap_when_not_auth_failed(self):
+        """Preserve the existing _run_probe return-False-on-cap contract for
+        a plain (non-auth_failed) account — TestUsageGateProbeExitCodeClassification
+        coverage, pinned here too since it shares this method."""
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        del gate._run_probe
+        gate._probe_config_dir = MagicMock()
+        gate._probe_config_dir.path = Path('/tmp/probe-test')
+        gate._probe_config_dir.write_credentials = MagicMock()
+
+        acct = gate._accounts[0]
+        assert acct.phase == AccountPhase.AVAILABLE
+
+        cap_stderr = b"You're out of extra usage \xc2\xb7 resets in 2h"
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.pid = 12345
+        proc.communicate = AsyncMock(return_value=(b'', cap_stderr))
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec', return_value=proc):
+            ok = await gate._run_probe(acct)
+
+        assert ok is False
+        assert acct.phase == AccountPhase.AVAILABLE
