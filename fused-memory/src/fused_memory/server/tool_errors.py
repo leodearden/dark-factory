@@ -50,6 +50,9 @@ def mcp_tool_errors(
                 logger.exception(f'{op} error: {e}')
                 return {'error': str(e), 'error_type': type(e).__name__}
 
+        # Set after functools.wraps: update_wrapper copies fn.__dict__ onto
+        # wrapper, which would otherwise clobber this marker.
+        wrapper.__mcp_tool_errors__ = True
         return wrapper
 
     return decorator
