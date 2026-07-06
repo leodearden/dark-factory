@@ -3103,6 +3103,44 @@ class TestExecuteGraphitiWriteWithDedup:
         service._normalize_task_node_names.assert_awaited_once()
         assert service._normalize_task_node_names.call_args == ((mock_result,), {'group_id': 'test'})
 
+    @pytest.mark.asyncio
+    async def test_normalize_task_node_names_runs_after_node_dedup(self, service):
+        """task 2110 amendment: _normalize_task_node_names's rename-vs-merge
+        decision depends on _dedup_episode_nodes having already collapsed
+        exact-name duplicates. Pin the ordering (not just that both are
+        awaited) so a future reordering of the two hooks is caught here
+        rather than surfacing as a subtle rename/merge collision."""
+        from unittest.mock import AsyncMock, Mock
+
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        mock_result = MockAddEpisodeResult(nodes=[MockNode(name='task 132')])
+
+        service.graphiti.add_episode = AsyncMock(return_value=mock_result)
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+        service._dedup_episode_nodes = AsyncMock(return_value=0)
+        service._normalize_task_node_names = AsyncMock(return_value=0)
+
+        manager = Mock()
+        manager.attach_mock(service._dedup_episode_nodes, '_dedup_episode_nodes')
+        manager.attach_mock(service._normalize_task_node_names, '_normalize_task_node_names')
+
+        payload = {
+            'name': 'ep_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        call_order = [call[0] for call in manager.mock_calls]
+        assert '_dedup_episode_nodes' in call_order and '_normalize_task_node_names' in call_order
+        assert call_order.index('_dedup_episode_nodes') < call_order.index('_normalize_task_node_names'), (
+            '_dedup_episode_nodes must run before _normalize_task_node_names — '
+            f'got call order {call_order!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for _dual_write_callback reading result.edges  (step 11)
