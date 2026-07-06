@@ -109,8 +109,20 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     ),
 }
 
-assert set(CATEGORY_POLICY) == set(FailureCategory), (
-    'CATEGORY_POLICY out of sync with FailureCategory: '
-    f'missing rows for {sorted(set(FailureCategory) - set(CATEGORY_POLICY))}, '
-    f'stray rows {sorted(set(CATEGORY_POLICY) - set(FailureCategory))}'
-)
+def _validate_exhaustive(enum_cls, policy) -> None:
+    """Raise if ``policy`` doesn't have exactly one row per ``enum_cls`` member.
+
+    Reusable, unit-testable form of the F1 exhaustiveness guard: a synthetic
+    enum/policy pair can be checked directly instead of only observing the
+    failure via a real import crash.
+    """
+    missing = set(enum_cls) - set(policy)
+    extra = set(policy) - set(enum_cls)
+    if missing or extra:
+        raise AssertionError(
+            'CATEGORY_POLICY out of sync with FailureCategory: '
+            f'missing rows for {sorted(missing)}, stray rows {sorted(extra)}'
+        )
+
+
+_validate_exhaustive(FailureCategory, CATEGORY_POLICY)
