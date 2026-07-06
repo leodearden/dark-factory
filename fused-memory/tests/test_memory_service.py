@@ -4486,6 +4486,35 @@ class TestRestoreFalselySupersededSiblingEdges:
             'sib1', group_id='proj', clear_invalid_at=True
         )
 
+    @pytest.mark.asyncio
+    async def test_does_not_restore_dependency_fact_edges(self, service):
+        """An invalidated dependency-fact edge is exclusively
+        _restore_superseded_dependency_edges's domain (it restores every
+        invalidated dependency edge unconditionally, regardless of
+        node-pair). This hook must not also restore it — even when its
+        node-pair is unrestated — or the two hooks would double-call
+        update_edge for the same edge."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        dep_edge = MockEdge(
+            fact='Task 562 depends on Task 557', uuid='dep-edge-1',
+            source_node_uuid='s1', target_node_uuid='t1', invalid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [dep_edge]
+
+        service.graphiti.update_edge = AsyncMock()
+
+        count = await service._restore_falsely_superseded_sibling_edges(result, group_id='proj')
+
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Step 7: TRACK B.2 _is_dependency_fact helper RED tests

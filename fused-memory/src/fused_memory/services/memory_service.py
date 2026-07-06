@@ -711,9 +711,17 @@ class MemoryService:
         (documented follow-up, not handled here).
 
         Modelled on ``_restore_superseded_dependency_edges``; handles None /
-        empty result the same way. Order-safe with respect to that method:
-        an edge whose invalid_at was already cleared by the dependency-restore
-        hook simply has ``invalid_at is None`` here and is skipped.
+        empty result the same way. Dependency-fact edges (``_is_dependency_fact``)
+        are excluded from restore candidates here even when their node-pair
+        is unrestated: ``_restore_superseded_dependency_edges`` already
+        restores every invalidated dependency edge unconditionally
+        (regardless of node-pair) earlier in the same post-write chain, so
+        this hook would otherwise issue a redundant second ``update_edge``
+        call for the same edge. This keeps the two hooks' contracts
+        non-overlapping without relying on any in-place mutation of *result*
+        (the edge objects returned by ``add_episode`` are not refreshed by a
+        subsequent ``update_edge`` call, so ``invalid_at`` here always
+        reflects the pre-restore state regardless of hook order).
 
         Args:
             result: The value returned by ``add_episode`` (typically an
@@ -748,6 +756,11 @@ class MemoryService:
         failed = 0
         for edge in edges:
             if getattr(edge, 'invalid_at', None) is None:
+                continue
+            if _is_dependency_fact(getattr(edge, 'fact', '') or ''):
+                # Exclusively _restore_superseded_dependency_edges's domain —
+                # it already restores every invalidated dependency edge
+                # unconditionally, earlier in the same post-write chain.
                 continue
             src = getattr(edge, 'source_node_uuid', '') or ''
             tgt = getattr(edge, 'target_node_uuid', '') or ''
@@ -951,6 +964,12 @@ class MemoryService:
         await self._dedup_episode_edges(result, group_id=payload['group_id'])
         # Post-write restore: undo false dependency-edge supersessions
         await self._restore_superseded_dependency_edges(result, group_id=payload['group_id'])
+        # Post-write restore: undo false sibling-edge supersessions — edges
+        # invalidated by graphiti's per-node-pair heuristic whose node-pair
+        # is not restated by any surviving edge in this same write (must run
+        # after the dependency restore above so already-cleared dependency
+        # edges are simply skipped here, not double-processed)
+        await self._restore_falsely_superseded_sibling_edges(result, group_id=payload['group_id'])
         # Post-write node dedup: merge exact-name duplicate entity nodes that
         # graphiti_core ingestion failed to reuse
         await self._dedup_episode_nodes(result, group_id=payload['group_id'])
