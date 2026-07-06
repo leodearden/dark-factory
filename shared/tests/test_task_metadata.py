@@ -14,7 +14,7 @@ Built bottom-up in TDD order (see plans/task-metadata-schema-prd.md §5):
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 import shared.task_metadata as task_metadata_module
 from shared.task_metadata import (
@@ -24,6 +24,7 @@ from shared.task_metadata import (
     MemoryHints,
     RetryLedger,
     TaskMetadata,
+    register_metadata_submodel,
 )
 
 
@@ -351,3 +352,30 @@ class TestDeterministicInvariants:
         # task_kind='normal' + before_done set [before_done only on deterministic]
         with pytest.raises(ValidationError):
             TaskMetadata(task_kind='normal', before_done=self._MINIMAL_BEFORE_DONE)
+
+
+class _DeployStateStub(BaseModel):
+    """Throwaway sub-model standing in for a future W10 registrant."""
+
+    phase: str
+
+
+class TestSubmodelRegistry:
+    """The W10 extension point: register_metadata_submodel + _SUBMODEL_REGISTRY."""
+
+    def test_register_new_key_stored_in_registry(self):
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        assert task_metadata_module._SUBMODEL_REGISTRY['deploy_state'] is _DeployStateStub
+
+    def test_register_same_model_twice_is_idempotent(self):
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        register_metadata_submodel('deploy_state', _DeployStateStub)  # no raise
+        assert task_metadata_module._SUBMODEL_REGISTRY['deploy_state'] is _DeployStateStub
+
+    def test_register_different_model_same_key_raises(self):
+        class _OtherDeployStateStub(BaseModel):
+            phase: str
+
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        with pytest.raises(ValueError):
+            register_metadata_submodel('deploy_state', _OtherDeployStateStub)
