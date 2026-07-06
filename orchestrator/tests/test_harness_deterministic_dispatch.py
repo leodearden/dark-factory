@@ -180,7 +180,11 @@ class TestRunSlotRouting:
         # is_deterministic returns False → normal path
         harness.scheduler.is_deterministic = MagicMock(return_value=False)
         harness._escalation_queue = EscalationQueue(tmp_path)
-        harness.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+        # Substrate gate: _run_slot now calls substrate_gate.carries_substrate_probe
+        # (module-level, not a Scheduler method — task 2121) directly on
+        # assignment.task. This task's metadata carries no 'substrate_probe' key, so
+        # the real predicate already returns False and the gate is skipped without
+        # needing to stub anything on the mocked scheduler.
 
         with (
             patch('orchestrator.harness.TaskWorkflow') as mock_tw,

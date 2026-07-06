@@ -475,7 +475,6 @@ def _make_harness(tmp_path: Path):
     # Wire stub scheduler
     h.scheduler = MagicMock()
     h.scheduler.set_task_status = AsyncMock()
-    h.scheduler.carries_substrate_probe = MagicMock(return_value=True)
     # is_deterministic was added after these tests were written (task 1899);
     # mock it False so _run_slot stays on the normal (non-deterministic) path.
     h.scheduler.is_deterministic = MagicMock(return_value=False)
@@ -897,7 +896,14 @@ class TestRunSlotSubstrateGateWiring:
     Tests verify the gate integration in _run_slot BEFORE TaskWorkflow construction:
     (a) FLIP → TaskWorkflow never constructed / workflow.run never awaited, cooldown armed.
     (b) PASS → TaskWorkflow IS constructed and workflow.run IS awaited.
-    (c) NO-PROBE → gate never invoked (carries_substrate_probe=False), workflow proceeds.
+    (c) NO-PROBE → gate never invoked (task metadata carries no substrate_probe key), workflow proceeds.
+
+    Task 2121: _run_slot's dispatch gate now calls substrate_gate.carries_substrate_probe
+    (module-level, key-presence) directly on assignment.task instead of consulting
+    Scheduler.carries_substrate_probe (deleted — it diverged from the module predicate
+    and is why task 2121 exists). Gate routing below is therefore driven entirely by the
+    task metadata _make_assignment(probe=...) builds; no scheduler-level stub is needed
+    or consulted.
     """
 
     @pytest.mark.asyncio
@@ -905,7 +911,6 @@ class TestRunSlotSubstrateGateWiring:
         """(a) FLIP: TaskWorkflow must NOT be constructed when gate returns False."""
         h = _make_slot_harness(tmp_path)
         assignment = _make_assignment(probe=True)
-        h.scheduler.carries_substrate_probe = MagicMock(return_value=True)
         h._run_substrate_gate = AsyncMock(return_value=False)
         # _block_and_escalate_substrate_flip is called inside _run_substrate_gate (already mocked);
         # stub it here too so the gate-returning-False path is clean.
@@ -940,7 +945,6 @@ class TestRunSlotSubstrateGateWiring:
         """(b) PASS: TaskWorkflow MUST be constructed and workflow.run awaited."""
         h = _make_slot_harness(tmp_path)
         assignment = _make_assignment(probe=True)
-        h.scheduler.carries_substrate_probe = MagicMock(return_value=True)
         h._run_substrate_gate = AsyncMock(return_value=True)
 
         sem = MagicMock()
@@ -965,7 +969,6 @@ class TestRunSlotSubstrateGateWiring:
         """(c) NO-PROBE: gate must NOT be invoked when carries_substrate_probe is False."""
         h = _make_slot_harness(tmp_path)
         assignment = _make_assignment(probe=False)
-        h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
         gate_mock = AsyncMock(return_value=True)
         h._run_substrate_gate = gate_mock
 
@@ -982,3 +985,152 @@ class TestRunSlotSubstrateGateWiring:
 
         # (c2) Workflow still runs (non-probe tasks unaffected).
         mock_wf.run.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Task 2121 RED: dispatch-level fail-closed via the REAL production gate
+# ---------------------------------------------------------------------------
+
+
+def _stub_old_carries_substrate_probe(h) -> None:
+    """Stub the still-present (pre-deletion) Scheduler.carries_substrate_probe.
+
+    Replicates the OLD divergent semantics (``extract_probe_set(task) is not
+    None``) that the harness's production dispatch gate consulted BEFORE task
+    2121's rewire, WITHOUT referencing the ``Scheduler.carries_substrate_probe``
+    symbol itself (it is deleted as part of this task's impl step).
+
+    On base (pre-rewire) harness.py calls ``self.scheduler.carries_substrate_probe``
+    directly, so this stub makes the gate observably skip for a malformed-but-
+    present descriptor — reproducing the actual defect (RED).  After the
+    rewire, harness.py calls ``substrate_gate.carries_substrate_probe`` (module-
+    level) directly instead, so this stub is never consulted — it goes dead
+    but harmless (GREEN).
+
+    A plain ``MagicMock()`` scheduler attribute would return a truthy MagicMock
+    for any task regardless of predicate choice, which would make the base
+    dispatch gate run unconditionally and mask the defect — hence the explicit
+    ``side_effect`` rather than a bare mock.
+    """
+    from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
+    h.scheduler.carries_substrate_probe = MagicMock(
+        side_effect=lambda t: extract_probe_set(t) is not None
+    )
+
+
+class TestRunSlotSubstrateFailClosed:
+    """Task 2121: the production dispatch gate must fail CLOSED, not skip.
+
+    Unlike ``TestRunSlotSubstrateGateWiring`` above (which mocks BOTH
+    ``carries_substrate_probe`` and ``_run_substrate_gate``), these tests
+    drive the REAL ``_run_substrate_gate`` / ``run_substrate_recheck`` end to
+    end through ``_run_slot`` — the actual production dispatch path — so they
+    exercise the real predicate-choice decision at harness.py's dispatch gate
+    rather than a mocked stand-in.
+
+    (a)/(b): a declared-but-malformed ``substrate_probe`` descriptor must
+    BLOCK dispatch (agent never spun up, task blocked, exactly one L1
+    'design_concern' escalation filed) rather than silently skip the gate.
+    (c): a task with no ``substrate_probe`` key at all is an unaffected
+    companion case — dispatch proceeds normally, no block, no escalation.
+    """
+
+    async def _run_and_assert_blocked(
+        self, tmp_path: Path, *, task_id: str, metadata: dict,
+    ) -> None:
+        """Shared body for the two malformed-descriptor cases (a) and (b)."""
+        from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+        h = _make_slot_harness(tmp_path)
+        _stub_old_carries_substrate_probe(h)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+
+        assignment = MagicMock()
+        assignment.task_id = task_id
+        assignment.task = {'id': task_id, 'title': 'fail-closed test', 'metadata': metadata}
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        proc_mock = AsyncMock(return_value=_fake_proc(0))
+        with (
+            patch('asyncio.create_subprocess_exec', proc_mock),
+            patch('orchestrator.harness.TaskWorkflow') as MockWorkflow,
+        ):
+            MockWorkflow.return_value = _make_mock_workflow()
+            await h._run_slot(assignment, sem)
+
+        assert not MockWorkflow.called, (
+            f'TaskWorkflow must NOT be constructed for malformed descriptor '
+            f'{metadata!r} — the dispatch gate must fail CLOSED, not skip'
+        )
+        h.scheduler.set_task_status.assert_awaited_once_with(task_id, 'blocked')  # type: ignore[attr-defined]
+
+        pending = h._escalation_queue.get_pending()
+        l1s = [e for e in pending if e.task_id == task_id and e.level == 1]
+        assert len(l1s) == 1, f'Expected exactly 1 L1 escalation for task {task_id}; got {l1s!r}'
+        assert l1s[0].category == 'design_concern', f'Expected design_concern, got {l1s[0].category!r}'
+        assert l1s[0].summary.startswith('SUBSTRATE_FLIP'), f'Unexpected summary: {l1s[0].summary!r}'
+
+        h.scheduler.release.assert_called_once()  # type: ignore[attr-defined]
+        release_call = h.scheduler.release.call_args  # type: ignore[attr-defined]
+        assert release_call.kwargs.get('requeued') is True, (
+            f'scheduler.release must be called with requeued=True on a fail-closed '
+            f'block; got {release_call!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_string_descriptor_blocks_dispatch(self, tmp_path: Path):
+        """(a) substrate_probe='garbage' (string) — must block, not skip."""
+        await self._run_and_assert_blocked(
+            tmp_path, task_id='fc-a', metadata={'substrate_probe': 'garbage'},
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_dict_descriptor_blocks_dispatch(self, tmp_path: Path):
+        """(b) substrate_probe={} (empty dict) — must block, not skip."""
+        await self._run_and_assert_blocked(
+            tmp_path, task_id='fc-b', metadata={'substrate_probe': {}},
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_probe_key_allows_dispatch(self, tmp_path: Path):
+        """(c) companion: no substrate_probe key at all — dispatch proceeds normally."""
+        from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+        h = _make_slot_harness(tmp_path)
+        _stub_old_carries_substrate_probe(h)
+        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+
+        task_id = 'fc-c'
+        assignment = MagicMock()
+        assignment.task_id = task_id
+        assignment.task = {'id': task_id, 'title': 'no probe here', 'metadata': {}}
+
+        sem = MagicMock()
+        sem.release = MagicMock()
+
+        proc_mock = AsyncMock(return_value=_fake_proc(0))
+        with (
+            patch('asyncio.create_subprocess_exec', proc_mock),
+            patch('orchestrator.harness.TaskWorkflow') as MockWorkflow,
+        ):
+            mock_wf = _make_mock_workflow()
+            MockWorkflow.return_value = mock_wf
+            await h._run_slot(assignment, sem)
+
+        assert MockWorkflow.called, 'TaskWorkflow must be constructed when no probe is declared'
+        mock_wf.run.assert_awaited_once()
+
+        blocked_calls = [
+            call for call in h.scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+            if len(call.args) >= 2 and call.args[1] == 'blocked'
+        ]
+        assert not blocked_calls, (
+            f'set_task_status must never be called with "blocked" for a non-probe '
+            f'task; got {blocked_calls!r}'
+        )
+
+        pending = h._escalation_queue.get_pending()
+        l1s = [e for e in pending if e.task_id == task_id]
+        assert not l1s, f'Expected no escalation for non-probe task {task_id}; got {l1s!r}'

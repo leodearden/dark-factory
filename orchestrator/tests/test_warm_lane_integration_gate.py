@@ -302,7 +302,11 @@ async def _run_synthetic_hard_cancel_slot(
     Mirrors the setup in
     TestHardCancelLaneRelease.test_synthetic_hard_cancel_retains_branch_and_lane.
     """
-    harness.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    # Substrate gate: _run_slot now calls substrate_gate.carries_substrate_probe
+    # (module-level, not a Scheduler method — task 2121) directly on
+    # assignment.task. The synthetic assignment built below carries an empty
+    # 'metadata' dict, so the real predicate already returns False and the gate
+    # is skipped without needing to stub anything on the mocked scheduler.
     harness.scheduler.is_deterministic = MagicMock(return_value=False)
 
     with patch('orchestrator.harness.TaskWorkflow') as MockWorkflow:
