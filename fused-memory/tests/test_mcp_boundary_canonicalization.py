@@ -102,3 +102,84 @@ class TestGatedWriteCanonicalization:
             f'Expected offending value {_PATH_SHAPED!r} named in error, got: {result!r}'
         )
         mock_service.add_episode.assert_not_called()
+
+
+class TestReadCanonicalization:
+    """Reads: search, get_entity, get_queue_stats (also count_memories_by_metadata,
+    get_memories_by_metadata, get_entity_by_uuid, get_episodes — covered by the
+    step-7 completeness sweep).
+    """
+
+    @pytest.mark.asyncio
+    async def test_search_routes_hyphen_and_underscore_spellings_identically(self):
+        """B1: search reaches the service with the canonical project_id for
+        EITHER spelling of a known project — 'dark-factory' and 'dark_factory'
+        must both resolve to 'dark_factory'.
+        """
+        mock_service = AsyncMock()
+        mock_service.search.return_value = []
+        server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
+
+        await server._tool_manager.call_tool(
+            'search', {'query': 'q', 'project_id': 'dark-factory'}
+        )
+        await server._tool_manager.call_tool(
+            'search', {'query': 'q', 'project_id': 'dark_factory'}
+        )
+
+        assert mock_service.search.call_count == 2
+        for call in mock_service.search.call_args_list:
+            assert call[1]['project_id'] == 'dark_factory', (
+                f'Expected canonicalized project_id on every call; calls={mock_service.search.call_args_list!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_search_rejects_path_shaped_project_id(self):
+        """B2: search(project_id='-home-leo-src-x') is rejected loudly, no service call."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
+
+        result = await server._tool_manager.call_tool(
+            'search', {'query': 'q', 'project_id': _PATH_SHAPED}
+        )
+
+        assert result.get('error_type') == 'PathShapedProjectIdError', (
+            f'Expected PathShapedProjectIdError, got: {result!r}'
+        )
+        mock_service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_entity_routes_hyphen_spelling_canonicalized(self):
+        """B1: get_entity(project_id='dark-factory') reaches the service as 'dark_factory'."""
+        mock_service = AsyncMock()
+        mock_service.get_entity.return_value = {'nodes': [], 'edges': []}
+        server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
+
+        await server._tool_manager.call_tool(
+            'get_entity', {'name': 'e', 'project_id': 'dark-factory'}
+        )
+
+        mock_service.get_entity.assert_called_once()
+        assert mock_service.get_entity.call_args[1]['project_id'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_get_queue_stats_none_project_id_passes_through(self):
+        """get_queue_stats(project_id=None) keeps global scope: group_id=None reaches durable_queue."""
+        mock_service = AsyncMock()
+        mock_service.durable_queue.get_stats = AsyncMock(return_value={'counts': {}})
+        server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
+
+        await server._tool_manager.call_tool('get_queue_stats', {'project_id': None})
+
+        mock_service.durable_queue.get_stats.assert_called_once_with(group_id=None)
+
+    @pytest.mark.asyncio
+    async def test_get_queue_stats_hyphen_spelling_canonicalized(self):
+        """B1: get_queue_stats(project_id='dark-factory') forwards group_id='dark_factory'."""
+        mock_service = AsyncMock()
+        mock_service.durable_queue.get_stats = AsyncMock(return_value={'counts': {}})
+        server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
+
+        await server._tool_manager.call_tool('get_queue_stats', {'project_id': 'dark-factory'})
+
+        mock_service.durable_queue.get_stats.assert_called_once_with(group_id='dark_factory')
