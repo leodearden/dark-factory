@@ -186,3 +186,83 @@ class TestStreakCounterCauseChangeVariant:
         assert 'task-1' not in counter.causes
         assert counter.value('task-2') == 1
         assert counter.causes['task-2'] == 'deps_live'
+
+
+class TestStreakCounterFirstSeenAgeVariant:
+    """Unit tests for the first-seen-age variant: touch(key, now=)/age().
+
+    Backs ``_starvation_first_seen`` / ``_starvation_escalated``: the
+    starvation watchdog stamps an anchor the first tick a task appears as a
+    dispatch-eligible candidate, then measures elapsed idle time against
+    that anchor on every subsequent tick until the task dispatches or is
+    GC'd.
+    """
+
+    def test_touch_stamps_first_seen_on_first_sight(self) -> None:
+        counter = StreakCounter(threshold=3)
+        assert counter.touch('task-1', now=100.0) == 100.0
+        assert counter.first_seen['task-1'] == 100.0
+
+    def test_touch_is_idempotent_after_first_sight(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counter.touch('task-1', now=100.0)
+        # A later tick's `now` must NOT overwrite the anchor.
+        assert counter.touch('task-1', now=200.0) == 100.0
+        assert counter.first_seen['task-1'] == 100.0
+
+    def test_absence_of_touch_does_not_auto_stamp(self) -> None:
+        counter = StreakCounter(threshold=3)
+        assert 'task-1' not in counter.first_seen
+
+    def test_age_returns_elapsed_since_first_seen(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counter.touch('task-1', now=100.0)
+        assert counter.age('task-1', now=145.0) == 45.0
+
+    def test_first_seen_is_identity_stable_across_calls(self) -> None:
+        counter = StreakCounter(threshold=3)
+        backing = counter.first_seen
+        counter.touch('task-1', now=100.0)
+        assert counter.first_seen is backing
+        assert backing == {'task-1': 100.0}
+
+    def test_mark_escalated_and_is_escalated(self) -> None:
+        counter = StreakCounter(threshold=3)
+        assert counter.is_escalated('task-1') is False
+        counter.mark_escalated('task-1')
+        assert counter.is_escalated('task-1') is True
+
+    def test_escalated_is_identity_stable_across_calls(self) -> None:
+        counter = StreakCounter(threshold=3)
+        backing = counter.escalated
+        counter.mark_escalated('task-1')
+        assert counter.escalated is backing
+        assert backing == {'task-1'}
+
+    def test_clear_pops_first_seen_and_discards_escalated(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counter.touch('task-1', now=100.0)
+        counter.mark_escalated('task-1')
+        counter.clear('task-1')
+        assert 'task-1' not in counter.first_seen
+        assert not counter.is_escalated('task-1')
+
+    def test_clear_missing_key_is_a_noop_for_age_variant(self) -> None:
+        counter = StreakCounter(threshold=3)
+        counter.clear('missing')  # must not raise, incl. escalated.discard
+
+    def test_gc_sweeps_both_first_seen_and_escalated_in_place(self) -> None:
+        counter = StreakCounter(threshold=3)
+        first_seen_backing = counter.first_seen
+        escalated_backing = counter.escalated
+        counter.touch('task-1', now=100.0)
+        counter.mark_escalated('task-1')
+        counter.touch('task-2', now=100.0)
+        counter.mark_escalated('task-2')
+        counter.gc({'task-1'})
+        assert counter.first_seen is first_seen_backing
+        assert counter.escalated is escalated_backing
+        assert 'task-1' not in counter.first_seen
+        assert not counter.is_escalated('task-1')
+        assert 'task-2' in counter.first_seen
+        assert counter.is_escalated('task-2')
