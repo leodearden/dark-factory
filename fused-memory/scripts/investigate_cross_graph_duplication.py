@@ -197,7 +197,21 @@ def build_investigation_report(
 ) -> dict:
     """Assemble the final investigation report dict from already-computed
     inputs. No I/O."""
-    raise NotImplementedError
+    scope = (
+        'systemic'
+        if collision_result['collisions'] or collision_result['suspected_path_leaks']
+        else 'single_node'
+    )
+    return {
+        'target_uuid': target_uuid,
+        'all_graphs': all_graphs,
+        'graph_count': len(all_graphs),
+        'present_in': presence,
+        'collision_groups': collision_result['collisions'],
+        'suspected_path_leaks': collision_result['suspected_path_leaks'],
+        'verdict': verdict,
+        'scope': scope,
+    }
 
 
 # ---------------------------------------------------------------------------
