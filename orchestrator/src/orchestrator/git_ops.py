@@ -3598,7 +3598,33 @@ class GitOps:
                 ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
             )
             if _rc_head == 0 and _cur_branch.strip() == full_branch:
-                await self.commit(lane, 'chore: save WIP before lane-acquire abort')
+                # Gate the commit on real changes existing OUTSIDE target/
+                # (review-fix, task 2199). target/ is the reify build/seed
+                # output dir and is NOT gitignored inside a lane checkout
+                # (the root .gitignore's `.worktrees/` entry does not reach
+                # into a lane's own working tree). The create-once and
+                # recycle re-seed fault routes reach this step right after a
+                # FAILED seed script, which can leave a partially-written
+                # target/ behind. There is by definition no genuine user WIP
+                # under target/ on those routes, so unconditionally
+                # committing here would turn a would-be-degenerate 0-commit
+                # ref into a RETAINED, commit-bearing branch full of seed
+                # garbage — defeating the degenerate-gated retention below.
+                # Fail toward committing (never-discard-WIP) if the status
+                # probe itself errors.
+                _rc_status, _status_out, _ = await _run(
+                    ['git', 'status', '--porcelain', '--', '.', ':!target'],
+                    cwd=lane,
+                )
+                if _rc_status != 0 or _status_out.strip():
+                    await self.commit(lane, 'chore: save WIP before lane-acquire abort')
+                else:
+                    logger.debug(
+                        '_abort_lane_acquisition: lane %s has no changes '
+                        'outside target/ — skipping WIP commit (avoids '
+                        'committing seed residue as a retained garbage '
+                        'branch)', lane,
+                    )
             else:
                 logger.debug(
                     '_abort_lane_acquisition: lane %s HEAD is not on %s '

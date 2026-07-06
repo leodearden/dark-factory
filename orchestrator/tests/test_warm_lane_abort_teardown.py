@@ -80,6 +80,28 @@ async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
     await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
 
 
+async def _add_failing_seed_script(repo: Path, rc: int, port: int = 39411) -> None:
+    """Commit a seed-warm-lane.sh stub that exits `rc` WITHOUT writing target/.
+
+    Used to drive a REAL (unmocked) seed failure end-to-end. Unlike
+    `_add_warm_lane_scripts`'s succeeding stub, this never creates target/,
+    so the failure is clean/residue-free by construction — isolating the
+    create-once-seed-fault teardown ordering (commit->detach->delete-branch
+    ->remove-worktree->release) from the target/-residue behavior covered
+    separately in TestAbortLaneAcquisitionWipAndRetention.
+    """
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    seed_script = scripts_dir / 'seed-warm-lane.sh'
+    seed_script.write_text(f'#!/usr/bin/env bash\nexit {rc}\n')
+    seed_script.chmod(0o755)
+    debug_script = scripts_dir / 'setup-worktree-debug-port.sh'
+    debug_script.write_text(f'#!/usr/bin/env bash\necho {port}\n')
+    debug_script.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add failing seed-warm-lane.sh stub'], cwd=repo)
+
+
 def _warm_config(**overrides) -> GitConfig:
     """Build a GitConfig with the warm-lane pool enabled (canonical settings)."""
     return GitConfig(
@@ -232,6 +254,41 @@ class TestAbortLaneAcquisitionWipAndRetention:
         rc, _, _ = await _run(['git', 'rev-parse', '--verify', 'task/X'], cwd=git_repo)
         assert rc != 0, 'Degenerate 0-commits-beyond-main branch must be DELETED'
 
+    async def test_abort_ignores_seeded_target_residue_for_wip_commit(
+        self, git_repo: Path,
+    ):
+        """A create-once lane's seeded (unscrubbed) target/ dir must NOT be
+        committed as WIP (review-fix, task 2199).
+
+        Unlike the sibling tests above, this deliberately does NOT scrub
+        target/ before the abort — seed-warm-lane.sh's stub already wrote
+        target/seeded.bin (untracked). If the WIP-commit step naively
+        `git add -A`-ed it, task/X would pick up a spurious commit and stop
+        being degenerate (0 commits beyond main), so the retention guard
+        would wrongly RETAIN it instead of deleting it as garbage.
+        """
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        info = await git_ops.acquire_warm_lane('X', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+        assert (info.path / 'target' / 'seeded.bin').exists(), (
+            'Fixture assumption: the stub seed script left target/ residue'
+        )
+
+        with patch.object(
+            git_ops, 'warm_lane_ref_is_degenerate', AsyncMock(return_value=True),
+        ):
+            await git_ops._abort_lane_acquisition(info.path, 'X', remove_worktree=False)
+
+        rc, _, _ = await _run(['git', 'rev-parse', '--verify', 'task/X'], cwd=git_repo)
+        assert rc != 0, (
+            'Seeded target/ residue must not be committed as WIP — task/X '
+            'must still be seen as degenerate (0 commits beyond main) and '
+            'deleted, not resurrected into a retained garbage branch'
+        )
+
 
 # ---------------------------------------------------------------------------
 # acquire_warm_lane's top-level except — load-bearing PRD fault-injection
@@ -370,3 +427,81 @@ class TestResetInPlaceReseedFaultRoutesThroughAbort:
         assert git_ops.warm_lane_pool.state(info_seed.path) == LaneState.FREE, (
             'Pool slot must be FREE after the fault teardown'
         )
+
+
+# ---------------------------------------------------------------------------
+# Create-once fresh-seed-fault — real (unmocked seed script) end-to-end
+# ordering: commit -> detach -> delete-branch -> remove-worktree -> release
+# (test-coverage review-fix, task 2199)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCreateOnceSeedFaultEndToEnd:
+    """A genuine create-once seed-script failure, driven through the
+    production acquire_warm_lane call site — not the primitive in
+    isolation — so remove_worktree=True and degenerate-branch deletion are
+    asserted together, in the order _abort_lane_acquisition actually runs
+    them."""
+
+    async def test_create_once_fresh_seed_fault_removes_worktree_and_deletes_degenerate_branch(
+        self, git_repo: Path,
+    ):
+        """rc != 0 from a real (unmocked) seed-warm-lane.sh on the fresh
+        create-once path must, end-to-end: delete the now-degenerate branch,
+        remove the minted worktree, and free the pool slot.
+        """
+        await _add_failing_seed_script(git_repo, rc=3)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        with patch.object(
+            git_ops, 'warm_lane_ref_is_degenerate', AsyncMock(return_value=True),
+        ):
+            result = await git_ops.acquire_warm_lane('X', start_ref)
+
+        assert result is _seed_rc_to_unavailable(3), (
+            f'Expected the shared seed-rc sentinel for 3; got {result!r}'
+        )
+        assert result is WarmLaneUnavailable.FAULT
+
+        lane = git_ops.worktree_base / '_lane-0'
+        assert not await git_ops._is_registered_worktree(lane), (
+            'The worktree minted for this create-once attempt must be '
+            'REMOVED after the seed fault'
+        )
+
+        rc, _, _ = await _run(['git', 'rev-parse', '--verify', 'task/X'], cwd=git_repo)
+        assert rc != 0, (
+            'task/X must be DELETED — it is degenerate (0 commits beyond '
+            'main, classifier forced True) — not left parked'
+        )
+
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+            'Pool slot must be FREE after the fault teardown'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pool-disabled no-op (test-coverage review-fix, task 2199)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAbortLaneAcquisitionPoolDisabled:
+    """_abort_lane_acquisition must no-op cleanly when the pool is disabled,
+    guarding the early `if self.warm_lane_pool is None: return` against a
+    future regression that moves logic ahead of that guard."""
+
+    async def test_abort_noop_when_pool_disabled(self, git_repo: Path):
+        """warm_lane_pool is None (pool size 0 / disabled) — the primitive
+        must return None without raising, even for a lane path that was
+        never acquired."""
+        git_ops = GitOps(_warm_config(), git_repo)  # warm_lane_pool_size defaults to 0
+        assert git_ops.warm_lane_pool is None
+
+        result = await git_ops._abort_lane_acquisition(
+            git_repo / 'nonexistent-lane', 'X', remove_worktree=False,
+        )
+        assert result is None
