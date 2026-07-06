@@ -13,6 +13,9 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+from escalation.queue import EscalationQueue
+
 from orchestrator.lane_lifecycle import (
     ESCALATION_SENTINEL_ROLE,
     LEGAL_TRANSITIONS,
@@ -141,3 +144,53 @@ class TestLegalRoundtrip:
         lifecycle = _lifecycle(tmp_path)
         lane = tmp_path / '_lane-0'
         assert lifecycle.read(lane) is None
+
+
+# ---------------------------------------------------------------------------
+# Illegal transition -> born-at-L2 escalation (user-observable signal, half 2)
+# ---------------------------------------------------------------------------
+
+
+def _released_lane(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    """Drive a lane through the legal sequence to RELEASED and return its path."""
+    lane = tmp_path / '_lane-0'
+    lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+    lifecycle.transition(lane, LaneState.REGISTERED, branch='task/foo')
+    lifecycle.transition(lane, LaneState.ASSIGNED, task_id='2254', title='demo')
+    lifecycle.transition(lane, LaneState.IN_USE)
+    lifecycle.transition(lane, LaneState.RELEASED)
+    return lane
+
+
+class TestIllegalEscalate:
+    def test_illegal_transition_files_born_at_l2_escalation(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        lifecycle = _lifecycle(tmp_path, escalation_queue=queue)
+        lane = _released_lane(tmp_path, lifecycle)
+
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        with pytest.raises(IllegalLaneTransition):
+            lifecycle.transition(lane, LaneState.IN_USE)
+
+        sentinel_task_id = f'lane-lifecycle-{lane.name}'
+        escalations = queue.get_by_task(sentinel_task_id)
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.severity in {'critical', 'urgent'}
+        assert esc.agent_role == ESCALATION_SENTINEL_ROLE
+        assert esc.agent_role.startswith('harness-')
+        assert esc.level == 2
+        assert esc.category == 'risk_identified'
+
+        assert record_path.read_bytes() == before_bytes
+
+    def test_illegal_transition_without_queue_still_raises_and_files_nothing(
+        self, tmp_path: Path,
+    ):
+        lifecycle = _lifecycle(tmp_path)  # escalation_queue=None
+        lane = _released_lane(tmp_path, lifecycle)
+
+        with pytest.raises(IllegalLaneTransition):
+            lifecycle.transition(lane, LaneState.IN_USE)
