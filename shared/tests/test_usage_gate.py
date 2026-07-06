@@ -799,3 +799,132 @@ class TestSoonestResetsAt:
         gate._accounts[1].resets_at = None
 
         assert gate.soonest_resets_at is None
+
+
+# ---------------------------------------------------------------------------
+# step-01/02: AccountPhase scaffolding — explicit `phase` field on
+# AccountState + a legacy-compat property shim for the old boolean flags
+# (capped/probing/probe_in_flight/auth_failed), plus the UsageGate
+# `_shutting_down` guard field.  AccountPhase / IllegalTransitionError are
+# imported *inside* each test (not at module scope) since they do not exist
+# yet on the base branch — this keeps the rest of the file collectible while
+# these specific tests fail red.
+# ---------------------------------------------------------------------------
+
+
+class TestAccountPhaseScaffolding:
+    """step-01: AccountPhase(StrEnum) + IllegalTransitionError + compat shim."""
+
+    def test_account_phase_importable_with_exact_members(self):
+        from shared.usage_gate import AccountPhase
+
+        assert {m.name for m in AccountPhase} == {
+            'AVAILABLE', 'PROBING', 'PROBE_IN_FLIGHT', 'CAPPED', 'AUTH_FAILED',
+        }
+
+    def test_illegal_transition_error_importable(self):
+        from shared.usage_gate import IllegalTransitionError
+
+        assert issubclass(IllegalTransitionError, Exception)
+
+    def test_fresh_account_defaults_to_available_phase(self):
+        from shared.usage_gate import AccountPhase
+
+        acct = AccountState(name='acct-A', token='tok')
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.capped is False
+        assert acct.probing is False
+        assert acct.probe_in_flight is False
+        assert acct.auth_failed is False
+        assert acct.near_cap is False
+
+    def test_capped_setter_maps_to_phase(self):
+        from shared.usage_gate import AccountPhase
+
+        acct = AccountState(name='acct-A', token='tok')
+        acct.capped = True
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.capped is True
+        assert acct.probing is False
+        assert acct.probe_in_flight is False
+        assert acct.auth_failed is False
+
+    def test_probing_setter_maps_to_phase(self):
+        from shared.usage_gate import AccountPhase
+
+        acct = AccountState(name='acct-A', token='tok')
+        acct.probing = True
+        assert acct.phase == AccountPhase.PROBING
+        assert acct.probing is True
+        assert acct.capped is False
+        assert acct.probe_in_flight is False
+        assert acct.auth_failed is False
+
+    def test_probe_in_flight_setter_maps_to_phase(self):
+        from shared.usage_gate import AccountPhase
+
+        acct = AccountState(name='acct-A', token='tok')
+        acct.probe_in_flight = True
+        assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+        assert acct.probe_in_flight is True
+        assert acct.capped is False
+        assert acct.probing is False
+        assert acct.auth_failed is False
+
+    def test_auth_failed_setter_maps_to_phase(self):
+        from shared.usage_gate import AccountPhase
+
+        acct = AccountState(name='acct-A', token='tok')
+        acct.auth_failed = True
+        assert acct.phase == AccountPhase.AUTH_FAILED
+        assert acct.auth_failed is True
+        assert acct.capped is False
+        assert acct.probing is False
+        assert acct.probe_in_flight is False
+
+    def test_mutual_exclusion_by_construction(self):
+        """Setting capped=True then auth_failed=True leaves only auth_failed True.
+
+        Guards against the pre-refactor bug class where independent boolean
+        fields could both be True simultaneously.
+        """
+        acct = AccountState(name='acct-A', token='tok')
+        acct.capped = True
+        acct.auth_failed = True
+        assert acct.auth_failed is True
+        assert acct.capped is False
+
+    def test_setter_clear_of_non_current_flag_is_noop(self):
+        """Clearing a flag that does NOT match the current phase is a no-op."""
+        from shared.usage_gate import AccountPhase
+
+        acct = AccountState(name='acct-A', token='tok')
+        acct.probe_in_flight = True
+        acct.probing = False  # probing is not the current phase -> no-op
+        assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+        assert acct.probe_in_flight is True
+
+    def test_setter_clear_of_current_flag_resets_to_available(self):
+        """Clearing the flag matching the CURRENT phase resets to AVAILABLE."""
+        from shared.usage_gate import AccountPhase
+
+        acct = AccountState(name='acct-A', token='tok')
+        acct.capped = True
+        acct.capped = False
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    def test_near_cap_is_independent_of_phase_and_bool_setters(self):
+        from shared.usage_gate import AccountPhase
+
+        acct = AccountState(name='acct-A', token='tok')
+        acct.near_cap = True
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.near_cap is True
+
+        # The legacy bool setters must not touch near_cap.
+        acct.capped = True
+        assert acct.near_cap is True
+
+    def test_usage_gate_has_shutting_down_flag_defaulting_false(self):
+        gate = make_gate(['acct-A'])
+        assert gate._shutting_down is False
