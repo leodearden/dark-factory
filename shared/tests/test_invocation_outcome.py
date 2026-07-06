@@ -9,8 +9,16 @@ from pathlib import Path
 
 import pytest
 
+from shared import cli_invoke as cli_invoke_module
+from shared import usage_gate as usage_gate_module
 from shared.cli_invoke import AgentResult
 from shared.invocation_outcome import (
+    CAP_CONFIRM_KEYWORDS,
+    CAP_HIT_PREFIXES,
+    CODEX_CAP_PATTERNS,
+    GEMINI_CAP_PATTERNS,
+    NEAR_CAP_PREFIXES,
+    NON_CAP_CLI_ERROR_MARKERS,
     OK,
     AuthFailed,
     CapHit,
@@ -153,6 +161,35 @@ class TestExtractCapMessage:
         text = "YOU'VE HIT YOUR usage limit. resets in 3h."
         message = _extract_cap_message(text, "you've hit your")
         assert message != ''
+
+
+class TestStringTableDriftGuard:
+    """Guard against silent divergence of the copied string tables.
+
+    invocation_outcome.py intentionally duplicates these tables rather than
+    importing them (see the module docstring: additive-only, consumer
+    rewire removes the duplication later). Until that rewire lands, a future
+    edit to one home must not silently diverge from the other — these tests
+    fail loudly the moment it does.
+    """
+
+    def test_cap_hit_prefixes_matches_usage_gate(self):
+        assert CAP_HIT_PREFIXES == usage_gate_module.CAP_HIT_PREFIXES
+
+    def test_cap_confirm_keywords_matches_usage_gate(self):
+        assert CAP_CONFIRM_KEYWORDS == usage_gate_module.CAP_CONFIRM_KEYWORDS
+
+    def test_near_cap_prefixes_matches_usage_gate(self):
+        assert NEAR_CAP_PREFIXES == usage_gate_module.NEAR_CAP_PREFIXES
+
+    def test_codex_cap_patterns_matches_usage_gate(self):
+        assert CODEX_CAP_PATTERNS == usage_gate_module.CODEX_CAP_PATTERNS
+
+    def test_gemini_cap_patterns_matches_usage_gate(self):
+        assert GEMINI_CAP_PATTERNS == usage_gate_module.GEMINI_CAP_PATTERNS
+
+    def test_non_cap_cli_error_markers_matches_cli_invoke(self):
+        assert NON_CAP_CLI_ERROR_MARKERS == cli_invoke_module.NON_CAP_CLI_ERROR_MARKERS
 
 
 class TestClassifyInvocationAuthFailedPrecedence:
