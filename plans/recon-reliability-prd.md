@@ -9,6 +9,16 @@
 
 ---
 
+> **Reconciliation correction (2026-07-06, at decompose):** an earlier draft of this PRD said W5
+> **supersedes / cancels task 2085**. That is **retracted.** Task 2085 was **ratified by a human the
+> same day** (MECH B: a new TaskCurator `action='route_deterministic'` + `operational_ask_registry.yaml`
+> + deterministic pure-gate at the recon Stage-2 emit path — the submit_task-boundary approach was
+> **explicitly rejected** for project-wide blast radius) and is now **pending/active**. **Do NOT cancel
+> 2085.** 2085 **owns operational-ask routing off the TDD pipeline**; W5's `execution_class` task (η) is
+> narrowed to the complementary **machine-checkable declaration layer** (require + validate + persist the
+> field) that 2085's routing and W5's premise-lint (ξ) consume. The `execution_class`→deterministic
+> *routing coercion* is removed from η. See §5 decision #3, §7, §10 η, §12 Open Q5.
+
 ## 1. Goal (user-observable)
 
 Reconciliation's *control-plane* state (markers, suppressions, counters, cycle summaries) and
@@ -41,7 +51,9 @@ After this PRD lands, an operator/developer observes:
   `submit_task` must set `metadata.execution_class ∈ {code_tdd, operational, decision}` (rejected
   otherwise with a structured error); `operational`/`decision` asks are routed off the
   architect+TDD pipeline (they become human-gated deterministic tasks), so live-data/live-mutation
-  work stops churning as architect "unactionable" refusals. **This supersedes task 2085.**
+  work stops churning as architect "unactionable" refusals. **η requires + validates the declared
+  `execution_class`; the operational→off-TDD routing is owned by the ratified task 2085 (see the
+  Reconciliation correction above).**
 - **Prompt/code drift on recon's self-model becomes structurally impossible.** A
   `recon_self_model.py` module exports the mechanism constants + invariants and *renders* the
   prompt sections describing them; the stage prompts import the rendered text. The same module
@@ -178,10 +190,12 @@ substrate:
 
 5. **`execution_class` on recon-filed tasks** — required `metadata.execution_class ∈ {code_tdd,
    operational, decision}`, enum-validated at the `submit_task` boundary for `recon-stage-*`
-   callers (template: `deterministic_task_error` in `middleware/deterministic_task_guard.py:79`).
-   `operational`/`decision` asks are coerced to a human-gated deterministic task
-   (`task_kind='deterministic'` + `always_escalates=true`, the deployed pure-gate preset) rather
-   than dispatched to the architect. **Supersedes task 2085.**
+   callers (template: `deterministic_task_error` in `middleware/deterministic_task_guard.py:79`),
+   and **persisted to metadata** as the machine-checkable executability contract. **The
+   operational→off-TDD routing is owned by the ratified task 2085** (MECH B: `route_deterministic`
+   + `operational_ask_registry.yaml`); η is narrowed to the **declaration layer** and does NOT
+   re-implement routing (see the Reconciliation correction above). The declared class is the
+   explicit input 2085's routing and W5's premise-lint (ξ) consume.
 
 **Computed stats** (finding 4) rides alongside: a `derive_stage_stats(ops, stage_agent_id)`
 function beside the write journal produces every write-shaped counter; `report.stats` is populated
@@ -222,14 +236,15 @@ path) is queued as task ε upstream of the ReconWritePolicy task (G3 resolution 
    the named server-side path (recon-stage-only) turns it into a contract a future change can't
    silently break. It writes via the fresh-uuid direct-insert primitive.
 
-3. **`operational`/`decision` recon asks → deployed deterministic human-gate, NOT the 8103 queue.**
-   `execution_class ∈ {operational, decision}` coerces the recon-filed task to
-   `task_kind='deterministic' + always_escalates=true` (the pure-gate preset — born-at-L2, human
-   resolves via `resolve_issue`), reusing deployed, tested infrastructure and keeping the item
-   tracked in the task tree. This matches how 1945/1946/2081/2082 were actually handled and the
-   architect's own recommendation in 2085's dry-run. Routing to the port-8103 escalation queue was
-   considered and rejected (cross-server write from `submit_task`, more failure surface; the 8103
-   queue is for integrity findings, not tracked work). Only `code_tdd` reaches the architect.
+3. **Operational-ask routing off the TDD pipeline is owned by the ratified task 2085, NOT by η.**
+   *Superseded by the Reconciliation correction:* an earlier draft had η coerce
+   `execution_class ∈ {operational, decision}` to a deterministic pure-gate at the submit_task
+   boundary. That routing is now 2085's job — the human ratified MECH B (a `route_deterministic`
+   TaskCurator action + an `operational_ask_registry.yaml` mirroring `cancelled_premise_blocklist`,
+   inserted at the recon Stage-2 emit path; the submit_task-boundary approach was **explicitly
+   rejected** for project-wide blast radius). W5's η is narrowed to **requiring + validating +
+   persisting** the declared `execution_class` (the machine-checkable contract) — the explicit input
+   2085's routing consumes. W5 does not re-implement routing and does not cancel 2085.
 
 4. **Ledger is the single-writer for marker lifecycle; Mem0 mirror is best-effort and lossy-safe.**
    No read path consults Mem0 for control-plane truth after cutover. Suppression lookups,
@@ -281,7 +296,7 @@ path) is queued as task ε upstream of the ReconWritePolicy task (G3 resolution 
 | W2 `task-status-authority` | consumes + produces | actor/agent_id on the task-write boundary + `_apply_status_transition` enforcement point | **W2** (table + actor); W5 owns recon overlay | W5 builds minimal recon agent_id plumbing (ε) + composes ReconWritePolicy (ζ) as an independent gate; dep on W2 interceptor task at decompose; W2 converges |
 | W3 `task-metadata-schema` | produces | `execution_class` enum/field | **W3** registers typed field; W5 defines mechanism | W5 ships untyped `metadata.execution_class` now (guard-validated); W3 types it later |
 | task 2140 (in-progress) | consumes | `recon_pool_map.py` stage→pool constants | 2140 | W5 imports; dep if unmerged at decompose |
-| task 2085 (blocked) | supersedes | operational-task filing policy | **W5** (execution_class, decision #3) | **cancel-with-citation**: recommend cancel of 2085 + close `esc-2085-16`, citing W5 task η; human executes the cancel (AFK safe-default — W5 does not self-close a blocked task with an open escalation). See §Open questions |
+| task 2085 (**pending, ratified**) | consumes / coordinates | operational-ask routing off the TDD pipeline | **2085** (MECH B: `route_deterministic` + `operational_ask_registry.yaml`) | **NOT superseded** (corrected 2026-07-06). 2085 owns routing; W5 η provides the complementary `execution_class` declaration+validation the routing consumes. **Do not cancel 2085.** |
 | task 2092 (blocked) | supersedes | flag_dedup function-local memoization concern | **W5** (ledger PK) | the ledger's persistent PK dedup replaces the function-local memo 2092 investigates; noted, no new work |
 | W6 `fm-memory-identity` | none | — | — | orthogonal — the ledger is SQLite/Mem0, not Graphiti entities; W5 does not touch `graphiti_client` |
 
@@ -462,11 +477,12 @@ Greek labels; actual IDs assigned at decompose. Every leaf names its observable 
   live-workflow status write, and stale-snapshot write each return the exact structured error dict;
   target task unchanged. *Prereqs:* ε; consumes `live_workflow_detector`; cross-batch dep on W2's
   interceptor task at decompose.
-- **η — `execution_class` guard + routing (supersedes 2085).** Modules:
-  `middleware/execution_class_guard.py` (new), `server/tools.py`. *Signal:* boundary test **E1** —
-  recon submit_task without execution_class rejected `ValidationError`; `operational` → deterministic
-  pure-gate task, not architect dispatch. *Prereqs:* β (prompt text). *Supersedes:* 2085
-  (cancel-with-citation).
+- **η — require + validate `execution_class` on recon-filed submit_task (declaration layer).** Modules:
+  `middleware/execution_class_guard.py` (new), `server/tools.py`. *Signal:* boundary test **E1**
+  (narrowed) — recon submit_task without a valid `execution_class` rejected `ValidationError`; a valid
+  class is accepted + persisted to metadata. Operational→off-TDD **routing is 2085's ratified job**,
+  not asserted here. *Prereqs:* ε (agent_id), β (prompt text). *Coordinates with 2085 (not supersedes;
+  do not cancel it).*
 - **θ — computed `derive_stage_stats`.** Modules: `reconciliation/stage_stats.py` (new) or
   `services/write_journal.py`; `reconciliation/stats_verifier.py` (delete `_STAT_ALIASES`).
   *Signal:* boundary test **S1** — `report.stats` derived from journal ops; over-reported count
@@ -542,13 +558,15 @@ Greek labels; actual IDs assigned at decompose. Every leaf names its observable 
    `get_task`/`get_statuses`, echoed back in the write payload and re-checked. **Suggested:** derive
    the token from the existing `_STAGE2_STALL_SNAPSHOT_KEYS` metadata recon already stamps
    (`task_knowledge_sync.py:418`), promoted to a server-checked field. Decide in task ζ.
-4. **`decision` execution_class routing.** Treated identically to `operational` (deterministic
-   pure-gate, born-at-L2) per decision #3, matching the "no-code decision task churns the
-   orchestrator" lesson. If a lighter-weight decision path is wanted later, revisit. Decide in task η.
-5. **Task 2085 cancel execution.** The PRD *recommends* cancel-with-citation; a **human** should
-   run the `set_task_status(2085, cancelled)` + `resolve_issue(close esc-2085-16)` citing W5 task η
-   — W5 does not self-close a blocked task with an open escalation while AFK (safe default). The η
-   task description states the supersession explicitly so the citation is discoverable.
+4. **`operational`/`decision` execution_class routing.** Owned by the ratified task 2085 (MECH B),
+   NOT by W5 η. η only requires + persists the declared class; how 2085 routes `operational` vs
+   `decision` asks is 2085's decision. Coordinate at implementation time so η's declared class is a
+   clean input to 2085's `route_deterministic`.
+5. **Task 2085 disposition — CORRECTED (do not cancel).** An earlier draft recommended cancelling
+   2085; that is retracted. 2085 was ratified (MECH B) and is pending/active as of 2026-07-06. No
+   human cancel is needed. The only coordination is to ensure η's `execution_class` field and 2085's
+   `operational_ask_registry.yaml`/`route_deterministic` compose (η = declaration, 2085 = routing);
+   land them without duplicating the routing coercion.
 6. **M4 dep granularity.** If M4 lands its `task_knowledge_sync.py` changes as several tasks, W5's
    κ/λ/μ depend on the last one (the file's final M4 state). Resolve by `search_tasks` at decompose;
    if M4 is unfiled, note the pending dep and proceed (W5 rebases onto M4 whenever it lands).

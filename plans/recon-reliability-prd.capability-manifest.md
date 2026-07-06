@@ -65,7 +65,7 @@ memory_consolidator.py scope), **2149** M5-γ (gather idiom in task_knowledge_sy
 | Structured-error surfacing (returned dict, LLM reads mid-run) | rejection-check (G6 branch 4) | `DarkFactoryPathScopeViolation` `path_scope_guard.py:125-154`; returned at `tools.py:2697/3202` | **PASS** |
 | Terminal/live-workflow/stale-snapshot writes are actually rejected on X | rejection-check | policy fires server-side pre-write; boundary tests P1/P2/P3 (ο) observe the diagnostic | **PRODUCER-UP** (ο verifies) |
 
-## η — execution_class guard + routing (supersedes 2085)
+## η — execution_class declaration+validation (coordinates with ratified 2085; does NOT supersede/cancel it)
 
 | Capability | Check | Evidence | Verdict |
 |---|---|---|---|
