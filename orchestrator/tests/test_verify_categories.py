@@ -263,3 +263,51 @@ class TestDerivedRegistriesByteIdentity:
         assert INFRA_TRANSIENT_CATEGORIES == frozenset({
             'pytest_internalerror', 'env_transient',
         })
+
+
+# ---------------------------------------------------------------------------
+# step-7: should_archive(category) reproduces the legacy per-category decision
+# ---------------------------------------------------------------------------
+
+
+class TestShouldArchive:
+    """should_archive(category) is a pure CATEGORY_POLICY table lookup that
+    reproduces the legacy _should_archive_category decision for every
+    category — proving the endswith('_error') heuristic can be deleted
+    without changing behavior for any of the 12 known categories.
+    """
+
+    @pytest.mark.parametrize(
+        ('category', 'expected'),
+        [
+            ('infra_timeout', False),
+            ('cargo_cli_error', True),
+            ('compile_error', False),
+            ('tree_sitter_generate_error', True),
+            ('flock_error', True),
+            ('npm_error', True),
+            ('pytest_internalerror', False),
+            ('env_transient', False),
+            ('test_failure', False),
+            ('unknown_test_failure', True),
+            ('passed', False),
+            ('', False),
+        ],
+    )
+    def test_matches_legacy_decision_for_every_category(self, category, expected):
+        from orchestrator.verify_categories import should_archive
+        assert should_archive(category) is expected
+
+    def test_unscoped_sentinel_categories_default_false(self):
+        # Out-of-band verify_runner sentinels are not CATEGORY_POLICY members —
+        # should_archive must not raise and must default to False for them.
+        from orchestrator.verify_categories import should_archive
+        assert should_archive('unscoped_typecheck_failed') is False
+        assert should_archive('unscoped_typecheck_timeout') is False
+
+    def test_unknown_category_defaults_false_endswith_heuristic_gone(self):
+        # Before this refactor, a bare '..._error' suffix implied archival.
+        # That heuristic is deleted: an unrecognized category must NOT
+        # auto-archive just because it ends with '_error'.
+        from orchestrator.verify_categories import should_archive
+        assert should_archive('made_up_error') is False
