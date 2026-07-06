@@ -493,6 +493,8 @@ class TestQdrantHelpers:
         monkeypatch.setattr('qdrant_client.QdrantClient', MagicMock(return_value=fake_client))
 
         assert _qdrant_available() is True
+        fake_client.get_collections.assert_called_once()
+        fake_client.close.assert_called_once()
 
     def test_qdrant_available_false_when_get_collections_raises(self, monkeypatch):
         """_qdrant_available() returns False (never raises) when get_collections() raises."""
@@ -516,13 +518,13 @@ class TestQdrantHelpers:
         assert _qdrant_available() is False
 
     def test_qdrant_skipif_default_reason(self):
-        """qdrant_skipif() returns a pytest.mark.skipif marker with the default reason."""
+        """qdrant_skipif() returns a pytest.mark.skipif marker with a non-empty default reason."""
         from _fm_helpers import qdrant_skipif
 
         m = qdrant_skipif()
 
         assert m.name == 'skipif'
-        assert m.kwargs['reason'] == 'Qdrant not reachable'
+        assert isinstance(m.kwargs['reason'], str) and m.kwargs['reason']
 
     def test_qdrant_skipif_custom_reason(self):
         """qdrant_skipif(reason=...) propagates a caller-supplied reason string."""

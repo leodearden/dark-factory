@@ -7,6 +7,7 @@ module name so test files can `from _fm_helpers import X` without
 colliding with sibling subprojects' helpers.
 """
 
+import contextlib
 import functools
 import inspect
 import json
@@ -510,11 +511,17 @@ def _qdrant_available() -> bool:
 
     try:
         client = QdrantClient(url=QDRANT_URL, timeout=2)
+    except Exception:
+        return False
+
+    try:
         client.get_collections()
-        client.close()
         return True
     except Exception:
         return False
+    finally:
+        with contextlib.suppress(Exception):
+            client.close()
 
 
 def qdrant_skipif(reason: str = 'Qdrant not reachable'):
