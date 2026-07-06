@@ -299,6 +299,35 @@ class TestDuplicateEdgeUuids:
         ]
         assert GraphitiBackend._duplicate_edge_uuids(rows) == []
 
+    def test_different_valid_at_preserved(self):
+        """Same neighbor and fact but different valid_at are temporally
+        distinct assertions — not duplicates."""
+        rows = [
+            ['B-uuid', 'e-1', 'Auth depends on Redis.', '2026-07-06T00:00:00+00:00'],
+            ['B-uuid', 'e-2', 'Auth depends on Redis.', '2026-07-06T01:00:00+00:00'],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+    def test_different_neighbor_preserved(self):
+        """Same fact and valid_at but different neighbor are a distinct pair —
+        not duplicates."""
+        rows = [
+            ['B-uuid', 'e-1', 'Auth depends on Redis.', self._VALID_AT],
+            ['C-uuid', 'e-2', 'Auth depends on Redis.', self._VALID_AT],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+    def test_fact_normalized_for_case_and_whitespace(self):
+        """Facts differing only by case/whitespace are treated as duplicates
+        (mirrors MemoryService._normalize_fact / graphiti-core's
+        _normalize_string_exact). Fails until fact normalization is applied
+        to the grouping key."""
+        rows = [
+            ['B-uuid', 'e-2', 'Auth depends on Redis', self._VALID_AT],
+            ['B-uuid', 'e-1', '  auth  depends  on  redis  ', self._VALID_AT],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == ['e-2']
+
 
 # ---------------------------------------------------------------------------
 # task 2073 step-1/2: GraphitiBackend.find_duplicate_entity_nodes
