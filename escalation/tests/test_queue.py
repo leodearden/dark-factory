@@ -1447,6 +1447,38 @@ class TestMakeIdCounter:
             f'{spy.call_count}x'
         )
 
+    def test_make_id_corrupt_counter_logs_error_and_resets_to_one(
+        self, tmp_path: Path, caplog,
+    ):
+        """A corrupt/unparseable counter file is treated as 0 and logged as an ERROR.
+
+        The counter is authoritative with no archive-scan fallback (PRD C9):
+        losing it is unrecoverable data loss, not a routine, self-healing
+        event, so it must be loud (ERROR) rather than a WARNING — a lost
+        counter silently re-mints ids from 1, colliding with any escalations
+        already issued for this task_id.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        (queue_dir / 'esc-cnt.seq').write_text('not-an-int')
+
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            result = queue.make_id('cnt')
+
+        assert result == 'esc-cnt-1'
+
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any('could not parse counter file' in r.message for r in error_records), (
+            f"Expected an ERROR containing 'could not parse counter file'; "
+            f"got: {[r.message for r in error_records]}"
+        )
+
 
 class TestIterAllEscalationPaths:
     """iter_all_escalation_paths(escalations_dir) yields all esc-*.json paths,

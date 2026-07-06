@@ -990,8 +990,9 @@ class EscalationQueue:
 
         The counter file ``queue_dir/esc-{task_id}.seq`` holds the
         last-issued sequence number as plain integer text (0 if the file is
-        absent, or on a parse failure — logged as a WARNING and treated as
-        0).  This file is the SOLE source of the next sequence: unlike the
+        absent, or on a parse failure — logged as an ERROR, since it is
+        loudly observable-but-unrecoverable data loss, and treated as 0).
+        This file is the SOLE source of the next sequence: unlike the
         retired directory/archive-scan derivation, make_id() never globs the
         queue root or the archive to "catch up" — the counter is
         authoritative (PRD task-status-authority-prd.md contract C9 /
@@ -1012,9 +1013,11 @@ class EscalationQueue:
                 try:
                     current = int(counter_path.read_text().strip())
                 except (ValueError, OSError) as e:
-                    logger.warning(
+                    logger.error(
                         f'make_id: could not parse counter file {counter_path}: {e}; '
-                        'treating as 0'
+                        'treating as 0 — counter is authoritative with no archive-scan '
+                        'fallback, so this WILL mint ids that collide with any already '
+                        f'issued for task_id {task_id!r}'
                     )
                     current = 0
             nxt = current + 1
