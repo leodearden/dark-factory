@@ -14,10 +14,13 @@ strict ``__all__`` union assertion untouched).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     'BeforeDone',
+    'DoneProvenance',
 ]
 
 
@@ -38,3 +41,34 @@ class BeforeDone(BaseModel):
     cwd: str | None = None
     timeout_secs: int = Field(gt=0)
     target_unit: str | None = None
+
+
+class DoneProvenance(BaseModel):
+    """``metadata.done_provenance`` — the single valid-kinds declaration (I2).
+
+    ``kind`` is the *only* place the valid-kinds vocabulary is declared;
+    fused-memory's ``_VALID_PROVENANCE_KINDS`` is retired in favour of
+    importing this model (see PRD §5, I2).
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    kind: Literal[
+        'merged',
+        'found_on_main',
+        'deterministic-deploy',
+        'deterministic-deploy-scheduled',
+    ]
+    commit: str | None = None
+    note: str | None = None
+    pid: int | None = None
+    unit: str | None = None
+    active_enter_timestamp: str | None = None
+
+    @model_validator(mode='after')
+    def _check_conditional_requirements(self) -> DoneProvenance:
+        if self.kind in ('merged', 'found_on_main') and self.commit is None:
+            raise ValueError(f'DoneProvenance: commit is required when kind={self.kind!r}.')
+        if self.kind == 'found_on_main' and self.note is None:
+            raise ValueError("DoneProvenance: note is required when kind='found_on_main'.")
+        return self

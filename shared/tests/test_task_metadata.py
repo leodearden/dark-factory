@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared.task_metadata import BeforeDone
+from shared.task_metadata import BeforeDone, DoneProvenance
 
 
 class TestBeforeDone:
@@ -64,3 +64,62 @@ class TestBeforeDone:
         bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, x_extra='keep-me')
         dumped = bd.model_dump()
         assert dumped['x_extra'] == 'keep-me'
+
+
+class TestDoneProvenance:
+    def test_merged_with_commit_constructs(self):
+        dp = DoneProvenance(kind='merged', commit='abc123')
+        assert dp.kind == 'merged'
+        assert dp.commit == 'abc123'
+
+    def test_found_on_main_with_commit_and_note_constructs(self):
+        dp = DoneProvenance(kind='found_on_main', commit='abc123', note='landed in 999')
+        assert dp.commit == 'abc123'
+        assert dp.note == 'landed in 999'
+
+    def test_deterministic_deploy_with_pid_unit_timestamp_constructs(self):
+        dp = DoneProvenance(
+            kind='deterministic-deploy',
+            pid=4242,
+            unit='fused-memory.service',
+            active_enter_timestamp='2026-07-06T00:00:00+00:00',
+        )
+        assert dp.pid == 4242
+        assert dp.unit == 'fused-memory.service'
+
+    def test_deterministic_deploy_scheduled_with_unit_constructs(self):
+        dp = DoneProvenance(kind='deterministic-deploy-scheduled', unit='fused-memory.service')
+        assert dp.unit == 'fused-memory.service'
+
+    def test_bogus_kind_rejected(self):
+        with pytest.raises(ValidationError):
+            DoneProvenance(kind='bogus')
+
+    def test_extra_subfields_retained_through_round_trip(self):
+        dp = DoneProvenance(
+            kind='deterministic-deploy-scheduled',
+            unit='fused-memory.service',
+            transient_unit='fused-memory-restart-1234.service',
+            fire_delay_secs=5,
+        )
+        dumped = dp.model_dump()
+        assert dumped['transient_unit'] == 'fused-memory-restart-1234.service'
+        assert dumped['fire_delay_secs'] == 5
+
+    def test_commit_required_for_merged(self):
+        with pytest.raises(ValidationError):
+            DoneProvenance(kind='merged')
+
+    def test_commit_required_for_found_on_main(self):
+        with pytest.raises(ValidationError):
+            DoneProvenance(kind='found_on_main', note='no commit')
+
+    def test_note_required_for_found_on_main(self):
+        with pytest.raises(ValidationError):
+            DoneProvenance(kind='found_on_main', commit='abc123')
+
+    def test_deterministic_deploy_ok_without_commit_or_note(self):
+        DoneProvenance(kind='deterministic-deploy')
+
+    def test_deterministic_deploy_scheduled_ok_without_commit_or_note(self):
+        DoneProvenance(kind='deterministic-deploy-scheduled')
