@@ -54,3 +54,34 @@ class TaskStatus(enum.StrEnum):
     INFRA_HOLD = "infra-hold"
     DONE = "done"
     CANCELLED = "cancelled"
+
+
+# Parity: orchestrator/task_status.py TERMINAL_STATUSES;
+# fused_memory/task_interceptor.py TERMINAL_STATUSES.
+TERMINAL: frozenset[TaskStatus] = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED})
+
+# The complement of TERMINAL — all non-terminal statuses, including the new
+# infra-hold. Deriving as a complement (rather than hardcoding) makes TERMINAL
+# and ACTIVE an exhaustive, disjoint partition of TaskStatus by construction;
+# mirrors task_filter.py's existing "complement of TERMINAL_STATUSES" comment.
+# infra-hold (D3) is active and non-terminal but NOT dispatchable — dispatch
+# legality ("scheduler dispatches only 'pending'") is owned by the scheduler,
+# not this module.
+ACTIVE: frozenset[TaskStatus] = frozenset(TaskStatus) - TERMINAL
+
+# Parity: orchestrator/task_status.py WORKFLOW_PRESERVE_STATUSES.
+WORKFLOW_PRESERVE: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.DONE,
+        TaskStatus.CANCELLED,
+        TaskStatus.DEFERRED,
+        TaskStatus.BLOCKED,
+        TaskStatus.MERGE_DEFERRED,
+    }
+)
+
+# Parity: fused_memory/task_interceptor.py STATUS_TRIGGERS. 'merge-deferred' is
+# deliberately excluded per PRD orchestrator-atomic-train-merge §9.2 (task 1519).
+STATUS_TRIGGERS: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.DONE, TaskStatus.BLOCKED, TaskStatus.CANCELLED, TaskStatus.DEFERRED}
+)
