@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from escalation.queue import EscalationQueue
@@ -194,3 +195,39 @@ class TestIllegalEscalate:
 
         with pytest.raises(IllegalLaneTransition):
             lifecycle.transition(lane, LaneState.IN_USE)
+
+
+# ---------------------------------------------------------------------------
+# Quarantine helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestQuarantine:
+    async def test_quarantine_delegates_and_persists_quarantined_state(
+        self, tmp_path: Path,
+    ):
+        dest = tmp_path / 'worktrees-orphaned' / '_lane-0-20260706T000000Z'
+        fake_quarantine_worktree = AsyncMock(return_value=dest)
+        lifecycle = _lifecycle(tmp_path, quarantine_worktree=fake_quarantine_worktree)
+        lane = tmp_path / '_lane-0'
+        # Non-terminal state, proving any -> QUARANTINED (not just RELEASED ->).
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/foo')
+        lifecycle.transition(lane, LaneState.ASSIGNED, task_id='2254', title='demo')
+
+        result = await lifecycle.quarantine(lane, branch='task/foo', reason='divergence')
+
+        fake_quarantine_worktree.assert_awaited_once_with(lane, 'task/foo', 'divergence')
+        assert result == dest
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == LaneState.QUARANTINED
+
+    async def test_quarantine_without_callable_wired_raises(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)  # quarantine_worktree=None
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+
+        with pytest.raises(RuntimeError):
+            await lifecycle.quarantine(lane, branch='task/foo', reason='divergence')
