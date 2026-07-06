@@ -2607,6 +2607,132 @@ class TestDeterministicRunnerResolutionProofAliasing:
 
 
 # ---------------------------------------------------------------------------
+# Task 2120: escalation-aliasing suppress-direction guard.
+#
+# The dedup guards in _file_infra_issue_and_block (:581) and
+# _file_milestone_gate_and_block (:799) must scope their "already pending?"
+# check to the runner's own DETERMINISTIC_AGENT_ROLE — otherwise an unrelated
+# PENDING escalation (e.g. a starvation-watchdog filing) falsely suppresses
+# the runner's own gate/infra filing, silently swallowing a required L2.
+# Two pending escalations may legitimately coexist for one task.
+#
+# (RED until the impl step scopes :581/:799 to DETERMINISTIC_AGENT_ROLE)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDeterministicRunnerDedupGuardScoping:
+    """An unrelated pending escalation must never suppress the runner's own
+    gate/infra filing."""
+
+    _UNRELATED_ROLE = 'orchestrator-starvation-watchdog'
+
+    def _seed_pending(
+        self, queue: EscalationQueue, task_id: str, agent_role: str,
+        category: str = 'infra_issue', level: int = 2,
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role=agent_role,
+            severity='critical',
+            category=category,
+            summary='seeded escalation (pending)',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    # --- test b: gate-filing dedup guard (:799) aliasing -------------------
+
+    async def test_gate_filing_still_files_despite_unrelated_pending_escalation(self, tmp_path: Path):
+        """Pure-gate task, no gate_escalated_at yet; an UNRELATED escalation is
+        already pending — the runner must STILL file its own milestone_gate
+        (two pending escalations legitimately coexist).
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _gate_task(task_id='900')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._seed_pending(queue, '900', self._UNRELATED_ROLE)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('900', status='pending')
+        assert len(pending) == 2, (
+            f"Runner's own gate filing must not be suppressed by an unrelated "
+            f'pending escalation; expected 2 pending, got {len(pending)}'
+        )
+        own = [e for e in pending if e.agent_role == 'orchestrator-deterministic']
+        assert len(own) == 1
+        assert own[0].category == 'milestone_gate'
+
+    # --- infra dedup (:581) aliasing ----------------------------------------
+
+    async def test_infra_filing_still_files_despite_unrelated_pending_escalation(self, tmp_path: Path):
+        """before_done_ran_at set, crash window (no verify, no runner-owned
+        resolution); an UNRELATED escalation is already pending — the runner
+        must STILL re-escalate its own infra_issue (two pending coexist).
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='901', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._seed_pending(queue, '901', self._UNRELATED_ROLE)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        pending = queue.get_by_task('901', status='pending')
+        assert len(pending) == 2, (
+            f"Runner's own infra filing must not be suppressed by an unrelated "
+            f'pending escalation; expected 2 pending, got {len(pending)}'
+        )
+        own = [e for e in pending if e.agent_role == 'orchestrator-deterministic']
+        assert len(own) == 1
+        assert own[0].category == 'infra_issue'
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    # --- parity: runner-owned pending escalation still dedups ---------------
+
+    async def test_parity_runner_owned_pending_still_suppresses_second_gate_filing(self, tmp_path: Path):
+        """Parity: a runner-owned PENDING escalation (e.g. from a prior
+        crash-safe re-dispatch before gate_escalated_at was stamped) must
+        still suppress a second filing — dedup fires for a matching role.
+        Must stay GREEN before AND after the :799 scoping fix.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _gate_task(task_id='902')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        self._seed_pending(queue, '902', 'orchestrator-deterministic', category='milestone_gate')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('902', status='pending')
+        assert len(pending) == 1, (
+            f'A runner-owned pending escalation must dedup a second filing; '
+            f'got {len(pending)} pending'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Scheduled-marker resume (amend: Suggestion 2): crash between
 # before_done_scheduled_at stamp and the done write.
 # before_done_scheduled_at set → transient unit registered → drive to done
