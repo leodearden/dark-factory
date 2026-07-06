@@ -4665,6 +4665,77 @@ class TestCycleSummaryRunIdBackfillInjection:
         assert warning_records[0].missing_cycle_summary_keys == ['stage']
 
 
+class TestCycleSummaryRunIdBackfillToolsBoundary:
+    """Boundary-level coverage between server/tools.py::_extract_causation's
+    UUID-generation fallback and the task-2109 run_id auto-backfill
+    (reviewer finding from the task 2109 amendment pass).
+
+    _extract_causation never actually passes a None causation_id through:
+    when metadata carries no '_causation_id' (e.g. the reconciliation stage
+    agent dropped it under the same kind of prompt-compliance failure this
+    task's run_id backfill exists to paper over), it synthesizes a fresh
+    str(uuid4()) on the spot (tools.py ~398-399). MemoryService.add_memory
+    has no signal to tell that call-scoped synthetic value apart from a
+    genuine run-scoped causation id — reconciliation/harness.py generates
+    run_id the same way, via str(uuid4()) — so
+    `_cycle_summary_run_id_backfill` backfills run_id from it regardless.
+
+    This is a KNOWN, ACCEPTED-FOR-NOW LIMITATION, not intended long-term
+    behavior: the write stops warning (looks healthy), but the backfilled
+    run_id is a meaningless per-call value that will never match any
+    sibling cycle_summary write from the same actual reconciliation run in
+    the Path-2 triple-filter count_memories_by_metadata({kind, run_id,
+    stage}) pre-check. Closing the gap requires _extract_causation to flag
+    whether it synthesized (vs. received) the id and, for a synthesized id,
+    skip the run_id backfill in favor of the fallback warning — a change to
+    fused_memory/server/tools.py, outside this task's locked module scope
+    (fused_memory/services + this test file). Tracked as a follow-up; this
+    test pins today's (masking) behavior so a future fix must consciously
+    come back and update it rather than silently regress.
+    """
+
+    @pytest.mark.asyncio
+    async def test_synthesized_causation_id_is_still_backfilled_as_run_id(self, service, caplog):
+        """Neither run_id nor metadata['_causation_id'] survive to the MCP
+        boundary -> _extract_causation synthesizes a fresh UUID -> today
+        that synthetic value is (mis)backfilled into run_id with no
+        warning. See class docstring for why this is a tracked gap rather
+        than intended behavior."""
+        from fused_memory.server.tools import _extract_causation
+
+        causation_id, _source, cleaned_meta = _extract_causation(
+            {'kind': 'cycle_summary', 'stage': 'memory_consolidator'},
+            'recon-stage-memory_consolidator',
+        )
+        assert cleaned_meta is not None
+        assert '_causation_id' not in cleaned_meta, (
+            "_extract_causation is expected to pop '_causation_id' out of "
+            'metadata before returning it — this test only exercises the '
+            'no-_causation_id-supplied fallback path.'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='test',
+                metadata=cleaned_meta,
+                causation_id=causation_id,
+            )
+
+        call_kwargs = service.mem0.add.call_args[1]
+        assert call_kwargs['metadata']['run_id'] == causation_id, (
+            'Documents the known gap: a causation_id synthesized by '
+            '_extract_causation (no real relationship to any reconciliation '
+            'run) is currently backfilled into run_id verbatim.'
+        )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records == [], (
+            'The write looks healthy (no warning) despite run_id being a '
+            f'meaningless synthetic id, got: {[r.message for r in warning_records]}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Step 3: TRACK B.1 service clear_invalid_at RED tests
 # ---------------------------------------------------------------------------
