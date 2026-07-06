@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -16,6 +16,8 @@ from shared.invocation_outcome import (
     InvocationOutcome,
     NearCap,
     ZeroOutputWedge,
+    _extract_cap_message,
+    _parse_resets_at,
 )
 
 
@@ -85,3 +87,65 @@ class TestInvocationOutcomeSumType:
         assert CapHit(resets_at=None, reason='r') != NearCap(reason='r')
         assert OK() != ZeroOutputWedge()
         assert AuthFailed(status=401) != AuthFailed(status=403)
+
+
+class TestParseResetsAt:
+    """_parse_resets_at: 7.1.a — None on parse failure, never a fabricated now+1h."""
+
+    FIXED_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def test_unparseable_text_returns_none(self):
+        text = "You've used all available credits. Upgrade your plan for more capacity."
+        assert _parse_resets_at(text, now=self.FIXED_NOW) is None
+
+    def test_no_reset_info_at_all_returns_none(self):
+        assert _parse_resets_at('no reset info here', now=self.FIXED_NOW) is None
+
+    def test_relative_hours(self):
+        result = _parse_resets_at('resets in 3h', now=self.FIXED_NOW)
+        assert result == self.FIXED_NOW + timedelta(hours=3)
+
+    def test_relative_minutes(self):
+        result = _parse_resets_at('resets in 45m', now=self.FIXED_NOW)
+        assert result == self.FIXED_NOW + timedelta(minutes=45)
+
+    def test_relative_days(self):
+        result = _parse_resets_at('resets in 2d', now=self.FIXED_NOW)
+        assert result == self.FIXED_NOW + timedelta(days=2)
+
+    def test_relative_hours_word_form(self):
+        """'resets in 3 hours' — the unit char is read from the first letter of 'hours'."""
+        result = _parse_resets_at('resets in 3 hours', now=self.FIXED_NOW)
+        assert result == self.FIXED_NOW + timedelta(hours=3)
+
+    def test_absolute_date_returns_tz_aware_datetime(self):
+        text = (
+            "You've hit your usage limit for Claude Pro. "
+            'Your plan resets on Apr 10, 9pm (UTC).'
+        )
+        result = _parse_resets_at(text, now=self.FIXED_NOW)
+        assert result is not None
+        assert result.tzinfo is not None
+        assert (result.year, result.month, result.day, result.hour) == (2026, 4, 10, 21)
+
+    def test_default_now_reads_wall_clock_when_not_injected(self):
+        """classify_invocation calls this without injecting now — must not raise."""
+        result = _parse_resets_at('resets in 1h')
+        assert result is not None
+
+
+class TestExtractCapMessage:
+    """_extract_cap_message: returns the sentence containing the matched prefix."""
+
+    def test_extracts_sentence_containing_prefix(self):
+        text = "You've hit your usage limit. Your plan resets in 3h."
+        message = _extract_cap_message(text, "You've hit your")
+        assert "You've hit your usage limit" in message
+
+    def test_returns_empty_string_when_prefix_absent(self):
+        assert _extract_cap_message('nothing relevant here', "You've hit your") == ''
+
+    def test_case_insensitive_match(self):
+        text = "YOU'VE HIT YOUR usage limit. resets in 3h."
+        message = _extract_cap_message(text, "you've hit your")
+        assert message != ''
