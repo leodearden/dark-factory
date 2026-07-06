@@ -179,11 +179,13 @@ class TestGatherOrRaise:
         """Every captured Exception is logged at WARNING; the first one raises."""
         first = ValueError('boom1')
         second = RuntimeError('boom2')
-        with caplog.at_level('WARNING', logger='fused_memory.utils.async_utils'):
-            with pytest.raises(ValueError) as exc_info:
-                await gather_or_raise(
-                    [_ok(1), _raise(first), _raise(second)], label='op'
-                )
+        with (
+            caplog.at_level('WARNING', logger='fused_memory.utils.async_utils'),
+            pytest.raises(ValueError) as exc_info,
+        ):
+            await gather_or_raise(
+                [_ok(1), _raise(first), _raise(second)], label='op'
+            )
         assert exc_info.value is first
         warning_records = [r for r in caplog.records if r.levelname == 'WARNING']
         assert len(warning_records) == 2, (
@@ -198,16 +200,18 @@ class TestGatherOrRaise:
     @pytest.mark.asyncio
     async def test_cancellation_short_circuits_pass_2(self, caplog) -> None:
         """A captured CancelledError re-raises before any Pass-2 logging."""
-        with caplog.at_level('WARNING', logger='fused_memory.utils.async_utils'):
-            with pytest.raises(asyncio.CancelledError):
-                await gather_or_raise(
-                    [
-                        _ok(1),
-                        _raise(ValueError('boom')),
-                        _raise(asyncio.CancelledError()),
-                    ],
-                    label='op',
-                )
+        with (
+            caplog.at_level('WARNING', logger='fused_memory.utils.async_utils'),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await gather_or_raise(
+                [
+                    _ok(1),
+                    _raise(ValueError('boom')),
+                    _raise(asyncio.CancelledError()),
+                ],
+                label='op',
+            )
         warning_records = [r for r in caplog.records if r.levelname == 'WARNING']
         assert len(warning_records) == 0, (
             f'Pass 1 must short-circuit before any Pass-2 logging; '
