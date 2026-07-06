@@ -648,30 +648,20 @@ class UsageGate:
             logger.warning(f'Cap detected but no matching account: {reason}')
             return False
 
-        acct.capped = True
-        acct.near_cap = False
-        acct.probing = False
-        acct.probe_in_flight = False
+        # resets_at is refreshed unconditionally (even on a same-phase repeat
+        # detection) — it feeds the resume-probe backoff target and
+        # _refresh_capped_accounts, independent of whether a phase edge fires.
         acct.resets_at = resets_at
-        if acct.pause_started_at is None:
-            acct.pause_started_at = datetime.now(UTC)
         logger.warning(f'Account {acct.name} CAPPED: {reason}')
-        if self._cost_store:
-            # Persist resets_at alongside reason so the dashboard can surface
-            # per-account uncap ETAs without re-parsing the reason string.
-            details: dict[str, str] = {'reason': reason}
-            if resets_at is not None:
-                details['resets_at'] = resets_at.isoformat()
-            self._fire_cost_event(acct.name, 'cap_hit', json.dumps(details))
-        self._start_account_resume_probe(acct)
-
-        # If all accounts are now unavailable (capped or auth_failed), close the global gate
-        if all(a.capped or a.auth_failed for a in self._accounts):
-            self._open.clear()
-            self._paused_reason = f'All accounts capped (last: {reason})'
-            if self._pause_started_at is None:
-                self._pause_started_at = datetime.now(UTC)
-            logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
+        if acct.phase != AccountPhase.CAPPED:
+            # _transition owns: the phase write, near_cap clear, the
+            # centralized _open recompute, cancelling/starting the
+            # opposite/matching background task, the cap_hit cost event, and
+            # gate-level pause bookkeeping. A same-phase repeat call (already
+            # CAPPED) is a pure no-op here — the old inline mutations had no
+            # legality concept and would silently re-run every field write
+            # and re-fire the cost event on every repeat detection.
+            self._transition(acct, AccountPhase.CAPPED, resets_at=resets_at, reason=reason)
         return True
 
     def _handle_near_cap_warning(
