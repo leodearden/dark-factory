@@ -26,6 +26,7 @@ from orchestrator.scheduler import (
     directory_locks,
     files_to_modules,
 )
+from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
@@ -10542,6 +10543,65 @@ class TestStarvationWatchdog:
         assert 'starved' not in scheduler._starvation_first_seen, (
             '_starvation_first_seen must be cleared by the continuity reset '
             'when the task is no longer a dispatch-eligible candidate'
+        )
+
+
+# ---------------------------------------------------------------------------
+# StreakCounter/StreakRegistry migration (task 2124)
+# ---------------------------------------------------------------------------
+
+class TestStreakRegistryMigration:
+    """Scheduler's five hand-rolled consecutive-tick counters are backed by
+    StreakCounter/StreakRegistry (orchestrator.streaks), aliased so every
+    existing test that reads/writes the legacy dict/set attributes directly
+    keeps working unchanged (parity-preserving migration, task 2124).
+    """
+
+    def _make_scheduler(self) -> tuple['Scheduler', list]:
+        """Build a bare Scheduler with a mutable fake clock (task 1880 pattern)."""
+        t: list[float] = [0.0]
+
+        def fake_clock() -> float:
+            return t[0]
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=fake_clock)
+        return scheduler, t
+
+    def test_legacy_attrs_alias_counter_containers(self):
+        """Each legacy attribute IS (identity) its StreakCounter's backing
+        container, so old inline code and new counter-method call sites
+        mutate — and observe — the exact same object.
+        """
+        scheduler, _t = self._make_scheduler()
+
+        assert isinstance(scheduler._streak_registry, StreakRegistry), (
+            'Scheduler must construct a StreakRegistry at _streak_registry'
+        )
+
+        assert scheduler._external_unresolved_counts is (
+            scheduler._streak_external_unresolved.counts
+        ), '_external_unresolved_counts must alias _streak_external_unresolved.counts'
+        assert scheduler._local_backfill_unresolved_counts is (
+            scheduler._streak_local_backfill.counts
+        ), '_local_backfill_unresolved_counts must alias _streak_local_backfill.counts'
+        assert scheduler._external_hold_streak is scheduler._streak_hold.counts, (
+            '_external_hold_streak must alias _streak_hold.counts'
+        )
+        assert scheduler._external_hold_cause is scheduler._streak_hold.causes, (
+            '_external_hold_cause must alias _streak_hold.causes'
+        )
+        assert scheduler._external_resolver_degraded_counts is (
+            scheduler._streak_resolver_degraded.counts
+        ), (
+            '_external_resolver_degraded_counts must alias '
+            '_streak_resolver_degraded.counts'
+        )
+        assert scheduler._starvation_first_seen is (
+            scheduler._streak_starvation.first_seen
+        ), '_starvation_first_seen must alias _streak_starvation.first_seen'
+        assert scheduler._starvation_escalated is scheduler._streak_starvation.escalated, (
+            '_starvation_escalated must alias _streak_starvation.escalated'
         )
 
 
