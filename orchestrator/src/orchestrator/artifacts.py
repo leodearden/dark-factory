@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from orchestrator.config import TASK_META_DIRNAME
+
 logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
@@ -162,6 +164,20 @@ class TaskArtifacts:
 
     def __init__(self, worktree: Path):
         self.root = worktree / '.task'
+
+    @staticmethod
+    def meta_root_for(worktree_base: Path, worktree_name: str) -> Path:
+        """Derive the `.task-meta` root for a worktree — the single owner of
+        this path shape (PRD `.task-meta path-derivation contract`,
+        worktree-lane-lifecycle W11-β).
+
+        Returns ``<worktree_base>/.task-meta/<worktree_name>`` — a SIBLING
+        of the worktree itself (``<worktree_base>/<worktree_name>``), not
+        nested inside it like the legacy ``<worktree>/.task``.  Callers
+        (γ/ε1/ε2/δ) must call this instead of joining ``'.task'`` (or
+        ``'.task-meta'``) by hand.
+        """
+        return worktree_base / TASK_META_DIRNAME / worktree_name
 
     def init(
         self,
