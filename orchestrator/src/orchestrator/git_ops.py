@@ -4076,7 +4076,7 @@ class GitOps:
                     'failed (rc=%d): %s — pruning admin entries and retrying '
                     'branch delete', holding, rc_rm, err_rm.strip(),
                 )
-            await _run(['git', 'worktree', 'prune'], cwd=self.project_root)
+            await self._prune_registrations(context='create_worktree-leftover')
 
         rc_del, _, err_del = await _run(
             ['git', 'branch', '-D', full_branch], cwd=self.project_root,
@@ -4605,7 +4605,7 @@ class GitOps:
         # (we ignore their rc) — if there is nothing stale they are no-ops.
         await _run(['git', 'worktree', 'remove', str(solo_wt), '--force'],
                    cwd=self.project_root)
-        await _run(['git', 'worktree', 'prune'], cwd=self.project_root)
+        await self._prune_registrations(context='materialize_member_solo')
         await _run(['git', 'branch', '-D', solo_name], cwd=self.project_root)
 
         # Create a temporary branch _solo-<member_id> starting at the member's
@@ -4688,12 +4688,9 @@ class GitOps:
             solo_branch: Bare solo branch name (e.g. ``'_solo-b2'``).
         """
         # Prune first so that a removed (but not yet pruned) worktree entry
-        # does not keep git from deleting the branch.
-        prune_rc, _, prune_err = await _run(
-            ['git', 'worktree', 'prune'], cwd=self.project_root,
-        )
-        if prune_rc != 0:
-            logger.warning('delete_solo_branch: worktree prune failed: %s', prune_err)
+        # does not keep git from deleting the branch. Failure/refusal is
+        # logged by the chokepoint itself (context-tagged 'delete_solo_branch').
+        await self._prune_registrations(context='delete_solo_branch')
 
         del_rc, _, del_err = await _run(
             ['git', 'branch', '-D', solo_branch], cwd=self.project_root,
@@ -5633,7 +5630,7 @@ class GitOps:
                 )
 
         if removed:
-            await _run(['git', 'worktree', 'prune'], cwd=self.project_root)
+            await self._prune_registrations(context='prune_stale_merge_worktrees')
             logger.info(
                 'prune_stale_merge_worktrees: removed %d stale merge '
                 'worktree(s)', len(removed),
@@ -5999,7 +5996,7 @@ class GitOps:
                     )
 
             if reaped:
-                await _run(['git', 'worktree', 'prune'], cwd=self.project_root)
+                await self._prune_registrations(context='reap_interactive_worktrees')
         except Exception:
             logger.warning(
                 'reap_interactive_worktrees: unexpected error during sweep '
@@ -7032,12 +7029,20 @@ class GitOps:
             )
             return None
 
-    async def prune_worktrees(self) -> None:
+    async def _prune_registrations(self, context: str) -> None:
         """Best-effort ``git worktree prune`` — clears stale admin entries.
 
-        Clears the ``.git/worktrees`` administrative records left behind by
+        Single chokepoint for every raw ``['git', 'worktree', 'prune']``
+        call site in this module (gitops-chokepoints PRD, task α). Clears
+        the ``.git/worktrees`` administrative records left behind by
         worktrees removed off-band (manual ``rm -rf``, quarantine, reap).
         Never raises.
+
+        Args:
+            context: Short identifier for the calling sweep (e.g.
+                ``'prune_worktrees'``, ``'create_worktree-leftover'``),
+                threaded into every log line so operators can attribute
+                which caller asked for the prune.
 
         **Pool-storage guard (task 2099)**: refuses to run when a pool is
         configured (:meth:`pool_in_use`) but :meth:`pool_storage_present` is
@@ -7064,18 +7069,18 @@ class GitOps:
         if self.pool_in_use() and not self.pool_storage_present():
             if self._pool_storage_bootstrap_ok():
                 logger.info(
-                    'prune_worktrees: pool storage sentinel absent at %s but '
+                    '%s: pool storage sentinel absent at %s but '
                     'the CoW seed base already resolves underneath it — '
                     'pre-first-seed cold start, not an unmounted mount; '
                     'skipping prune without escalating',
-                    self.worktree_base,
+                    context, self.worktree_base,
                 )
                 return
             logger.warning(
-                'prune_worktrees: pool storage absent/unmounted at %s — '
+                '%s: pool storage absent/unmounted at %s — '
                 'refusing to run `git worktree prune` (would wipe '
                 '.git/worktrees admin entries for every mount-resident lane)',
-                self.worktree_base,
+                context, self.worktree_base,
             )
             self._note_pool_storage_absent()
             return
@@ -7084,6 +7089,16 @@ class GitOps:
                 ['git', 'worktree', 'prune'], cwd=self.project_root,
             )
             if rc != 0:
-                logger.warning('prune_worktrees: git worktree prune failed: %s', err)
+                logger.warning('%s: git worktree prune failed: %s', context, err)
         except Exception as e:
-            logger.warning('prune_worktrees: git worktree prune raised: %s', e)
+            logger.warning('%s: git worktree prune raised: %s', context, e)
+
+    async def prune_worktrees(self, context: str = 'prune_worktrees') -> None:
+        """Best-effort ``git worktree prune`` — thin public delegate.
+
+        See :meth:`_prune_registrations` for the full guard/skip/escalate
+        semantics. Kept as a separate public method so existing harness
+        callers (:meth:`orchestrator.harness.Harness`, the orphan reaper)
+        are unaffected.
+        """
+        await self._prune_registrations(context=context)
