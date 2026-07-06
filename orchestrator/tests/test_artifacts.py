@@ -1196,3 +1196,75 @@ class TestMetaRootConstructor:
 
         # Writes are new-path ONLY — the legacy `.task` dir must not appear.
         assert not (worktree / '.task').exists()
+
+
+class TestReadPlanNewThenOldCompat:
+    """`read_plan` reads new-path-then-old (compat window); write-backs
+    (e.g. via `update_step_status`) target the new path only — migrate on
+    write.
+    """
+
+    @pytest.fixture
+    def meta_root(self, worktree: Path) -> Path:
+        return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+    @pytest.fixture
+    def legacy_root(self, worktree: Path) -> Path:
+        return worktree / '.task'
+
+    def test_reads_from_new_when_only_new(
+        self, worktree: Path, meta_root: Path
+    ):
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
+        ta.write_plan({'steps': [{'id': 'new-step', 'status': 'pending', 'commit': None}]})
+
+        read = ta.read_plan()
+        assert read['steps'][0]['id'] == 'new-step'
+
+    def test_falls_back_to_legacy_when_only_old(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        legacy_plan = {'steps': [{'id': 'legacy-step', 'status': 'pending', 'commit': None}]}
+        (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        read = ta.read_plan()
+        assert read['steps'][0]['id'] == 'legacy-step'
+
+    def test_prefers_new_when_both_exist(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        legacy_plan = {'steps': [{'id': 'legacy-step', 'status': 'pending', 'commit': None}]}
+        (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.write_plan({'steps': [{'id': 'new-step', 'status': 'pending', 'commit': None}]})
+
+        read = ta.read_plan()
+        assert read['steps'][0]['id'] == 'new-step'
+
+    def test_write_back_targets_new_only(
+        self, worktree: Path, meta_root: Path, legacy_root: Path
+    ):
+        worktree.mkdir()
+        legacy_root.mkdir(parents=True)
+        legacy_plan = {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
+        (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
+
+        ta = TaskArtifacts(worktree, meta_root)
+        ta.update_step_status('step-1', 'done', commit='abc123')
+
+        new_plan = json.loads((meta_root / 'plan.json').read_text())
+        assert new_plan['steps'][0]['status'] == 'done'
+        assert new_plan['steps'][0]['commit'] == 'abc123'
+
+        # Legacy copy must be untouched by the write-back.
+        legacy_plan_after = json.loads((legacy_root / 'plan.json').read_text())
+        assert legacy_plan_after['steps'][0]['status'] == 'pending'
+        assert legacy_plan_after['steps'][0]['commit'] is None
