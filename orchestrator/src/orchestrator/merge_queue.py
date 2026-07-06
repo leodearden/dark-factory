@@ -128,6 +128,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     MergeOutcome,
     MergeReadyPredicate,
     MergeRequest,
+    OutcomeKind,
     RealMergeItem,
     SoloVerifyResult,
     SpeculativeItem,

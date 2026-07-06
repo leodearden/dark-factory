@@ -906,6 +906,86 @@ class InflightStatus(StrEnum):
     REQUEUED_PREDISPATCH = 'REQUEUED_PREDISPATCH'
 
 
+class OutcomeKind(StrEnum):
+    """The ``_emit_merge_attempt`` outcome vocabulary (task 2165).
+
+    A single str-compatible Enum (mirrors ``InflightStatus`` above /
+    ``event_store.EventType``) enumerating every ``data['outcome']`` value
+    passed to :func:`orchestrator.merge_queue._emit_merge_attempt`. Members
+    are ``str`` instances, so every existing ``==``/``in``/JSON comparison
+    against the raw outcome strings keeps working unchanged, and
+    ``EventStore.emit``'s ``json.dumps`` produces byte-identical payloads to
+    before this enum existed.
+
+    Member names are lowercase and match their values, following
+    ``EventType``'s convention (the event-vocabulary sibling emitted
+    alongside this one in the same ``merge_attempt`` row) rather than
+    ``InflightStatus``'s uppercase sentinels — the wire values here are
+    already lowercase.
+
+    ``'blocked'`` is intentionally NOT a member: bare-infrastructure
+    ``blocked`` outcomes (merge-infra failures unrelated to conflicts,
+    ``advance_main``'s ``not_descendant``/``contaminated``/``stash_failed``
+    codes) are documented as never passed to ``_emit_merge_attempt`` — see
+    its docstring. Only specific diagnostic ``blocked`` outcomes (e.g.
+    ``dropped_plan_targets``, ``cas_exhausted``) are emitted, and those have
+    their own members here.
+    """
+
+    done = 'done'
+    already_merged = 'already_merged'
+    unknown_branch = 'unknown_branch'
+    conflict = 'conflict'
+    merge_failed = 'merge_failed'
+    verify_failed = 'verify_failed'
+    advance_failed = 'advance_failed'
+    dropped_plan_targets = 'dropped_plan_targets'
+    abandoned_verify_timeouts = 'abandoned_verify_timeouts'
+    train_incomplete = 'train_incomplete'
+    train_rebase_conflict = 'train_rebase_conflict'
+    train_partial_flip = 'train_partial_flip'
+    cas_exhausted = 'cas_exhausted'
+    main_health_red = 'main_health_red'
+    post_merge_equivalence_failed = 'post_merge_equivalence_failed'
+    post_merge_pyright_broken = 'post_merge_pyright_broken'
+    plan_files_not_touched = 'plan_files_not_touched'
+    plan_files_narrowed = 'plan_files_narrowed'
+    cas_retry = 'cas_retry'
+    gate_retry = 'gate_retry'
+    post_merge_generation_chained = 'post_merge_generation_chained'
+
+    @property
+    def is_terminal(self) -> bool:
+        """False for the four outcomes where the attempt/merge is still live.
+
+        See ``_NON_TERMINAL_OUTCOMES`` below (defined after this class;
+        looked up here at call time, once the module has finished loading).
+        """
+        return self not in _NON_TERMINAL_OUTCOMES
+
+
+_NON_TERMINAL_OUTCOMES: frozenset[OutcomeKind] = frozenset({
+    OutcomeKind.cas_retry,
+    OutcomeKind.gate_retry,
+    OutcomeKind.post_merge_generation_chained,
+    OutcomeKind.plan_files_narrowed,
+})
+"""The non-terminal subset of :class:`OutcomeKind` — attempt/merge still live.
+
+``cas_retry``/``gate_retry``: the attempt continues (a retry is queued).
+``post_merge_generation_chained``: the gen-(n+1) request is enqueued by
+``_maybe_auto_chain_generation`` BEFORE this emit, so the merge is still live.
+``plan_files_narrowed``: a mid-submission waypoint — enqueue / ``merge_queued``
+follows in the same flow.
+
+FROZEN CONTRACT: this exact set is mirrored by the dashboard's
+``_ACTIVE_ONLY`` allowlist (``dashboard/src/dashboard/data/merge_queue.py``),
+which has no import on this module. Changing this set REQUIRES updating that
+allowlist in the same change — see the pinning test in
+``tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``.
+"""
+
+
 @dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
