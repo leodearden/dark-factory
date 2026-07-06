@@ -2734,6 +2734,208 @@ class TestDedupEpisodeNodes:
 
 
 # ---------------------------------------------------------------------------
+# task 2110 step-5: MemoryService._normalize_task_node_names
+# ---------------------------------------------------------------------------
+
+class TestNormalizeTaskNodeNames:
+    """Unit tests for MemoryService._normalize_task_node_names — the post-write
+    hook that canonicalizes non-canonical task-entity node names (e.g.
+    'task 132', 'tasks 153') minted by graphiti_core's LLM extraction to the
+    canonical 'Task N' form (task 2110).
+
+    Collision policy: when a canonical 'Task N' node already exists, the
+    bad-named node is MERGED into it; only when no canonical node exists is
+    the bad-named survivor RENAMED (and any remaining bad-named duplicates
+    merged into it).
+    """
+
+    @pytest.mark.asyncio
+    async def test_renames_when_no_canonical_exists(self, service):
+        """(a) A single 'task 132' node with no existing 'Task 132' canonical
+        is renamed in place — merge_entities is never called."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        async def fake_find_duplicates(name, *, group_id):
+            if name == 'task 132':
+                return [{'uuid': 'survivor', 'created_at': 100, 'edge_count': 3}]
+            return []  # 'Task 132' has no canonical match
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
+        service.graphiti.rename_entity_node = AsyncMock(return_value={})
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='task 132')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 1
+        service.graphiti.rename_entity_node.assert_awaited_once_with(
+            'survivor', 'Task 132', group_id='test',
+        )
+        service.graphiti.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_merges_into_existing_canonical(self, service):
+        """(b) A 'tasks 153' node with an existing 'Task 153' canonical is
+        merged into the canonical survivor — rename_entity_node is never called."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        async def fake_find_duplicates(name, *, group_id):
+            if name == 'tasks 153':
+                return [{'uuid': 'bad-uuid', 'created_at': 100, 'edge_count': 1}]
+            if name == 'Task 153':
+                return [{'uuid': 'canon-uuid', 'created_at': 50, 'edge_count': 5}]
+            return []
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
+        service.graphiti.rename_entity_node = AsyncMock(return_value={})
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='tasks 153')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 1
+        service.graphiti.merge_entities.assert_awaited_once_with(
+            'bad-uuid', 'canon-uuid', group_id='test',
+        )
+        service.graphiti.rename_entity_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_renames_survivor_and_merges_remaining_dups_when_no_canonical(self, service):
+        """(c) Two 'task 132' duplicates with no canonical -> the survivor is
+        renamed and the remaining duplicate is merged into it."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        async def fake_find_duplicates(name, *, group_id):
+            if name == 'task 132':
+                return [
+                    {'uuid': 'survivor', 'created_at': 100, 'edge_count': 5},
+                    {'uuid': 'dup-1', 'created_at': 200, 'edge_count': 1},
+                ]
+            return []  # 'Task 132' has no canonical match
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
+        service.graphiti.rename_entity_node = AsyncMock(return_value={})
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='task 132')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 2
+        service.graphiti.rename_entity_node.assert_awaited_once_with(
+            'survivor', 'Task 132', group_id='test',
+        )
+        service.graphiti.merge_entities.assert_awaited_once_with(
+            'dup-1', 'survivor', group_id='test',
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_task_node_name_is_untouched(self, service):
+        """(d) A non-task entity name ('Alice') is never looked up or mutated."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        service.graphiti.rename_entity_node = AsyncMock(return_value={})
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='Alice')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 0
+        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
+        service.graphiti.rename_entity_node.assert_not_awaited()
+        service.graphiti.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_already_canonical_name_is_noop(self, service):
+        """(e) An already-canonical name ('Task 42') is a no-op — canonicalize
+        maps it to itself, so the canonical!=name guard skips it entirely."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        service.graphiti.rename_entity_node = AsyncMock(return_value={})
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='Task 42')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 0
+        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
+        service.graphiti.rename_entity_node.assert_not_awaited()
+        service.graphiti.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_none_result_returns_zero(self, service):
+        """(f) None result -> 0, no backend calls."""
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        service.graphiti.rename_entity_node = AsyncMock(return_value={})
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        count = await service._normalize_task_node_names(None, group_id='test')
+
+        assert count == 0
+        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
+        service.graphiti.rename_entity_node.assert_not_awaited()
+        service.graphiti.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_nodes_returns_zero(self, service):
+        """(f) Empty result.nodes -> 0, no backend calls."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        service.graphiti.rename_entity_node = AsyncMock(return_value={})
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(nodes=[])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 0
+        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rename_failure_is_swallowed_and_other_names_still_processed(
+        self, service, caplog,
+    ):
+        """(g) A rename_entity_node failure for one bad name does not propagate
+        and does not stop a second bad name from being processed."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        async def fake_find_duplicates(name, *, group_id):
+            if name in ('task 132', 'Task 132'):
+                return [{'uuid': 'survivor-a', 'created_at': 100, 'edge_count': 1}] \
+                    if name == 'task 132' else []
+            if name in ('tasks 200', 'Task 200'):
+                return [{'uuid': 'survivor-b', 'created_at': 100, 'edge_count': 1}] \
+                    if name == 'tasks 200' else []
+            return []
+
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
+
+        async def fake_rename(node_uuid, new_name, *, group_id):
+            if node_uuid == 'survivor-a':
+                raise RuntimeError('transient write timeout')
+            return {}
+
+        service.graphiti.rename_entity_node = AsyncMock(side_effect=fake_rename)
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        result = MockAddEpisodeResult(nodes=[
+            MockNode(name='task 132'),
+            MockNode(name='tasks 200'),
+        ])
+
+        with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
+            count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 1, 'Only the second (successful) rename should count'
+        assert service.graphiti.rename_entity_node.await_count == 2, (
+            'The second name must still be attempted after the first fails'
+        )
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records, 'Expected an exception/error log for the failed rename'
+
+
+# ---------------------------------------------------------------------------
 # Tests for _execute_graphiti_write integration with dedup  (steps 8, 10)
 # ---------------------------------------------------------------------------
 
