@@ -106,6 +106,18 @@ class LandedOutbox:
         """Return every landed row currently in the outbox (for the startup reconciler)."""
         return [LandedRow(task_id=k, **v) for k, v in self._cache.items()]
 
+    def consume(self, task_id: str) -> None:
+        """Idempotently prune *task_id* from the outbox (WA-3).
+
+        No-op if *task_id* is not present (repeated consume / unknown id).
+        Flushes through :meth:`_save_raw` so the prune is durable — a
+        consumed row does not resurrect after a restart.
+        """
+        if task_id not in self._cache:
+            return
+        del self._cache[task_id]
+        self._save_raw(self._cache)
+
     # ------------------------------------------------------------------
     # Internal I/O (mirrors merge_queue_store._load_raw/_save_raw)
     # ------------------------------------------------------------------
