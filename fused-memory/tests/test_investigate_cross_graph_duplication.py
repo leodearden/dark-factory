@@ -10,6 +10,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -37,6 +38,22 @@ def _load_module() -> types.ModuleType:
 
 
 _mod = _load_module()
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+def _make_graph_mock(rows: list[list] | None = None) -> MagicMock:
+    """Minimal stand-in for conftest.make_graph_mock, scoped to this test module
+    so it is usable without the fixture (kept consistent with its shape;
+    copied from test_purge_knowlive_namespace.py)."""
+    result = MagicMock()
+    result.result_set = rows if rows is not None else []
+    graph = MagicMock()
+    graph.ro_query = AsyncMock(return_value=result)
+    graph.query = AsyncMock(return_value=result)
+    return graph
 
 
 # ===========================================================================
@@ -147,3 +164,99 @@ class TestDetectCollisionGroups:
         r2 = _mod.detect_collision_groups(list(reversed(names)))
 
         assert r1 == r2
+
+
+# ===========================================================================
+# Tests: probe_node_across_graphs
+# ===========================================================================
+
+class TestProbeNodeAcrossGraphs:
+    """Tests for async probe_node_across_graphs(graphiti, uuid, graph_names) -> list[dict]."""
+
+    @pytest.mark.asyncio
+    async def test_calls_graph_for_once_per_graph_name(self):
+        """graphiti._graph_for is called exactly once for each graph name."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.probe_node_across_graphs(
+            graphiti, 'uuid-1', ['reify', 'dark_factory', 'know_live'],
+        )
+
+        assert graphiti._graph_for.call_count == 3
+        called_names = {c.args[0] for c in graphiti._graph_for.call_args_list}
+        assert called_names == {'reify', 'dark_factory', 'know_live'}
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self):
+        """The probe is read-only: ro_query is used once per graph, and
+        query is NEVER called."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.probe_node_across_graphs(
+            graphiti, 'uuid-1', ['reify', 'dark_factory', 'know_live'],
+        )
+
+        assert graph.ro_query.call_count == 3
+        graph.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_uuid_passed_as_cypher_parameter(self):
+        """The target uuid is passed as a Cypher query parameter, not
+        string-interpolated into the query text."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.probe_node_across_graphs(graphiti, 'target-uuid', ['reify'])
+
+        call = graph.ro_query.call_args
+        params = call.args[1] if len(call.args) > 1 else call.kwargs.get('params')
+        assert params == {'uuid': 'target-uuid'}
+
+    @pytest.mark.asyncio
+    async def test_returns_one_entry_per_graph_with_nonempty_result(self):
+        """Graphs with a matching row contribute one normalized entry each;
+        a graph with an empty result_set contributes none."""
+        graphiti = MagicMock()
+
+        def _graph_for(name):
+            if name in ('reify', 'dark_factory'):
+                return _make_graph_mock([['target-uuid', 'orchestrator', 'reify']])
+            return _make_graph_mock([])  # know_live: not present
+
+        graphiti._graph_for = MagicMock(side_effect=_graph_for)
+
+        result = await _mod.probe_node_across_graphs(
+            graphiti, 'target-uuid', ['reify', 'dark_factory', 'know_live'],
+        )
+
+        assert result == [
+            {'graph': 'reify', 'uuid': 'target-uuid', 'name': 'orchestrator', 'group_id': 'reify'},
+            {'graph': 'dark_factory', 'uuid': 'target-uuid', 'name': 'orchestrator', 'group_id': 'reify'},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_result_set_is_omitted(self):
+        """A graph with no matching node is omitted from the result entirely."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.probe_node_across_graphs(graphiti, 'uuid-1', ['reify'])
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_empty_graph_names_returns_empty_list_without_calls(self):
+        """No graph names -> no _graph_for calls, empty result."""
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock()
+
+        result = await _mod.probe_node_across_graphs(graphiti, 'uuid-1', [])
+
+        assert result == []
+        graphiti._graph_for.assert_not_called()
