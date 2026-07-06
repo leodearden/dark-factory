@@ -9,6 +9,13 @@ do not need to be re-keyed.
 
 Network errors are caught and surfaced as ``{'offline': True, 'error': ...}``;
 the caller turns that into a per-project skip plus a Tasks-tab banner.
+
+Note: the three failover loops below raise ``ValueError`` from within their
+``_call`` closures on a "soft failure" (malformed/errored MCP result), which
+``mcp_fanout.first_success`` treats the same as a transport error — including
+invalidating that URL's cached session. Previously a soft failure here fell
+through with a bare ``continue`` and no session teardown; see
+``mcp_fanout``'s module docstring for why this normalization is intentional.
 """
 
 from __future__ import annotations
@@ -36,6 +43,10 @@ from dashboard.data.memory import mcp_tool_call
 # primarily redundant for MCP de-duplication (the 20 s inner TTL handles it);
 # they remain for legacy shaping-cost avoidance and are outside this task's
 # scope to remove.
+#
+# Keyed by project_root_str — a small, bounded set in practice — which
+# satisfies TTLCache's documented "bounded key space" assumption (it never
+# evicts individual store/lock entries short of a blanket .clear()).
 # ---------------------------------------------------------------------------
 
 # Within the PRD's recommended 15-30 s staleness window.  Slightly longer than

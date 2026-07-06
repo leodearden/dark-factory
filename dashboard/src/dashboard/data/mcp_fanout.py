@@ -16,9 +16,21 @@ Two patterns recur across the dashboard's MCP data-fetchers
    expensive async refresh for a few seconds so concurrent/rapid callers
    collapse onto one in-flight refresh instead of hammering MCP.
 
-Both are extracted here, behavior-preserving, from their original call
-sites so new consumers do not have to re-derive the failover/caching
-discipline from scratch.
+Both are extracted here from their original call sites so new consumers
+do not have to re-derive the failover/caching discipline from scratch.
+
+The extraction is behavior-preserving for ``dashboard.data.memory``, whose
+``_first_success`` already invalidated the failing session on both
+transport errors and ``ValueError``. For ``dashboard.data.tasks`` it is
+behavior-preserving *except* for one intentional normalization: a "soft
+failure" (a malformed/errored MCP result) previously fell through to the
+next URL with a bare ``continue`` and no session teardown, whereas now it
+is signalled by raising ``ValueError`` from within ``call``, which
+``first_success`` treats the same as a transport error — including
+invalidating that URL's cached session. This is a deliberate unification
+with memory.py's pre-existing behavior, not a regression: re-initializing
+a session after a soft failure is cheap and strictly more conservative,
+and no caller depends on the session surviving one.
 """
 
 from __future__ import annotations
@@ -104,6 +116,25 @@ class TTLCache(Generic[V]):
     itself in the cache for the TTL window. The cache is value-type-agnostic
     and always returns the raw stored value; copy isolation (if needed) is
     the caller's responsibility.
+
+    **Single-flight only holds for cacheable results.** The "exactly one
+    refresh" guarantee above applies while the produced value passes
+    ``cache_ok``. If ``cache_ok(value)`` is False, nothing is stored, so the
+    next lock-queued waiter's post-lock freshness re-check still misses and
+    it runs its own ``refresh`` in turn — concurrent cold callers during an
+    outage each perform a full refresh (serialized one-at-a-time by the
+    per-key lock, not run in parallel) rather than collapsing onto one. This
+    is intentional: a non-cacheable result must not be handed to every other
+    waiter when a subsequent attempt might succeed.
+
+    **Unbounded key space is a caller assumption, not a guarantee.** Neither
+    ``_store`` nor ``_locks`` ever evict individual entries — only the
+    blanket ``clear()`` resets them — so a distinct key accumulates a store
+    slot and a ``Lock`` forever once created. This is safe for the current
+    callers (each keyed by a small, bounded set of project roots), but a
+    future high-cardinality key space (e.g. keyed per-request or per-user)
+    would leak locks and stale entries indefinitely; such a caller should
+    add its own eviction or key externally.
     """
 
     def __init__(self, ttl_seconds: float | Callable[[], float]):
