@@ -335,3 +335,73 @@ class TestMoveEntityAcrossGraphsMentions:
         assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
 
         assert result.mentions_moved == 1
+
+
+# ---------------------------------------------------------------------------
+# step-11: move_entity_across_graphs -- CREATE-BEFORE-DELETE ordering
+# ---------------------------------------------------------------------------
+
+class TestMoveEntityAcrossGraphsOrdering:
+    """S5 ordering: the source DETACH DELETE runs strictly after every target CREATE."""
+
+    @pytest.mark.asyncio
+    async def test_source_detach_delete_runs_after_all_target_creates(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """Records mutating .query() call order across BOTH graphs into one
+        shared list (each graph's .query is wrapped to append (role, cypher,
+        params)), so the true cross-graph ordering of the target CREATEs vs.
+        the source DETACH DELETE can be asserted directly -- not just each
+        mock's own internal call order, which wouldn't distinguish "source
+        deleted before target finished creating" from the reverse.
+        """
+        backend = make_backend(mock_config)
+        call_order: list[tuple[str, str, dict]] = []
+
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(side_effect=[
+            MagicMock(result_set=[NODE_ROW_FIXTURE]),
+            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
+            MagicMock(result_set=[MENTION_ROW_FIXTURE]),
+        ])
+
+        async def _record_source_query(cypher, params=None):
+            call_order.append(('source', cypher, params or {}))
+            return MagicMock()
+
+        source_mock.query = AsyncMock(side_effect=_record_source_query)
+
+        target_mock = make_graph_mock()
+
+        async def _record_target_query(cypher, params=None):
+            call_order.append(('target', cypher, params or {}))
+            return MagicMock()
+
+        target_mock.query = AsyncMock(side_effect=_record_target_query)
+
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        await move_entity_across_graphs(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        # node CREATE, edge CREATE, mention CREATE (all target) THEN the
+        # source DETACH DELETE -- exactly 4 mutating calls, in this order.
+        assert len(call_order) == 4
+        roles = [role for role, _, _ in call_order]
+        assert roles == ['target', 'target', 'target', 'source']
+        for _role, cypher, _params in call_order[:3]:
+            assert 'CREATE' in cypher
+
+        # the delete is the final mutating call, targets source_graph only
+        # (never target_graph), and is scoped to the moved node's uuid.
+        final_role, final_cypher, final_params = call_order[-1]
+        assert final_role == 'source'
+        assert 'DETACH DELETE' in final_cypher
+        assert final_params.get('uuid') == NODE_UUID_FIXTURE
