@@ -43,6 +43,8 @@ class StreakCounter:
         self.key_fn = key_fn
         self.counts: dict[Any, int] = {}
         self.causes: dict[Any, str] = {}
+        self.first_seen: dict[Any, float] = {}
+        self.escalated: set[Any] = set()
 
     def bump(self, key: Any) -> int:
         """Increment the streak for ``key`` and return the new count."""
@@ -50,21 +52,42 @@ class StreakCounter:
         self.counts[key] = value
         return value
 
-    def touch(self, key: Any, *, cause: str) -> int:
-        """Bump the streak for ``key``, resetting it when ``cause`` changes.
+    def touch(self, key: Any, *, cause: str | None = None, now: float | None = None) -> Any:
+        """Stamp/bump ``key`` — dispatches on whichever kwarg is given.
 
-        Mirrors ``Scheduler._note_external_hold``: if the last-seen cause
-        for ``key`` differs from ``cause`` (including the first-ever touch,
+        ``now=`` selects the first-seen-age variant (mirrors the starvation
+        watchdog): stamps ``first_seen[key]`` only the first time it is
+        seen and is idempotent thereafter, returning the stored anchor.
+
+        ``cause=`` selects the cause-change-reset variant (mirrors
+        ``Scheduler._note_external_hold``): if the last-seen cause for
+        ``key`` differs from ``cause`` (including the first-ever touch,
         where no cause has been seen), the streak resets to 0 before being
         bumped — so it always reflects a single consecutive-run cause
         rather than a mixed accumulation across differing causes.
         """
+        if now is not None:
+            if key not in self.first_seen:
+                self.first_seen[key] = now
+            return self.first_seen[key]
         if self.causes.get(key) != cause:
             self.counts[key] = 0
         self.causes[key] = cause
         value = self.counts.get(key, 0) + 1
         self.counts[key] = value
         return value
+
+    def age(self, key: Any, now: float) -> float:
+        """Elapsed time since ``key``'s first-seen anchor was stamped."""
+        return now - self.first_seen.get(key, now)
+
+    def mark_escalated(self, key: Any) -> None:
+        """Record that ``key`` currently has an open escalation."""
+        self.escalated.add(key)
+
+    def is_escalated(self, key: Any) -> bool:
+        """Whether ``key`` currently has an open escalation."""
+        return key in self.escalated
 
     def value(self, key: Any) -> int:
         """Read the current streak for ``key`` (0 if never bumped)."""
@@ -74,6 +97,8 @@ class StreakCounter:
         """Reset ``key`` — pop it from every backing container."""
         self.counts.pop(key, None)
         self.causes.pop(key, None)
+        self.first_seen.pop(key, None)
+        self.escalated.discard(key)
 
     def gc(self, stale_ids: Iterable[Any]) -> None:
         """Drop every key whose ``key_fn``-extracted task-id is stale.
@@ -86,3 +111,7 @@ class StreakCounter:
             del self.counts[key]
         for key in [k for k in self.causes if self.key_fn(k) in stale]:
             del self.causes[key]
+        for key in [k for k in self.first_seen if self.key_fn(k) in stale]:
+            del self.first_seen[key]
+        for key in [k for k in self.escalated if self.key_fn(k) in stale]:
+            self.escalated.discard(key)
