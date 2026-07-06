@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -467,3 +469,84 @@ class TestClassifyInvocationWedgeOkFailure:
         result = AgentResult(success=False, output='generic failure, no signal')
         outcome = classify_invocation(result, strict_confirm=True)
         assert isinstance(outcome, Failure)
+
+
+# --- B3: golden-corpus acceptance test -------------------------------------
+#
+# corpus.json is the checked-in source of truth (see its README for the
+# record schema and provenance). New CLI wordings are pinned by appending a
+# row there rather than editing this test.
+
+_CORPUS_PATH = Path(__file__).parent / 'fixtures' / 'cap_strings' / 'corpus.json'
+
+_VARIANT_CLASSES: dict[str, type[InvocationOutcome]] = {
+    'OK': OK,
+    'CapHit': CapHit,
+    'NearCap': NearCap,
+    'AuthFailed': AuthFailed,
+    'CliLocalError': CliLocalError,
+    'ZeroOutputWedge': ZeroOutputWedge,
+    'Failure': Failure,
+}
+
+
+def _load_corpus() -> list[dict]:
+    with _CORPUS_PATH.open() as f:
+        return json.load(f)
+
+
+def _agent_result_from_record(record: dict) -> AgentResult:
+    """Build an AgentResult from a corpus record.
+
+    ``success`` and ``output`` are required (no-default) positional fields on
+    AgentResult itself, so this helper supplies the README-documented
+    defaults (``success=False``, ``output=''``) explicitly; every other field
+    defaults exactly as AgentResult itself defaults.
+    """
+    return AgentResult(
+        success=record.get('success', False),
+        output=record.get('output', ''),
+        stderr=record.get('stderr', ''),
+        turns=record.get('turns', 0),
+        cost_usd=record.get('cost_usd', 0.0),
+        timed_out=record.get('timed_out', False),
+        transcript_turns=record.get('transcript_turns'),
+        api_error_status=record.get('api_error_status'),
+    )
+
+
+_CORPUS = _load_corpus()
+
+
+class TestGoldenCorpus:
+    """B3 — the user-observable signal.
+
+    Every historical cap/error string in corpus.json maps to its recorded
+    expected InvocationOutcome variant, per backend, with strict_confirm
+    toggling the prefix-only vs confirm-guarded regime.
+    """
+
+    @pytest.mark.parametrize('record', _CORPUS, ids=[r['id'] for r in _CORPUS])
+    def test_corpus_record_classifies_as_expected(self, record):
+        result = _agent_result_from_record(record)
+        outcome = classify_invocation(
+            result,
+            strict_confirm=record['strict_confirm'],
+            backend=record.get('backend', 'claude'),
+        )
+
+        expected_cls = _VARIANT_CLASSES[record['expected']]
+        assert isinstance(outcome, expected_cls), (
+            f'{record["id"]}: expected {record["expected"]}, '
+            f'got {type(outcome).__name__} ({outcome!r})'
+        )
+
+        resets_at_expectation = record.get('resets_at')
+        if record['expected'] == 'CapHit' and resets_at_expectation == 'set':
+            assert outcome.resets_at is not None, (
+                f'{record["id"]}: expected resets_at to be set, got None'
+            )
+        elif record['expected'] == 'CapHit' and resets_at_expectation == 'none':
+            assert outcome.resets_at is None, (
+                f'{record["id"]}: expected resets_at to be None, got {outcome.resets_at!r}'
+            )
