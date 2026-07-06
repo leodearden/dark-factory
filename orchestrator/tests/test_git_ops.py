@@ -9214,3 +9214,35 @@ class TestWarmLaneRefIsDegenerate:
         assert '--main-ref main' in line
         assert '--branch-prefix task/' in line
         assert f'--repo {git_repo}' in line
+
+    async def test_run_exception_returns_false(
+        self, git_ops: GitOps, git_repo: Path, caplog,
+    ):
+        """The except-Exception branch of the fail-soft contract.
+
+        An unexpected exception from ``_run`` (e.g. an OS-level exec
+        failure) must fail-soft to False — never raise — and log a
+        WARNING, mirroring ``_run_warm_lane_disk_guard``'s exception
+        handling.
+        """
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_degenerate_ref_check_stub(scripts_dir)
+        _set_degenerate_ref_exit(git_repo, 0)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', side_effect=RuntimeError('boom')),
+        ):
+            result = await git_ops.warm_lane_ref_is_degenerate('789')
+
+        assert result is False, (
+            'an exception from _run must fail-soft to False, never raise'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'warm_lane_ref_is_degenerate' in r.getMessage() for r in warnings
+        ), (
+            f'Expected a WARNING log on the exception path, got: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
