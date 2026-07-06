@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 __all__ = [
     'BeforeDone',
     'DoneProvenance',
+    'MemoryHints',
 ]
 
 
@@ -72,3 +73,15 @@ class DoneProvenance(BaseModel):
         if self.kind == 'found_on_main' and self.note is None:
             raise ValueError("DoneProvenance: note is required when kind='found_on_main'.")
         return self
+
+
+class MemoryHints(BaseModel):
+    """``metadata.memory_hints`` — canonical ``{entities, queries}`` shape.
+
+    Legacy ``[{entity, query}, ...]`` blobs are upgraded to this shape by the
+    registered v0->v1 migration (see :func:`apply_migrations`) before
+    validation.
+    """
+
+    entities: list[str] = Field(default_factory=list)
+    queries: list[str] = Field(default_factory=list)

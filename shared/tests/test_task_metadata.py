@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared.task_metadata import BeforeDone, DoneProvenance
+from shared.task_metadata import BeforeDone, DoneProvenance, MemoryHints
 
 
 class TestBeforeDone:
@@ -123,3 +123,23 @@ class TestDoneProvenance:
 
     def test_deterministic_deploy_scheduled_ok_without_commit_or_note(self):
         DoneProvenance(kind='deterministic-deploy-scheduled')
+
+
+class TestMemoryHints:
+    def test_constructs_with_values(self):
+        mh = MemoryHints(entities=['E'], queries=['Q'])
+        assert mh.entities == ['E']
+        assert mh.queries == ['Q']
+
+    def test_defaults_to_empty_lists(self):
+        mh = MemoryHints()
+        assert mh.entities == []
+        assert mh.queries == []
+
+    def test_non_list_entities_rejected(self):
+        with pytest.raises(ValidationError):
+            MemoryHints(entities='not-a-list')
+
+    def test_wrong_element_type_rejected(self):
+        with pytest.raises(ValidationError):
+            MemoryHints(entities=[123])
