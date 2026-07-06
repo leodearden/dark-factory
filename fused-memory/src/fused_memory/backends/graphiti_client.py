@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import importlib.util
 import logging
+import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -176,6 +177,17 @@ def _as_sortable_utc(created_at: datetime | None) -> datetime:
     if created_at.tzinfo is None:
         return created_at.replace(tzinfo=UTC)
     return created_at.astimezone(UTC)
+
+
+def _normalize_fact_for_grouping(fact: str | None) -> str:
+    """Normalize an edge fact for duplicate-grouping comparison.
+
+    Mirrors ``MemoryService._normalize_fact`` (lowercase + collapse
+    whitespace) and graphiti-core's ``_normalize_string_exact`` — kept as a
+    small local copy rather than an import because the backend layer must
+    not depend on the services layer. A None/missing fact coerces to ''.
+    """
+    return re.sub(r'\s+', ' ', (fact or '').lower()).strip()
 
 
 class _MultiTenantFalkorDriver(FalkorDriver):
@@ -1316,7 +1328,7 @@ class GraphitiBackend:
         groups: dict[tuple[str, str, str], list[str]] = {}
         for row in deduped_rows:
             neighbor_uuid, edge_uuid, fact, valid_at = row[0], row[1], row[2], row[3]
-            key = (neighbor_uuid, fact, str(valid_at))
+            key = (neighbor_uuid, _normalize_fact_for_grouping(fact), str(valid_at))
             groups.setdefault(key, []).append(edge_uuid)
 
         duplicates: list[str] = []
