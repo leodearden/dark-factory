@@ -171,10 +171,14 @@ async def move_entity_across_graphs(
     byte-exact ``fact_embedding``, provided the OTHER endpoint already
     exists in target_graph (silently skipped otherwise -- see inline note).
 
-    Mentions reattachment, the source ``DETACH DELETE``, and the idempotency
-    probe are added in later steps (9-14); ``rewrite_group_id`` substitution
-    for the node/edges lands in step-16 (applied here as a forward-compatible
-    no-op when ``rewrite_group_id`` is None).
+    Mentions (step-9/10): every Episodic MENTIONS link onto the node is
+    recreated in target_graph, provided the episode node already exists
+    there (same silent-skip rule as edges; MENTIONS carries no embedding).
+
+    The source ``DETACH DELETE`` and the idempotency probe are added in
+    later steps (11-14); ``rewrite_group_id`` substitution for the
+    node/edges/mentions lands in step-16 (applied here as a
+    forward-compatible no-op when ``rewrite_group_id`` is None).
 
     Args:
         graphiti: An initialized GraphitiBackend (or compatible object
@@ -291,13 +295,46 @@ async def move_entity_across_graphs(
         )
         edges_moved += 1
 
+    # --- Episodic MENTIONS links (step-9/10) ---
+    # MENTIONS carries no embedding (graphiti_core's own save query, see
+    # models/edges/edge_db_queries.py EPISODIC_EDGE_SAVE, only ever sets
+    # uuid/group_id/created_at) -- no raw-transport read needed here.
+    mentions_result = await source.ro_query(
+        'MATCH (ep:Episodic)-[e:MENTIONS]->(n:Entity {uuid: $uuid}) '
+        'RETURN e.uuid, e.group_id, e.created_at, ep.uuid',
+        {'uuid': uuid},
+    )
+    mentions_moved = 0
+    for row in mentions_result.result_set or []:
+        mention_uuid, _mention_group_id, mention_created_at, episode_uuid = row
+        # As with RELATES_TO's other endpoint: the Episodic node is not moved
+        # by this primitive and must already exist in target_graph, or this
+        # MATCH yields no rows and the mention is silently skipped.
+        await target.query(
+            'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
+            'CREATE (ep)-[e:MENTIONS]->(n) '
+            'SET e.uuid = $edge_uuid, '
+            '    e.group_id = $group_id, '
+            '    e.created_at = $created_at',
+            {
+                'episode_uuid': episode_uuid,
+                'entity_uuid': node_uuid,
+                'edge_uuid': mention_uuid,
+                'group_id': new_group_id,
+                'created_at': mention_created_at,
+            },
+        )
+        mentions_moved += 1
+
     logger.info(
-        'move_entity_across_graphs: node moved uuid=%s source=%s target=%s edges_moved=%d',
-        uuid, source_graph, target_graph, edges_moved,
+        'move_entity_across_graphs: node moved uuid=%s source=%s target=%s '
+        'edges_moved=%d mentions_moved=%d',
+        uuid, source_graph, target_graph, edges_moved, mentions_moved,
     )
     return MoveResult(
         uuid=uuid,
         source_graph=source_graph,
         target_graph=target_graph,
         edges_moved=edges_moved,
+        mentions_moved=mentions_moved,
     )
