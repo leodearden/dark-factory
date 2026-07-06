@@ -287,8 +287,8 @@ def classify_invocation(
     """Classify a CLI agent invocation result into an ``InvocationOutcome``.
 
     Total and pure: every ``AgentResult`` maps to exactly one variant, in
-    precedence order AuthFailed > CliLocalError > CapHit/NearCap >
-    ZeroOutputWedge > OK > Failure. Reads only ``result`` (and ``backend`` /
+    precedence order AuthFailed > CliLocalError > OK > CapHit/NearCap >
+    ZeroOutputWedge > Failure. Reads only ``result`` (and ``backend`` /
     ``strict_confirm``) — no I/O, no gate mutation.
     """
     # AuthFailed — narrow to {401, 403}. 429 is deliberately EXCLUDED: it
@@ -309,6 +309,20 @@ def classify_invocation(
     for marker in NON_CAP_CLI_ERROR_MARKERS:
         if marker in combined_lower:
             return CliLocalError(marker=marker)
+
+    # OK — a successful invocation short-circuits the remaining string-based
+    # cap/wedge heuristics below. Without this, a successful run whose output
+    # happens to *quote* cap-like text (e.g. an agent echoing a usage-limit
+    # string back, or reviewing this very module's string tables) would be
+    # misclassified as CapHit/NearCap even though nothing failed. The legacy
+    # detect_cap_hit path this consolidates only ever ran on failed
+    # invocations, so this restores that scoping. AuthFailed/CliLocalError
+    # stay ABOVE this check because they key off structured signals (an exact
+    # status code, an exact CLI marker substring) rather than the fuzzy
+    # cap-prefix matching below, so they don't carry the same false-positive
+    # risk against incidental output text.
+    if result.success:
+        return OK()
 
     # Backend-specific cap patterns checked first, ahead of the claude prefix
     # logic below (mirrors usage_gate.py:386-397). Codex/Gemini error bodies
@@ -361,8 +375,5 @@ def classify_invocation(
     # message on a zero-turn timeout still classifies as CapHit, not a wedge.
     if is_zero_output_timeout(result):
         return ZeroOutputWedge()
-
-    if result.success:
-        return OK()
 
     return Failure(kind='unclassified')

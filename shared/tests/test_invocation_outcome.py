@@ -502,6 +502,20 @@ class TestClassifyInvocationWedgeOkFailure:
         outcome = classify_invocation(result, strict_confirm=True)
         assert outcome == OK()
 
+    def test_success_true_outranks_incidental_cap_like_text(self):
+        """A successful invocation is authoritative even when its own output
+        happens to quote cap-like text (e.g. echoing a usage-limit string, or
+        reviewing this very module's string tables) — it must not be
+        reclassified as CapHit/NearCap. The legacy detect_cap_hit path this
+        consolidates only ever ran on failed invocations; success=True short-
+        circuits before the string-based cap heuristics run."""
+        result = AgentResult(
+            success=True,
+            output="You've hit your usage limit for Claude Pro. Your plan resets in 3h.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == OK()
+
     def test_no_signal_at_all_falls_to_failure_tail(self):
         result = AgentResult(success=False, output='generic failure, no signal')
         outcome = classify_invocation(result, strict_confirm=True)
