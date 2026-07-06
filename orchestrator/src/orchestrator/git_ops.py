@@ -1661,14 +1661,27 @@ class GitOps:
                         f'manually once any wanted work is preserved. (fail-safe; '
                         f'was the silent rmtree at git_ops.py:702)'
                     )
-                logger.warning(
-                    f'Directory {worktree_path} exists but is NOT a registered '
-                    f'git worktree, and holds no live work (no .git link, only '
-                    f'.task/ residue, branch has no commits beyond '
-                    f'{self.config.main_branch}) — removing stale directory and '
-                    f'creating fresh worktree'
-                )
-                shutil.rmtree(worktree_path)
+                if self._refuse_foreign_band(
+                    worktree_path, frozenset(), 'create_worktree-self-heal',
+                ):
+                    # Refused: the WARNING has already been emitted by the
+                    # helper. This site's legitimate target is always a
+                    # non-band task worktree, so this branch is unreachable
+                    # in real usage — pure defense-in-depth. Never delete a
+                    # protected band here; leave it in place (the `git
+                    # worktree add` below will then fail loudly on the
+                    # still-non-empty directory rather than silently
+                    # destroying foreign-band content).
+                    pass
+                else:
+                    logger.warning(
+                        f'Directory {worktree_path} exists but is NOT a registered '
+                        f'git worktree, and holds no live work (no .git link, only '
+                        f'.task/ residue, branch has no commits beyond '
+                        f'{self.config.main_branch}) — removing stale directory and '
+                        f'creating fresh worktree'
+                    )
+                    shutil.rmtree(worktree_path)
 
         # If the branch ref already exists (stale from a previous run, or — the
         # 3576 trigger — still checked out in a leftover worktree), clean it up
@@ -1877,11 +1890,22 @@ class GitOps:
             # Self-heal a stale unregistered directory (mirrors acquire_warm_lane's
             # create-once branch) so `git worktree add` doesn't refuse a non-empty dir.
             if path.exists() and not await self._is_registered_worktree(path):
-                logger.warning(
-                    'create_interactive_worktree: %s exists but is not registered; '
-                    'removing stale directory (self-heal)', path,
-                )
-                shutil.rmtree(path)
+                if self._refuse_foreign_band(
+                    path, frozenset({self.config.iact_prefix}),
+                    'create_interactive_worktree-self-heal',
+                ):
+                    # Refused: the WARNING has already been emitted by the
+                    # helper. Real candidates here are always this site's
+                    # own iact band, so this branch is unreachable in real
+                    # usage — pure defense-in-depth. Leave the directory in
+                    # place rather than delete a foreign band.
+                    pass
+                else:
+                    logger.warning(
+                        'create_interactive_worktree: %s exists but is not registered; '
+                        'removing stale directory (self-heal)', path,
+                    )
+                    shutil.rmtree(path)
 
             # Branch-namespace self-heal: full_branch shares config.branch_prefix
             # with dispatch task branches and other interactive slugs (see the
