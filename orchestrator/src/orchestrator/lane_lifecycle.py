@@ -263,3 +263,20 @@ class LaneLifecycle:
                 'lane_lifecycle: failed to file illegal-transition escalation '
                 'for lane %s', Path(lane).name, exc_info=True,
             )
+
+    async def quarantine(self, lane: Path | str, branch: str, reason: str) -> Path | None:
+        """Delegate the git-side relocation, then record the QUARANTINED edge.
+
+        Requires an injected ``quarantine_worktree`` callable (raises
+        ``RuntimeError`` if unwired). ``any -> QUARANTINED`` is always legal
+        (see ``LEGAL_TRANSITIONS``), so the durable record transition below
+        never raises ``IllegalLaneTransition``; it is preserved beside the
+        relocated worktree.
+        """
+        if self._quarantine_worktree is None:
+            raise RuntimeError(
+                'LaneLifecycle.quarantine: no quarantine_worktree callable wired'
+            )
+        dest = await self._quarantine_worktree(lane, branch, reason)
+        self.transition(lane, LaneState.QUARANTINED)
+        return dest
