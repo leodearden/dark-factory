@@ -6449,7 +6449,7 @@ class TestSetTaskStatusBlockedRecording:
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
 
-        # Return a terminal_exit_rejected response — 'done' is in _TERMINAL_STATUSES
+        # Return a terminal_exit_rejected response — 'done' is in TERMINAL_STATUSES
         # so the warn-and-return carve-out fires (logs warning, returns cleanly).
         rejection_response = {
             'result': {
@@ -9238,45 +9238,44 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
         )
 
 
-class TestActiveTaskStatusesMatchesFusedMemory:
-    """Guard: ACTIVE_TASK_STATUSES in task_status.py must stay in sync with
-    fused-memory's canonical definition.
+class TestOrchestratorStatusSetsMatchShared:
+    """Guard: orchestrator.task_status must stay wired to shared.task_statuses.
 
-    If the server adds a new active status and the orchestrator's local copy
-    is not updated, tasks in that status would be silently excluded from the
-    active get_tasks fetch and never dispatched.  This test makes divergence
-    fail CI rather than strand tasks silently.
+    orchestrator/task_status.py is a thin re-export shim over the single
+    cross-package authority (shared.task_statuses).  This test asserts the
+    re-exported names are identical to the shared source rather than local
+    re-derivations, so an accidental future re-inlining of local literals
+    (re-introducing drift) fails CI.
     """
 
-    def test_active_task_statuses_matches_fused_memory(self):
-        """orchestrator.task_status.ACTIVE_TASK_STATUSES == fused_memory canonical.
+    def test_status_sets_are_shared_reexports(self):
+        """orchestrator.task_status constants == shared.task_statuses constants."""
+        from shared.task_statuses import ACTIVE, TERMINAL, WORKFLOW_PRESERVE
 
-        fused_memory is not on the orchestrator test path (cross-package import
-        is intentionally avoided per design — mirrored, not imported).  Instead
-        we compare against the hardcoded canonical set from
-        fused_memory/src/fused_memory/reconciliation/task_filter.py:66.
-        Update BOTH files when the server adds a new active status.
-        """
-        from orchestrator.task_status import ACTIVE_TASK_STATUSES as orch_set
-
-        # Canonical active statuses as defined in
-        # fused_memory/reconciliation/task_filter.py (task_filter.ACTIVE_TASK_STATUSES).
-        # Keep in sync with that file manually — divergence here is the signal.
-        fm_canonical: frozenset[str] = frozenset(
-            {
-                'pending',
-                'in-progress',
-                'blocked',
-                'deferred',
-                'review',
-                'merge-deferred',
-            }
+        from orchestrator.task_status import (
+            ACTIVE_TASK_STATUSES,
+            TERMINAL_STATUSES,
+            WORKFLOW_PRESERVE_STATUSES,
         )
-        assert orch_set == fm_canonical, (
+
+        assert TERMINAL_STATUSES == TERMINAL, (
+            "TERMINAL_STATUSES drift detected!\n"
+            f"  orchestrator/task_status.py: {sorted(TERMINAL_STATUSES)}\n"
+            f"  shared/task_statuses.py (canonical): {sorted(TERMINAL)}\n"
+            "orchestrator.task_status.TERMINAL_STATUSES must re-export shared.task_statuses.TERMINAL."
+        )
+        assert ACTIVE_TASK_STATUSES == ACTIVE, (
             "ACTIVE_TASK_STATUSES drift detected!\n"
-            f"  orchestrator/task_status.py: {sorted(orch_set)}\n"
-            f"  fused_memory/reconciliation/task_filter.py (canonical): {sorted(fm_canonical)}\n"
-            "Update orchestrator/task_status.py to match the server-side definition."
+            f"  orchestrator/task_status.py: {sorted(ACTIVE_TASK_STATUSES)}\n"
+            f"  shared/task_statuses.py (canonical): {sorted(ACTIVE)}\n"
+            "orchestrator.task_status.ACTIVE_TASK_STATUSES must re-export shared.task_statuses.ACTIVE."
+        )
+        assert WORKFLOW_PRESERVE_STATUSES == WORKFLOW_PRESERVE, (
+            "WORKFLOW_PRESERVE_STATUSES drift detected!\n"
+            f"  orchestrator/task_status.py: {sorted(WORKFLOW_PRESERVE_STATUSES)}\n"
+            f"  shared/task_statuses.py (canonical): {sorted(WORKFLOW_PRESERVE)}\n"
+            "orchestrator.task_status.WORKFLOW_PRESERVE_STATUSES must re-export "
+            "shared.task_statuses.WORKFLOW_PRESERVE."
         )
 
 
