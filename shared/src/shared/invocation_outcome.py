@@ -31,6 +31,7 @@ __all__ = [
     'CliLocalError',
     'ZeroOutputWedge',
     'Failure',
+    'classify_invocation',
 ]
 
 
@@ -217,3 +218,27 @@ def _extract_cap_message(text: str, prefix: str) -> str:
     if end == -1:
         end = min(idx + 200, len(text))
     return text[idx:end].strip()
+
+
+def classify_invocation(
+    result: AgentResult,
+    *,
+    strict_confirm: bool,
+    backend: str = 'claude',
+) -> InvocationOutcome:
+    """Classify a CLI agent invocation result into an ``InvocationOutcome``.
+
+    Total and pure: every ``AgentResult`` maps to exactly one variant, in
+    precedence order AuthFailed > CliLocalError > CapHit/NearCap >
+    ZeroOutputWedge > OK > Failure. Reads only ``result`` (and ``backend`` /
+    ``strict_confirm``) — no I/O, no gate mutation.
+    """
+    # AuthFailed — narrow to {401, 403}. 429 is deliberately EXCLUDED: it
+    # carries a real cap-message body ("You're out of extra usage · resets
+    # ...") that the cap-hit tier recognises, so routing 429 here would skip
+    # cap detection entirely and never trip AllAccountsCappedException
+    # (mirrors cli_invoke.py:799-805).
+    if result.api_error_status in (401, 403):
+        return AuthFailed(status=result.api_error_status)
+
+    return Failure(kind='unclassified')
