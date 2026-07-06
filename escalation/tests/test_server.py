@@ -800,22 +800,13 @@ class TestResolveIssueActionEnum:
         assert result.get('status') == 'dismissed', f"Expected dismissed; got: {result}"
 
     # --- (e) invalid action → error, record unchanged ---
-
-    @pytest.mark.asyncio
-    async def test_action_bogus_returns_error_record_unchanged(self, tmp_path: Path):
-        """action='bogus' returns {'error': ...} and record remains pending."""
-        queue = EscalationQueue(tmp_path / 'esc')
-        server = create_server(queue)
-        esc = self._seed_pending(queue)
-
-        result = await _resolve_issue(
-            server, escalation_id=esc.id, resolution='fixed', action='bogus',
-        )
-
-        assert 'error' in result, f"Expected error dict for invalid action; got: {result}"
-        record = queue.get(esc.id)
-        assert record is not None
-        assert record.status == 'pending', f"Record must stay pending; got {record.status!r}"
+    #
+    # Folded into TestResolveIssueTableBGate.
+    # test_bogus_action_returns_illegal_transition_code_record_unchanged below,
+    # which asserts everything this case covered (error dict + record stays
+    # pending) plus the typed code='illegal_transition' and the
+    # resolution_action stamp guard. Kept as a single test to avoid two
+    # near-identical bogus-action tests drifting apart.
 
 
 # ---------------------------------------------------------------------------
