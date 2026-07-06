@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 
+from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -32,6 +33,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     generate_summary_nonce,
 )
 from fused_memory.reconciliation.flag_dedup import (
+    _NOT_FOUND_PHRASE,
     _content_fingerprint,
     _is_valid_marker_task_id,
     _normalize_content_description,
@@ -1550,12 +1552,27 @@ async def _sweep_terminal_task_flag_markers(
         try:
             return await taskmaster.get_task(component, project_root)
         except Exception as exc:
-            logger.debug(
-                'reconciliation._sweep_terminal_task_flag_markers: '
-                'get_task failed for task_id=%s: %s',
-                component, exc,
-                extra={'project_id': project_id, 'run_id': run_id},
-            )
+            # A TaskmasterError carrying the not-found phrase means the
+            # referenced task_id no longer exists (e.g. hard-deleted) — an
+            # expected, benign steady-state condition for this GC sweep, not
+            # an infrastructure failure, so it's logged at debug to avoid
+            # recurring per-cycle noise. Any other exception (timeout,
+            # connection error, unexpected shape, ...) is unanticipated and
+            # is logged at warning so it surfaces.
+            if isinstance(exc, TaskmasterError) and _NOT_FOUND_PHRASE in str(exc).lower():
+                logger.debug(
+                    'reconciliation._sweep_terminal_task_flag_markers: '
+                    'task_id=%s not found (expected during GC sweep): %s',
+                    component, exc,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+            else:
+                logger.warning(
+                    'reconciliation._sweep_terminal_task_flag_markers: '
+                    'get_task failed for task_id=%s: %s',
+                    component, exc,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
             return None  # KEEP marker on error (fail-safe)
 
     task_results = await asyncio.gather(*(_safe_get_task(c) for c in distinct_components))
