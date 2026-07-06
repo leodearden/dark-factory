@@ -18,7 +18,7 @@ either upstream format changes, this module must be updated by hand.
 1. ps-scan launch patterns (:func:`find_running_orchestrators`) — the
    ``'orchestrator run'`` substring match and the ``--prd``/``--config``
    regexes re-derive the CLI surface of the ``run`` command defined in
-   ``orchestrator/src/orchestrator/cli.py`` (options at cli.py:168-183).
+   ``orchestrator/src/orchestrator/cli.py`` (grep that file for ``def run``).
    Anyone renaming the ``run`` command or its ``--prd``/``--config`` flags
    must update ``find_running_orchestrators`` to match.
 
@@ -149,8 +149,8 @@ def find_running_orchestrators() -> list[dict]:
     Returns [] on subprocess failure or if no orchestrators found.
 
     FORMAT COUPLING: the patterns below re-derive the ``run`` command's CLI
-    surface from orchestrator/src/orchestrator/cli.py (options at
-    cli.py:168-183). See the module docstring's FORMAT COUPLING section.
+    surface from orchestrator/src/orchestrator/cli.py (grep that file for
+    ``def run``). See the module docstring's FORMAT COUPLING section.
     """
     try:
         result = subprocess.run(
