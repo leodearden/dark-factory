@@ -130,6 +130,21 @@ class TestParseResetsAt:
         result = _parse_resets_at('resets in 3 hours', now=self.FIXED_NOW)
         assert result == self.FIXED_NOW + timedelta(hours=3)
 
+    def test_relative_minutes_word_form(self):
+        result = _parse_resets_at('resets in 45 minutes', now=self.FIXED_NOW)
+        assert result == self.FIXED_NOW + timedelta(minutes=45)
+
+    def test_relative_days_word_form(self):
+        result = _parse_resets_at('resets in 2 days', now=self.FIXED_NOW)
+        assert result == self.FIXED_NOW + timedelta(days=2)
+
+    def test_months_word_is_not_misparsed_as_minutes(self):
+        """'resets in 3 months' must not collide with the 'm' of 'minutes' —
+        an implausible-but-distinguishable unit should parse to None (7.1.a),
+        never silently become 3 minutes."""
+        result = _parse_resets_at('resets in 3 months', now=self.FIXED_NOW)
+        assert result is None
+
     def test_absolute_date_returns_tz_aware_datetime(self):
         text = (
             "You've hit your usage limit for Claude Pro. "
