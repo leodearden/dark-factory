@@ -7503,6 +7503,11 @@ Output JSON matching the schema. Every task must appear in the output.
         When ``_escalation_queue`` is None the drift is logged but not submitted.
         See ``_start_main_tip_sweep`` / ``_main_tip_sweep_loop`` for the periodic
         invocation context.
+
+        On a PASS (task 2114), also self-heals: calls
+        ``_close_superseded_main_sweep_escalations`` with the just-verified
+        clean SHA to auto-close any prior main-sweep escalation whose swept
+        SHA this clean tip has superseded.  Never called on the failure path.
         """
         from orchestrator import verify as verify_mod  # noqa: PLC0415
 
@@ -7529,6 +7534,7 @@ Output JSON matching the schema. Every task must appear in the output.
         self._last_swept_main_sha = swept_sha
 
         if vr.passed:
+            await self._close_superseded_main_sweep_escalations(swept_sha)
             return
 
         # Drift detected: file one L1 escalation per distinct bad SHA.
