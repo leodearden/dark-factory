@@ -800,10 +800,51 @@ class TestResolveIssueActionEnum:
         assert result.get('status') == 'dismissed', f"Expected dismissed; got: {result}"
 
     # --- (e) invalid action → error, record unchanged ---
+    #
+    # Folded into TestResolveIssueTableBGate.
+    # test_bogus_action_returns_illegal_transition_code_record_unchanged below,
+    # which asserts everything this case covered (error dict + record stays
+    # pending) plus the typed code='illegal_transition' and the
+    # resolution_action stamp guard. Kept as a single test to avoid two
+    # near-identical bogus-action tests drifting apart.
+
+
+# ---------------------------------------------------------------------------
+# TestResolveIssueTableBGate: Table B (escalation.action_effects) is the SINGLE
+# legality authority for resolve_issue (plans/task-status-authority-prd.md
+# contract C5 / decisions D1, D2).
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueTableBGate:
+    """resolve_issue consults Table B (escalation.action_effects) before any mutation."""
+
+    def _seed_pending(
+        self,
+        queue: EscalationQueue,
+        esc_id: str = 'esc-tb-0001',
+        category: str = 'scope_violation',
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='t-table-b',
+            agent_role='implementer',
+            severity='blocking',
+            category=category,
+            summary='Table B gate test escalation',
+        )
+        queue.submit(esc)
+        return esc
 
     @pytest.mark.asyncio
-    async def test_action_bogus_returns_error_record_unchanged(self, tmp_path: Path):
-        """action='bogus' returns {'error': ...} and record remains pending."""
+    async def test_bogus_action_returns_illegal_transition_code_record_unchanged(
+        self, tmp_path: Path
+    ):
+        """action='bogus' returns a typed code='illegal_transition' and makes no record change.
+
+        Fails today: resolve_issue's bare `action not in RESOLVE_ACTIONS` check
+        returns {'error': ...} with no 'code' key.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         esc = self._seed_pending(queue)
@@ -813,9 +854,34 @@ class TestResolveIssueActionEnum:
         )
 
         assert 'error' in result, f"Expected error dict for invalid action; got: {result}"
+        assert result.get('code') == 'illegal_transition', (
+            f"Expected code='illegal_transition'; got: {result}"
+        )
         record = queue.get(esc.id)
         assert record is not None
         assert record.status == 'pending', f"Record must stay pending; got {record.status!r}"
+        assert record.resolution_action is None, (
+            f"Record must not be stamped; got {record.resolution_action!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_novel_category_does_not_narrow_legality(self, tmp_path: Path):
+        """A category absent from server.CATEGORIES (e.g. 'milestone_gate') still resolves.
+
+        Proves the Table B gate does not narrow legality by category — the G6
+        archive verification found live resolutions across a wide, open
+        category vocabulary that server.CATEGORIES (inert/unvalidated) does
+        not even fully list.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue, esc_id='esc-tb-0002', category='milestone_gate')
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
 
 
 # ---------------------------------------------------------------------------
