@@ -165,6 +165,7 @@ class TestMergeEntities:
             'inter_node_deleted': 0,
         })
         backend.delete_entity_node = AsyncMock()
+        backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
         backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
             'sur-uuid', 'SurvivingName',
             old_summary='old sur summary',
@@ -204,7 +205,8 @@ class TestMergeEntities:
 
     @pytest.mark.asyncio
     async def test_calls_in_correct_order(self, backend_with_mocks):
-        """Calls redirect_node_edges, then delete_entity_node, then refresh_entity_summary."""
+        """Calls redirect_node_edges, then delete_entity_node, then
+        dedup_valid_edges_for_node, then refresh_entity_summary."""
         backend = backend_with_mocks
         call_order = []
         backend.redirect_node_edges = AsyncMock(
@@ -215,11 +217,29 @@ class TestMergeEntities:
         backend.delete_entity_node = AsyncMock(
             side_effect=lambda *a, **kw: call_order.append('delete')
         )
+        backend.dedup_valid_edges_for_node = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('dedup') or 0
+        )
         backend.refresh_entity_summary = AsyncMock(
             side_effect=lambda *a, **kw: call_order.append('refresh') or make_rebuild_detail('sur-uuid', 'S')
         )
         await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
-        assert call_order == ['redirect', 'delete', 'refresh']
+        assert call_order == ['redirect', 'delete', 'dedup', 'refresh']
+
+    @pytest.mark.asyncio
+    async def test_dedups_surviving_node_edges(self, backend_with_mocks):
+        """Awaits dedup_valid_edges_for_node once with the surviving uuid and group_id."""
+        backend = backend_with_mocks
+        await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        backend.dedup_valid_edges_for_node.assert_awaited_once_with('sur-uuid', group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_audit_dict_reports_duplicate_edges_removed(self, backend_with_mocks):
+        """Audit dict surfaces the duplicate_edges_removed count from dedup_valid_edges_for_node."""
+        backend = backend_with_mocks
+        backend.dedup_valid_edges_for_node = AsyncMock(return_value=2)
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['duplicate_edges_removed'] == 2
 
     @pytest.mark.asyncio
     async def test_returns_audit_dict(self, backend_with_mocks):
@@ -248,6 +268,7 @@ class TestMergeEntities:
             'inter_node_deleted': 0,
         })
         backend.delete_entity_node = AsyncMock()
+        backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
         backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
             'sur-uuid', 'SurName',
             old_summary='existing summary', new_summary='existing summary', edge_count=1,
@@ -256,6 +277,170 @@ class TestMergeEntities:
         backend.delete_entity_node.assert_awaited_once_with('dep-uuid', group_id='test')
         backend.refresh_entity_summary.assert_awaited_once_with('sur-uuid', group_id='test')
         assert result['surviving_uuid'] == 'sur-uuid'
+
+
+# ---------------------------------------------------------------------------
+# task 2118 step-1/3: GraphitiBackend._duplicate_edge_uuids (pure helper)
+# ---------------------------------------------------------------------------
+
+class TestDuplicateEdgeUuids:
+    """GraphitiBackend._duplicate_edge_uuids(rows) groups valid-edge rows shaped
+    [neighbor_uuid, edge_uuid, fact, valid_at] by (neighbor_uuid, normalized fact,
+    valid_at) and returns the non-survivor edge uuids to delete, keeping the
+    lexicographically-lowest uuid per group as the survivor."""
+
+    _FACT = (
+        'The fix requires adding the _finalizing_head term to '
+        '_inflight_speculative_count().'
+    )
+    _VALID_AT = '2026-07-06T00:00:00+00:00'
+
+    def test_returns_non_survivor_uuids_for_duplicate_group(self):
+        """Three edges from A to the same neighbor B, identical fact and
+        valid_at (mirrors the real aec7014f/735efe05 case) -> the two higher
+        uuids are returned; the lowest uuid ('e-1') survives."""
+        rows = [
+            ['B-uuid', 'e-3', self._FACT, self._VALID_AT],
+            ['B-uuid', 'e-1', self._FACT, self._VALID_AT],
+            ['B-uuid', 'e-2', self._FACT, self._VALID_AT],
+        ]
+        result = GraphitiBackend._duplicate_edge_uuids(rows)
+        assert result == ['e-2', 'e-3']
+
+    def test_single_edge_returns_empty(self):
+        """A lone edge has nothing to dedup against."""
+        rows = [['B-uuid', 'e-1', self._FACT, self._VALID_AT]]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+    def test_all_distinct_returns_empty(self):
+        """Edges with distinct neighbor/fact/valid_at are all preserved."""
+        rows = [
+            ['B-uuid', 'e-1', 'fact one', '2026-07-06T00:00:00+00:00'],
+            ['C-uuid', 'e-2', 'fact two', '2026-07-06T01:00:00+00:00'],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+    def test_different_valid_at_preserved(self):
+        """Same neighbor and fact but different valid_at are temporally
+        distinct assertions — not duplicates."""
+        rows = [
+            ['B-uuid', 'e-1', 'Auth depends on Redis.', '2026-07-06T00:00:00+00:00'],
+            ['B-uuid', 'e-2', 'Auth depends on Redis.', '2026-07-06T01:00:00+00:00'],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+    def test_different_neighbor_preserved(self):
+        """Same fact and valid_at but different neighbor are a distinct pair —
+        not duplicates."""
+        rows = [
+            ['B-uuid', 'e-1', 'Auth depends on Redis.', self._VALID_AT],
+            ['C-uuid', 'e-2', 'Auth depends on Redis.', self._VALID_AT],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+    def test_fact_normalized_for_case_and_whitespace(self):
+        """Facts differing only by case/whitespace are treated as duplicates
+        (mirrors MemoryService._normalize_fact / graphiti-core's
+        _normalize_string_exact). Fails until fact normalization is applied
+        to the grouping key."""
+        rows = [
+            ['B-uuid', 'e-2', 'Auth depends on Redis', self._VALID_AT],
+            ['B-uuid', 'e-1', '  auth  depends  on  redis  ', self._VALID_AT],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == ['e-2']
+
+    def test_self_loop_double_match_returns_empty(self):
+        """The undirected Cypher MATCH in dedup_valid_edges_for_node
+        double-matches a self-loop edge (A)-[e]-(A), surfacing the same
+        (neighbor_uuid, edge_uuid, fact, valid_at) row twice. The edge-uuid
+        dedup guard (rows deduplicated by edge_uuid before grouping) must
+        fold these back into a single row so the lone self-loop edge is not
+        mistaken for a duplicate pair and returned for deletion. A
+        regression that removed the edge-uuid dedup would risk exactly that
+        for a self-loop with no other edges to disambiguate it."""
+        rows = [
+            ['A-uuid', 'e-1', self._FACT, self._VALID_AT],
+            ['A-uuid', 'e-1', self._FACT, self._VALID_AT],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == []
+
+    def test_collapses_reverse_direction_duplicate_by_design(self):
+        """The (neighbor_uuid, fact, valid_at) grouping key carries no edge
+        direction, so a forward edge A->B and a reverse edge B->A sharing an
+        identical fact and valid_at collapse into a single survivor exactly
+        like a same-direction parallel duplicate would. This is deliberate,
+        not an oversight (see task 2118's design decision to use an
+        undirected MATCH): the merge scenario this helper targets only ever
+        mints same-direction duplicates, and the undirected Cypher query in
+        dedup_valid_edges_for_node reports the neighbor via `m.uuid`
+        regardless of which side the edge originates from, so direction
+        isn't even available to key on. Pinned here so a future change to
+        add direction-sensitivity is a conscious, test-visible decision
+        rather than a silent behavior change."""
+        rows = [
+            # Forward edge A->B, as seen from A's undirected query (m=B).
+            ['B-uuid', 'e-2', 'Auth depends on Redis.', self._VALID_AT],
+            # Reverse edge B->A, also surfaced with neighbor_uuid='B-uuid'
+            # from A's perspective since the MATCH is undirected.
+            ['B-uuid', 'e-1', 'Auth depends on Redis.', self._VALID_AT],
+        ]
+        assert GraphitiBackend._duplicate_edge_uuids(rows) == ['e-2']
+
+
+# ---------------------------------------------------------------------------
+# task 2118 step-5/6: GraphitiBackend.dedup_valid_edges_for_node
+# ---------------------------------------------------------------------------
+
+class TestDedupValidEdgesForNode:
+    """GraphitiBackend.dedup_valid_edges_for_node(node_uuid, *, group_id) reads
+    the node's valid incident edges and deletes non-survivor duplicates via
+    bulk_remove_edges."""
+
+    @pytest.mark.asyncio
+    async def test_removes_duplicate_edges_and_returns_count(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """One duplicate group (uuids 'e-2' and 'e-1') collapses to the
+        non-survivor 'e-2'; an unrelated distinct edge is left alone."""
+        backend = make_backend(mock_config)
+        valid_at = '2026-07-06T00:00:00+00:00'
+        rows = [
+            ['B-uuid', 'e-2', 'Some fact.', valid_at],
+            ['B-uuid', 'e-1', 'Some fact.', valid_at],
+            ['C-uuid', 'e-3', 'Unrelated fact.', valid_at],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.bulk_remove_edges = AsyncMock(return_value=1)
+
+        result = await backend.dedup_valid_edges_for_node('A-uuid', group_id='test')
+
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert '-[e:RELATES_TO]-' in cypher
+        assert 'invalid_at IS NULL' in cypher
+        params = extract_params(graph.ro_query.call_args)
+        assert params.get('uuid') == 'A-uuid'
+        backend.bulk_remove_edges.assert_awaited_once_with(['e-2'], group_id='test')
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_no_duplicates_returns_zero_without_deleting(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """All-distinct rows -> returns 0 and bulk_remove_edges is never called."""
+        backend = make_backend(mock_config)
+        rows = [
+            ['B-uuid', 'e-1', 'Fact one.', '2026-07-06T00:00:00+00:00'],
+            ['C-uuid', 'e-2', 'Fact two.', '2026-07-06T01:00:00+00:00'],
+        ]
+        graph = make_graph_mock(rows)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.bulk_remove_edges = AsyncMock(return_value=0)
+
+        result = await backend.dedup_valid_edges_for_node('A-uuid', group_id='test')
+
+        assert result == 0
+        backend.bulk_remove_edges.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

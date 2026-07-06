@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import importlib.util
 import logging
+import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -176,6 +177,17 @@ def _as_sortable_utc(created_at: datetime | None) -> datetime:
     if created_at.tzinfo is None:
         return created_at.replace(tzinfo=UTC)
     return created_at.astimezone(UTC)
+
+
+def _normalize_fact_for_grouping(fact: str | None) -> str:
+    """Normalize an edge fact for duplicate-grouping comparison.
+
+    Mirrors ``MemoryService._normalize_fact`` (lowercase + collapse
+    whitespace) and graphiti-core's ``_normalize_string_exact`` — kept as a
+    small local copy rather than an import because the backend layer must
+    not depend on the services layer. A None/missing fact coerces to ''.
+    """
+    return re.sub(r'\s+', ' ', (fact or '').lower()).strip()
 
 
 class _MultiTenantFalkorDriver(FalkorDriver):
@@ -846,6 +858,52 @@ class GraphitiBackend:
         await graph.query(delete_cypher, {'uuids': uuids})
         return found
 
+    async def dedup_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> int:
+        """Collapse post-merge parallel duplicate valid edges incident to a node.
+
+        Task 2118: ``redirect_node_edges`` (the ``merge_entities`` helper)
+        redirects a deprecated node's edges onto the surviving node by
+        blindly copying ``old.uuid`` onto the recreated edge, without
+        checking whether the survivor already has an equivalent edge to the
+        same neighbor. When the deprecated/surviving pair started as
+        exact-name duplicate nodes each holding their own copy of the same
+        fact, this leaves the survivor with two distinct-uuid ``RELATES_TO``
+        edges to the same neighbor sharing an identical (normalized) fact
+        and ``valid_at`` — a duplicate that neither the pre-merge
+        ``MemoryService._dedup_episode_edges`` sweep nor graphiti-core's
+        ``resolve_extracted_edges`` fast-path can catch, since those only
+        see the edges before they converge onto the same node pair.
+
+        Queries the node's currently-valid (``invalid_at IS NULL``)
+        incident edges (undirected, so directed and reverse-directed exact
+        duplicates both collapse), delegates grouping + survivor selection
+        to ``_duplicate_edge_uuids``, and deletes any non-survivor uuids via
+        ``bulk_remove_edges``.
+
+        Args:
+            node_uuid: UUID of the Entity node whose valid edges to dedup
+                (typically the surviving node of a merge).
+            group_id: Project graph to query.
+
+        Returns:
+            Number of duplicate edges removed. 0 when there is nothing to
+            dedup — ``bulk_remove_edges`` is not called in that case.
+
+        Raises:
+            RuntimeError: if the backend is not initialized.
+        """
+        graph = self._graph_for(group_id)
+        cypher = (
+            'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+            'WHERE e.invalid_at IS NULL '
+            'RETURN m.uuid, e.uuid, e.fact, e.valid_at'
+        )
+        result = await graph.ro_query(cypher, {'uuid': node_uuid})
+        duplicate_uuids = self._duplicate_edge_uuids(result.result_set or [])
+        if not duplicate_uuids:
+            return 0
+        return await self.bulk_remove_edges(duplicate_uuids, group_id=group_id)
+
     async def redirect_node_edges(
         self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
     ) -> dict:
@@ -963,7 +1021,11 @@ class GraphitiBackend:
         2. Redirect all RELATES_TO edges from deprecated to surviving via
            redirect_node_edges.
         3. Delete the deprecated node via delete_entity_node.
-        4. Rebuild the surviving node's summary via refresh_entity_summary.
+        4. Collapse any parallel duplicate edges left on the surviving node via
+           dedup_valid_edges_for_node (task 2118 — redirect_node_edges copies
+           uuids onto redirected edges without checking for an equivalent edge
+           the survivor already has).
+        5. Rebuild the surviving node's summary via refresh_entity_summary.
 
         Args:
             deprecated_uuid: UUID of the entity node to be deleted.
@@ -972,6 +1034,7 @@ class GraphitiBackend:
         Returns:
             Audit dict with keys: surviving_uuid, surviving_name, deprecated_uuid,
             deprecated_name, edges_redirected (sub-dict with redirect counts),
+            duplicate_edges_removed (count collapsed post-redirect),
             surviving_summary (dict with old/new summary and edge_count).
 
         Raises:
@@ -990,12 +1053,18 @@ class GraphitiBackend:
         # Delete the deprecated node
         await self.delete_entity_node(deprecated_uuid, group_id=group_id)
 
+        # Collapse parallel duplicates left on the survivor by the redirect above
+        duplicate_edges_removed = await self.dedup_valid_edges_for_node(
+            surviving_uuid, group_id=group_id,
+        )
+
         # Rebuild the surviving node's summary
         refresh_result = await self.refresh_entity_summary(surviving_uuid, group_id=group_id)
 
         logger.info(
-            'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s',
+            'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s duplicate_edges_removed=%d',
             deprecated_uuid, dep_name, surviving_uuid, sur_name, edges_redirected,
+            duplicate_edges_removed,
         )
         return {
             'surviving_uuid': surviving_uuid,
@@ -1003,6 +1072,7 @@ class GraphitiBackend:
             'deprecated_uuid': deprecated_uuid,
             'deprecated_name': dep_name,
             'edges_redirected': edges_redirected,
+            'duplicate_edges_removed': duplicate_edges_removed,
             'surviving_summary': {
                 'before': refresh_result.get('old_summary', ''),
                 'after': refresh_result.get('new_summary', ''),
@@ -1274,6 +1344,57 @@ class GraphitiBackend:
             'fact': fact if fact is not None else '',
             'name': name if name is not None else '',
         }
+
+    @staticmethod
+    def _duplicate_edge_uuids(rows: Sequence[Sequence[Any]]) -> list[str]:
+        """Return non-survivor edge uuids from valid-edge rows sharing a duplicate key.
+
+        Task 2118: after ``redirect_node_edges`` (the ``merge_entities`` helper)
+        blindly copies ``old.uuid`` onto redirected edges, a surviving node can
+        end up with two distinct-uuid ``RELATES_TO`` edges to the same neighbor
+        carrying an identical fact and ``valid_at`` — a parallel duplicate that
+        neither the pre-merge ``MemoryService._dedup_episode_edges`` sweep nor
+        graphiti-core's ``resolve_extracted_edges`` fast-path can catch, since
+        they only converge onto the same node pair *after* the merge.
+
+        Args:
+            rows: Iterable of positional rows ``(neighbor_uuid, edge_uuid, fact,
+                valid_at)`` — the shape returned by
+                ``dedup_valid_edges_for_node``'s Cypher query.
+
+        Returns:
+            Sorted list of edge uuids to delete (empty when no group has a
+            duplicate). For each group of rows sharing the same
+            ``(neighbor_uuid, fact, valid_at)`` key, the lexicographically
+            lowest edge uuid is kept as the survivor and every other uuid in
+            the group is returned for deletion.
+
+        Note:
+            Rows are first deduplicated by edge uuid (keeping the first
+            occurrence) so that an undirected Cypher MATCH double-matching a
+            self-loop edge doesn't fabricate a spurious duplicate pair.
+        """
+        seen_edge_uuids: set[str] = set()
+        deduped_rows: list[Sequence[Any]] = []
+        for row in rows:
+            edge_uuid = row[1]
+            if edge_uuid in seen_edge_uuids:
+                continue
+            seen_edge_uuids.add(edge_uuid)
+            deduped_rows.append(row)
+
+        groups: dict[tuple[str, str, str], list[str]] = {}
+        for row in deduped_rows:
+            neighbor_uuid, edge_uuid, fact, valid_at = row[0], row[1], row[2], row[3]
+            key = (neighbor_uuid, _normalize_fact_for_grouping(fact), str(valid_at))
+            groups.setdefault(key, []).append(edge_uuid)
+
+        duplicates: list[str] = []
+        for uuids in groups.values():
+            if len(uuids) > 1:
+                survivor = min(uuids)
+                duplicates.extend(u for u in uuids if u != survivor)
+        return sorted(duplicates)
 
     @staticmethod
     def _canonical_facts(edges: Sequence[Mapping[str, Any]]) -> list[str]:
