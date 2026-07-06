@@ -757,6 +757,63 @@ class TestDetectStaleSummariesDryRun:
             await backend.detect_stale_dry_run(group_id='test')
 
     @pytest.mark.asyncio
+    async def test_exception_logs_warning_for_each_failure_before_raising_first(
+        self, mock_config, make_backend, caplog
+    ):
+        """Each captured Exception is logged at WARNING before the first is raised.
+
+        Task β (fm-cancellederror-convention-prd.md): detect_stale_dry_run routes
+        through gather_or_raise (fused_memory.utils.async_utils), which adds
+        observability the hand-rolled Pass 2 never had — every captured Exception
+        is logged at WARNING (not just the one that gets raised) before the
+        positionally-first is re-raised. Raise-first semantics are unchanged (see
+        test_exception_propagates_from_gather above); this test pins the *added*
+        logging side-effect.
+
+        Three entities: 'uuid-bad-one' and 'uuid-bad-two' both raise distinct
+        RuntimeErrors; 'uuid-ok' succeeds. asyncio.gather preserves input order in
+        its results list regardless of completion order, so the positionally-first
+        Exception (uuid-bad-one's) is the one raised, and both failures are logged.
+
+        The CancelledError-propagates-with-zero-warnings guarantee is not
+        re-asserted here: Pass 1 (inside gather_or_raise) re-raises a captured
+        BaseException before Pass 2's logging loop even runs (see
+        fused_memory/utils/async_utils.py), and test_cancelled_error_propagates_from_gather
+        above already pins CancelledError propagation for this call site.
+        """
+        backend = make_backend(mock_config)
+        entities = [
+            {'uuid': 'uuid-bad-one', 'name': 'BadOne', 'summary': 'fact'},
+            {'uuid': 'uuid-ok', 'name': 'OK', 'summary': 'fact'},
+            {'uuid': 'uuid-bad-two', 'name': 'BadTwo', 'summary': 'fact'},
+        ]
+        backend.list_entity_nodes = AsyncMock(return_value=entities)
+
+        async def edges_with_errors(node_uuid, *, group_id):
+            if node_uuid == 'uuid-bad-one':
+                raise RuntimeError('first failure')
+            if node_uuid == 'uuid-bad-two':
+                raise RuntimeError('second failure')
+            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
+
+        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_with_errors)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'),
+            pytest.raises(RuntimeError, match='first failure'),
+        ):
+            await backend.detect_stale_dry_run(group_id='test')
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2, (
+            f'expected one WARNING per captured Exception (2), got {len(warnings)}: '
+            f'{[r.message for r in warnings]}'
+        )
+        assert any('first failure' in r.message for r in warnings)
+        assert any('second failure' in r.message for r in warnings)
+        assert all('RuntimeError' in r.message for r in warnings)
+
+    @pytest.mark.asyncio
     async def test_result_correctness_under_parallel_execution(self, mock_config, make_backend):
         """Stale/clean/empty distribution is preserved correctly under parallel execution.
 

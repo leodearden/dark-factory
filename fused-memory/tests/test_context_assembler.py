@@ -664,10 +664,11 @@ class TestContextAssemblerCancellation:
         """Pass 2 guard must use isinstance(ctx_result, Exception), not BaseException.
 
         Defense-in-depth test: injects a KeyboardInterrupt() instance directly into
-        batch_contexts by patching asyncio.gather to return it as a value (avoiding the
-        asyncio task re-raise that would occur if a coroutine actually raised it).
-        Pass 1 is bypassed by patching propagate_cancellations to a no-op, so Pass 2
-        sees the bare BaseException value directly.
+        batch_contexts by patching gather_collect (fused_memory.utils.async_utils) to
+        return it as a value directly (avoiding the asyncio task re-raise that would
+        occur if a coroutine actually raised it). This bypasses gather_collect's own
+        internal Pass 1 (propagate_cancellations) check, so Pass 2 in assemble() sees
+        the bare BaseException value directly.
 
         With the old ``isinstance(ctx_result, BaseException)`` guard,
         KeyboardInterrupt() IS caught and degraded to [] — assemble() returns normally.
@@ -692,20 +693,19 @@ class TestContextAssemblerCancellation:
         ]
         watermark = _make_watermark()
 
-        async def _mock_gather(*args, **kwargs):
+        async def _mock_gather_collect(coros):
             # Return KeyboardInterrupt() as a value — bypasses asyncio task re-raise.
             # Close any coroutines passed in so they don't trigger
             # "coroutine was never awaited" RuntimeWarnings at GC time.
-            for coro in args:
+            for coro in coros:
                 if hasattr(coro, 'close'):
                     coro.close()
             return [KeyboardInterrupt()]
 
         with (
-            patch('fused_memory.reconciliation.context_assembler.asyncio.gather', new=_mock_gather),
             patch(
-                'fused_memory.reconciliation.context_assembler.propagate_cancellations',
-                new=lambda results: None,
+                'fused_memory.reconciliation.context_assembler.gather_collect',
+                new=_mock_gather_collect,
             ),
             pytest.raises(TypeError),
         ):

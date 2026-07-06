@@ -41,7 +41,7 @@ from fused_memory.reconciliation.recon_pool_map import (
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
-from fused_memory.utils.async_utils import propagate_cancellations
+from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.task_naming import canonicalize_task_node_name
 
 if TYPE_CHECKING:
@@ -1856,28 +1856,18 @@ class MemoryService:
         exact = await self.graphiti.get_nodes_by_exact_name(name, group_id=project_id)
         if exact:
             uuids = [uuid for n in exact if (uuid := n.get('uuid'))]
-            edge_results = await asyncio.gather(
-                *(self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
-                return_exceptions=True,
+            # Two-tier check via gather_or_raise (fused_memory.utils.async_utils),
+            # mirroring the fuzzy fallback below: return_exceptions=True ensures a
+            # transient failure in one concurrent get_valid_edges_for_node call
+            # cannot leave sibling coroutines running as orphaned background
+            # tasks. Pass 1 re-raises structured-cancellation signals; Pass 2
+            # logs every exception, then raises the first (get_entity's local
+            # Pass-2 semantics — see async_utils docstring).
+            edge_results = await gather_or_raise(
+                (self.graphiti.get_valid_edges_for_node(u, group_id=project_id) for u in uuids),
+                label='get_entity: get_valid_edges_for_node failed',
+                logger=logger,
             )
-            # Two-tier check (see async_utils.propagate_cancellations), mirroring
-            # the fuzzy fallback below: return_exceptions=True ensures a transient
-            # failure in one concurrent get_valid_edges_for_node call cannot leave
-            # sibling coroutines running as orphaned background tasks. Pass 1
-            # re-raises structured-cancellation signals; Pass 2 logs every
-            # exception, then raises the first (get_entity's local Pass-2
-            # semantics — see async_utils docstring).
-            propagate_cancellations(edge_results)
-            first_exc = next((r for r in edge_results if isinstance(r, Exception)), None)
-            if first_exc is not None:
-                for r in edge_results:
-                    if isinstance(r, Exception):
-                        logger.warning(
-                            'get_entity: get_valid_edges_for_node failed: %s: %s',
-                            type(r).__name__,
-                            r,
-                        )
-                raise first_exc
             edge_lists = cast(list, edge_results)
             # Duplicate-name matches each contribute their own edges; dedup by
             # edge uuid so `edges` stays consistent with the (possibly
@@ -1896,43 +1886,30 @@ class MemoryService:
             edge_data = [_edge_to_dict(e) for e in edges]
             return {'nodes': node_data, 'edges': edge_data}
 
-        results = await asyncio.gather(
-            self.graphiti.search_nodes(
-                query=name,
-                group_ids=[project_id],
-                max_nodes=5,
+        # Two-tier check via gather_or_raise (fused_memory.utils.async_utils).
+        # Both coroutines settle before either is inspected (no orphans).
+        # Pass 1: re-raises structured-cancellation signals (CancelledError,
+        #   KeyboardInterrupt, SystemExit) before any per-call logging —
+        #   cancellation takes precedence over application-level failures
+        #   regardless of position in the results list.
+        # Pass 2: logs each captured Exception and raises the first — these
+        #   are application-level failures from the Graphiti backend.
+        results = await gather_or_raise(
+            (
+                self.graphiti.search_nodes(
+                    query=name,
+                    group_ids=[project_id],
+                    max_nodes=5,
+                ),
+                self.graphiti.search(
+                    query=name,
+                    group_ids=[project_id],
+                    num_results=edge_limit,
+                ),
             ),
-            self.graphiti.search(
-                query=name,
-                group_ids=[project_id],
-                num_results=edge_limit,
-            ),
-            return_exceptions=True,
+            label='get_entity: Graphiti call failed',
+            logger=logger,
         )
-
-        # Two-tier check for asyncio.gather(return_exceptions=True) results.
-        # Both coroutines have already settled at this point (no orphans).
-        #
-        # Pass 1: propagate_cancellations handles structured-cancellation signals
-        #   (CancelledError, KeyboardInterrupt, SystemExit) before any per-call logging.
-        #   Cancellation takes precedence over application-level failures regardless
-        #   of position in the results list.
-        #   See fused_memory.utils.async_utils.propagate_cancellations for the shared
-        #   Pass 1 guard contract.
-        #
-        # Pass 2: log each captured Exception and raise the first — these are
-        #   application-level failures from the Graphiti backend.
-        propagate_cancellations(results)
-        first_exc = next((r for r in results if isinstance(r, Exception)), None)
-        if first_exc is not None:
-            for r in results:
-                if isinstance(r, Exception):
-                    logger.warning(
-                        'get_entity: Graphiti call failed: %s: %s',
-                        type(r).__name__,
-                        r,
-                    )
-            raise first_exc
 
         nodes = cast(list, results[0])
         edges = cast(list, results[1])
@@ -2634,10 +2611,10 @@ class MemoryService:
         1. Target selection — entity_uuids (targeted, bypasses detection) takes
            precedence over detect_stale_with_edges (force=False) or
            list_entity_nodes (force=True).
-        2. Fan-out — asyncio.Semaphore(20) + asyncio.gather(return_exceptions=True)
+        2. Fan-out — asyncio.Semaphore(20) + gather_collect (fused_memory.utils.async_utils)
            calling graphiti.rebuild_entity_from_edges for each target.
-        3. Error accumulation — two-tier: propagate_cancellations (Pass 1) then
-           per-entity dict accumulation (Pass 2).
+        3. Error accumulation — two-tier: gather_collect's Pass 1 (cancellation
+           propagation) then per-entity dict accumulation (Pass 2).
 
         Logs the operation via write journal if available.
 
@@ -2740,13 +2717,9 @@ class MemoryService:
                             old_summary=t['old_summary'],
                         )
 
-                gather_results = await asyncio.gather(
-                    *(_rebuild_one(t) for t in targets), return_exceptions=True
-                )
-
                 # Pass 1: propagate CancelledError before per-entity accumulation.
                 try:
-                    propagate_cancellations(gather_results)
+                    gather_results = await gather_collect(_rebuild_one(t) for t in targets)
                 except BaseException as e:
                     if not isinstance(e, Exception):
                         logger.warning(

@@ -10,7 +10,6 @@ entity, its context is counted only once.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from datetime import UTC, datetime
@@ -23,7 +22,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     Watermark,
 )
-from fused_memory.utils.async_utils import propagate_cancellations
+from fused_memory.utils.async_utils import gather_collect
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -128,16 +127,13 @@ class ContextAssembler:
                 self._fetch_context(event, project_id)
                 for event in batch
             ]
-            batch_contexts = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-
-            # Two-tier check for asyncio.gather(return_exceptions=True) results.
-            # Pass 1: delegates to propagate_cancellations (fused_memory.utils.async_utils)
-            # — the shared Pass 1 guard used by all gather(return_exceptions=True) callsites.
-            # Re-raising here preserves the structured-cancellation contract and prevents
-            # the assembler from silently converting a shutdown signal into an empty context list.
-            # See propagate_cancellations for the Pass 1 contract;
-            # graphiti_client.rebuild_entity_summaries for a complete two-pass example.
-            propagate_cancellations(batch_contexts)
+            # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+            # Pass 1 (inside gather_collect): re-raises structured-cancellation
+            # signals — this preserves the structured-cancellation contract and
+            # prevents the assembler from silently converting a shutdown signal
+            # into an empty context list.
+            # Pass 2 (below): per-event degrade-to-empty on ordinary Exceptions.
+            batch_contexts = await gather_collect(fetch_tasks)
 
             for event, ctx_result in zip(batch, batch_contexts, strict=True):
                 if isinstance(ctx_result, Exception):
