@@ -21,12 +21,16 @@ in {'role': 'user', 'content': ...}, which recon's string-content call sites
 (e.g. task_knowledge_sync.py's add_memory calls) always produce. So that
 drop condition is unreachable from recon's actual call shape.
 
-Empirically confirmed below by a hermetic harness with a stubbed,
-IDENTICAL-vector embedder (cosine=1.0 — a strictly stronger worst case than
-the survey's ~0.92) against a real Qdrant: every one of N byte-identical
-infer=False writes lands as a distinct point. (A second, real-OpenAI-
-embedder confirmation is added alongside this — see that test's docstring
-for the additional empirical result once it lands.)
+Empirically confirmed TWICE below, both against a real Qdrant: (i)
+test_identical_infer_false_writes_all_land_distinct — a hermetic harness
+with a stubbed, IDENTICAL-vector embedder (cosine=1.0, a strictly stronger
+worst case than the survey's ~0.92); and (ii)
+test_identical_writes_land_with_real_openai_embeddings — the same probe
+with genuine OpenAI embeddings (cosine≈1.0 for identical text), when
+OPENAI_API_KEY is available. In both, every one of N byte-identical
+infer=False writes lands as a distinct point (N distinct ids and
+backend.count(scope)==N) — directly rebutting the '~0.92 cosine dedup'
+observation with real embeddings, not just the code trace.
 
 Consequence for downstream tasks: δ's add_system_record is a no-op
 hardening (the premise it "fixes" is already false), and λ's deletion
@@ -114,12 +118,19 @@ async def _build_recon_backend(mock_config, scope, monkeypatch, *, real_embedder
     """
     monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
 
-    backend = Mem0Backend(mock_config)
+    config = mock_config.model_copy(deep=True)
+    if real_embedder:
+        # mock_config's embedder.providers.openai.api_key is a fake fixture
+        # value ('test-key'); clearing it here makes mem0's OpenAIEmbedding
+        # fall back to the real OPENAI_API_KEY env var instead.
+        config.embedder.providers.openai.api_key = None
+
+    backend = Mem0Backend(config)
     inst = await backend._get_instance(scope)
     inst.db.add_history = lambda *a, **kw: None
 
     if not real_embedder:
-        collection = scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+        collection = scope.mem0_collection_name(config.mem0.collection_prefix)
         dim = _collection_vector_size(collection)
         stub_vector = [0.1] * dim
         inst.embedding_model.embed = lambda *a, **kw: stub_vector
