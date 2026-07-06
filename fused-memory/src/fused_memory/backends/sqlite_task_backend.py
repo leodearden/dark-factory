@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 
 # Incremented whenever the DB schema changes shape.  Stored in the SQLite
 # user_version header; read by ``_migrate`` at connection-open time.
-_SCHEMA_VERSION = 1
+# v1 -> v2: added claimant_run_id/heartbeat_at columns to `tasks` (task 2182,
+# PRD plans/task-status-authority-prd.md C4/D4).
+_SCHEMA_VERSION = 2
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
@@ -53,16 +55,18 @@ _warned_malformed_task_ids: set[tuple[str, str, int]] = set()
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
-    tag           TEXT NOT NULL DEFAULT 'master',
-    id            INTEGER NOT NULL,
-    title         TEXT NOT NULL,
-    description   TEXT,
-    details       TEXT,
-    test_strategy TEXT,
-    status        TEXT NOT NULL,
-    priority      TEXT,
-    metadata      TEXT,
-    updated_at    TEXT NOT NULL,
+    tag             TEXT NOT NULL DEFAULT 'master',
+    id              INTEGER NOT NULL,
+    title           TEXT NOT NULL,
+    description     TEXT,
+    details         TEXT,
+    test_strategy   TEXT,
+    status          TEXT NOT NULL,
+    priority        TEXT,
+    metadata        TEXT,
+    updated_at      TEXT NOT NULL,
+    claimant_run_id TEXT,
+    heartbeat_at    TEXT,
     PRIMARY KEY (tag, id)
 );
 
@@ -163,14 +167,33 @@ def _format_task_id(task_id: int) -> str:
 
 
 async def _migrate(conn: aiosqlite.Connection) -> None:
-    """One-shot idempotent migration: parent_id schema → flat schema.
+    """Incremental idempotent migration, stepped by ``PRAGMA user_version``.
 
-    Gated on ``PRAGMA user_version``.  When < _SCHEMA_VERSION AND tasks still
-    has a ``parent_id`` column: rebuild all three tables without parent_id
-    (straggler subtask rows with parent_id != 0 are silently dropped — by
-    soak + DF-B there are none), set user_version = 1.  If parent_id is
-    already absent (fresh DB opened with the new _SCHEMA_SQL), just stamps
-    the version.  Skipped entirely when user_version >= _SCHEMA_VERSION.
+    Skipped entirely when ``user_version >= _SCHEMA_VERSION``. Otherwise:
+
+    * **v0 -> v2** (``parent_id`` column still present): full rebuild of all
+      three tables without parent_id (straggler subtask rows with
+      parent_id != 0 are silently dropped — by soak + DF-B there are none).
+      The rebuilt ``tasks`` table is created directly in v2 shape (including
+      ``claimant_run_id``/``heartbeat_at``), so a legacy parent_id DB lands
+      straight at v2 in one pass — it never passes through an intermediate
+      v1 ALTER. Sets ``user_version = 2``.
+
+    * **v1 -> v2** (``parent_id`` already absent): the common production
+      case — either an already-migrated v1 DB (parent_id gone, claimant
+      columns absent) or a brand-new DB just created by ``_SCHEMA_SQL``
+      (parent_id never existed, claimant columns already present).
+      Feature-detects each of ``claimant_run_id``/``heartbeat_at`` via
+      ``PRAGMA table_info`` and ``ALTER TABLE ADD COLUMN``s whichever is
+      missing (idempotent — a fresh DB has both already, so this is a
+      no-op there), then stamps ``user_version = 2``.
+
+      IMPORTANT: this branch must never be short-circuited into "parent_id
+      absent -> just stamp the version" — ``_SCHEMA_SQL`` uses
+      ``CREATE TABLE IF NOT EXISTS``, so it never adds columns to an
+      existing table. An already-migrated v1 production DB (the common
+      case) would silently keep missing columns forever if this branch
+      only stamped the version without also running the ALTERs.
     """
     row = await (await conn.execute('PRAGMA user_version')).fetchone()
     if row and row[0] >= _SCHEMA_VERSION:
@@ -178,64 +201,77 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
 
     info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
     col_names = {r[1] for r in info_rows}
-    if 'parent_id' not in col_names:
-        await conn.execute(f'PRAGMA user_version = {_SCHEMA_VERSION}')
-        await conn.commit()
+
+    if 'parent_id' in col_names:
+        # Full rebuild: parent_id column is still present in all three
+        # tables. Rows with parent_id != 0 (straggler subtasks) are dropped
+        # by the INSERT...SELECT WHERE parent_id = 0 — no prior cancellation
+        # needed. The rebuilt tasks_new already carries claimant_run_id /
+        # heartbeat_at (NULL for every migrated row) so this lands directly
+        # at v2.
+        await conn.executescript(f"""
+            BEGIN;
+
+            CREATE TABLE tasks_new (
+                tag             TEXT NOT NULL DEFAULT 'master',
+                id              INTEGER NOT NULL,
+                title           TEXT NOT NULL,
+                description     TEXT,
+                details         TEXT,
+                test_strategy   TEXT,
+                status          TEXT NOT NULL,
+                priority        TEXT,
+                metadata        TEXT,
+                updated_at      TEXT NOT NULL,
+                claimant_run_id TEXT,
+                heartbeat_at    TEXT,
+                PRIMARY KEY (tag, id)
+            );
+            INSERT INTO tasks_new
+                (tag, id, title, description, details, test_strategy,
+                 status, priority, metadata, updated_at)
+            SELECT tag, id, title, description, details, test_strategy,
+                   status, priority, metadata, COALESCE(updated_at, '')
+            FROM tasks WHERE parent_id = 0;
+            DROP TABLE tasks;
+            ALTER TABLE tasks_new RENAME TO tasks;
+            CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+
+            CREATE TABLE dependencies_new (
+                tag        TEXT NOT NULL DEFAULT 'master',
+                task_id    INTEGER NOT NULL,
+                depends_on INTEGER NOT NULL,
+                PRIMARY KEY (tag, task_id, depends_on)
+            );
+            INSERT OR IGNORE INTO dependencies_new (tag, task_id, depends_on)
+            SELECT tag, task_id, depends_on FROM dependencies WHERE parent_id = 0;
+            DROP TABLE dependencies;
+            ALTER TABLE dependencies_new RENAME TO dependencies;
+
+            CREATE TABLE id_counters_new (
+                tag    TEXT NOT NULL DEFAULT 'master',
+                max_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (tag)
+            );
+            INSERT INTO id_counters_new (tag, max_id)
+            SELECT tag, MAX(max_id) FROM id_counters WHERE parent_id = 0 GROUP BY tag;
+            DROP TABLE id_counters;
+            ALTER TABLE id_counters_new RENAME TO id_counters;
+
+            PRAGMA user_version = {_SCHEMA_VERSION};
+            COMMIT;
+        """)
         return
 
-    # Full rebuild: parent_id column is still present in all three tables.
-    # Rows with parent_id != 0 (straggler subtasks) are dropped by the
-    # INSERT...SELECT WHERE parent_id = 0 — no prior cancellation needed.
-    await conn.executescript(f"""
-        BEGIN;
-
-        CREATE TABLE tasks_new (
-            tag           TEXT NOT NULL DEFAULT 'master',
-            id            INTEGER NOT NULL,
-            title         TEXT NOT NULL,
-            description   TEXT,
-            details       TEXT,
-            test_strategy TEXT,
-            status        TEXT NOT NULL,
-            priority      TEXT,
-            metadata      TEXT,
-            updated_at    TEXT NOT NULL,
-            PRIMARY KEY (tag, id)
-        );
-        INSERT INTO tasks_new
-            (tag, id, title, description, details, test_strategy,
-             status, priority, metadata, updated_at)
-        SELECT tag, id, title, description, details, test_strategy,
-               status, priority, metadata, COALESCE(updated_at, '')
-        FROM tasks WHERE parent_id = 0;
-        DROP TABLE tasks;
-        ALTER TABLE tasks_new RENAME TO tasks;
-        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
-
-        CREATE TABLE dependencies_new (
-            tag        TEXT NOT NULL DEFAULT 'master',
-            task_id    INTEGER NOT NULL,
-            depends_on INTEGER NOT NULL,
-            PRIMARY KEY (tag, task_id, depends_on)
-        );
-        INSERT OR IGNORE INTO dependencies_new (tag, task_id, depends_on)
-        SELECT tag, task_id, depends_on FROM dependencies WHERE parent_id = 0;
-        DROP TABLE dependencies;
-        ALTER TABLE dependencies_new RENAME TO dependencies;
-
-        CREATE TABLE id_counters_new (
-            tag    TEXT NOT NULL DEFAULT 'master',
-            max_id INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (tag)
-        );
-        INSERT INTO id_counters_new (tag, max_id)
-        SELECT tag, MAX(max_id) FROM id_counters WHERE parent_id = 0 GROUP BY tag;
-        DROP TABLE id_counters;
-        ALTER TABLE id_counters_new RENAME TO id_counters;
-
-        PRAGMA user_version = {_SCHEMA_VERSION};
-        COMMIT;
-    """)
+    # v1 -> v2: parent_id is already absent. Feature-detect and ALTER in
+    # whichever claimant column is missing (idempotent; a fresh DB created
+    # by _SCHEMA_SQL already has both, so neither ALTER fires).
+    if 'claimant_run_id' not in col_names:
+        await conn.execute('ALTER TABLE tasks ADD COLUMN claimant_run_id TEXT')
+    if 'heartbeat_at' not in col_names:
+        await conn.execute('ALTER TABLE tasks ADD COLUMN heartbeat_at TEXT')
+    await conn.execute(f'PRAGMA user_version = {_SCHEMA_VERSION}')
+    await conn.commit()
 
 
 def _warn_malformed_metadata_once(
