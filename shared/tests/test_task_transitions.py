@@ -218,3 +218,43 @@ class TestTransitionsUnionDerivation:
             and isinstance(pair[1], TaskStatus)
             for pair in union
         )
+
+
+# ---------------------------------------------------------------------------
+# Pair 4 — the single actor-specific restriction: RECONCILIATION may not
+# transition FROM in-progress (task-1655, D5)
+# (test-actor-restriction RED / impl-actor-restriction GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestActorRestriction:
+    def test_reconciliation_cannot_transition_from_in_progress(self):
+        # The live_workflow_status_write guard (task_knowledge_sync.py:521/
+        # 2996) actively blocks recon writes on a live/in-progress task —
+        # this is that restriction's pure-table mirror.
+        assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.PENDING, ActorClass.RECONCILIATION) is False
+        assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, ActorClass.RECONCILIATION) is False
+        assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.DONE, ActorClass.RECONCILIATION) is False
+
+    @pytest.mark.parametrize(
+        'actor', [ActorClass.ORCHESTRATOR, ActorClass.HUMAN, ActorClass.ESCALATION, ActorClass.DETERMINISTIC]
+    )
+    def test_safe_open_contrast_for_other_actors(self, actor):
+        # Same (from, to) pair the recon test above rejects — every other
+        # actor gets the full union (safe-open, D5).
+        assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.PENDING, actor) is True
+
+    def test_reconciliations_legitimate_writes_remain_legal(self):
+        # Recon's real call sites (task_knowledge_sync.py:2787 stage2;
+        # targeted.py:1001/1041) — none of these originate from in-progress,
+        # so the restriction must not collaterally block them.
+        assert is_legal_transition(TaskStatus.DEFERRED, TaskStatus.PENDING, ActorClass.RECONCILIATION) is True
+        assert is_legal_transition(TaskStatus.PENDING, TaskStatus.CANCELLED, ActorClass.RECONCILIATION) is True
+        assert is_legal_transition(TaskStatus.BLOCKED, TaskStatus.CANCELLED, ActorClass.RECONCILIATION) is True
+        assert is_legal_transition(TaskStatus.DEFERRED, TaskStatus.BLOCKED, ActorClass.RECONCILIATION) is True
+
+    def test_unknown_actor_is_safe_open(self):
+        assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.PENDING, 'mystery-actor') is True
+
+    def test_reconciliation_is_strict_subset_of_human(self):
+        assert TRANSITIONS[ActorClass.RECONCILIATION] < TRANSITIONS[ActorClass.HUMAN]
