@@ -7818,6 +7818,19 @@ Output JSON matching the schema. Every task must appear in the output.
         falling back to ``scheduler.get_task`` for an escalation whose task
         wasn't in the blocked set.
 
+        Source C (task 2114): before Source B handles a pending escalation,
+        first offer it to ``_revalidate_open_l2`` — the generalized
+        terminal-subject closure (any L2 whose subject task has gone
+        done/cancelled).  Evidence is a single batch ``scheduler.get_statuses``
+        read over every pending L2's task-id, taken once per pass; the read
+        is defensively wrapped so a scheduler that can't answer (unconfigured
+        mock, transient error) degrades to an empty statuses dict rather than
+        aborting the pass — Source C then closes nothing and Source B runs
+        exactly as before.  When Source C closes an escalation, Source B is
+        skipped for it (``continue``); this composes with the existing
+        per-item fail-soft try/except so one bad escalation never blocks
+        the rest.
+
         A and B are mutually exclusive per task ACROSS passes by construction
         (A requires an empty pending queue; B requires an open escalation) —
         once A files an escalation for a tid, the queue is non-empty so A
@@ -7869,10 +7882,29 @@ Output JSON matching the schema. Every task must appear in the output.
                     tid, type(exc).__name__, exc,
                 )
 
-        for esc in self._escalation_queue.get_pending():
+        pending = self._escalation_queue.get_pending()
+
+        statuses: dict[str, str] = {}
+        l2_ids = sorted({
+            e.task_id for e in pending if getattr(e, 'level', None) == 2
+        })
+        if self.config.escalation_revalidation_enabled and l2_ids:
+            try:
+                statuses, _err = await self.scheduler.get_statuses(l2_ids)
+            except Exception as exc:
+                logger.error(
+                    'Deterministic-recon-sweep: Source-C get_statuses failed '
+                    'for %d L2 escalation(s): %s: %s',
+                    len(l2_ids), type(exc).__name__, exc,
+                )
+                statuses = {}
+
+        for esc in pending:
             if esc.task_id in recovered_this_pass:
                 continue
             try:
+                if await self._revalidate_open_l2(esc, statuses):
+                    continue
                 task = task_by_id.get(esc.task_id)
                 if task is None:
                     task = await self.scheduler.get_task(esc.task_id)
