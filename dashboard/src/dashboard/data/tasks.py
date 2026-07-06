@@ -13,7 +13,6 @@ the caller turns that into a per-project skip plus a Tasks-tab banner.
 
 from __future__ import annotations
 
-import logging
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -24,17 +23,15 @@ from dashboard.config import DashboardConfig
 from dashboard.data.mcp_fanout import TTLCache, first_success
 from dashboard.data.memory import mcp_tool_call
 
-logger = logging.getLogger(__name__)
-
 # ---------------------------------------------------------------------------
 # Per-project_root TTL cache for fetch_tasks
 # (mirrors app._load_task_cards / merge_queue.load_task_titles pattern)
 #
-# Code-duplication note: this is now the third copy of the
-# {TTL constant, dict[str, tuple[float, list[dict]]], _clear() hook,
-# store-only-on-success, list()-copy} pattern alongside
-# app._task_cards_cache and merge_queue._task_titles_cache.  Extracting a
-# shared TTLCache helper would require changes to app.py and merge_queue.py,
+# Code-duplication note: fetch_tasks's own copy of the {TTL constant, store,
+# _clear() hook, store-only-on-success, list()-copy} pattern is now extracted
+# into dashboard.data.mcp_fanout.TTLCache (this task).  app._task_cards_cache
+# and merge_queue._task_titles_cache still implement the pattern inline —
+# extracting a shared helper there would require changes to those modules,
 # which fall outside this task's module lock.  Both caller caches are now
 # primarily redundant for MCP de-duplication (the 20 s inner TTL handles it);
 # they remain for legacy shaping-cost avoidance and are outside this task's
