@@ -647,13 +647,18 @@ async def aggregate_cost_summary(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_cost_summary` results from multiple databases.
 
     Token totals are summed component-wise; per-run costs are concatenated
     across DBs and a single global p95 is computed from the merged list.
+
+    *now* is resolved once and threaded identically to every per-DB call so
+    all queries share a single cutoff, closing the per-DB clock-skew race.
     """
-    results = await asyncio.gather(*(get_cost_summary(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_summary(db, days=days, now=now) for db in dbs))
     merged: dict[str, dict] = {}
     for result in results:
         for pid, info in result.items():
@@ -691,9 +696,11 @@ async def aggregate_cost_by_project(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, list[dict]]:
     """Merge :func:`get_cost_by_project` results from multiple databases."""
-    results = await asyncio.gather(*(get_cost_by_project(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_by_project(db, days=days, now=now) for db in dbs))
     merged: dict[str, list[dict]] = {}
     for result in results:
         for pid, models in result.items():
@@ -708,6 +715,7 @@ async def aggregate_cost_by_account(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_cost_by_account` across databases.
 
@@ -724,8 +732,12 @@ async def aggregate_cost_by_account(
 
     The paired ``resets_at`` travels with whichever of cap_hit / auth_failed
     is globally most recent. Spend/invocations/cap_events are summed.
+
+    *now* is resolved once and threaded identically to every per-DB call so
+    all queries share a single cutoff, closing the per-DB clock-skew race.
     """
-    results = await asyncio.gather(*(get_cost_by_account(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_by_account(db, days=days, now=now) for db in dbs))
     merged: dict[str, dict] = {}
     for result in results:
         for acct, info in result.items():
@@ -794,9 +806,11 @@ async def aggregate_cost_by_role(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_cost_by_role` results from multiple databases."""
-    results = await asyncio.gather(*(get_cost_by_role(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    results = await asyncio.gather(*(get_cost_by_role(db, days=days, now=now) for db in dbs))
     merged: dict[str, dict] = {}
     for result in results:
         for pid, roles in result.items():
@@ -838,10 +852,12 @@ async def aggregate_account_events(
     *,
     days: int = 7,
     limit: int = 200,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Merge :func:`get_account_events` from multiple databases."""
+    now = resolve_now(now)
     results = await asyncio.gather(
-        *(get_account_events(db, days=days, limit=limit) for db in dbs),
+        *(get_account_events(db, days=days, limit=limit, now=now) for db in dbs),
     )
     combined: list[dict] = []
     for result in results:
@@ -855,10 +871,12 @@ async def aggregate_run_cost_breakdown(
     *,
     days: int = 7,
     limit: int = 500,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Merge :func:`get_run_cost_breakdown` from multiple databases."""
+    now = resolve_now(now)
     results = await asyncio.gather(
-        *(get_run_cost_breakdown(db, days=days, limit=limit) for db in dbs),
+        *(get_run_cost_breakdown(db, days=days, limit=limit, now=now) for db in dbs),
     )
     combined: list[dict] = []
     for result in results:
