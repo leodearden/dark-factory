@@ -783,14 +783,21 @@ class UsageGate:
         logger.info(f'Account {acct.name}: firing auth re-probe')
         ok = await self._run_probe(acct)
         if ok:
-            acct.auth_failed = False
-            acct.auth_failed_at = None
-            logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
-            self._open.set()
-            if self._cost_store:
-                self._fire_cost_event(
-                    acct.name, 'auth_resumed', json.dumps({}),
-                )
+            if acct.phase == AccountPhase.AUTH_FAILED:
+                # _transition owns: the phase write, clearing auth_failed_at,
+                # and the centralized _open recompute. A phase mismatch here
+                # (e.g. SIGHUP's fan-out reprobing an account that was never
+                # auth_failed) is a pure no-op — mirrors the idempotency
+                # guards on _handle_cap_detected/_handle_auth_failure. The
+                # old unconditional field writes + event fire re-ran (and
+                # re-fired 'auth_resumed') on every successful call
+                # regardless of the account's current phase.
+                self._transition(acct, AccountPhase.AVAILABLE)
+                logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
+                if self._cost_store:
+                    self._fire_cost_event(
+                        acct.name, 'auth_resumed', json.dumps({}),
+                    )
         else:
             logger.info(
                 f'Account {acct.name}: auth re-probe failed — staying auth_failed',
@@ -1167,20 +1174,18 @@ class UsageGate:
         # safety-margin implications — see
         # test_probe_prefix_only_without_confirm_keyword_still_returns_false.
         #
-        # Demote auth_failed → capped on cap-prefix:
-        # An auth_failed account whose reprobe shows a cap-prefix is a 429
-        # misclassification we now correct in-flight (the cap-retry path
-        # already routes 429 to _handle_cap_detected on the entry side; this
-        # closes the recovery gap for accounts marked auth_failed before that
-        # routing landed, and for any provider whose error body conflates
-        # auth + cap).
+        # Demote auth_failed → capped on cap-prefix: an auth_failed account
+        # whose reprobe shows a cap-prefix is a 429 misclassification we
+        # correct in-flight via the single legal AUTH_FAILED -> CAPPED edge
+        # (see _LEGAL_TRANSITIONS) rather than leaving it on the
+        # longer-cadence auth-reprobe loop.
         for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
             for prefix in prefixes:
                 if prefix.lower() in combined.lower():
                     logger.info(
                         f'Account {acct.name}: probe got cap message: {prefix}',
                     )
-                    if acct.auth_failed:
+                    if acct.phase == AccountPhase.AUTH_FAILED:
                         resets_at = _parse_resets_at(combined)
                         reason = (
                             _extract_cap_message(combined, prefix)
@@ -1190,27 +1195,30 @@ class UsageGate:
                             f'Account {acct.name}: auth-reprobe saw cap '
                             f'message — demoting auth_failed → capped'
                         )
-                        # Cancel the auth-reprobe task BEFORE _handle_cap_detected
-                        # so a stray reprobe iteration doesn't race the new
-                        # account-resume probe loop. The current call IS the
-                        # auth-reprobe loop; calling cancel() on its task will
-                        # take effect at the next suspension point.
+                        # Cancel + clear the stale auth-reprobe task now (the
+                        # current call IS that task; cancel() only takes
+                        # effect at its next suspension point, so the field
+                        # is cleared explicitly here rather than left to
+                        # settle asynchronously).
                         if (
                             acct.auth_reprobe_task is not None
                             and not acct.auth_reprobe_task.done()
                         ):
                             acct.auth_reprobe_task.cancel()
                         acct.auth_reprobe_task = None
-                        # _handle_cap_detected sets capped=True, clears
-                        # auth_failed implicitly via the all-blocked invariant
-                        # check (still-pending), fires the cost event, and
-                        # starts the account-resume probe loop. We clear
-                        # auth_failed here explicitly so the all-blocked
-                        # invariant doesn't double-flip (capped + auth_failed
-                        # would mis-render in the dashboard).
-                        acct.auth_failed = False
-                        acct.auth_failed_at = None
-                        self._handle_cap_detected(reason, resets_at, acct.token)
+                        # resets_at is persisted here (mirrors
+                        # _handle_cap_detected) — _transition only threads
+                        # resets_at into the cap_hit cost-event details, it
+                        # does not write acct.resets_at itself.
+                        acct.resets_at = resets_at
+                        # _transition owns: the phase write, clearing
+                        # auth_failed_at, starting the account-resume probe
+                        # loop, the cap_hit cost event, and the centralized
+                        # _open recompute.
+                        self._transition(
+                            acct, AccountPhase.CAPPED,
+                            resets_at=resets_at, reason=reason,
+                        )
                     return False
 
         if proc.returncode != 0:
