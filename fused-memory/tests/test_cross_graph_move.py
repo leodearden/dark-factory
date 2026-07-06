@@ -695,6 +695,7 @@ class TestMergeForeignDuplicate:
         assert delete_params.get('uuid') == NODE_UUID_FIXTURE
 
         # (c) no edge lost, none double-counted.
+        assert isinstance(result, MergeResult)
         assert result.home_edge_count_before == 2
         assert result.edges_recreated == 1
         assert result.home_edge_count_after == 3
