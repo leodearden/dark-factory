@@ -152,13 +152,20 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
 )
 
 # Per-actor transition table. ORCHESTRATOR/ESCALATION/DETERMINISTIC/HUMAN all
-# get the full union (safe-open default, D5) for now — RECONCILIATION's
-# restricted subset is added by impl-actor-restriction.
+# get the full union (safe-open default, D5).
 TRANSITIONS: dict[ActorClass, frozenset[tuple[TaskStatus, TaskStatus]]] = {
     ActorClass.ORCHESTRATOR: _UNION,
     ActorClass.ESCALATION: _UNION,
     ActorClass.DETERMINISTIC: _UNION,
     ActorClass.HUMAN: _UNION,
+    # The ONLY actor-specific restriction (task-1655, D5): reconciliation
+    # must never mutate a live/claimed in-progress task. The
+    # live_workflow_status_write guard (task_knowledge_sync.py:521/2996)
+    # actively blocks recon status writes on an in-progress task at
+    # runtime — this is that restriction's pure-table mirror: the union
+    # minus every (in-progress, *) pair. Finer actor granularity beyond
+    # this one rule is deferred to the production soak (Open Question 4).
+    ActorClass.RECONCILIATION: frozenset(p for p in _UNION if p[0] != TaskStatus.IN_PROGRESS),
 }
 
 
