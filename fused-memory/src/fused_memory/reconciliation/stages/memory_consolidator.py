@@ -33,6 +33,9 @@ from fused_memory.reconciliation.flag_dedup import (
 )
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.recon_pool_map import (
+    STAGE1_CYCLE_SUMMARY_RECON_POOL as _STAGE1_CYCLE_SUMMARY_RECON_POOL,
+)
 from fused_memory.reconciliation.stage1_stall_detector import (
     compute_stalled_task_ids,
     extract_human_operator_task_ids,
@@ -56,10 +59,11 @@ logger = logging.getLogger(__name__)
 # Stage 1 per-cycle summary pool cap and related constants (task 1942).
 # Mirrors Stage 2's cycle-summary pool cap (task 1657 + trim-then-write, task
 # 1831): every per-cycle summary add_memory call is tagged
-# recon_pool='stage1_cycle_summary' (producer contract: Stage 1 prompt).
+# recon_pool='stage1_cycle_summary' (producer contract: Stage 1 prompt) —
+# _STAGE1_CYCLE_SUMMARY_RECON_POOL is imported above from the shared leaf
+# module recon_pool_map.py (task 2140), not redefined here.
 # MemoryConsolidator.run() pre-trims the pool to cap-1 BEFORE the agent write
 # via the shared reconciliation.summary_pool core.
-_STAGE1_CYCLE_SUMMARY_RECON_POOL = 'stage1_cycle_summary'
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 

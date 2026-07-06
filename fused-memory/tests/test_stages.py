@@ -13936,11 +13936,17 @@ class TestStage1CycleSummaryPoolTrim:
         assert STAGE1_CYCLE_SUMMARY_POOL_CAP == 2
 
     def test_stage1_cycle_summary_recon_pool_constant(self):
+        from fused_memory.reconciliation.recon_pool_map import (
+            STAGE1_CYCLE_SUMMARY_RECON_POOL,
+        )
         from fused_memory.reconciliation.stages.memory_consolidator import (
             _STAGE1_CYCLE_SUMMARY_RECON_POOL,
         )
 
         assert _STAGE1_CYCLE_SUMMARY_RECON_POOL == 'stage1_cycle_summary'
+        # Identity, not just equality: the stage constant is an alias of the
+        # shared leaf-module constant, not a re-defined duplicate (task 2140).
+        assert _STAGE1_CYCLE_SUMMARY_RECON_POOL is STAGE1_CYCLE_SUMMARY_RECON_POOL
 
     @pytest.mark.asyncio
     async def test_stat_set_to_trimmed_count_when_pool_over_cap(self, mock_deps):
@@ -15773,4 +15779,57 @@ class TestTaskKnowledgeSyncStage2FlagMarkersAcknowledgedStat:
         assert call_args[4] == [], (
             'a previous run\'s leftover _stage2_combined_flags must not be '
             f'visible to this run\'s join; got {call_args[4]!r}'
+        )
+
+
+class TestReconPoolMapImportOrder:
+    """Task 2140: recon_pool_map.py is a leaf module reachable from
+    reconciliation.stages.memory_consolidator without going through
+    fused_memory.services.
+
+    Before task 2140 the stage constants were duplicated (instead of
+    imported from services.memory_service) specifically because importing
+    them from memory_service, in a process that imports
+    reconciliation.stages.memory_consolidator BEFORE anything under
+    fused_memory.services has run, raised "ImportError: cannot import name
+    ... from partially initialized module ... (most likely due to a
+    circular import)" — memory_consolidator -> task_knowledge_sync ->
+    services.live_workflow_detector -> services/__init__ -> memory_service.
+    This test reproduces that exact entry order in a fresh subprocess (so no
+    other test's import side effects can mask the ordering) and asserts it
+    now succeeds, because recon_pool_map.py imports nothing from
+    fused_memory.
+    """
+
+    def test_memory_consolidator_importable_before_services(self):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                '-c',
+                (
+                    'import fused_memory.reconciliation.stages.memory_consolidator\n'
+                    'import fused_memory.services\n'
+                    'from fused_memory.reconciliation.stages.memory_consolidator import (\n'
+                    '    _STAGE1_CYCLE_SUMMARY_RECON_POOL,\n'
+                    ')\n'
+                    'from fused_memory.services.memory_service import (\n'
+                    '    _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,\n'
+                    ')\n'
+                    'assert (\n'
+                    "    _CYCLE_SUMMARY_STAGE_TO_RECON_POOL['memory_consolidator']\n"
+                    '    is _STAGE1_CYCLE_SUMMARY_RECON_POOL\n'
+                    ')\n'
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            'importing reconciliation.stages.memory_consolidator before '
+            'fused_memory.services must not raise a circular-import error; '
+            f'stderr:\n{result.stderr}'
         )

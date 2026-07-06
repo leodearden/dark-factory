@@ -4594,8 +4594,24 @@ class TestReconPoolAutoTag:
         assert _infer_recon_pool({}) is None
 
     def test_map_matches_canonical_per_stage_constants(self):
-        """Drift guard: the map's values must equal the per-stage canonical constants
-        that stage1/stage2 themselves emit, so the two copies can't silently diverge."""
+        """Sanity check: the per-stage constants and the map's values must be
+        the SAME object (identity) as the leaf-module source of truth
+        (recon_pool_map.py, task 2140) — i.e. every site aliases those
+        objects today rather than defining its own copy.
+
+        Caveat: 'stage1_cycle_summary' / 'stage2_cycle_summary' are
+        identifier-like literals that CPython typically interns, so `is`
+        can still hold even if a stage re-introduced its own literal
+        definition — this assertion alone does not prove duplication is
+        impossible. The real duplication guards are the
+        `== 'stage1_cycle_summary'` / `== 'stage2_cycle_summary'` pins on
+        the stage constants plus TestReconPoolMapImportOrder's fresh-
+        subprocess import-order check; this test only pins that today's
+        objects are aliased, not redefined."""
+        from fused_memory.reconciliation.recon_pool_map import (
+            STAGE1_CYCLE_SUMMARY_RECON_POOL,
+            STAGE2_CYCLE_SUMMARY_RECON_POOL,
+        )
         from fused_memory.reconciliation.stages.memory_consolidator import (
             _STAGE1_CYCLE_SUMMARY_RECON_POOL,
         )
@@ -4605,14 +4621,27 @@ class TestReconPoolAutoTag:
         from fused_memory.services.memory_service import (
             _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
         )
+        assert _STAGE1_CYCLE_SUMMARY_RECON_POOL is STAGE1_CYCLE_SUMMARY_RECON_POOL
+        assert _STAGE2_CYCLE_SUMMARY_RECON_POOL is STAGE2_CYCLE_SUMMARY_RECON_POOL
         assert (
             _CYCLE_SUMMARY_STAGE_TO_RECON_POOL['memory_consolidator']
-            == _STAGE1_CYCLE_SUMMARY_RECON_POOL
+            is _STAGE1_CYCLE_SUMMARY_RECON_POOL
         )
         assert (
             _CYCLE_SUMMARY_STAGE_TO_RECON_POOL['task_knowledge_sync']
-            == _STAGE2_CYCLE_SUMMARY_RECON_POOL
+            is _STAGE2_CYCLE_SUMMARY_RECON_POOL
         )
+
+    def test_map_is_the_shared_recon_pool_map_object(self):
+        """_CYCLE_SUMMARY_STAGE_TO_RECON_POOL is imported from, not a copy of,
+        the leaf module's canonical dict (task 2140)."""
+        from fused_memory.reconciliation.recon_pool_map import (
+            CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+        )
+        from fused_memory.services.memory_service import (
+            _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+        )
+        assert _CYCLE_SUMMARY_STAGE_TO_RECON_POOL is CYCLE_SUMMARY_STAGE_TO_RECON_POOL
 
 
 class TestMissingCycleSummaryKeys:
