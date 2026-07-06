@@ -163,7 +163,12 @@ _BG_LOOP_FAILURE_BACKOFF_SECS: float = 60.0
 # task 2074): the runner's own sentinel role for deploy infra_issue escalations,
 # plus this sweep's own role so a previously-unconfirmed L1 it filed self-heals
 # once the unit recovers.  Any other role (or category != 'infra_issue') is left
-# untouched — in particular milestone_gate escalations are NEVER auto-resolved.
+# untouched — in particular milestone_gate escalations are NEVER auto-resolved
+# by Source B while the subject task remains live.  (Source C — task 2114,
+# see _revalidate_open_l2 below — is a separate, later mechanism that DOES
+# close a milestone_gate/design_concern/etc. L2 once its SUBJECT task goes
+# terminal; that is a deliberate, category-agnostic broadening, not a
+# contradiction of this guarantee.)
 _DETERMINISTIC_ESCALATION_SENTINEL_ROLES: frozenset[str] = frozenset({
     'orchestrator-deterministic',
     'harness-deterministic-recon-sweep',
@@ -7860,6 +7865,19 @@ Output JSON matching the schema. Every task must appear in the output.
         still-live task) for a human to triage, per this task's conservatism
         requirement.
 
+        Category-agnostic BY DESIGN (task 2114 design_decisions[3] in
+        .task/plan.json): this closes a terminal-subject L2 regardless of
+        ``category``, INCLUDING human-decision categories such as
+        ``milestone_gate`` and ``design_concern``.  Confirmed during the
+        2114 review pass rather than left implicit: once the SUBJECT task
+        itself has gone ``done``/``cancelled`` there is by construction
+        nothing left for a human to gate — a cancelled task cannot proceed
+        no matter what the pending decision was, and a done task already
+        completed via some other path — so the open L2 no longer blocks
+        anything real. This is distinct from (and does not affect) the
+        live-subject case, which always leaves the escalation open for a
+        human to triage.
+
         Returns True when the escalation was closed this call (the caller
         uses this to skip further per-item handling for the same escalation
         in the same pass), False otherwise.
@@ -7986,7 +8004,22 @@ Output JSON matching the schema. Every task must appear in the output.
         })
         if self.config.escalation_revalidation_enabled and l2_ids:
             try:
-                statuses, _err = await self.scheduler.get_statuses(l2_ids)
+                statuses, statuses_err = await self.scheduler.get_statuses(l2_ids)
+                if statuses_err is not None:
+                    # get_statuses never raises on failure — it returns
+                    # ({}, exception) — so this is the ONLY signal that
+                    # distinguishes "no L2 subjects are terminal" (a genuine
+                    # no-op pass) from "the status read itself failed"
+                    # (statuses is already {} either way; log so an
+                    # operator can tell the two apart instead of Source C
+                    # silently closing nothing every pass).
+                    logger.info(
+                        'Deterministic-recon-sweep: Source-C get_statuses '
+                        'returned a resolver error for %d L2 escalation(s) '
+                        '(degrading to no terminal statuses this pass): '
+                        '%s: %s',
+                        len(l2_ids), type(statuses_err).__name__, statuses_err,
+                    )
             except Exception as exc:
                 logger.error(
                     'Deterministic-recon-sweep: Source-C get_statuses failed '
