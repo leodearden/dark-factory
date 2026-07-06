@@ -14,6 +14,7 @@ strict ``__all__`` union assertion untouched).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -25,6 +26,7 @@ __all__ = [
     'MemoryHints',
     'RetryLedger',
     'TaskMetadata',
+    'apply_migrations',
     'register_metadata_submodel',
 ]
 
@@ -193,3 +195,70 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
     if existing is not None and existing is not model:
         raise ValueError(f'metadata sub-model already registered for {key!r}')
     _SUBMODEL_REGISTRY[key] = model
+
+
+def _normalize_legacy_memory_hints(value: object) -> object:
+    """Coerce a legacy list-of-dicts ``memory_hints`` value to canonical dict shape.
+
+    Ported verbatim from fused-memory's ``_normalize_legacy_memory_hints_value``
+    (``sqlite_task_backend.py:1320``) so ~2100 historical tasks upgrade
+    identically: ``entities``/``queries`` are deduped *independently*
+    (first-seen order, not per-pair), non-dict items and entries with
+    missing/empty/non-string ``entity``/``query`` are skipped, and any
+    non-list input (already-canonical dict, scalar, None) passes through
+    unchanged.
+    """
+    if not isinstance(value, list):
+        return value
+    entities: list[str] = []
+    queries: list[str] = []
+    seen_entities: set[str] = set()
+    seen_queries: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        entity = item.get('entity')
+        if isinstance(entity, str) and entity and entity not in seen_entities:
+            entities.append(entity)
+            seen_entities.add(entity)
+        query = item.get('query')
+        if isinstance(query, str) and query and query not in seen_queries:
+            queries.append(query)
+            seen_queries.add(query)
+    return {'entities': entities, 'queries': queries}
+
+
+def _migrate_v0_to_v1(blob: dict) -> dict:
+    """v0->v1: normalize a legacy list-shaped ``memory_hints`` and stamp ``schema_version=1``."""
+    upgraded = dict(blob)
+    if 'memory_hints' in upgraded:
+        upgraded['memory_hints'] = _normalize_legacy_memory_hints(upgraded['memory_hints'])
+    upgraded['schema_version'] = 1
+    return upgraded
+
+
+# Versioned migration registry, keyed by SOURCE schema_version. apply_migrations
+# chains through this until the blob's schema_version has no registered migration
+# (i.e. it is current).
+_MIGRATIONS: dict[int, Callable[[dict], dict]] = {
+    0: _migrate_v0_to_v1,
+}
+
+
+def apply_migrations(blob: dict) -> dict:
+    """Upgrade *blob* through the registered migration chain to the current schema version.
+
+    Non-mutating: the caller's ``blob`` is never modified in place — each
+    step operates on (and returns) its own shallow copy.
+    """
+    upgraded = dict(blob)
+    current = upgraded.get('schema_version', 0)
+    while current in _MIGRATIONS:
+        upgraded = _MIGRATIONS[current](upgraded)
+        new_version = upgraded.get('schema_version', current)
+        if new_version == current:
+            # Safety net: a misconfigured migration that forgets to bump
+            # schema_version would otherwise loop forever.
+            break
+        current = new_version
+    return upgraded
