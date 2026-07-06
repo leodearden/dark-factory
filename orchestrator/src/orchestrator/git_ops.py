@@ -2133,6 +2133,60 @@ class GitOps:
             )
             return 127
 
+    async def warm_lane_ref_is_degenerate(self, task_id: str) -> bool:
+        """Invoke reify's ``<project_root>/scripts/warm-lane-degenerate-ref-check.sh``.
+
+        Task 2112: wraps reify's read-only classifier primitive (contract in
+        reify ``docs/design/warm-lane-degenerate-ref-seam.md``, reify task
+        5006) so callers can ask "is task <task_id>'s branch ref degenerate
+        (zero commits over main AND the tip does not cite this task)?"
+        without duplicating the git plumbing. Mirrors the
+        ``_run_warm_lane_disk_guard`` / ``_run_warm_lane_gc_reclaim``
+        invocation pattern.
+
+        Single-ref exit-code taxonomy (per the reify contract):
+            0 — degenerate (count==0 over main AND tip does NOT cite
+                task_id) — skip/prune-safe.
+            1 — live.
+            2 — usage error.
+            3 — structural error.
+            4 — landed (count==0 over main AND tip DOES cite task_id).
+            5 — absent (ref does not exist).
+
+        **FAIL-SOFT contract**: returns True ONLY on exit 0. An absent
+        script, any other exit code (1/2/3/4/5/other), or any exception all
+        return False — so on any doubt this is a no-op and existing
+        behaviour is preserved. Read-only; never mutates refs. Never raises.
+        """
+        try:
+            script = self.project_root / 'scripts' / 'warm-lane-degenerate-ref-check.sh'
+            if not script.exists():
+                logger.debug(
+                    'warm_lane_ref_is_degenerate: script absent at %s — no-op', script,
+                )
+                return False
+            cmd = [
+                str(script),
+                '--task', str(task_id),
+                '--main-ref', self.config.main_branch,
+                '--branch-prefix', self.config.branch_prefix,
+                '--repo', str(self.project_root),
+            ]
+            rc, _, err = await _run(cmd, cwd=self.project_root)
+            if rc != 0:
+                logger.debug(
+                    'warm_lane_ref_is_degenerate: script exited %d for task %s '
+                    '(stderr=%r) — treating as not-degenerate',
+                    rc, task_id, err,
+                )
+            return rc == 0
+        except Exception:
+            logger.warning(
+                'warm_lane_ref_is_degenerate: unexpected error for task %s',
+                task_id, exc_info=True,
+            )
+            return False
+
     async def _warm_lane_disk_admission_blocked(self) -> bool:
         """Run the ε disk-pressure admission check: check → reclaim → recheck.
 
@@ -2860,6 +2914,29 @@ class GitOps:
                         cwd=self.project_root,
                     )
                     await self.warm_lane_pool.release(lane)
+                    # Task 2112 / angle A-2 — delete the degenerate task-branch
+                    # ref residue. `git worktree add -b full_branch <lane>
+                    # start_ref` (above) already created full_branch — often
+                    # at a foreign 'Merge task/<other> into main' commit — and
+                    # `git worktree remove --force` only drops the worktree
+                    # directory, leaving that zero-commit branch ref parked.
+                    # Gated on the read-only primitive (fail-soft False on any
+                    # doubt); _delete_branch_if_on_main is a second guard that
+                    # retains (never deletes) any branch carrying commits
+                    # beyond main. Scoped to this create-once seed-fault path
+                    # only — the reattach/reuse paths deliberately retain
+                    # commit-bearing branches and are untouched.
+                    # Task 2112 amendment: `branch_name` here is acquire_warm_lane's
+                    # own parameter — the BARE task id, e.g. '321', NOT the
+                    # prefixed `full_branch` ('task/321'). warm_lane_ref_is_degenerate
+                    # forwards it verbatim as `--task <branch_name>`, which is the
+                    # flag the reify script expects. Passing full_branch here would
+                    # silently misclassify (the script would look up a ref literally
+                    # named 'task/task/321').
+                    if await self.warm_lane_ref_is_degenerate(branch_name):
+                        await self._delete_branch_if_on_main(
+                            full_branch, context='acquire_warm_lane seed-fault',
+                        )
                     return _seed_rc_to_unavailable(seed_rc)
             else:
                 # ── Already-registered lane — check on-disk backstop first ─

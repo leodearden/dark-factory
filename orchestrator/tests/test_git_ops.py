@@ -9122,3 +9122,127 @@ class TestAcquireWarmLaneOrphanedReuseGuard:
             'previously-uncommitted WIP must be recoverable on task/R '
             "(committed by _reuse_warm_lane's commit() after repair)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 2112 step-1/2 — GitOps.warm_lane_ref_is_degenerate unit tests
+# ---------------------------------------------------------------------------
+
+
+def _write_degenerate_ref_check_stub(scripts_dir: Path) -> None:
+    """Write a warm-lane-degenerate-ref-check.sh stub into scripts_dir.
+
+    Mirrors the disk-guard stub-script pattern in
+    test_warm_lane_disk_guard.py: appends the full argv (one line) to
+    ``<repo>/.test_degenerate_ref_call_log`` and exits with the code read
+    from ``<repo>/.test_degenerate_ref_exit`` (defaults to 0 when absent).
+    """
+    script = scripts_dir / 'warm-lane-degenerate-ref-check.sh'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -euo pipefail\n'
+        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'ROOT="$(dirname "$DIR")"\n'
+        'echo "$*" >> "$ROOT/.test_degenerate_ref_call_log"\n'
+        'if [ -f "$ROOT/.test_degenerate_ref_exit" ]; then\n'
+        '    rc=$(cat "$ROOT/.test_degenerate_ref_exit")\n'
+        'else\n'
+        '    rc=0\n'
+        'fi\n'
+        'exit "${rc:-0}"\n'
+    )
+    script.chmod(0o755)
+
+
+def _set_degenerate_ref_exit(repo: Path, code: int) -> None:
+    """Set the exit code the stub script will return on its next invocation."""
+    (repo / '.test_degenerate_ref_exit').write_text(str(code))
+
+
+def _read_degenerate_ref_call_log(repo: Path) -> list[str]:
+    log = repo / '.test_degenerate_ref_call_log'
+    if not log.exists():
+        return []
+    return [line for line in log.read_text().splitlines() if line.strip()]
+
+
+@pytest.mark.asyncio
+class TestWarmLaneRefIsDegenerate:
+    """Unit tests for GitOps.warm_lane_ref_is_degenerate (task 2112 step-2).
+
+    Wraps reify's read-only classifier script
+    ``scripts/warm-lane-degenerate-ref-check.sh``: exit 0 (degenerate) is the
+    ONLY code that yields True; every other documented exit (1=live,
+    4=landed, 5=absent) plus an absent script must fail-soft to False.
+    """
+
+    async def test_absent_script_returns_false(self, git_ops: GitOps):
+        """No scripts/ dir at all (fresh git_repo fixture) → fail-soft False."""
+        assert await git_ops.warm_lane_ref_is_degenerate('123') is False
+
+    async def test_exit_0_returns_true(self, git_ops: GitOps, git_repo: Path):
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_degenerate_ref_check_stub(scripts_dir)
+        _set_degenerate_ref_exit(git_repo, 0)
+
+        assert await git_ops.warm_lane_ref_is_degenerate('123') is True
+
+    @pytest.mark.parametrize('rc', [1, 4, 5])
+    async def test_nonzero_exit_returns_false(
+        self, git_ops: GitOps, git_repo: Path, rc: int,
+    ):
+        """rc=1 (live), rc=4 (landed), rc=5 (absent) all fail-soft to False."""
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_degenerate_ref_check_stub(scripts_dir)
+        _set_degenerate_ref_exit(git_repo, rc)
+
+        assert await git_ops.warm_lane_ref_is_degenerate('123') is False
+
+    async def test_invokes_expected_argv(self, git_ops: GitOps, git_repo: Path):
+        """Invoked argv carries --task/--main-ref/--branch-prefix/--repo."""
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_degenerate_ref_check_stub(scripts_dir)
+        _set_degenerate_ref_exit(git_repo, 0)
+
+        await git_ops.warm_lane_ref_is_degenerate('456')
+
+        [line] = _read_degenerate_ref_call_log(git_repo)
+        assert '--task 456' in line
+        assert '--main-ref main' in line
+        assert '--branch-prefix task/' in line
+        assert f'--repo {git_repo}' in line
+
+    async def test_run_exception_returns_false(
+        self, git_ops: GitOps, git_repo: Path, caplog,
+    ):
+        """The except-Exception branch of the fail-soft contract.
+
+        An unexpected exception from ``_run`` (e.g. an OS-level exec
+        failure) must fail-soft to False — never raise — and log a
+        WARNING, mirroring ``_run_warm_lane_disk_guard``'s exception
+        handling.
+        """
+        scripts_dir = git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        _write_degenerate_ref_check_stub(scripts_dir)
+        _set_degenerate_ref_exit(git_repo, 0)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+            patch('orchestrator.git_ops._run', side_effect=RuntimeError('boom')),
+        ):
+            result = await git_ops.warm_lane_ref_is_degenerate('789')
+
+        assert result is False, (
+            'an exception from _run must fail-soft to False, never raise'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'warm_lane_ref_is_degenerate' in r.getMessage() for r in warnings
+        ), (
+            f'Expected a WARNING log on the exception path, got: '
+            f'{[r.getMessage() for r in warnings]}'
+        )

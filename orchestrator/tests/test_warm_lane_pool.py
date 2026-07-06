@@ -10,6 +10,7 @@ Step-5: RED — GitOps._seed_warm_lane absent.
 import asyncio
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1156,6 +1157,120 @@ class TestAcquireWarmLaneCreateOnce:
         info = await git_ops.acquire_warm_lane('task-A', start_ref)
         assert info is WarmLaneUnavailable.FAULT, (
             f'Expected WarmLaneUnavailable.FAULT for absent seed script, got {info!r}'
+        )
+
+    async def test_acquire_seed_fault_deletes_degenerate_branch_via_primitive(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Task 2112 angle A/2: create-once seed-fault teardown deletes the
+        just-created degenerate branch ref when the primitive is certain.
+
+        ``git worktree add -b task/<id>`` succeeds (creating the branch at
+        start_ref), then the seed faults (no seed-warm-lane.sh committed —
+        rc=127). The pre-existing teardown removes the WORKTREE but leaves
+        the zero-commit branch ref parked. With warm_lane_ref_is_degenerate
+        mocked True (primitive says degenerate), the branch ref must now be
+        deleted too.
+        """
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=True)
+
+        info = await git_ops.acquire_warm_lane('321', start_ref)
+        assert info is WarmLaneUnavailable.FAULT, (
+            f'Expected WarmLaneUnavailable.FAULT for absent seed script, got {info!r}'
+        )
+
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/321'], cwd=wl_git_repo,
+        )
+        assert rc != 0, (
+            'degenerate task-branch ref must be deleted after seed-fault '
+            'teardown when the primitive says degenerate'
+        )
+
+    async def test_acquire_seed_fault_retains_branch_when_primitive_says_not_degenerate(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Precision companion: primitive False (or absent-script fail-soft
+        default) → seed-fault teardown behaves exactly as before — the
+        branch ref is retained, not deleted.
+        """
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)
+
+        info = await git_ops.acquire_warm_lane('322', start_ref)
+        assert info is WarmLaneUnavailable.FAULT, (
+            f'Expected WarmLaneUnavailable.FAULT for absent seed script, got {info!r}'
+        )
+
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/322'], cwd=wl_git_repo,
+        )
+        assert rc == 0, (
+            'branch ref must be retained when the primitive says not-degenerate '
+            '(fail-soft default preserves current behaviour)'
+        )
+
+    async def test_acquire_seed_fault_retains_branch_with_commits_despite_primitive_true(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """Second-guard precision: a branch with real commits beyond main
+        must survive even when the primitive reports degenerate=True.
+
+        ``_delete_branch_if_on_main`` (git_ops.py:2924's "second guard"
+        comment) independently checks ``_branch_has_commits_beyond_main``
+        and refuses to delete a branch that carries WIP, regardless of what
+        ``warm_lane_ref_is_degenerate`` reports. The seed script here commits
+        to the lane's branch before faulting, simulating partial work landed
+        prior to the failure, so this exercises that structural guard rather
+        than relying solely on the (mocked) primitive being correct.
+        """
+        scripts_dir = wl_git_repo / 'scripts'
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        seed_script = scripts_dir / 'seed-warm-lane.sh'
+        seed_script.write_text(
+            '#!/usr/bin/env bash\n'
+            '# argv: <base_target> <lane_dir> <mode>\n'
+            'set -e\n'
+            'LANE_DIR="$2"\n'
+            'echo "wip" > "$LANE_DIR/wip_file.txt"\n'
+            'git -C "$LANE_DIR" add wip_file.txt\n'
+            'git -C "$LANE_DIR" commit -m "wip before fault" --quiet\n'
+            'exit 1\n'
+        )
+        seed_script.chmod(0o755)
+        await _run(['git', 'add', '-A'], cwd=wl_git_repo)
+        await _run(
+            ['git', 'commit', '-m', 'add committing-then-faulting seed script'],
+            cwd=wl_git_repo,
+        )
+
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=2)
+        _, start_ref, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wl_git_repo)
+        start_ref = start_ref.strip()
+
+        # Primitive says degenerate — but the branch actually carries a real
+        # commit beyond main, so the second guard must retain it anyway.
+        git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=True)
+
+        info = await git_ops.acquire_warm_lane('323', start_ref)
+        assert info is WarmLaneUnavailable.FAULT, (
+            f'Expected WarmLaneUnavailable.FAULT for faulting seed script, got {info!r}'
+        )
+
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', 'task/323'], cwd=wl_git_repo,
+        )
+        assert rc == 0, (
+            'branch ref carrying a real commit beyond main must be retained '
+            'even when warm_lane_ref_is_degenerate reports True — '
+            '_delete_branch_if_on_main is a second, independent guard'
         )
 
     async def test_acquire_create_once_seed_disk_pressure_returns_disk_pressure(
