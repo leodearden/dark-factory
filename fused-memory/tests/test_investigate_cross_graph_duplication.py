@@ -352,3 +352,83 @@ class TestClassifyConfigRouting:
         verdict = _mod.classify_config_routing(self.NO_COLLISIONS, [])
 
         assert set(verdict.keys()) == {'confirmed', 'signals', 'rationale'}
+
+
+# ===========================================================================
+# Tests: build_investigation_report
+# ===========================================================================
+
+class TestBuildInvestigationReport:
+    """Tests for build_investigation_report(target_uuid, all_graphs, presence,
+    collision_result, verdict) -> dict."""
+
+    def test_report_shape_and_passthrough_fields(self):
+        """Every input is threaded through to its corresponding report key,
+        with graph_count derived from len(all_graphs)."""
+        target_uuid = 'f02a32ea-0efd-4865-94b4-97a412d8ffda'
+        all_graphs = ['reify', 'dark_factory', 'know_live']
+        presence = [
+            {'graph': 'reify', 'uuid': target_uuid, 'name': 'orchestrator', 'group_id': 'reify'},
+            {'graph': 'dark_factory', 'uuid': target_uuid, 'name': 'orchestrator', 'group_id': 'reify'},
+        ]
+        collision_result = {'collisions': [], 'suspected_path_leaks': []}
+        verdict = {'confirmed': True, 'signals': ['cross_graph_node_leak'], 'rationale': 'because'}
+
+        report = _mod.build_investigation_report(
+            target_uuid, all_graphs, presence, collision_result, verdict,
+        )
+
+        assert report['target_uuid'] == target_uuid
+        assert report['all_graphs'] == all_graphs
+        assert report['graph_count'] == 3
+        assert report['present_in'] == presence
+        assert report['collision_groups'] == collision_result['collisions']
+        assert report['suspected_path_leaks'] == collision_result['suspected_path_leaks']
+        assert report['verdict'] == verdict
+
+    def test_scope_is_single_node_when_no_collisions_or_leaks(self):
+        """No collisions and no path leaks -> scope='single_node'."""
+        collision_result = {'collisions': [], 'suspected_path_leaks': []}
+        verdict = {'confirmed': False, 'signals': [], 'rationale': 'none'}
+
+        report = _mod.build_investigation_report('u1', ['reify'], [], collision_result, verdict)
+
+        assert report['scope'] == 'single_node'
+
+    def test_scope_is_systemic_when_collisions_present(self):
+        """Non-empty collisions -> scope='systemic'."""
+        collision_result = {
+            'collisions': [
+                {'canonical': 'dark_factory', 'variants': ['dark-factory', 'dark_factory'], 'count': 2},
+            ],
+            'suspected_path_leaks': [],
+        }
+        verdict = {'confirmed': True, 'signals': ['name_normalization_collision'], 'rationale': 'x'}
+
+        report = _mod.build_investigation_report(
+            'u1', ['dark_factory', 'dark-factory'], [], collision_result, verdict,
+        )
+
+        assert report['scope'] == 'systemic'
+
+    def test_scope_is_systemic_when_path_leaks_present(self):
+        """Non-empty suspected_path_leaks -> scope='systemic'."""
+        collision_result = {'collisions': [], 'suspected_path_leaks': ['-home-leo-src-dark-factory']}
+        verdict = {'confirmed': True, 'signals': ['suspected_path_leak'], 'rationale': 'x'}
+
+        report = _mod.build_investigation_report(
+            'u1', ['-home-leo-src-dark-factory'], [], collision_result, verdict,
+        )
+
+        assert report['scope'] == 'systemic'
+
+    def test_pure_no_io_referentially_stable(self):
+        """Calling twice with identical inputs returns equal dicts (pure,
+        no I/O, no hidden mutable state between calls)."""
+        collision_result = {'collisions': [], 'suspected_path_leaks': []}
+        verdict = {'confirmed': False, 'signals': [], 'rationale': 'none'}
+
+        r1 = _mod.build_investigation_report('u1', ['reify'], [], collision_result, verdict)
+        r2 = _mod.build_investigation_report('u1', ['reify'], [], collision_result, verdict)
+
+        assert r1 == r2
