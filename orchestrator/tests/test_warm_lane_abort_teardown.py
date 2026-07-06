@@ -95,3 +95,40 @@ async def _get_head(repo: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
     assert rc == 0, f'git rev-parse HEAD failed (rc={rc})'
     return out.strip()
+
+
+# ---------------------------------------------------------------------------
+# _abort_lane_acquisition — detach + pool-release core (steps 1-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAbortLaneAcquisitionDetachAndRelease:
+    """_abort_lane_acquisition: HEAD-detach + pool-release core contract."""
+
+    async def test_abort_remove_worktree_false_detaches_and_frees(
+        self, git_repo: Path,
+    ):
+        """remove_worktree=False: HEAD detaches, pool slot frees, worktree retained."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        info = await git_ops.acquire_warm_lane('X', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+
+        await git_ops._abort_lane_acquisition(info.path, 'X', remove_worktree=False)
+
+        _, branch, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=info.path,
+        )
+        assert branch.strip() == 'HEAD', (
+            f'Expected detached HEAD after abort; got branch={branch.strip()!r}'
+        )
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE, (
+            'Pool slot must be FREE after abort'
+        )
+        assert await git_ops._is_registered_worktree(info.path), (
+            'remove_worktree=False must retain the worktree registration'
+        )
