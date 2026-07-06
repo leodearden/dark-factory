@@ -149,11 +149,13 @@ class TestMoveEntityAcrossGraphsNodeCore:
         """
         backend = make_backend(mock_config)
         source_mock = make_graph_mock()
-        # ro_query is called twice: (1) node scalar props, (2) this node's
-        # RELATES_TO edges (step-7/8) -- empty here, so no edge is recreated
-        # and the CREATE/embedding-read assertions below are unaffected.
+        # ro_query is called three times: (1) node scalar props, (2) this
+        # node's RELATES_TO edges (step-7/8), (3) its Episodic MENTIONS links
+        # (step-9/10) -- both empty here, so no edge/mention is recreated and
+        # the CREATE/embedding-read assertions below are unaffected.
         source_mock.ro_query = AsyncMock(side_effect=[
             MagicMock(result_set=[NODE_ROW_FIXTURE]),
+            MagicMock(result_set=[]),
             MagicMock(result_set=[]),
         ])
         target_mock = make_graph_mock()
@@ -171,7 +173,7 @@ class TestMoveEntityAcrossGraphsNodeCore:
 
         # (a) reads node props from source via ro_query, and the exact
         # name_embedding from source via the raw transport.
-        assert source_mock.ro_query.await_count == 2
+        assert source_mock.ro_query.await_count == 3
         read_params = extract_params(source_mock.ro_query.call_args_list[0])
         assert read_params.get('uuid') == NODE_UUID_FIXTURE
         fake_read_compact.assert_awaited_once()
@@ -227,6 +229,7 @@ class TestMoveEntityAcrossGraphsEdges:
         source_mock.ro_query = AsyncMock(side_effect=[
             MagicMock(result_set=[NODE_ROW_FIXTURE]),
             MagicMock(result_set=[EDGE_ROW_FIXTURE]),
+            MagicMock(result_set=[]),  # no MENTIONS links in this scenario (step-9/10)
         ])
         target_mock = make_graph_mock()
         backend._driver._get_graph = _route_graphs({
@@ -242,7 +245,7 @@ class TestMoveEntityAcrossGraphsEdges:
         )
 
         # edges are read from source via a second ro_query call
-        assert source_mock.ro_query.await_count == 2
+        assert source_mock.ro_query.await_count == 3
         edges_read_cypher = extract_cypher(source_mock.ro_query.call_args_list[1])
         assert 'RELATES_TO' in edges_read_cypher
         assert 'DISTINCT' in edges_read_cypher
@@ -270,3 +273,65 @@ class TestMoveEntityAcrossGraphsEdges:
         assert params.get('episodes') == ['episode-uuid-1']
 
         assert result.edges_moved == 1
+
+
+# ---------------------------------------------------------------------------
+# step-9: move_entity_across_graphs -- Episodic MENTIONS reattachment
+# ---------------------------------------------------------------------------
+
+EPISODE_UUID_FIXTURE = 'episode-dddd-4444'
+MENTION_UUID_FIXTURE = 'mention-eeee-5555'
+
+# (e.uuid, e.group_id, e.created_at, ep.uuid) -- a MENTIONS link from an
+# Episodic node onto the moved Entity node.
+MENTION_ROW_FIXTURE = [
+    MENTION_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, '2026-01-01T00:00:00+00:00', EPISODE_UUID_FIXTURE,
+]
+
+
+class TestMoveEntityAcrossGraphsMentions:
+    """S5 mentions reattachment: recreate the moved node's Episodic MENTIONS links."""
+
+    @pytest.mark.asyncio
+    async def test_recreates_mentions_link_for_episode(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        backend = make_backend(mock_config)
+        source_mock = make_graph_mock()
+        source_mock.ro_query = AsyncMock(side_effect=[
+            MagicMock(result_set=[NODE_ROW_FIXTURE]),
+            MagicMock(result_set=[]),  # no RELATES_TO edges in this scenario
+            MagicMock(result_set=[MENTION_ROW_FIXTURE]),
+        ])
+        target_mock = make_graph_mock()
+        backend._driver._get_graph = _route_graphs({
+            SOURCE_GRAPH_FIXTURE: source_mock,
+            TARGET_GRAPH_FIXTURE: target_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        result = await move_entity_across_graphs(
+            backend, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+        )
+
+        # MENTIONS links are read from source via a third ro_query call
+        assert source_mock.ro_query.await_count == 3
+        mentions_read_cypher = extract_cypher(source_mock.ro_query.call_args_list[2])
+        assert 'MENTIONS' in mentions_read_cypher
+        assert 'Episodic' in mentions_read_cypher
+
+        # target.query: (1) node CREATE, (2) mentions CREATE (no edges here)
+        assert target_mock.query.await_count == 2
+        mention_create_call = target_mock.query.call_args_list[1]
+        cypher = extract_cypher(mention_create_call)
+        params = extract_params(mention_create_call)
+        assert 'MENTIONS' in cypher
+        assert 'Episodic' in cypher
+        assert params.get('episode_uuid') == EPISODE_UUID_FIXTURE
+        assert params.get('entity_uuid') == NODE_UUID_FIXTURE
+        assert params.get('edge_uuid') == MENTION_UUID_FIXTURE
+        assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
+
+        assert result.mentions_moved == 1
