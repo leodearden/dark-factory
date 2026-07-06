@@ -248,6 +248,14 @@ NEAR_CAP_PREFIXES = [
     "You're close to",
 ]
 
+# Codex (OpenAI) cap-hit patterns. Copied from usage_gate.py:86 (CODEX_CAP_PATTERNS).
+CODEX_CAP_PATTERNS = ['usage limit reached', 'rate limit', 'quota exceeded',
+                      'insufficient_quota', 'rate_limit_exceeded']
+
+# Gemini (Google) cap-hit patterns. Copied from usage_gate.py:90 (GEMINI_CAP_PATTERNS).
+GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
+                       'RESOURCE_EXHAUSTED', 'quota_exceeded']
+
 
 def _extract_cap_message(text: str, prefix: str) -> str:
     """Extract the full sentence containing the cap-hit prefix."""
@@ -293,6 +301,18 @@ def classify_invocation(
     for marker in NON_CAP_CLI_ERROR_MARKERS:
         if marker in combined_lower:
             return CliLocalError(marker=marker)
+
+    # Backend-specific cap patterns checked first, ahead of the claude prefix
+    # logic below (mirrors usage_gate.py:386-397). Codex/Gemini error bodies
+    # don't carry a parseable reset time, so resets_at is always None here.
+    if backend == 'codex':
+        for pattern in CODEX_CAP_PATTERNS:
+            if pattern.lower() in combined_lower:
+                return CapHit(resets_at=None, reason=f'Codex cap hit: {pattern}')
+    elif backend == 'gemini':
+        for pattern in GEMINI_CAP_PATTERNS:
+            if pattern.lower() in combined_lower:
+                return CapHit(resets_at=None, reason=f'Gemini cap hit: {pattern}')
 
     # Claude cap/near-cap detection: require both a prefix match AND a
     # secondary confirmation keyword (defence against false positives on
