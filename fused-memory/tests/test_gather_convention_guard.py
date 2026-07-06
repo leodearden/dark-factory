@@ -75,7 +75,8 @@ class TestCapturedCancelledErrorPropagatesFromSummaryPool:
 SRC_ROOT = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
 ASYNC_UTILS_PATH = SRC_ROOT / 'utils' / 'async_utils.py'
 
-# (path-relative-to-src, enclosing-function-name) -> one-line justification.
+# (path-relative-to-src, enclosing-function-name) -> (expected site count,
+# one-line justification).
 #
 # Each entry is a deliberate teardown/drain site: an await on already-
 # scheduled asyncio.Task objects where a cancelled child is an EXPECTED drain
@@ -84,25 +85,39 @@ ASYNC_UTILS_PATH = SRC_ROOT / 'utils' / 'async_utils.py'
 # excluded from the gather_collect conversion (PRD
 # plans/fm-cancellederror-convention-prd.md, task γ, resolved design
 # decision 3).
-DRAIN_ALLOWLIST: dict[tuple[str, str], str] = {
+#
+# The key is (path, enclosing-function) only — it does not distinguish
+# between multiple distinct `gather(...)` calls inside the same function. The
+# expected-count guards against that: if an allowlisted function later grows
+# a SECOND `gather(..., return_exceptions=True)` call (e.g. a best-effort
+# collect sweep added alongside a genuine drain), the site count for that key
+# exceeds its expected count and the guard fails, forcing that new call to
+# get its own explicit review rather than silently inheriting the drain's
+# justification.
+DRAIN_ALLOWLIST: dict[tuple[str, str], tuple[int, str]] = {
     ('fused_memory/middleware/task_interceptor.py', 'drain'): (
+        1,
         'Fire-and-forget background-task shutdown drain; a cancelled child '
         'is an expected drain outcome and the drain must complete to '
         'guarantee cleanup.'
     ),
     ('fused_memory/middleware/task_interceptor.py', 'close'): (
+        1,
         'Per-project curator worker drain at interceptor close; same '
         'must-complete teardown semantics as drain().'
     ),
     ('fused_memory/services/durable_queue.py', 'close'): (
+        1,
         'Durable queue worker drain at close; cancelled workers are an '
         'expected shutdown outcome, not a failure to propagate.'
     ),
     ('fused_memory/reconciliation/harness.py', 'run_loop'): (
+        1,
         'Graceful-shutdown drain of per-project reconciliation loop tasks '
         'in the run_loop finally block.'
     ),
     ('fused_memory/server/main.py', 'run_server'): (
+        1,
         'Documented CancelledError-collection drain of the primary/recon '
         'server tasks before re-raising in run_server.'
     ),
@@ -177,21 +192,33 @@ class TestNoRawGatherReturnExceptionsOutsideHelperOrAllowlist:
     correctly ignored.
 
     Asserts the PROPERTY (no raw site outside helpers/allowlist), never a
-    hardcoded site count — this stays correct as sites are converted one
+    hardcoded TOTAL site count — this stays correct as sites are converted one
     file at a time (RED now; fully GREEN once the last recon site
     converts) and needs no edits when line numbers drift.
+
+    Each allowlisted (path, function) key does carry a small expected PER-KEY
+    site count (currently 1 for every entry, since each is a single-gather
+    function today). That count is enforced too: if a second, distinct
+    `gather(..., return_exceptions=True)` call later appears inside an
+    already-allowlisted function, it silently matches the same key unless the
+    count check catches it — so this test also fails in that case, naming the
+    function and the unexpected site count.
     """
 
     def test_no_raw_sites_outside_helper_or_allowlist(self) -> None:
         offenders: list[str] = []
+        allowlisted_sites: dict[tuple[str, str], list[int]] = {}
+
         for path in sorted(SRC_ROOT.rglob('*.py')):
             if path == ASYNC_UTILS_PATH:
                 continue
             rel = path.relative_to(SRC_ROOT.parent).as_posix()
             for lineno, func in _gather_return_exceptions_sites(path):
-                if (rel, func) in DRAIN_ALLOWLIST:
-                    continue
-                offenders.append(f'{rel}:{lineno}:{func or "<module>"}')
+                key = (rel, func)
+                if key in DRAIN_ALLOWLIST:
+                    allowlisted_sites.setdefault(key, []).append(lineno)
+                else:
+                    offenders.append(f'{rel}:{lineno}:{func or "<module>"}')
 
         assert not offenders, (
             'Found raw gather(..., return_exceptions=True) call site(s) outside '
@@ -200,4 +227,24 @@ class TestNoRawGatherReturnExceptionsOutsideHelperOrAllowlist:
             'gather_collect / gather_or_raise (fused_memory.utils.async_utils), or '
             '— if it is a genuine teardown/drain site where a cancelled child is an '
             'expected outcome — add a justified ALLOWLIST entry.'
+        )
+
+        count_offenders: list[str] = []
+        for (rel, func), linenos in allowlisted_sites.items():
+            expected_count, _justification = DRAIN_ALLOWLIST[(rel, func)]
+            if len(linenos) > expected_count:
+                count_offenders.append(
+                    f'{rel}::{func} has {len(linenos)} gather(..., return_exceptions=True) '
+                    f'call site(s) at lines {linenos}, but the ALLOWLIST only expects '
+                    f'{expected_count} for this function'
+                )
+        assert not count_offenders, (
+            'An allowlisted drain function gained an unexpected extra '
+            'gather(..., return_exceptions=True) call site: '
+            f'{count_offenders}. The (path, function) allowlist key matches on '
+            'function name alone, so a new call inside an already-allowlisted '
+            'function would otherwise inherit its justification silently. Give '
+            'the new site its own review — if it is a best-effort collect sweep '
+            'rather than a drain, convert it to gather_collect / gather_or_raise '
+            'instead of extending the allowlist.'
         )
