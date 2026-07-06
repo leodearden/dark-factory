@@ -23,6 +23,7 @@ import re
 import signal
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,8 @@ __all__ = [
     'UsageGate',
     'InvokeSlot',
     'AccountState',
+    'AccountPhase',
+    'IllegalTransitionError',
     'SessionBudgetExhausted',
 ]
 
@@ -110,30 +113,102 @@ def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
     return isinstance(obj, dict) and obj.get('subtype') == 'error_max_budget_usd'
 
 
+class AccountPhase(StrEnum):
+    """Explicit lifecycle phase for one account (PRD §7.3, task W4-γ).
+
+    Exactly one phase is active per account at any time — this is the single
+    source of truth that replaces the old, independently-mutable
+    ``capped``/``probing``/``probe_in_flight``/``auth_failed`` booleans on
+    :class:`AccountState` (which could — and did — drift out of sync, e.g.
+    ``capped`` and ``auth_failed`` both True simultaneously).
+    """
+
+    AVAILABLE = 'available'
+    PROBING = 'probing'
+    PROBE_IN_FLIGHT = 'probe_in_flight'
+    CAPPED = 'capped'
+    AUTH_FAILED = 'auth_failed'
+
+
+class IllegalTransitionError(Exception):
+    """Raised by :meth:`UsageGate._transition` on a phase edge not present in
+    ``_LEGAL_TRANSITIONS``. Account state is left unchanged."""
+
+
 @dataclass
 class AccountState:
     """Per-account cap tracking."""
 
     name: str
     token: str | None          # None = default account (no override)
-    capped: bool = False
+    phase: AccountPhase = AccountPhase.AVAILABLE
     resets_at: datetime | None = None
     pause_started_at: datetime | None = None
     resume_task: asyncio.Task | None = field(default=None, repr=False)
     probe_count: int = 0
     near_cap: bool = False
-    # Probe lifecycle:
-    #   probing=True  → freshly uncapped by probe, first task should claim it
-    #   probe_in_flight=True → one task is testing, others must wait
-    probing: bool = False
-    probe_in_flight: bool = False
-    # Auth-failure lifecycle (distinct from cap): 4xx responses indicate the
-    # account is not authorised (e.g. org access revoked, token expired).
-    # Unlike cap, auth_failed only clears on an explicit re-probe after the
-    # configured interval or a SIGHUP-triggered env reload.
-    auth_failed: bool = False
     auth_failed_at: datetime | None = None
     auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
+
+    # --- Legacy-compat boolean shim -----------------------------------
+    #
+    # capped/probing/probe_in_flight/auth_failed used to be four independent
+    # dataclass fields, mutated directly across ~10 sites in this module and
+    # read/written by sibling test files outside this task's edit scope
+    # (test_concurrency.py, test_usage_gate_exhaustive.py, test_auth_failed.py,
+    # test_probe_loop.py, test_failover_integration.py, and
+    # orchestrator/tests/test_usage_gate.py via its re-export shim).
+    #
+    # Production code (UsageGate._transition) now writes `phase` exclusively.
+    # These properties keep the old boolean attribute-access surface working
+    # for those out-of-scope callers: getter compares to the matching phase;
+    # setter(True) enters that phase, setter(False) reverts to AVAILABLE only
+    # if the flag being cleared is the account's *current* phase (clearing a
+    # non-current flag is a no-op, matching legacy behavior where the other
+    # flags were already False).
+    @property
+    def capped(self) -> bool:
+        return self.phase == AccountPhase.CAPPED
+
+    @capped.setter
+    def capped(self, value: bool) -> None:
+        if value:
+            self.phase = AccountPhase.CAPPED
+        elif self.phase == AccountPhase.CAPPED:
+            self.phase = AccountPhase.AVAILABLE
+
+    @property
+    def probing(self) -> bool:
+        return self.phase == AccountPhase.PROBING
+
+    @probing.setter
+    def probing(self, value: bool) -> None:
+        if value:
+            self.phase = AccountPhase.PROBING
+        elif self.phase == AccountPhase.PROBING:
+            self.phase = AccountPhase.AVAILABLE
+
+    @property
+    def probe_in_flight(self) -> bool:
+        return self.phase == AccountPhase.PROBE_IN_FLIGHT
+
+    @probe_in_flight.setter
+    def probe_in_flight(self, value: bool) -> None:
+        if value:
+            self.phase = AccountPhase.PROBE_IN_FLIGHT
+        elif self.phase == AccountPhase.PROBE_IN_FLIGHT:
+            self.phase = AccountPhase.AVAILABLE
+
+    @property
+    def auth_failed(self) -> bool:
+        return self.phase == AccountPhase.AUTH_FAILED
+
+    @auth_failed.setter
+    def auth_failed(self, value: bool) -> None:
+        if value:
+            self.phase = AccountPhase.AUTH_FAILED
+        elif self.phase == AccountPhase.AUTH_FAILED:
+            self.phase = AccountPhase.AVAILABLE
 
 
 class SessionBudgetExhausted(Exception):
@@ -223,6 +298,7 @@ class UsageGate:
         self._run_id: str | None = None
         self._last_account_name: str | None = None
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
+        self._shutting_down: bool = False
 
         self._probe_config_dir = TaskConfigDir('usage-gate-probe')
         self._accounts: list[AccountState] = self._init_accounts()
