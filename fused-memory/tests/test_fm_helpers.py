@@ -464,3 +464,82 @@ class TestAssertIdTitlePairing:
         }
         with pytest.raises(AssertionError, match='9999.*absent|absent.*9999|stray|bleed'):
             assert_id_title_pairing(rendered, title_by_id, kind='active')
+
+
+# ---------------------------------------------------------------------------
+# Tests for shared Qdrant test scaffolding (task 2277)
+# ---------------------------------------------------------------------------
+# De-duplicates the _qdrant_available()/QDRANT_URL/skip-marker scaffolding that
+# was previously copy-pasted verbatim in test_recon_dedup_premise.py and
+# test_mem0_qdrant_integration.py (flagged by esc-2221-26). No real Qdrant is
+# used here — qdrant_client.QdrantClient is monkeypatched throughout.
+
+class TestQdrantHelpers:
+    """Unit tests for QDRANT_URL, _qdrant_available(), and qdrant_skipif()."""
+
+    def test_qdrant_url_constant(self):
+        """QDRANT_URL matches the local-Qdrant default both integration files used."""
+        from _fm_helpers import QDRANT_URL
+
+        assert QDRANT_URL == 'http://localhost:6333'
+
+    def test_qdrant_available_true_when_client_ok(self, monkeypatch):
+        """_qdrant_available() returns True when construction, get_collections, and close all succeed."""
+        from _fm_helpers import _qdrant_available
+
+        fake_client = MagicMock()
+        fake_client.get_collections.return_value = None
+        fake_client.close.return_value = None
+        monkeypatch.setattr('qdrant_client.QdrantClient', MagicMock(return_value=fake_client))
+
+        assert _qdrant_available() is True
+
+    def test_qdrant_available_false_when_get_collections_raises(self, monkeypatch):
+        """_qdrant_available() returns False (never raises) when get_collections() raises."""
+        from _fm_helpers import _qdrant_available
+
+        fake_client = MagicMock()
+        fake_client.get_collections.side_effect = Exception('boom')
+        monkeypatch.setattr('qdrant_client.QdrantClient', MagicMock(return_value=fake_client))
+
+        assert _qdrant_available() is False
+
+    def test_qdrant_available_false_when_construct_raises(self, monkeypatch):
+        """_qdrant_available() returns False (never raises) when QdrantClient(...) itself raises."""
+        from _fm_helpers import _qdrant_available
+
+        def _boom(*args, **kwargs):
+            raise Exception('connection refused')
+
+        monkeypatch.setattr('qdrant_client.QdrantClient', _boom)
+
+        assert _qdrant_available() is False
+
+    def test_qdrant_skipif_default_reason(self):
+        """qdrant_skipif() returns a pytest.mark.skipif marker with the default reason."""
+        from _fm_helpers import qdrant_skipif
+
+        m = qdrant_skipif()
+
+        assert m.name == 'skipif'
+        assert m.kwargs['reason'] == 'Qdrant not reachable'
+
+    def test_qdrant_skipif_custom_reason(self):
+        """qdrant_skipif(reason=...) propagates a caller-supplied reason string."""
+        from _fm_helpers import qdrant_skipif
+
+        assert qdrant_skipif(reason='x').kwargs['reason'] == 'x'
+
+    def test_qdrant_skipif_condition_tracks_probe(self, monkeypatch):
+        """qdrant_skipif()'s skip condition is `not _qdrant_available()`, evaluated at call time.
+
+        Pins the behaviour-preserving contract: the marker must track whatever
+        _qdrant_available() currently reports, not a value cached at import time.
+        """
+        import _fm_helpers
+
+        monkeypatch.setattr(_fm_helpers, '_qdrant_available', lambda: False)
+        assert _fm_helpers.qdrant_skipif().args[0] is True
+
+        monkeypatch.setattr(_fm_helpers, '_qdrant_available', lambda: True)
+        assert _fm_helpers.qdrant_skipif().args[0] is False
