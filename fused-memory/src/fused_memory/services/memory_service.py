@@ -839,6 +839,9 @@ class MemoryService:
         # Post-write node dedup: merge exact-name duplicate entity nodes that
         # graphiti_core ingestion failed to reuse
         await self._dedup_episode_nodes(result, group_id=payload['group_id'])
+        # Post-write task-node-name canonicalization: rename/merge non-canonical
+        # task-entity node names (e.g. 'task 132') to the canonical 'Task N' form
+        await self._normalize_task_node_names(result, group_id=payload['group_id'])
 
         # Register planning episodes so they can be filtered from search results
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
