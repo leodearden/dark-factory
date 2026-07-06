@@ -365,3 +365,53 @@ class TestClassifyInvocationClaudeCap:
         result = AgentResult(success=False, output="You're close to the finish line")
         outcome = classify_invocation(result, strict_confirm=True)
         assert isinstance(outcome, Failure)
+
+
+class TestClassifyInvocationBackends:
+    """Codex/Gemini backend cap-pattern switch; claude's default path is unaffected."""
+
+    @pytest.mark.parametrize(
+        ('text', 'pattern'),
+        [
+            ('Error: usage limit reached', 'usage limit reached'),
+            ('Error: rate limit', 'rate limit'),
+            ('Error: quota exceeded', 'quota exceeded'),
+            ('Error: insufficient_quota', 'insufficient_quota'),
+            ('Error: rate_limit_exceeded', 'rate_limit_exceeded'),
+        ],
+    )
+    def test_codex_cap_patterns(self, text, pattern):
+        result = AgentResult(success=False, output=text)
+        outcome = classify_invocation(result, strict_confirm=True, backend='codex')
+        assert outcome == CapHit(resets_at=None, reason=f'Codex cap hit: {pattern}')
+
+    @pytest.mark.parametrize(
+        ('text', 'pattern'),
+        [
+            ('Error: quota exceeded', 'quota exceeded'),
+            ('Error: rate limit', 'rate limit'),
+            ('Error: resource exhausted', 'resource exhausted'),
+            ('Error: RESOURCE_EXHAUSTED', 'RESOURCE_EXHAUSTED'),
+            ('Error: quota_exceeded', 'quota_exceeded'),
+        ],
+    )
+    def test_gemini_cap_patterns(self, text, pattern):
+        result = AgentResult(success=False, output=text)
+        outcome = classify_invocation(result, strict_confirm=True, backend='gemini')
+        assert outcome == CapHit(resets_at=None, reason=f'Gemini cap hit: {pattern}')
+
+    def test_matching_is_case_insensitive(self):
+        result = AgentResult(success=False, output='ERROR: USAGE LIMIT REACHED')
+        outcome = classify_invocation(result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, CapHit)
+
+    def test_claude_default_backend_unaffected_by_codex_patterns(self):
+        """A codex-only pattern must not trip the cap tier for backend='claude'."""
+        result = AgentResult(success=False, output='Error: insufficient_quota')
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert not isinstance(outcome, CapHit)
+
+    def test_backend_patterns_checked_against_stderr_too(self):
+        result = AgentResult(success=False, output='', stderr='Error: quota exceeded')
+        outcome = classify_invocation(result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, CapHit)
