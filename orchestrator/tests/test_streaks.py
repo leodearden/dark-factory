@@ -11,7 +11,9 @@ stay at scheduler.py call sites (`counter.value(key) >= threshold`).
 
 from __future__ import annotations
 
-from orchestrator.streaks import StreakCounter
+import pytest
+
+from orchestrator.streaks import StreakCounter, StreakRegistry
 
 
 class TestStreakCounterCountVariant:
@@ -266,3 +268,140 @@ class TestStreakCounterFirstSeenAgeVariant:
         assert not counter.is_escalated('task-1')
         assert 'task-2' in counter.first_seen
         assert counter.is_escalated('task-2')
+
+
+class TestStreakRegistry:
+    """Unit tests for StreakRegistry: register(name, counter, on_gc=None) +
+    ``await gc(stale_ids, extra=None)``.
+
+    The registry owns GC ONLY — it replaces the manual per-dict enumeration
+    in ``acquire_next`` with one consolidated sweep over every registered
+    counter, including the async starvation on_gc/resolve callback.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gc_sweeps_the_registered_counter(self) -> None:
+        registry = StreakRegistry()
+        counter = StreakCounter(threshold=3)
+        registry.register('unresolved', counter)
+        counter.bump('task-1')
+        counter.bump('task-2')
+
+        await registry.gc({'task-1'})
+
+        assert counter.value('task-1') == 0
+        assert counter.value('task-2') == 1
+
+    @pytest.mark.asyncio
+    async def test_gc_sweeps_every_registered_counter(self) -> None:
+        registry = StreakRegistry()
+        counter_a = StreakCounter(threshold=3)
+        counter_b = StreakCounter(threshold=3)
+        registry.register('a', counter_a)
+        registry.register('b', counter_b)
+        counter_a.bump('task-1')
+        counter_b.bump('task-1')
+
+        await registry.gc({'task-1'})
+
+        assert counter_a.value('task-1') == 0
+        assert counter_b.value('task-1') == 0
+
+    @pytest.mark.asyncio
+    async def test_registered_but_forgotten_counter_is_still_swept(self) -> None:
+        """A counter no call site references again after registration is
+        still GC'd — the registry, not manual per-dict enumeration at the
+        call site, owns the sweep."""
+        registry = StreakRegistry()
+        forgotten = StreakCounter(threshold=3)
+        registry.register('forgotten', forgotten)
+        forgotten.bump('task-1')
+
+        await registry.gc({'task-1'})
+
+        assert forgotten.value('task-1') == 0
+
+    @pytest.mark.asyncio
+    async def test_extra_unions_additional_ids_for_the_named_counter_only(self) -> None:
+        registry = StreakRegistry()
+        starvation = StreakCounter(threshold=3)
+        other = StreakCounter(threshold=3)
+        registry.register('starvation', starvation)
+        registry.register('other', other)
+        starvation.touch('escalated-task', now=100.0)
+        starvation.mark_escalated('escalated-task')
+        other.bump('escalated-task')
+
+        # 'escalated-task' is not in stale_ids (not terminal) but IS passed
+        # via extra['starvation'] (the non-eligible-status sweep) — only the
+        # 'starvation' counter is swept for it; 'other' is untouched.
+        await registry.gc(set(), extra={'starvation': {'escalated-task'}})
+
+        assert 'escalated-task' not in starvation.first_seen
+        assert other.value('escalated-task') == 1
+
+    @pytest.mark.asyncio
+    async def test_on_gc_awaited_once_per_cleared_key_present_in_escalated(self) -> None:
+        registry = StreakRegistry()
+        starvation = StreakCounter(threshold=3)
+        resolved: list[str] = []
+
+        async def on_gc(key: str) -> None:
+            resolved.append(key)
+
+        registry.register('starvation', starvation, on_gc=on_gc)
+        starvation.touch('task-1', now=100.0)
+        starvation.mark_escalated('task-1')
+        starvation.touch('task-2', now=100.0)  # terminal but never escalated
+
+        await registry.gc({'task-1', 'task-2'})
+
+        # task-2 was never escalated — no resolve callback for it, but it is
+        # still cleared (mirrors the unconditional _starvation_first_seen.pop
+        # alongside the conditional resolve-on-escalated in scheduler.py).
+        assert resolved == ['task-1']
+        assert 'task-1' not in starvation.first_seen
+        assert not starvation.is_escalated('task-1')
+        assert 'task-2' not in starvation.first_seen
+
+    @pytest.mark.asyncio
+    async def test_on_gc_not_invoked_for_ids_outside_the_sweep(self) -> None:
+        registry = StreakRegistry()
+        starvation = StreakCounter(threshold=3)
+        resolved: list[str] = []
+
+        async def on_gc(key: str) -> None:
+            resolved.append(key)
+
+        registry.register('starvation', starvation, on_gc=on_gc)
+        starvation.touch('task-1', now=100.0)
+        starvation.mark_escalated('task-1')
+
+        await registry.gc({'task-2'})  # task-1 is not stale
+
+        assert resolved == []
+        assert starvation.is_escalated('task-1')
+
+    @pytest.mark.asyncio
+    async def test_zero_entries_in_any_registered_counter_after_gc(self) -> None:
+        """The 'zero entries in ANY registered counter' invariant."""
+        registry = StreakRegistry()
+        unresolved = StreakCounter(threshold=3, key_fn=lambda k: k[0])
+        hold = StreakCounter(threshold=3)
+        starvation = StreakCounter(threshold=3)
+        registry.register('unresolved', unresolved)
+        registry.register('hold', hold)
+        registry.register('starvation', starvation)
+
+        unresolved.bump(('task-1', 'dep-a'))
+        hold.touch('task-1', cause='deps_live')
+        starvation.touch('task-1', now=100.0)
+        starvation.mark_escalated('task-1')
+
+        await registry.gc({'task-1'})
+
+        assert unresolved.value(('task-1', 'dep-a')) == 0
+        assert hold.value('task-1') == 0
+        assert 'task-1' not in hold.causes
+        assert 'task-1' not in starvation.first_seen
+        assert not starvation.is_escalated('task-1')
