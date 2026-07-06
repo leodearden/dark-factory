@@ -63,6 +63,15 @@ from persisting in entity summaries.
 triggering Graphiti's edge resolution pipeline which can falsely invalidate active edges. \
 Use `add_memory(category='entities_and_relations')` only for genuinely new relationships \
 that don't correspond to any existing edge.
+- When you do use `add_memory(category='entities_and_relations')` for a genuinely new \
+fact, the fused-memory server now AUTOMATICALLY repairs the most common false invalidation \
+it triggers: a post-write guardrail in `MemoryService._execute_graphiti_write` restores any \
+pre-existing edge that the write invalidated but whose `(source, target)` node-pair is NOT \
+restated by any surviving edge in that same write — a provably-false sibling invalidation. \
+So a manual `get_entity` before/after diff is no longer required to catch THIS failure mode. \
+Known limitation: an invalidated edge whose node-pair IS restated by a new surviving edge is \
+left untouched (it may be a legitimate contradiction) and still warrants care. This does not \
+weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary` for restated facts.
 - {_STAGE1_PROJECT_ID_GUIDELINE}
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross-project scope mismatches flagged to Stage 2): \

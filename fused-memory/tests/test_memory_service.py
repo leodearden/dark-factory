@@ -3174,6 +3174,38 @@ class TestExecuteGraphitiWriteWithDedup:
             f'got call order {call_order!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_execute_graphiti_write_calls_restore_hook_for_invalidated_sibling_edges(self, service):
+        """task 2111 step-3: the sibling-edge restore hook
+        (_restore_falsely_superseded_sibling_edges) is invoked with the
+        add_episode result and group_id, alongside the dependency-restore/
+        node-dedup/normalize sweeps already wired into _execute_graphiti_write.
+        RED until step-4 wires the call in."""
+        from unittest.mock import AsyncMock
+
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        mock_result = MockAddEpisodeResult(edges=[MockEdge(fact='sibling fact', uuid='sib1')])
+        mock_result.entity_edges = []
+
+        service.graphiti.add_episode = AsyncMock(return_value=mock_result)
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=0)
+
+        payload = {
+            'name': 'ep_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        service._restore_falsely_superseded_sibling_edges.assert_awaited_once()
+        assert service._restore_falsely_superseded_sibling_edges.call_args == (
+            (mock_result,), {'group_id': 'test'},
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for _dual_write_callback reading result.edges  (step 11)
@@ -4295,6 +4327,191 @@ class TestRestoreSupersededDependencyEdges:
         result.edges = []
         service.graphiti.update_edge = AsyncMock()
         count = await service._restore_superseded_dependency_edges(result, group_id='proj')
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 2111 step-1: _restore_falsely_superseded_sibling_edges RED tests
+# ---------------------------------------------------------------------------
+
+class TestRestoreFalselySupersededSiblingEdges:
+    """_restore_falsely_superseded_sibling_edges must clear invalid_at for any
+    invalidated edge whose (source, target) node-pair is NOT restated by a
+    surviving valid edge in the same add_episode result — and must leave
+    same-node-pair invalidations (possible legitimate contradictions) alone.
+    """
+
+    @pytest.mark.asyncio
+    async def test_restores_invalidated_edges_on_different_node_pairs(self, service):
+        """Repro: a new valid edge on (E1,E2) plus two invalidated sibling
+        edges on DIFFERENT node-pairs (E1,X) and (E2,Y) are both restored."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        new_valid = MockEdge(
+            fact='E1 relates to E2 somehow', uuid='new1',
+            source_node_uuid='E1', target_node_uuid='E2', invalid_at=None,
+        )
+        sibling_1 = MockEdge(
+            fact='E1 is part of the stdlib-M8.2 project', uuid='sib1',
+            source_node_uuid='E1', target_node_uuid='X', invalid_at=ts,
+        )
+        sibling_2 = MockEdge(
+            fact='E2 maps each geometry function to its geometry-arg positions',
+            uuid='sib2', source_node_uuid='E2', target_node_uuid='Y', invalid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [new_valid, sibling_1, sibling_2]
+
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'x', 'fact': 'y', 'refreshed_nodes': []}
+        )
+
+        count = await service._restore_falsely_superseded_sibling_edges(result, group_id='proj')
+
+        assert count == 2, f'Expected both siblings restored, got {count}'
+        restored_uuids = {c.args[0] for c in service.graphiti.update_edge.await_args_list}
+        assert restored_uuids == {'sib1', 'sib2'}
+        for c in service.graphiti.update_edge.await_args_list:
+            assert c.kwargs == {'group_id': 'proj', 'clear_invalid_at': True}
+
+    @pytest.mark.asyncio
+    async def test_does_not_restore_same_node_pair_invalidation(self, service):
+        """An invalidated edge whose node-pair IS restated by a surviving valid
+        edge is left untouched — it may be a legitimate contradiction the LLM
+        correctly resolved, and is left to the LLM's judgment."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        new_valid = MockEdge(
+            fact='E1 now relates differently to E2', uuid='new1',
+            source_node_uuid='E1', target_node_uuid='E2', invalid_at=None,
+        )
+        old_same_pair = MockEdge(
+            fact='E1 used to relate to E2', uuid='old1',
+            source_node_uuid='E1', target_node_uuid='E2', invalid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [new_valid, old_same_pair]
+
+        service.graphiti.update_edge = AsyncMock()
+
+        count = await service._restore_falsely_superseded_sibling_edges(result, group_id='proj')
+
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_valid_edges_never_passed_to_update_edge(self, service):
+        """Edges that are already valid (invalid_at is None) are never
+        candidates for restoration, regardless of their node-pair."""
+        from _fm_helpers import MockEdge
+
+        valid_1 = MockEdge(
+            fact='valid fact 1', uuid='v1',
+            source_node_uuid='E1', target_node_uuid='E2', invalid_at=None,
+        )
+        valid_2 = MockEdge(
+            fact='valid fact 2', uuid='v2',
+            source_node_uuid='E3', target_node_uuid='E4', invalid_at=None,
+        )
+
+        result = MagicMock()
+        result.edges = [valid_1, valid_2]
+
+        service.graphiti.update_edge = AsyncMock()
+
+        count = await service._restore_falsely_superseded_sibling_edges(result, group_id='proj')
+
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_for_none_result(self, service):
+        """Returns 0 and makes no calls when result is None."""
+        service.graphiti.update_edge = AsyncMock()
+        count = await service._restore_falsely_superseded_sibling_edges(None, group_id='proj')
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_for_empty_edges(self, service):
+        """Returns 0 and makes no calls when result.edges is empty."""
+        result = MagicMock()
+        result.edges = []
+        service.graphiti.update_edge = AsyncMock()
+        count = await service._restore_falsely_superseded_sibling_edges(result, group_id='proj')
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_honors_entity_edges_fallback_when_edges_empty(self, service):
+        """result.entity_edges is used when result.edges is absent/empty."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        new_valid = MockEdge(
+            fact='E1 relates to E2', uuid='new1',
+            source_node_uuid='E1', target_node_uuid='E2', invalid_at=None,
+        )
+        sibling = MockEdge(
+            fact='E1 is part of the stdlib-M8.2 project', uuid='sib1',
+            source_node_uuid='E1', target_node_uuid='X', invalid_at=ts,
+        )
+
+        result = MockAddEpisodeResult.__new__(MockAddEpisodeResult)
+        result.edges = []
+        result.entity_edges = [new_valid, sibling]
+
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'sib1', 'fact': 'sibling', 'refreshed_nodes': []}
+        )
+
+        count = await service._restore_falsely_superseded_sibling_edges(result, group_id='proj')
+
+        assert count == 1
+        service.graphiti.update_edge.assert_called_once_with(
+            'sib1', group_id='proj', clear_invalid_at=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_does_not_restore_dependency_fact_edges(self, service):
+        """An invalidated dependency-fact edge is exclusively
+        _restore_superseded_dependency_edges's domain (it restores every
+        invalidated dependency edge unconditionally, regardless of
+        node-pair). This hook must not also restore it — even when its
+        node-pair is unrestated — or the two hooks would double-call
+        update_edge for the same edge."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        dep_edge = MockEdge(
+            fact='Task 562 depends on Task 557', uuid='dep-edge-1',
+            source_node_uuid='s1', target_node_uuid='t1', invalid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [dep_edge]
+
+        service.graphiti.update_edge = AsyncMock()
+
+        count = await service._restore_falsely_superseded_sibling_edges(result, group_id='proj')
+
         assert count == 0
         service.graphiti.update_edge.assert_not_called()
 

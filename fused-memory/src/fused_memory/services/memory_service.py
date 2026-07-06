@@ -684,6 +684,120 @@ class MemoryService:
             )
         return restored
 
+    async def _restore_falsely_superseded_sibling_edges(
+        self, result: Any, *, group_id: str
+    ) -> int:
+        """Undo false sibling-edge invalidations caused by LLM edge-resolution.
+
+        Graphiti's upstream ``add_episode`` LLM pipeline can falsely supersede
+        pre-existing edges that merely SHARE an entity node with a newly-added
+        fact, even when the new fact does not contradict them (an
+        over-triggering "most-recent-edge-wins per node" heuristic). A
+        legitimate temporal supersession always replaces a fact between the
+        SAME two entities with a newer fact between those same two entities,
+        so graphiti both sets ``invalid_at`` on the old edge AND adds a new
+        valid edge on that same node-pair. This method scans the edges
+        returned in *result* — exactly the edges this episode touched — and
+        clears ``invalid_at`` for any invalidated edge whose
+        ``(source_node_uuid, target_node_uuid)`` pair is NOT restated by any
+        surviving (``invalid_at is None``) edge in this same write: such an
+        edge cannot be a legitimate supersession, so its invalidation is
+        provably the sibling-invalidation bug.
+
+        Known limitation: an invalidated edge whose node-pair IS restated by
+        a surviving valid edge (a same-node-pair invalidation) is left
+        untouched, since it may be a legitimate contradiction the LLM
+        correctly resolved — that case is left to the LLM's judgment
+        (documented follow-up, not handled here).
+
+        Modelled on ``_restore_superseded_dependency_edges``; handles None /
+        empty result the same way. Dependency-fact edges (``_is_dependency_fact``)
+        are excluded from restore candidates here even when their node-pair
+        is unrestated: ``_restore_superseded_dependency_edges`` already
+        restores every invalidated dependency edge unconditionally
+        (regardless of node-pair) earlier in the same post-write chain, so
+        this hook would otherwise issue a redundant second ``update_edge``
+        call for the same edge. This keeps the two hooks' contracts
+        non-overlapping without relying on any in-place mutation of *result*
+        (the edge objects returned by ``add_episode`` are not refreshed by a
+        subsequent ``update_edge`` call, so ``invalid_at`` here always
+        reflects the pre-restore state regardless of hook order).
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                    AddEpisodeResults object with an ``edges`` attribute).
+                    Handles ``None`` and objects with empty/missing edges
+                    gracefully.
+
+        Returns:
+            Number of sibling edges whose false invalidation was reversed (0
+            when nothing to do).
+        """
+        if result is None:
+            return 0
+
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
+        if not edges:
+            return 0
+
+        restated_pairs: set[tuple[str, str]] = set()
+        for edge in edges:
+            if getattr(edge, 'invalid_at', None) is not None:
+                continue
+            src = getattr(edge, 'source_node_uuid', '') or ''
+            tgt = getattr(edge, 'target_node_uuid', '') or ''
+            restated_pairs.add((src, tgt))
+
+        restored = 0
+        failed = 0
+        for edge in edges:
+            if getattr(edge, 'invalid_at', None) is None:
+                continue
+            if _is_dependency_fact(getattr(edge, 'fact', '') or ''):
+                # Exclusively _restore_superseded_dependency_edges's domain —
+                # it already restores every invalidated dependency edge
+                # unconditionally, earlier in the same post-write chain.
+                continue
+            src = getattr(edge, 'source_node_uuid', '') or ''
+            tgt = getattr(edge, 'target_node_uuid', '') or ''
+            if (src, tgt) in restated_pairs:
+                # Same-node-pair invalidation: possibly a legitimate
+                # contradiction. Leave to the LLM's judgment.
+                continue
+            edge_uuid = getattr(edge, 'uuid', '') or ''
+            try:
+                await self.graphiti.update_edge(
+                    edge_uuid, group_id=group_id, clear_invalid_at=True
+                )
+                restored += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Best-effort: a transient backend error (lock contention,
+                # write timeout) must not fail an already-committed episode
+                # write.  Log and continue so the episode reports success.
+                logger.exception(
+                    'Failed to restore sibling edge %s; will retry on next episode',
+                    edge_uuid,
+                )
+                failed += 1
+
+        if restored > 0:
+            logger.info(
+                'Restored %d falsely-superseded sibling edge(s) after add_episode',
+                restored,
+            )
+        if failed > 0:
+            logger.warning(
+                'Failed to restore %d sibling edge(s) after add_episode',
+                failed,
+            )
+        return restored
+
     async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
         """Canonicalize non-canonical task-entity node names to 'Task N'.
 
@@ -850,6 +964,12 @@ class MemoryService:
         await self._dedup_episode_edges(result, group_id=payload['group_id'])
         # Post-write restore: undo false dependency-edge supersessions
         await self._restore_superseded_dependency_edges(result, group_id=payload['group_id'])
+        # Post-write restore: undo false sibling-edge supersessions — edges
+        # invalidated by graphiti's per-node-pair heuristic whose node-pair
+        # is not restated by any surviving edge in this same write (must run
+        # after the dependency restore above so already-cleared dependency
+        # edges are simply skipped here, not double-processed)
+        await self._restore_falsely_superseded_sibling_edges(result, group_id=payload['group_id'])
         # Post-write node dedup: merge exact-name duplicate entity nodes that
         # graphiti_core ingestion failed to reuse
         await self._dedup_episode_nodes(result, group_id=payload['group_id'])
