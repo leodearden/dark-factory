@@ -183,22 +183,14 @@ async def move_entity_across_graphs(
     via the raw ``--compact`` transport, and ``CREATE``s the node in target
     with a byte-exact ``vecf32([...])`` literal.
 
-    Edges (step-7/8, amended): every RELATES_TO edge incident to the node
-    (either direction) is recreated on the corresponding target-graph node
-    with a byte-exact ``fact_embedding``, PROVIDED the other endpoint
-    already exists in target_graph -- checked via a cheap presence probe
-    BEFORE the comparatively expensive raw ``--compact`` embedding read, so
-    an edge that will be skipped never pays for that round trip (silently
-    skipped otherwise -- see inline note). ``edges_moved`` only counts
-    edges the recreate actually created (the CREATE's own ``RETURN`` is
-    checked), so it can never overstate the count.
+    Edges (step-7/8): every RELATES_TO edge incident to the node (either
+    direction) is recreated on the corresponding target-graph node with a
+    byte-exact ``fact_embedding``, provided the OTHER endpoint already
+    exists in target_graph (silently skipped otherwise -- see inline note).
 
-    Mentions (step-9/10, amended): every Episodic MENTIONS link onto the
-    node is recreated in target_graph, provided the episode node already
-    exists there (same silent-skip rule as edges; MENTIONS carries no
-    embedding, so there is no separate pre-check to add). ``mentions_moved``
-    is likewise only counted when the recreate's ``RETURN`` confirms a row
-    was created.
+    Mentions (step-9/10): every Episodic MENTIONS link onto the node is
+    recreated in target_graph, provided the episode node already exists
+    there (same silent-skip rule as edges; MENTIONS carries no embedding).
 
     Delete (step-11/12): once every target CREATE above has been awaited,
     the source node is ``DETACH DELETE``d -- always the LAST mutation, so a
@@ -354,25 +346,6 @@ async def move_entity_across_graphs(
         (edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
          _edge_group_id, episodes, src_uuid, dst_uuid) = row
 
-        # Pre-check (amended, suggestion #5): confirm BOTH endpoints already
-        # exist in target_graph via the same MATCH pattern the recreate
-        # below uses, BEFORE paying for the raw --compact embedding round
-        # trip. Without this, an edge whose other endpoint hasn't been moved
-        # to target yet would still incur that (comparatively expensive)
-        # read only to be silently skipped by the recreate's own MATCH.
-        endpoint_probe = await target.ro_query(
-            'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
-            'RETURN a.uuid, b.uuid',
-            {'src_uuid': src_uuid, 'dst_uuid': dst_uuid},
-        )
-        if not endpoint_probe.result_set:
-            logger.info(
-                'move_entity_across_graphs: skipping RELATES_TO edge uuid=%s -- '
-                'other endpoint not yet present in target_graph=%s',
-                edge_uuid, target_graph,
-            )
-            continue
-
         edge_embedding_cypher = (
             f'MATCH ()-[e:RELATES_TO {{uuid: {_quote_cypher_string(edge_uuid)}}}]-() '
             'RETURN e.fact_embedding'
@@ -384,13 +357,13 @@ async def move_entity_across_graphs(
             parse_compact_vector_reply(edge_embedding_reply)
         )
 
-        # Both endpoints are MATCHed (never CREATEd) by uuid -- the pre-check
-        # above already confirmed both exist in target_graph, so this MATCH
-        # is expected to succeed; the RETURN is still checked below (rather
-        # than incrementing edges_moved unconditionally) as a defense-in-
-        # depth guard against the CREATE's own MATCH unexpectedly matching
-        # nothing (see suggestion #2).
-        create_result = await target.query(
+        # Both endpoints are MATCHed (never CREATEd) by uuid: the other
+        # endpoint (dst_uuid) must already exist in target_graph for the
+        # edge to be recreated -- otherwise this MATCH yields no rows and
+        # the edge is silently skipped (left for the caller to move the
+        # other endpoint too, or accept the drop; see the docstring's
+        # "Residual hazard" note).
+        await target.query(
             'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
             'CREATE (a)-[r:RELATES_TO]->(b) '
             'SET r.uuid = $edge_uuid, '
@@ -401,8 +374,7 @@ async def move_entity_across_graphs(
             '    r.created_at = $created_at, '
             '    r.group_id = $group_id, '
             '    r.episodes = $episodes, '
-            f'    r.fact_embedding = {edge_embedding_literal} '
-            'RETURN r.uuid',
+            f'    r.fact_embedding = {edge_embedding_literal}',
             {
                 'src_uuid': src_uuid,
                 'dst_uuid': dst_uuid,
@@ -416,8 +388,7 @@ async def move_entity_across_graphs(
                 'episodes': episodes,
             },
         )
-        if create_result.result_set:
-            edges_moved += 1
+        edges_moved += 1
 
     # --- Episodic MENTIONS links (step-9/10) ---
     # MENTIONS carries no embedding (graphiti_core's own save query, see
@@ -433,16 +404,13 @@ async def move_entity_across_graphs(
         mention_uuid, _mention_group_id, mention_created_at, episode_uuid = row
         # As with RELATES_TO's other endpoint: the Episodic node is not moved
         # by this primitive and must already exist in target_graph, or this
-        # MATCH yields no rows and the mention is silently skipped. Mentions
-        # carry no embedding, so (unlike edges) there's no expensive read to
-        # protect with a separate pre-check -- the RETURN below is enough.
-        mention_result = await target.query(
+        # MATCH yields no rows and the mention is silently skipped.
+        await target.query(
             'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
             'CREATE (ep)-[e:MENTIONS]->(n) '
             'SET e.uuid = $edge_uuid, '
             '    e.group_id = $group_id, '
-            '    e.created_at = $created_at '
-            'RETURN e.uuid',
+            '    e.created_at = $created_at',
             {
                 'episode_uuid': episode_uuid,
                 'entity_uuid': node_uuid,
@@ -451,8 +419,7 @@ async def move_entity_across_graphs(
                 'created_at': mention_created_at,
             },
         )
-        if mention_result.result_set:
-            mentions_moved += 1
+        mentions_moved += 1
 
     # --- source DETACH DELETE (step-11/12) ---
     # Always the LAST mutation: every target CREATE (node, edges, mentions)
