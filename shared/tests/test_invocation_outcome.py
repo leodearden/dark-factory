@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from shared.cli_invoke import AgentResult
 from shared.invocation_outcome import (
     OK,
     AuthFailed,
@@ -18,6 +19,7 @@ from shared.invocation_outcome import (
     ZeroOutputWedge,
     _extract_cap_message,
     _parse_resets_at,
+    classify_invocation,
 )
 
 
@@ -149,3 +151,44 @@ class TestExtractCapMessage:
         text = "YOU'VE HIT YOUR usage limit. resets in 3h."
         message = _extract_cap_message(text, "you've hit your")
         assert message != ''
+
+
+class TestClassifyInvocationAuthFailedPrecedence:
+    """AuthFailed is highest precedence; narrow to {401, 403} — 429 falls through."""
+
+    def test_401_returns_auth_failed(self):
+        result = AgentResult(success=False, output='', api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == AuthFailed(status=401)
+
+    def test_403_returns_auth_failed(self):
+        result = AgentResult(success=False, output='', api_error_status=403)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == AuthFailed(status=403)
+
+    def test_401_outranks_cap_prefix_in_same_text(self):
+        """AuthFailed must win even when the same result also carries a cap message."""
+        result = AgentResult(
+            success=False,
+            output="You've hit your usage limit. Your plan resets in 3h.",
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == AuthFailed(status=401)
+
+    def test_429_with_cap_text_is_cap_hit_not_auth_failed(self):
+        """429 is deliberately excluded from AuthFailed — it carries a real cap body."""
+        result = AgentResult(
+            success=False,
+            output="You're out of extra usage for this billing period. Your plan resets in 2h.",
+            api_error_status=429,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CapHit)
+        assert not isinstance(outcome, AuthFailed)
+
+    def test_429_alone_with_no_cap_text_is_not_auth_failed(self):
+        result = AgentResult(success=False, output='some unrelated text', api_error_status=429)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert not isinstance(outcome, AuthFailed)
+        assert isinstance(outcome, Failure)
