@@ -3107,6 +3107,13 @@ Output JSON matching the schema. Every task must appear in the output.
                 # when the primitive is CERTAIN the ref is degenerate; any
                 # uncertainty falls through to the existing skip-count path
                 # below, unchanged.
+                # Cost note: this spawns one subprocess per sweep for every
+                # task that reaches here. The metadata fast-path above
+                # (_branch_is_degenerate) already resolves the common case
+                # without a subprocess, so this branch is only exercised for
+                # the exceptional absent/malformed-branch_base_sha case and
+                # is expected to be low-volume; no within-sweep memoization
+                # is applied.
                 if await self.git_ops.warm_lane_ref_is_degenerate(tid):
                     self._reconcile_skip_counts.pop(tid, None)
                     if status == 'in-progress':
