@@ -61,3 +61,14 @@ def parse_compact_vector_reply(reply: str) -> list[str]:
     if not text:
         return []
     return [token.strip() for token in text.split(',')]
+
+
+def format_vecf32_literal(tokens: list[str]) -> str:
+    """Render exact float32 string tokens as a ``vecf32([...])`` Cypher literal.
+
+    *tokens* are embedded verbatim (comma-space joined) -- never re-parsed or
+    reformatted -- so that the exact decimal strings read via the raw
+    ``--compact`` transport survive untouched into the Cypher literal used to
+    recreate the node/edge's vector property on the target/home graph.
+    """
+    return f"vecf32([{', '.join(tokens)}])"
