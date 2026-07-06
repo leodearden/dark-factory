@@ -23,9 +23,11 @@ discipline from scratch.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable, Sequence
-from typing import TypeVar
+from typing import Generic, TypeVar
 
 import httpx
 
@@ -79,3 +81,75 @@ async def first_success(
             errors.append(f'{url}: {e}')
             invalidate_session(url)
     return offline_result(errors)
+
+
+class TTLCache(Generic[V]):
+    """Single-flight, short-TTL cache keyed by an arbitrary string.
+
+    Generalizes scheduler.py's ``_scheduler_cache`` +
+    ``_scheduler_refresh_lock`` double-checked-locking pattern: a warm entry
+    is served without any lock; a cold or expired entry causes exactly one
+    concurrent caller to run ``refresh`` while the rest wait on a per-key
+    lock and then re-check freshness (double-checked locking) rather than
+    each running their own redundant refresh.
+
+    ``ttl_seconds`` accepts a plain float OR a zero-arg callable, resolved
+    at *each* freshness check rather than captured once at construction —
+    this is what lets a caller monkeypatch a module-level TTL constant at
+    runtime (as ``test_tasks.py`` does for ``_FETCH_TASKS_TTL_SECONDS``) and
+    have it take effect immediately.
+
+    ``cache_ok`` (per-call, default always-true) gates whether a given
+    refresh result is stored — e.g. an offline/error marker should not pin
+    itself in the cache for the TTL window. The cache is value-type-agnostic
+    and always returns the raw stored value; copy isolation (if needed) is
+    the caller's responsibility.
+    """
+
+    def __init__(self, ttl_seconds: float | Callable[[], float]):
+        self._ttl_fn: Callable[[], float] = (
+            ttl_seconds if callable(ttl_seconds) else (lambda: ttl_seconds)
+        )
+        self._store: dict[str, tuple[float, V]] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def get_fresh(self, key: str) -> V | None:
+        """Return the cached value for *key* iff still within TTL, else None."""
+        cached = self._store.get(key)
+        if cached is not None and (time.monotonic() - cached[0]) < self._ttl_fn():
+            return cached[1]
+        return None
+
+    async def get_or_refresh(
+        self,
+        key: str,
+        refresh: Callable[[], Awaitable[V]],
+        *,
+        cache_ok: Callable[[V], bool] = lambda v: True,
+    ) -> V:
+        """Return a fresh cached value for *key*, refreshing at most once.
+
+        Fast path: a warm entry is returned with no lock. Otherwise acquires
+        a per-key lock, re-checks freshness (another waiter may have just
+        filled it), and — if still cold — runs ``refresh()`` and stores the
+        result iff ``cache_ok(value)``.
+        """
+        fresh = self.get_fresh(key)
+        if fresh is not None:
+            return fresh
+
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            fresh = self.get_fresh(key)
+            if fresh is not None:
+                return fresh
+
+            value = await refresh()
+            if cache_ok(value):
+                self._store[key] = (time.monotonic(), value)
+            return value
+
+    def clear(self) -> None:
+        """Reset the store and all per-key locks (test/admin hook)."""
+        self._store.clear()
+        self._locks.clear()
