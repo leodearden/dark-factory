@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import zoneinfo
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -154,6 +155,40 @@ class TestParseResetsAt:
         assert result is not None
         assert result.tzinfo is not None
         assert (result.year, result.month, result.day, result.hour) == (2026, 4, 10, 21)
+
+    def test_absolute_time_without_date_same_day(self):
+        """'resets 9pm (Europe/London)' — no month/day, so this is the
+        no-date absolute-time branch (distinct from the with-date branch
+        above). When the parsed time is still ahead of `now` in the target
+        tz, the reset stays on the same day."""
+        now = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)  # 10:00 GMT; Europe/London has no DST in Jan
+        result = _parse_resets_at('resets 9pm (Europe/London)', now=now)
+        assert result is not None
+        assert result.tzinfo is not None
+        london = result.astimezone(zoneinfo.ZoneInfo('Europe/London'))
+        assert (london.year, london.month, london.day, london.hour) == (2026, 1, 1, 21)
+
+    def test_absolute_time_without_date_rolls_over_to_tomorrow(self):
+        """When the parsed time has already passed today in the target tz,
+        the no-date branch rolls over to tomorrow (`target += timedelta(days=1)`)
+        — the failure mode this branch takes on parse success is 'roll
+        forward', distinct from the with-date branch's 'assume next year' and
+        from this same branch's `return None` when the time string itself
+        doesn't parse."""
+        now = datetime(2026, 1, 1, 22, 0, tzinfo=UTC)  # 22:00 GMT, already past 21:00
+        result = _parse_resets_at('resets 9pm (Europe/London)', now=now)
+        assert result is not None
+        london = result.astimezone(zoneinfo.ZoneInfo('Europe/London'))
+        assert (london.year, london.month, london.day, london.hour) == (2026, 1, 2, 21)
+
+    def test_absolute_time_without_date_colon_minutes_am(self):
+        """'resets 3:00 AM (US/Pacific)' — the H:MM AM/PM-with-colon format,
+        the other example named in this function's docstring."""
+        now = datetime(2026, 1, 1, 6, 0, tzinfo=UTC)  # 22:00 Pacific the prior day
+        result = _parse_resets_at('resets 3:00 AM (US/Pacific)', now=now)
+        assert result is not None
+        pacific = result.astimezone(zoneinfo.ZoneInfo('US/Pacific'))
+        assert (pacific.month, pacific.day, pacific.hour, pacific.minute) == (1, 1, 3, 0)
 
     def test_default_now_reads_wall_clock_when_not_injected(self):
         """classify_invocation calls this without injecting now — must not raise."""
