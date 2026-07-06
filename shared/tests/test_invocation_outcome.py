@@ -192,3 +192,72 @@ class TestClassifyInvocationAuthFailedPrecedence:
         outcome = classify_invocation(result, strict_confirm=True)
         assert not isinstance(outcome, AuthFailed)
         assert isinstance(outcome, Failure)
+
+
+class TestClassifyInvocationCliLocalError:
+    """Local CLI/usage errors must never be misclassified as a cap hit (reify-3604)."""
+
+    def test_session_id_in_use_is_cli_local_error(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            stderr='Error: Session ID abc-123 is already in use.',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='is already in use')
+
+    def test_unrecognized_arguments_is_cli_local_error(self):
+        result = AgentResult(success=False, output='', stderr='error: unrecognized arguments: --foo')
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='unrecognized arguments')
+
+    def test_unknown_option_is_cli_local_error(self):
+        result = AgentResult(success=False, output='', stderr="unknown option '--bar'")
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='unknown option')
+
+    def test_invalid_value_is_cli_local_error(self):
+        result = AgentResult(success=False, output='', stderr="invalid value for '--model'")
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='invalid value')
+
+    def test_no_such_file_or_directory_is_cli_local_error(self):
+        result = AgentResult(success=False, output='', stderr='no such file or directory: /tmp/x')
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='no such file or directory')
+
+    def test_permission_denied_is_cli_local_error(self):
+        result = AgentResult(success=False, output='', stderr='permission denied: /tmp/x')
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='permission denied')
+
+    def test_marker_in_output_not_just_stderr(self):
+        result = AgentResult(success=False, output='unrecognized arguments: --foo', stderr='')
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CliLocalError)
+
+    def test_case_insensitive_match(self):
+        result = AgentResult(success=False, output='', stderr='PERMISSION DENIED: /tmp/x')
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CliLocalError)
+
+    def test_cli_local_error_outranks_cap_message(self):
+        """reify-3604: a --session-id collision must never be treated as a cap hit."""
+        result = AgentResult(
+            success=False,
+            stderr='Error: Session ID abc-123 is already in use.',
+            output="You've hit your usage limit. Your plan resets in 3h.",
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='is already in use')
+        assert not isinstance(outcome, CapHit)
+
+    def test_auth_failed_still_outranks_cli_local_error(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            api_error_status=401,
+            stderr='Error: Session ID abc-123 is already in use.',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == AuthFailed(status=401)
