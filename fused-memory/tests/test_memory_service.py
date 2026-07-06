@@ -3174,6 +3174,38 @@ class TestExecuteGraphitiWriteWithDedup:
             f'got call order {call_order!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_execute_graphiti_write_calls_restore_hook_for_invalidated_sibling_edges(self, service):
+        """task 2111 step-3: the sibling-edge restore hook
+        (_restore_falsely_superseded_sibling_edges) is invoked with the
+        add_episode result and group_id, alongside the dependency-restore/
+        node-dedup/normalize sweeps already wired into _execute_graphiti_write.
+        RED until step-4 wires the call in."""
+        from unittest.mock import AsyncMock
+
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
+
+        mock_result = MockAddEpisodeResult(edges=[MockEdge(fact='sibling fact', uuid='sib1')])
+        mock_result.entity_edges = []
+
+        service.graphiti.add_episode = AsyncMock(return_value=mock_result)
+        service.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=0)
+
+        payload = {
+            'name': 'ep_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        service._restore_falsely_superseded_sibling_edges.assert_awaited_once()
+        assert service._restore_falsely_superseded_sibling_edges.call_args == (
+            (mock_result,), {'group_id': 'test'},
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for _dual_write_callback reading result.edges  (step 11)
