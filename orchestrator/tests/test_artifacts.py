@@ -1145,3 +1145,20 @@ class TestWorktreeMissingTolerance:
         monkeypatch.setattr(pathlib.Path, 'write_text', _raise_permission)
         with pytest.raises(PermissionError):
             ta.write_review('rev', {'verdict': 'PASS', 'issues': []})
+
+
+class TestMetaRootDerivation:
+    """`meta_root_for` is the single owner of the `.task-meta/<name>` path
+    shape (PRD `.task-meta path-derivation contract`) — no other module
+    joins '.task' by hand.
+    """
+
+    def test_meta_root_for_derives_task_meta_path(self):
+        assert TaskArtifacts.meta_root_for(Path('/pool/.worktrees'), '_lane-0') == (
+            Path('/pool/.worktrees/.task-meta/_lane-0')
+        )
+
+    def test_meta_root_for_different_base_and_name(self):
+        assert TaskArtifacts.meta_root_for(Path('/other/base'), 'task-42') == (
+            Path('/other/base/.task-meta/task-42')
+        )
