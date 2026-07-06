@@ -1,7 +1,11 @@
 """Tests for resolve_project_id() — converts filesystem project_root to logical project_id."""
 
+import pytest
+from pydantic import ValidationError
+
 from fused_memory.models.scope import (
     KNOWN_PROJECT_ROOTS_ENV,
+    Scope,
     build_known_projects_map,
     known_project_roots_from_env,
     resolve_project_id,
@@ -142,3 +146,44 @@ class TestBuildKnownProjectsMap:
             'reify': str(a.resolve()),
             'dark_factory': str(b.resolve()),
         }
+
+
+class TestScopeCanonicalizesProjectId:
+    """Scope.project_id is canonicalized at construction, so every field
+    derived from it (graphiti_group_id, mem0_collection_name,
+    mem0_user_id) is always canonical too."""
+
+    def test_project_id_stored_canonical(self):
+        assert Scope(project_id='dark-factory').project_id == 'dark_factory'
+
+    def test_graphiti_group_id_canonical(self):
+        assert Scope(project_id='dark-factory').graphiti_group_id == 'dark_factory'
+
+    def test_mem0_collection_name_canonical(self):
+        scope = Scope(project_id='dark-factory')
+        assert scope.mem0_collection_name('fused') == 'fused_dark_factory'
+
+    def test_mem0_user_id_canonical(self):
+        assert Scope(project_id='dark-factory').mem0_user_id == 'dark_factory'
+
+    def test_uppercase_and_hyphen_combined(self):
+        assert Scope(project_id='KNOW-live').project_id == 'know_live'
+
+    def test_construction_idempotent(self):
+        """Constructing a Scope from an already-canonical project_id (i.e.
+        the project_id read back off a previously-constructed Scope) yields
+        the same canonical value again."""
+        once = Scope(project_id='dark-factory').project_id
+        twice = Scope(project_id=once).project_id
+        assert twice == 'dark_factory'
+
+    def test_path_shaped_project_id_raises_validation_error(self):
+        """A path-shaped project_id is LOUD-rejected as a pydantic
+        ValidationError at construction, not silently normalized."""
+        bad = '-home-leo-src-x'
+        with pytest.raises(ValidationError) as exc_info:
+            Scope(project_id=bad)
+        assert bad in str(exc_info.value), (
+            'PathShapedProjectIdError message must be preserved through '
+            f"pydantic's wrapping; got: {exc_info.value}"
+        )

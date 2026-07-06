@@ -48,6 +48,7 @@ import sys
 from typing import Any
 
 from fused_memory.models.scope import resolve_project_id
+from fused_memory.utils.validation import is_path_shaped_name
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -61,23 +62,6 @@ logger = logging.getLogger('investigate_cross_graph_duplication')
 # ---------------------------------------------------------------------------
 # Pure core
 # ---------------------------------------------------------------------------
-
-def is_path_shaped_name(name: str) -> bool:
-    """True if *name* looks like a mangled filesystem path rather than a
-    clean project key (e.g. '-home-leo-src-dark-factory').
-
-    A mangled absolute path always retains a leading path separator: a raw
-    '/' if unmangled, or the '-' that an absolute path's leading '/'
-    collapses to once mangled into a graph name. The leak verdict is
-    scoped to that structural signal alone. An earlier revision also
-    flagged any name with >=4 hyphen segments containing a filesystem-ish
-    token (home, src, usr, ...), but that heuristic misclassified
-    legitimate multi-word project keys (e.g. 'my-home-src-app') as path
-    leaks purely because they happened to contain such a token; it has
-    been removed in favor of requiring an actual leading separator.
-    """
-    return name.startswith('/') or name.startswith('-') or '/' in name
-
 
 def detect_collision_groups(graph_names: list[str]) -> dict:
     """Partition *graph_names* into name-normalization collision groups and

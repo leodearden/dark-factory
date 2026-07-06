@@ -5,7 +5,9 @@ import os
 import subprocess
 from pathlib import Path, PurePosixPath
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from fused_memory.utils.validation import _to_underscore_canonical, canonicalize_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,14 @@ def resolve_project_id(
       1. Explicit mapping dict (if provided and contains project_root).
       2. Derive from basename: lowercase, hyphens -> underscores.
 
+    The underscore-canonical mapping (lowercase + hyphen->underscore) is the
+    same rule applied by :func:`fused_memory.utils.validation.canonicalize_project_id`
+    -- both delegate to the shared ``_to_underscore_canonical`` helper so the
+    rule has one source of truth. Unlike ``canonicalize_project_id``, this
+    function never raises on path-shaped input: it operates on an
+    already-extracted path basename (see below), not a raw caller-supplied
+    project_id, so the LOUD-reject guard does not apply here.
+
     Examples:
         >>> resolve_project_id('/home/leo/src/dark-factory')
         'dark_factory'
@@ -132,7 +142,7 @@ def resolve_project_id(
     if mapping and project_root in mapping:
         return mapping[project_root]
     name = PurePosixPath(project_root.rstrip('/')).name
-    return name.lower().replace('-', '_')
+    return _to_underscore_canonical(name)
 
 
 def known_project_roots_from_env(
@@ -205,6 +215,17 @@ class Scope(BaseModel):
     project_id: str
     agent_id: str | None = None
     session_id: str | None = None
+
+    @field_validator('project_id')
+    @classmethod
+    def _canonicalize_project_id(cls, v: str) -> str:
+        """Canonicalize project_id at construction (mode='after' — v is a
+        guaranteed str post type-coercion) so every field derived from it
+        (graphiti_group_id, mem0_collection_name, mem0_user_id) is always
+        canonical too. Path-shaped input raises PathShapedProjectIdError
+        (a ValueError subclass), which pydantic surfaces as a
+        ValidationError at Scope() construction."""
+        return canonicalize_project_id(v)
 
     @property
     def graphiti_group_id(self) -> str:
