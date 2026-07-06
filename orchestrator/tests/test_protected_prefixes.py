@@ -15,6 +15,7 @@ pattern (``_init_repo`` via ``orchestrator.git_ops._run``,
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -139,4 +140,91 @@ class TestProtectedPrefixesRegistry:
         assert '_iact-' not in registry, (
             'the default iact_prefix key must NOT leak in when a custom '
             'prefix is configured'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestRefuseForeignBand — PREFIX-band matching only (exact-name matching is
+# covered separately in TestRefuseForeignBandExactAndConfig once step-6 lands
+# the exact-name precedence layer).
+# ---------------------------------------------------------------------------
+
+
+class TestRefuseForeignBand:
+    """RED — GitOps._refuse_foreign_band: PREFIX-band matching (step-3/4)."""
+
+    def test_foreign_prefix_band_refused_with_warning(
+        self, pp_git_repo: Path, caplog,
+    ) -> None:
+        """(a-core) A `_iact-<x>` dir, owned={'_merge-'} -> refused (True) +
+        WARNING naming the matched band token and its owner."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        path = git_ops.worktree_base / '_iact-someone'
+        path.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = git_ops._refuse_foreign_band(
+                path, frozenset({'_merge-'}), 'test-context',
+            )
+
+        assert result is True, 'expected a foreign band to be refused (True)'
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, 'expected a WARNING to be logged for the foreign-band refusal'
+        joined = '\n'.join(r.getMessage() for r in warnings)
+        assert '_iact-' in joined, (
+            f'expected the WARNING to name the matched band token (_iact-); got: {joined!r}'
+        )
+        assert 'interactive' in joined, (
+            f'expected the WARNING to name the owner (interactive); got: {joined!r}'
+        )
+
+    def test_owned_prefix_band_not_refused_no_warning(
+        self, pp_git_repo: Path, caplog,
+    ) -> None:
+        """(b) A `_merge-<id>` dir, owned={'_merge-'} -> proceeds (False), no WARNING."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        path = git_ops.worktree_base / '_merge-abc123'
+        path.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = git_ops._refuse_foreign_band(
+                path, frozenset({'_merge-'}), 'test-context',
+            )
+
+        assert result is False, 'expected an owned band to proceed (False)'
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings, f'expected NO warning for an owned band; got {warnings!r}'
+
+    def test_non_band_name_not_refused(self, pp_git_repo: Path) -> None:
+        """(c) A plain task-id dir (non-band) -> proceeds (False) regardless of owned."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        path = git_ops.worktree_base / '123'
+        path.mkdir()
+
+        result = git_ops._refuse_foreign_band(path, frozenset(), 'test-context')
+
+        assert result is False, 'expected a non-band name to fail-open (False)'
+
+    def test_non_direct_child_not_refused_even_if_name_matches(
+        self, pp_git_repo: Path,
+    ) -> None:
+        """(d) A nested path whose NAME matches a prefix but whose PARENT is
+        NOT worktree_base -> proceeds (False), fail-open."""
+        config = GitConfig()
+        git_ops = GitOps(config, pp_git_repo)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        nested = git_ops.worktree_base / '123' / '_merge-nested'
+        nested.mkdir(parents=True)
+
+        result = git_ops._refuse_foreign_band(nested, frozenset(), 'test-context')
+
+        assert result is False, (
+            'expected a non-direct-child path to fail-open even though its '
+            'name matches a protected prefix'
         )
