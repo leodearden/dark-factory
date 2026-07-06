@@ -1134,3 +1134,156 @@ class TestRunSlotSubstrateFailClosed:
         pending = h._escalation_queue.get_pending()
         l1s = [e for e in pending if e.task_id == task_id]
         assert not l1s, f'Expected no escalation for non-probe task {task_id}; got {l1s!r}'
+
+
+# ---------------------------------------------------------------------------
+# TestSubstrateGateForeignBandGuard — harness pre-clean band-ownership guard
+# (gitops-chokepoints ε, task 2205 step-13/14).
+#
+# _run_substrate_gate's best-effort pre-clean loop removes any stale gate
+# worktree left by a prior interrupted run before adding a fresh one. This
+# guards the path-scoped `git worktree remove --force` against ever
+# targeting a foreign protected band, consulting the same
+# `GitOps._refuse_foreign_band` primitive used by the git_ops.py sweeps and
+# self-heal sites. The real gate_path is always `_substrate-gate-{task_id}`
+# (the owned band), so a genuine refusal is unreachable through real call
+# patterns — proven here via a forced-True spy, mirroring the other
+# point-site wiring tests in test_protected_prefixes.py.
+# ---------------------------------------------------------------------------
+
+
+async def _init_gate_repo(repo: Path) -> None:
+    from orchestrator.git_ops import _run
+
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+def _make_real_git_harness(repo: Path):
+    """Build a Harness whose ``git_ops`` is a REAL ``GitOps`` on *repo*.
+
+    Unlike ``_make_harness`` (which replaces ``h.git_ops`` with a bare
+    MagicMock), this keeps the real instance so ``_refuse_foreign_band`` can
+    actually be exercised / spied on — needed to prove the substrate-gate
+    pre-clean site consults the shared band-ownership guard.
+    """
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.harness import Harness
+
+    config = OrchestratorConfig(project_root=repo, max_per_module=1)
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.OverrideStore'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        h = Harness(config)
+
+    h.scheduler = MagicMock()
+    h.scheduler.set_task_status = AsyncMock()
+    h.scheduler.is_deterministic = MagicMock(return_value=False)
+    h._escalation_queue = None
+    return h
+
+
+@pytest.mark.asyncio
+class TestSubstrateGateForeignBandGuard:
+    """RED — _run_substrate_gate's pre-clean consults _refuse_foreign_band
+    before its path-scoped `git worktree remove --force` (step-13/14)."""
+
+    async def test_refusal_prevents_preclean_removal(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A forced-True spy must stop the pre-clean removal (the stale gate
+        worktree survives intact) and must be consulted with
+        (gate_path, frozenset({'_substrate-gate-'}), 'substrate-gate-cleanup')."""
+        from orchestrator.git_ops import _run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_gate_repo(repo)
+        h = _make_real_git_harness(repo)
+        assignment = _make_assignment()
+
+        gate_path = h.git_ops.worktree_base / '_substrate-gate-42'
+        h.git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(gate_path), 'main'],
+            cwd=repo,
+        )
+        assert rc == 0, f'failed to plant stale gate worktree fixture: {err}'
+        assert gate_path.exists()
+
+        calls: list[tuple] = []
+
+        def _spy(path, owned, context):
+            calls.append((path, owned, context))
+            return True
+
+        monkeypatch.setattr(h.git_ops, '_refuse_foreign_band', _spy)
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+
+        result = await h._run_substrate_gate(assignment)
+
+        assert gate_path.exists(), (
+            'expected the stale gate worktree to survive the pre-clean sweep '
+            '(refused), but it was removed from disk'
+        )
+        assert calls, (
+            'expected _refuse_foreign_band to be consulted before the '
+            'pre-clean remove'
+        )
+        called_path, called_owned, called_context = calls[0]
+        assert called_path == gate_path
+        assert called_owned == frozenset({'_substrate-gate-'}), (
+            f'expected the pre-clean guard to pass owned={{"_substrate-gate-"}}; '
+            f'got {called_owned!r}'
+        )
+        assert called_context == 'substrate-gate-cleanup'
+        # Side effect of forcing a refusal on this always-owned path: the
+        # still-registered stale worktree makes the subsequent (real) `git
+        # worktree add` fail, which the gate maps to FLIP.
+        assert result is False
+
+    async def test_owned_band_preclean_removal_proceeds_unchanged(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Regression: with the REAL (unpatched) guard, a stale worktree at
+        the owned `_substrate-gate-<id>` path is still cleaned up by the
+        pre-clean sweep, so the gate succeeds exactly as before the guard was
+        wired (if the guard wrongly refused its own band, `git worktree add`
+        would fail on the still-registered path and the gate would FLIP)."""
+        from orchestrator.git_ops import _run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_gate_repo(repo)
+        h = _make_real_git_harness(repo)
+        assignment = _make_assignment()
+
+        gate_path = h.git_ops.worktree_base / '_substrate-gate-42'
+        h.git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(gate_path), 'main'],
+            cwd=repo,
+        )
+        assert rc == 0, f'failed to plant stale gate worktree fixture: {err}'
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+
+        result = await h._run_substrate_gate(assignment)
+
+        assert result is True, (
+            'expected the gate to succeed — the pre-existing stale worktree '
+            'at the owned gate_path must still be cleaned up by the '
+            'pre-clean sweep'
+        )
