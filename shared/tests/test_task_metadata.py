@@ -490,3 +490,100 @@ class TestParseMetadataCore:
         model, warnings = result
         assert isinstance(model, TaskMetadata)
         assert isinstance(warnings, list)
+
+
+class TestParseMetadataFailurePolicy:
+    """The direction x enforce failure-policy matrix (PRD §5 + I1/I4).
+
+    TestParseMetadataCore covers only the paths that never warn. This class
+    covers every path that must warn-and-accept (read, or write+enforce=False)
+    or reject-loudly (write+enforce=True) instead of the old silent-``{}``
+    discard: unparseable JSON, an invalid typed/registered sub-model slice,
+    an unrecognised top-level key, and a deterministic cross-field invariant
+    violation.
+    """
+
+    _BAD_JSON = '{not json'
+
+    def test_unparseable_json_read_warns_never_raises(self):
+        model, warnings = parse_metadata(self._BAD_JSON, direction='read')
+        assert model == TaskMetadata()
+        assert len(warnings) == 1
+        assert warnings[0].code == 'unparseable_json'
+
+    def test_unparseable_json_write_warn_mode_accepts(self):
+        model, warnings = parse_metadata(self._BAD_JSON, direction='write', enforce=False)
+        assert model == TaskMetadata()
+        assert len(warnings) == 1
+        assert warnings[0].code == 'unparseable_json'
+
+    def test_unparseable_json_write_enforce_raises(self):
+        with pytest.raises(ValueError):
+            parse_metadata(self._BAD_JSON, direction='write', enforce=True)
+
+    # done_provenance: Literal rejects 'bogus'. before_done: missing required
+    # timeout_secs. Neither sets task_kind='deterministic', so only the named
+    # sub-model fails — the outer cross-field invariant never enters into it.
+    _INVALID_SUBMODEL_CASES = [
+        pytest.param(
+            {'done_provenance': {'kind': 'bogus'}}, 'done_provenance', id='done_provenance_bogus_kind'
+        ),
+        pytest.param(
+            {'before_done': {'script': 'scripts/x.sh'}}, 'before_done', id='before_done_missing_timeout'
+        ),
+    ]
+
+    @pytest.mark.parametrize('blob,field', _INVALID_SUBMODEL_CASES)
+    def test_invalid_typed_submodel_read_warns_best_effort(self, blob, field):
+        model, warnings = parse_metadata(blob, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == field
+        assert model.model_dump()[field] == blob[field]
+
+    @pytest.mark.parametrize('blob,field', _INVALID_SUBMODEL_CASES)
+    def test_invalid_typed_submodel_write_warn_mode_accepts_raw(self, blob, field):
+        model, warnings = parse_metadata(blob, direction='write', enforce=False)
+        assert len(warnings) == 1
+        assert warnings[0].field == field
+        assert model.model_dump()[field] == blob[field]
+
+    @pytest.mark.parametrize('blob,field', _INVALID_SUBMODEL_CASES)
+    def test_invalid_typed_submodel_write_enforce_raises(self, blob, field):
+        with pytest.raises(ValidationError):
+            parse_metadata(blob, direction='write', enforce=True)
+
+    def test_invalid_registered_submodel_slice_write_enforce_raises(self):
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        with pytest.raises(ValidationError):
+            parse_metadata({'deploy_state': {}}, direction='write', enforce=True)
+
+    def test_invalid_registered_submodel_slice_warn_mode_accepts_raw(self):
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        model, warnings = parse_metadata({'deploy_state': {}}, direction='write', enforce=False)
+        assert len(warnings) == 1
+        assert warnings[0].code == 'invalid_submodel'
+        assert warnings[0].field == 'deploy_state'
+        assert model.model_dump()['deploy_state'] == {}
+
+    def test_x_prefixed_unknown_key_silent_zero_warnings(self):
+        model, warnings = parse_metadata({'x_experimental': 'v'}, direction='write')
+        assert warnings == []
+        assert model.model_dump()['x_experimental'] == 'v'
+
+    def test_other_unknown_key_single_warning_in_warn_mode(self):
+        model, warnings = parse_metadata({'mystery_field': 'v'}, direction='write')
+        assert len(warnings) == 1
+        assert warnings[0].code == 'unknown_key'
+        assert warnings[0].field == 'mystery_field'
+        assert model.model_dump()['mystery_field'] == 'v'
+
+    def test_deterministic_invariant_violation_write_enforce_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
+
+    def test_deterministic_invariant_violation_write_warn_mode_accepts(self):
+        model, warnings = parse_metadata(
+            {'task_kind': 'deterministic'}, direction='write', enforce=False
+        )
+        assert len(warnings) == 1
+        assert model.task_kind == 'deterministic'
