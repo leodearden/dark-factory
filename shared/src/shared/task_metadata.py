@@ -163,3 +163,11 @@ class TaskMetadata(BaseModel):
     # scheduler (PRD Open Q #4); ExternalDep is a parse/render convenience.
     external_deps: list[str] = Field(default_factory=list)
     files: list[str] = Field(default_factory=list)
+
+    @model_validator(mode='after')
+    def _deterministic_invariants(self) -> TaskMetadata:
+        if self.task_kind == 'deterministic' and self.before_done is None and not self.always_escalates:
+            raise ValueError('deterministic task requires before_done or always_escalates')
+        if self.before_done is not None and self.task_kind != 'deterministic':
+            raise ValueError('before_done is only valid on deterministic tasks')
+        return self

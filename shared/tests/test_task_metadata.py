@@ -270,6 +270,7 @@ class TestTaskMetadataFields:
 
     def test_nested_dicts_coerce_to_typed_submodels(self):
         tm = TaskMetadata(
+            task_kind='deterministic',
             before_done={'script': 'scripts/x.sh', 'timeout_secs': 60},
             done_provenance={'kind': 'merged', 'commit': 'abc123'},
             memory_hints={'entities': ['E'], 'queries': ['Q']},
