@@ -116,6 +116,8 @@ import signal
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from orchestrator import systemd_inspect
+from orchestrator.systemd_inspect import inspect_systemd_unit
 from orchestrator.workflow import WorkflowOutcome
 
 if TYPE_CHECKING:
@@ -155,14 +157,16 @@ _REAP_GRACE_SECS: float = 5.0
 # reap_grace_secs with room to spare) rather than tight.
 _RUN_TIMEOUT_GRACE_SECS: float = 30.0
 
-# Task 2091: bound `_default_inspect_unit`'s `systemctl --user show` call — a
-# parallel latent-hang gap to task 2090, which only wraps the before_done
-# run_fn subprocess and not this inspect call (esc-2090-11).  This runs on
-# both the baseline inspect and the post-deploy verify inspect; an unbounded
-# `communicate()` here strands the runner exactly like task 2087 (before_
-# done_ran_at stamped, before_done_verified_at never stamped, no escalation
-# filed).  10s comfortably covers a normal `systemctl show` round trip.
-_INSPECT_TIMEOUT_SECS: float = 10.0
+# Task 2091 / 2119: bound `_default_inspect_unit`'s `systemctl --user show`
+# call — a parallel latent-hang gap to task 2090, which only wraps the
+# before_done run_fn subprocess and not this inspect call (esc-2090-11).
+# This runs on both the baseline inspect and the post-deploy verify inspect;
+# an unbounded `communicate()` here strands the runner exactly like task 2087
+# (before_done_ran_at stamped, before_done_verified_at never stamped, no
+# escalation filed). The hardening itself (and its 10s default timeout) now
+# lives in ``systemd_inspect.py`` — see ``_default_inspect_unit`` below,
+# which is a thin delegate to ``systemd_inspect.inspect_systemd_unit``.
+_INSPECT_TIMEOUT_SECS: float = systemd_inspect._INSPECT_TIMEOUT_SECS
 
 # Task 2120: sentinel agent_role the runner stamps on its own escalations and
 # scopes all its get_by_task queries to — an unrelated escalation with the
@@ -391,65 +395,18 @@ class DeterministicRunner:
     async def _default_inspect_unit(self, unit: str) -> dict:
         """Query systemctl for unit state fields needed for fresh-PID verify.
 
-        Returns a dict with at minimum: MainPID (int), ActiveState (str),
-        ActiveEnterTimestamp (str), ActiveEnterTimestampMonotonic (int).
-        Integers default to 0 on parse failure (sentinel-safe).
+        Task 2119: thin delegate to the hoisted, hardened
+        ``systemd_inspect.inspect_systemd_unit`` (task 2091's timeout/kill/
+        reap hardening now lives there exactly once). Returns a dict with at
+        minimum: MainPID (int), ActiveState (str), ActiveEnterTimestamp
+        (str), ActiveEnterTimestampMonotonic (int). Integers default to 0 on
+        parse failure (sentinel-safe).
         """
-        proc = await asyncio.create_subprocess_exec(
-            'systemctl', '--user', 'show', unit,
-            '-p', 'MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+        return await inspect_systemd_unit(
+            unit,
+            timeout_secs=self._inspect_timeout_secs,
+            reap_grace_secs=self._reap_grace_secs,
         )
-        try:
-            stdout, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=self._inspect_timeout_secs,
-            )
-        except TimeoutError:
-            # Task 2091: a wedged `systemctl show` here (systemd busy/hung, or
-            # a grandchild inheriting the stdout pipe) would otherwise strand
-            # the runner identically to task 2087's signature. This process
-            # is NOT spawned with start_new_session=True (unlike
-            # _default_run_script's), so it shares the orchestrator's own
-            # process group — killing via `_terminate_process_tree`'s
-            # `os.killpg` would risk a self-inflicted SIGKILL. A direct
-            # `proc.kill()` is sufficient: a plain `systemctl show` isn't
-            # expected to fork grandchildren the way a deploy script can.
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)
-            logger.warning(
-                'DeterministicRunner: systemctl show %s timed out after %ss — '
-                'returning MainPID=0 sentinel',
-                unit, self._inspect_timeout_secs,
-            )
-            # On the VERIFY leg, MainPID=0 routes through the existing
-            # verify-fail path: fresh-PID verify already treats MainPID=0 as
-            # a sentinel failure -> born-at-L2 escalate + blocked (matching
-            # the 2090 hardening pattern). On the BASELINE leg, MainPID=0
-            # alone would NOT be caught there (only the verify leg checks
-            # pid > 0) — run()'s baseline capture additionally checks
-            # ActiveState=='' to catch a wedged baseline before the deploy
-            # is even attempted.
-            return {
-                'MainPID': 0,
-                'ActiveState': '',
-                'ActiveEnterTimestamp': '',
-                'ActiveEnterTimestampMonotonic': 0,
-            }
-        result: dict = {}
-        for line in (stdout or b'').decode(errors='replace').splitlines():
-            if '=' in line:
-                key, _, val = line.partition('=')
-                result[key.strip()] = val.strip()
-        # Coerce numeric fields — a missing / unparseable value is treated as 0 (sentinel)
-        for field in ('MainPID', 'ActiveEnterTimestampMonotonic'):
-            try:
-                result[field] = int(result.get(field, 0))
-            except (TypeError, ValueError):
-                result[field] = 0
-        return result
 
     async def _default_run_script(self, before_done: dict) -> tuple[int, str]:
         """Run the deploy script to completion under a timeout.
