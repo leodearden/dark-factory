@@ -2789,6 +2789,16 @@ class Scheduler:
             return False, None
         if tid in self._dispatched:
             return False, None
+        # metadata.deferred_watch (task 2234): metadata.trigger is human-authored
+        # prose describing an upstream reactivation condition (e.g. "graphiti-core
+        # upstream release correcting per-node-pair over-invalidation") and is
+        # never evaluated here. This is a minimal, deliberately over-broad gate —
+        # it blocks dispatch whenever deferred_watch is truthy, full stop. The
+        # narrower "released by an explicit operator reactivation signal"
+        # exception is added in a follow-up refinement.
+        metadata = task.get('metadata') or {}
+        if metadata.get('deferred_watch'):
+            return False, None
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
             return False, None
