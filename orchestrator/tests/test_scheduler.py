@@ -9242,15 +9242,23 @@ class TestOrchestratorStatusSetsMatchShared:
     """Guard: orchestrator.task_status must stay wired to shared.task_statuses.
 
     orchestrator/task_status.py is a thin re-export shim over the single
-    cross-package authority (shared.task_statuses).  This test asserts the
-    re-exported names are identical to the shared source rather than local
-    re-derivations, so an accidental future re-inlining of local literals
-    (re-introducing drift) fails CI.
+    cross-package authority (shared.task_statuses).  TERMINAL_STATUSES and
+    WORKFLOW_PRESERVE_STATUSES are pure re-exports of shared.TERMINAL and
+    shared.WORKFLOW_PRESERVE — identical membership, asserted by equality.
+
+    ACTIVE_TASK_STATUSES is DELIBERATELY NOT a raw re-export of shared.ACTIVE:
+    it is shared.ACTIVE MINUS the new 'infra-hold' status, pinned to the
+    pre-existing 6-member orchestrator fetch set. shared.ACTIVE's complement
+    construction adds infra-hold (task_statuses.py:71-79 MIGRATION HAZARD),
+    which scheduler.py's active-fetch consumers (acquire_next, _get_train_
+    members) have not yet been audited to receive. That audit + enablement is
+    owned by task omega4 (PRD C7/D3). This test locks the exclusion so an
+    accidental future switch to the raw shared.ACTIVE re-export fails CI.
     """
 
     def test_status_sets_are_shared_reexports(self):
         """orchestrator.task_status constants == shared.task_statuses constants."""
-        from shared.task_statuses import ACTIVE, TERMINAL, WORKFLOW_PRESERVE
+        from shared.task_statuses import ACTIVE, TERMINAL, WORKFLOW_PRESERVE, TaskStatus
 
         from orchestrator.task_status import (
             ACTIVE_TASK_STATUSES,
@@ -9264,11 +9272,27 @@ class TestOrchestratorStatusSetsMatchShared:
             f"  shared/task_statuses.py (canonical): {sorted(TERMINAL)}\n"
             "orchestrator.task_status.TERMINAL_STATUSES must re-export shared.task_statuses.TERMINAL."
         )
-        assert ACTIVE_TASK_STATUSES == ACTIVE, (
-            "ACTIVE_TASK_STATUSES drift detected!\n"
+        assert ACTIVE - {TaskStatus.INFRA_HOLD} == ACTIVE_TASK_STATUSES, (
+            "ACTIVE_TASK_STATUSES must equal shared.ACTIVE minus infra-hold (deliberate pin)!\n"
             f"  orchestrator/task_status.py: {sorted(ACTIVE_TASK_STATUSES)}\n"
-            f"  shared/task_statuses.py (canonical): {sorted(ACTIVE)}\n"
-            "orchestrator.task_status.ACTIVE_TASK_STATUSES must re-export shared.task_statuses.ACTIVE."
+            f"  shared.ACTIVE - {{infra-hold}} (expected): {sorted(ACTIVE - {TaskStatus.INFRA_HOLD})}\n"
+            "orchestrator.task_status.ACTIVE_TASK_STATUSES must be shared.ACTIVE with "
+            "TaskStatus.INFRA_HOLD excluded, not a raw re-export of shared.ACTIVE."
+        )
+        assert TaskStatus.INFRA_HOLD not in ACTIVE_TASK_STATUSES, (
+            "ACTIVE_TASK_STATUSES must NOT contain infra-hold — its inclusion in the "
+            "scheduler's active-fetch consumers is unaudited pending task omega4 (PRD C7/D3)."
+        )
+        assert {
+            TaskStatus.PENDING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.BLOCKED,
+            TaskStatus.DEFERRED,
+            TaskStatus.REVIEW,
+            TaskStatus.MERGE_DEFERRED,
+        } == ACTIVE_TASK_STATUSES, (
+            "ACTIVE_TASK_STATUSES must be exactly the pre-existing 6-member fetch set!\n"
+            f"  orchestrator/task_status.py: {sorted(ACTIVE_TASK_STATUSES)}"
         )
         assert WORKFLOW_PRESERVE_STATUSES == WORKFLOW_PRESERVE, (
             "WORKFLOW_PRESERVE_STATUSES drift detected!\n"
