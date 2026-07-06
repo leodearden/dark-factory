@@ -885,7 +885,7 @@ class EscalationQueue:
         """
         self._atomic_write_path(self.queue_dir / f'{escalation_id}.json', json_text)
 
-    def _atomic_write_path(self, path: Path, json_text: str) -> None:
+    def _atomic_write_path(self, path: Path, json_text: str, *, durable: bool = False) -> None:
         """Write *json_text* atomically to *path*.
 
         Uses the tmp+rename pattern: the tmp file is created in ``path.parent``
@@ -894,8 +894,14 @@ class EscalationQueue:
         a dated subdir.  On failure the tmp file is cleaned up and the exception
         propagates unchanged.
 
+        When *durable* is True, the tmp file is fsync'd before the rename and
+        the containing directory is fsync'd after the rename — for callers
+        (e.g. ``_write_seq_counter``) that must survive a crash immediately
+        after this call returns.  Plain tmp+rename alone only guarantees the
+        rename is atomic, not that it is durable yet.
+
         Callers: _atomic_write() (root targets), patch_resolution_metadata()
-        (root or archive targets).
+        (root or archive targets), _write_seq_counter() (durable=True).
         """
         fd, tmp_path_str = tempfile.mkstemp(
             suffix='.tmp', prefix=path.stem, dir=str(path.parent)
@@ -903,11 +909,20 @@ class EscalationQueue:
         try:
             with os.fdopen(fd, 'w') as f:
                 f.write(json_text)
+                if durable:
+                    f.flush()
+                    os.fsync(f.fileno())
             os.rename(tmp_path_str, str(path))
         except Exception:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path_str)
             raise
+        if durable:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
     def _archive_resolved(self, escalation_id: str, resolved_at: str) -> None:
         """Best-effort move ``queue_dir/{escalation_id}.json`` into the dated archive subdir.
@@ -964,30 +979,11 @@ class EscalationQueue:
     def _write_seq_counter(self, path: Path, value: int) -> None:
         """Durably persist *value* as the counter contents at *path*.
 
-        Same tmp+rename shape as ``_atomic_write_path``, plus an fsync of the
-        tmp file before the rename and an fsync of the containing directory
-        after.  The counter must survive a crash immediately after this call
-        returns (PRD C9: "fsync-incremented") — plain tmp+rename alone only
-        guarantees the rename is atomic, not that it is durable yet.
+        Delegates to ``_atomic_write_path(durable=True)`` — the counter must
+        survive a crash immediately after this call returns (PRD C9:
+        "fsync-incremented").
         """
-        fd, tmp_path_str = tempfile.mkstemp(
-            suffix='.tmp', prefix=path.stem, dir=str(path.parent)
-        )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(str(value))
-                f.flush()
-                os.fsync(f.fileno())
-            os.rename(tmp_path_str, str(path))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path_str)
-            raise
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        self._atomic_write_path(path, str(value), durable=True)
 
     def make_id(self, task_id: str) -> str:
         """Generate a unique escalation ID from a durable per-task_id counter.
