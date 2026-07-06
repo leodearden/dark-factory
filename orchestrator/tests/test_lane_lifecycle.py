@@ -48,23 +48,22 @@ class TestStaticContract:
         for member in LaneState:
             assert member.value == member.name.lower()
 
-    def test_legal_transitions_contains_required_edges(self):
-        required = {
+    def test_legal_transitions_contains_key_contractual_edges(self):
+        # A focused spot-check, not the full table — duplicating the exact
+        # table/comprehension LEGAL_TRANSITIONS is built from would just be a
+        # change-detector. Exhaustive behavioral coverage of the sequence
+        # (including the RELEASED -> ASSIGNED reuse edge) lives in
+        # TestLegalRoundtrip, TestIllegalEscalate, and TestQuarantine.
+        key_edges = {
             (None, LaneState.SEED),
-            (LaneState.SEED, LaneState.REGISTERED),
-            (LaneState.REGISTERED, LaneState.ASSIGNED),
-            (LaneState.RELEASED, LaneState.ASSIGNED),
             (LaneState.ASSIGNED, LaneState.IN_USE),
             (LaneState.IN_USE, LaneState.RELEASED),
-            (LaneState.ASSIGNED, LaneState.RELEASED),
+            (LaneState.RELEASED, LaneState.ASSIGNED),
         }
-        assert required <= LEGAL_TRANSITIONS
-
-    def test_legal_transitions_contains_any_to_quarantined(self):
-        # "any" includes every real state AND the pre-record None origin.
-        origins = [*list(LaneState), None]
-        for origin in origins:
-            assert (origin, LaneState.QUARANTINED) in LEGAL_TRANSITIONS
+        assert key_edges <= LEGAL_TRANSITIONS
+        # "any -> QUARANTINED" holds from a real state and the None origin.
+        assert (LaneState.ASSIGNED, LaneState.QUARANTINED) in LEGAL_TRANSITIONS
+        assert (None, LaneState.QUARANTINED) in LEGAL_TRANSITIONS
 
     def test_legal_transitions_excludes_illegal_edge(self):
         assert (LaneState.RELEASED, LaneState.IN_USE) not in LEGAL_TRANSITIONS
@@ -146,6 +145,26 @@ class TestLegalRoundtrip:
         lane = tmp_path / '_lane-0'
         assert lifecycle.read(lane) is None
 
+    def test_released_lane_reassigned_carries_branch_and_seed_forward(
+        self, tmp_path: Path,
+    ):
+        """RELEASED -> ASSIGNED warm-lane reuse: task_id/title come from the
+        new assignment, while branch/seeded_from_sha (never cleared by the
+        RELEASED edge) carry forward from before the release.
+        """
+        lifecycle = _lifecycle(tmp_path)
+        lane = _released_lane(tmp_path, lifecycle)
+
+        record = lifecycle.transition(
+            lane, LaneState.ASSIGNED, task_id='9999', title='reused-demo',
+        )
+        assert record.state == LaneState.ASSIGNED
+        assert record.task_id == '9999'
+        assert record.title == 'reused-demo'
+        assert record.branch == 'task/foo'
+        assert record.seeded_from_sha == 'abc123'
+        assert lifecycle.read(lane) == record
+
 
 # ---------------------------------------------------------------------------
 # Illegal transition -> born-at-L2 escalation (user-observable signal, half 2)
@@ -195,6 +214,72 @@ class TestIllegalEscalate:
 
         with pytest.raises(IllegalLaneTransition):
             lifecycle.transition(lane, LaneState.IN_USE)
+
+
+# ---------------------------------------------------------------------------
+# Unknown **fields validation
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownFieldValidation:
+    def test_transition_rejects_unknown_field_name(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+
+        with pytest.raises(TypeError):
+            lifecycle.transition(lane, LaneState.SEED, seeded_sha='abc123')  # typo
+
+        # The rejected call must not have written a record.
+        assert lifecycle.read(lane) is None
+
+
+# ---------------------------------------------------------------------------
+# Corrupt on-disk record handling
+# ---------------------------------------------------------------------------
+
+
+def _seed_corrupt_record(tmp_path: Path, lane: Path) -> Path:
+    """Write unparseable bytes directly to *lane*'s record path."""
+    record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text('{not valid json')
+    return record_path
+
+
+class TestCorruptRecord:
+    def test_corrupt_record_blocks_transition_and_escalates(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        lifecycle = _lifecycle(tmp_path, escalation_queue=queue)
+        lane = tmp_path / '_lane-0'
+        record_path = _seed_corrupt_record(tmp_path, lane)
+        before_bytes = record_path.read_bytes()
+
+        with pytest.raises(IllegalLaneTransition):
+            lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='xyz')
+
+        # Never silent-heal: a corrupt record is not treated as a fresh,
+        # None-origin lane, and the corrupt bytes are left untouched.
+        assert record_path.read_bytes() == before_bytes
+
+        sentinel_task_id = f'lane-lifecycle-{lane.name}'
+        escalations = queue.get_by_task(sentinel_task_id)
+        assert len(escalations) == 1
+        esc = escalations[0]
+        assert esc.agent_role == ESCALATION_SENTINEL_ROLE
+        assert esc.level == 2
+        assert esc.category == 'risk_identified'
+
+    def test_corrupt_record_still_allows_quarantine(self, tmp_path: Path):
+        # any -> QUARANTINED (including a corrupt "any") stays reachable so a
+        # corrupt lane can still be recovered via quarantine.
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        _seed_corrupt_record(tmp_path, lane)
+
+        record = lifecycle.transition(lane, LaneState.QUARANTINED)
+
+        assert record.state == LaneState.QUARANTINED
+        assert lifecycle.read(lane) == record
 
 
 # ---------------------------------------------------------------------------
