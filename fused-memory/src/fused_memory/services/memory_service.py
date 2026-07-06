@@ -1886,43 +1886,30 @@ class MemoryService:
             edge_data = [_edge_to_dict(e) for e in edges]
             return {'nodes': node_data, 'edges': edge_data}
 
-        results = await asyncio.gather(
-            self.graphiti.search_nodes(
-                query=name,
-                group_ids=[project_id],
-                max_nodes=5,
+        # Two-tier check via gather_or_raise (fused_memory.utils.async_utils).
+        # Both coroutines settle before either is inspected (no orphans).
+        # Pass 1: re-raises structured-cancellation signals (CancelledError,
+        #   KeyboardInterrupt, SystemExit) before any per-call logging —
+        #   cancellation takes precedence over application-level failures
+        #   regardless of position in the results list.
+        # Pass 2: logs each captured Exception and raises the first — these
+        #   are application-level failures from the Graphiti backend.
+        results = await gather_or_raise(
+            (
+                self.graphiti.search_nodes(
+                    query=name,
+                    group_ids=[project_id],
+                    max_nodes=5,
+                ),
+                self.graphiti.search(
+                    query=name,
+                    group_ids=[project_id],
+                    num_results=edge_limit,
+                ),
             ),
-            self.graphiti.search(
-                query=name,
-                group_ids=[project_id],
-                num_results=edge_limit,
-            ),
-            return_exceptions=True,
+            label='get_entity: Graphiti call failed',
+            logger=logger,
         )
-
-        # Two-tier check for asyncio.gather(return_exceptions=True) results.
-        # Both coroutines have already settled at this point (no orphans).
-        #
-        # Pass 1: propagate_cancellations handles structured-cancellation signals
-        #   (CancelledError, KeyboardInterrupt, SystemExit) before any per-call logging.
-        #   Cancellation takes precedence over application-level failures regardless
-        #   of position in the results list.
-        #   See fused_memory.utils.async_utils.propagate_cancellations for the shared
-        #   Pass 1 guard contract.
-        #
-        # Pass 2: log each captured Exception and raise the first — these are
-        #   application-level failures from the Graphiti backend.
-        propagate_cancellations(results)
-        first_exc = next((r for r in results if isinstance(r, Exception)), None)
-        if first_exc is not None:
-            for r in results:
-                if isinstance(r, Exception):
-                    logger.warning(
-                        'get_entity: Graphiti call failed: %s: %s',
-                        type(r).__name__,
-                        r,
-                    )
-            raise first_exc
 
         nodes = cast(list, results[0])
         edges = cast(list, results[1])
