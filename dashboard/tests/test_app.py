@@ -279,6 +279,50 @@ def test_costs_returns_full_costs_block(client):
         assert key in costs, f'COSTS missing {key}'
 
 
+def test_costs_route_threads_shared_now_to_all_aggregates(client):
+    """api_costs must capture one `now` and pass the SAME now to all six
+    route aggregates. Asserted via call-site kwargs (mirrors
+    test_merge_queue_uses_24h_recent_window) because the test fixture
+    carries no per-project DBs, so a shared reference timestamp is not
+    observable in the JSON payload. Closes the per-DB clock-skew race at
+    the route layer, on top of the aggregator-level guarantee from task
+    2170 step-6/step-8."""
+    mock_names = (
+        'aggregate_cost_summary',
+        'aggregate_cost_by_project',
+        'aggregate_cost_by_account',
+        'aggregate_cost_by_role',
+        'aggregate_cost_trend',
+    )
+    mocks = {name: AsyncMock(return_value={}) for name in mock_names}
+    mocks['aggregate_account_events'] = AsyncMock(return_value=[])
+
+    with (
+        patch('dashboard.app.aggregate_cost_summary', new=mocks['aggregate_cost_summary']),
+        patch('dashboard.app.aggregate_cost_by_project', new=mocks['aggregate_cost_by_project']),
+        patch('dashboard.app.aggregate_cost_by_account', new=mocks['aggregate_cost_by_account']),
+        patch('dashboard.app.aggregate_cost_by_role', new=mocks['aggregate_cost_by_role']),
+        patch('dashboard.app.aggregate_cost_trend', new=mocks['aggregate_cost_trend']),
+        patch('dashboard.app.aggregate_account_events', new=mocks['aggregate_account_events']),
+    ):
+        resp = client.get('/api/v2/dashboard/costs?window=7d')
+
+    assert resp.status_code == 200
+
+    nows = []
+    for name, mock in mocks.items():
+        assert mock.await_args is not None, f'{name} was never awaited'
+        assert 'now' in mock.await_args.kwargs, f'{name} was not called with now='
+        now = mock.await_args.kwargs['now']
+        assert now is not None, f'{name} received now=None'
+        assert now.tzinfo is not None, f'{name} received a naive (non-UTC-aware) datetime: {now!r}'
+        nows.append(now)
+
+    assert all(n == nows[0] for n in nows), (
+        f"expected all six aggregates to share one reference now, got {nows!r}"
+    )
+
+
 def test_performance_returns_performance(client):
     resp = client.get('/api/v2/dashboard/performance')
     assert resp.status_code == 200
