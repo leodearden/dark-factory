@@ -16,7 +16,32 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+import shared.task_metadata as task_metadata_module
 from shared.task_metadata import BeforeDone, DoneProvenance, MemoryHints
+
+
+@pytest.fixture(autouse=True)
+def _reset_metadata_registry_state():
+    """Snapshot and restore task_metadata's module-global registry/migrations.
+
+    register_metadata_submodel and the migration registry mutate module-global
+    dicts; without this, TestSubmodelRegistry / TestMigrations / the registry
+    portion of the parse_metadata tests would leak registrations into later
+    tests. Uses getattr/hasattr defensively since _SUBMODEL_REGISTRY and
+    _MIGRATIONS are added incrementally by later steps in this file's own
+    TDD sequence.
+    """
+    had_registry = hasattr(task_metadata_module, '_SUBMODEL_REGISTRY')
+    registry_snapshot = dict(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {}))
+    had_migrations = hasattr(task_metadata_module, '_MIGRATIONS')
+    migrations_snapshot = dict(getattr(task_metadata_module, '_MIGRATIONS', {}))
+    yield
+    if had_registry:
+        task_metadata_module._SUBMODEL_REGISTRY.clear()
+        task_metadata_module._SUBMODEL_REGISTRY.update(registry_snapshot)
+    if had_migrations:
+        task_metadata_module._MIGRATIONS.clear()
+        task_metadata_module._MIGRATIONS.update(migrations_snapshot)
 
 
 class TestBeforeDone:
