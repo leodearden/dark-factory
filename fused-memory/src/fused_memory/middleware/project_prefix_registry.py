@@ -177,6 +177,44 @@ class ProjectPrefixRegistry:
         """Return the owning project_id for *prefix*, or None if unknown."""
         return self.prefix_to_project.get(prefix)
 
+    def project_for_path(self, file_path: str | None) -> str | None:
+        """Return the owning project_id for *file_path*, or None if unowned.
+
+        Unlike :meth:`project_for_prefix` (exact prefix-string lookup) or the
+        guard's regex-over-prose ``find_paths``, this resolves an arbitrary
+        file path via exact leading-path-*component* matching: a registered
+        prefix ``P`` (always trailing-slash-terminated) owns *file_path* when
+        ``file_path == P.rstrip('/')`` (the bare directory name, no trailing
+        content) or ``file_path.startswith(P)`` — the trailing ``/`` on ``P``
+        enforces the component boundary, so e.g. ``'cratesfoo/x'`` does NOT
+        match the prefix ``'crates/'``, and ``'vendor/crates/x'`` does not
+        either (``crates/`` is not a *leading* component there).
+
+        A leading ``'./'`` is stripped before matching. When more than one
+        registered prefix matches, the LONGEST one wins (its owner is
+        returned). Returns ``None`` for an empty/falsy *file_path* or when no
+        registered prefix matches.
+
+        This is the CERTAIN/structured counterpart to the heuristic prose
+        scanners in :mod:`fused_memory.middleware.path_scope_guard` — used by
+        ``check_files_for_scope`` to classify concrete ``metadata.files``
+        entries (task 2206).
+        """
+        path = (file_path or '').strip()
+        if path.startswith('./'):
+            path = path[2:]
+        if not path:
+            return None
+
+        best_prefix = ''
+        best_owner: str | None = None
+        for prefix, owner in self.prefix_to_project.items():
+            matches = path == prefix.rstrip('/') or path.startswith(prefix)
+            if matches and len(prefix) > len(best_prefix):
+                best_prefix = prefix
+                best_owner = owner
+        return best_owner
+
     def root_for_project(self, project_id: str) -> str | None:
         """Return the configured project_root for *project_id*, or None."""
         return self.project_to_root.get(project_id)
