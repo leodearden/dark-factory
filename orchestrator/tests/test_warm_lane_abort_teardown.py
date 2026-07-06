@@ -132,3 +132,24 @@ class TestAbortLaneAcquisitionDetachAndRelease:
         assert await git_ops._is_registered_worktree(info.path), (
             'remove_worktree=False must retain the worktree registration'
         )
+
+    async def test_abort_remove_worktree_true_removes_minted_worktree(
+        self, git_repo: Path,
+    ):
+        """remove_worktree=True: the minted worktree is removed; slot still frees."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        info = await git_ops.acquire_warm_lane('X', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+
+        await git_ops._abort_lane_acquisition(info.path, 'X', remove_worktree=True)
+
+        assert not await git_ops._is_registered_worktree(info.path), (
+            'remove_worktree=True must remove the minted worktree'
+        )
+        assert git_ops.warm_lane_pool is not None
+        assert git_ops.warm_lane_pool.state(info.path) == LaneState.FREE, (
+            'Pool slot must be FREE after abort'
+        )
