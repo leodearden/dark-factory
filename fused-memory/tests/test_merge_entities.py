@@ -165,6 +165,7 @@ class TestMergeEntities:
             'inter_node_deleted': 0,
         })
         backend.delete_entity_node = AsyncMock()
+        backend.dedup_valid_edges_for_node = AsyncMock(return_value=0)
         backend.refresh_entity_summary = AsyncMock(return_value=make_rebuild_detail(
             'sur-uuid', 'SurvivingName',
             old_summary='old sur summary',
@@ -204,7 +205,8 @@ class TestMergeEntities:
 
     @pytest.mark.asyncio
     async def test_calls_in_correct_order(self, backend_with_mocks):
-        """Calls redirect_node_edges, then delete_entity_node, then refresh_entity_summary."""
+        """Calls redirect_node_edges, then delete_entity_node, then
+        dedup_valid_edges_for_node, then refresh_entity_summary."""
         backend = backend_with_mocks
         call_order = []
         backend.redirect_node_edges = AsyncMock(
@@ -215,11 +217,29 @@ class TestMergeEntities:
         backend.delete_entity_node = AsyncMock(
             side_effect=lambda *a, **kw: call_order.append('delete')
         )
+        backend.dedup_valid_edges_for_node = AsyncMock(
+            side_effect=lambda *a, **kw: call_order.append('dedup') or 0
+        )
         backend.refresh_entity_summary = AsyncMock(
             side_effect=lambda *a, **kw: call_order.append('refresh') or make_rebuild_detail('sur-uuid', 'S')
         )
         await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
-        assert call_order == ['redirect', 'delete', 'refresh']
+        assert call_order == ['redirect', 'delete', 'dedup', 'refresh']
+
+    @pytest.mark.asyncio
+    async def test_dedups_surviving_node_edges(self, backend_with_mocks):
+        """Awaits dedup_valid_edges_for_node once with the surviving uuid and group_id."""
+        backend = backend_with_mocks
+        await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        backend.dedup_valid_edges_for_node.assert_awaited_once_with('sur-uuid', group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_audit_dict_reports_duplicate_edges_removed(self, backend_with_mocks):
+        """Audit dict surfaces the duplicate_edges_removed count from dedup_valid_edges_for_node."""
+        backend = backend_with_mocks
+        backend.dedup_valid_edges_for_node = AsyncMock(return_value=2)
+        result = await backend.merge_entities('dep-uuid', 'sur-uuid', group_id='test')
+        assert result['duplicate_edges_removed'] == 2
 
     @pytest.mark.asyncio
     async def test_returns_audit_dict(self, backend_with_mocks):
