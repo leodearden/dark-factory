@@ -15,7 +15,10 @@ the module docstring and ``plans/cross-graph-entity-leak-prd.md`` decision 5.
 """
 from __future__ import annotations
 
-from fused_memory.maintenance.cross_graph_move import parse_compact_vector_reply
+from fused_memory.maintenance.cross_graph_move import (
+    format_vecf32_literal,
+    parse_compact_vector_reply,
+)
 
 # ---------------------------------------------------------------------------
 # Recorded/representative `GRAPH.RO_QUERY ... --compact` vector-reply fixture.
@@ -72,3 +75,31 @@ class TestParseCompactVectorReply:
     def test_empty_vector_reply_returns_empty_list(self):
         """An empty '--compact' vector reply parses to an empty token list."""
         assert parse_compact_vector_reply('[]') == []
+
+
+# ---------------------------------------------------------------------------
+# step-3: format_vecf32_literal
+# ---------------------------------------------------------------------------
+
+class TestFormatVecf32Literal:
+    """format_vecf32_literal(tokens) -> 'vecf32([...])', tokens embedded verbatim."""
+
+    def test_formats_tokens_into_vecf32_literal(self):
+        """Renders a simple token list as a vecf32([...]) Cypher literal."""
+        assert format_vecf32_literal(['0.5', '1.0']) == 'vecf32([0.5, 1.0])'
+
+    def test_empty_tokens_render_empty_vecf32_literal(self):
+        """An empty token list renders as vecf32([])."""
+        assert format_vecf32_literal([]) == 'vecf32([])'
+
+    def test_round_trip_matches_expected_fixture_byte_for_byte(self):
+        """format_vecf32_literal(parse_compact_vector_reply(fixture)) is lossless.
+
+        Chaining the two pure functions over the recorded --compact fixture
+        must reproduce the recorded expected vecf32([...]) literal exactly,
+        including the full-precision (non-float()-roundtrippable) tokens --
+        proving the read->literal passthrough never touches the numeric
+        value.
+        """
+        tokens = parse_compact_vector_reply(COMPACT_VECTOR_REPLY_FIXTURE)
+        assert format_vecf32_literal(tokens) == EXPECTED_VECF32_LITERAL_FIXTURE
