@@ -194,3 +194,51 @@ class TestLandedOutboxFsyncDurability:
         assert any(stat.S_ISDIR(m) for m in captured_modes), (
             f'Expected at least one fsync on a directory; modes={captured_modes!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9 — MergeProvenance façade
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _restore_merge_provenance_binding():
+    """Snapshot/restore MergeProvenance's process-global bound outbox.
+
+    MergeProvenance.bind() mutates a class-level reference shared across the
+    whole test process; without this fixture a bind() in one test would leak
+    into whichever test runs next in the same xdist worker. Imported locally
+    (not at module scope) so this fixture itself does not exist — and thus
+    cannot break collection — until step-10 defines MergeProvenance.
+    """
+    from orchestrator.landed_outbox import MergeProvenance
+
+    original = MergeProvenance._outbox
+    yield
+    MergeProvenance._outbox = original
+
+
+class TestMergeProvenanceFacade:
+    """MergeProvenance.lookup() is a fail-safe façade over a bound LandedOutbox."""
+
+    def test_lookup_with_nothing_bound_returns_none(
+        self, _restore_merge_provenance_binding: None,
+    ) -> None:
+        from orchestrator.landed_outbox import MergeProvenance
+
+        MergeProvenance._outbox = None  # explicit: nothing bound
+        assert MergeProvenance.lookup('42') is None
+
+    def test_lookup_routes_to_bound_outbox(
+        self, tmp_path: Path, _restore_merge_provenance_binding: None,
+    ) -> None:
+        from orchestrator.landed_outbox import MergeProvenance
+
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        row = LandedRow(task_id='42', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
+        outbox.record(row)
+
+        MergeProvenance.bind(outbox)
+
+        assert MergeProvenance.lookup('42') == row
+        assert MergeProvenance.lookup('unknown') is None
