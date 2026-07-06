@@ -864,7 +864,9 @@ class DeterministicRunner:
         # If the gate escalation was already filed in a prior dispatch, check
         # whether it is still open or has been resolved.
         if gate_escalated_at:
-            pending = self.escalation_queue.get_by_task(task_id, status='pending')
+            pending = self.escalation_queue.get_by_task(
+                task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+            )
             if pending:
                 # Escalation still open — quiescence (B3): return BLOCKED without
                 # re-escalating.  The existing L2 is still awaiting human action.
@@ -925,7 +927,9 @@ class DeterministicRunner:
             # I1 once-only idempotency guard (parallel to β's gate_escalated_at branch):
             # if the deploy already ran, check whether its escalation is still open.
             if before_done_ran_at:
-                pending = self.escalation_queue.get_by_task(task_id, status='pending')
+                pending = self.escalation_queue.get_by_task(
+                    task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+                )
                 if pending:
                     # Pending infra_issue → quiescent BLOCKED (B7 reaper / I1 no-rerun)
                     logger.debug(
@@ -955,7 +959,13 @@ class DeterministicRunner:
                 before_done_verified_at = metadata.get('before_done_verified_at')
                 # status=None scans the archive too → detects a resolved/dismissed
                 # escalation, i.e. proof a human was in the loop on a prior failure.
-                ever_escalated = bool(self.escalation_queue.get_by_task(task_id))
+                # agent_role scopes this to the runner's OWN escalations — an
+                # unrelated escalation sharing this task_id (e.g. a starvation-
+                # watchdog filing) must never alias as proof a human resolved
+                # THIS runner's failure (task 2120).
+                ever_escalated = bool(self.escalation_queue.get_by_task(
+                    task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
+                ))
 
                 if before_done_verified_at:
                     # (a) Deploy verified OK; crash before the done write.
