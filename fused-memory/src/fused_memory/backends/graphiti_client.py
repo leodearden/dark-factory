@@ -230,6 +230,7 @@ class GraphitiBackend:
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._indexed_graphs: set[str] = set()
         self._cloned_drivers: dict[str, GraphDriver] = {}
+        self._identity_locks: dict[str, asyncio.Lock] = {}
 
     # --- Per-request driver routing ---
 
@@ -250,6 +251,32 @@ class GraphitiBackend:
         """Return the FalkorGraph object for *group_id* (for direct Cypher)."""
         driver = self._require_driver()
         return driver._get_graph(group_id)
+
+    def _identity_lock_for(self, group_id: str) -> asyncio.Lock:
+        """Return the per-group_id write-time-identity lock, creating it lazily.
+
+        Mirrors the DurableWriteQueue._group_locks idiom (durable_queue.py:136,
+        259-260): one asyncio.Lock per group_id, created on first access and
+        cached thereafter so repeated calls for the same group_id return the
+        exact same Lock instance.
+
+        This registry is SEPARATE from DurableWriteQueue._group_locks, which
+        only guards _claim_next — not _process_item/add_episode — so with
+        workers_per_group > 1 two add_episode calls for the same group can run
+        concurrently and would race on entity-name resolution without their
+        own lock.
+
+        Callers (MemoryService) are expected to hold this lock across an
+        add_episode + reconcile critical section (which includes any call to
+        _resolve_or_create_entity), and must NEVER hold it across a Mem0
+        write. Synchronous accessor — returns the Lock object itself, not a
+        coroutine, so callers write ``async with backend._identity_lock_for(gid):``.
+        """
+        lock = self._identity_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._identity_locks[group_id] = lock
+        return lock
 
     def _require_driver(self) -> FalkorDriver:
         if self._driver is None:
