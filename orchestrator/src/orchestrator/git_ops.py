@@ -183,6 +183,26 @@ POOL_ROOT_SENTINEL: str = '.pool-root'
 # I1). See InteractiveWorktreeInfo / InteractiveWorktreeLimitError /
 # GitOps.create_interactive_worktree below for the full contract.
 
+# Band-ownership registry for worktree_base's ephemeral-worktree namespace
+# (gitops-chokepoints PRD, Mechanism 3 / task ε).  Maps a band TOKEN to an
+# owner tag identifying the subsystem that mints/reaps it.  A key ending in
+# '-' is a PREFIX (matched via str.startswith); a key not ending in '-' is
+# an EXACT worktree name (matched via ==).  Consulted by
+# GitOps._refuse_foreign_band (via GitOps.protected_prefixes(), which also
+# merges in the config-driven _iact-* band) so a destructive cleanup sweep
+# can never remove a band it does not own — see that method's docstring for
+# the full contract.  Exact-name keys use the persistent-name constants
+# above (not independent literals) so this registry cannot drift from them.
+PROTECTED_PREFIXES: dict[str, str] = {
+    '_lane-': 'warm-lane-pool',
+    '_spec-': 'merge-speculation-pool',
+    '_merge-': 'merge-queue',
+    '_solo-': 'attribution-solo',
+    '_substrate-gate-': 'harness-substrate-gate',
+    PERSISTENT_MERGE_WORKTREE_NAME: 'persistent-merge-verify',
+    PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: 'persistent-offline-deep',
+}
+
 
 class ScrubOutcome(Enum):
     """Outcome discriminant for :class:`ScrubResult`.
@@ -911,6 +931,19 @@ class GitOps:
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
+
+    def protected_prefixes(self) -> dict[str, str]:
+        """Authoritative band-ownership registry for this instance.
+
+        Returns the module-level :data:`PROTECTED_PREFIXES` (the static
+        bands) merged with this instance's config-driven interactive band
+        (``self.config.iact_prefix`` -> ``'interactive'``).  The iact band
+        is config-shaped (:attr:`GitConfig.iact_prefix` may be overridden
+        per deployment), so a single module constant cannot capture the
+        authoritative band map — the per-instance view is the correct one
+        for callers to consult, including :meth:`_refuse_foreign_band`.
+        """
+        return {**PROTECTED_PREFIXES, self.config.iact_prefix: 'interactive'}
 
     def pool_in_use(self) -> bool:
         """True iff a warm or spec lane pool is configured on this host (task 2099).
