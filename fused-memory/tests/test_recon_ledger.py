@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
-from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 
 EXPECTED_COLUMNS = {
     'project_id',
@@ -73,3 +73,53 @@ async def test_initialize_creates_schema_with_expected_columns_and_indexes(tmp_p
         )
     finally:
         await s.close()
+
+
+@pytest.mark.asyncio
+async def test_upsert_then_get_by_identity_round_trips(store):
+    """upsert() persists a record; get_by_identity() reads it back unchanged."""
+    record = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='stage1_flag_marker',
+        payload_json='{"flag": "drift"}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        task_id='task-1',
+        flag_type='drift_flag',
+        run_id='run-1',
+        expires_at='2026-07-15T00:00:00+00:00',
+    )
+    await store.upsert(record)
+
+    fetched = await store.get_by_identity(
+        'proj-a',
+        'stage1_flag_marker',
+        task_id='task-1',
+        flag_type='drift_flag',
+        run_id='run-1',
+    )
+    assert fetched == record
+
+
+@pytest.mark.asyncio
+async def test_get_by_identity_none_expires_at_round_trips_to_none(store):
+    """A record created with expires_at=None reads back as None, not the string 'None'."""
+    record = ReconLedgerRecord(
+        project_id='proj-a',
+        record_kind='cycle_summary',
+        payload_json='{}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+    )
+    await store.upsert(record)
+
+    fetched = await store.get_by_identity('proj-a', 'cycle_summary')
+    assert fetched is not None
+    assert fetched.expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_get_by_identity_unknown_identity_returns_none(store):
+    """An identity with no matching row returns None rather than raising."""
+    fetched = await store.get_by_identity('proj-unknown', 'stage1_flag_marker')
+    assert fetched is None
