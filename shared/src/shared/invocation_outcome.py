@@ -102,6 +102,24 @@ _MONTH_ABBR = {
     'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
 }
 
+# NOTE — fork, not drift-guarded: _parse_resets_at and _extract_cap_message
+# below are ported from usage_gate.py (their regex/parsing logic originated
+# there), but unlike CAP_HIT_PREFIXES/CAP_CONFIRM_KEYWORDS/NEAR_CAP_PREFIXES/
+# CODEX_CAP_PATTERNS/GEMINI_CAP_PATTERNS/NON_CAP_CLI_ERROR_MARKERS (pinned by
+# TestStringTableDriftGuard in test_invocation_outcome.py), these two
+# functions have NO automated guard keeping them in sync with their
+# usage_gate.py originals — and have already intentionally diverged: this
+# copy of _parse_resets_at returns None on parse failure and accepts an
+# injectable ``now`` (PRD 7.1.a — an unknown reset time must be reported as
+# explicitly unknown, never fabricated, and tests need determinism), whereas
+# usage_gate.py's ``_parse_resets_at(text) -> datetime`` fabricates
+# ``now + 1h`` on parse failure and always reads the real wall clock. Both
+# copies are pure and forked deliberately (this task is additive-only; see
+# the module docstring), so a future edit to one is not expected to be
+# mirrored in the other — but it also won't be caught if it should have
+# been. Resolved by the beta consumer-rewire, which is expected to delete
+# usage_gate.py's copies in favour of these once callers are repointed here.
+
 
 def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | None:
     """Parse reset time from cap-hit message text.
@@ -271,7 +289,13 @@ GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
 
 
 def _extract_cap_message(text: str, prefix: str) -> str:
-    """Extract the full sentence containing the cap-hit prefix."""
+    """Extract the full sentence containing the cap-hit prefix.
+
+    Forked from usage_gate.py, same as ``_parse_resets_at`` above — see the
+    fork/no-drift-guard note by that function's definition. Not covered by
+    TestStringTableDriftGuard, which pins only the plain string-table
+    constants.
+    """
     lower = text.lower()
     idx = lower.find(prefix.lower())
     if idx == -1:

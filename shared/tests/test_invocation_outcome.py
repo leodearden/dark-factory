@@ -186,6 +186,17 @@ class TestStringTableDriftGuard:
     rewire removes the duplication later). Until that rewire lands, a future
     edit to one home must not silently diverge from the other — these tests
     fail loudly the moment it does.
+
+    Scope: this guard covers ONLY the six plain string-table constants below
+    (CAP_HIT_PREFIXES, CAP_CONFIRM_KEYWORDS, NEAR_CAP_PREFIXES,
+    CODEX_CAP_PATTERNS, GEMINI_CAP_PATTERNS, NON_CAP_CLI_ERROR_MARKERS). It
+    does NOT cover ``_parse_resets_at``/``_extract_cap_message`` — those are
+    also forked from usage_gate.py, are larger and already known to have
+    diverged (see the fork note above ``_parse_resets_at`` in
+    invocation_outcome.py), and are where a real silent regression is more
+    likely. Once the beta consumer-rewire removes the duplication entirely,
+    this whole class should be deleted rather than left to outlive its
+    purpose.
     """
 
     def test_cap_hit_prefixes_matches_usage_gate(self):
