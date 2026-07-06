@@ -249,6 +249,7 @@ from typing import Any, Literal, NotRequired, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.mem0_dedup import find_prior_memories
+from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
 
@@ -2241,22 +2242,25 @@ async def acknowledge_flag_marker(
 
     # mode == 'delete', or mode == 'tag' with a confirmed replacement write:
     # delete all located priors best-effort (one bad delete does not abort the batch).
-    results = await asyncio.gather(
-        *(
-            memory_service.delete_memory(
-                memory_id=prior.id,
-                store='mem0',
-                project_id=project_id,
-                causation_id=run_id,
-                _source='flag_acknowledgment',
-            )
-            for prior in priors
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this delete fan-out from silently converting a shutdown
+    # signal into an under-counted acknowledgment tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    results = await gather_collect(
+        memory_service.delete_memory(
+            memory_id=prior.id,
+            store='mem0',
+            project_id=project_id,
+            causation_id=run_id,
+            _source='flag_acknowledgment',
+        )
+        for prior in priors
     )
     success_count = 0
     for prior, result in zip(priors, results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             log.warning(
                 'acknowledge_flag_marker: failed to delete prior marker %s for task %s'
                 ' flag_type %s: %s',
@@ -2335,24 +2339,27 @@ async def acknowledge_resolved_flags(
     # concurrent acknowledge_flag_marker calls against the same prior marker(s).
     deduped_sigs = list(dict.fromkeys(sigs))
 
-    results = await asyncio.gather(
-        *(
-            acknowledge_flag_marker(
-                memory_service,
-                project_id=project_id,
-                run_id=run_id,
-                task_id=tid,
-                flag_type=ftype,
-                mode=mode,
-                log=log,
-            )
-            for tid, ftype in deduped_sigs
-        ),
-        return_exceptions=True,
+    # Two-tier check via gather_collect (fused_memory.utils.async_utils).
+    # Pass 1 (inside gather_collect): re-raises structured-cancellation
+    # signals — this preserves the structured-cancellation contract and
+    # prevents this batch fan-out from silently converting a shutdown
+    # signal into an under-counted acknowledgment tally.
+    # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
+    results = await gather_collect(
+        acknowledge_flag_marker(
+            memory_service,
+            project_id=project_id,
+            run_id=run_id,
+            task_id=tid,
+            flag_type=ftype,
+            mode=mode,
+            log=log,
+        )
+        for tid, ftype in deduped_sigs
     )
     total = 0
     for (tid, ftype), result in zip(deduped_sigs, results, strict=True):
-        if isinstance(result, BaseException):
+        if isinstance(result, Exception):
             log.warning(
                 'acknowledge_resolved_flags: acknowledge_flag_marker failed for task %s'
                 ' flag_type %s: %s',
