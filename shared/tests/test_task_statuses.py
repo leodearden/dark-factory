@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import enum
 
+import pytest
+
 from shared.task_statuses import ACTIVE, STATUS_TRIGGERS, TERMINAL, WORKFLOW_PRESERVE, TaskStatus
 
 # ---------------------------------------------------------------------------
@@ -111,3 +113,54 @@ class TestDerivedFrozensets:
     def test_workflow_preserve_and_status_triggers_are_subsets(self):
         assert set(TaskStatus) >= WORKFLOW_PRESERVE
         assert set(TaskStatus) >= STATUS_TRIGGERS
+
+
+# ---------------------------------------------------------------------------
+# Tracking placeholder — cross-package drift guard (reviewer finding, task
+# 2163 amendment pass). NOT runnable yet: see skip reason.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skip(
+    reason=(
+        'Placeholder for the cross-package drift guard that supersedes the '
+        '_LEGACY_* inlined snapshots above. Those snapshots pin what the legacy '
+        'sets looked like on 2026-07-06 but are never re-checked against the '
+        'live source files, so a legacy set can drift before rho1a/omega2 '
+        'rewire its call site to import from shared.task_statuses. Unskip once '
+        'BOTH: (1) rho1a/omega2 have rewired the call sites below to import '
+        'from shared.task_statuses (so the assertions compare a re-export to '
+        "itself rather than two independently-maintained literals), and (2) "
+        'orchestrator/fused_memory are importable from this test environment '
+        '(shared/tests/conftest.py currently only puts shared/src on sys.path). '
+        'Cross-package import is intentionally avoided elsewhere in this '
+        'codebase for this exact problem — see the mirrored-not-imported '
+        'precedent at orchestrator/tests/test_scheduler.py::'
+        'test_active_task_statuses_matches_fused_memory — so item (2) may '
+        'require deliberate test-env wiring rather than falling out for free.'
+    )
+)
+class TestCrossPackageDriftGuardPlaceholder:
+    """Shape of the future guard. Not runnable yet — see the skip reason."""
+
+    def test_orchestrator_task_status_matches_shared(self):
+        from orchestrator.task_status import (
+            ACTIVE_TASK_STATUSES,
+            TERMINAL_STATUSES,
+            WORKFLOW_PRESERVE_STATUSES,
+        )
+
+        assert TERMINAL_STATUSES == TERMINAL
+        assert ACTIVE_TASK_STATUSES == ACTIVE
+        assert WORKFLOW_PRESERVE_STATUSES == WORKFLOW_PRESERVE
+
+    def test_fused_memory_task_interceptor_matches_shared(self):
+        from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES, TaskInterceptor
+
+        assert TERMINAL_STATUSES == TERMINAL
+        assert TaskInterceptor.STATUS_TRIGGERS == STATUS_TRIGGERS
+
+    def test_fused_memory_task_filter_matches_shared(self):
+        from fused_memory.reconciliation.task_filter import ACTIVE_TASK_STATUSES
+
+        assert ACTIVE_TASK_STATUSES == ACTIVE
