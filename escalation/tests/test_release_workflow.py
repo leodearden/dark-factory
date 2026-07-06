@@ -242,9 +242,11 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     h.scheduler.get_status = AsyncMock(return_value='in-progress')
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.release = MagicMock()
-    # carries_substrate_probe must return False so _run_slot skips _run_substrate_gate
-    # (which needs git_ops.worktree_base — left None since TaskWorkflow is patched).
-    h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    # Substrate gate: _run_slot now calls substrate_gate.carries_substrate_probe
+    # (module-level, not a Scheduler method — task 2121) directly on
+    # assignment.task below, which carries no 'metadata' key — the real
+    # predicate returns False so _run_slot skips _run_substrate_gate (which
+    # needs git_ops.worktree_base — left None since TaskWorkflow is patched).
     # is_deterministic gate: stub False so _run_slot follows the normal TaskWorkflow
     # path instead of misrouting to _run_deterministic_slot on a truthy MagicMock
     # (task 1899 deterministic-runner drift; mirrors the test_crash_recovery 1919 fix).

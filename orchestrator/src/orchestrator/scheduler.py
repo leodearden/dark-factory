@@ -1410,30 +1410,13 @@ class Scheduler:
         task['metadata'] = {}
 
     @staticmethod
-    def carries_substrate_probe(task: dict) -> bool:
-        """Return True iff *task* carries a non-empty ``substrate_probe`` descriptor.
-
-        This is the single source of truth the harness uses to decide whether
-        to run the dispatch-time substrate re-check gate (D4).  Delegates to
-        ``substrate_gate.extract_probe_set`` so the descriptor-extraction
-        logic lives in one place.
-
-        Lazy import keeps substrate_gate dependency-light and avoids import
-        cycles (substrate_gate imports nothing from orchestrator).
-        """
-        # Lazy import — substrate_gate is stdlib-only; deferred to avoid
-        # loading it at scheduler import time (mirrors b3_gate lazy-import
-        # of orchestrator.config at resolution time).
-        from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
-        return extract_probe_set(task) is not None
-
-    @staticmethod
     def is_deterministic(task: dict) -> bool:
         """Return True iff *task* is a deterministic-kind task.
 
         Reads ``task['metadata']['task_kind']`` and returns True when it equals
         ``'deterministic'``.  Tolerates missing/None metadata gracefully,
-        mirroring the ``carries_substrate_probe`` pattern (scheduler.py:1372).
+        mirroring the ``substrate_gate.carries_substrate_probe`` pattern
+        (permissive on missing/malformed metadata rather than raising).
 
         This is the single source of truth used by:
           - ``Harness._run_slot`` (route to DeterministicRunner)

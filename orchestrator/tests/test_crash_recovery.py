@@ -35,12 +35,14 @@ def harness(tmp_path: Path, mock_orch_config):
     # restore/preserve, none assert release.
     h.scheduler.get_status = AsyncMock(return_value=None)
     h.scheduler._dispatched = set()
-    # Substrate gate: return False from carries_substrate_probe so _run_slot
-    # tests skip the D4 gate entirely (no real git repo in tmp_path).
-    h.scheduler.carries_substrate_probe = MagicMock(return_value=False)
+    # Substrate gate: _run_slot now calls substrate_gate.carries_substrate_probe
+    # (module-level, not a Scheduler method — task 2121) directly on
+    # assignment.task. This file's task dicts carry no 'metadata' key, so the
+    # real predicate already returns False and the D4 gate is skipped without
+    # needing to stub anything on the mocked scheduler.
     # Deterministic dispatch (task 1899): is_deterministic is a sync @staticmethod
     # predicate checked at top of _run_slot (harness.py:3728).  Stub False so the
-    # 4 _run_slot tests skip _run_deterministic_slot — mirrors carries_substrate_probe.
+    # 4 _run_slot tests skip _run_deterministic_slot.
     h.scheduler.is_deterministic = MagicMock(return_value=False)
 
     # Replace git_ops cleanup/quarantine with async mocks; keep worktree_base real
