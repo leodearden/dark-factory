@@ -117,6 +117,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from orchestrator import systemd_inspect
+from orchestrator.systemd_inspect import inspect_systemd_unit
 from orchestrator.workflow import WorkflowOutcome
 
 if TYPE_CHECKING:
@@ -401,7 +402,7 @@ class DeterministicRunner:
         (str), ActiveEnterTimestampMonotonic (int). Integers default to 0 on
         parse failure (sentinel-safe).
         """
-        return await systemd_inspect.inspect_systemd_unit(
+        return await inspect_systemd_unit(
             unit,
             timeout_secs=self._inspect_timeout_secs,
             reap_grace_secs=self._reap_grace_secs,
