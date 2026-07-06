@@ -183,6 +183,26 @@ POOL_ROOT_SENTINEL: str = '.pool-root'
 # I1). See InteractiveWorktreeInfo / InteractiveWorktreeLimitError /
 # GitOps.create_interactive_worktree below for the full contract.
 
+# Band-ownership registry for worktree_base's ephemeral-worktree namespace
+# (gitops-chokepoints PRD, Mechanism 3 / task ε).  Maps a band TOKEN to an
+# owner tag identifying the subsystem that mints/reaps it.  A key ending in
+# '-' is a PREFIX (matched via str.startswith); a key not ending in '-' is
+# an EXACT worktree name (matched via ==).  Consulted by
+# GitOps._refuse_foreign_band (via GitOps.protected_prefixes(), which also
+# merges in the config-driven _iact-* band) so a destructive cleanup sweep
+# can never remove a band it does not own — see that method's docstring for
+# the full contract.  Exact-name keys use the persistent-name constants
+# above (not independent literals) so this registry cannot drift from them.
+PROTECTED_PREFIXES: dict[str, str] = {
+    '_lane-': 'warm-lane-pool',
+    '_spec-': 'merge-speculation-pool',
+    '_merge-': 'merge-queue',
+    '_solo-': 'attribution-solo',
+    '_substrate-gate-': 'harness-substrate-gate',
+    PERSISTENT_MERGE_WORKTREE_NAME: 'persistent-merge-verify',
+    PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: 'persistent-offline-deep',
+}
+
 
 class ScrubOutcome(Enum):
     """Outcome discriminant for :class:`ScrubResult`.
@@ -912,6 +932,96 @@ class GitOps:
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
 
+    def protected_prefixes(self) -> dict[str, str]:
+        """Authoritative band-ownership registry for this instance.
+
+        Returns the module-level :data:`PROTECTED_PREFIXES` (the static
+        bands) merged with this instance's config-driven interactive band
+        (``self.config.iact_prefix`` -> ``'interactive'``).  The iact band
+        is config-shaped (:attr:`GitConfig.iact_prefix` may be overridden
+        per deployment), so a single module constant cannot capture the
+        authoritative band map — the per-instance view is the correct one
+        for callers to consult, including :meth:`_refuse_foreign_band`.
+        """
+        return {**PROTECTED_PREFIXES, self.config.iact_prefix: 'interactive'}
+
+    def _refuse_foreign_band(
+        self, path: Path, owned: frozenset[str], context: str,
+    ) -> bool:
+        """True if *path* belongs to a protected band this sweep does not own.
+
+        Band-ownership guard for destructive worktree cleanup — defense in
+        depth against a filter bug that steers a foreign band's directory
+        into a sweep's removal step (gitops-chokepoints PRD, Mechanism 3).
+        This is a band-ownership check, not a general ACL: it fails OPEN
+        (returns False, i.e. "proceed") for anything outside its narrow
+        scope —
+
+        - *path* is not a direct child of :attr:`worktree_base` (task
+          worktrees, quarantine dirs, and other nested paths are outside
+          this check).
+        - *path*'s name matches no band token in :meth:`protected_prefixes`.
+        - The matched band token is already in *owned*.
+
+        Otherwise this logs a WARNING naming the matched band token, its
+        owner, and *context*, and returns True.  Callers must skip the
+        destructive call for this one candidate (never raise) — every call
+        site sits inside a best-effort / never-raise sweep.
+        """
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved.parent != self.worktree_base:
+            return False
+
+        registry = self.protected_prefixes()
+        name = resolved.name
+        exact_match = next(
+            (key for key in registry if not key.endswith('-') and name == key),
+            None,
+        )
+        prefix_match = next(
+            (key for key in registry if key.endswith('-') and name.startswith(key)),
+            None,
+        )
+        # Exact-name keys take precedence over prefix keys: e.g. the
+        # persistent `_merge-verify` worktree matches both its own exact
+        # name and the `_merge-` prefix, and must resolve to the exact
+        # persistent-merge-verify token so a plain `_merge-` owner still
+        # refuses it (see the design_decisions entry on exact-first
+        # precedence).
+        token = exact_match if exact_match is not None else prefix_match
+        if token is None:
+            return False
+        if token in owned:
+            return False
+
+        logger.warning(
+            '%s: refusing to remove %s — belongs to protected band %r '
+            '(owner=%r), not owned by this sweep (owned=%r)',
+            context, path, token, registry[token], sorted(owned),
+        )
+        return True
+
+    def refuse_foreign_band(
+        self, path: Path, owned: frozenset[str], context: str,
+    ) -> bool:
+        """Public entry point for the :meth:`_refuse_foreign_band` guard.
+
+        Cross-module callers (e.g. harness.py's substrate-gate pre-clean)
+        should consult the band-ownership guard through this supported
+        public method rather than reaching across the module boundary into
+        the leading-underscore internal name — mirrors
+        :meth:`protected_prefixes`, which is public for the same reason.
+        Delegates to :meth:`_refuse_foreign_band`; see that method's
+        docstring for the full contract (fail-open rules, WARNING
+        semantics, never-raise guarantee). Kept as a thin wrapper (rather
+        than renaming the internal method) so existing intra-class callers
+        and unit tests targeting the primitive directly are undisturbed.
+        """
+        return self._refuse_foreign_band(path, owned, context)
+
     def pool_in_use(self) -> bool:
         """True iff a warm or spec lane pool is configured on this host (task 2099).
 
@@ -1569,14 +1679,27 @@ class GitOps:
                         f'manually once any wanted work is preserved. (fail-safe; '
                         f'was the silent rmtree at git_ops.py:702)'
                     )
-                logger.warning(
-                    f'Directory {worktree_path} exists but is NOT a registered '
-                    f'git worktree, and holds no live work (no .git link, only '
-                    f'.task/ residue, branch has no commits beyond '
-                    f'{self.config.main_branch}) — removing stale directory and '
-                    f'creating fresh worktree'
-                )
-                shutil.rmtree(worktree_path)
+                if self._refuse_foreign_band(
+                    worktree_path, frozenset(), 'create_worktree-self-heal',
+                ):
+                    # Refused: the WARNING has already been emitted by the
+                    # helper. This site's legitimate target is always a
+                    # non-band task worktree, so this branch is unreachable
+                    # in real usage — pure defense-in-depth. Never delete a
+                    # protected band here; leave it in place (the `git
+                    # worktree add` below will then fail loudly on the
+                    # still-non-empty directory rather than silently
+                    # destroying foreign-band content).
+                    pass
+                else:
+                    logger.warning(
+                        f'Directory {worktree_path} exists but is NOT a registered '
+                        f'git worktree, and holds no live work (no .git link, only '
+                        f'.task/ residue, branch has no commits beyond '
+                        f'{self.config.main_branch}) — removing stale directory and '
+                        f'creating fresh worktree'
+                    )
+                    shutil.rmtree(worktree_path)
 
         # If the branch ref already exists (stale from a previous run, or — the
         # 3576 trigger — still checked out in a leftover worktree), clean it up
@@ -1785,11 +1908,22 @@ class GitOps:
             # Self-heal a stale unregistered directory (mirrors acquire_warm_lane's
             # create-once branch) so `git worktree add` doesn't refuse a non-empty dir.
             if path.exists() and not await self._is_registered_worktree(path):
-                logger.warning(
-                    'create_interactive_worktree: %s exists but is not registered; '
-                    'removing stale directory (self-heal)', path,
-                )
-                shutil.rmtree(path)
+                if self._refuse_foreign_band(
+                    path, frozenset({self.config.iact_prefix}),
+                    'create_interactive_worktree-self-heal',
+                ):
+                    # Refused: the WARNING has already been emitted by the
+                    # helper. Real candidates here are always this site's
+                    # own iact band, so this branch is unreachable in real
+                    # usage — pure defense-in-depth. Leave the directory in
+                    # place rather than delete a foreign band.
+                    pass
+                else:
+                    logger.warning(
+                        'create_interactive_worktree: %s exists but is not registered; '
+                        'removing stale directory (self-heal)', path,
+                    )
+                    shutil.rmtree(path)
 
             # Branch-namespace self-heal: full_branch shares config.branch_prefix
             # with dispatch task branches and other interactive slugs (see the
@@ -5361,6 +5495,10 @@ class GitOps:
         async for wt_path, wt_resolved in self._iter_merge_worktrees():
             if wt_resolved in keep_resolved:
                 continue
+            if self._refuse_foreign_band(
+                wt_path, frozenset({'_merge-'}), 'prune_stale_merge_worktrees',
+            ):
+                continue
             rc_rm, _, err = await _run(
                 ['git', 'worktree', 'remove', '--force', str(wt_path)],
                 cwd=self.project_root,
@@ -5717,6 +5855,12 @@ class GitOps:
                             reason = 'ttl_idle'
 
                 if reason is None:
+                    continue
+
+                if self._refuse_foreign_band(
+                    wt_path, frozenset({self.config.iact_prefix}),
+                    'reap_interactive_worktrees',
+                ):
                     continue
 
                 rc_rm, _, err = await _run(
