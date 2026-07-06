@@ -141,6 +141,27 @@ class IllegalTransitionError(Exception):
     ``_LEGAL_TRANSITIONS``. Account state is left unchanged."""
 
 
+# Legal phase edges (PRD §7.3, task W4-γ). Any edge not listed here raises
+# IllegalTransitionError from _transition unless called with force=True (the
+# escape hatch reserved for _on_sighup_async's operator-driven hard reset).
+_LEGAL_TRANSITIONS: dict[AccountPhase, frozenset[AccountPhase]] = {
+    AccountPhase.AVAILABLE: frozenset({AccountPhase.CAPPED, AccountPhase.AUTH_FAILED}),
+    AccountPhase.PROBING: frozenset({
+        AccountPhase.AVAILABLE,
+        AccountPhase.PROBE_IN_FLIGHT,
+        AccountPhase.CAPPED,
+        AccountPhase.AUTH_FAILED,
+    }),
+    AccountPhase.PROBE_IN_FLIGHT: frozenset({
+        AccountPhase.AVAILABLE,
+        AccountPhase.CAPPED,
+        AccountPhase.AUTH_FAILED,
+    }),
+    AccountPhase.CAPPED: frozenset({AccountPhase.PROBING}),
+    AccountPhase.AUTH_FAILED: frozenset({AccountPhase.AVAILABLE, AccountPhase.CAPPED}),
+}
+
+
 @dataclass
 class AccountState:
     """Per-account cap tracking."""
@@ -359,7 +380,22 @@ class UsageGate:
         ``_open.is_set() <=> any(a.phase in {AVAILABLE, PROBING})``) —
         replacing the ~10 scattered ``self._open.set()``/``.clear()`` call
         sites this method's callers used to own directly.
+
+        Raises :class:`IllegalTransitionError` — without mutating any state
+        — if ``new_phase`` is not a legal edge from ``acct.phase`` per
+        ``_LEGAL_TRANSITIONS``, unless ``force=True`` (reserved for
+        ``_on_sighup_async``'s operator-driven hard reset to AVAILABLE).
         """
+        if not force and new_phase not in _LEGAL_TRANSITIONS.get(acct.phase, frozenset()):
+            logger.error(
+                'Illegal phase transition for account %r: %s -> %s (reason=%r)',
+                acct.name, acct.phase, new_phase, reason,
+            )
+            raise IllegalTransitionError(
+                f'Illegal phase transition for account {acct.name!r}: '
+                f'{acct.phase} -> {new_phase}'
+            )
+
         acct.phase = new_phase
         acct.near_cap = False
 
