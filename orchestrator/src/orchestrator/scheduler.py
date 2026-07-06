@@ -2764,6 +2764,15 @@ class Scheduler:
         Plain truthiness is used throughout (matching the codebase's existing
         metadata-flag convention) so bool ``True``, ``1``, and non-empty
         timestamp strings all count as "set".
+
+        Operator footgun: truthiness here is Python's, not English's.
+        ``metadata.deferred_watch = "false"`` is a non-empty string and is
+        therefore truthy — it still gates the task. Conversely
+        ``metadata.trigger_met = ""`` is falsy and will NOT reactivate
+        dispatch. To un-defer, either clear ``deferred_watch`` (set it to
+        bool ``False`` or remove the key) or set ``trigger_met`` to a
+        genuinely truthy value such as bool ``True`` or a non-empty
+        timestamp string.
         """
         metadata = task.get('metadata') or {}
         return bool(metadata.get('deferred_watch')) and not metadata.get('trigger_met')
