@@ -296,13 +296,14 @@ class TaskArtifacts:
         return json.loads(path.read_text())
 
     def clear_blocking_dependency(self) -> None:
-        """Remove ``.task/blocking_dependency.json`` if present.
+        """Remove ``.task/blocking_dependency.json`` if present (both the new
+        and legacy paths — see ``_clear_path``).
 
         Called by the workflow after the dependency has been registered (or
         determined to be a no-op due to an advance-past-report race) so a
         subsequent architect invocation does not see a stale report.
         """
-        (self.root / 'blocking_dependency.json').unlink(missing_ok=True)
+        self._clear_path('blocking_dependency.json')
 
     # ──────────────────────────────────────────────────────────────────
     # Architect task-rejection artifacts (paired with plan-tools MCP)
@@ -337,8 +338,8 @@ class TaskArtifacts:
         return json.loads(path.read_text())
 
     def clear_already_done(self) -> None:
-        """Remove ``.task/already_done.json`` if present."""
-        (self.root / 'already_done.json').unlink(missing_ok=True)
+        """Remove ``.task/already_done.json`` if present (both roots)."""
+        self._clear_path('already_done.json')
 
     def write_unactionable_task(self, reason: str, evidence: str) -> None:
         """Write ``.task/unactionable_task.json`` — architect's claim that
@@ -365,8 +366,8 @@ class TaskArtifacts:
         return json.loads(path.read_text())
 
     def clear_unactionable_task(self) -> None:
-        """Remove ``.task/unactionable_task.json`` if present."""
-        (self.root / 'unactionable_task.json').unlink(missing_ok=True)
+        """Remove ``.task/unactionable_task.json`` if present (both roots)."""
+        self._clear_path('unactionable_task.json')
 
     def write_false_premise(
         self,
@@ -400,8 +401,8 @@ class TaskArtifacts:
         return json.loads(path.read_text())
 
     def clear_false_premise(self) -> None:
-        """Remove ``.task/false_premise.json`` if present."""
-        (self.root / 'false_premise.json').unlink(missing_ok=True)
+        """Remove ``.task/false_premise.json`` if present (both roots)."""
+        self._clear_path('false_premise.json')
 
     def _read_path(self, name: str) -> Path:
         """Resolve *name* new-path-then-old (compat window).
@@ -418,6 +419,20 @@ class TaskArtifacts:
         if legacy.exists():
             return legacy
         return new
+
+    def _clear_path(self, name: str) -> None:
+        """Remove *name* from BOTH the new and legacy roots (compat window).
+
+        The write-side mirror of ``_read_path``. Because paired ``read_*``
+        methods fall back to the legacy path via ``_read_path``, a clear that
+        only unlinks the new path is a no-op on a legacy-only artifact — the
+        next read then resurrects it through the fallback. Removing from both
+        roots closes that window. When ``meta_root`` was not supplied,
+        ``self.root == self._legacy_root`` so both calls target the same
+        path (idempotent, byte-identical).
+        """
+        (self.root / name).unlink(missing_ok=True)
+        (self._legacy_root / name).unlink(missing_ok=True)
 
     def read_plan(self) -> dict:
         """Read current plan state (new-path-then-old), auto-normalizing
@@ -710,8 +725,10 @@ class TaskArtifacts:
         self._write_json(self.root / 'agent_session.json', data)
 
     def clear_agent_session(self) -> None:
-        """Remove ``.task/agent_session.json`` if present (idempotent)."""
-        (self.root / 'agent_session.json').unlink(missing_ok=True)
+        """Remove ``.task/agent_session.json`` if present (idempotent, both
+        the new and legacy roots).
+        """
+        self._clear_path('agent_session.json')
 
     def read_agent_session(self) -> dict | None:
         """Return parsed ``.task/agent_session.json`` (new-path-then-old),
