@@ -164,6 +164,12 @@ _RUN_TIMEOUT_GRACE_SECS: float = 30.0
 # filed).  10s comfortably covers a normal `systemctl show` round trip.
 _INSPECT_TIMEOUT_SECS: float = 10.0
 
+# Task 2120: sentinel agent_role the runner stamps on its own escalations and
+# scopes all its get_by_task queries to — an unrelated escalation with the
+# same task_id (e.g. a starvation-watchdog filing) must never alias as this
+# runner's own dedup/quiescence/resolution-proof signal.
+DETERMINISTIC_AGENT_ROLE: str = 'orchestrator-deterministic'
+
 
 class DeterministicRunner:
     """Per-slot runner for deterministic gate tasks.
@@ -572,7 +578,9 @@ class DeterministicRunner:
         """
         from escalation.models import Escalation
 
-        existing_pending = self.escalation_queue.get_by_task(task_id, status='pending')
+        existing_pending = self.escalation_queue.get_by_task(
+            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        )
         if existing_pending:
             logger.info(
                 'DeterministicRunner: task %s already has %d pending escalation(s) — '
@@ -583,7 +591,7 @@ class DeterministicRunner:
             esc = Escalation(
                 id=self.escalation_queue.make_id(task_id),
                 task_id=task_id,
-                agent_role='orchestrator-deterministic',
+                agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
                 category='infra_issue',
                 summary=summary[:200],
@@ -790,7 +798,9 @@ class DeterministicRunner:
         # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
         # failure on the following update_task re-files the gate on next dispatch
         # rather than silently skipping it).
-        existing_pending = self.escalation_queue.get_by_task(task_id, status='pending')
+        existing_pending = self.escalation_queue.get_by_task(
+            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        )
         if existing_pending:
             logger.info(
                 'DeterministicRunner: task %s already has %d pending escalation(s) — '
@@ -801,7 +811,7 @@ class DeterministicRunner:
             esc = Escalation(
                 id=self.escalation_queue.make_id(task_id),
                 task_id=task_id,
-                agent_role='orchestrator-deterministic',
+                agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
                 category='milestone_gate',
                 summary=title[:200],
@@ -858,7 +868,9 @@ class DeterministicRunner:
         # If the gate escalation was already filed in a prior dispatch, check
         # whether it is still open or has been resolved.
         if gate_escalated_at:
-            pending = self.escalation_queue.get_by_task(task_id, status='pending')
+            pending = self.escalation_queue.get_by_task(
+                task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+            )
             if pending:
                 # Escalation still open — quiescence (B3): return BLOCKED without
                 # re-escalating.  The existing L2 is still awaiting human action.
@@ -919,7 +931,9 @@ class DeterministicRunner:
             # I1 once-only idempotency guard (parallel to β's gate_escalated_at branch):
             # if the deploy already ran, check whether its escalation is still open.
             if before_done_ran_at:
-                pending = self.escalation_queue.get_by_task(task_id, status='pending')
+                pending = self.escalation_queue.get_by_task(
+                    task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+                )
                 if pending:
                     # Pending infra_issue → quiescent BLOCKED (B7 reaper / I1 no-rerun)
                     logger.debug(
@@ -949,7 +963,13 @@ class DeterministicRunner:
                 before_done_verified_at = metadata.get('before_done_verified_at')
                 # status=None scans the archive too → detects a resolved/dismissed
                 # escalation, i.e. proof a human was in the loop on a prior failure.
-                ever_escalated = bool(self.escalation_queue.get_by_task(task_id))
+                # agent_role scopes this to the runner's OWN escalations — an
+                # unrelated escalation sharing this task_id (e.g. a starvation-
+                # watchdog filing) must never alias as proof a human resolved
+                # THIS runner's failure (task 2120).
+                ever_escalated = bool(self.escalation_queue.get_by_task(
+                    task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
+                ))
 
                 if before_done_verified_at:
                     # (a) Deploy verified OK; crash before the done write.

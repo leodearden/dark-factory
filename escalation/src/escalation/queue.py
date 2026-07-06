@@ -308,6 +308,7 @@ class EscalationQueue:
 
     def get_by_task(
         self, task_id: str, status: str | None = None, level: int | None = None,
+        agent_role: str | None = None,
     ) -> list[Escalation]:
         """Scan dir for escalations matching a task ID.
 
@@ -315,6 +316,10 @@ class EscalationQueue:
         - status == 'pending': scan queue root only (fast path, skips archive).
         - status is None or another value: scan queue root PLUS archive/**/ to
           include resolved/dismissed escalations that have been moved out.
+
+        ``agent_role``, when given, restricts results to escalations filed by
+        that exact agent_role (None = no filter, full backward compatibility).
+        Applied in the same pass as status/level, BEFORE dedup/seen bookkeeping.
 
         Deduplication: if the same escalation id appears in both the queue root
         and the archive (e.g. crash mid-resolve), only the first occurrence that
@@ -375,6 +380,8 @@ class EscalationQueue:
                 if status is not None and esc.status != status:
                     continue
                 if level is not None and esc.level != level:
+                    continue
+                if agent_role is not None and esc.agent_role != agent_role:
                     continue
                 if esc.id in seen:
                     logger.debug(
