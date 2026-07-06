@@ -10,7 +10,7 @@ PRD session in the program. Each stream's session MUST read this file before aut
 | ID | Slug | Scope (one line) | Mode | Wave | Upstream deps |
 |----|------|------------------|------|------|---------------|
 | M1 | gitops-chokepoints | `_prune_registrations` chokepoint + grep-guard test; `_abort_lane_acquisition` primitive; PROTECTED_PREFIXES registry | agent | now | — |
-| M2 | supervision-quick-fixes | hoist `inspect_systemd_unit(unit, timeout)` to one module-level fn; scope DeterministicRunner escalation queries by `agent_role`; substrate-probe fail-closed | agent | now | — |
+| M2 | supervision-quick-fixes | hoist `inspect_systemd_unit(unit, timeout)` to one module-level fn; scope DeterministicRunner escalation queries by `agent_role`; substrate-probe fail-closed; single module-lock derivation helper; StreakCounter registry | agent | now | — |
 | M3 | dashboard-alignment | OutcomeKind vocabulary (fail-safe), request-scoped `now` threading in burndown/costs, shared MCP fan-out + TTL-cache helpers | agent | now | — |
 | M4 | recon-project-scope | frozen `ProjectScope` dataclass (NewType ProjectId/ProjectRoot) threaded through recon signatures | agent | now | — |
 | M5 | fm-cancellederror-convention | enforce CancelledError re-raise convention in fused-memory; extract the full gather-cancellation idiom | agent | now | — |
@@ -23,7 +23,7 @@ PRD session in the program. Each stream's session MUST read this file before aut
 | W7 | verify-plan | structured `VerifyCmd`; single `derive_verify_plan()`; tool-dispatched failure classifier; `FailureCategory` enum + policy table; typed `BlockRecord`; dry-run proposals on merge-verify block path | spawn | 1 | — |
 | W8 | fm-task-dedup | durable `candidate_key` partial-UNIQUE index (dedup no longer fails open to CREATE); per-ticket lifecycle struct; single update_task write-authority seam | spawn | 1 | — |
 | W9 | workflow-state-machine | `WorkflowStateMachine` + `TerminalReport`; `StewardOutcome` sum type; `classify_failure` → `BlockDisposition` table; collapse the three already-merged guards onto the W1 journal | spawn | 2 | W1, W2, W4, W7 |
-| W10 | harness-supervision | `proc_supervision.py` RestartPlan/execute(); `BackgroundService`/LifecycleRegistry; `TaskGroundTruth` resolver + classification table; `DeployState` typed schema | spawn | 2 | M2, W2 (claimant), W1 (journal) |
+| W10 | harness-supervision | `proc_supervision.py` RestartPlan/execute(); `BackgroundService`/LifecycleRegistry; `TaskGroundTruth` resolver + classification table; `DeployState` typed schema; SchedulerCallbacks seam; decompose `acquire_next` into named phases | spawn | 2 | M2, W1, W2, W3 |
 | W11 | worktree-lane-lifecycle | `LaneLifecycle` single-writer + durable per-lane record on the pool mount; `.task/` relocation out of the git tree | spawn | 2 | M1 |
 
 Wave 2 sessions wire cross-batch deps against the wave-1/agent batches' real task ids
