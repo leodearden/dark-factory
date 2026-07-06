@@ -98,3 +98,49 @@ class TestLandedOutboxAllAndLastWriteWins:
         # The overwrite must persist across a re-open, not just in the cache.
         reopened = LandedOutbox(path)
         assert reopened.lookup('x') == second
+
+
+# ---------------------------------------------------------------------------
+# step-5 — consume() idempotent prune
+# ---------------------------------------------------------------------------
+
+
+class TestLandedOutboxConsume:
+    """consume() removes a row; repeated/unknown consume is a no-op; prune is durable."""
+
+    def test_consume_removes_row(self, tmp_path: Path) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        row = LandedRow(task_id='7', branch_tip_sha='sha', advanced_sha='adv', landed_at=1.0)
+        outbox.record(row)
+
+        outbox.consume('7')
+
+        assert outbox.lookup('7') is None
+        assert outbox.all() == []
+
+    def test_consume_is_idempotent(self, tmp_path: Path) -> None:
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        row = LandedRow(task_id='7', branch_tip_sha='sha', advanced_sha='adv', landed_at=1.0)
+        outbox.record(row)
+
+        outbox.consume('7')
+        outbox.consume('7')  # second call: silent no-op, must not raise
+
+        assert outbox.lookup('7') is None
+
+    def test_consume_unknown_task_id_is_noop(self, tmp_path: Path) -> None:
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.consume('does-not-exist')  # must not raise
+        assert outbox.all() == []
+
+    def test_consumed_row_does_not_resurrect_after_reopen(self, tmp_path: Path) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        row = LandedRow(task_id='9', branch_tip_sha='sha', advanced_sha='adv', landed_at=1.0)
+        outbox.record(row)
+        outbox.consume('9')
+
+        reopened = LandedOutbox(path)
+        assert reopened.lookup('9') is None
+        assert reopened.all() == []
