@@ -17,7 +17,14 @@ import pytest
 from pydantic import ValidationError
 
 import shared.task_metadata as task_metadata_module
-from shared.task_metadata import BeforeDone, DoneProvenance, ExternalDep, MemoryHints, RetryLedger
+from shared.task_metadata import (
+    BeforeDone,
+    DoneProvenance,
+    ExternalDep,
+    MemoryHints,
+    RetryLedger,
+    TaskMetadata,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -246,3 +253,60 @@ class TestRetryLedger:
         rl = RetryLedger(x_new_counter=3)
         dumped = rl.model_dump()
         assert dumped['x_new_counter'] == 3
+
+
+class TestTaskMetadataFields:
+    def test_empty_defaults(self):
+        tm = TaskMetadata()
+        assert tm.schema_version == 1
+        assert tm.task_kind == 'normal'
+        assert tm.always_escalates is False
+        assert tm.before_done is None
+        assert tm.done_provenance is None
+        assert tm.memory_hints is None
+        assert tm.retry_ledger is None
+        assert tm.external_deps == []
+        assert tm.files == []
+
+    def test_nested_dicts_coerce_to_typed_submodels(self):
+        tm = TaskMetadata(
+            before_done={'script': 'scripts/x.sh', 'timeout_secs': 60},
+            done_provenance={'kind': 'merged', 'commit': 'abc123'},
+            memory_hints={'entities': ['E'], 'queries': ['Q']},
+            retry_ledger={'consecutive_no_plan_failures': 2},
+        )
+        assert isinstance(tm.before_done, BeforeDone)
+        assert isinstance(tm.done_provenance, DoneProvenance)
+        assert isinstance(tm.memory_hints, MemoryHints)
+        assert isinstance(tm.retry_ledger, RetryLedger)
+        assert tm.before_done.script == 'scripts/x.sh'
+        assert tm.done_provenance.commit == 'abc123'
+        assert tm.memory_hints.entities == ['E']
+        assert tm.retry_ledger.consecutive_no_plan_failures == 2
+
+    def test_external_deps_stays_list_of_str(self):
+        tm = TaskMetadata(external_deps=['a:1', 'b:2'])
+        assert tm.external_deps == ['a:1', 'b:2']
+        assert all(isinstance(dep, str) for dep in tm.external_deps)
+
+    def test_deterministic_task_kind_with_before_done_accepted(self):
+        tm = TaskMetadata(
+            task_kind='deterministic',
+            before_done={'script': 'scripts/x.sh', 'timeout_secs': 60},
+        )
+        assert tm.task_kind == 'deterministic'
+
+    def test_bad_task_kind_rejected(self):
+        with pytest.raises(ValidationError):
+            TaskMetadata(task_kind='weird')
+
+    def test_unknown_top_level_keys_round_trip(self):
+        blob = {
+            'x_foo': 1,
+            'legacy_bar': [1, 2],
+            'schema_version': 1,
+            'task_kind': 'normal',
+        }
+        dumped = TaskMetadata(**blob).model_dump()
+        for key, value in blob.items():
+            assert dumped[key] == value
