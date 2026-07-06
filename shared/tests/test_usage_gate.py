@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 from datetime import UTC, datetime, timedelta
@@ -1187,3 +1188,139 @@ class TestTransitionSideEffectsLifecycle:
 
         assert acct.phase == AccountPhase.AUTH_FAILED
         assert acct.auth_reprobe_task is None
+
+    # -----------------------------------------------------------------
+    # step-3: cost-event emission, gate-level pause bookkeeping, and
+    # recovery bookkeeping (probe_count reset / pause-time consumption /
+    # auth_failed_at clearing) owned by _transition itself.
+    # -----------------------------------------------------------------
+
+    async def test_transition_to_capped_fires_cap_hit_event_with_reason_and_resets_at(self):
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=make_mock_cost_store())
+        acct = gate._accounts[0]
+        resets_at = datetime.now(UTC) + timedelta(hours=1)
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._transition(acct, AccountPhase.CAPPED, resets_at=resets_at, reason='hit')
+
+        mock_fire.assert_called_once()
+        account_name, event_type, details = mock_fire.call_args[0]
+        assert account_name == acct.name
+        assert event_type == 'cap_hit'
+        parsed = json.loads(details)
+        assert parsed['reason'] == 'hit'
+        assert parsed['resets_at'] == resets_at.isoformat()
+        await _drain_task(acct.resume_task)
+
+    async def test_transition_to_auth_failed_fires_auth_failed_event_with_reason_and_resets_at(self):
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=make_mock_cost_store())
+        acct = gate._accounts[0]
+        resets_at = datetime.now(UTC) + timedelta(hours=2)
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._transition(acct, AccountPhase.AUTH_FAILED, resets_at=resets_at, reason='403')
+
+        mock_fire.assert_called_once()
+        account_name, event_type, details = mock_fire.call_args[0]
+        assert account_name == acct.name
+        assert event_type == 'auth_failed'
+        parsed = json.loads(details)
+        assert parsed['reason'] == '403'
+        assert parsed['resets_at'] == resets_at.isoformat()
+        await _drain_task(acct.auth_reprobe_task)
+
+    async def test_transition_to_capped_without_cost_store_no_json_dumps_or_fire(self):
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+
+        with (
+            patch('shared.usage_gate.json.dumps') as mock_dumps,
+            patch.object(gate, '_fire_cost_event') as mock_fire,
+        ):
+            gate._transition(acct, AccountPhase.CAPPED, reason='hit')
+
+        mock_dumps.assert_not_called()
+        mock_fire.assert_not_called()
+        await _drain_task(acct.resume_task)
+
+    async def test_transition_to_auth_failed_without_cost_store_no_json_dumps_or_fire(self):
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+
+        with (
+            patch('shared.usage_gate.json.dumps') as mock_dumps,
+            patch.object(gate, '_fire_cost_event') as mock_fire,
+        ):
+            gate._transition(acct, AccountPhase.AUTH_FAILED, reason='403')
+
+        mock_dumps.assert_not_called()
+        mock_fire.assert_not_called()
+        await _drain_task(acct.auth_reprobe_task)
+
+    async def test_transition_to_capped_stamps_gate_pause_when_all_blocked(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        assert gate._paused_reason == ''
+        assert gate._pause_started_at is None
+
+        gate._transition(acct, AccountPhase.CAPPED, reason='cap reason xyz')
+
+        assert gate._paused_reason != ''
+        assert 'cap reason xyz' in gate._paused_reason
+        assert gate._pause_started_at is not None
+
+    async def test_transition_to_capped_leaves_paused_reason_untouched_when_sibling_available(self):
+        gate = make_gate(['acct-A', 'acct-B'], wait_for_reset=False, cost_store=None)
+        a, b = gate._accounts
+        assert gate._paused_reason == ''
+
+        gate._transition(a, AccountPhase.CAPPED, reason='a capped')
+
+        assert b.phase == AccountPhase.AVAILABLE
+        assert gate._paused_reason == ''
+        assert gate._pause_started_at is None
+
+    async def test_transition_from_capped_to_probing_resets_probe_count_and_consumes_pause(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        acct.probe_count = 3
+        acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=120)
+
+        gate._transition(acct, AccountPhase.PROBING)
+
+        assert acct.probe_count == 0
+        assert acct.pause_started_at is None
+        assert 119 <= gate._total_pause_secs <= 121
+
+    async def test_transition_from_auth_failed_to_available_clears_auth_failed_at(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.AUTH_FAILED
+        acct.auth_failed_at = datetime.now(UTC)
+
+        gate._transition(acct, AccountPhase.AVAILABLE)
+
+        assert acct.auth_failed_at is None
+
+    async def test_recovery_from_capped_does_not_fire_resumed_event(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=make_mock_cost_store())
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        acct.pause_started_at = datetime.now(UTC)
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._transition(acct, AccountPhase.PROBING)
+
+        mock_fire.assert_not_called()
+
+    async def test_recovery_from_auth_failed_does_not_fire_auth_resumed_event(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=make_mock_cost_store())
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.AUTH_FAILED
+        acct.auth_failed_at = datetime.now(UTC)
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            gate._transition(acct, AccountPhase.AVAILABLE)
+
+        mock_fire.assert_not_called()
