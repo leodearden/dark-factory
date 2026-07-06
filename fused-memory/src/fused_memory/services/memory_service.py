@@ -39,6 +39,7 @@ from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.utils.async_utils import propagate_cancellations
+from fused_memory.utils.task_naming import canonicalize_task_node_name
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -682,6 +683,112 @@ class MemoryService:
                 failed,
             )
         return restored
+
+    async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
+        """Canonicalize non-canonical task-entity node names to 'Task N'.
+
+        graphiti_core's LLM entity extraction sometimes mints task-entity nodes
+        with non-canonical names (e.g. 'task 132', 'tasks 153') instead of the
+        canonical 'Task N' form. This method scans each distinct entity name
+        this episode touched via ``canonicalize_task_node_name`` (task 2110)
+        and, for every name that canonicalizes to something other than itself,
+        corrects the live node(s):
+
+        - If a canonical 'Task N' node already exists, every bad-named node is
+          MERGED into it via ``merge_entities`` — renaming instead would recreate
+          the exact-name duplicate ``_dedup_episode_nodes`` exists to resolve.
+        - Otherwise, the bad-named survivor (most valid edges, then oldest, then
+          uuid — same canonical ordering as ``find_duplicate_entity_nodes``) is
+          RENAMED to the canonical name via ``rename_entity_node``, and any
+          remaining bad-named duplicates are merged into it.
+
+        Modelled on ``_dedup_episode_nodes``; handles None / empty result the
+        same way. Each rename/merge is best-effort (mirrors
+        ``_dedup_episode_nodes``): a transient backend error for one name must
+        not fail an already-committed episode write, and must not stop
+        subsequent names from being processed. Untouched bad names simply
+        survive to be healed the next time an episode touches that name.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                    AddEpisodeResults object with a ``nodes`` attribute).
+                    Handles ``None`` and objects with empty/missing nodes
+                    gracefully.
+
+        Returns:
+            Number of nodes successfully renamed or merged into a canonical
+            survivor (0 when nothing to do).
+        """
+        if result is None:
+            return 0
+
+        nodes = getattr(result, 'nodes', None) or []
+        if not nodes:
+            return 0
+
+        canonical_by_bad_name: dict[str, str] = {}
+        for node in nodes:
+            name = getattr(node, 'name', '') or ''
+            if not name or name in canonical_by_bad_name:
+                continue
+            canonical = canonicalize_task_node_name(name)
+            if canonical is None or canonical == name:
+                continue
+            canonical_by_bad_name[name] = canonical
+
+        fixed = 0
+        failed = 0
+        for bad_name, canonical in canonical_by_bad_name.items():
+            try:
+                bad_matches = await self.graphiti.find_duplicate_entity_nodes(
+                    bad_name, group_id=group_id,
+                )
+                if not bad_matches:
+                    continue
+                canon_matches = await self.graphiti.find_duplicate_entity_nodes(
+                    canonical, group_id=group_id,
+                )
+                if canon_matches:
+                    canon_survivor = canon_matches[0]['uuid']
+                    for dup in bad_matches:
+                        await self.graphiti.merge_entities(
+                            dup['uuid'], canon_survivor, group_id=group_id,
+                        )
+                        fixed += 1
+                else:
+                    survivor = bad_matches[0]['uuid']
+                    await self.graphiti.rename_entity_node(
+                        survivor, canonical, group_id=group_id,
+                    )
+                    fixed += 1
+                    for dup in bad_matches[1:]:
+                        await self.graphiti.merge_entities(
+                            dup['uuid'], survivor, group_id=group_id,
+                        )
+                        fixed += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Best-effort: a transient backend error (lock contention,
+                # write timeout) must not fail an already-committed episode
+                # write. Log and continue so the episode reports success.
+                logger.exception(
+                    'Failed to normalize task node name %r -> %r after '
+                    'add_episode; will retry on next episode',
+                    bad_name, canonical,
+                )
+                failed += 1
+
+        if fixed > 0:
+            logger.info(
+                'Normalized %d task-entity node name(s) after add_episode', fixed,
+            )
+        if failed > 0:
+            logger.warning(
+                'Failed to normalize %d task-entity node name(s) after add_episode',
+                failed,
+            )
+        return fixed
 
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
