@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import aiosqlite
 import pytest
@@ -1807,6 +1808,7 @@ CREATE TABLE account_events (
 );
 """
 
+from dashboard.data import costs  # noqa: E402
 from dashboard.data.costs import (  # noqa: E402
     aggregate_account_events,
     aggregate_cost_by_account,
@@ -2192,6 +2194,65 @@ class TestAggregateCostTrend:
         # Each project should have 7 days of data (gap-filled)
         assert len(result['dark_factory']) == 7
         assert len(result['reify']) == 7
+
+
+# ---------------------------------------------------------------------------
+# TestAggregateNowThreading (step-5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    'fn_under_test',
+    [
+        aggregate_cost_summary,
+        aggregate_cost_by_project,
+        aggregate_cost_by_account,
+        aggregate_cost_by_role,
+        aggregate_account_events,
+        aggregate_run_cost_breakdown,
+    ],
+    ids=lambda fn: fn.__name__,
+)
+class TestAggregateNowThreading:
+    """Each _cutoff-routed aggregator must resolve `now` once and thread the
+    identical value to every per-DB call — not let each per-DB call resolve
+    the clock independently (the exact race this task closes)."""
+
+    @pytest.mark.asyncio
+    async def test_injected_now_threaded_identically(self, fn_under_test, two_conns):
+        """now=fixed_now is threaded unchanged to both per-DB _cutoff calls."""
+        fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        captured: list = []
+        real_cutoff = costs._cutoff
+
+        def spy(days, *, now=None):
+            captured.append(now)
+            return real_cutoff(days, now=now)
+
+        with patch.object(costs, '_cutoff', side_effect=spy):
+            await fn_under_test(two_conns, days=7, now=fixed_now)
+
+        assert captured == [fixed_now, fixed_now], (
+            f"Expected both per-DB calls to receive now={fixed_now!r}, got {captured!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_now_resolved_once_and_shared(self, fn_under_test, two_conns):
+        """Without now, the aggregator resolves once and threads one shared value."""
+        captured: list = []
+        real_cutoff = costs._cutoff
+
+        def spy(days, *, now=None):
+            captured.append(now)
+            return real_cutoff(days, now=now)
+
+        with patch.object(costs, '_cutoff', side_effect=spy):
+            await fn_under_test(two_conns, days=7)
+
+        assert len(captured) == 2
+        assert captured[0] is not None
+        assert captured[0] == captured[1], (
+            f"Expected both per-DB calls to share one resolved now, got {captured!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
