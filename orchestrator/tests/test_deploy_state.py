@@ -13,11 +13,17 @@ from __future__ import annotations
 import enum
 import json
 
+import pytest
 import shared.task_metadata as task_metadata_module
 from shared.deploy_state import DeployPhase, DeployState, VerifyBaseline
 from shared.task_metadata import parse_metadata
 
-from orchestrator.deploy_state import _LEGAL, is_legal_transition
+from orchestrator.deploy_state import (
+    _LEGAL,
+    IllegalDeployTransition,
+    enforce_transition,
+    is_legal_transition,
+)
 
 
 class TestDeployPhase:
@@ -119,3 +125,40 @@ class TestLegalTransitionTable:
         # A pair absent from the table falls back to False rather than KeyError.
         assert (DeployPhase.SCHEDULED, DeployPhase.DONE) not in _LEGAL
         assert is_legal_transition(DeployPhase.SCHEDULED, DeployPhase.DONE) is False
+
+
+class TestEnforceTransition:
+    """DS-2: enforce_transition raises + files a loud escalation, never silent."""
+
+    def test_legal_edge_returns_none_and_does_not_call_sink(self) -> None:
+        calls = []
+        sink = lambda task_id, old, new: calls.append((task_id, old, new))  # noqa: E731
+
+        result = enforce_transition(
+            DeployPhase.SCHEDULED, DeployPhase.RAN, task_id='t1', escalation_sink=sink
+        )
+
+        assert result is None
+        assert calls == []
+
+    def test_illegal_edge_raises_and_files_escalation_before_raising(self) -> None:
+        calls = []
+        sink = lambda task_id, old, new: calls.append((task_id, old, new))  # noqa: E731
+
+        with pytest.raises(IllegalDeployTransition):
+            enforce_transition(
+                DeployPhase.SCHEDULED, DeployPhase.DONE, task_id='t1', escalation_sink=sink
+            )
+
+        assert calls == [('t1', DeployPhase.SCHEDULED, DeployPhase.DONE)]
+
+    def test_initial_set_from_none_returns_none_and_does_not_call_sink(self) -> None:
+        calls = []
+        sink = lambda task_id, old, new: calls.append((task_id, old, new))  # noqa: E731
+
+        result = enforce_transition(
+            None, DeployPhase.SCHEDULED, task_id='t1', escalation_sink=sink
+        )
+
+        assert result is None
+        assert calls == []
