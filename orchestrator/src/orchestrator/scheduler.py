@@ -2174,8 +2174,7 @@ class Scheduler:
                     threshold=threshold,
                 )
             else:
-                self._external_hold_streak.pop(task_id, None)
-                self._external_hold_cause.pop(task_id, None)
+                self._streak_hold.clear(task_id)
 
     async def _apply_starvation_watchdog(self, candidates: list[dict]) -> None:
         """Per-tick starvation watchdog over the dispatch-eligible candidate list.
@@ -2233,18 +2232,16 @@ class Scheduler:
                 continue
 
             # Stamp first_seen anchor on the first tick this task appears.
-            if tid not in self._starvation_first_seen:
-                self._starvation_first_seen[tid] = now
+            self._streak_starvation.touch(tid, now=now)
 
-            first_seen = self._starvation_first_seen[tid]
             skip = self._skip_count.get(tid, 0)
-            idle_elapsed = now - first_seen
+            idle_elapsed = self._streak_starvation.age(tid, now)
 
             # Fire when BOTH gates are crossed AND not already escalated.
             if (
                 skip >= cfg.skip_threshold
                 and idle_elapsed >= cfg.idle_secs
-                and tid not in self._starvation_escalated
+                and not self._streak_starvation.is_escalated(tid)
                 and self._on_starvation_warn is not None
             ):
                 summary = (
@@ -2266,7 +2263,7 @@ class Scheduler:
                     f'skip_threshold={cfg.skip_threshold}, idle_secs={cfg.idle_secs}'
                 )
                 await self._on_starvation_warn(tid, summary=summary, detail=detail)
-                self._starvation_escalated.add(tid)
+                self._streak_starvation.mark_escalated(tid)
 
     async def _resolve_starvation_escalation(self, task_id: str) -> None:
         """Resolve the open starvation-watchdog INFO escalation for *task_id*.
@@ -2280,12 +2277,11 @@ class Scheduler:
         Callers wrap every call in try/except (log + continue) so a resolve
         failure can NEVER abort a successful dispatch (PROPERTY 1).
         """
-        in_escalated = task_id in self._starvation_escalated
+        in_escalated = self._streak_starvation.is_escalated(task_id)
         if in_escalated and self._on_starvation_resolve is not None:
             await self._on_starvation_resolve(task_id)
         # Unconditionally clear both dicts so no stale residue survives.
-        self._starvation_escalated.discard(task_id)
-        self._starvation_first_seen.pop(task_id, None)
+        self._streak_starvation.clear(task_id)
 
     async def _starvation_gc_resolve(self, tid: str) -> None:
         """``on_gc`` callback for the ``'starvation'`` StreakRegistry entry.
