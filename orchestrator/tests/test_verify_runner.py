@@ -293,6 +293,41 @@ class TestVerifyResultContention:
 
 
 # ---------------------------------------------------------------------------
+# Task 2306 step-3: FLOCK_CONTENTION_CATEGORY + make_flock_contention_result —
+# the contention-result builder consumed by task beta (workstation side).
+# ---------------------------------------------------------------------------
+
+
+class TestMakeFlockContentionResult:
+    """make_flock_contention_result builds a losslessly-parseable contention VerifyResult."""
+
+    def test_category_constant_value(self):
+        from orchestrator.verify_runner import FLOCK_CONTENTION_CATEGORY
+        assert FLOCK_CONTENTION_CATEGORY == 'flock_contention'
+
+    def test_builder_shape(self):
+        from orchestrator.verify_runner import (
+            FLOCK_CONTENTION_CATEGORY,
+            make_flock_contention_result,
+        )
+        result = make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
+        assert result.passed is False
+        assert result.timed_out is False
+        assert result.category == FLOCK_CONTENTION_CATEGORY
+        assert result.contention == {'host': 'leo-laptop', 'holder_pgid': 4242, 'waiter_pgid': 4343}
+
+    def test_builder_accepts_none_holder_pgid(self):
+        from orchestrator.verify_runner import make_flock_contention_result
+        result = make_flock_contention_result(host='leo-laptop', holder_pgid=None, waiter_pgid=4343)
+        assert result.contention == {'host': 'leo-laptop', 'holder_pgid': None, 'waiter_pgid': 4343}
+
+    def test_builder_result_round_trips(self):
+        from orchestrator.verify_runner import make_flock_contention_result
+        result = make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
+        assert result_from_json(result_to_json(result)) == result
+
+
+# ---------------------------------------------------------------------------
 # Golden round-trip test — wire codec (spec_to_json / result_to_json)
 # ---------------------------------------------------------------------------
 
