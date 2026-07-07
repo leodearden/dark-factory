@@ -29,6 +29,7 @@ async def journal(tmp_path):
 
 
 async def _log_write(journal: WriteJournal, *, causation_id: str, operation: str,
+                     agent_id: str = 'recon-stage-memory_consolidator',
                      result_summary: dict | None = None, success: bool = True) -> None:
     await journal.log_write_op(
         write_op_id=str(uuid.uuid4()),
@@ -36,6 +37,7 @@ async def _log_write(journal: WriteJournal, *, causation_id: str, operation: str
         source='mcp_tool',
         operation=operation,
         project_id='test',
+        agent_id=agent_id,
         result_summary=result_summary,
         success=success,
     )
@@ -145,6 +147,60 @@ def test_bucket_ops_by_stage_assigns_to_matching_window():
 
 
 # ── verify_and_rewrite_stats ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verify_boundary_s1_computed_stats_override_llm_report(journal):
+    """Boundary signal S1 (task 2226): the write journal, not the LLM's
+    self-report, is the source of truth for a stage's write counters.
+
+    The LLM reports memories_added=5 and memories_written=5 (both inflated);
+    the journal shows only 2 real adds. After verification: memories_added is
+    overridden to the observed count (2); both originals are preserved under
+    _reported as the judge's divergence signal; memories_written — recognised
+    as an LLM counter but no longer computed now that the alias mirror is gone
+    — is dropped from the top-level stats entirely (its claim still visible
+    under _reported); and a code-computed non-counter stat
+    (graphiti_queue_health) is left untouched.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+
+    for i in range(2):
+        await _log_write(
+            journal, causation_id=run_id, operation='add_memory',
+            result_summary={'memory_ids': [f'm{i}'], 'stores': ['mem0']},
+        )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator,
+            now - timedelta(minutes=1), now + timedelta(minutes=1),
+            stats={
+                'memories_added': 5,
+                'memories_written': 5,
+                'graphiti_queue_health': {'depth': 3},
+            },
+        ),
+    }
+
+    await verify_and_rewrite_stats(run_id, reports, journal)
+
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    assert stats['memories_added'] == 2
+    assert stats['_reported']['memories_added'] == 5
+    assert stats['_reported']['memories_written'] == 5
+    assert 'memories_written' not in stats
+    # Code-computed non-counter stat survives the override untouched.
+    assert stats['graphiti_queue_health'] == {'depth': 3}
+
+
+def test_stats_verifier_has_no_alias_map():
+    """_STAT_ALIASES is retired — memories_written no longer mirrors a
+    canonical key; it's either dropped (S1) or absent entirely."""
+    import fused_memory.reconciliation.stats_verifier as sv  # noqa: PLC0415
+
+    assert not hasattr(sv, '_STAT_ALIASES')
 
 
 @pytest.mark.asyncio
