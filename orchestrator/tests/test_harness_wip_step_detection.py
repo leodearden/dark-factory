@@ -533,6 +533,19 @@ class TestBuildImplementerPromptWipNotice:
 
 @pytest.mark.asyncio
 class TestBuildImplementerPromptMandatoryPreflight:
+    async def test_preflight_renders_with_wip_notice_none(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        """Proves the pre-flight is not accidentally coupled to wip_section:
+        it must render even when there is no WIP notice at all, which is the
+        common case for most implementer invocations."""
+        prompt = await briefing.build_implementer_prompt(
+            minimal_plan, [], context='', wip_notice=None,
+        )
+
+        assert 'git diff HEAD' in prompt
+        assert 'mark_step_done' in prompt
+
     async def test_preflight_still_renders_alongside_wip_notice(
         self, briefing: BriefingAssembler, minimal_plan: dict,
     ):
@@ -545,7 +558,7 @@ class TestBuildImplementerPromptMandatoryPreflight:
         )
 
         assert 'git diff HEAD' in prompt
-        assert 'Verify Before Re-Implementing' in prompt
+        assert 'Mandatory pre-flight' in prompt
 
 
 # ---------------------------------------------------------------------------
