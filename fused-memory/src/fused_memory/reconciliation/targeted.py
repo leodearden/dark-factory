@@ -795,7 +795,7 @@ class TargetedReconciler:
         self,
         *,
         parent_id: str,
-        project_root: str,
+        project_root: ProjectRoot,
         run_id: str,
     ) -> list[dict]:
         """Classify and route each non-terminal descendant of ``parent_id``.
@@ -965,7 +965,7 @@ class TargetedReconciler:
 
         return actions
 
-    async def _live_status_map(self, project_root: str) -> dict[str, str]:
+    async def _live_status_map(self, project_root: ProjectRoot) -> dict[str, str]:
         """Return a fresh {str(task_id): str(status)} map for the project.
 
         Called at most once per sweep (lazy-memoized by the caller) to detect
@@ -992,7 +992,7 @@ class TargetedReconciler:
         }
 
     async def _sweep_cancel_orphan(
-        self, *, task_id: str, parent_id: str, project_root: str,
+        self, *, task_id: str, parent_id: str, project_root: ProjectRoot,
     ) -> dict | None:
         """Auto-cancel a deterministic-orphan review-followup."""
         reason = f'{_PARENT_CANCELLED_REOPEN_PREFIX}{parent_id}'
@@ -1024,7 +1024,7 @@ class TargetedReconciler:
         parent_id: str,
         escalation_id: str | None,
         is_dependent: bool,
-        project_root: str,
+        project_root: ProjectRoot,
     ) -> dict | None:
         """Auto-block an ambiguous descendant + record parent_cancelled metadata.
 
@@ -1085,7 +1085,7 @@ class TargetedReconciler:
         parent_id: str,
         escalation_id: str | None,
         is_dependent: bool,
-        project_root: str,
+        project_root: ProjectRoot,
     ) -> dict | None:
         """File an L1 escalation for an ambiguous descendant when orch is live."""
         # is-None narrows the optional types for pyright (mirrors
