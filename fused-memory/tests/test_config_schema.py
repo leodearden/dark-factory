@@ -24,6 +24,7 @@ from fused_memory.config.schema import (
     ServerConfig,
     SummaryRebuildConfig,
     TaskMetadataConfig,
+    TaskStatusConfig,
     YamlSettingsSource,
 )
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
@@ -948,3 +949,25 @@ class TestTaskMetadataConfig:
         """A config dict override for task_metadata is validated into the model."""
         cfg = FusedMemoryConfig(task_metadata={'enforce': True})  # type: ignore[arg-type]
         assert cfg.task_metadata.enforce is True
+
+
+class TestTaskStatusConfig:
+    """Task 2175 (rho1b): ``task_status.enforce_transitions`` — RED-TIER, restart-only.
+
+    Log-mode (default, ``enforce_transitions=False``): an illegal
+    ``(from, to, actor)`` status transition at the interceptor's
+    ``_apply_status_transition`` chokepoint emits an ``illegal_transition
+    would-reject`` warning and the write proceeds. Enforce-mode (``True``):
+    the same write is rejected with a typed ``illegal_transition`` error.
+    Flipped only after the Gamma soak proves the transition table clean; not
+    hot-reloadable. See ``plans/task-status-authority-prd.md`` C3/D5/D6.
+    """
+
+    def test_defaults_to_log_mode(self):
+        assert TaskStatusConfig().enforce_transitions is False
+
+    def test_override_enables_enforce_mode(self):
+        assert TaskStatusConfig(enforce_transitions=True).enforce_transitions is True
+
+    def test_fused_memory_config_attaches_disabled_by_default(self):
+        assert FusedMemoryConfig().task_status.enforce_transitions is False
