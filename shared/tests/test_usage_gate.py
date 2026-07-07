@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,7 +15,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import AccountPhase, AccountState, IllegalTransitionError, UsageGate
+from shared.usage_gate import (
+    _LEGAL_TRANSITIONS,
+    AccountPhase,
+    AccountState,
+    IllegalTransitionError,
+    UsageGate,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1978,3 +1985,89 @@ class TestSighupUncapsViaTransition:
         assert b.auth_failed_at is None
         assert gate._open.is_set() is True
         assert gate._paused_reason == ''
+
+
+# ---------------------------------------------------------------------------
+# step-17/18: B2 (DD-5) — the centralized _open recompute invariant
+# (gate._open.is_set() <=> any(acct.phase in {AVAILABLE, PROBING})) must hold
+# after EVERY _transition call. hypothesis is NOT installed (import fails),
+# so this is hand-rolled: an exhaustive walk of every _LEGAL_TRANSITIONS edge
+# plus a seeded random.Random multi-account walk, mirroring what a
+# hypothesis @given(...) strategy would otherwise generate.
+# ---------------------------------------------------------------------------
+
+
+def _open_invariant_holds(gate: UsageGate) -> bool:
+    expected_open = any(
+        a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING)
+        for a in gate._accounts
+    )
+    return gate._open.is_set() == expected_open
+
+
+@pytest.mark.asyncio
+class TestOpenInvariantProperty:
+    """step-17: DD-5 property — _open.is_set() <=> any account in
+    {AVAILABLE, PROBING} — holds after every legal _transition edge, both
+    exhaustively and over long seeded random walks."""
+
+    async def test_exhaustive_every_legal_edge_preserves_invariant(self):
+        for from_phase, targets in _LEGAL_TRANSITIONS.items():
+            for to_phase in targets:
+                gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+                acct = gate._accounts[0]
+                acct.phase = from_phase
+
+                gate._transition(acct, to_phase)
+
+                assert _open_invariant_holds(gate), (
+                    f'{from_phase} -> {to_phase} broke the DD-5 _open invariant'
+                )
+                await _drain_task(acct.resume_task)
+                await _drain_task(acct.auth_reprobe_task)
+
+    async def test_random_walk_two_accounts_preserves_invariant(self):
+        rng = random.Random(1234)
+        gate = make_gate(['a', 'b'], wait_for_reset=False, cost_store=None)
+        assert _open_invariant_holds(gate)
+
+        for _ in range(300):
+            acct = rng.choice(gate._accounts)
+            legal = sorted(_LEGAL_TRANSITIONS.get(acct.phase, frozenset()))
+            if not legal:
+                continue
+            gate._transition(acct, rng.choice(legal))
+            assert _open_invariant_holds(gate)
+
+        for acct in gate._accounts:
+            await _drain_task(acct.resume_task)
+            await _drain_task(acct.auth_reprobe_task)
+
+    async def test_random_walk_three_accounts_preserves_invariant(self):
+        rng = random.Random(5678)
+        gate = make_gate(['a', 'b', 'c'], wait_for_reset=False, cost_store=None)
+        assert _open_invariant_holds(gate)
+
+        for _ in range(300):
+            acct = rng.choice(gate._accounts)
+            legal = sorted(_LEGAL_TRANSITIONS.get(acct.phase, frozenset()))
+            if not legal:
+                continue
+            gate._transition(acct, rng.choice(legal))
+            assert _open_invariant_holds(gate)
+
+        for acct in gate._accounts:
+            await _drain_task(acct.resume_task)
+            await _drain_task(acct.auth_reprobe_task)
+
+    async def test_force_reset_preserves_invariant(self):
+        gate = make_gate(['a', 'b'], wait_for_reset=False, cost_store=None)
+        a, b = gate._accounts
+        a.phase = AccountPhase.CAPPED
+        b.phase = AccountPhase.AUTH_FAILED
+
+        gate._transition(a, AccountPhase.AVAILABLE, force=True)
+        assert _open_invariant_holds(gate)
+
+        gate._transition(b, AccountPhase.AVAILABLE, force=True)
+        assert _open_invariant_holds(gate)
