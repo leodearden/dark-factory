@@ -118,6 +118,126 @@ class TestFormatVecf32Literal:
 
 
 # ---------------------------------------------------------------------------
+# _read_compact_vector: the ONE non-pure, byte-exactness-critical read path.
+#
+# Every OTHER test in this module monkeypatches _read_compact_vector away, so
+# this class is the module's only coverage of its raw `--compact` reply
+# parsing: the reply[1][0]/cell indexing, the int(cell[0]) scalar-type
+# extraction, the non-VECTORF32 ValueError path (which is ALSO how a
+# null/absent embedding surfaces), and the bytes-token materialization. A
+# regression in any of these (reply-shape change, wrong scalar-type constant)
+# would otherwise ship green. It feeds a recorded/representative raw reply
+# structure through the REAL function.
+#
+# Compact reply shape (per falkordb's own parse_scalar convention, mirrored in
+# _read_compact_vector's docstring): reply == [header, rows, stats]; rows[0] is
+# the first row; row[0] is the first cell == [scalar_type, value]; scalar_type
+# 12 == VALUE_VECTORF32 and value is the list of exact float32 token bytes.
+# ---------------------------------------------------------------------------
+
+_VALUE_VECTORF32_TAG = 12  # falkordb ResultSetScalarTypes.VALUE_VECTORF32
+_VALUE_NULL_TAG = 1        # falkordb ResultSetScalarTypes.VALUE_NULL
+
+
+def _compact_reply(cell) -> list:
+    """Wrap a single result *cell* in the [header, rows, stats] compact shape."""
+    return ['header', [[cell]], 'stats']
+
+
+class TestReadCompactVectorTransport:
+    """_read_compact_vector(falkor_client, *, group_id, cypher) raw-reply parsing."""
+
+    def _client_returning(self, reply) -> MagicMock:
+        client = MagicMock()
+        client.execute_command = AsyncMock(return_value=reply)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_returns_exact_bracketed_token_string(self):
+        """A VECTORF32 cell's byte-exact tokens materialize to the bracketed reply string.
+
+        Uses the full-precision recorded fixture tokens, so a regression that
+        (say) round-tripped a token through float() would alter the returned
+        string and fail here. Also asserts the raw `--compact` command is
+        issued verbatim against the given group_id/cypher.
+        """
+        cypher = 'MATCH (n:Entity {uuid: \'x\'}) RETURN n.name_embedding'
+        reply = _compact_reply([
+            _VALUE_VECTORF32_TAG,
+            [b'0.5', b'0.10000000149011611938', b'-0.987654321098765432'],
+        ])
+        client = self._client_returning(reply)
+
+        out = await cross_graph_move._read_compact_vector(
+            client, group_id=SOURCE_GRAPH_FIXTURE, cypher=cypher,
+        )
+
+        # (a) exact bracketed token string, byte-for-byte the --compact fixture.
+        assert out == COMPACT_VECTOR_REPLY_FIXTURE
+        # ...and it flows losslessly into the vecf32 literal via the pure funcs.
+        assert (
+            format_vecf32_literal(parse_compact_vector_reply(out))
+            == EXPECTED_VECF32_LITERAL_FIXTURE
+        )
+        # It issued the raw GRAPH.RO_QUERY ... --compact command as given.
+        client.execute_command.assert_awaited_once_with(
+            'GRAPH.RO_QUERY', SOURCE_GRAPH_FIXTURE, cypher, '--compact',
+        )
+
+    @pytest.mark.asyncio
+    async def test_str_tokens_are_materialized_without_float_coercion(self):
+        """Non-bytes (str) tokens pass through via str(v), never float()-coerced."""
+        reply = _compact_reply([_VALUE_VECTORF32_TAG, ['0.5', '0.10000000149011611938']])
+        client = self._client_returning(reply)
+
+        out = await cross_graph_move._read_compact_vector(
+            client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
+        )
+
+        assert out == '[0.5, 0.10000000149011611938]'
+
+    @pytest.mark.asyncio
+    async def test_non_vectorf32_scalar_type_raises_naming_group_id_and_cypher(self):
+        """A non-VECTORF32 scalar-type tag raises ValueError citing group_id + cypher.
+
+        Guards the scalar-type constant (_VALUE_VECTORF32): a wrong tag, or a
+        genuinely wrong-typed column, must fail loudly with a diagnostic
+        naming both the group_id and the cypher rather than mis-parsing.
+        """
+        cypher = 'RETURN e.fact_embedding'
+        # scalar_type 10 (e.g. VALUE_ARRAY) != VECTORF32 -> type check fires.
+        reply = _compact_reply([10, [b'not', b'a', b'vector']])
+        client = self._client_returning(reply)
+
+        with pytest.raises(ValueError) as excinfo:
+            await cross_graph_move._read_compact_vector(
+                client, group_id='know_live', cypher=cypher,
+            )
+
+        msg = str(excinfo.value)
+        assert 'know_live' in msg
+        assert cypher in msg
+        assert '10' in msg  # the offending scalar_type is reported
+
+    @pytest.mark.asyncio
+    async def test_null_absent_embedding_raises_not_empty_vector(self):
+        """A NULL/absent embedding raises rather than yielding an empty vector.
+
+        FalkorDB reports a missing property as a non-VECTORF32 (VALUE_NULL)
+        scalar_type with a null value; the type check fires BEFORE the value is
+        ever indexed, so a corrupt/embedding-less source row surfaces as a hard
+        ValueError instead of a silently-empty vecf32([]) literal.
+        """
+        reply = _compact_reply([_VALUE_NULL_TAG, None])
+        client = self._client_returning(reply)
+
+        with pytest.raises(ValueError):
+            await cross_graph_move._read_compact_vector(
+                client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
+            )
+
+
+# ---------------------------------------------------------------------------
 # move_entity_across_graphs (S5) fixtures + shared test helper
 # ---------------------------------------------------------------------------
 
