@@ -361,6 +361,7 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     """
     from orchestrator.git_ops import GitOps
     from orchestrator.verify_runner import (
+        make_flock_contention_result,
         result_to_json,
         run_merge_verify_on_worktree,
         spec_from_json,
@@ -399,12 +400,28 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         finally:
             await git_ops.cleanup_merge_worktree(wt)
 
+    # Flock guard (task 2306 α): serialize the whole verify span under a
+    # laptop-side exclusive fcntl.flock when the persistent-worktree knob is
+    # on — the per-host serial invariant that _bump_host_verify_attempt_count
+    # relies on is only supplied at WORKSTATION startup, not on the laptop.
+    # Knob OFF -> fd stays None -> byte-identical back-compat (no lock).
+    fd: int | None = None
+    if config.git.persistent_merge_worktree:
+        fd = acquire_merge_verify_flock(
+            merge_verify_lock_path(git_ops.worktree_base), MERGE_VERIFY_FLOCK_WAIT_SECS
+        )
+        if fd is not None:
+            write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+
     try:
         result = asyncio.run(_run())
     except Exception as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
     finally:
+        if fd is not None:
+            remove_lock_holder_pgid(git_ops.worktree_base)
+            release_merge_verify_flock(fd)
         # Always remove the pgid file so cancel-verify knows this run is done.
         if pgf is not None:
             remove_pgid_file(pgf)

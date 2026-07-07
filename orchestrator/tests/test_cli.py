@@ -1048,7 +1048,10 @@ def test_verify_merge_uses_acquire_host_verify_worktree(tmp_path, monkeypatch):
     fake_wt.mkdir()
 
     # --- Build mock GitOps instance ---
+    fake_worktree_base = tmp_path / '.worktrees'
+    fake_worktree_base.mkdir()
     mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
     mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
     mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
     # _create_merge_worktree is a spy: return a valid 2-tuple so the old code
