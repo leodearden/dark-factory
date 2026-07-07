@@ -8,6 +8,12 @@ Covers:
                  consume), not-on-main (allow dispatch + prune), and
                  status-unknown fail-safe (gate but leave unconsumed for the
                  next retry).
+  reviewer_comprehensive amendment #1 — a ``consume()`` failure AFTER a
+                 successful ``mark_done`` must still gate (defense-in-depth
+                 against a same-tick "marked done AND dispatched" race).
+  reviewer_comprehensive amendment #3 — pin the ``'already_done_pruned'``
+                 (RC-3) disposition's gate mapping, the one disposition the
+                 original step-1 RED left uncovered.
 
 Mirrors test_merge_queue_landed_reconciler.py's mock-git_ops / fake-scheduler
 convention with a REAL LandedOutbox on ``tmp_path`` so ``lookup()``/
@@ -162,4 +168,99 @@ class TestReconcileLandedTaskStatusUnknown:
         scheduler.mark_done.assert_not_called()
         assert outbox.lookup('Z') is not None, (
             'status-unknown row must be LEFT unconsumed for the next startup/tick to retry'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Row present, on main, task already in a preserve-status — RC-3 gate mapping.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileLandedTaskAlreadyDonePruned:
+    """Row on main + status already terminal => gate, no mark_done, still pruned.
+
+    Pins the ``'already_done_pruned'`` (RC-3) disposition's ``!=
+    'pruned_not_landed'`` -> ``True`` mapping (reviewer_comprehensive
+    amendment #3) — the one disposition the original step-1 RED left
+    untested. This is the branch most likely to regress if the
+    disposition-string contract in ``reconcile_landed_row`` ever changes.
+    """
+
+    async def test_already_done_gates_without_mark_done_and_prunes(
+        self, tmp_path: Path,
+    ) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+
+        git_ops = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='done')
+
+        result = await reconcile_landed_task(
+            'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+        )
+
+        assert result is True, (
+            'advanced_sha on main + already-terminal status => still gate '
+            '(the task is done either way, just not via this call)'
+        )
+        scheduler.mark_done.assert_not_called()
+        assert outbox.lookup('Z') is None, (
+            'already-done row must still be pruned (RC-3), just without a done-write'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Defense-in-depth: a post-mark_done consume() failure must not un-gate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileLandedTaskConsumeFailsAfterMarkDone:
+    """A ``consume()`` failure AFTER a successful ``mark_done`` must still gate.
+
+    ``reconcile_landed_row`` calls ``scheduler.mark_done(...)`` and THEN
+    ``outbox.consume(...)``. If ``consume()`` raises, the task is already
+    genuinely done — a caller must never see this as "not gated", or the
+    scheduler's dispatch-gate consult (``_consult_landed_outbox``, task
+    2156) would fail OPEN for this candidate and dispatch an agent for a
+    task that was just marked done: the exact same-tick "marked done AND
+    dispatched" race flagged in reviewer_comprehensive amendment #1.
+
+    (``LandedOutbox.consume()``/``_save_raw`` already fails open on
+    ``OSError`` internally — logs at ERROR, counts ``save_failures``, never
+    raises — so this test injects a non-OSError failure to exercise the
+    defense-in-depth guard in ``reconcile_landed_row`` for any OTHER
+    exception a ``consume()`` implementation could raise.)
+    """
+
+    async def test_consume_failure_after_mark_done_still_gates(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        caplog.set_level('WARNING')
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+        outbox.consume = MagicMock(side_effect=RuntimeError('durable write hiccup'))
+
+        git_ops = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='in-progress')
+
+        result = await reconcile_landed_task(
+            'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+        )
+
+        assert result is True, (
+            'mark_done already succeeded, so a subsequent consume() failure '
+            'must still gate (never re-open dispatch for an already-done task)'
+        )
+        scheduler.mark_done.assert_called_once_with('Z', kind='merged', sha='ADV')
+        outbox.consume.assert_called_once_with('Z')
+        assert any(record.levelname == 'WARNING' for record in caplog.records), (
+            'a swallowed consume() failure should be logged, not silent'
         )
