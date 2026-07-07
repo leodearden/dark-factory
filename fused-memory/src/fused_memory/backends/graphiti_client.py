@@ -236,6 +236,7 @@ class GraphitiBackend:
         self._llm_client = None
         self._embedder = None
         self._cross_encoder = None
+        self._group_clients: dict[str, Graphiti] = {}
 
     # --- Per-request driver routing ---
 
@@ -251,6 +252,33 @@ class GraphitiBackend:
         cloned = driver.clone(database=group_id)
         self._cloned_drivers[group_id] = cloned
         return cloned
+
+    def _client_for(self, group_id: str) -> Graphiti:
+        """Return a cached Graphiti client dedicated to *group_id*.
+
+        Each client is built with ``graph_driver=self._driver_for(group_id)``,
+        whose ``_database`` already equals *group_id*. Upstream
+        ``Graphiti.add_episode`` only mutates ``self.driver``/``self.clients.driver``
+        when ``group_id != self.driver._database`` (graphiti_core 0.28.2,
+        graphiti.py:889-890) — since that condition is never true for a
+        per-group client, the shared-driver mutation race that misroutes
+        concurrent cross-group writes is structurally unreachable here.
+        The llm_client/embedder/cross_encoder sub-clients are shared (hoisted
+        in ``initialize()``) across every per-group client and the base
+        ``self.client``.
+        """
+        cached = self._group_clients.get(group_id)
+        if cached is not None:
+            return cached
+        client = Graphiti(
+            graph_driver=self._driver_for(group_id),
+            llm_client=self._llm_client,
+            embedder=self._embedder,
+            cross_encoder=self._cross_encoder,
+            max_coroutines=self.config.queue.graphiti_max_coroutines,
+        )
+        self._group_clients[group_id] = client
+        return client
 
     def _graph_for(self, group_id: str) -> Any:
         """Return the FalkorGraph object for *group_id* (for direct Cypher)."""
