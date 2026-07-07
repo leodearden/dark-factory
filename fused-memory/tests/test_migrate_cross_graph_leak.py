@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params
+
 from fused_memory.maintenance.cross_graph_move import MergeResult, MoveResult
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'migrate_cross_graph_leak.py'
@@ -1215,8 +1216,16 @@ class TestRunApplyExceptionIsolation:
             tmp_path, [failing_move, succeeding_merge], {'reify': 1, 'know_live': 1},
         )
 
+        # merge_mock's return_value is a real, zero-loss MergeResult (not a
+        # bare AsyncMock()) -- run() reads edges_recreated/home_edge_count_before/
+        # home_edge_count_after off the result (see _merge_result_entry), and an
+        # unconfigured MagicMock's truthy attributes and non-identical `+` result
+        # would otherwise be misread as a lossy outcome, spuriously flipping
+        # 'blocked' to True (same pitfall documented on the sibling tests above).
         move_mock = AsyncMock(side_effect=RuntimeError('simulated epsilon failure'))
-        merge_mock = AsyncMock()
+        merge_mock = AsyncMock(return_value=MergeResult(
+            uuid='u-merge', wrong_graph='know_live', home_graph='pump_web_ui',
+        ))
         monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
         monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
 
@@ -1238,6 +1247,7 @@ class TestRunApplyExceptionIsolation:
         merge_result = [r for r in report['apply_results'] if r['uuid'] == 'u-merge']
         assert merge_result == [{
             'uuid': 'u-merge', 'disposition': _mod.MERGE, 'applied': True, 'blocked': False,
+            'edges_recreated': 0, 'home_edge_count_before': 0, 'home_edge_count_after': 0,
         }]
 
         assert 'post_verify' in report
