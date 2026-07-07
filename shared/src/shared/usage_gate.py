@@ -741,7 +741,7 @@ class UsageGate:
             return False
 
         logger.warning(f'Account {acct.name} AUTH-FAILED: {reason}')
-        if acct.phase != AccountPhase.AUTH_FAILED:
+        if acct.phase not in (AccountPhase.AUTH_FAILED, AccountPhase.CAPPED):
             # In production, HTTP 429 with "out of extra usage" carries a
             # "resets ..." phrase in the body — parse and persist it so the
             # dashboard can surface a reset ETA without re-parsing reason
@@ -754,6 +754,17 @@ class UsageGate:
             # and gate-level pause bookkeeping. A same-phase repeat call
             # (already AUTH_FAILED) is a pure no-op here.
             self._transition(acct, AccountPhase.AUTH_FAILED, resets_at=resets_at, reason=reason)
+        # else: already AUTH_FAILED (no-op repeat) OR already CAPPED —
+        # CAPPED->AUTH_FAILED is not a legal edge (_LEGAL_TRANSITIONS[CAPPED]
+        # == {PROBING}), so demoting a time-bounded cap to an operator-gated
+        # auth_failed would raise IllegalTransitionError. A concurrent
+        # sibling task can cap this account (via _handle_cap_detected) after
+        # before_invoke already handed it out AVAILABLE; when the in-flight
+        # caller's request then fails with a 403, the cap already makes the
+        # account unavailable and self-recovers via resets_at/resume-probe,
+        # which takes precedence over auth_failed. Return True unconditionally
+        # (below) regardless of which branch ran so cli_invoke.py's
+        # invoke_slot() still settles the slot and fails over.
         return True
 
     def _start_auth_reprobe(self, acct: AccountState) -> None:
