@@ -5944,6 +5944,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # duplicate arriving while the same heal is still running.
         if (
             registry is not None
+            and self.merge_worker is not None
             and registry.attempts(sig) >= MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
             and not self.merge_worker.is_lane_halted('normal')
         ):
