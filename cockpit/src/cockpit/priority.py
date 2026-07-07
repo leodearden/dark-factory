@@ -107,4 +107,4 @@ def score(item: ScoringItem, weights: Priorities, now: datetime) -> float:
     )
     raw = max(0.0, raw)
     urgency = raw / (1.0 + raw)
-    return urgency
+    return STATE_TIER.get(item.state, 0.0) + urgency
