@@ -1141,3 +1141,81 @@ class TestRecordDrivenRecovery:
         assert result is not None, (
             'pool must not be stuck exhausted after quarantining a lane'
         )
+
+    async def test_terminal_task_releases_lane_not_adopted(self, harness: Harness):
+        """Terminal task (T10 amplifier): durable record ASSIGNED:'42'
+        branch='task/42' and git reality still matches (registered, branch
+        OK), but the task itself is already terminal (scheduler.get_status
+        -> 'done').  The lane must be RELEASED (cleanup_worktree), NOT
+        adopted -- re-pinning a dead task's lane on every restart would
+        shrink the pool forever.  This is resolved BEFORE the git-reality
+        adopt/quarantine decision, so it must win even though registration
+        and branch both check out fine.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane = base / '_lane-0'
+        lane.mkdir(parents=True, exist_ok=True)
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
+        harness.git_ops.lane_branch_checkouts = AsyncMock(
+            return_value={'42': lane},
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='done')  # terminal
+
+        await harness._recover_crashed_tasks()
+
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            lane, '42',
+        )
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.RELEASED
+
+        assert pool.assignment_for('42') is None
+        assert '42' not in harness._recovered_plans
+
+    async def test_quarantine_on_branch_mismatch(self, harness: Harness):
+        """The 2062 detached-HEAD/stale-branch collision: durable record
+        ASSIGNED:'42' branch='task/42', the admin entry is still registered,
+        but the lane is ACTUALLY checked out onto a different task's branch
+        (task/99) -- a stale-branch collision, not an orphan.  Must route to
+        the SAME quarantine cell as the not-registered divergence (each
+        historical bug collapses to one QUARANTINE cell), never adopt.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane = base / '_lane-0'
+        lane.mkdir(parents=True, exist_ok=True)
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
+        # lane_branch_checkouts returns {bare_id: lane} (branch_prefix
+        # already stripped -- see GitOps.lane_branch_checkouts's documented
+        # contract, and the comment on the matching adopt-path test above).
+        # bare_id '99' reconstructs to 'task/99', which disagrees with the
+        # record's 'task/42' -- the lane is actually checked out on a
+        # DIFFERENT task's branch than its own durable record claims.
+        harness.git_ops.lane_branch_checkouts = AsyncMock(
+            return_value={'99': lane},
+        )
+        harness.scheduler.get_status = AsyncMock(return_value=None)  # non-terminal
+
+        await harness._recover_crashed_tasks()
+
+        harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            lane, 'task/42', 'recovery-record-divergence',
+        )
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.QUARANTINED
+
+        assert pool.assignment_for('42') is None
+        assert '42' not in harness._recovered_plans
