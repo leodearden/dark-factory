@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 
 from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
@@ -278,6 +279,55 @@ async def test_add_task_valid_metadata_emits_no_schema_warning(
     assert census_msgs == [], (
         f'Expected no task_metadata.schema_warning lines for valid metadata; got: {census_msgs}'
     )
+
+
+@pytest.mark.asyncio
+async def test_add_task_enforce_mode_rejects_invariant_violation(tmp_path, project_root):
+    """Enforce-mode add_task: an invariant-violating write raises and rolls back.
+
+    ``task_metadata_enforce=True`` flips parse_metadata's write-boundary
+    failure policy from warn-and-proceed to raise: the malformed write is
+    rejected with pydantic.ValidationError, no row is persisted, and the
+    allocated id is not consumed by the rolled-back txn — a subsequent valid
+    add still gets id '1'.
+    """
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        with pytest.raises(ValidationError):
+            await backend.add_task(
+                project_root=project_root, title='t',
+                metadata=json.dumps({'task_kind': 'deterministic'}),
+            )
+
+        listing = await backend.get_tasks(project_root=project_root)
+        assert listing['tasks'] == [], (
+            f'Expected no rows persisted after a rolled-back txn; got: {listing["tasks"]}'
+        )
+
+        dto = await backend.add_task(project_root=project_root, title='valid')
+        assert dto['id'] == '1', (
+            f'Expected the rolled-back id to not be consumed; got id={dto["id"]!r}'
+        )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_add_task_enforce_mode_rejects_unparseable_json(tmp_path, project_root):
+    """Enforce-mode add_task: unparseable metadata JSON raises (json.JSONDecodeError)."""
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        with pytest.raises(ValueError):
+            await backend.add_task(
+                project_root=project_root, title='t',
+                metadata='{not valid json',
+            )
+    finally:
+        await backend.close()
 
 
 @pytest.mark.asyncio
