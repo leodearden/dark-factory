@@ -1196,6 +1196,16 @@ class Scheduler:
         # promoted L2 when the probe reports 'ok' again.  Signature: () -> None
         # (async).  Default None so bare-Scheduler unit tests are unaffected.
         self._on_warm_base_resolve: Callable[..., Any] | None = None
+        # Injected async hook installed by the Harness — the landed-outbox
+        # consult-before-dispatch gate (task 2156, W1 δ — PRD
+        # merge-queue-reliability §8.2 SD-1, boundary B5).  Signature:
+        # (task_id: str) -> bool (async).  True means the task's merge has
+        # already landed on main (advanced_sha is an ancestor) and it is
+        # being driven to done inline by the hook's own shared
+        # reconcile-to-done routine, so acquire_next() must NOT dispatch it
+        # this tick.  Default None so bare-Scheduler unit tests are
+        # unaffected and the gate is a no-op until the Harness wires it up.
+        self._landed_outbox_gate: Callable[[str], Any] | None = None
         # --- Snapshot write throttle (task 1332) ---
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
@@ -3367,6 +3377,27 @@ class Scheduler:
                         },
                     )
 
+    async def _consult_landed_outbox(self, candidate_ids: list[str]) -> set[str]:
+        """Consult the injected landed-outbox dispatch gate for each candidate.
+
+        Returns the subset of ``candidate_ids`` the hook gated (task 2156,
+        SD-1 / B5): the task's merge already landed on ``main`` and is being
+        driven to ``done`` inline by the hook's shared reconcile-to-done
+        routine, so it must not be dispatched this tick.  A single set is
+        computed here and honored by BOTH the pin loop and the scored loop
+        in ``acquire_next`` (mirrors ``_eligible_for_dispatch``'s
+        one-source-of-truth property).  Returns the empty set immediately
+        without awaiting anything when no hook is installed (default None),
+        so bare-Scheduler unit tests are unaffected.
+        """
+        if self._landed_outbox_gate is None:
+            return set()
+        gated: set[str] = set()
+        for tid in candidate_ids:
+            if await self._landed_outbox_gate(tid):
+                gated.add(tid)
+        return gated
+
     async def acquire_next(self) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
@@ -3839,6 +3870,22 @@ class Scheduler:
             candidates.append(t)
             candidate_signals[tid_str] = signal_label
 
+        # Landed-outbox consult-before-dispatch gate (task 2156, W1 δ — PRD
+        # merge-queue-reliability §8.2 SD-1, boundary B5).  Consulted once per
+        # candidate here, BEFORE the starvation watchdog / pin loop / scored
+        # loop, so a single gated_ids set is honored by both dispatch paths.
+        # A gated task's merge already landed on main and is being driven to
+        # done inline by the injected hook — dropping it from `candidates`
+        # here stops the ghost-loop re-dispatch without touching starvation
+        # bookkeeping for a task that is effectively already finished.
+        gated_ids = await self._consult_landed_outbox(
+            [str(t.get('id', '')) for t in candidates]
+        )
+        if gated_ids:
+            candidates = [
+                t for t in candidates if str(t.get('id', '')) not in gated_ids
+            ]
+
         # Starvation watchdog pass (task 1880): side-effecting scan over the
         # dispatch-eligible candidate list.  Runs once per tick, wrapped in
         # try/except so a watchdog/callback failure can NEVER abort the tick or
@@ -3881,6 +3928,12 @@ class Scheduler:
                     external_resolver_failed=_external_resolver_failed,
                 )
                 if not eligible:
+                    continue
+                if pin_tid in gated_ids:
+                    # Landed-outbox gate (task 2156, SD-1/B5): this pinned
+                    # task's merge already landed on main and is being driven
+                    # to done inline — skip it here too so the pin loop and
+                    # the scored loop share the one gated_ids source of truth.
                     continue
                 # Eligible pinned candidate — try to acquire its modules.
                 pin_modules = self._get_modules(pin_task)
