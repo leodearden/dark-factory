@@ -70,6 +70,7 @@ def plan_tools_mcp_server(
     orch_project_dir: Path,
     worktree: Path,
     python_executable: str | None = None,
+    meta_root: Path | None = None,
 ) -> dict:
     """Return a stdio MCP server config dict for the plan-tools server.
 
@@ -109,15 +110,26 @@ def plan_tools_mcp_server(
         python_executable: Full path to the Python interpreter to use for the
             direct-interpreter no-uv hot path.  When ``None``, falls back to
             the ``uv run --no-sync --frozen`` form.
+        meta_root: Optional `.task-meta` root (see
+            ``TaskArtifacts.meta_root_for``) to pass through to the
+            plan-tools server as ``--meta-root``, so the agent-side plan.json
+            writer targets the same relocated artifacts root as the
+            orchestrator (worktree-lane-lifecycle PRD task ε1). When
+            ``None`` (default), no ``--meta-root`` flag is emitted and args
+            are byte-identical to before this parameter existed.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
+    meta_root_args = ['--meta-root', str(meta_root)] if meta_root is not None else []
     if python_executable:
         # Direct-interpreter no-uv hot path: eliminates the uv futex wedge.
         return {
             'command': python_executable,
-            'args': ['-m', 'orchestrator.mcp.plan_tools', '--worktree', str(worktree)],
+            'args': [
+                '-m', 'orchestrator.mcp.plan_tools', '--worktree', str(worktree),
+                *meta_root_args,
+            ],
         }
     # uv fallback: backward-compatible form with fast-start flags (task 1775).
     return {
@@ -127,6 +139,7 @@ def plan_tools_mcp_server(
             *_PLAN_TOOLS_FAST_START_FLAGS,
             'python', '-m', 'orchestrator.mcp.plan_tools',
             '--worktree', str(worktree),
+            *meta_root_args,
         ],
     }
 
