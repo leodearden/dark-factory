@@ -26,6 +26,7 @@ from orchestrator.scheduler import (
     directory_locks,
     files_to_modules,
 )
+from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
@@ -10543,6 +10544,137 @@ class TestStarvationWatchdog:
             '_starvation_first_seen must be cleared by the continuity reset '
             'when the task is no longer a dispatch-eligible candidate'
         )
+
+
+# ---------------------------------------------------------------------------
+# StreakCounter/StreakRegistry migration (task 2124)
+# ---------------------------------------------------------------------------
+
+class TestStreakRegistryMigration:
+    """Scheduler's five hand-rolled consecutive-tick counters are backed by
+    StreakCounter/StreakRegistry (orchestrator.streaks), aliased so every
+    existing test that reads/writes the legacy dict/set attributes directly
+    keeps working unchanged (parity-preserving migration, task 2124).
+    """
+
+    def _make_scheduler(self) -> tuple['Scheduler', list]:
+        """Build a bare Scheduler with a mutable fake clock (task 1880 pattern)."""
+        t: list[float] = [0.0]
+
+        def fake_clock() -> float:
+            return t[0]
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, time_source=fake_clock)
+        return scheduler, t
+
+    def test_legacy_attrs_alias_counter_containers(self):
+        """Each legacy attribute IS (identity) its StreakCounter's backing
+        container, so old inline code and new counter-method call sites
+        mutate — and observe — the exact same object.
+        """
+        scheduler, _t = self._make_scheduler()
+
+        assert isinstance(scheduler._streak_registry, StreakRegistry), (
+            'Scheduler must construct a StreakRegistry at _streak_registry'
+        )
+
+        assert scheduler._external_unresolved_counts is (
+            scheduler._streak_external_unresolved.counts
+        ), '_external_unresolved_counts must alias _streak_external_unresolved.counts'
+        assert scheduler._local_backfill_unresolved_counts is (
+            scheduler._streak_local_backfill.counts
+        ), '_local_backfill_unresolved_counts must alias _streak_local_backfill.counts'
+        assert scheduler._external_hold_streak is scheduler._streak_hold.counts, (
+            '_external_hold_streak must alias _streak_hold.counts'
+        )
+        assert scheduler._external_hold_cause is scheduler._streak_hold.causes, (
+            '_external_hold_cause must alias _streak_hold.causes'
+        )
+        assert scheduler._external_resolver_degraded_counts is (
+            scheduler._streak_resolver_degraded.counts
+        ), (
+            '_external_resolver_degraded_counts must alias '
+            '_streak_resolver_degraded.counts'
+        )
+        assert scheduler._starvation_first_seen is (
+            scheduler._streak_starvation.first_seen
+        ), '_starvation_first_seen must alias _streak_starvation.first_seen'
+        assert scheduler._starvation_escalated is scheduler._streak_starvation.escalated, (
+            '_starvation_escalated must alias _streak_starvation.escalated'
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_before_threshold_leaves_zero_entries_in_any_registered_counter(
+        self,
+    ):
+        """A terminal-before-threshold task leaves NO residue in ANY counter
+        registered on ``_streak_registry`` — including one no hand-rolled GC
+        block knows about.
+
+        Registers a 'probe' StreakCounter standing in for a future watchdog
+        that (per task 2124's design) registers on the shared registry
+        instead of hand-rolling its own dict + GC block.  Seeds it, plus the
+        five real migrated counters, sub-threshold for task 'T'.  Gives 'T' a
+        spine entry (``_skip_count``) so it enters ``_all_tracked`` →
+        ``_stale_ids`` once reported terminal.  After one ``acquire_next()``
+        tick, EVERY registered counter — 'probe' included — must be fully
+        swept.  RED until the GC sweep is routed through
+        ``StreakRegistry.gc`` (old blocks enumerate the five by name and
+        never touch 'probe').
+
+        NOTE: the spine entry uses ``_skip_count`` rather than
+        ``_pending_anchor`` — ``_update_age_anchors`` (called earlier in the
+        same tick, before the stale-id sweep) unconditionally pops
+        ``_pending_anchor`` for any tid observed with a non-'pending' status,
+        so a task reported as already-'done' in its very first observed tick
+        never survives in ``_pending_anchor`` long enough to reach the
+        stale-id sweep.  ``_skip_count`` has no such early-pop and is one of
+        the four ``_all_tracked`` spine dicts, so it reliably lands 'T' in
+        ``_stale_ids`` for this single-tick repro.
+        """
+        scheduler, _t = self._make_scheduler()
+
+        probe = StreakCounter(key_fn=lambda k: k[0])
+        probe.bump(('T', 'dep'))
+        scheduler._streak_registry.register('probe', probe)
+
+        # Seed the five real counters sub-threshold for task 'T'.
+        scheduler._external_unresolved_counts[('T', 'proj:1')] = 1
+        scheduler._local_backfill_unresolved_counts[('T', '2')] = 1
+        scheduler._external_hold_streak['T'] = 1
+        scheduler._external_hold_cause['T'] = 'deps_live'
+        scheduler._external_resolver_degraded_counts['T'] = 1
+        scheduler._starvation_first_seen['T'] = 0.0
+
+        # Spine entry so 'T' enters _all_tracked -> _stale_ids once terminal.
+        scheduler._skip_count['T'] = 0
+
+        scheduler.get_tasks = AsyncMock(
+            return_value=[
+                {'id': 'T', 'status': 'done', 'dependencies': [], 'metadata': {}}
+            ]
+        )
+
+        await scheduler.acquire_next()
+
+        for name, (counter, _on_gc) in scheduler._streak_registry._counters.items():
+            assert not counter.counts, (
+                f'counter {name!r} must have no counts entries after GC; '
+                f'got {counter.counts!r}'
+            )
+            assert not counter.causes, (
+                f'counter {name!r} must have no causes entries after GC; '
+                f'got {counter.causes!r}'
+            )
+            assert not counter.first_seen, (
+                f'counter {name!r} must have no first_seen entries after GC; '
+                f'got {counter.first_seen!r}'
+            )
+            assert not counter.escalated, (
+                f'counter {name!r} must have no escalated entries after GC; '
+                f'got {counter.escalated!r}'
+            )
 
 
 # ---------------------------------------------------------------------------
