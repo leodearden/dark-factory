@@ -8,6 +8,22 @@ each `dashboard/src/dashboard/data/*.py` file with `ast` and flags every
 physical source line nor part of `resolve_now`'s own definition (the
 sanctioned single clock-read site).
 
+`dashboard/src/dashboard/app.py` — the route/composition layer sitting on
+top of the data layer — is scanned too (see
+`test_no_bare_clock_reads_in_app_composition_layer` below). A future
+regression there (e.g. a route reverting to a per-leg `datetime.now(UTC)`
+instead of one shared capture) would reintroduce exactly the cross-DB
+clock-skew race this guard exists to prevent, so the route layer needs the
+same protection as the data layer. Route handlers legitimately read the
+clock once per request — there is nothing upstream to inject a `now` from,
+so they call `datetime.now(UTC)` directly rather than `resolve_now(None)` —
+and either thread that single value through a fan-out (`now=now` kwargs,
+mirroring how `resolve_now` callers behave in the data layer) or use it
+once locally (e.g. a ticket-age computation). Each such site is tagged
+`# clock-exempt: single-capture route`. No module besides
+`dashboard/data/*.py` and `app.py` is scanned by this guard; that boundary
+is intentional, not an oversight.
+
 The matcher intentionally does not require the receiver to be a bare
 `datetime` name: it flags any `.now(...)` attribute call, so an aliased
 import (``from datetime import datetime as dt`` then ``dt.now(UTC)``, or
@@ -132,10 +148,11 @@ def test_aliased_module_import_fires():
 
 
 # ---------------------------------------------------------------------------
-# Acceptance test: the real data-layer tree
+# Acceptance tests: the real tree (data layer + composition layer)
 # ---------------------------------------------------------------------------
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'data'
+_APP_PY = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'app.py'
 
 
 def test_no_bare_clock_reads_in_data_modules():
@@ -149,5 +166,25 @@ def test_no_bare_clock_reads_in_data_modules():
 
     assert not violations, (
         'Bare datetime.now() reads found (missing resolve_now() or a '
+        '`# clock-exempt:` tag):\n' + '\n'.join(violations)
+    )
+
+
+def test_no_bare_clock_reads_in_app_composition_layer():
+    """`app.py` route handlers must tag or thread every clock read too.
+
+    This is the layer that calls into the data layer's aggregate functions
+    (e.g. `aggregate_burndown_series`, `aggregate_cost_summary`) — a route
+    that silently reverted to reading the clock per fan-out leg instead of
+    capturing `now` once and threading it through would reintroduce the
+    same clock-skew race this guard blocks in the data layer, just one
+    level up the call stack. See the module docstring for the
+    `single-capture route` tag convention this test enforces.
+    """
+    source = _APP_PY.read_text()
+    violations = [f'{_APP_PY.name}:{lineno}: {text.strip()}' for lineno, text in find_clock_violations(source)]
+
+    assert not violations, (
+        'Bare datetime.now() reads found in app.py (missing a '
         '`# clock-exempt:` tag):\n' + '\n'.join(violations)
     )

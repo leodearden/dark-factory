@@ -654,7 +654,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     days = _parse_window(request.query_params)
     hours = days * 24
-    effective_now = datetime.now(UTC)
+    effective_now = datetime.now(UTC)  # clock-exempt: single-capture route
 
     project_dbs = await _project_scoped_dbs_labeled(
         config,
@@ -710,7 +710,7 @@ async def api_costs(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     days = _parse_window(request.query_params)
     dbs = await _cost_dbs(config, pool)
-    now = datetime.now(UTC)
+    now = datetime.now(UTC)  # clock-exempt: single-capture route
     summary, by_project, by_account, by_role, trend, events = await asyncio.gather(
         aggregate_cost_summary(dbs, days=days, now=now),
         aggregate_cost_by_project(dbs, days=days, now=now),
@@ -858,7 +858,7 @@ async def api_curator(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     http_client: httpx.AsyncClient = request.app.state.http_client
-    now = datetime.now(UTC)
+    now = datetime.now(UTC)  # clock-exempt: single-capture route
 
     # 1 + 2 + 3. Fan-out list_tickets, latency sparks, and cap intervals all
     #              run concurrently — the fan-out dominates latency under slow
@@ -1298,7 +1298,7 @@ async def api_burndown(request: Request) -> JSONResponse:
 
     try:
         projects = await aggregate_burndown_projects(dbs)
-        now = datetime.now(UTC)
+        now = datetime.now(UTC)  # clock-exempt: single-capture route
         per_pid = await asyncio.gather(
             *(aggregate_burndown_series(dbs, pid, days=days, now=now) for pid in projects)
         )
