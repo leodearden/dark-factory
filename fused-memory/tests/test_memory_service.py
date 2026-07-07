@@ -2962,6 +2962,159 @@ class TestNormalizeTaskNodeNames:
 
 
 # ---------------------------------------------------------------------------
+# Tests for _reconcile_episode_identity  (task 2202 / W6-β, step 3)
+# ---------------------------------------------------------------------------
+
+class TestReconcileEpisodeIdentity:
+    """Unit tests for MemoryService._reconcile_episode_identity — the single
+    orchestration point (task 2202 / W6-β) that folds the five post-write
+    sweeps (_dedup_episode_edges, _restore_superseded_dependency_edges,
+    _restore_falsely_superseded_sibling_edges, _dedup_episode_nodes,
+    _normalize_task_node_names) into one call, run under α's (task 2198)
+    per-group identity lock. Preserves the pre-existing chain order —
+    dependency-restore before sibling-restore, per the ordering comment at
+    the _execute_graphiti_write call site — and aggregates each sub-pass's
+    int return into a ReconcileStats.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invokes_five_sub_passes_once_each_in_order(self, service):
+        """All five sub-passes are awaited exactly once, each with
+        (result, group_id='test'), in the preserved chain order, and their
+        int returns land in the matching ReconcileStats field."""
+        from unittest.mock import Mock
+
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=2)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=3)
+        service._dedup_episode_nodes = AsyncMock(return_value=4)
+        service._normalize_task_node_names = AsyncMock(return_value=5)
+
+        manager = Mock()
+        manager.attach_mock(service._dedup_episode_edges, '_dedup_episode_edges')
+        manager.attach_mock(
+            service._restore_superseded_dependency_edges, '_restore_superseded_dependency_edges'
+        )
+        manager.attach_mock(
+            service._restore_falsely_superseded_sibling_edges,
+            '_restore_falsely_superseded_sibling_edges',
+        )
+        manager.attach_mock(service._dedup_episode_nodes, '_dedup_episode_nodes')
+        manager.attach_mock(service._normalize_task_node_names, '_normalize_task_node_names')
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._dedup_episode_edges.assert_awaited_once_with(mock_result, group_id='test')
+        service._restore_superseded_dependency_edges.assert_awaited_once_with(
+            mock_result, group_id='test'
+        )
+        service._restore_falsely_superseded_sibling_edges.assert_awaited_once_with(
+            mock_result, group_id='test'
+        )
+        service._dedup_episode_nodes.assert_awaited_once_with(mock_result, group_id='test')
+        service._normalize_task_node_names.assert_awaited_once_with(mock_result, group_id='test')
+
+        expected_order = [
+            '_dedup_episode_edges',
+            '_restore_superseded_dependency_edges',
+            '_restore_falsely_superseded_sibling_edges',
+            '_dedup_episode_nodes',
+            '_normalize_task_node_names',
+        ]
+        call_order = [c[0] for c in manager.mock_calls if c[0] in expected_order]
+        assert call_order == expected_order, (
+            f'sub-passes must run in the preserved chain order, got {call_order!r}'
+        )
+
+        assert stats.edges_deduped == 1
+        assert stats.dependency_edges_restored == 2
+        assert stats.sibling_edges_restored == 3
+        assert stats.nodes_resolved == 4
+        assert stats.task_names_normalized == 5
+
+    @pytest.mark.asyncio
+    async def test_returns_reconcile_stats_instance_with_no_errors_on_success(self, service):
+        """The aggregated return value is a ReconcileStats instance (typed
+        field access, not a bare dict/tuple) with an empty errors list when
+        every sub-pass succeeds."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        from fused_memory.services.memory_service import ReconcileStats
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=0)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=0)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=0)
+        service._dedup_episode_nodes = AsyncMock(return_value=0)
+        service._normalize_task_node_names = AsyncMock(return_value=0)
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        assert isinstance(stats, ReconcileStats)
+        assert stats.errors == []
+
+    # best-effort per-sub-pass guard
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_in_one_sub_pass_is_swallowed_and_others_still_run(
+        self, service,
+    ):
+        """A generic Exception raised by one sub-pass (_dedup_episode_nodes)
+        does not propagate: the remaining sub-passes still run, the failed
+        sub-pass's label lands in ReconcileStats.errors, and the other
+        counts still reflect the sub-passes that succeeded."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=2)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=3)
+        service._dedup_episode_nodes = AsyncMock(side_effect=RuntimeError('lock contention'))
+        service._normalize_task_node_names = AsyncMock(return_value=5)
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._normalize_task_node_names.assert_awaited_once_with(
+            mock_result, group_id='test'
+        )
+        assert stats.edges_deduped == 1
+        assert stats.dependency_edges_restored == 2
+        assert stats.sibling_edges_restored == 3
+        assert stats.nodes_resolved == 0, 'the failed sub-pass must leave its count at the default'
+        assert stats.task_names_normalized == 5, 'sub-passes after the failure must still run'
+        assert '_dedup_episode_nodes' in stats.errors
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+    async def test_cancelled_keyboard_interrupt_system_exit_propagate(
+        self, service, exc_type,
+    ):
+        """CancelledError/KeyboardInterrupt/SystemExit raised by a sub-pass
+        DO propagate out of _reconcile_episode_identity (never swallowed),
+        and a later sub-pass never runs."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=2)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=3)
+        service._dedup_episode_nodes = AsyncMock(side_effect=exc_type('interrupted'))
+        service._normalize_task_node_names = AsyncMock(return_value=5)
+
+        with pytest.raises(exc_type):
+            await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._normalize_task_node_names.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Tests for _execute_graphiti_write integration with dedup  (steps 8, 10)
 # ---------------------------------------------------------------------------
 
