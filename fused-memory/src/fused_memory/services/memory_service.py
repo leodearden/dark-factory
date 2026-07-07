@@ -513,25 +513,30 @@ class MemoryService:
         return await self.graphiti.bulk_remove_edges(duplicates, group_id=group_id)
 
     async def _dedup_episode_nodes(self, result: Any, *, group_id: str) -> int:
-        """Merge exact-name duplicate entity nodes minted within a single add_episode call.
+        """Resolve/collapse exact-name duplicate entity nodes touched by one add_episode call.
 
         graphiti_core's ingestion-time entity resolution (resolve_extracted_nodes)
         only resolves each extracted node against candidates surfaced by hybrid
         embedding+BM25 search — there is no guaranteed exact-name Cypher lookup.
         When that search misses an existing canonical node, ingestion mints a
         brand-new node even though a node with the exact same name already
-        exists. This sweep re-checks each entity name this episode touched via
-        ``find_duplicate_entity_nodes`` and merges any duplicates it finds into
-        the canonical survivor (most valid edges, then oldest, then lowest
-        uuid) via ``merge_entities``.
+        exists. This sweep re-checks each entity name this episode touched by
+        delegating to α's (task 2198) write-time-identity chokepoint
+        ``GraphitiBackend._resolve_or_create_entity``, which resolves a lone
+        match, no-ops on zero matches, and collapses >=2 matches into a
+        canonical survivor via ``merge_entities``.
 
         Modelled on ``_dedup_episode_edges``; handles None / empty result the
-        same way. Each merge is best-effort (mirrors
+        same way. Each resolve is best-effort (mirrors
         ``_restore_superseded_dependency_edges``): a transient backend error
-        merging one duplicate must not fail an already-committed episode
-        write, and must not stop subsequent duplicates/names from being
-        processed. Unmerged duplicates simply survive to be healed the next
-        time an episode touches that name.
+        resolving one name must not fail an already-committed episode write,
+        and must not stop subsequent names from being processed. Unresolved
+        names simply survive to be healed the next time an episode touches
+        that name.
+
+        Callers (``_reconcile_episode_identity``) MUST run this under α's
+        ``_identity_lock_for(group_id)`` — ``_resolve_or_create_entity``
+        performs no locking of its own.
 
         Args:
             result: The value returned by ``add_episode`` (typically an
@@ -540,8 +545,10 @@ class MemoryService:
                     gracefully.
 
         Returns:
-            Number of duplicate nodes successfully merged into their
-            canonical survivor (0 when nothing to do).
+            Number of distinct names that resolved to a non-None uuid (0
+            when nothing to do). This is a resolve count, not a merge
+            count — a name can resolve without any collapse having been
+            necessary.
         """
         if result is None:
             return 0
@@ -559,39 +566,34 @@ class MemoryService:
             seen.add(name)
             names.append(name)
 
-        merged = 0
+        resolved = 0
         failed = 0
         for name in names:
-            matches = await self.graphiti.find_duplicate_entity_nodes(name, group_id=group_id)
-            if len(matches) < 2:
-                continue
-            survivor = matches[0]['uuid']
-            for dup in matches[1:]:
-                dup_uuid = dup['uuid']
-                try:
-                    await self.graphiti.merge_entities(dup_uuid, survivor, group_id=group_id)
-                    merged += 1
-                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                    raise
-                except Exception:
-                    # Best-effort: a transient backend error (lock contention,
-                    # write timeout) must not fail an already-committed episode
-                    # write.  Log and continue so the episode reports success.
-                    logger.exception(
-                        'Failed to merge exact-name duplicate node %s -> %s after '
-                        'add_episode; will retry on next episode',
-                        dup_uuid, survivor,
-                    )
-                    failed += 1
+            try:
+                uuid = await self.graphiti._resolve_or_create_entity(name, group_id=group_id)
+                if uuid is not None:
+                    resolved += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Best-effort: a transient backend error (lock contention,
+                # write timeout) must not fail an already-committed episode
+                # write.  Log and continue so the episode reports success.
+                logger.exception(
+                    'Failed to resolve exact-name entity %r after add_episode; '
+                    'will retry on next episode',
+                    name,
+                )
+                failed += 1
 
-        if merged > 0:
-            logger.info('Merged %d exact-name duplicate node(s) after add_episode', merged)
+        if resolved > 0:
+            logger.info('Resolved %d exact-name entity/entities after add_episode', resolved)
         if failed > 0:
             logger.warning(
-                'Failed to merge %d exact-name duplicate node(s) after add_episode',
+                'Failed to resolve %d exact-name entity/entities after add_episode',
                 failed,
             )
-        return merged
+        return resolved
 
     async def _restore_superseded_dependency_edges(
         self, result: Any, *, group_id: str
