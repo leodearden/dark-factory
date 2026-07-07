@@ -104,27 +104,41 @@ def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarnin
     Returns ``(None, warnings)`` when *metadata* is non-None but cannot be
     resolved to a JSON object at all — *warnings* then carries
     ``shared.task_metadata.parse_metadata``'s diagnosis
-    (``direction='read'``). Returns ``(dict, [])`` for ``None`` (benign
-    absent) and for anything already resolvable to a dict.
+    (``direction='read'``). Returns ``(None, [])`` for ``None`` and for an
+    empty string (both benign-absent — mirrors the pre-collapse
+    ``isinstance(raw, str) and raw`` guard so a blank string is never a
+    discard), and ``(dict, [])`` for anything already resolvable to a dict.
 
     The returned dict — when not ``None`` — is always independently
     re-derived from *metadata*, never ``parse_metadata(...).model_dump()``,
     so unknown/curator-internal keys round-trip byte-for-value (I1) instead
     of gaining ``TaskMetadata``'s typed-field defaults.
+
+    A string is parsed with a local ``json.loads`` first; ``parse_metadata``
+    is only invoked on the failure path to obtain its diagnosis. The two
+    discard codes this function surfaces (``unparseable_json`` /
+    ``not_an_object``) are fully determined by that same
+    loads-then-isinstance check, so a string that already parses to a dict
+    never pays for ``parse_metadata``'s ``apply_migrations`` /
+    submodel-validation / ``TaskMetadata`` construction — none of that
+    output is used here.
     """
     if metadata is None:
         return None, []
     if isinstance(metadata, dict):
         return metadata, []
     if isinstance(metadata, str):
+        if not metadata:
+            return None, []
+        try:
+            parsed = json.loads(metadata)
+        except ValueError:
+            _, warnings = parse_metadata(metadata, direction='read')
+            return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
+        if isinstance(parsed, dict):
+            return parsed, []
         _, warnings = parse_metadata(metadata, direction='read')
-        discard = [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-        if discard:
-            return None, discard
-        # parse_metadata already confirmed this parses to a JSON object —
-        # reparse independently for the raw dict (see docstring: never
-        # model_dump()).
-        return json.loads(metadata), []
+        return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
     return None, []
 
 
@@ -1527,7 +1541,7 @@ class TaskInterceptor:
         ``None`` coercion.
         """
         parsed, warnings = _parse_metadata_value(metadata)
-        if parsed is None and metadata is not None:
+        if warnings:
             _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
         return parsed
 
@@ -3637,6 +3651,19 @@ def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> d
     }
 
 
+# Single source of truth for done_provenance.kind membership (I2) — derived
+# once from shared.task_metadata.DoneProvenance rather than re-derived on
+# every _validate_done_provenance call (the retired _VALID_PROVENANCE_KINDS
+# was a module-level constant too; this keeps that shape while sourcing the
+# values from the shared model so a 5th kind auto-propagates here and into
+# the human-readable message below without a second edit).
+_DONE_PROVENANCE_KINDS = get_args(DoneProvenance.model_fields['kind'].annotation)
+_DONE_PROVENANCE_KINDS_TEXT = (
+    ', '.join(f'"{k}"' for k in _DONE_PROVENANCE_KINDS[:-1])
+    + f', or "{_DONE_PROVENANCE_KINDS[-1]}"'
+)
+
+
 async def _validate_done_provenance(
     task_id: str,
     raw: object,
@@ -3753,12 +3780,10 @@ async def _validate_done_provenance(
             'self-restart that was scheduled but not yet verified (no '
             'commit required).',
         ), None
-    if kind not in get_args(DoneProvenance.model_fields['kind'].annotation):
+    if kind not in _DONE_PROVENANCE_KINDS:
         return _done_provenance_error(
             task_id,
-            f'done_provenance.kind must be "merged", "found_on_main", '
-            f'"deterministic-deploy", or "deterministic-deploy-scheduled" '
-            f'(got {kind!r})',
+            f'done_provenance.kind must be {_DONE_PROVENANCE_KINDS_TEXT} (got {kind!r})',
         ), None
 
     if kind == 'merged' and commit_input is None:
@@ -3948,7 +3973,7 @@ def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
     """
     raw = before.get('metadata') if isinstance(before, dict) else None
     parsed, warnings = _parse_metadata_value(raw)
-    if parsed is None and raw is not None:
+    if warnings:
         _warn_metadata_discard('_merged_audit_metadata', raw, warnings)
     existing: dict = parsed if isinstance(parsed, dict) else {}
     return {**existing, **audit_fields}

@@ -440,3 +440,23 @@ class TestInjectTaskKind:
             f'valid dict metadata must not emit a WARNING; got '
             f'{[r.message for r in warns]!r}'
         )
+
+    def test_empty_string_metadata_no_warning(self, caplog):
+        """Amendment: an empty-string metadata is benign-absent, not a discard.
+
+        Mirrors the pre-collapse ``isinstance(raw, str) and raw`` guard —
+        '' must fall back to a fresh dict exactly like None, without
+        emitting a task_metadata.schema_warning census line.
+        """
+        inject_task_kind = self._import_inject()
+        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+            result = inject_task_kind('', 'normal')
+        assert result == {'task_kind': 'normal'}
+        warns = [
+            r for r in caplog.records
+            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'empty-string metadata must not emit a WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )

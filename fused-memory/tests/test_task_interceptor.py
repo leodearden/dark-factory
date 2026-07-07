@@ -7125,6 +7125,36 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
             f'{[r.message for r in warns]!r}'
         )
 
+    def test_parse_metadata_empty_string_no_warning(self, caplog):
+        """Amendment: an empty-string metadata is benign-absent, not a discard.
+
+        Mirrors the pre-collapse ``isinstance(raw, str) and raw`` guard —
+        '' must not emit a task_metadata.schema_warning census line.
+        """
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._parse_metadata({'metadata': ''})
+        assert result == {}
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
+        )
+
+    def test_extract_metadata_dict_empty_string_no_warning(self, caplog):
+        """Amendment: an empty-string metadata is benign-absent, not a discard."""
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._extract_metadata_dict('')
+        assert result is None
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
+        )
+
 
 # ── task 2166 step-7: _merged_audit_metadata discard WARN ──
 #
@@ -7187,6 +7217,28 @@ class TestMergedAuditMetadataWarnsOnDiscard:
         assert not warns, (
             f'valid JSON-string metadata must not emit a WARNING; got '
             f'{[r.message for r in warns]!r}'
+        )
+
+    def test_empty_string_metadata_no_warning(self, caplog):
+        """Amendment: an empty-string metadata is benign-absent, not a discard.
+
+        Mirrors the pre-collapse ``isinstance(raw, str) and raw`` guard — a
+        legacy row storing '' must merge audit_fields onto {} silently,
+        exactly like the None case, instead of emitting a spurious
+        task_metadata.schema_warning census line.
+        """
+        from fused_memory.middleware.task_interceptor import _merged_audit_metadata
+
+        audit_fields = {'reopen_reason': 'retry'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = _merged_audit_metadata({'metadata': ''}, audit_fields)
+        assert result == audit_fields
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
         )
 
 

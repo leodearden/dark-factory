@@ -2508,6 +2508,10 @@ def create_mcp_server(
         parsed: dict | None = None
         if isinstance(metadata, dict):
             parsed = metadata
+        elif isinstance(metadata, str) and not metadata:
+            # Empty string is benign-absent, not a discard — mirrors the
+            # pre-collapse `isinstance(raw, str) and raw` guard.
+            parsed = None
         elif isinstance(metadata, str):
             _, warnings = parse_metadata(metadata, direction='read')
             discard = [w for w in warnings if w.code in _METADATA_DISCARD_CODES]

@@ -78,6 +78,10 @@ def _parse_metadata_with_discard(metadata: Any) -> tuple[dict, bool]:
         return {}, False
     if isinstance(metadata, dict):
         return metadata, False
+    if isinstance(metadata, str) and not metadata:
+        # Empty string is benign-absent, not a discard — mirrors the
+        # pre-collapse `isinstance(raw, str) and raw` guard.
+        return {}, False
     _, warnings = parse_metadata(metadata, direction='read')
     if any(w.code in _DISCARD_CODES for w in warnings):
         return {}, True
