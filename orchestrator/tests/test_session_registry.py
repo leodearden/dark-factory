@@ -193,3 +193,56 @@ def test_transcript_path_for_cwd_encodes_dot() -> None:
         sr.transcript_path_for_cwd('/home/leo/.openclaw-workspace')
         == '~/.claude/projects/-home-leo--openclaw-workspace'
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-5: single-writer atomic write / read / update
+# ---------------------------------------------------------------------------
+
+
+def test_write_record_creates_record_json_matching_the_record(tmp_path: Path) -> None:
+    r = _make_record()
+    sr.write_record(r, root=tmp_path)
+    path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    assert path.is_file()
+    assert sr.SessionRecord.from_json(path.read_text()) == r
+
+
+def test_write_record_leaves_no_leftover_tmp_file(tmp_path: Path) -> None:
+    r = _make_record()
+    sr.write_record(r, root=tmp_path)
+    slug_dir = sr.record_path_for_slug(r.session_slug, root=tmp_path).parent
+    leftovers = [p for p in slug_dir.iterdir() if p.suffix == '.tmp']
+    assert leftovers == []
+
+
+def test_read_record_returns_equal_record(tmp_path: Path) -> None:
+    r = _make_record()
+    sr.write_record(r, root=tmp_path)
+    assert sr.read_record(r.session_slug, root=tmp_path) == r
+
+
+def test_update_status_mutates_status_and_exit_code_in_place(tmp_path: Path) -> None:
+    r = _make_record(status=sr.Status.LAUNCHING, exit_code=None)
+    sr.write_record(r, root=tmp_path)
+
+    sr.update_status(r.session_slug, root=tmp_path, status=sr.Status.EXITED, exit_code=3)
+
+    reread = sr.read_record(r.session_slug, root=tmp_path)
+    assert reread.status == sr.Status.EXITED
+    assert reread.exit_code == 3
+    # Every other field survives the read-modify-write untouched.
+    assert reread.session_slug == r.session_slug
+    assert reread.title == r.title
+
+
+def test_refresh_record_updates_existing_record_under_same_key(tmp_path: Path) -> None:
+    r = _make_record(status=sr.Status.LAUNCHING)
+    sr.write_record(r, root=tmp_path)
+
+    sr.refresh_record(r.session_slug, root=tmp_path, status=sr.Status.RUNNING)
+
+    path_before = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    reread = sr.read_record(r.session_slug, root=tmp_path)
+    assert reread.status == sr.Status.RUNNING
+    assert sr.record_path_for_slug(r.session_slug, root=tmp_path) == path_before
