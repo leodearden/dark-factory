@@ -39,6 +39,8 @@ from typing import Any
 # the record shape. Bump SCHEMA_VERSION on any breaking field change.
 # ---------------------------------------------------------------------------
 
+logger = logging.getLogger(__name__)
+
 SCHEMA_VERSION = 1
 
 
@@ -166,7 +168,10 @@ _SLUG_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')
 
 
 def build_session_slug(
-    role: str, project: str, task_id: str | None, launcher_pid: int,
+    role: str,
+    project: str,
+    task_id: str | None,
+    launcher_pid: int,
 ) -> str:
     """Build the record-identity/directory key ``<role>-<project>[-<taskid>]-<pid>``.
 
@@ -238,7 +243,9 @@ def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
     path = record_path_for_slug(record.session_slug, root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(
-        suffix='.tmp', prefix=path.stem, dir=str(path.parent),
+        suffix='.tmp',
+        prefix=path.stem,
+        dir=str(path.parent),
     )
     try:
         with os.fdopen(fd, 'w') as f:
@@ -367,7 +374,9 @@ class ReapedSessionRecord:
 
 
 def reap_stale_records(
-    root: Path | str | None = None, *, now: datetime | None = None,
+    root: Path | str | None = None,
+    *,
+    now: datetime | None = None,
 ) -> list[ReapedSessionRecord]:
     """Sweep ``<root>/sessions/*/`` and remove stale session-record directories.
 
@@ -427,3 +436,168 @@ def reap_stale_records(
             reaped.append(ReapedSessionRecord(path=slug_dir, session_slug=slug, reason=reason))
 
     return reaped
+
+
+# ---------------------------------------------------------------------------
+# CLI + fail-soft (PRD: a registry fault must never change the spawn's exit code)
+# ---------------------------------------------------------------------------
+
+_TITLE_RE = re.compile(r'^(?P<role>[^:]+):(?P<project>[^#\s]+)(?:#(?P<task_id>\S+))?')
+"""Matches the documented spawn terminal-title convention (skills/spawn/SKILL.md):
+``'<role>:<project>#<task-id> <short-slug>'``, task-id and short-slug optional."""
+
+
+@dataclass(frozen=True)
+class SpawnIdentity:
+    """Resolved role/project/task_id/escalation_id for a `launching` write."""
+
+    role: str
+    project: str
+    task_id: str | None
+    escalation_id: str | None
+
+
+def parse_spawn_identity(
+    env: Mapping[str, str],
+    title: str,
+    prompt: str,
+    cwd: str,
+) -> SpawnIdentity:
+    """Resolve spawn identity: env > title-parse > defaults.
+
+    1. ``CLAUDE_SPAWN_ROLE``/``PROJECT``/``TASK_ID``/``ESCALATION_ID`` in *env*,
+       when set to a non-empty value.
+    2. For whichever of role/project/task_id env did not supply, a best-effort
+       parse of the documented terminal-title convention
+       ``'<role>:<project>#<task-id> <short-slug>'`` (skills/spawn/SKILL.md).
+       The trailing short-slug is always discarded; a project-level title
+       (no ``#``) yields ``task_id=None``.
+    3. Defaults: ``role='session'``, ``project=basename(cwd)`` or ``'unknown'``.
+
+    *prompt* takes no part in this resolution; it is accepted so callers have
+    one function for the whole spawn-identity cascade.
+    """
+    role = env.get('CLAUDE_SPAWN_ROLE') or None
+    project = env.get('CLAUDE_SPAWN_PROJECT') or None
+    task_id = env.get('CLAUDE_SPAWN_TASK_ID') or None
+    escalation_id = env.get('CLAUDE_SPAWN_ESCALATION_ID') or None
+
+    if (role is None or project is None) and title:
+        m = _TITLE_RE.match(title.strip())
+        if m:
+            role = role or m.group('role')
+            project = project or m.group('project')
+            if task_id is None:
+                task_id = m.group('task_id')
+
+    if role is None:
+        role = 'session'
+    if project is None:
+        project = os.path.basename(cwd) or 'unknown'
+
+    return SpawnIdentity(role=role, project=project, task_id=task_id, escalation_id=escalation_id)
+
+
+def _run_launching(env: Mapping[str, str]) -> str:
+    """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir."""
+    title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
+    prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
+    cwd = env.get('CLAUDE_SPAWN_CWD') or os.getcwd()
+    launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
+    launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else os.getpid()
+
+    identity = parse_spawn_identity(env, title, prompt, cwd)
+    slug = build_session_slug(identity.role, identity.project, identity.task_id, launcher_pid)
+
+    record = SessionRecord(
+        session_slug=slug,
+        status=Status.LAUNCHING,
+        title=title,
+        role=identity.role,
+        project=identity.project,
+        task_id=identity.task_id,
+        escalation_id=identity.escalation_id,
+        prompt=prompt,
+        cwd=cwd,
+        launcher_pid=launcher_pid,
+        start_ts=datetime.now(UTC).isoformat(),
+        transcript_path=transcript_path_for_cwd(cwd),
+    )
+    write_record(record)
+    return str(record_path_for_slug(slug).parent)
+
+
+def _slug_root_from_record_dir(record_dir: str) -> tuple[str, Path]:
+    """Derive (slug, root) from a record dir printed by `launching`.
+
+    The dir is ``<root>/sessions/<slug>``, so its name is the slug and its
+    grandparent is the root -- this is how the `exit`/`refresh` CLI
+    subcommands (which only ever receive this printed dir, not a root) find
+    their way back to the same write_record/read_record key.
+    """
+    path = Path(record_dir)
+    return path.name, path.parent.parent
+
+
+def _run_exit(record_dir: str, code: int) -> None:
+    slug, root = _slug_root_from_record_dir(record_dir)
+    update_status(slug, root=root, status=Status.EXITED, exit_code=code)
+
+
+def _run_refresh(record_dir: str, status_value: str) -> None:
+    slug, root = _slug_root_from_record_dir(record_dir)
+    refresh_record(slug, root=root, status=Status(status_value))
+
+
+def _run_reap() -> list[ReapedSessionRecord]:
+    return reap_stale_records()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog='session_registry')
+    sub = parser.add_subparsers(dest='verb', required=True)
+
+    sub.add_parser('launching', help='write a LAUNCHING record from CLAUDE_SPAWN_* env')
+
+    exit_p = sub.add_parser('exit', help='set status=exited + exit_code on a record')
+    exit_p.add_argument('--record', required=True, help='record dir, as printed by `launching`')
+    exit_p.add_argument('--code', required=True, type=int)
+
+    refresh_p = sub.add_parser('refresh', help='upsert a record with a new status (hook seam)')
+    refresh_p.add_argument('--record', required=True, help='record dir')
+    refresh_p.add_argument('--status', required=True, choices=[s.value for s in Status])
+
+    sub.add_parser('reap', help='sweep and remove stale session records')
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    ALWAYS returns 0: a fault in any subcommand's core logic is logged
+    loudly (stderr, via the standard logging machinery) and swallowed here
+    rather than raised, so a registry fault can never change the exit code
+    of the bash caller (spawn-claude.sh) that invokes this script.
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.verb == 'launching':
+            print(_run_launching(os.environ))
+        elif args.verb == 'exit':
+            _run_exit(args.record, args.code)
+        elif args.verb == 'refresh':
+            _run_refresh(args.record, args.status)
+        elif args.verb == 'reap':
+            _run_reap()
+    except Exception:
+        logger.error('session_registry %s failed', args.verb, exc_info=True)
+        return 0
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

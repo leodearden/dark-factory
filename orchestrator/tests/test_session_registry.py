@@ -10,7 +10,6 @@ tests/scripts/test_spawn_claude.py's bash-level harness.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -140,8 +139,11 @@ def test_session_record_json_round_trip_with_null_fields() -> None:
     preserve that, not coerce it to a string or drop the key.
     """
     r = _make_record(
-        task_id=None, escalation_id=None, exit_code=None,
-        result_file=None, transcript_path=None,
+        task_id=None,
+        escalation_id=None,
+        exit_code=None,
+        result_file=None,
+        transcript_path=None,
     )
     assert sr.SessionRecord.from_json(r.to_json()) == r
 
@@ -173,14 +175,16 @@ def test_fleet_root_defaults_to_dot_claude_fleet(monkeypatch: pytest.MonkeyPatch
 
 
 def test_fleet_root_honors_env_override(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     assert sr.fleet_root() == tmp_path
 
 
 def test_fleet_root_explicit_root_overrides_env(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', '/should/not/be/used')
     other = tmp_path / 'other'
@@ -269,8 +273,8 @@ def test_refresh_record_updates_existing_record_under_same_key(tmp_path: Path) -
 
 
 def test_ttl_constants_are_module_level_timedeltas() -> None:
-    assert sr.TERMINAL_TTL == timedelta(hours=24)
-    assert sr.NON_TERMINAL_HEARTBEAT_TTL == timedelta(hours=1)
+    assert timedelta(hours=24) == sr.TERMINAL_TTL
+    assert timedelta(hours=1) == sr.NON_TERMINAL_HEARTBEAT_TTL
 
 
 def test_reap_removes_terminal_record_past_ttl(tmp_path: Path) -> None:
@@ -406,7 +410,9 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
 
 
 def test_main_launching_writes_record_and_prints_only_record_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _set_env(monkeypatch, _launching_env(tmp_path))
 
@@ -431,7 +437,9 @@ def test_main_launching_writes_record_and_prints_only_record_dir(
 
 
 def test_main_exit_sets_status_exited_and_exit_code(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _set_env(monkeypatch, _launching_env(tmp_path))
     sr.main(['launching'])
@@ -447,7 +455,9 @@ def test_main_exit_sets_status_exited_and_exit_code(
 
 
 def test_main_refresh_sets_status(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _set_env(monkeypatch, _launching_env(tmp_path))
     sr.main(['launching'])
@@ -472,7 +482,10 @@ def test_parse_spawn_identity_env_first_overrides_conflicting_title() -> None:
         'CLAUDE_SPAWN_ESCALATION_ID': 'esc-5',
     }
     identity = sr.parse_spawn_identity(
-        env=env, title='unblock:df#2085 routing-mechanism', prompt='', cwd='/x',
+        env=env,
+        title='unblock:df#2085 routing-mechanism',
+        prompt='',
+        cwd='/x',
     )
     assert identity.role == 'review'
     assert identity.project == 'other'
@@ -482,7 +495,10 @@ def test_parse_spawn_identity_env_first_overrides_conflicting_title() -> None:
 
 def test_parse_spawn_identity_falls_back_to_task_scoped_title() -> None:
     identity = sr.parse_spawn_identity(
-        env={}, title='unblock:df#2085 routing-mechanism', prompt='', cwd='/x',
+        env={},
+        title='unblock:df#2085 routing-mechanism',
+        prompt='',
+        cwd='/x',
     )
     assert identity.role == 'unblock'
     assert identity.project == 'df'
@@ -491,7 +507,10 @@ def test_parse_spawn_identity_falls_back_to_task_scoped_title() -> None:
 
 def test_parse_spawn_identity_falls_back_to_project_level_title_with_no_hash() -> None:
     identity = sr.parse_spawn_identity(
-        env={}, title='prd:df attention-rail', prompt='', cwd='/x',
+        env={},
+        title='prd:df attention-rail',
+        prompt='',
+        cwd='/x',
     )
     assert identity.role == 'prd'
     assert identity.project == 'df'
@@ -500,7 +519,10 @@ def test_parse_spawn_identity_falls_back_to_project_level_title_with_no_hash() -
 
 def test_parse_spawn_identity_defaults_when_env_and_title_absent() -> None:
     identity = sr.parse_spawn_identity(
-        env={}, title='', prompt='', cwd='/home/leo/src/dark-factory',
+        env={},
+        title='',
+        prompt='',
+        cwd='/home/leo/src/dark-factory',
     )
     assert identity.role == 'session'
     assert identity.project == 'dark-factory'
