@@ -100,3 +100,43 @@ class TestReconcileLandedOutboxRC1CrashBeforeAdvance:
         assert reopened.lookup('Z') is None, 'RC-1 row must be pruned (consumed)'
         assert report['pruned_not_landed'] == 1
         assert report['marked_done'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-3 — RC-2 / boundary B3: crash between advance and done-write
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileLandedOutboxRC2CrashBeforeDoneWrite:
+    """RC-2: advanced_sha landed on main but the task was never marked done."""
+
+    async def test_landed_row_drives_done_write_then_is_pruned(self, tmp_path: Path) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+
+        # Producer half: advance_main reports 'advanced' — record AND advance
+        # both genuinely happened before the crash (which hit before the
+        # done-write landed).
+        git_ops_producer = _producer_git_ops(AdvanceOutcome('advanced', advanced_sha='ADV'))
+        await _journal_landed_then_advance(
+            outbox, git_ops_producer,
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV',
+            merge_wt=tmp_path,
+        )
+
+        # Restart: re-open a fresh LandedOutbox at the same path.
+        reopened = LandedOutbox(path)
+
+        # Reconciler half: is_ancestor('ADV', 'MAIN') is True — advanced_sha
+        # genuinely landed; the task's status is not yet 'done'.
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='in-progress')
+
+        report = await reconcile_landed_outbox(reopened, git_ops_recon, scheduler)
+
+        scheduler.mark_done.assert_called_once_with('Z', kind='merged', sha='ADV')
+        assert reopened.lookup('Z') is None, (
+            'RC-2 row must be consumed AFTER the done-write'
+        )
+        assert report['marked_done'] == 1
