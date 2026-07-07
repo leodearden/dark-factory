@@ -10,10 +10,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import (
+from shared.invocation_outcome import (
     CAP_HIT_PREFIXES,
     NEAR_CAP_PREFIXES,
+    CapHit,
+    CliLocalError,
+    NearCap,
+    classify_invocation,
+)
+from shared.usage_gate import (
     AccountState,
     UsageGate,
 )
@@ -967,6 +974,72 @@ class TestRunProbe:
         assert result is False, (
             '_run_probe must return False on a bare cap prefix even without a confirm keyword; '
             'see docstring for the deliberate asymmetry with detect_cap_hit'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2129 (W4-beta) step-3: _run_probe's cap detection must route through
+# classify_invocation(strict_confirm=False) — the DD-2 probe regime — so
+# CliLocalError precedence (reify-3604) applies here too, not just at
+# detect_cap_hit/cli_invoke.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunProbeClassifyInvocationConsistency:
+    """_run_probe's verdicts must agree with classify_invocation(strict_confirm=False).
+
+    ``test_non_cap_marker_is_not_misread_as_still_capped`` is RED against
+    today's _run_probe: it scans CAP_HIT_PREFIXES/NEAR_CAP_PREFIXES directly
+    with no notion of NON_CAP_CLI_ERROR_MARKERS, so a message that contains
+    both a cap-like prefix and a local-CLI-error marker is misread as "still
+    capped" (returns False) today. Once _run_probe is rewired onto
+    classify_invocation (step-4), CliLocalError precedence applies uniformly
+    and this goes green. The other test pins the already-correct prefix-only
+    (no confirm keyword) behavior against the classifier as a regression guard.
+    """
+
+    async def _make_probing_gate(self) -> tuple[UsageGate, AccountState]:
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.capped = True
+        return gate, acct
+
+    async def test_prefix_only_without_confirm_keyword_agrees_with_classifier(self):
+        """DD-2: the probe regime (strict_confirm=False) accepts a bare prefix
+        with no CAP_CONFIRM_KEYWORDS keyword — still "capped", still False."""
+        gate, acct = await self._make_probing_gate()
+        prefix = CAP_HIT_PREFIXES[0]  # e.g. "You've hit your"
+        text = f'{prefix} quota'  # deliberately no confirm keyword
+        outcome = classify_invocation(
+            AgentResult(success=False, output=text), strict_confirm=False,
+        )
+        assert isinstance(outcome, (CapHit, NearCap))
+
+        proc = _make_mock_proc(returncode=0, stderr=text.encode())
+        with patch('asyncio.create_subprocess_exec', return_value=proc):
+            result = await gate._run_probe(acct)
+        assert result is False
+
+    async def test_non_cap_marker_is_not_misread_as_still_capped(self):
+        """reify-3604 applied to _run_probe: a local CLI/usage error occurring
+        alongside cap-like text must not be treated as "still capped"."""
+        gate, acct = await self._make_probing_gate()
+        text = (
+            f'{CAP_HIT_PREFIXES[0]} usage limit. Your plan resets in 3h. '
+            'permission denied: /tmp/x'
+        )
+        outcome = classify_invocation(
+            AgentResult(success=False, output=text), strict_confirm=False,
+        )
+        assert isinstance(outcome, CliLocalError)
+
+        proc = _make_mock_proc(returncode=0, stderr=text.encode())
+        with patch('asyncio.create_subprocess_exec', return_value=proc):
+            result = await gate._run_probe(acct)
+        assert result is True, (
+            '_run_probe must not misread a local CLI error co-occurring with '
+            'cap-like text as "still capped" (CliLocalError precedence, reify-3604)'
         )
 
 
