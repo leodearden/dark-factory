@@ -1390,7 +1390,7 @@ class TestSelectTier:
             return_value={'size': int(opus_threshold) - 10, 'oldest_event_age_seconds': None}
         )
 
-        tier = await harness._select_tier('test-project')
+        tier = await harness._select_tier(ProjectId('test-project'))
 
         harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier, TierConfig)
@@ -1429,7 +1429,7 @@ class TestSelectTier:
             return_value={'size': int(opus_threshold) + 5, 'oldest_event_age_seconds': 60.0}
         )
 
-        tier = await harness._select_tier('test-project')
+        tier = await harness._select_tier(ProjectId('test-project'))
 
         harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier, TierConfig)
@@ -1468,7 +1468,7 @@ class TestSelectTier:
             return_value={'size': int(opus_threshold), 'oldest_event_age_seconds': None}
         )
 
-        tier = await harness._select_tier('test-project')
+        tier = await harness._select_tier(ProjectId('test-project'))
 
         harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier, TierConfig)
@@ -1513,7 +1513,7 @@ class TestSelectTier:
         harness.buffer.get_buffer_stats = AsyncMock(
             return_value={'size': 30, 'oldest_event_age_seconds': None}
         )
-        tier_a = await harness._select_tier('test-project')
+        tier_a = await harness._select_tier(ProjectId('test-project'))
 
         harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier_a, TierConfig)
@@ -1527,7 +1527,7 @@ class TestSelectTier:
         harness.buffer.get_buffer_stats = AsyncMock(
             return_value={'size': 50, 'oldest_event_age_seconds': 30.0}
         )
-        tier_b = await harness._select_tier('test-project')
+        tier_b = await harness._select_tier(ProjectId('test-project'))
 
         harness.buffer.get_buffer_stats.assert_called_once_with('test-project')
         assert isinstance(tier_b, TierConfig)
@@ -1677,7 +1677,7 @@ async def test_select_tier_boundary(
     # Patch get_buffer_stats to return controlled buffer size
     harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': buffer_size})
 
-    tier = await harness._select_tier('test-project')
+    tier = await harness._select_tier(ProjectId('test-project'))
 
     assert tier.model == expected_model
     assert tier.episode_limit == expected_episode_limit
@@ -1743,7 +1743,7 @@ async def test_opus_tier_propagates_limits_to_consolidator(
     stage0.episode_limit = 0
     stage0.memory_limit = 0
 
-    tier = await harness._select_tier('test-project')
+    tier = await harness._select_tier(ProjectId('test-project'))
     await harness.run_full_cycle('test-project', 'buffer_size:16', tier=tier)
 
     assert captured.get('episode_limit') == 500, (
@@ -1961,7 +1961,7 @@ class TestHarnessFetchFilteredTaskTree:
             ]
         }
 
-        result = await harness._fetch_filtered_task_tree('/abs/path')
+        result = await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         assert isinstance(result, FilteredTaskTree)
         assert len(result.active_tasks) == 4
@@ -1987,7 +1987,7 @@ class TestHarnessFetchFilteredTaskTree:
         harness.taskmaster.get_tasks.side_effect = RuntimeError('connection refused')  # type: ignore[union-attr,attr-defined]
 
         with caplog.at_level(logging.WARNING):
-            result = await harness._fetch_filtered_task_tree('/abs/path')
+            result = await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         # Must NOT re-raise; must return empty tree
         assert isinstance(result, FilteredTaskTree)
@@ -2029,7 +2029,7 @@ class TestHarnessFetchFilteredTaskTree:
             config=config,
         )
 
-        result = await harness._fetch_filtered_task_tree('/abs/path')
+        result = await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
@@ -2046,7 +2046,7 @@ class TestHarnessFetchFilteredTaskTree:
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
-        result = await harness._fetch_filtered_task_tree('')
+        result = await harness._fetch_filtered_task_tree(ProjectRoot(''))
 
         assert isinstance(result, FilteredTaskTree)
         assert result.active_tasks == []
@@ -2077,7 +2077,7 @@ class TestHarnessFetchFilteredTaskTree:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
         with caplog.at_level(logging.WARNING):
-            result = await harness._fetch_filtered_task_tree('.')
+            result = await harness._fetch_filtered_task_tree(ProjectRoot('.'))
 
         # (a) graceful degradation — empty tree, no exception raised
         assert isinstance(result, FilteredTaskTree)
@@ -2134,7 +2134,7 @@ class TestHarnessFetchFilteredTaskTree:
         }
 
         with caplog.at_level(logging.DEBUG):
-            result = await harness._fetch_filtered_task_tree('/abs/path')
+            result = await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         # (a) A log record at >= DEBUG level must contain the count 4 and project_root.
         #     The record is now at INFO level with raw_count=4 in the extra dict.
@@ -2185,7 +2185,7 @@ class TestHarnessFetchFilteredTaskTree:
         harness.taskmaster = None
 
         with caplog.at_level(logging.INFO):
-            result = await harness._fetch_filtered_task_tree('/abs/path')
+            result = await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         # Still returns empty tree
         assert isinstance(result, FilteredTaskTree)
@@ -2245,7 +2245,7 @@ class TestHarnessFetchFilteredTaskTree:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
         with caplog.at_level(logging.INFO):
-            result = await harness._fetch_filtered_task_tree('')
+            result = await harness._fetch_filtered_task_tree(ProjectRoot(''))
 
         # Still returns empty tree
         assert isinstance(result, FilteredTaskTree)
@@ -2319,7 +2319,7 @@ class TestHarnessFetchFilteredTaskTree:
         }
 
         with caplog.at_level(logging.DEBUG):
-            result = await harness._fetch_filtered_task_tree('/abs/path')
+            result = await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         # Result is correct
         assert isinstance(result, FilteredTaskTree)
@@ -2391,7 +2391,7 @@ class TestHarnessFetchFilteredTaskTree:
         }
 
         with caplog.at_level(logging.DEBUG):
-            result = await harness._fetch_filtered_task_tree('/abs/path')
+            result = await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         assert isinstance(result, FilteredTaskTree)
 
@@ -2470,7 +2470,7 @@ class TestHarnessFetchFilteredTaskTree:
         }
 
         with caplog.at_level(logging.DEBUG):
-            await harness._fetch_filtered_task_tree('/abs/path')
+            await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         # (a) INFO record with marker and correct structured fields
         info_fetched = [
@@ -2536,7 +2536,7 @@ class TestHarnessFetchFilteredTaskTree:
         harness.taskmaster.get_tasks.return_value = {'tasks': []}  # type: ignore[union-attr,attr-defined]
 
         with caplog.at_level(logging.DEBUG):
-            result_a = await harness._fetch_filtered_task_tree('/abs/path')
+            result_a = await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         debug_records_a = [
             r for r in caplog.records
@@ -2564,7 +2564,7 @@ class TestHarnessFetchFilteredTaskTree:
         }
 
         with caplog.at_level(logging.DEBUG):
-            result_b = await harness._fetch_filtered_task_tree('/abs/path')
+            result_b = await harness._fetch_filtered_task_tree(ProjectRoot('/abs/path'))
 
         debug_records_b = [
             r for r in caplog.records
@@ -3186,7 +3186,7 @@ async def test_replay_deletes_successful_and_preserves_failed(
     await event_buffer.defer_write('test-project', 'good-3', 'cat', {})
 
     # Should not raise — per-item exception is swallowed
-    await harness._replay_deferred_writes('test-project')
+    await harness._replay_deferred_writes(ProjectId('test-project'))
 
     # add_memory was called for every claimed row
     assert len(call_log) == 3
@@ -3224,7 +3224,7 @@ async def test_replay_propagates_cancellation_and_preserves_claims(
     await event_buffer.defer_write('test-project', 'c', 'cat', {})
 
     with pytest.raises(asyncio.CancelledError):
-        await harness._replay_deferred_writes('test-project')
+        await harness._replay_deferred_writes(ProjectId('test-project'))
 
     # 'a' was successfully written and deleted; 'b' and 'c' remain claimed
     await event_buffer.release_stale_claims(0.0)
@@ -4934,7 +4934,7 @@ async def test_fetch_filtered_task_tree_short_circuits_on_empty_project_root(
     harness = _make_harness_927(journal, event_buffer, mock_memory_service, project_root=None)
 
     # fetcher returns empty tree when project_root is ''
-    result = await harness._fetch_filtered_task_tree('')
+    result = await harness._fetch_filtered_task_tree(ProjectRoot(''))
     assert isinstance(result, FilteredTaskTree)
     assert result.active_tasks == []
 
@@ -5258,7 +5258,7 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
         )
 
         with caplog.at_level(logging.INFO):
-            await harness._replay_deferred_writes('test-project')
+            await harness._replay_deferred_writes(ProjectId('test-project'))
 
         # (a) add_memory was NOT called — dedup should have skipped the write
         mock_memory_service.add_memory.assert_not_called()
@@ -5292,7 +5292,7 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             {},  # no task_id, no transition
         )
 
-        await harness._replay_deferred_writes('test-project')
+        await harness._replay_deferred_writes(ProjectId('test-project'))
 
         # (a) search was NOT called — bypass condition triggered before any search
         mock_memory_service.search.assert_not_called()
@@ -5325,7 +5325,7 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             {'task_id': '1'},  # transition absent
         )
 
-        await harness._replay_deferred_writes('test-project')
+        await harness._replay_deferred_writes(ProjectId('test-project'))
 
         # search must NOT be called — only task_id present, transition guard fails
         mock_memory_service.search.assert_not_called()
@@ -5352,7 +5352,7 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             {'transition': 'done'},  # task_id absent
         )
 
-        await harness._replay_deferred_writes('test-project')
+        await harness._replay_deferred_writes(ProjectId('test-project'))
 
         # search must NOT be called — only transition present, tid guard fails
         mock_memory_service.search.assert_not_called()
@@ -5414,7 +5414,7 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             },
         )
 
-        await harness._replay_deferred_writes('test-project')
+        await harness._replay_deferred_writes(ProjectId('test-project'))
 
         # (a) search WAS called — transition='done' AND tid present, so dedup branch entered
         mock_memory_service.search.assert_called_once()
@@ -5444,7 +5444,7 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
             {'task_id': '999', 'transition': 'done'},
         )
 
-        await harness._replay_deferred_writes('test-project')
+        await harness._replay_deferred_writes(ProjectId('test-project'))
 
         # (a) search WAS called with project_id and '999' and 'completion'
         mock_memory_service.search.assert_called_once()
@@ -5482,7 +5482,7 @@ class TestReplayDeferredWritesCompletionSummaryDedup:
 
         with caplog.at_level(logging.WARNING):
             # (a) must NOT raise
-            await harness._replay_deferred_writes('test-project')
+            await harness._replay_deferred_writes(ProjectId('test-project'))
 
         # (b) add_memory WAS called once — search failure falls through to write
         mock_memory_service.add_memory.assert_called_once()
@@ -8676,7 +8676,7 @@ class TestHarnessFetchTaskCountCensus:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         harness.taskmaster.get_statuses = AsyncMock(return_value={'1': 'done', '2': 'pending'})  # type: ignore[union-attr,attr-defined]
 
-        result = await harness._fetch_task_count_census('/abs/project')
+        result = await harness._fetch_task_count_census(ProjectRoot('/abs/project'))
 
         assert result == {'1': 'done', '2': 'pending'}
         harness.taskmaster.get_statuses.assert_called_once_with(project_root='/abs/project')  # type: ignore[union-attr,attr-defined]
@@ -8703,7 +8703,7 @@ class TestHarnessFetchTaskCountCensus:
             config=config,
         )
 
-        result = await harness._fetch_task_count_census('/abs/project')
+        result = await harness._fetch_task_count_census(ProjectRoot('/abs/project'))
 
         assert result == {}
 
@@ -8713,7 +8713,7 @@ class TestHarnessFetchTaskCountCensus:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         harness.taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('connection refused'))  # type: ignore[union-attr,attr-defined]
 
-        result = await harness._fetch_task_count_census('/abs/project')
+        result = await harness._fetch_task_count_census(ProjectRoot('/abs/project'))
 
         assert result == {}
 
@@ -8733,7 +8733,7 @@ class TestHarnessFetchTaskCountCensus:
 
         _HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
         with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
-            result = await harness._fetch_task_count_census('/abs/project')
+            result = await harness._fetch_task_count_census(ProjectRoot('/abs/project'))
 
         assert result == {}
         warns = [
@@ -8755,7 +8755,7 @@ class TestHarnessFetchTaskCountCensus:
 
         _HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
         with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
-            result = await harness._fetch_task_count_census('/abs/project')
+            result = await harness._fetch_task_count_census(ProjectRoot('/abs/project'))
 
         assert result == {}
         warns = [
@@ -8792,7 +8792,7 @@ class TestHarnessCheckGraphitiQueueHealth:
         harness.memory.durable_queue = durable_queue_mock
 
         with caplog.at_level(logging.WARNING):
-            result = await harness._check_graphiti_queue_health('test_project')
+            result = await harness._check_graphiti_queue_health(ProjectId('test_project'))
 
         assert result is not None
         assert result['dead_count'] == 3
@@ -8812,7 +8812,7 @@ class TestHarnessCheckGraphitiQueueHealth:
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         harness.memory.durable_queue = None
 
-        result = await harness._check_graphiti_queue_health('test_project')
+        result = await harness._check_graphiti_queue_health(ProjectId('test_project'))
 
         assert result is None
 
@@ -8826,7 +8826,7 @@ class TestHarnessCheckGraphitiQueueHealth:
         durable_queue_mock.get_stats = AsyncMock(side_effect=RuntimeError('db error'))
         harness.memory.durable_queue = durable_queue_mock
 
-        result = await harness._check_graphiti_queue_health('test_project')
+        result = await harness._check_graphiti_queue_health(ProjectId('test_project'))
 
         assert result is None
 

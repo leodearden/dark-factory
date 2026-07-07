@@ -337,6 +337,13 @@ def build_stale_run_diagnostics(
 class ReconciliationHarness:
     """Orchestrates the three-stage reconciliation pipeline."""
 
+    # Declared, never assigned in __init__: production builds a fresh list per
+    # cycle via _make_stages(scope) (task 2146 β, decision 5). Tests assign this
+    # as a convenience instance attribute (harness.stages = harness._make_stages(scope))
+    # to keep their harness.stages[N] access pattern — this annotation is what lets
+    # pyright resolve that access.
+    stages: list[Any]
+
     def __init__(
         self,
         memory_service: MemoryService,
@@ -680,7 +687,7 @@ class ReconciliationHarness:
         stage.filtered_task_tree = filtered_task_tree
         stage.remediation_mode = remediation_mode
 
-    async def _fetch_filtered_task_tree(self, project_root: str) -> FilteredTaskTree:
+    async def _fetch_filtered_task_tree(self, project_root: ProjectRoot) -> FilteredTaskTree:
         """Fetch the task tree once and return a filtered subset of active tasks.
 
         Degrades gracefully on failure — returns an empty FilteredTaskTree so
@@ -757,7 +764,7 @@ class ReconciliationHarness:
             )
             return FilteredTaskTree()
 
-    async def _fetch_task_count_census(self, project_root: str) -> dict[str, str]:
+    async def _fetch_task_count_census(self, project_root: ProjectRoot) -> dict[str, str]:
         """Fetch the authoritative {id: status} map from taskmaster.get_statuses().
 
         Mirrors _fetch_filtered_task_tree's fail-open posture: guard against a
@@ -801,7 +808,7 @@ class ReconciliationHarness:
             )
             return {}
 
-    async def _check_graphiti_queue_health(self, project_id: str) -> dict | None:
+    async def _check_graphiti_queue_health(self, project_id: ProjectId) -> dict | None:
         """Read the Graphiti async-queue dead-letter count for project_id.
 
         Uses DurableWriteQueue.get_stats(group_id=project_id) to classify the
@@ -1089,7 +1096,7 @@ class ReconciliationHarness:
                 await self.buffer.mark_run_complete(
                     run.project_id, instance_id=run.instance_id,
                 )
-            await self._replay_deferred_writes(run.project_id)
+            await self._replay_deferred_writes(ProjectId(run.project_id))
             detail = (
                 f"project={diag['project_id']} run_type={diag['run_type']} "
                 f"instance={diag['instance_id']} age={diag['age_seconds']:.0f}s "
@@ -1275,7 +1282,7 @@ class ReconciliationHarness:
 
     # ── Deferred write replay ─────────────────────────────────────────
 
-    async def _replay_deferred_writes(self, project_id: str) -> None:
+    async def _replay_deferred_writes(self, project_id: ProjectId) -> None:
         """Replay targeted-recon writes that were deferred during a full cycle.
 
         Uses a claim → replay-one → delete-on-success pattern so that
@@ -1453,7 +1460,7 @@ class ReconciliationHarness:
 
     # ── Tier selection ─────────────────────────────────────────────────
 
-    async def _select_tier(self, project_id: str) -> TierConfig:
+    async def _select_tier(self, project_id: ProjectId) -> TierConfig:
         """Choose model tier based on buffer size."""
         buffer_count = (await self.buffer.get_buffer_stats(project_id)).get('size', 0)
         use_opus = buffer_count > (self.config.buffer_size_threshold * self.config.opus_threshold_ratio)
@@ -1605,7 +1612,7 @@ class ReconciliationHarness:
                         project_id, reason='judge halted reconciliation',
                     )
                     try:
-                        await self._replay_deferred_writes(project_id)
+                        await self._replay_deferred_writes(ProjectId(project_id))
                     finally:
                         # Scope the release to this instance — see
                         # plans/recon-stale-recovery-rca.md.
@@ -1626,7 +1633,7 @@ class ReconciliationHarness:
                             f'({remaining} cycles remaining)'
                         )
 
-                tier = await self._select_tier(project_id)
+                tier = await self._select_tier(ProjectId(project_id))
                 iterator = BacklogIterator(self.config, self.journal, self.buffer, self)
                 heartbeat_task = asyncio.create_task(self._heartbeat_loop(project_id))
                 use_iterator = False
@@ -1678,7 +1685,7 @@ class ReconciliationHarness:
                     await self.buffer.restore_drained(project_id)
                 finally:
                     try:
-                        await self._replay_deferred_writes(project_id)
+                        await self._replay_deferred_writes(ProjectId(project_id))
                     finally:
                         # Cancel heartbeat only after replay so the lock heartbeat
                         # keeps the per-project lock alive for the full replay
@@ -1820,7 +1827,7 @@ class ReconciliationHarness:
         )
 
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
-        graphiti_queue_health = await self._check_graphiti_queue_health(project_id)
+        graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
 
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
