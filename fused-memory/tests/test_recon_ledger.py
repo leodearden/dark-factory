@@ -320,3 +320,58 @@ async def test_gc_deletes_expired_and_terminal_referenced_rows(store):
         )
         is not None
     )
+
+
+@pytest.mark.asyncio
+async def test_gc_with_empty_terminal_task_ids_deletes_only_expired(store):
+    """gc() with an empty terminal_task_ids list must not raise (SQLite
+    rejects an empty `IN ()` list) and must delete only expired rows,
+    leaving live and never-expire rows untouched."""
+    expired = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-expired',
+        flag_type='drift_flag',
+        expires_at='2026-06-15T00:00:00+00:00',
+    )
+    live = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-live',
+        flag_type='drift_flag',
+        expires_at='2026-12-01T00:00:00+00:00',
+    )
+    never_expire = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='cycle_summary',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-never',
+    )
+    await store.upsert(expired)
+    await store.upsert(live)
+    await store.upsert(never_expire)
+
+    deleted_count = await store.gc('proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=[])
+
+    assert deleted_count == 1
+    assert (
+        await store.get_by_identity(
+            'proj-p', 'stage1_flag_marker', task_id='task-expired', flag_type='drift_flag'
+        )
+        is None
+    )
+    assert (
+        await store.get_by_identity(
+            'proj-p', 'stage1_flag_marker', task_id='task-live', flag_type='drift_flag'
+        )
+        is not None
+    )
+    assert await store.get_by_identity('proj-p', 'cycle_summary', task_id='task-never') is not None
