@@ -1796,3 +1796,105 @@ class TestAuthRecoveryViaTransition:
 
         assert ok is False
         assert acct.phase == AccountPhase.AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# step-13/14: the PROBE_IN_FLIGHT edges (confirm_account_ok, release_probe_slot,
+# and before_invoke's probe-claim) migrated onto _transition.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestProbeSlotViaTransition:
+    """step-13: confirm_account_ok / release_probe_slot / before_invoke's
+    probe-claim route the PROBE_IN_FLIGHT<->AVAILABLE/PROBING edges through
+    _transition (probe_count reset + centralized _open recompute owned by
+    _transition, replacing each site's own inline field writes and
+    _open.set()/clear())."""
+
+    async def test_confirm_account_ok_on_probe_in_flight_transitions_via_transition(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.PROBE_IN_FLIGHT
+        acct.probe_count = 2
+        acct.near_cap = True
+        gate._open.clear()
+
+        with patch.object(gate, '_transition', wraps=gate._transition) as mock_transition:
+            gate.confirm_account_ok(acct.token)
+
+        mock_transition.assert_called_once_with(acct, AccountPhase.AVAILABLE)
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.probe_count == 0
+        assert acct.near_cap is False
+        assert gate._open.is_set() is True
+
+    async def test_confirm_account_ok_on_non_probe_in_flight_does_not_transition(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.near_cap = True
+        assert acct.phase == AccountPhase.AVAILABLE
+
+        with patch.object(gate, '_transition', wraps=gate._transition) as mock_transition:
+            gate.confirm_account_ok(acct.token)  # must not raise
+
+        mock_transition.assert_not_called()
+        assert acct.near_cap is False
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    async def test_release_probe_slot_on_probe_in_flight_transitions_via_transition(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.PROBE_IN_FLIGHT
+        acct.probe_count = 4
+        gate._open.clear()
+
+        with patch.object(gate, '_transition', wraps=gate._transition) as mock_transition:
+            gate.release_probe_slot(acct.token)
+
+        mock_transition.assert_called_once_with(acct, AccountPhase.AVAILABLE)
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.probe_count == 0
+        assert gate._open.is_set() is True
+
+    async def test_release_probe_slot_noop_when_token_none(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.PROBE_IN_FLIGHT
+
+        gate.release_probe_slot(None)  # must not raise
+
+        assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+
+    async def test_release_probe_slot_noop_when_token_unknown(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.PROBE_IN_FLIGHT
+
+        gate.release_probe_slot('unknown-token')  # must not raise
+
+        assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+
+    async def test_release_probe_slot_noop_when_not_probe_in_flight(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        assert acct.phase == AccountPhase.AVAILABLE
+
+        with patch.object(gate, '_transition', wraps=gate._transition) as mock_transition:
+            gate.release_probe_slot(acct.token)  # must not raise
+
+        mock_transition.assert_not_called()
+        assert acct.phase == AccountPhase.AVAILABLE
+
+    async def test_before_invoke_claims_probing_account_via_transition(self):
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.PROBING
+
+        with patch.object(gate, '_transition', wraps=gate._transition) as mock_transition:
+            token = await gate.before_invoke()
+
+        mock_transition.assert_called_once_with(acct, AccountPhase.PROBE_IN_FLIGHT)
+        assert token == acct.token
+        assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+        assert gate._open.is_set() is False
