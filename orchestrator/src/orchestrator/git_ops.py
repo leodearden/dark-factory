@@ -3312,8 +3312,9 @@ class GitOps:
         QUARANTINED lane) is logged and swallowed so a durable-record hiccup
         never regresses ``acquire_warm_lane`` itself.
         """
-        target = ACQUIRE_ROUTE_TRANSITIONS[route][1]
+        target = None
         try:
+            target = ACQUIRE_ROUTE_TRANSITIONS[route][1]
             rec = self._lane_lifecycle.read(lane)
             original_state = rec.state if rec is not None else None
             if (
@@ -3354,7 +3355,7 @@ class GitOps:
             logger.warning(
                 '_note_assigned_via_route: failed to record %s for lane %s '
                 '(task %s, route %s) — durable record may be stale/inconsistent',
-                target, lane, task_id, route.value, exc_info=True,
+                target, lane, task_id, getattr(route, 'value', route), exc_info=True,
             )
 
     async def _reuse_warm_lane(
