@@ -756,3 +756,54 @@ class TestLoadReviewedManifest:
         merge_mock.assert_not_awaited()
         memory_service.graphiti.list_graphs.assert_not_awaited()
         assert report['exit_code'] != 0
+
+
+# ===========================================================================
+# Tests: run() apply dispatch to epsilon primitives (step-17/18)
+# ===========================================================================
+
+class TestRunApplyDispatch:
+    """Tests for run() dispatching a reviewed manifest's nodes by disposition."""
+
+    @pytest.mark.asyncio
+    async def test_dispatches_move_and_merge_skips_unresolved(self, tmp_path, monkeypatch):
+        """MOVE nodes dispatch to move_entity_across_graphs, MERGE nodes to
+        merge_foreign_duplicate, and an UNRESOLVED node is NEVER passed to
+        either primitive -- the report still records it as a blocked entry."""
+        move_node = _classified_node(
+            'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        merge_node = _classified_node(
+            'u-merge', source_graph='reify', target_graph='know_live', disposition=_mod.MERGE,
+        )
+        unresolved_node = _classified_node(
+            'u-unresolved', source_graph='reify', target_graph=None, disposition=_mod.UNRESOLVED,
+        )
+        manifest = _mod.build_manifest(
+            [move_node, merge_node, unresolved_node], {'reify': 3}, dry_run=True,
+        )
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+
+        move_mock = AsyncMock()
+        merge_mock = AsyncMock()
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+
+        memory_service = _make_memory_service({})
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        move_mock.assert_awaited_once_with(
+            memory_service.graphiti, 'u-move', 'reify', 'dark_factory',
+        )
+        merge_mock.assert_awaited_once_with(
+            memory_service.graphiti, 'u-merge', wrong_graph='reify', home_graph='know_live',
+        )
+        assert report['unresolved_uuids'] == ['u-unresolved']
+        blocked = [r for r in report['apply_results'] if r['uuid'] == 'u-unresolved']
+        assert blocked == [{
+            'uuid': 'u-unresolved', 'disposition': _mod.UNRESOLVED,
+            'applied': False, 'blocked': True,
+        }]
