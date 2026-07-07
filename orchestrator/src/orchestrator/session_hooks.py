@@ -18,10 +18,13 @@ is present in, and stable across, all three events for one session.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
 import json
 import logging
 import os
 import sys
+import tempfile
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -231,6 +234,96 @@ def run_stop(
 
 
 # ---------------------------------------------------------------------------
+# Settings merge (MERGE-not-clobber, PRD §4 decision 5)
+# ---------------------------------------------------------------------------
+
+_HOOK_SCRIPTS: dict[str, str] = {
+    'SessionStart': 'session-start.sh',
+    'Notification': 'notification.sh',
+    'Stop': 'stop.sh',
+}
+_HOOK_TIMEOUT_SECS = 10
+"""Mirrors ~/.claude/hooks/worktree-hookspath-{capture,restore}.sh's own timeout."""
+
+
+def merge_hook_settings(settings: Mapping[str, Any], script_dir: str | Path) -> dict[str, Any]:
+    """Idempotently merge the SessionStart/Notification/Stop trio into *settings*.
+
+    Deep-copies *settings* and adds ONLY the three event keys under
+    ``hooks`` that are not already present, each pointing (by absolute path
+    into *script_dir*) at its matching entrypoint script. Every existing
+    event key (``PreToolUse``/``PostToolUse``/...) and every other top-level
+    key (``env``/``permissions``/``statusLine``/...) is left byte-identical
+    -- *settings* itself is never mutated. Safe to call twice: an event key
+    already present (from a prior merge) is left untouched, not duplicated.
+    """
+    merged = copy.deepcopy(dict(settings))
+    hooks = merged.setdefault('hooks', {})
+    script_dir_path = Path(script_dir)
+    for event, script_name in _HOOK_SCRIPTS.items():
+        if event in hooks:
+            continue
+        hooks[event] = [
+            {
+                'matcher': '*',
+                'hooks': [
+                    {
+                        'type': 'command',
+                        'command': str(script_dir_path / script_name),
+                        'timeout': _HOOK_TIMEOUT_SECS,
+                    }
+                ],
+            }
+        ]
+    return merged
+
+
+def _hooks_script_dir() -> Path:
+    """Absolute path to the in-repo skills/spawn/hooks/ dir, derived from this file's own path."""
+    repo_root = Path(__file__).resolve().parents[3]
+    return repo_root / 'skills' / 'spawn' / 'hooks'
+
+
+_DEFAULT_SETTINGS_PATH = Path.home() / '.claude' / 'settings.json'
+
+
+def _run_install(settings_path: str | Path | None = None) -> None:
+    """Merge the hooks trio into the real ``~/.claude/settings.json`` (or *settings_path*).
+
+    Reads the current settings (a missing file reads as ``{}``), merges in
+    the trio via ``merge_hook_settings``, writes a timestamped ``.bak`` of
+    the pre-merge bytes when the file already existed, then atomically
+    replaces the settings file (tmp file in the same dir + ``os.replace``,
+    mirroring ``session_registry.write_record``) so a crash mid-write can
+    never leave it truncated or corrupt.
+    """
+    path = Path(settings_path) if settings_path is not None else _DEFAULT_SETTINGS_PATH
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        raw = ''
+    settings = json.loads(raw) if raw.strip() else {}
+
+    merged = merge_hook_settings(settings, _hooks_script_dir())
+
+    if raw:
+        stamp = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
+        path.with_name(f'{path.name}.{stamp}.bak').write_text(raw)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(suffix='.tmp', prefix=path.stem, dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(merged, f, indent=2)
+            f.write('\n')
+        os.replace(tmp_path_str, str(path))
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path_str)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # CLI + fail-soft (PRD: a hook fault must never block a session or turn)
 # ---------------------------------------------------------------------------
 
@@ -241,7 +334,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser('session-start', help='SessionStart hook: capture/refresh the record (status=running)')
     sub.add_parser('notification', help='Notification hook: status=awaiting-input, print the OSC retitle')
     sub.add_parser('stop', help='Stop hook: status=idle, print the OSC retitle')
-    sub.add_parser('install', help='merge the hooks trio into ~/.claude/settings.json')
+    install_p = sub.add_parser('install', help='merge the hooks trio into ~/.claude/settings.json')
+    install_p.add_argument(
+        '--settings-path',
+        default=None,
+        help='override the settings.json path (default: ~/.claude/settings.json)',
+    )
     return parser
 
 
