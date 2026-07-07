@@ -332,3 +332,36 @@ async def classify_node(
         'edge_count': counts['edges'],
         'episode_count': counts['episodes'],
     }
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+async def run(args: Any, memory_service: Any) -> dict:
+    """Census -> classify -> manifest (dry-run), or apply a reviewed manifest.
+
+    Dry-run (default, ``args.apply`` False): enumerates every populated
+    graph via ``list_graphs()``, census-enumerates each one's foreign nodes,
+    classifies every foreign node found, and returns the assembled manifest
+    (``build_manifest`` output, ``dry_run=True``) with ``exit_code=0``
+    attached. Nothing is mutated on this path -- no ``graph.query`` is
+    issued and neither ε primitive is invoked.
+    """
+    graphiti = memory_service.graphiti
+
+    if not args.apply:
+        populated = set(await graphiti.list_graphs())
+        census_counts: dict[str, int] = {}
+        classified: list[dict] = []
+        for graph_key in populated:
+            foreign = await census_foreign_nodes(graphiti, graph_key, page_size=args.page_size)
+            census_counts[graph_key] = len(foreign)
+            for node in foreign:
+                classified.append(await classify_node(graphiti, node, populated))
+
+        manifest = build_manifest(classified, census_counts, dry_run=True)
+        manifest['exit_code'] = 0
+        return manifest
+
+    raise NotImplementedError('--apply is implemented in a later step (2272 step-16+)')
