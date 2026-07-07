@@ -68,29 +68,58 @@ def _is_prune_argv_literal(node: ast.AST) -> TypeGuard[ast.List | ast.Tuple]:
     return all(token in remaining for token in _EXPECTED_ARGV[1:])
 
 
+def _chokepoint_ranges(tree: ast.Module) -> list[tuple[int, int]]:
+    """Line ranges of every ``_prune_registrations`` method defined directly
+    on a class named ``GitOps``.
+
+    A plain name-only scan (any function called ``_prune_registrations``,
+    anywhere) would also treat a differently-classed or module-level
+    function of the same name as sanctioned. This walks the tree tracking
+    the nearest *directly enclosing* class, so only a method defined
+    straight in ``class GitOps:`` (not a same-named function elsewhere, and
+    not a function nested inside a GitOps method) qualifies — matching the
+    contract that ``GitOps._prune_registrations`` specifically is the
+    chokepoint.
+    """
+    ranges: list[tuple[int, int]] = []
+
+    def visit(node: ast.AST, enclosing_class: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, child.name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if (
+                    child.name == _CHOKEPOINT_FUNCTION
+                    and enclosing_class == _CHOKEPOINT_CLASS
+                ):
+                    end = getattr(child, 'end_lineno', child.lineno)
+                    ranges.append((child.lineno, end))
+                # A function body is no longer "directly inside" the
+                # enclosing class, so functions nested within it (e.g. a
+                # closure defined inside a method) don't inherit the
+                # class qualification.
+                visit(child, None)
+            else:
+                visit(child, enclosing_class)
+
+    visit(tree, None)
+    return ranges
+
+
 def _find_prune_argv_literals(source: str) -> list[tuple[int, bool]]:
     """Return (lineno, inside_chokepoint) for each prune argv literal in *source*.
 
     ``inside_chokepoint`` is True when the literal's line falls within the
-    line range of an ``async def _prune_registrations`` (or plain
-    ``def _prune_registrations``) function body. Returns an empty list if
-    the file cannot be parsed.
+    line range of a ``_prune_registrations`` method defined directly on the
+    ``GitOps`` class (see :func:`_chokepoint_ranges`). Returns an empty
+    list if the file cannot be parsed.
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return []
 
-    # Collect line ranges of every function named _prune_registrations,
-    # walking the whole tree so nested/class-scoped defs are covered.
-    chokepoint_ranges: list[tuple[int, int]] = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == _CHOKEPOINT_FUNCTION
-        ):
-            end = getattr(node, 'end_lineno', node.lineno)
-            chokepoint_ranges.append((node.lineno, end))
+    chokepoint_ranges = _chokepoint_ranges(tree)
 
     results: list[tuple[int, bool]] = []
     for node in ast.walk(tree):
