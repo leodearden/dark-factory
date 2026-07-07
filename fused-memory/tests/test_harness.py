@@ -5643,8 +5643,8 @@ async def test_remediation_pass_uses_threaded_project_root_over_registry(
         },
     )
 
-    stages = harness._make_stages()
-    harness._make_stages = lambda: stages
+    stages = harness._make_stages(_scope('reify', '/path/B'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
     captured_roots: dict[str, str] = {}
     for stage in stages:
@@ -5663,7 +5663,7 @@ async def test_remediation_pass_uses_threaded_project_root_over_registry(
         parent_run_id='test-parent-run',
         findings=findings,
         tier=tier,
-        project_root='/path/A',  # threaded caller value — must win over registry '/path/B'
+        scope=_scope('reify', '/path/A'),  # threaded caller value — must win over registry '/path/B'
     )
 
     assert len(captured_roots) == 3, (
@@ -5718,8 +5718,8 @@ async def test_remediation_uses_threaded_project_root_not_mutated_registry(
     # Pin the same stage instances so before_return callbacks registered here
     # remain effective during the remediation pass (same _make_stages shim used
     # by ~10 other tests in this file).
-    stages = harness._make_stages()
-    harness._make_stages = lambda: stages
+    stages = harness._make_stages(_scope('reify', '/path/A'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
     # Push one event so run_full_cycle has something to drain for 'reify'.
     await event_buffer.push(_make_event('reify'))
