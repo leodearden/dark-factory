@@ -207,3 +207,57 @@ def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path:
     assert record.prompt == '/unblock 2085'
     # mtime heartbeat bumped by the refresh write.
     assert record_path.stat().st_mtime > old_ts
+
+
+# ---------------------------------------------------------------------------
+# Step-7: run_notification / run_stop (status flip + OSC return)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('handler_name', 'expected_status', 'expected_glyph_prefix'),
+    [
+        ('run_notification', 'awaiting-input', '⏸ AWAITING'),
+        ('run_stop', 'idle', '✅'),
+    ],
+)
+def test_run_notification_and_run_stop_flip_status_and_return_osc(
+    tmp_path: Path,
+    handler_name: str,
+    expected_status: str,
+    expected_glyph_prefix: str,
+) -> None:
+    hook_input = {'session_id': 'sess-c', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        role='session',
+        project='dark-factory',
+        cwd='/home/leo/src/dark-factory',
+    )
+    sr.write_record(existing, root=tmp_path)
+    handler = getattr(sh, handler_name)
+
+    osc = handler(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status(expected_status)
+    assert osc == f'\033]0;{expected_glyph_prefix} session:dark-factory\007'
+
+
+def test_run_notification_prefers_persisted_record_title(tmp_path: Path) -> None:
+    hook_input = {'session_id': 'sess-d', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.RUNNING,
+        title='unblock:df#2085 routing-mechanism',
+    )
+    sr.write_record(existing, root=tmp_path)
+
+    osc = sh.run_notification(hook_input, env, root=tmp_path)
+
+    assert osc == '\033]0;⏸ AWAITING unblock:df#2085 routing-mechanism\007'
