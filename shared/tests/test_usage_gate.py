@@ -1631,6 +1631,33 @@ class TestUncapViaTransition:
         details = json.loads(details_json)
         assert details['label'] == 'probe #1 confirmed'
 
+    async def test_probe_loop_success_no_ops_when_phase_raced_away(self):
+        """Regression (esc-2128-2): _refresh_capped_accounts runs outside
+        self._lock and targets the same resets_at event, so it can win the
+        CAPPED->PROBING race while _account_resume_probe_loop awaits _run_probe.
+        When the probe then returns ok=True from a non-CAPPED phase, the success
+        block must be a pure no-op — NOT call _transition(acct, PROBING), which
+        would raise IllegalTransitionError inside the fire-and-forget task
+        (PROBING/AVAILABLE/PROBE_IN_FLIGHT all lack PROBING as a legal
+        successor). Mirrors the auth-reprobe guard in _reprobe_account."""
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        acct.probe_count = 0
+        acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
+
+        async def racing_probe(a):
+            # Simulate _refresh_capped_accounts uncapping this account mid-await.
+            a.phase = AccountPhase.PROBING
+            return True
+
+        gate._run_probe = racing_probe
+
+        # Must not raise IllegalTransitionError (PROBING->PROBING is illegal).
+        await asyncio.wait_for(gate._account_resume_probe_loop(acct), timeout=5)
+
+        assert acct.phase == AccountPhase.PROBING
+
 
 # ---------------------------------------------------------------------------
 # step-11/12: the auth-recovery (_reprobe_account) and demotion (_run_probe)
