@@ -462,9 +462,13 @@ class UsageGate:
             self._open.clear()
             if self._pause_started_at is None:
                 self._pause_started_at = datetime.now(UTC)
-            self._paused_reason = reason
-            # else: gate already paused for a prior reason — SIGHUP is the
-            # sole clearer of _paused_reason (see _on_sighup_async).
+            if reason:
+                self._paused_reason = reason
+            # else: a reason-less closing edge (e.g. before_invoke's
+            # PROBE_IN_FLIGHT probe-slot claim, reason='' by default) must
+            # not clobber a real cap/auth reason already recorded here.
+            # SIGHUP is the sole clearer of _paused_reason (see
+            # _on_sighup_async).
 
         # --- Enter-phase side effects: task lifecycle + cost event --------
         if new_phase == AccountPhase.CAPPED:

@@ -1287,6 +1287,27 @@ class TestTransitionSideEffectsLifecycle:
         assert gate._paused_reason == ''
         assert gate._pause_started_at is None
 
+    async def test_transition_reasonless_closing_edge_preserves_prior_paused_reason(self):
+        """Amendment (reviewer_comprehensive): a reason-less closing edge —
+        e.g. before_invoke's PROBING -> PROBE_IN_FLIGHT probe-slot claim,
+        which calls _transition with no `reason` kwarg — must not clobber a
+        real cap/auth reason already recorded in _paused_reason. Only SIGHUP
+        clears it (see _on_sighup_async)."""
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+
+        gate._transition(acct, AccountPhase.CAPPED, reason='cap reason xyz')
+        assert gate._paused_reason == 'cap reason xyz'
+
+        # Cap resets and the resume-probe confirms → PROBING, then
+        # before_invoke claims the sole probing account with the default
+        # reason='' — this re-closes the gate (single account) but must not
+        # overwrite the previously recorded reason with an empty string.
+        gate._transition(acct, AccountPhase.PROBING)
+        gate._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
+
+        assert gate._paused_reason == 'cap reason xyz'
+
     async def test_transition_from_capped_to_probing_resets_probe_count_and_consumes_pause(self):
         gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
         acct = gate._accounts[0]
