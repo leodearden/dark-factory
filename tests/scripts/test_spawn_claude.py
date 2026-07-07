@@ -560,3 +560,50 @@ def test_spawn_writes_session_record_lifecycle(
     record = session_registry.SessionRecord.from_json(record_path.read_text())
     assert record.status == session_registry.Status.EXITED
     assert record.exit_code == exit_code
+
+
+# ===========================================================================
+# task-2285 step-13: session-registry fail-soft on forced registry failure
+# ===========================================================================
+# CLAUDE_FLEET_ROOT is pointed at a subpath UNDER a pre-created regular file,
+# so any mkdir the registry attempts raises NotADirectoryError deterministically
+# (not reliant on filesystem permission semantics, which vary across CI users/
+# containers). This pins the hard requirement (design decision 3): a registry
+# fault must be loud (caller-visible stderr) but must NEVER change
+# spawn-claude.sh's own exit code, and must leave no record dir behind.
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_spawn_fail_soft_on_unwritable_fleet_root(
+    tmp_path: pathlib.Path, exit_code: int,
+) -> None:
+    """A forced registry-write failure must not affect the exit-code contract."""
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=exit_code)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    # Shadow _base_env's CLAUDE_FLEET_ROOT with one that can never be created:
+    # a path nested UNDER a pre-existing regular file.
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("i am a regular file, not a directory\n")
+    env["CLAUDE_FLEET_ROOT"] = str(blocker / "fleet")
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == exit_code, (
+        f"a registry fault must never change the exit-code contract: "
+        f"expected {exit_code}, got {result.returncode}\n"
+        f"stderr: {result.stderr.decode()}"
+    )
+
+    stderr = result.stderr.decode()
+    assert "session_registry" in stderr and "failed" in stderr, (
+        f"expected a loud registry-fault line on the spawn's stderr, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    assert not fleet_root.exists(), (
+        f"no record dir should have been created under an unwritable fleet root, "
+        f"but {fleet_root} exists"
+    )
