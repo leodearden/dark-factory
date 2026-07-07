@@ -10,7 +10,7 @@ import os
 import re
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -947,6 +947,27 @@ class ModuleLockTable:
         self._held.setdefault(task_id, set()).update(new_modules)
         logger.info(f'Task {task_id} expanded locks: {new_modules}')
         return True
+
+
+def _iter_pending_deps_in(
+    tasks: list[dict], dep_set: Iterable[str]
+) -> Iterator[tuple[str, str]]:
+    """Yield ``(task_id, dep_id)`` for each pending task's dep found in *dep_set*.
+
+    Shared iteration shape for the three near-identical local dep-backfill
+    passes in ``Scheduler.acquire_next`` (degraded-bump, recovered-clear,
+    still-missing-bump) — they differ only in which dep-id collection they
+    test membership against and what they do with the matched pair, so the
+    task/dep walk itself is factored out here.
+    """
+    for t in tasks:
+        tid = str(t.get('id', ''))
+        if t.get('status') != 'pending' or not tid:
+            continue
+        for d in t.get('dependencies') or []:
+            dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
+            if dep_id in dep_set:
+                yield tid, dep_id
 
 
 class Scheduler:
@@ -3437,36 +3458,24 @@ class Scheduler:
                     _backfill_err,
                     _missing_dep_ids,
                 )
-                for _t in tasks:
-                    _tid = str(_t.get('id', ''))
-                    if _t.get('status') != 'pending' or not _tid:
-                        continue
-                    for _d in (_t.get('dependencies') or []):
-                        _dep_id = str(
-                            _d.get('id', _d) if isinstance(_d, dict) else _d
+                for _tid, _dep_id in _iter_pending_deps_in(tasks, _missing_dep_ids):
+                    _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
+                    # Reuse max_external_dep_unresolved_cycles as the
+                    # grace threshold — same "consecutive ticks before
+                    # loud escalation" semantics as the external-dep
+                    # resolver-degraded path being mirrored here.
+                    # A dedicated max_local_backfill_unresolved_cycles
+                    # field is deferred (config.py is out of scope).
+                    if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                        logger.warning(
+                            'acquire_next: local dep backfill unresolved '
+                            'for %d consecutive ticks '
+                            '(task=%s, dep=%s) — possible scheduler '
+                            'degradation',
+                            _cnt,
+                            _tid,
+                            _dep_id,
                         )
-                        if _dep_id in _missing_dep_ids:
-                            _key = (_tid, _dep_id)
-                            self._local_backfill_unresolved_counts[_key] = (
-                                self._local_backfill_unresolved_counts.get(_key, 0) + 1
-                            )
-                            _cnt = self._local_backfill_unresolved_counts[_key]
-                            # Reuse max_external_dep_unresolved_cycles as the
-                            # grace threshold — same "consecutive ticks before
-                            # loud escalation" semantics as the external-dep
-                            # resolver-degraded path being mirrored here.
-                            # A dedicated max_local_backfill_unresolved_cycles
-                            # field is deferred (config.py is out of scope).
-                            if _cnt >= self.config.max_external_dep_unresolved_cycles:
-                                logger.warning(
-                                    'acquire_next: local dep backfill unresolved '
-                                    'for %d consecutive ticks '
-                                    '(task=%s, dep=%s) — possible scheduler '
-                                    'degradation',
-                                    _cnt,
-                                    _tid,
-                                    _dep_id,
-                                )
             else:
                 status_map.update(_backfilled)
                 # Reset the consecutive-tick counters for deps that resolved
@@ -3476,18 +3485,8 @@ class Scheduler:
                 # degrades → recovers → degrades again accumulates across the
                 # gap, making the "consecutive" counters and warning messages
                 # misreport the streak length.
-                for _t in tasks:
-                    _tid = str(_t.get('id', ''))
-                    if _t.get('status') != 'pending' or not _tid:
-                        continue
-                    for _d in (_t.get('dependencies') or []):
-                        _dep_id = str(
-                            _d.get('id', _d) if isinstance(_d, dict) else _d
-                        )
-                        if _dep_id in _backfilled:
-                            self._local_backfill_unresolved_counts.pop(
-                                (_tid, _dep_id), None
-                            )
+                for _tid, _dep_id in _iter_pending_deps_in(tasks, _backfilled):
+                    self._streak_local_backfill.clear((_tid, _dep_id))
                 # Partial-response guard: get_statuses returned a valid
                 # (non-error) dict that is still missing some of the requested
                 # dep ids.  Treat those still-missing ids as degraded — warn +
@@ -3505,31 +3504,19 @@ class Scheduler:
                         len(_missing_dep_ids),
                         sorted(_still_missing),
                     )
-                    for _t in tasks:
-                        _tid = str(_t.get('id', ''))
-                        if _t.get('status') != 'pending' or not _tid:
-                            continue
-                        for _d in (_t.get('dependencies') or []):
-                            _dep_id = str(
-                                _d.get('id', _d) if isinstance(_d, dict) else _d
+                    for _tid, _dep_id in _iter_pending_deps_in(tasks, _still_missing):
+                        _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
+                        # Same threshold as the degraded path above.
+                        if _cnt >= self.config.max_external_dep_unresolved_cycles:
+                            logger.warning(
+                                'acquire_next: local dep absent from '
+                                'backfill for %d consecutive ticks '
+                                '(task=%s, dep=%s) — possible '
+                                'scheduler degradation',
+                                _cnt,
+                                _tid,
+                                _dep_id,
                             )
-                            if _dep_id in _still_missing:
-                                _key = (_tid, _dep_id)
-                                self._local_backfill_unresolved_counts[_key] = (
-                                    self._local_backfill_unresolved_counts.get(_key, 0) + 1
-                                )
-                                _cnt = self._local_backfill_unresolved_counts[_key]
-                                # Same threshold as the degraded path above.
-                                if _cnt >= self.config.max_external_dep_unresolved_cycles:
-                                    logger.warning(
-                                        'acquire_next: local dep absent from '
-                                        'backfill for %d consecutive ticks '
-                                        '(task=%s, dep=%s) — possible '
-                                        'scheduler degradation',
-                                        _cnt,
-                                        _tid,
-                                        _dep_id,
-                                    )
 
         # Operator-issued eviction drain: process any queued force-evict
         # requests BEFORE the automatic park-GC sweep so that operator-lever
