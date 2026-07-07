@@ -24,6 +24,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from shared.task_statuses import ACTIVE as ACTIVE_TASK_STATUSES
+
 # --------------------------------------------------------------------------- #
 # Count-snapshot detection
 # --------------------------------------------------------------------------- #
@@ -214,20 +216,21 @@ def extract_batch_plan_task_ids(text: str) -> set[int]:
 # Status constants
 # --------------------------------------------------------------------------- #
 
-ACTIVE_TASK_STATUSES: frozenset[str] = frozenset(
-    {
-        'pending',
-        'in-progress',
-        'blocked',
-        'deferred',
-        'review',
-        # Non-terminal holding state for atomic-train members that have passed
-        # own-verify-green and are awaiting the group merge.
-        # Deliberately excluded from TERMINAL_STATUSES and STATUS_TRIGGERS —
-        # see PRD orchestrator-atomic-train-merge §9.2 and task 1519.
-        'merge-deferred',
-    }
-)
+# ACTIVE_TASK_STATUSES is re-exported from shared.task_statuses (PRD
+# task-status-authority C1/C2, finding 6.4) — the single source of truth,
+# imported above as `ACTIVE as ACTIVE_TASK_STATUSES`. It is now shared.ACTIVE
+# (7 members) and therefore INCLUDES 'infra-hold' in addition to the
+# pre-existing {pending, in-progress, blocked, deferred, review,
+# merge-deferred}. 'infra-hold' is a non-terminal holding state (currently
+# inert — no writer emits it yet); the three consumer branches below have
+# been confirmed to correctly treat it as active/non-terminal:
+#   - filter_task_tree (~line 365): `status in ACTIVE_TASK_STATUSES` → active_tasks
+#   - summarize_statuses (~line 463): `status in ACTIVE_TASK_STATUSES` → active census
+#   - cross_verify_task_counts (~line 625): live_active_ids membership check
+# merge-deferred remains a non-terminal holding state for atomic-train members
+# that have passed own-verify-green and are awaiting the group merge;
+# deliberately excluded from TERMINAL_STATUSES/STATUS_TRIGGERS — see PRD
+# orchestrator-atomic-train-merge §9.2 and task 1519.
 
 INACTIVE_TASK_STATUSES: frozenset[str] = frozenset(
     {

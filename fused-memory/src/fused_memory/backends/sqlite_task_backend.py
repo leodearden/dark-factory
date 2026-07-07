@@ -18,6 +18,7 @@ from typing import Any
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 from shared.task_metadata import SchemaWarning, apply_migrations, parse_metadata
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.backends.task_backend_types import (
@@ -96,6 +97,13 @@ DEFAULT_TAG = 'master'
 # "clear it to NULL" (explicit None). Module-level and private — never
 # compared across processes, only used as an in-process default marker.
 _UNSET = object()
+
+# Store-level vocabulary floor (PRD task-status-authority C2, finding 6.4):
+# set_task_status/add_task reject any status outside this set instead of
+# writing it verbatim. Single source of truth is shared.task_statuses —
+# frozenset(TaskStatus) rather than a hardcoded literal, so a new status
+# added there is accepted here automatically.
+_VALID_STATUSES: frozenset[TaskStatus] = frozenset(TaskStatus)
 
 
 def _now() -> str:
@@ -808,6 +816,12 @@ class SqliteTaskBackend:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
+        if status not in _VALID_STATUSES:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                f'Invalid status {status!r}. Must be one of '
+                f'{sorted(s.value for s in _VALID_STATUSES)}.',
+            )
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             cursor = await conn.execute(
                 'SELECT status FROM tasks WHERE tag = ? AND id = ?',
@@ -967,6 +981,12 @@ class SqliteTaskBackend:
     ) -> AddTaskResult:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
+        if status not in _VALID_STATUSES:
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                f'Invalid status {status!r}. Must be one of '
+                f'{sorted(s.value for s in _VALID_STATUSES)}.',
+            )
 
         # SqliteTaskBackend has no LLM — derive title/description from prompt
         # when the caller only supplied a prompt. The first non-empty line is
