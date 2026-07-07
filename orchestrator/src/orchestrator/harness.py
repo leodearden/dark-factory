@@ -4755,16 +4755,15 @@ Output JSON matching the schema. Every task must appear in the output.
         # The path-scoped `remove` is gated by the foreign-band guard (defense in
         # depth against this cleanup ever targeting a protected band it does not
         # own — gitops-chokepoints PRD, Mechanism 3); `prune` is registration-global,
-        # not band-scoped, so it always runs.
-        _cleanup_argvs: list[tuple[str, ...]] = [('git', 'worktree', 'prune')]
+        # not band-scoped, so it always runs — routed through the guarded
+        # GitOps.prune_worktrees chokepoint (gitops-chokepoints PRD task β) rather
+        # than a raw `git worktree prune` argv.
         if not self.git_ops.refuse_foreign_band(
             gate_path, frozenset({'_substrate-gate-'}), 'substrate-gate-cleanup',
         ):
-            _cleanup_argvs.insert(0, ('git', 'worktree', 'remove', '--force', str(gate_path)))
-        for _cleanup_argv in _cleanup_argvs:
             try:
                 _cleanup_proc = await asyncio.create_subprocess_exec(
-                    *_cleanup_argv,
+                    'git', 'worktree', 'remove', '--force', str(gate_path),
                     cwd=str(self.git_ops.project_root),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -4772,6 +4771,11 @@ Output JSON matching the schema. Every task must appear in the output.
                 await _cleanup_proc.communicate()
             except Exception:
                 pass  # best-effort; path may simply not exist
+        # No local try/except needed: prune_worktrees never raises (it wraps its
+        # own `git worktree prune` subprocess in try/except internally — see
+        # GitOps._prune_registrations). This cleanup's best-effort contract
+        # depends on that invariant; preserve it if that method is refactored.
+        await self.git_ops.prune_worktrees(context='substrate-gate-cleanup')
 
         # Build ephemeral detached worktree — mirrors evals/snapshots.py pattern.
         proc = await asyncio.create_subprocess_exec(

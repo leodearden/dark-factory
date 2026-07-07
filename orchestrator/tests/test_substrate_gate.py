@@ -278,7 +278,7 @@ class TestRunSubstrateRecheckFailClosed:
         assert verdict.verdict == FLIP, f'Expected FLIP, got {verdict.verdict!r}'
         assert verdict.flipped is True
         # Checker must NOT have been invoked
-        assert checker.calls == []
+        assert checker.calls == []  # type: ignore[attr-defined]
         # A WARNING must have been emitted
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             f'Expected a WARNING; got: {[r.message for r in caplog.records]!r}'
@@ -293,7 +293,7 @@ class TestRunSubstrateRecheckFailClosed:
             verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
         assert verdict.verdict == FLIP, f'Expected FLIP, got {verdict.verdict!r}'
         assert verdict.flipped is True
-        assert checker.calls == []
+        assert checker.calls == []  # type: ignore[attr-defined]
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             f'Expected a WARNING; got: {[r.message for r in caplog.records]!r}'
         )
@@ -307,7 +307,7 @@ class TestRunSubstrateRecheckFailClosed:
             verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
         assert verdict.verdict == SKIP, f'Expected SKIP, got {verdict.verdict!r}'
         assert verdict.flipped is False
-        assert checker.calls == []
+        assert checker.calls == []  # type: ignore[attr-defined]
         # No WARNING for a genuinely-absent probe
         assert not any(r.levelno >= logging.WARNING for r in caplog.records), (
             f'Expected no WARNING for genuinely-absent probe; got: {[r.message for r in caplog.records]!r}'
@@ -385,7 +385,7 @@ class TestRunSubstrateRecheck:
         assert verdict.verdict == SKIP
         assert verdict.flipped is False
         # Checker must NOT have been invoked for a task with no descriptor
-        assert checker.calls == []
+        assert checker.calls == []  # type: ignore[attr-defined]
 
     def test_descriptor_but_no_checker_returns_flip(self):
         """Descriptor present but no resolvable checker → FLIP."""
@@ -403,8 +403,8 @@ class TestRunSubstrateRecheck:
         task = make_probe_task(checker=['run_check'], probe_set='probes/suite.json')
         checker = fake_checker(rc=0)
         run_substrate_recheck(task=task, worktree='/wt/gate', run_subprocess=checker)
-        assert len(checker.calls) == 1
-        called_argv, called_cwd = checker.calls[0]
+        assert len(checker.calls) == 1  # type: ignore[attr-defined]
+        called_argv, called_cwd = checker.calls[0]  # type: ignore[attr-defined]
         assert called_argv == ['run_check', 'probes/suite.json']
         assert called_cwd == '/wt/gate'
 
@@ -484,6 +484,7 @@ def _make_harness(tmp_path: Path):
     h.git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' * 5)  # 40-char SHA
     h.git_ops.worktree_base = tmp_path / '.worktrees'
     h.git_ops.project_root = tmp_path
+    h.git_ops.prune_worktrees = AsyncMock(return_value=None)
 
     # No escalation queue by default — tests that need one attach it explicitly
     h._escalation_queue = None
@@ -1286,4 +1287,130 @@ class TestSubstrateGateForeignBandGuard:
             'expected the gate to succeed — the pre-existing stale worktree '
             'at the owned gate_path must still be cleaned up by the '
             'pre-clean sweep'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSubstrateGatePruneChokepoint — gitops-chokepoints β (task 2190).
+#
+# The substrate-gate pre-clean's prune half must route through the guarded
+# GitOps.prune_worktrees(context=...) chokepoint (added by α, task 2185)
+# rather than issuing a raw ('git', 'worktree', 'prune') subprocess argv.
+# ---------------------------------------------------------------------------
+
+
+class TestSubstrateGatePruneChokepoint:
+    """gitops-chokepoints β: the substrate-gate pre-clean's prune half routes
+    through ``GitOps.prune_worktrees(context='substrate-gate-cleanup')``
+    instead of a raw ``git worktree prune`` argv (mocked ``git_ops``)."""
+
+    @pytest.mark.asyncio
+    async def test_preclean_calls_prune_worktrees_with_context(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """The pre-clean loop calls the guarded chokepoint with the
+        'substrate-gate-cleanup' context, not a raw prune subprocess — and
+        does so only after the path-scoped remove has run."""
+        h = _make_harness(tmp_path)
+        # h.git_ops is a bare MagicMock, so the default
+        # `refuse_foreign_band(...)` return is a truthy MagicMock and
+        # `not truthy` is False — force it False so the guarded path-scoped
+        # `git worktree remove` branch is actually exercised by this test,
+        # not silently skipped.
+        h.git_ops.refuse_foreign_band = MagicMock(return_value=False)
+        assignment = _make_assignment()
+
+        exec_mock = AsyncMock(return_value=_fake_proc(0))
+        # Record how many subprocess calls had happened by the time the prune
+        # chokepoint fires, so we can confirm remove-then-prune ordering
+        # (not just that both happened somewhere during the gate run).
+        exec_calls_before_prune: list[int] = []
+        h.git_ops.prune_worktrees.side_effect = (  # type: ignore[attr-defined]
+            lambda **kw: exec_calls_before_prune.append(len(exec_mock.call_args_list))
+        )
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+        with patch('asyncio.create_subprocess_exec', new=exec_mock):
+            result = await h._run_substrate_gate(assignment)
+
+        assert result is True
+        h.git_ops.prune_worktrees.assert_awaited_once_with(  # type: ignore[attr-defined]
+            context='substrate-gate-cleanup',
+        )
+        assert exec_calls_before_prune == [1], (
+            f'expected exactly one subprocess call (the path-scoped `git '
+            f'worktree remove`) to precede the prune chokepoint call; '
+            f'got {exec_calls_before_prune!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_raw_prune_argv_in_subprocess_calls(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """No subprocess call in the gate path issues a raw
+        ('git', 'worktree', 'prune') argv — prune only happens via the
+        chokepoint delegate, asserted above."""
+        h = _make_harness(tmp_path)
+        # Force the guard False (see test_preclean_calls_prune_worktrees_with_
+        # context above) so the path-scoped remove branch actually runs here
+        # too, and this test's "no raw prune argv" sweep covers that call.
+        h.git_ops.refuse_foreign_band = MagicMock(return_value=False)
+        assignment = _make_assignment()
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+        exec_mock = AsyncMock(return_value=_fake_proc(0))
+        with patch('asyncio.create_subprocess_exec', exec_mock):
+            result = await h._run_substrate_gate(assignment)
+
+        assert result is True
+        prune_argv_calls = [
+            c for c in exec_mock.call_args_list
+            if tuple(c.args) == ('git', 'worktree', 'prune')
+        ]
+        assert not prune_argv_calls, (
+            f'expected no raw ("git", "worktree", "prune") subprocess call; '
+            f'found {prune_argv_calls!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_gate_worktree_self_heal_still_works(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Regression (real GitOps): a stale gate worktree left by a prior
+        interrupted run is still cleaned up before 'worktree add', so the
+        gate proceeds normally rather than FLIPping on 'already exists'."""
+        from orchestrator.git_ops import _run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_gate_repo(repo)
+        h = _make_real_git_harness(repo)
+        assignment = _make_assignment()
+
+        gate_path = h.git_ops.worktree_base / '_substrate-gate-42'
+        h.git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(gate_path), 'main'],
+            cwd=repo,
+        )
+        assert rc == 0, f'failed to plant stale gate worktree fixture: {err}'
+        assert gate_path.exists()
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+
+        result = await h._run_substrate_gate(assignment)
+
+        assert result is True, (
+            'expected the gate to succeed — the pre-existing stale gate '
+            'worktree must still be cleaned up (remove + chokepoint prune) '
+            'so `git worktree add` does not fail with "already exists"'
         )
