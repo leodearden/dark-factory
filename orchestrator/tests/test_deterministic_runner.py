@@ -4468,3 +4468,191 @@ class TestSelfRestartScheduledCrashResumeActThenAsk:
         await runner.run(assignment)
 
         unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# TestSharedDoneProvenance (task 2167 — W3-δ: shared TaskMetadata seam, SEAM B)
+# ---------------------------------------------------------------------------
+
+class TestSharedDoneProvenance:
+    """Unit tests for the ``_build_done_provenance`` helper (SEAM B).
+
+    ``_build_done_provenance`` is the single seam every runner
+    ``done_provenance`` construction routes through:
+    ``DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)``.
+    This shares ONE valid-kinds enum with the fused-memory validator (I2) —
+    an unknown/typo kind raises pydantic ``ValidationError`` at BUILD time on
+    the orchestrator side, structurally preventing the 1902/1976/1982
+    permanently-blocked self-restart failure mode (a kind fused-memory
+    silently rejects).  ``exclude_none`` keeps the emitted wire dict
+    byte-compatible with the hand-written literals it replaces; extra fields
+    (``transient_unit``/``fire_delay_secs``) survive via ``DoneProvenance``'s
+    ``extra='allow'``.
+    """
+
+    def test_scheduled_kind_preserves_extra_fields(self):
+        """deterministic-deploy-scheduled + unit + extras -> all preserved."""
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        result = _build_done_provenance(
+            'deterministic-deploy-scheduled',
+            unit='u',
+            transient_unit='orch-redeploy-restart-850.service',
+            fire_delay_secs=5,
+        )
+
+        assert result['kind'] == 'deterministic-deploy-scheduled'
+        assert result['unit'] == 'u'
+        assert result['transient_unit'] == 'orch-redeploy-restart-850.service'
+        assert result['fire_delay_secs'] == 5
+
+    def test_deploy_kind_preserves_pid_and_timestamp(self):
+        """deterministic-deploy + pid + active_enter_timestamp -> preserved."""
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        result = _build_done_provenance(
+            'deterministic-deploy',
+            pid=200,
+            unit='u',
+            active_enter_timestamp='2026-07-06T00:00:00+00:00',
+        )
+
+        assert result['pid'] == 200
+        assert result['active_enter_timestamp'] == '2026-07-06T00:00:00+00:00'
+
+    def test_unknown_kind_raises_validation_error(self):
+        """An unknown/typo kind raises pydantic ValidationError at build time.
+
+        I2 structural prevention: it is impossible for the runner to emit a
+        kind the shared/backend enum rejects — the exact 1902/1976/1982
+        permanently-blocked self-restart failure mode.
+        """
+        from pydantic import ValidationError
+
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        with pytest.raises(ValidationError):
+            _build_done_provenance('bogus')
+
+    def test_none_valued_optional_fields_excluded(self):
+        """exclude_none -> no 'commit'/'note'/'pid' keys when unset.
+
+        Byte-compatibility with the hand-written literals it replaces: those
+        never carried explicit None values either.
+        """
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        result = _build_done_provenance('deterministic-deploy')
+
+        assert 'commit' not in result
+        assert 'note' not in result
+        assert 'pid' not in result
+
+    def test_emitted_dict_round_trips_through_done_provenance(self):
+        """The emitted dict re-validates cleanly through DoneProvenance itself.
+
+        'deterministic-deploy-scheduled' has no conditional commit/note
+        requirement, so round-tripping the built dict back through the model
+        must not raise.
+        """
+        from shared.task_metadata import DoneProvenance
+
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        built = _build_done_provenance('deterministic-deploy-scheduled', unit='u')
+
+        DoneProvenance(**built)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# TestSharedDoneProvenance (task 2167 — W3-δ: shared TaskMetadata seam, SEAM B)
+# ---------------------------------------------------------------------------
+
+class TestSharedDoneProvenance:
+    """Unit tests for the ``_build_done_provenance`` helper (SEAM B).
+
+    ``_build_done_provenance`` is the single seam every runner
+    ``done_provenance`` construction routes through:
+    ``DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)``.
+    This shares ONE valid-kinds enum with the fused-memory validator (I2) —
+    an unknown/typo kind raises pydantic ``ValidationError`` at BUILD time on
+    the orchestrator side, structurally preventing the 1902/1976/1982
+    permanently-blocked self-restart failure mode (a ``kind`` fused-memory
+    silently rejects).  ``exclude_none`` keeps the emitted wire dict
+    byte-compatible with the hand-written literals it replaces; extra fields
+    (``transient_unit``/``fire_delay_secs``) survive via ``DoneProvenance``'s
+    ``extra='allow'``.
+    """
+
+    def test_scheduled_kind_preserves_extra_fields(self):
+        """deterministic-deploy-scheduled + unit + extras -> all preserved."""
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        result = _build_done_provenance(
+            'deterministic-deploy-scheduled',
+            unit='u',
+            transient_unit='orch-redeploy-restart-850.service',
+            fire_delay_secs=5,
+        )
+
+        assert result['kind'] == 'deterministic-deploy-scheduled'
+        assert result['unit'] == 'u'
+        assert result['transient_unit'] == 'orch-redeploy-restart-850.service'
+        assert result['fire_delay_secs'] == 5
+
+    def test_deploy_kind_preserves_pid_and_timestamp(self):
+        """deterministic-deploy + pid + active_enter_timestamp -> preserved."""
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        result = _build_done_provenance(
+            'deterministic-deploy',
+            pid=200,
+            unit='u',
+            active_enter_timestamp='2026-07-06T00:00:00+00:00',
+        )
+
+        assert result['pid'] == 200
+        assert result['active_enter_timestamp'] == '2026-07-06T00:00:00+00:00'
+
+    def test_unknown_kind_raises_validation_error(self):
+        """An unknown/typo kind raises pydantic ValidationError at build time.
+
+        I2 structural prevention: it is impossible for the runner to emit a
+        kind the shared/backend enum rejects — the exact 1902/1976/1982
+        permanently-blocked self-restart failure mode.
+        """
+        from pydantic import ValidationError
+
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        with pytest.raises(ValidationError):
+            _build_done_provenance('bogus')
+
+    def test_none_valued_optional_fields_excluded(self):
+        """exclude_none -> no 'commit'/'note'/'pid' keys when unset.
+
+        Byte-compatibility with the hand-written literals it replaces: those
+        never carried explicit None values either.
+        """
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        result = _build_done_provenance('deterministic-deploy')
+
+        assert 'commit' not in result
+        assert 'note' not in result
+        assert 'pid' not in result
+
+    def test_emitted_dict_round_trips_through_done_provenance(self):
+        """The emitted dict re-validates cleanly through DoneProvenance itself.
+
+        'deterministic-deploy-scheduled' has no conditional commit/note
+        requirement, so round-tripping the built dict back through the model
+        must not raise.
+        """
+        from shared.task_metadata import DoneProvenance
+
+        from orchestrator.deterministic_runner import _build_done_provenance
+
+        built = _build_done_provenance('deterministic-deploy-scheduled', unit='u')
+
+        DoneProvenance(**built)  # must not raise
