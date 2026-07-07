@@ -129,3 +129,53 @@ def _args(
     base = {'apply': apply, 'manifest': manifest, 'page_size': page_size}
     base.update(overrides)
     return types.SimpleNamespace(**base)
+
+
+# ===========================================================================
+# Tests: resolve_target_graph (step-1/2)
+# ===========================================================================
+
+class TestResolveTargetGraph:
+    """Tests for pure resolve_target_graph(group_id, populated_graphs, alias_map)."""
+
+    def test_group_id_naming_a_populated_graph_returns_it(self):
+        """A group_id that names an actual populated graph is its own home
+        (displaced-only node -- it just needs to move back to a graph that
+        already exists)."""
+        populated = {'reify', 'dark_factory', 'know_live'}
+
+        target = _mod.resolve_target_graph('dark_factory', populated, _mod.ALIAS_MAP)
+
+        assert target == 'dark_factory'
+
+    def test_orphan_group_id_mapped_by_alias_map_returns_canonical_target(self):
+        """An orphan group_id absent from populated_graphs but present in
+        ALIAS_MAP resolves to its mapped canonical target."""
+        populated = {'reify', 'dark_factory', 'know_live'}
+
+        assert _mod.resolve_target_graph('know-live', populated, _mod.ALIAS_MAP) == 'know_live'
+        assert _mod.resolve_target_graph('dark-factory', populated, _mod.ALIAS_MAP) == 'dark_factory'
+
+    def test_unmapped_orphan_returns_none(self):
+        """An orphan group_id that names neither a populated graph nor an
+        ALIAS_MAP entry is UNRESOLVED (None) -- not silently dropped, not
+        silently routed anywhere."""
+        populated = {'reify', 'dark_factory', 'know_live'}
+
+        target = _mod.resolve_target_graph(
+            'my_solar_challenge_typo', populated, _mod.ALIAS_MAP,
+        )
+
+        assert target is None
+
+    def test_unmapped_hyphen_spelling_is_never_auto_normalized(self):
+        """A hyphen spelling absent from BOTH populated_graphs and the alias
+        map returns None -- it is never silently canonicalized (e.g. via a
+        blind hyphen->underscore rewrite) to a new graph name. Guards against
+        a future regression that "helpfully" adds generic canonicalization
+        in place of the explicit, human-reviewable ALIAS_MAP."""
+        populated = {'reify', 'dark_factory', 'know_live'}
+
+        target = _mod.resolve_target_graph('some-other-typo', populated, _mod.ALIAS_MAP)
+
+        assert target is None
