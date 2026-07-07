@@ -290,3 +290,45 @@ async def count_node_edges_episodes(graph: Any, uuid: str) -> dict:
     edges = edges_result.result_set[0][0] if edges_result.result_set else 0
     episodes = episodes_result.result_set[0][0] if episodes_result.result_set else 0
     return {'edges': edges, 'episodes': episodes}
+
+
+async def classify_node(
+    graphiti: Any,
+    node: dict,
+    populated_graphs: set[str] | list[str] | frozenset[str],
+    *,
+    alias_map: dict[str, str] = ALIAS_MAP,
+) -> dict:
+    """Classify one census row (see census_foreign_nodes) into a manifest record.
+
+    Orchestrates the pure helpers above over a single foreign-node row:
+    resolve_target_graph decides where the node belongs; if (and only if) it
+    resolves, a presence probe against the target graph feeds
+    disposition_for's MOVE/MERGE split -- an unresolved node (target is
+    None) skips the probe entirely, since there is no target to probe.
+    edge_count/episode_count are always read from the SOURCE graph (not the
+    target), so a human reviewer can see how much topology a MOVE/MERGE will
+    carry before approving --apply.
+    """
+    target_graph = resolve_target_graph(node['group_id'], populated_graphs, alias_map)
+    if target_graph is not None:
+        present_in_target = await node_present_in_graph(
+            graphiti._graph_for(target_graph), node['uuid'],
+        )
+    else:
+        present_in_target = False
+    disposition = disposition_for(target_graph, present_in_target)
+
+    counts = await count_node_edges_episodes(
+        graphiti._graph_for(node['source_graph']), node['uuid'],
+    )
+
+    return {
+        'uuid': node['uuid'],
+        'name': node['name'],
+        'source_graph': node['source_graph'],
+        'target_graph': target_graph,
+        'disposition': disposition,
+        'edge_count': counts['edges'],
+        'episode_count': counts['episodes'],
+    }
