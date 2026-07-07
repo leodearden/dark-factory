@@ -3732,8 +3732,24 @@ Output JSON matching the schema. Every task must appear in the output.
 
         if not lock_path.exists():
             # No worktree or no lock → orphan, revert.
+            #
+            # Guard on branch WIP before reaping: a lock-less worktree whose
+            # leftover branch still carries commits beyond main (e.g. the
+            # stale-lock branch below already reaped the dir on a prior cycle
+            # and retained the branch) is a re-attach-eligible shape, not
+            # disposable orphan residue.  Reaping it here would just recreate
+            # the exact leftover-branch state that create_worktree's cold-path
+            # γ reattach guard now resumes from — so RETAIN the dir instead and
+            # let the next dispatch resume it.  `worktree_path.exists()` is
+            # checked first so the branch-WIP probe (a subprocess call) never
+            # runs when there is no dir to preserve.
+            _no_lock_branch = f'{self.git_ops.config.branch_prefix}{tid}'
+            _branch_has_wip = worktree_path.exists() and await self.git_ops._orphan_has_commits(
+                _no_lock_branch
+            )
             if (
                 worktree_path.exists()
+                and not _branch_has_wip
                 and tid not in self._recovered_plans
                 and tid not in self._preserved_worktrees
             ):
@@ -3745,6 +3761,12 @@ Output JSON matching the schema. Every task must appear in the output.
                         ' (no-lock); continuing',
                         tid, exc_info=True,
                     )
+            elif _branch_has_wip:
+                logger.info(
+                    'Reconcile: task %s no-lock but branch %s carries WIP'
+                    ' commits — retaining worktree for resume',
+                    tid, _no_lock_branch,
+                )
             await self.scheduler.set_task_status(tid, 'pending')
             logger.info(
                 'Reconcile: reverted task %s to pending (reason=no-lock)', tid
