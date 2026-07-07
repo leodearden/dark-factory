@@ -11,10 +11,13 @@ orthogonal to permit/speculation state) and is NOT owned by this class.
 
 Permit lifecycle
 -----------------
-The Merger and Verifier coroutines share one ``_speculation_slot``
-(``asyncio.Semaphore``, depth K). :class:`SpeculationController` holds a
-REFERENCE to that shared semaphore (injected — it never owns/creates its
-own) and drives only the MERGER side of its lifecycle:
+The Merger and Verifier coroutines share one speculation slot (depth K),
+single-owned by a :class:`PermitLedger` (MQ-refactor zeta / task 2159) that
+wraps the underlying ``asyncio.Semaphore``. :class:`SpeculationController`
+holds a REFERENCE to that shared :class:`PermitLedger` (injected — it never
+owns/creates its own) and drives only the MERGER side of its lifecycle,
+storing the :class:`~orchestrator.merge_types.SpecPermit` token it
+currently holds (or ``None``) rather than a bare boolean:
 
 * ``acquire_for_lookahead()`` — acquire one permit before peeking for a
   speculative look-ahead item (depth-K cap). ``held_by_merger`` becomes 1.
@@ -30,8 +33,9 @@ own) and drives only the MERGER side of its lifecycle:
   immediately.
 * ``on_transfer`` — the merger has handed a speculative item to the
   verifier via ``_verifier_queue.put()``; the verifier now owns the permit,
-  so this clears ``held_by_merger`` WITHOUT releasing the semaphore. Used
-  ONLY at the single post-merge-success look-ahead site — ``spec_base`` is
+  so this clears ``held_by_merger`` (drops the controller's own reference)
+  WITHOUT releasing it through the ledger. Used ONLY at the single
+  post-merge-success look-ahead site — ``spec_base`` is
   deliberately left untouched because the immediately-following look-ahead
   call (``on_lookahead_found`` / ``on_lookahead_pending`` / ``on_shutdown``)
   re-derives or clears it.
@@ -51,26 +55,36 @@ own) and drives only the MERGER side of its lifecycle:
 The verifier-side releases (``_resolve_and_release``'s ``was_speculative``/
 ``speculative`` release, ``_finalize_inflight``'s finally release, and the
 cascade re-merge release) are UNCHANGED by this class — they keep releasing
-the same shared semaphore directly. This controller owns only the
-merger-side acquire/transfer/retain/release lifecycle.
+the same shared semaphore directly (raw, not through the ledger, until task
+eta migrates them). This controller owns only the merger-side
+acquire/transfer/retain/release lifecycle, mediated entirely through the
+injected :class:`PermitLedger`.
 
 Plain-Semaphore double-release tolerance
 -----------------------------------------
-``_slot`` MUST remain a plain ``asyncio.Semaphore`` — never a
-``BoundedSemaphore``. A narrow ``CancelledError``-after-``put()`` race can
-cause the same permit to be released twice (once by the merger's outer
-``finally`` and once by the verifier's drain) — see ``merge_queue.py``'s
-speculative-queue-put site comment. A plain ``Semaphore`` tolerates this
-(its internal counter simply increments past the original bound); a
-``BoundedSemaphore`` would raise ``ValueError`` and crash the shutdown
-path. Every release call in this module is therefore an unguarded
-``self._slot.release()`` — never wrapped in extra bookkeeping to prevent
-over-release.
+The semaphore :class:`PermitLedger` wraps MUST remain a plain
+``asyncio.Semaphore`` — never a ``BoundedSemaphore``. A narrow
+``CancelledError``-after-``put()`` race can cause the same permit to be
+released twice (once by the merger's outer ``finally`` and once by the
+verifier's drain) — see ``merge_queue.py``'s speculative-queue-put site
+comment. A plain ``Semaphore`` tolerates this (its internal counter simply
+increments past the original bound); a ``BoundedSemaphore`` would raise
+``ValueError`` and crash the shutdown path. Every release call in this
+module is therefore ``self._ledger.release(self._permit)`` — idempotent
+per-token (a second release of the SAME token is a silent no-op per
+``PermitLedger.release``'s ``released``-flag check) — but this does NOT
+itself prevent the wrapped semaphore's internal counter from exceeding
+``depth``: a verifier-side raw release (still unmediated by the ledger
+until task eta) can race a merger-side release of what the ledger still
+believes is the same live token, and the ledger applies that second
+release like any other, over-releasing the wrapped semaphore exactly as
+before.
 
-``merge_queue.py`` re-exports :class:`SpeculationController` through its
-top-level shim so existing importers (``from orchestrator.merge_queue
-import SpeculationController``) keep working unchanged — see that module's
-re-export shim block.
+``merge_queue.py`` re-exports :class:`SpeculationController` and
+:class:`PermitLedger` through its top-level shim so existing importers
+(``from orchestrator.merge_queue import SpeculationController,
+PermitLedger``) keep working unchanged — see that module's re-export shim
+block.
 """
 
 from __future__ import annotations
@@ -167,18 +181,19 @@ class PermitLedger:
 class SpeculationController:
     """Owns the merger loop's speculation state + merger-side permit lifecycle.
 
-    Constructed with a REFERENCE to the worker's shared ``_speculation_slot``
-    semaphore (never its own) so the verifier-side releases keep operating
-    on the same object. See the module docstring for the full lifecycle.
+    Constructed with a REFERENCE to the worker's shared :class:`PermitLedger`
+    (never its own) so the verifier-side raw releases keep operating on the
+    same underlying semaphore the ledger wraps. See the module docstring for
+    the full lifecycle.
     """
 
-    def __init__(self, slot: asyncio.Semaphore, depth: int) -> None:
-        self._slot = slot
+    def __init__(self, ledger: PermitLedger, depth: int) -> None:
+        self._ledger = ledger
         self._depth = depth
-        # True exactly while the merger holds one _slot permit that has NOT
-        # yet been handed off to the verifier (on_transfer) or released
+        # The permit the merger currently holds, or None if it holds none —
+        # NOT yet handed off to the verifier (on_transfer) or released
         # (on_abort / on_shutdown / on_dequeue's FALLBACK branch).
-        self._held: bool = False
+        self._permit: SpecPermit | None = None
         # SHA to use as base for the CURRENT request's merge; None → merge
         # against actual main HEAD (non-speculative).
         self.spec_base: str | None = None
@@ -199,7 +214,7 @@ class SpeculationController:
         conservation-audit task (iota) sums against ``slot_available`` and
         ``inflight_speculative`` to check the identity ``== depth``.
         """
-        return 1 if self._held else 0
+        return 1 if self._permit is not None else 0
 
     def is_idle(self) -> bool:
         """True when there is no in-flight speculation state at all.
@@ -253,18 +268,20 @@ class SpeculationController:
         """
         if (
             self.pending_spec_base is not None
-            and self._held
+            and self._permit is not None
             and self.pending_predecessor is not None
             and not self.pending_predecessor.result.done()
         ):
             self.spec_base = self.pending_spec_base  # ATTACH
         else:
-            # FALLBACK — release retained permit (if any); over-release is
-            # avoided by the `if self._held` guard, never by the semaphore
-            # type (see module docstring's double-release tolerance note).
-            if self._held:
-                self._slot.release()
-                self._held = False
+            # FALLBACK — release retained permit (if any); a redundant
+            # release is avoided by this `if self._permit is not None`
+            # guard, and independently by the ledger's own idempotent
+            # release (see module docstring's double-release tolerance
+            # note).
+            if self._permit is not None:
+                self._ledger.release(self._permit)
+                self._permit = None
             self.spec_base = None
         # Clear pending locals — consumed by ATTACH or dropped by FALLBACK.
         self.pending_spec_base = None
@@ -278,8 +295,7 @@ class SpeculationController:
         ``merge_queue.py:6936-6937``). Blocks until a permit is available;
         sets ``held_by_merger`` to 1 once acquired.
         """
-        await self._slot.acquire()
-        self._held = True
+        self._permit = await self._ledger.acquire()
 
     def on_lookahead_found(self, next_req: MergeRequest, merge_commit: str) -> None:
         """Record a pickable look-ahead item found while a permit is held.
@@ -304,9 +320,10 @@ class SpeculationController:
     def on_transfer(self) -> None:
         """The merger has handed a speculative item to the verifier.
 
-        Clears ``held_by_merger`` WITHOUT releasing the semaphore — the
-        verifier now owns the permit and will release it itself on drain
-        (the zeta chokepoint). Mirrors ``merge_queue.py:6926``.
+        Clears ``held_by_merger`` WITHOUT releasing the permit through the
+        ledger — the verifier now owns the permit and will release it
+        itself on drain (the zeta chokepoint). Mirrors
+        ``merge_queue.py:6926``.
 
         Used ONLY at the single post-merge-success look-ahead site:
         ``spec_base`` is deliberately left as-is because the
@@ -316,16 +333,17 @@ class SpeculationController:
         runs for this permit), use ``on_transfer_terminal`` instead so
         ``spec_base`` does not leak stale between requests.
         """
-        self._held = False
+        self._permit = None
 
     def on_transfer_terminal(self) -> None:
         """The merger has handed a TERMINAL (early-continue) item to the verifier.
 
         Like ``on_transfer``, clears ``held_by_merger`` WITHOUT releasing the
-        semaphore — the verifier now owns the permit. UNLIKE ``on_transfer``,
-        ALSO clears ``spec_base``: this is for the seven early-continue sites
-        (already_merged / conflict / merge-fail / abandoned / revparse-fail /
-        drop / branch-presence-guard) where the loop ``continue``s
+        permit through the ledger — the verifier now owns the permit. UNLIKE
+        ``on_transfer``, ALSO clears ``spec_base``: this is for the seven
+        early-continue sites (already_merged / conflict / merge-fail /
+        abandoned / revparse-fail / drop / branch-presence-guard) where the
+        loop ``continue``s
         immediately afterward, so no subsequent look-ahead call will ever
         run to re-derive ``spec_base`` for this permit. Mirrors the original
         loop-locals, which set BOTH ``held_spec_permit = False`` AND
@@ -337,20 +355,21 @@ class SpeculationController:
         False and ``snapshot()['speculation']['spec_base']`` as non-None
         until the next ``on_dequeue`` happens to overwrite or clear it.
         """
-        self._held = False
+        self._permit = None
         self.spec_base = None
 
     def on_abort(self) -> None:
         """A guard/failure/exception/train short-circuit before a put.
 
-        Releases the held permit (if any — guarded against over-release,
-        never by the semaphore type) and clears ``spec_base``. Covers the
-        merger's request_abandoned/train/WorktreeMissing/Exception in-body
-        releases (``merge_queue.py:6540/6645/7013/7045``).
+        Releases the held permit (if any — guarded against a redundant
+        release both by this controller's own check and by the ledger's own
+        idempotent release) and clears ``spec_base``. Covers the merger's
+        request_abandoned/train/WorktreeMissing/Exception in-body releases
+        (``merge_queue.py:6540/6645/7013/7045``).
         """
-        if self._held:
-            self._slot.release()
-            self._held = False
+        if self._permit is not None:
+            self._ledger.release(self._permit)
+            self._permit = None
         self.spec_base = None
 
     def on_shutdown(self) -> None:
@@ -363,9 +382,9 @@ class SpeculationController:
         branch and the outer ``finally`` (``merge_queue.py:6958-6962`` and
         ``:7052-7053``).
         """
-        if self._held:
-            self._slot.release()
-            self._held = False
+        if self._permit is not None:
+            self._ledger.release(self._permit)
+            self._permit = None
         self.spec_base = None
         self.prefetched = None
         self.pending_spec_base = None
@@ -375,11 +394,11 @@ class SpeculationController:
         """Return a synchronous read-only snapshot of the controller's state.
 
         Additive-value dict consumed by ``SpeculativeMergeWorker.snapshot()``'s
-        ``'speculation'`` key (task 1993 step-10). ``slot_available`` reads
-        the shared semaphore's internal counter directly — safe here because
-        both this read and every mutation happen on the single asyncio event
-        loop (no lock needed; mirrors ``snapshot()``'s existing non-blocking
-        contract).
+        ``'speculation'`` key (task 1993 step-10). ``slot_available``
+        delegates to the ledger's own ``slot_available`` (itself an
+        internal-counter read) — safe here because both that read and every
+        mutation happen on the single asyncio event loop (no lock needed;
+        mirrors ``snapshot()``'s existing non-blocking contract).
         """
         return {
             'depth': self._depth,
@@ -393,8 +412,5 @@ class SpeculationController:
                 self.pending_predecessor.task_id
                 if self.pending_predecessor is not None else None
             ),
-            # Internal Semaphore counter — no public accessor exists; the
-            # controller and worker both run on the single asyncio event
-            # loop so this read is never torn.
-            'slot_available': self._slot._value,  # type: ignore[attr-defined]
+            'slot_available': self._ledger.slot_available,
         }

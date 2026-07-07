@@ -4242,17 +4242,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # _speculation_depth (K) at all times.  Plain Semaphore (not Bounded)
         # so stop() may over-release without raising.
         self._speculation_slot = asyncio.Semaphore(self._speculation_depth)
+        # MQ-refactor zeta (task 2159): single owner of the semaphore above —
+        # mediates every acquire/release through a SpecPermit token so
+        # conservation (slot_available + len(live) == depth) holds by
+        # construction. The verifier-side releases (_resolve_and_release/
+        # _finalize_inflight/cascade) still target _speculation_slot directly
+        # (raw, not through the ledger) until task eta migrates them.
+        self._speculation_ledger = PermitLedger(
+            self._speculation_slot, self._speculation_depth,
+        )
         # MQ-refactor theta (task 1993): owns the merger-side speculation
         # state machine (spec_base/prefetched/pending_spec_base/
-        # pending_predecessor + the _speculation_slot permit lifecycle) with
-        # EXPLICIT ownership-transfer semantics. Holds a REFERENCE to the
-        # shared _speculation_slot above (never its own) so the verifier-side
+        # pending_predecessor + the permit lifecycle) with EXPLICIT
+        # ownership-transfer semantics. Holds a REFERENCE to the shared
+        # _speculation_ledger above (never its own) so the verifier-side
         # releases (_resolve_and_release/_finalize_inflight/cascade) keep
-        # releasing the same semaphore unchanged. See
+        # releasing the same underlying semaphore unchanged. See
         # merge_speculation_controller.py's module docstring for the full
         # lifecycle contract.
         self._speculation_controller = SpeculationController(
-            self._speculation_slot, self._speculation_depth,
+            self._speculation_ledger, self._speculation_depth,
         )
         # Merger-ahead cap (Mechanism 1, task 1646): limits non-speculative
         # build-ahead to speculation_depth items in the verifier queue.
