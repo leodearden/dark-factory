@@ -3354,6 +3354,178 @@ class TestExecuteGraphitiWriteWithDedup:
 
 
 # ---------------------------------------------------------------------------
+# Tests for the write-time identity gate (task 2202 step-5/6): the identity
+# lock wraps add_episode + _reconcile_episode_identity as one critical
+# section in _execute_graphiti_write.
+# ---------------------------------------------------------------------------
+
+class TestWriteTimeIdentityGate:
+    """_execute_graphiti_write holds α's per-group identity lock
+    (GraphitiBackend._identity_lock_for) across add_episode AND the new
+    _reconcile_episode_identity, making entity identity a write-time
+    guarantee (task 2202 / W6-β) instead of a best-effort post-hoc sweep.
+
+    Boundary signals per the W6 PRD:
+      B1 — two concurrent same-group_id writes serialize (their
+           add_episode+reconcile critical sections do not interleave), no
+           unhandled error, scoped to ONE group_id — group-scoped identity
+           only. Cross-graph isolation is task 2115's concern and is NOT
+           asserted here.
+      B2 — cross-episode duplicate-name collapse via the reconcile's
+           _resolve_or_create_entity sub-pass; exercised directly in
+           TestDedupEpisodeNodes (step-1/2), not repeated here.
+      B3 — a Mem0 write for the group is not serialized by the identity
+           lock (_execute_mem0_write never touches it — the lock is
+           Graphiti-only).
+    """
+
+    @pytest.mark.asyncio
+    async def test_lock_held_across_add_episode_and_reconcile_then_released(self, service):
+        """The SAME Lock object is held (locked() is True) both while
+        add_episode runs and while _reconcile_episode_identity runs, and is
+        released (locked() is False) once _execute_graphiti_write returns.
+        _reconcile_episode_identity is awaited with the add_episode result.
+
+        RED: today _execute_graphiti_write acquires no lock and never calls
+        _reconcile_episode_identity (it calls the five sweeps directly), so
+        the lock is never held and the reconcile awaited-with assertion
+        also fails.
+        """
+        from _fm_helpers import MockAddEpisodeResult
+
+        from fused_memory.services.memory_service import ReconcileStats
+
+        mock_result = MockAddEpisodeResult()
+        lock = service.graphiti._identity_lock_for('test')
+        observed_locked: dict[str, bool] = {}
+        observed_same_lock: dict[str, bool] = {}
+
+        async def fake_add_episode(*args, **kwargs):
+            observed_locked['add_episode'] = lock.locked()
+            observed_same_lock['add_episode'] = (
+                service.graphiti._identity_lock_for('test') is lock
+            )
+            return mock_result
+
+        async def fake_reconcile(result, *, group_id):
+            observed_locked['reconcile'] = lock.locked()
+            observed_same_lock['reconcile'] = (
+                service.graphiti._identity_lock_for(group_id) is lock
+            )
+            assert result is mock_result
+            assert group_id == 'test'
+            return ReconcileStats()
+
+        service.graphiti.add_episode = AsyncMock(side_effect=fake_add_episode)
+        service._reconcile_episode_identity = AsyncMock(side_effect=fake_reconcile)
+
+        payload = {
+            'name': 'ep_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        assert observed_locked.get('add_episode') is True, 'lock must be held during add_episode'
+        assert observed_locked.get('reconcile') is True, (
+            'lock must be held during _reconcile_episode_identity'
+        )
+        assert observed_same_lock.get('add_episode') is True
+        assert observed_same_lock.get('reconcile') is True
+        assert lock.locked() is False, 'lock must be released after _execute_graphiti_write returns'
+        service._reconcile_episode_identity.assert_awaited_once_with(mock_result, group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_group_writes_serialize_b1(self, service):
+        """B1: two concurrent _execute_graphiti_write calls for the SAME
+        group_id='test' do not interleave their add_episode+reconcile
+        critical sections, and neither raises. Scoped to one group_id only
+        — cross-graph isolation is task 2115's concern, not asserted here.
+
+        RED: with no lock, both calls' add_episode invocations overlap
+        (each yields at ``await asyncio.sleep(0)``), so the overlap
+        detector trips.
+        """
+        from _fm_helpers import MockAddEpisodeResult
+
+        from fused_memory.services.memory_service import ReconcileStats
+
+        active = 0
+        max_active = 0
+        overlap_detected = False
+
+        async def _bump():
+            nonlocal active, max_active, overlap_detected
+            active += 1
+            max_active = max(max_active, active)
+            if active > 1:
+                overlap_detected = True
+            await asyncio.sleep(0)
+            active -= 1
+
+        async def fake_add_episode(*args, **kwargs):
+            await _bump()
+            return MockAddEpisodeResult()
+
+        async def fake_reconcile(result, *, group_id):
+            await _bump()
+            return ReconcileStats()
+
+        service.graphiti.add_episode = AsyncMock(side_effect=fake_add_episode)
+        service._reconcile_episode_identity = AsyncMock(side_effect=fake_reconcile)
+
+        def make_payload(name):
+            return {
+                'name': name,
+                'content': 'test content',
+                'source': 'text',
+                'group_id': 'test',
+                'source_description': '',
+            }
+
+        results = await asyncio.gather(
+            service._execute_graphiti_write('add_episode', make_payload('a')),
+            service._execute_graphiti_write('add_episode', make_payload('b')),
+            return_exceptions=True,
+        )
+
+        assert not any(isinstance(r, BaseException) for r in results), results
+        assert not overlap_detected, (
+            'two concurrent same-group_id critical sections interleaved'
+        )
+        assert max_active == 1
+
+    @pytest.mark.asyncio
+    async def test_mem0_write_not_serialized_by_identity_lock_b3(self, service):
+        """B3: a Mem0 write for the same group_id completes without
+        blocking while the identity lock is held, and never touches
+        _identity_lock_for at all — the lock is Graphiti-only.
+
+        Not RED today: _execute_mem0_write never touched the Graphiti
+        identity lock even before this task, so this is a non-regression
+        guard for the invariant, pinned alongside (a)/(b) above."""
+        lock = service.graphiti._identity_lock_for('test')
+        service.graphiti._identity_lock_for.reset_mock()
+
+        await lock.acquire()
+        try:
+            payload = {
+                'content': 'some fact',
+                'project_id': 'test',
+                'agent_id': 'agent-1',
+                'metadata': {},
+            }
+            result = await asyncio.wait_for(service._execute_mem0_write(payload), timeout=1.0)
+        finally:
+            lock.release()
+
+        assert result == {'results': [{'id': 'mem0-1'}]}
+        service.graphiti._identity_lock_for.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Tests for _dual_write_callback reading result.edges  (step 11)
 # ---------------------------------------------------------------------------
 
