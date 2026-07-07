@@ -12,6 +12,7 @@ from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.targeted import TargetedReconciler
@@ -2014,6 +2015,145 @@ async def test_on_task_done_writes_own_title_in_multicompletion_window(
                     f"Task {task['id']}: content contains neighbor title {other_title!r}.\n"
                     f"  content: {content!r}"
                 )
+
+
+# ── ProjectScope threading (task 2152, stream M4) ────────────────────────
+#
+# The pair-taking transition handlers accept a single ProjectScope instead of
+# a (project_id, project_root) str pair — see plans/recon-project-scope-prd.md.
+# These tests call the handlers DIRECTLY (bypassing reconcile_task) to pin
+# the positional shape (task_id, scope, task_before, run_id[, *,
+# reopen_reason]) and to confirm scope.project_id/scope.project_root reach
+# the right downstream calls (memory reads/writes keyed by project_id;
+# taskmaster/journal calls keyed by project_root) — catching a transposition
+# of the two fields that a type checker alone would not. Every OTHER test in
+# this file continues to drive the handlers via reconcile_task (unchanged
+# boundary) as regression coverage that behaviour is unaffected by the
+# signature change.
+
+
+class TestHandlersAcceptProjectScope:
+    """The four transition handlers accept a single ProjectScope; scope.project_id
+    and scope.project_root are used for the memory and taskmaster calls
+    respectively."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_journal(self, reconciler):
+        """Direct handler calls bypass reconcile_task's start_run(), so a
+        real ReconciliationJournal would receive actions for a run that was
+        never started. Stub the journal so the test is isolated to exactly
+        what it pins: the handler's ProjectScope signature and its
+        scope.project_id/scope.project_root usage."""
+        reconciler.journal = AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_on_task_done_accepts_scope(
+        self, reconciler, mock_memory_service, mock_taskmaster
+    ):
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        task_before = {
+            'id': '1', 'title': 'Add tests', 'status': 'in-progress',
+            'description': 'Test suite',
+        }
+
+        result = await reconciler._on_task_done('1', scope, task_before, 'run-1')
+
+        assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+        assert any(
+            call.kwargs.get('project_id') == 'test-project'
+            for call in mock_memory_service.add_memory.call_args_list
+        ), f'add_memory never called with project_id=test-project: {mock_memory_service.add_memory.call_args_list}'
+        # Guards against scope.project_id/scope.project_root being transposed:
+        # the dependent-task lookup (step 3) must receive project_root, not
+        # project_id, alongside add_memory receiving project_id above.
+        mock_taskmaster.get_tasks.assert_called_once_with(project_root='/tmp/test')
+
+    @pytest.mark.asyncio
+    async def test_on_task_blocked_accepts_scope(
+        self, reconciler, mock_memory_service, mock_taskmaster
+    ):
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        mock_memory_service.search = AsyncMock(return_value=[
+            MemoryResult(id='1', content='relevant info', source_store=SourceStore.mem0, entities=['X']),
+        ])
+
+        result = await reconciler._on_task_blocked(
+            '1', scope, {'id': '1', 'title': 'Blocked task', 'status': 'in-progress'}, 'run-1',
+        )
+
+        assert any(a['type'] == 'hints_attached' for a in result.get('actions', []))
+
+    @pytest.mark.asyncio
+    async def test_on_task_cancelled_accepts_scope(self, reconciler, mock_taskmaster):
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        task_before = {
+            'id': '1', 'title': 'Cancelled', 'status': 'in-progress',
+            'subtasks': [
+                {'id': '1.1', 'status': 'pending', 'title': 'Sub1'},
+                {'id': '1.2', 'status': 'done', 'title': 'Sub2'},
+            ],
+        }
+
+        result = await reconciler._on_task_cancelled('1', scope, task_before, 'run-1')
+
+        review_actions = [a for a in result.get('actions', []) if a['type'] == 'subtasks_need_review']
+        assert len(review_actions) == 1
+        assert review_actions[0]['count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_on_task_deferred_accepts_scope_and_delegates_to_blocked(
+        self, reconciler, mock_memory_service, mock_taskmaster,
+    ):
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        mock_memory_service.search = AsyncMock(return_value=[
+            MemoryResult(id='1', content='info', source_store=SourceStore.mem0, entities=['X']),
+        ])
+
+        result = await reconciler._on_task_deferred(
+            '1', scope, {'id': '1', 'title': 'Deferred task', 'status': 'in-progress'}, 'run-1',
+        )
+
+        assert any(a['type'] == 'hints_attached' for a in result.get('actions', []))
+
+
+class TestShouldWithholdBatchPromotionAcceptsScope:
+    """_should_withhold_batch_promotion accepts a single ProjectScope.
+
+    Calls the guard DIRECTLY (bypassing reconcile_task/_on_task_done) to pin
+    the positional shape (ep_uuid, scope, statuses_cache) and to confirm
+    scope.project_id/scope.project_root reach get_episode_content and
+    get_statuses respectively. Reuses the batch-plan content shape from
+    TestBatchPlanPromotionGate above.
+    """
+
+    @pytest.mark.asyncio
+    async def test_withholds_when_a_sibling_is_active(
+        self, reconciler, mock_memory_service, mock_taskmaster
+    ):
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value='Merge-queue batch queued together as df 1985-2002'
+        )
+        mock_taskmaster.get_statuses = AsyncMock(return_value={'1990': 'in-progress'})
+
+        result = await reconciler._should_withhold_batch_promotion('ep-uuid', scope, {})
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_promotes_when_all_siblings_terminal(
+        self, reconciler, mock_memory_service, mock_taskmaster
+    ):
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value='Merge-queue batch queued together as df 1985-2002'
+        )
+        statuses = {str(tid): 'done' for tid in range(1985, 2003)}
+        mock_taskmaster.get_statuses = AsyncMock(return_value=statuses)
+
+        result = await reconciler._should_withhold_batch_promotion('ep-uuid', scope, {})
+
+        assert result is False
 
 
 # ── Pre-echo authoritative-resolution check (task 1984) ─────────────────────

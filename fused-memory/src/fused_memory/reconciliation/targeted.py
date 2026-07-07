@@ -20,6 +20,7 @@ from fused_memory.models.reconciliation import (
     RunStatus,
     RunType,
 )
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.task_filter import (
@@ -133,7 +134,7 @@ class TargetedReconciler:
         self,
         content: str,
         category: str,
-        project_id: str,
+        project_id: ProjectId,
         metadata: dict,
         causation_id: str,
     ) -> bool:
@@ -204,6 +205,7 @@ class TargetedReconciler:
 
         try:
             require_project_root(project_root)
+            scope = ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
             handler = {
                 'done': self._on_task_done,
@@ -222,7 +224,7 @@ class TargetedReconciler:
                 if transition == 'cancelled':
                     handler_kwargs['reopen_reason'] = reopen_reason
                 result = await handler(
-                    task_id, project_id, project_root, task_before, run_id,
+                    task_id, scope, task_before, run_id,
                     **handler_kwargs,
                 )
 
@@ -253,8 +255,7 @@ class TargetedReconciler:
     async def _should_withhold_batch_promotion(
         self,
         ep_uuid: str,
-        project_id: str,
-        project_root: str,
+        scope: ProjectScope,
         statuses_cache: dict,
     ) -> bool:
         """Return True when ep_uuid is a batch-plan episode with a still-active sibling.
@@ -288,7 +289,7 @@ class TargetedReconciler:
         know the statuses.)
         """
         try:
-            content = await self.memory.get_episode_content(ep_uuid, project_id)
+            content = await self.memory.get_episode_content(ep_uuid, scope.project_id)
         except Exception as e:
             logger.warning(f'get_episode_content failed for planned episode {ep_uuid}: {e}')
             content = None
@@ -302,7 +303,7 @@ class TargetedReconciler:
 
         if 'statuses' not in statuses_cache:
             try:
-                raw = await self.taskmaster.get_statuses(project_root=project_root)
+                raw = await self.taskmaster.get_statuses(project_root=scope.project_root)
                 if isinstance(raw, dict):
                     statuses_cache['statuses'] = raw
                 else:
@@ -328,7 +329,7 @@ class TargetedReconciler:
         return any(statuses.get(str(t)) in ACTIVE_TASK_STATUSES for t in batch_ids)
 
     async def _fetch_done_provenance(
-        self, task_id: str, project_root: str, task_before_task: dict,
+        self, task_id: str, project_root: ProjectRoot, task_before_task: dict,
     ) -> dict | None:
         """Return the current-transition ``metadata.done_provenance``, or None.
 
@@ -375,7 +376,7 @@ class TargetedReconciler:
         return None
 
     async def _on_task_done(
-        self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
+        self, task_id: str, scope: ProjectScope, task_before: dict, run_id: str
     ) -> dict:
         """Task completed. Verify knowledge capture, note dependent unblocks."""
         task = _extract_task(task_before)
@@ -400,7 +401,7 @@ class TargetedReconciler:
             # resolution will not suppress a stale description here.
             try:
                 memories = await self.memory.get_memories_by_metadata(
-                    project_id=project_id, filters={'task_id': task_id},
+                    project_id=scope.project_id, filters={'task_id': task_id},
                     limit=_AUTHORITATIVE_PRECHECK_LIMIT,
                 )
             except Exception as e:
@@ -422,7 +423,7 @@ class TargetedReconciler:
                 # verbatim reads as if the bug is still open. Fall back to the
                 # legacy description+details append when no usable provenance
                 # exists (legacy tasks / a failed provenance write).
-                provenance = await self._fetch_done_provenance(task_id, project_root, task)
+                provenance = await self._fetch_done_provenance(task_id, scope.project_root, task)
                 outcome = _format_outcome_echo(provenance)
                 if outcome:
                     content += f" {outcome}"
@@ -447,7 +448,7 @@ class TargetedReconciler:
             written = await self._fenced_add_memory(
                 content=content,
                 category='observations_and_summaries',
-                project_id=project_id,
+                project_id=scope.project_id,
                 metadata=write_metadata,
                 causation_id=run_id,
             )
@@ -470,7 +471,7 @@ class TargetedReconciler:
         # 1. Search for existing knowledge about this task
         related = await self.memory.search(
             query=f'{title} {description}',
-            project_id=project_id,
+            project_id=scope.project_id,
             limit=5,
             causation_id=run_id,
         )
@@ -502,7 +503,7 @@ class TargetedReconciler:
             try:
                 planned_related = await self.memory.search(
                     query=f'{title} {description}',
-                    project_id=project_id,
+                    project_id=scope.project_id,
                     limit=10,
                     causation_id=run_id,
                     include_planned=True,
@@ -526,7 +527,7 @@ class TargetedReconciler:
                 # is already cached once per block via statuses_cache.
                 for ep_uuid in ep_uuids:
                     if await self._should_withhold_batch_promotion(
-                        ep_uuid, project_id, project_root, statuses_cache
+                        ep_uuid, scope, statuses_cache
                     ):
                         withheld_count += 1
                         continue
@@ -567,7 +568,7 @@ class TargetedReconciler:
                     written = await self._fenced_add_memory(
                         content=f"Completed task '{title}': {verification.summary}",
                         category='observations_and_summaries',
-                        project_id=project_id,
+                        project_id=scope.project_id,
                         metadata={
                             'source': 'targeted_reconciliation',
                             'task_id': task_id,
@@ -591,7 +592,7 @@ class TargetedReconciler:
 
         # 3. Check dependent tasks — are they unblocked?
         try:
-            all_tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
+            all_tasks_data = await self.taskmaster.get_tasks(project_root=scope.project_root)
             all_tasks = all_tasks_data.get('tasks', [])
             if isinstance(all_tasks, list):
                 for t in all_tasks:
@@ -619,7 +620,7 @@ class TargetedReconciler:
         return result
 
     async def _on_task_blocked(
-        self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
+        self, task_id: str, scope: ProjectScope, task_before: dict, run_id: str
     ) -> dict:
         """Task blocked. Search for relevant knowledge, attach as hints."""
         task = _extract_task(task_before)
@@ -630,7 +631,7 @@ class TargetedReconciler:
 
         related = await self.memory.search(
             query=f'blockers for: {title} {description}',
-            project_id=project_id,
+            project_id=scope.project_id,
             limit=5,
             causation_id=run_id,
         )
@@ -660,13 +661,13 @@ class TargetedReconciler:
                     resp = await self.task_interceptor.update_task(
                         task_id=task_id,
                         metadata=metadata_payload,
-                        project_root=project_root,
+                        project_root=scope.project_root,
                     )
                 else:
                     resp = await self.taskmaster.update_task(
                         task_id=task_id,
                         metadata=metadata_payload,
-                        project_root=project_root,
+                        project_root=scope.project_root,
                     )
 
                 # TaskInterceptor gates (_backlog_gate, _reject_status_in_update_task,
@@ -725,8 +726,7 @@ class TargetedReconciler:
     async def _on_task_cancelled(
         self,
         task_id: str,
-        project_id: str,
-        project_root: str,
+        scope: ProjectScope,
         task_before: dict,
         run_id: str,
         *,
@@ -784,7 +784,7 @@ class TargetedReconciler:
         # Sweep top-level descendants — orphan review-followups + dependents.
         sweep_actions = await self._sweep_cancelled_descendants(
             parent_id=task_id,
-            project_root=project_root,
+            project_root=scope.project_root,
             run_id=run_id,
         )
         result['actions'].extend(sweep_actions)
@@ -795,7 +795,7 @@ class TargetedReconciler:
         self,
         *,
         parent_id: str,
-        project_root: str,
+        project_root: ProjectRoot,
         run_id: str,
     ) -> list[dict]:
         """Classify and route each non-terminal descendant of ``parent_id``.
@@ -965,7 +965,7 @@ class TargetedReconciler:
 
         return actions
 
-    async def _live_status_map(self, project_root: str) -> dict[str, str]:
+    async def _live_status_map(self, project_root: ProjectRoot) -> dict[str, str]:
         """Return a fresh {str(task_id): str(status)} map for the project.
 
         Called at most once per sweep (lazy-memoized by the caller) to detect
@@ -992,7 +992,7 @@ class TargetedReconciler:
         }
 
     async def _sweep_cancel_orphan(
-        self, *, task_id: str, parent_id: str, project_root: str,
+        self, *, task_id: str, parent_id: str, project_root: ProjectRoot,
     ) -> dict | None:
         """Auto-cancel a deterministic-orphan review-followup."""
         reason = f'{_PARENT_CANCELLED_REOPEN_PREFIX}{parent_id}'
@@ -1024,7 +1024,7 @@ class TargetedReconciler:
         parent_id: str,
         escalation_id: str | None,
         is_dependent: bool,
-        project_root: str,
+        project_root: ProjectRoot,
     ) -> dict | None:
         """Auto-block an ambiguous descendant + record parent_cancelled metadata.
 
@@ -1085,7 +1085,7 @@ class TargetedReconciler:
         parent_id: str,
         escalation_id: str | None,
         is_dependent: bool,
-        project_root: str,
+        project_root: ProjectRoot,
     ) -> dict | None:
         """File an L1 escalation for an ambiguous descendant when orch is live."""
         # is-None narrows the optional types for pyright (mirrors
@@ -1140,10 +1140,10 @@ class TargetedReconciler:
         }
 
     async def _on_task_deferred(
-        self, task_id: str, project_id: str, project_root: str, task_before: dict, run_id: str
+        self, task_id: str, scope: ProjectScope, task_before: dict, run_id: str
     ) -> dict:
         """Task deferred. Similar to blocked — attach relevant knowledge hints."""
-        return await self._on_task_blocked(task_id, project_id, project_root, task_before, run_id)
+        return await self._on_task_blocked(task_id, scope, task_before, run_id)
 
 def _extract_task(task_data: dict) -> dict:
     """Normalize Taskmaster response to get the task dict."""
