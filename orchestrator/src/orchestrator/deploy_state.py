@@ -26,45 +26,37 @@ __all__ = [
     'is_legal_transition',
 ]
 
-# Legal edges are membership in this set; any pair absent is illegal by
-# construction (is_legal_transition defaults to False). Per the PRD §5.2
-# chart (scheduled→ran→{verified|failed|escalated}→done) plus the
+# Only legal (True) edges are stored; any pair absent from this table is
+# illegal by construction (is_legal_transition defaults to False). Per the
+# PRD §5.2 chart (scheduled→ran→{verified|failed|escalated}→done) plus the
 # DeterministicRunner field-combo presets (CLAUDE.md "Field-combo presets").
-#
-# plans/harness-supervision-prd.md §5.2 sketches this as
-# `_LEGAL: dict[(old, new), bool]` — illustrative shorthand for the same
-# lookup table. `_LEGAL` itself is not exported (absent from __all__);
-# is_legal_transition is the only public contract, so the table is a
-# frozenset of legal pairs rather than a dict whose value is `True` on
-# every entry by construction (there is no meaningful False value to store —
-# illegality is absence).
-_LEGAL: frozenset[tuple[DeployPhase, DeployPhase]] = frozenset((
+_LEGAL: dict[tuple[DeployPhase, DeployPhase], bool] = {
     # scheduled -> ran: the deploy script was launched (before_done_ran_at).
-    (DeployPhase.SCHEDULED, DeployPhase.RAN),
+    (DeployPhase.SCHEDULED, DeployPhase.RAN): True,
     # ran -> verified: fresh-PID verify confirmed the deploy took effect.
-    (DeployPhase.RAN, DeployPhase.VERIFIED),
+    (DeployPhase.RAN, DeployPhase.VERIFIED): True,
     # ran -> failed: the deploy script itself failed (non-zero exit/timeout).
-    (DeployPhase.RAN, DeployPhase.FAILED),
+    (DeployPhase.RAN, DeployPhase.FAILED): True,
     # ran -> escalated: act-then-ask (always_escalates=True) files its
     # born-at-L2 gate right after the action runs, without a verify leg.
-    (DeployPhase.RAN, DeployPhase.ESCALATED),
+    (DeployPhase.RAN, DeployPhase.ESCALATED): True,
     # verified -> done: auto-deploy's happy path (before_done, not
     # always_escalates) — no human gate required.
-    (DeployPhase.VERIFIED, DeployPhase.DONE),
+    (DeployPhase.VERIFIED, DeployPhase.DONE): True,
     # verified -> escalated: act-then-ask still gates on human resolution
     # even after a successful verify.
-    (DeployPhase.VERIFIED, DeployPhase.ESCALATED),
+    (DeployPhase.VERIFIED, DeployPhase.ESCALATED): True,
     # failed -> escalated: a deploy failure always routes to a born-at-L2
     # escalation (DS-2 loudness — never silently dropped).
-    (DeployPhase.FAILED, DeployPhase.ESCALATED),
+    (DeployPhase.FAILED, DeployPhase.ESCALATED): True,
     # escalated -> done: the human resolved the gate/failure escalation.
-    (DeployPhase.ESCALATED, DeployPhase.DONE),
-))
+    (DeployPhase.ESCALATED, DeployPhase.DONE): True,
+}
 
 
 def is_legal_transition(old: DeployPhase, new: DeployPhase) -> bool:
     """Whether ``old -> new`` is a legal deploy-phase transition."""
-    return (old, new) in _LEGAL
+    return _LEGAL.get((old, new), False)
 
 
 class IllegalDeployTransition(RuntimeError):
