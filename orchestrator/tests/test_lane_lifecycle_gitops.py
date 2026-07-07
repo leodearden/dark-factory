@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -248,4 +249,43 @@ class TestDiskBackstopPlanJsonRelocation:
         assert found == lane, (
             f'expected new-then-old fallback to find legacy plan.json at '
             f'{legacy_dir}, got {found!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Interactive worktree stamp relocation: .task-meta write-only via TaskArtifacts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestInteractiveWorktreeStampRelocation:
+    """create_interactive_worktree must write its interactive.json stamp ONLY
+    to the new .task-meta location (W11 gamma .task -> .task-meta relocation;
+    PRD `.task-meta` path-derivation contract: writes new-path-only) — never
+    under <iact_worktree>/.task/."""
+
+    async def test_stamp_written_to_new_path_only(self, git_repo: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+
+        info = await git_ops.create_interactive_worktree('stamp-slug')
+
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, info.path.name)
+        stamp_path = meta_root / 'interactive.json'
+        assert stamp_path.is_file(), f'expected stamp at new path {stamp_path}'
+
+        stamp = json.loads(stamp_path.read_text())
+        assert stamp['owner'] == 'stamp-slug', (
+            f"expected stamp['owner'] == 'stamp-slug', got {stamp.get('owner')!r}"
+        )
+        assert stamp['branch'] == info.branch, (
+            f"expected stamp['branch'] == {info.branch!r}, got {stamp.get('branch')!r}"
+        )
+        assert stamp['slug'] == 'stamp-slug', (
+            f"expected stamp['slug'] == 'stamp-slug', got {stamp.get('slug')!r}"
+        )
+        datetime.fromisoformat(stamp['created_at'])  # machine-parseable ISO8601
+
+        legacy_path = info.path / '.task' / 'interactive.json'
+        assert not legacy_path.exists(), (
+            f'expected NO interactive.json written under the legacy path {legacy_path}'
         )
