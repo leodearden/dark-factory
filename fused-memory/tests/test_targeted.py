@@ -2022,29 +2022,34 @@ async def test_on_task_done_writes_own_title_in_multicompletion_window(
 # The pair-taking transition handlers accept a single ProjectScope instead of
 # a (project_id, project_root) str pair — see plans/recon-project-scope-prd.md.
 # These tests call the handlers DIRECTLY (bypassing reconcile_task) to pin
-# the new positional shape (task_id, scope, task_before, run_id[, *,
-# reopen_reason]): today the handlers still take (task_id, project_id,
-# project_root, task_before, run_id), so passing `scope` positionally as the
-# 2nd argument shifts every later positional arg by one and leaves `run_id`
-# unbound, raising TypeError. Every OTHER test in this file continues to
-# drive the handlers via reconcile_task (unchanged boundary) as regression
-# coverage that behaviour is unaffected by the signature change.
+# the positional shape (task_id, scope, task_before, run_id[, *,
+# reopen_reason]) and to confirm scope.project_id/scope.project_root reach
+# the right downstream calls (memory reads/writes keyed by project_id;
+# taskmaster/journal calls keyed by project_root) — catching a transposition
+# of the two fields that a type checker alone would not. Every OTHER test in
+# this file continues to drive the handlers via reconcile_task (unchanged
+# boundary) as regression coverage that behaviour is unaffected by the
+# signature change.
 
 
 class TestHandlersAcceptProjectScope:
-    """RED: the four transition handlers accept a single ProjectScope."""
+    """The four transition handlers accept a single ProjectScope; scope.project_id
+    and scope.project_root are used for the memory and taskmaster calls
+    respectively."""
 
     @pytest.fixture(autouse=True)
     def _isolate_journal(self, reconciler):
         """Direct handler calls bypass reconcile_task's start_run(), so a
         real ReconciliationJournal would receive actions for a run that was
         never started. Stub the journal so the test is isolated to exactly
-        what it pins: the handler's new ProjectScope signature and its
+        what it pins: the handler's ProjectScope signature and its
         scope.project_id/scope.project_root usage."""
         reconciler.journal = AsyncMock()
 
     @pytest.mark.asyncio
-    async def test_on_task_done_accepts_scope(self, reconciler, mock_memory_service):
+    async def test_on_task_done_accepts_scope(
+        self, reconciler, mock_memory_service, mock_taskmaster
+    ):
         scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
         task_before = {
             'id': '1', 'title': 'Add tests', 'status': 'in-progress',
@@ -2058,6 +2063,10 @@ class TestHandlersAcceptProjectScope:
             call.kwargs.get('project_id') == 'test-project'
             for call in mock_memory_service.add_memory.call_args_list
         ), f'add_memory never called with project_id=test-project: {mock_memory_service.add_memory.call_args_list}'
+        # Guards against scope.project_id/scope.project_root being transposed:
+        # the dependent-task lookup (step 3) must receive project_root, not
+        # project_id, alongside add_memory receiving project_id above.
+        mock_taskmaster.get_tasks.assert_called_once_with(project_root='/tmp/test')
 
     @pytest.mark.asyncio
     async def test_on_task_blocked_accepts_scope(
@@ -2108,13 +2117,12 @@ class TestHandlersAcceptProjectScope:
 
 
 class TestShouldWithholdBatchPromotionAcceptsScope:
-    """RED: _should_withhold_batch_promotion accepts a single ProjectScope.
+    """_should_withhold_batch_promotion accepts a single ProjectScope.
 
     Calls the guard DIRECTLY (bypassing reconcile_task/_on_task_done) to pin
-    the new positional shape (ep_uuid, scope, statuses_cache): today the
-    signature is (self, ep_uuid, project_id, project_root, statuses_cache),
-    so passing `scope` as the 2nd positional argument leaves `statuses_cache`
-    unbound, raising TypeError. Reuses the batch-plan content shape from
+    the positional shape (ep_uuid, scope, statuses_cache) and to confirm
+    scope.project_id/scope.project_root reach get_episode_content and
+    get_statuses respectively. Reuses the batch-plan content shape from
     TestBatchPlanPromotionGate above.
     """
 
