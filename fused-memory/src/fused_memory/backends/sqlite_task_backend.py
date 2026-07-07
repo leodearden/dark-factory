@@ -17,7 +17,7 @@ from typing import Any
 
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
-from shared.task_metadata import SchemaWarning, parse_metadata
+from shared.task_metadata import SchemaWarning, apply_migrations, parse_metadata
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.backends.task_backend_types import (
@@ -1563,40 +1563,6 @@ def _merge_values(old: object, new: object) -> object:
     return old
 
 
-def _normalize_legacy_memory_hints_value(value: object) -> object:
-    """Coerce a legacy list-of-dicts ``memory_hints`` value to canonical dict shape.
-
-    The canonical shape is ``{"entities": [...], "queries": [...]}``.
-    The legacy shape is ``[{"entity": <str>, "query": <str>}, ...]``.
-
-    When *value* is a list each element that is a dict is inspected:
-    * ``entity`` is appended to ``entities`` only when it is a non-empty string.
-    * ``query`` is appended to ``queries`` only when it is a non-empty string.
-    * Non-dict items and entries with missing / empty / non-string keys are skipped.
-
-    Any non-list input (dict, scalar, None) is returned unchanged — the function is
-    a no-op for already-canonical values and for any shape it does not recognise.
-    """
-    if not isinstance(value, list):
-        return value
-    entities: list[str] = []
-    queries: list[str] = []
-    seen_entities: set[str] = set()
-    seen_queries: set[str] = set()
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        entity = item.get("entity")
-        if isinstance(entity, str) and entity and entity not in seen_entities:
-            entities.append(entity)
-            seen_entities.add(entity)
-        query = item.get("query")
-        if isinstance(query, str) and query and query not in seen_queries:
-            queries.append(query)
-            seen_queries.add(query)
-    return {"entities": entities, "queries": queries}
-
-
 def _merge_metadata(
     existing_raw: str | None,
     incoming: str,
@@ -1667,8 +1633,8 @@ def _merge_metadata(
     # path — so a write that omits memory_hints does not silently migrate the
     # stored legacy shape.
     if "memory_hints" in old and "memory_hints" in new:
-        old = {**old, "memory_hints": _normalize_legacy_memory_hints_value(old["memory_hints"])}
-        new = {**new, "memory_hints": _normalize_legacy_memory_hints_value(new["memory_hints"])}
+        old = {**old, "memory_hints": apply_migrations({"memory_hints": old["memory_hints"]})["memory_hints"]}
+        new = {**new, "memory_hints": apply_migrations({"memory_hints": new["memory_hints"]})["memory_hints"]}
     try:
         merged = _merge_values(old, new)
     except RecursionError:
