@@ -1359,8 +1359,10 @@ class GraphitiBackend:
           graphiti_core's job; this primitive only resolves/collapses existing
           nodes, it never creates one.
         - 1 match: returns that node's uuid directly (pure resolve, no writes).
-        - >=2 matches: collapses duplicates via find_duplicate_entity_nodes +
-          merge_entities (see step-6).
+        - >=2 matches: collapses duplicates via find_duplicate_entity_nodes
+          (already survivor-first: edge_count DESC, created_at ASC, uuid ASC)
+          and merge_entities, folding every non-canonical duplicate into the
+          survivor. Returns the survivor's uuid.
 
         Args:
             name: Exact name of the Entity to resolve.
@@ -1378,8 +1380,11 @@ class GraphitiBackend:
             return None
         if len(nodes) == 1:
             return nodes[0]['uuid']
-        # >=2 branch (collapse via find_duplicate_entity_nodes + merge_entities)
-        # added in step-6.
+        dups = await self.find_duplicate_entity_nodes(name, group_id=group_id)
+        survivor = dups[0]
+        for dup in dups[1:]:
+            await self.merge_entities(dup['uuid'], survivor['uuid'], group_id=group_id)
+        return survivor['uuid']
 
     @staticmethod
     def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
