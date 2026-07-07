@@ -7126,6 +7126,70 @@ class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
         )
 
 
+# ── task 2166 step-7: _merged_audit_metadata discard WARN ──
+#
+# _merged_audit_metadata's inline before['metadata'] str-parse must delegate
+# to shared.task_metadata.parse_metadata(direction='read') the same way
+# _parse_metadata/_extract_metadata_dict do (step-5/6): warn loudly on a
+# genuine whole-metadata discard (unparseable JSON / non-object) while
+# staying silent for valid dict/JSON-string metadata, and preserve the
+# audit-wins merge semantics unchanged.
+
+
+class TestMergedAuditMetadataWarnsOnDiscard:
+    def test_unparseable_string_warns_and_merges_onto_empty_dict(self, caplog):
+        """RED: current inline parse coerces 'garbage{{{' to {} silently."""
+        from fused_memory.middleware.task_interceptor import _merged_audit_metadata
+
+        audit_fields = {'reopen_reason': 'retry'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = _merged_audit_metadata({'metadata': 'garbage{{{'}, audit_fields)
+        assert result == audit_fields
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('task_metadata.schema_warning' in r.message for r in warns), (
+            f'expected a task_metadata.schema_warning WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_valid_dict_metadata_merges_audit_wins_no_warning(self, caplog):
+        """Audit fields win on collision; a valid dict is not a discard."""
+        from fused_memory.middleware.task_interceptor import _merged_audit_metadata
+
+        existing = {'files': ['a.py'], 'reopen_reason': 'stale'}
+        audit_fields = {'reopen_reason': 'fresh'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = _merged_audit_metadata({'metadata': existing}, audit_fields)
+        assert result == {'files': ['a.py'], 'reopen_reason': 'fresh'}
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'valid dict metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
+        )
+
+    def test_valid_json_string_metadata_merges_audit_wins_no_warning(self, caplog):
+        """Audit fields win on collision; a valid JSON string is not a discard."""
+        from fused_memory.middleware.task_interceptor import _merged_audit_metadata
+
+        existing = {'files': ['a.py'], 'reopen_reason': 'stale'}
+        audit_fields = {'reopen_reason': 'fresh'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = _merged_audit_metadata({'metadata': json.dumps(existing)}, audit_fields)
+        assert result == {'files': ['a.py'], 'reopen_reason': 'fresh'}
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'valid JSON-string metadata must not emit a WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+
 # ── task-1810 step-15/16: _check_escalation_idempotency tuple sentinel ──
 
 
