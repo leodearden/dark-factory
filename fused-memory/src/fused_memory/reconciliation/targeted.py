@@ -134,7 +134,7 @@ class TargetedReconciler:
         self,
         content: str,
         category: str,
-        project_id: str,
+        project_id: ProjectId,
         metadata: dict,
         causation_id: str,
     ) -> bool:
@@ -329,7 +329,7 @@ class TargetedReconciler:
         return any(statuses.get(str(t)) in ACTIVE_TASK_STATUSES for t in batch_ids)
 
     async def _fetch_done_provenance(
-        self, task_id: str, project_root: str, task_before_task: dict,
+        self, task_id: str, project_root: ProjectRoot, task_before_task: dict,
     ) -> dict | None:
         """Return the current-transition ``metadata.done_provenance``, or None.
 
