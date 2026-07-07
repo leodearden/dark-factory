@@ -17,6 +17,7 @@ from typing import Any
 
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.task_metadata import SchemaWarning, parse_metadata
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.backends.task_backend_types import (
@@ -333,6 +334,22 @@ def _warn_malformed_metadata_once(
         )
 
 
+def _emit_schema_warning(task_id: int, warning: SchemaWarning) -> None:
+    """Emit the write-boundary census line for one :class:`SchemaWarning`.
+
+    One WARNING line per warning, emitted only in warn-mode
+    (``task_metadata.enforce=False``). The literal token
+    ``task_metadata.schema_warning`` is what the enforce-gate census greps
+    for in the fused-memory journal (PRD §1/§5) — it is deliberately
+    distinct from the ``_warn_malformed_metadata_once`` read-path token
+    (``'malformed metadata'``) so the two censuses never conflate.
+    """
+    logger.warning(
+        'task_metadata.schema_warning task_id=%s field=%s error=%s',
+        task_id, warning.field, warning.message,
+    )
+
+
 def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: str) -> dict[str, Any]:
     """Convert a tasks-table row into the get_tasks/get_task wire dict.
 
@@ -384,8 +401,19 @@ class SqliteTaskBackend:
     drains all of them.
     """
 
-    def __init__(self, config: TaskmasterConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: TaskmasterConfig | None = None,
+        *,
+        task_metadata_enforce: bool = False,
+    ) -> None:
         self.config = config
+        # RED-TIER / restart-only (task 2162, W3-β): False (default) is
+        # warn-mode — a write-boundary schema violation emits a
+        # task_metadata.schema_warning census line and the write proceeds.
+        # True is enforce-mode — the same violation raises and the write is
+        # rolled back. See config.schema.TaskMetadataConfig.
+        self._task_metadata_enforce = task_metadata_enforce
         self._connections: dict[str, aiosqlite.Connection] = {}
         # Guards the connection map AND each project's first-access bring-up
         # (schema + WAL pragmas). Held briefly during open; released before
@@ -867,6 +895,57 @@ class SqliteTaskBackend:
             'message': f'Updated claimant fields for task {task_id}',
         }
 
+    # ── Write-boundary validation (task 2162, W3-β) ─────────────────────
+
+    async def _validate_metadata_on_write(
+        self,
+        metadata: str | None,
+        *,
+        project_root: str,
+        tag: str,
+        task_id: int,
+    ) -> None:
+        """Validate a metadata blob at the add_task/update_task write boundary.
+
+        Delegates to the shared ``parse_metadata`` (direction='write'). In
+        warn-mode (the default) every returned :class:`SchemaWarning` is
+        logged as one ``task_metadata.schema_warning`` census line and the
+        write proceeds unchanged. In enforce-mode a malformed blob's raise
+        (``ValidationError`` / ``ValueError`` / ``TypeError``) propagates
+        uncaught out of this call — the caller's ``async with self._txn(...)``
+        rolls back so the original bytes are preserved.
+        """
+        _, warnings = parse_metadata(
+            metadata, direction='write', enforce=self._task_metadata_enforce,
+        )
+        for warning in warnings:
+            _emit_schema_warning(task_id, warning)
+
+    # ── Write-boundary validation (task 2162, W3-β) ────────────────────
+
+    async def _validate_metadata_on_write(
+        self,
+        metadata: str | None,
+        *,
+        project_root: str,
+        tag: str,
+        task_id: int,
+    ) -> None:
+        """Validate a ``metadata`` JSON blob at the add_task/update_task write boundary.
+
+        Delegates to the shared ``parse_metadata`` (direction='write').
+        Every returned :class:`SchemaWarning` is logged as one
+        ``task_metadata.schema_warning`` census line and the write proceeds
+        unchanged.
+
+        NOTE: warn-only for now — hardcodes ``enforce=False`` regardless of
+        ``self._task_metadata_enforce``. Honoring the flag (so enforce-mode
+        raises and the caller's ``_txn`` rolls back) is wired in separately.
+        """
+        _, warnings = parse_metadata(metadata, direction='write', enforce=False)
+        for warning in warnings:
+            _emit_schema_warning(task_id, warning)
+
     async def add_task(
         self,
         project_root: str,
@@ -922,6 +1001,9 @@ class SqliteTaskBackend:
             _max_row = await cursor.fetchone()
             assert _max_row is not None  # aggregate MAX always returns one row
             next_id = (_max_row[0] or 0) + 1
+            await self._validate_metadata_on_write(
+                metadata, project_root=project_root, tag=tag, task_id=next_id,
+            )
             await conn.execute(
                 """
                     INSERT INTO tasks (tag, id, title, description,
