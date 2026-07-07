@@ -18,7 +18,6 @@ import pytest
 from escalation.queue import EscalationQueue
 
 from orchestrator.lane_lifecycle import (
-    ACQUIRE_ROUTE_TRANSITIONS,
     ESCALATION_SENTINEL_ROLE,
     LEGAL_TRANSITIONS,
     AcquireRoute,
@@ -359,29 +358,18 @@ class TestPoolStorageSentinel:
 
 
 class TestAcquireRouteTable:
+    # NOTE: table/vocabulary shape invariants (every route has an edge, every
+    # edge is a legal (from, to) tuple, every edge targets ASSIGNED) are
+    # enforced by `_validate_acquire_route_transitions()`, which runs at
+    # `orchestrator.lane_lifecycle` import time and raises AssertionError on
+    # collection if violated — see that module for the single source of
+    # truth. Re-asserting them here would be pure duplication (this suite
+    # could never even collect if they failed). What IS worth pinning here is
+    # the literal route-name vocabulary itself, which the import-time
+    # validator does not check (it only checks table/enum concordance,
+    # whatever the names are).
     def test_acquire_route_has_exactly_seven_members(self):
         assert {member.name for member in AcquireRoute} == {
             'REUSE', 'REUSE_REPAIR', 'CREATE_ONCE_FRESH', 'CREATE_ONCE_REATTACH',
             'DISK_BACKSTOP_REUSE', 'RESET_IN_PLACE_REATTACH', 'RECYCLE',
         }
-
-    def test_table_has_an_entry_for_every_route_no_missing_or_extra(self):
-        assert set(ACQUIRE_ROUTE_TRANSITIONS) == set(AcquireRoute)
-
-    def test_every_edge_is_a_from_to_tuple(self):
-        for route, edge in ACQUIRE_ROUTE_TRANSITIONS.items():
-            assert isinstance(edge, tuple) and len(edge) == 2, (
-                f'{route}: expected a (from, to) tuple, got {edge!r}'
-            )
-
-    def test_every_edge_is_a_legal_transition(self):
-        for route, edge in ACQUIRE_ROUTE_TRANSITIONS.items():
-            assert edge in LEGAL_TRANSITIONS, (
-                f'{route}: edge {edge!r} is not a member of LEGAL_TRANSITIONS'
-            )
-
-    def test_every_edge_targets_assigned(self):
-        for route, edge in ACQUIRE_ROUTE_TRANSITIONS.items():
-            assert edge[1] is LaneState.ASSIGNED, (
-                f'{route}: expected edge to target LaneState.ASSIGNED, got {edge[1]!r}'
-            )
