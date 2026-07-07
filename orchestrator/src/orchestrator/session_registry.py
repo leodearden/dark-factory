@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -304,3 +305,124 @@ def refresh_record(
         record.status = status
     write_record(record, root=root)
     return record
+
+
+# ---------------------------------------------------------------------------
+# TTL / pid stale-record reaper (PRD §4.8)
+# ---------------------------------------------------------------------------
+
+TERMINAL_TTL = timedelta(hours=24)
+"""How long a terminal (EXITED/FAILED_TO_START) record survives after its
+last write before the reaper reclaims it, regardless of launcher_pid."""
+
+NON_TERMINAL_HEARTBEAT_TTL = timedelta(hours=1)
+"""How long a non-terminal record survives with a dead launcher_pid and no
+fresh write (heartbeat) before the reaper reclaims it. A live launcher_pid
+retains the record regardless of age."""
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if the process identified by *pid* is alive.
+
+    Copied (not imported) from harness.py:295-317 to keep this module
+    stdlib-only and self-contained (invocable as a standalone script from
+    bash with no orchestrator package import).
+
+    - Returns False for pid <= 0 (invalid).
+    - Uses os.kill(pid, 0): success -> alive; ProcessLookupError -> dead;
+      PermissionError -> alive (visible but unsignalable); other OSError ->
+      treated as dead.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+@dataclass(frozen=True)
+class ReapedSessionRecord:
+    """One session-registry record directory removed by reap_stale_records.
+
+    path: the removed ``<slug>/`` directory (not the record.json file).
+    session_slug: the session's identity/directory key, derived from the
+        directory name itself (never from the record body).
+    reason: why it was reaped -- one of ``'terminal_ttl'`` (a terminal
+        record older than TERMINAL_TTL), ``'stale_pid'`` (a non-terminal
+        record whose launcher_pid is dead and older than
+        NON_TERMINAL_HEARTBEAT_TTL), or ``'corrupt'`` (record.json missing
+        or unparseable and older than NON_TERMINAL_HEARTBEAT_TTL).
+    """
+
+    path: Path
+    session_slug: str
+    reason: str
+
+
+def reap_stale_records(
+    root: Path | str | None = None, *, now: datetime | None = None,
+) -> list[ReapedSessionRecord]:
+    """Sweep ``<root>/sessions/*/`` and remove stale session-record directories.
+
+    Mirrors the ``reap_interactive_worktrees``/``interactive.json`` idiom
+    (git_ops.py): identity (which directory to remove) is derived from the
+    *path* -- the slug directory name -- never from the record body, so a
+    missing or corrupt record.json is still reapable. Age is measured from
+    record.json's mtime (bumped by every write_record/refresh_record call,
+    i.e. its heartbeat); when record.json itself is absent, the slug
+    directory's own mtime is used instead so identity-only reap still works.
+
+    Rules (first match wins):
+    - record body unreadable (missing or corrupt) and age >
+      NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='corrupt'.
+    - status is terminal (EXITED/FAILED_TO_START) and age > TERMINAL_TTL ->
+      reaped, reason='terminal_ttl' (independent of launcher_pid liveness).
+    - status is non-terminal, launcher_pid is dead, and age >
+      NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='stale_pid'.
+    - otherwise -> kept.
+
+    *now* is injectable for deterministic tests; defaults to the real UTC
+    clock.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    base = sessions_dir(root)
+    reaped: list[ReapedSessionRecord] = []
+    if not base.is_dir():
+        return reaped
+
+    for slug_dir in sorted(base.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        slug = slug_dir.name
+        record_path = slug_dir / 'record.json'
+        age_source = record_path if record_path.is_file() else slug_dir
+        try:
+            mtime = age_source.stat().st_mtime
+        except OSError:
+            continue  # vanished mid-sweep (e.g. concurrent reap) -- skip it
+        age = now - datetime.fromtimestamp(mtime, tz=UTC)
+
+        try:
+            record = read_record(slug, root=root)
+        except (FileNotFoundError, CorruptSessionRecord):
+            reason = 'corrupt' if age > NON_TERMINAL_HEARTBEAT_TTL else None
+        else:
+            if record.status in TERMINAL_STATUSES:
+                reason = 'terminal_ttl' if age > TERMINAL_TTL else None
+            elif not _pid_alive(record.launcher_pid) and age > NON_TERMINAL_HEARTBEAT_TTL:
+                reason = 'stale_pid'
+            else:
+                reason = None
+
+        if reason is not None:
+            shutil.rmtree(slug_dir)
+            reaped.append(ReapedSessionRecord(path=slug_dir, session_slug=slug, reason=reason))
+
+    return reaped
