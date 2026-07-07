@@ -338,6 +338,18 @@ async def classify_node(
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def load_reviewed_manifest(path: str | Path) -> dict:
+    """Load a previously-emitted, human-reviewed manifest JSON file.
+
+    ``--apply`` consumes this EXISTING file verbatim -- it never recomputes
+    a fresh census/classification (see the module docstring's Contract
+    section): the dry-run manifest is the sole recovery record, and
+    recomputing at apply time would bypass human review and could act on a
+    census that has drifted since it was reviewed.
+    """
+    return json.loads(Path(path).read_text())
+
+
 async def run(args: Any, memory_service: Any) -> dict:
     """Census -> classify -> manifest (dry-run), or apply a reviewed manifest.
 
@@ -347,6 +359,11 @@ async def run(args: Any, memory_service: Any) -> dict:
     (``build_manifest`` output, ``dry_run=True``) with ``exit_code=0``
     attached. Nothing is mutated on this path -- no ``graph.query`` is
     issued and neither ε primitive is invoked.
+
+    Apply (``args.apply`` True) requires an EXISTING, human-reviewed
+    manifest file (``args.manifest``) -- it refuses (non-zero ``exit_code``,
+    zero mutations, no census recompute) if none is given, rather than
+    silently falling back to a freshly recomputed census.
     """
     graphiti = memory_service.graphiti
 
@@ -364,4 +381,18 @@ async def run(args: Any, memory_service: Any) -> dict:
         manifest['exit_code'] = 0
         return manifest
 
-    raise NotImplementedError('--apply is implemented in a later step (2272 step-16+)')
+    if not args.manifest:
+        return {
+            'dry_run': False,
+            'nodes': [],
+            'error': (
+                '--apply requires an existing, human-reviewed manifest file '
+                '(--manifest PATH) -- it never recomputes a fresh census. '
+                'Run a dry-run first, review the emitted manifest, then '
+                're-run with --apply --manifest PATH.'
+            ),
+            'exit_code': 1,
+        }
+
+    manifest = load_reviewed_manifest(args.manifest)
+    raise NotImplementedError('apply dispatch is implemented in a later step (2272 step-18+)')
