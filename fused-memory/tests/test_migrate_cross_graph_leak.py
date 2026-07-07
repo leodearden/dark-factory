@@ -698,8 +698,8 @@ class TestRunDryRun:
 
         # Nothing mutated: no .query on either graph, and neither epsilon
         # primitive was invoked.
-        reify_graph.query.assert_not_called()
-        dark_factory_graph.query.assert_not_called()
+        reify_graph.query.assert_not_awaited()
+        dark_factory_graph.query.assert_not_awaited()
         move_mock.assert_not_awaited()
         merge_mock.assert_not_awaited()
 
