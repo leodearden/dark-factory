@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
+from shared.task_metadata import parse_metadata
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.mcp_tools.scheduler_state import (
