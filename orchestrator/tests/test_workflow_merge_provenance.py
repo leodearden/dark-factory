@@ -28,7 +28,6 @@ from orchestrator.workflow import (
     WorkflowOutcome,
     WorkflowState,
     _PriorImplStatus,
-    _RecoveryDecision,
 )
 
 
@@ -131,63 +130,6 @@ def _reset_merge_provenance():
     MergeProvenance._outbox = None
     yield
     MergeProvenance._outbox = None
-
-
-# ---------------------------------------------------------------------------
-# Tests: TaskWorkflow._resolve_already_merged
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-class TestResolveAlreadyMerged:
-    """Unit tests for TaskWorkflow._resolve_already_merged() (PRD α, MP-1).
-
-    Pure decision function: journal hit is authoritative and short-circuits
-    before the legacy heuristic is ever consulted; a journal miss falls back
-    to ``_has_prior_implementation``.
-    """
-
-    async def test_journal_hit_returns_done_without_consulting_fallback(
-        self, tmp_path: Path,
-    ):
-        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
-        _bind_landed_row(tmp_path, task_id=f.wf.task_id, advanced_sha='advancedsha123')
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            side_effect=AssertionError(
-                '_has_prior_implementation must not be called on a journal hit',
-            ),
-        )
-
-        decision = f.wf._resolve_already_merged(wt_head='wthead123')
-
-        assert decision == _RecoveryDecision(
-            done=True, basis='journal', sha='advancedsha123',
-        )
-
-    async def test_journal_miss_with_prior_work_returns_fallback(
-        self, tmp_path: Path,
-    ):
-        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=True, entries=[], base_commit=None),
-        )
-
-        decision = f.wf._resolve_already_merged(wt_head='wthead123')
-
-        assert decision == _RecoveryDecision(done=True, basis='fallback', sha=None)
-        f.wf._has_prior_implementation.assert_called_once_with(wt_head='wthead123')
-
-    async def test_journal_miss_with_no_prior_work_returns_no_recovery(
-        self, tmp_path: Path,
-    ):
-        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
-        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
-            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
-        )
-
-        decision = f.wf._resolve_already_merged(wt_head='wthead123')
-
-        assert decision == _RecoveryDecision(done=False, basis=None, sha=None)
 
 
 # ---------------------------------------------------------------------------

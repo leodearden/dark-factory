@@ -805,30 +805,6 @@ class _PriorImplStatus(NamedTuple):
     """SHA read from metadata.json, or None if the file is absent."""
 
 
-@dataclass(frozen=True)
-class _RecoveryDecision:
-    """Result of :meth:`TaskWorkflow._resolve_already_merged`.
-
-    The journal-first outcome consumed by every already-merged guard
-    (:meth:`TaskWorkflow._recover_if_already_merged`,
-    :meth:`TaskWorkflow._recover_before_execute`,
-    :meth:`TaskWorkflow._recover_before_merge`) and passed straight through to
-    :meth:`TaskWorkflow._finalise_recovery_done` (PRD workflow-state-machine
-    α, Contract §8 MP-1/MP-2).
-    """
-
-    done: bool
-    """True iff the task should be finalised DONE via recovery."""
-
-    basis: str | None
-    """``'journal'`` (MergeProvenance hit) or ``'fallback'`` (legacy
-    ``_has_prior_implementation`` heuristic).  ``None`` iff ``done`` is False."""
-
-    sha: str | None
-    """Done-provenance commit SHA — ``row.advanced_sha`` for a journal hit,
-    the git main SHA for a fallback hit, ``None`` iff ``done`` is False."""
-
-
 class TaskWorkflow:
     """Per-task state machine."""
 
@@ -7440,30 +7416,6 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             base_commit=base_commit,
         )
 
-    def _resolve_already_merged(self, *, wt_head: str | None) -> _RecoveryDecision:
-        """Journal-first already-merged decision (PRD workflow-state-machine α, MP-1).
-
-        Consults :meth:`MergeProvenance.lookup` first: a hit is authoritative
-        and short-circuits before the legacy heuristic is ever consulted (the
-        landed-outbox journal is keyed by ``task_id``, independent of the
-        current worktree's git ancestry — a strictly more robust signal than
-        re-deriving merge state from the worktree on every re-run). A miss
-        falls back to the unchanged :meth:`_has_prior_implementation`
-        heuristic; *wt_head* is forwarded verbatim so callers keep their
-        existing SHA-primary-vs-iteration-log-scan semantics.
-
-        Returns a :class:`_RecoveryDecision` with ``sha=None`` on a fallback
-        hit — callers supply the git main SHA themselves (this method has no
-        access to it).
-        """
-        row: LandedRow | None = MergeProvenance.lookup(self.task_id)
-        if row is not None:
-            return _RecoveryDecision(done=True, basis='journal', sha=row.advanced_sha)
-        status = self._has_prior_implementation(wt_head=wt_head)
-        if status.has_work:
-            return _RecoveryDecision(done=True, basis='fallback', sha=None)
-        return _RecoveryDecision(done=False, basis=None, sha=None)
-
     async def _finalise_recovery_done(
         self, *, basis: str, sha: str, kind: str, note: str,
     ) -> WorkflowOutcome:
@@ -7472,7 +7424,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         The sole writer of :attr:`_merge_recovery_basis`.  Every already-merged
         guard's only route to a recovery-DONE goes through this method, so a
         recovery-DONE always carries an explicit provenance ``basis`` — either
-        ``'journal'`` (:meth:`_resolve_already_merged` found a
+        ``'journal'`` (a caller's :meth:`MergeProvenance.lookup` call found a
         :class:`~orchestrator.landed_outbox.LandedRow`) or ``'fallback'`` (the
         legacy :meth:`_has_prior_implementation` heuristic). Extracted and
         generalized from the pre-PLAN guard's original DONE tail.
