@@ -2150,6 +2150,99 @@ class TestClassifyAgentFailure:
         assert '1800000ms' in cls.summary
 
 
+class TestClassifyAgentFailureOutcomeProjection:
+    """Pin the DD-3 projection: classify_agent_failure derives its verdict
+    from a single classify_invocation call (task beta consumer-rewire), while
+    preserving every branch InvocationOutcome does not model.
+
+    The ``spy_classify.called`` assertions are RED today — classify_agent_failure
+    does not call classify_invocation at all yet — and turn GREEN once step-8's
+    re-derivation lands. The plain ``kind is`` assertions are contract locks:
+    they already hold today and must keep holding after the derivation change
+    — in particular, guarding against the API_ERROR branch being wrongly
+    narrowed to AuthFailed-only, since classify_invocation's AuthFailed only
+    covers {401, 403}, never 429/5xx.
+    """
+
+    def test_success_consistent_with_ok_outcome(self):
+        """result.success=True (classify_invocation -> OK) => kind SUCCESS,
+        and the verdict is actually derived via classify_invocation."""
+        result = AgentResult(success=True, output='done', subtype='success', turns=3)
+        with patch('shared.invocation_outcome.classify_invocation',
+                   wraps=classify_invocation) as spy_classify:
+            cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.SUCCESS
+        assert spy_classify.called, (
+            'classify_agent_failure must derive SUCCESS via classify_invocation (OK)'
+        )
+
+    @pytest.mark.parametrize('status', [401, 403])
+    def test_401_403_consistent_with_auth_failed_outcome(self, status):
+        """api_error_status in {401, 403} (classify_invocation -> AuthFailed)
+        => kind API_ERROR, and the verdict is actually derived via
+        classify_invocation."""
+        result = AgentResult(
+            success=False, output='Unauthorized', subtype='', api_error_status=status,
+        )
+        with patch('shared.invocation_outcome.classify_invocation',
+                   wraps=classify_invocation) as spy_classify:
+            cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.API_ERROR
+        assert spy_classify.called, (
+            'classify_agent_failure must derive API_ERROR via classify_invocation (AuthFailed)'
+        )
+
+    def test_non_4xx_api_error_status_still_api_error(self):
+        """A non-401/403 api_error_status (e.g. 500 — classify_invocation does
+        NOT tag this AuthFailed) must still classify as API_ERROR: this rule
+        is an AgentResult-field read InvocationOutcome does not model, and
+        must survive the derivation change as a superset of AuthFailed."""
+        result = AgentResult(
+            success=False, output='Internal error', subtype='', api_error_status=500,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.API_ERROR
+
+    def test_max_turns_preserved(self):
+        """subtype=='error_max_turns' => MAX_TURNS — not modelled by
+        InvocationOutcome, must be preserved as a direct AgentResult-field read."""
+        result = AgentResult(
+            success=False, output='', subtype='error_max_turns',
+            turns=75, output_tokens=12345,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.MAX_TURNS
+
+    def test_empty_output_preserved(self):
+        """subtype=='error_empty_output' => EMPTY_OUTPUT — not modelled by
+        InvocationOutcome, must be preserved as a direct AgentResult-field read."""
+        result = AgentResult(
+            success=False, output='', subtype='error_empty_output', turns=1,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.EMPTY_OUTPUT
+
+    def test_schema_salvaged_preserved(self):
+        """schema_salvaged=True => STRUCTURAL — not modelled by
+        InvocationOutcome, must be preserved as a direct AgentResult-field read."""
+        result = AgentResult(
+            success=False, output='', subtype='', schema_salvaged=True,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.STRUCTURAL
+
+    def test_timed_out_preserved(self):
+        """timed_out=True => TIMED_OUT — not modelled by InvocationOutcome,
+        must be preserved as a direct AgentResult-field read (and still beats
+        subtype-based rules, per the existing rule order)."""
+        result = AgentResult(
+            success=False, output='', subtype='error_max_turns',
+            turns=50, duration_ms=1_800_000, timed_out=True,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.TIMED_OUT
+
+
 class TestBuildFailureMessage:
     """Tests for the build_failure_message formatting helper."""
 
