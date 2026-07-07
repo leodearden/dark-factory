@@ -636,3 +636,207 @@ class TestDeleteJunkKey:
 
         graph.delete.assert_not_called()
         assert disposition == 'UNRESOLVED'
+
+
+# ===========================================================================
+# Helpers: run() fixtures
+#
+# run() queries the SAME graph key for two distinct purposes -- entity
+# enumeration (a family sibling) and total-node counting (every junk-key
+# candidate, INCLUDING that same sibling, per the "plus emptied family
+# siblings" junk-key policy) -- so a single graph mock must answer both
+# ro_query shapes correctly. These helpers are shared by TestRunDryRun and
+# TestRunApply.
+# ===========================================================================
+
+def _make_run_graph_mock(
+    entity_rows: list[list] | None = None,
+    total_count: int | None = None,
+) -> MagicMock:
+    """Graph mock whose ro_query dispatches on the Cypher text: the
+    Entity-enumeration query returns *entity_rows*, the total-count query
+    returns [[*total_count*]]. Defaults total_count to len(entity_rows) when
+    not given explicitly."""
+    entity_rows = entity_rows if entity_rows is not None else []
+    if total_count is None:
+        total_count = len(entity_rows)
+
+    async def _ro_query(cypher: str, params: dict | None = None):
+        result = MagicMock()
+        result.result_set = entity_rows if 'Entity' in cypher else [[total_count]]
+        return result
+
+    graph = MagicMock()
+    graph.ro_query = AsyncMock(side_effect=_ro_query)
+    graph.query = AsyncMock()
+    graph.delete = AsyncMock(return_value=None)
+    return graph
+
+
+def _make_run_graphiti_mock(
+    entity_rows_by_key: dict[str, list] | None = None,
+    total_count_by_key: dict[str, int] | None = None,
+) -> MagicMock:
+    """MagicMock graphiti whose _graph_for(key) MEMOIZES one graph mock per
+    key -- the same mock instance is returned across repeat calls for a key
+    -- configured via _make_run_graph_mock. Keys without an explicit fixture
+    default to an empty/zero-count graph. The per-key mocks are exposed via
+    ._graphs_by_key for post-call assertions (e.g. .delete/.query
+    not-called)."""
+    entity_rows_by_key = entity_rows_by_key or {}
+    total_count_by_key = total_count_by_key or {}
+    graphs: dict[str, MagicMock] = {}
+
+    def _graph_for(key: str) -> MagicMock:
+        if key not in graphs:
+            rows = entity_rows_by_key.get(key, [])
+            count = total_count_by_key.get(key, len(rows))
+            graphs[key] = _make_run_graph_mock(rows, count)
+        return graphs[key]
+
+    graphiti = MagicMock()
+    graphiti._graph_for = MagicMock(side_effect=_graph_for)
+    graphiti._graphs_by_key = graphs
+    return graphiti
+
+
+def _make_run_qdrant_mock(points_by_collection: dict[str, list] | None = None) -> AsyncMock:
+    """AsyncMock qdrant client whose scroll() dispatches on collection_name;
+    unlisted collections scroll as empty."""
+    points_by_collection = points_by_collection or {}
+
+    async def _scroll(*, collection_name: str, **_kwargs):
+        return (points_by_collection.get(collection_name, []), None)
+
+    client = AsyncMock()
+    client.scroll = AsyncMock(side_effect=_scroll)
+    client.upsert = AsyncMock(return_value=None)
+    client.delete_collection = AsyncMock(return_value=None)
+    return client
+
+
+def _make_run_memory_service(graphiti: MagicMock, qdrant_client: AsyncMock) -> MagicMock:
+    """MagicMock memory_service wired the way run() consumes it: .graphiti
+    directly, and the raw Qdrant transport via .mem0._get_async_qdrant()
+    (PRD reuse note: mem0_client.py's _get_async_qdrant)."""
+    memory_service = MagicMock()
+    memory_service.graphiti = graphiti
+    memory_service.mem0 = MagicMock()
+    memory_service.mem0._get_async_qdrant = AsyncMock(return_value=qdrant_client)
+    return memory_service
+
+
+def _run_args(apply: bool = False, **overrides):
+    """SimpleNamespace stand-in for argparse.Namespace, mirroring the
+    purge_knowlive_namespace test suite's _args() helper."""
+    import types as _types
+    base = {'apply': apply}
+    base.update(overrides)
+    return _types.SimpleNamespace(**base)
+
+
+# ===========================================================================
+# Tests: run() -- dry-run path
+# ===========================================================================
+
+class TestRunDryRun:
+    """Tests for async run(args, memory_service, *, limit) in dry-run (args.apply=False)."""
+
+    def _scenario(self):
+        """One sibling with entity rows (know-live, unmerged); one non-empty
+        JUNK_KEYS entry (my-project); one collection with points
+        (fused_dark-factory). Every other alias/collection/key falls back to
+        the empty/zero-count default."""
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            total_count_by_key={'my-project': 3},
+        )
+        qdrant_client = _make_run_qdrant_mock(
+            points_by_collection={
+                'fused_dark-factory': [_make_point('p1', payload={'user_id': 'dark-factory'})],
+            },
+        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+        return memory_service, graphiti, qdrant_client
+
+    @pytest.mark.asyncio
+    async def test_dry_run_touches_nothing(self, monkeypatch):
+        """Dry-run performs ZERO mutations across every backend: no
+        move_entity_across_graphs, no qdrant upsert/delete_collection, no
+        GRAPH.DELETE, and read-only ro_query only (.query is NEVER called
+        on any graph)."""
+        move_mock = AsyncMock()
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        memory_service, graphiti, qdrant_client = self._scenario()
+
+        await _mod.run(_run_args(apply=False), memory_service, limit=1000)
+
+        move_mock.assert_not_called()
+        qdrant_client.upsert.assert_not_called()
+        qdrant_client.delete_collection.assert_not_called()
+        assert graphiti._graphs_by_key, 'expected at least one graph to have been touched'
+        for graph in graphiti._graphs_by_key.values():
+            graph.delete.assert_not_called()
+            graph.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_report_shape_and_dispositions(self):
+        """dry_run=True; a sibling with entity rows is MERGE; a collection
+        with points is MERGE; a non-empty JUNK_KEYS entry is UNRESOLVED even
+        in dry-run; an unmerged sibling is ALSO UNRESOLVED as a junk-key
+        candidate (its entities are still present, node_count > 0)."""
+        memory_service, _, _ = self._scenario()
+
+        report = await _mod.run(_run_args(apply=False), memory_service, limit=1000)
+
+        assert report['dry_run'] is True
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        assert graph_by_sibling['know-live']['canonical'] == 'know_live'
+        assert graph_by_sibling['know-live']['node_count'] == 1
+        assert graph_by_sibling['know-live']['node_uuids'] == ['uuid-1']
+        assert graph_by_sibling['know-live']['disposition'] == 'MERGE'
+
+        collection_by_source = {item['source']: item for item in report['collection_merges']}
+        assert collection_by_source['fused_dark-factory']['target'] == 'fused_dark_factory'
+        assert collection_by_source['fused_dark-factory']['point_count'] == 1
+        assert collection_by_source['fused_dark-factory']['disposition'] == 'MERGE'
+
+        junk_by_key = {item['key']: item for item in report['junk_key_deletions']}
+        assert junk_by_key['my-project']['node_count'] == 3
+        assert junk_by_key['my-project']['disposition'] == 'UNRESOLVED'
+        assert junk_by_key['test-project']['node_count'] == 0
+        assert junk_by_key['test-project']['disposition'] == 'DELETE'
+        assert junk_by_key['know-live']['node_count'] == 1
+        assert junk_by_key['know-live']['disposition'] == 'UNRESOLVED'
+
+    @pytest.mark.asyncio
+    async def test_dry_run_collection_unresolved_when_scroll_capped(self):
+        """A collection whose scroll hits --limit is UNRESOLVED, not MERGE:
+        no-silent-caps -- a capped scroll may be incomplete, so it must not
+        be reported as a clean merge."""
+        points = [_make_point(f'p{i}') for i in range(2)]
+        graphiti = _make_run_graphiti_mock()
+        qdrant_client = _make_run_qdrant_mock(
+            points_by_collection={'fused_dark-factory': points},
+        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=False), memory_service, limit=2)
+
+        collection_by_source = {item['source']: item for item in report['collection_merges']}
+        assert collection_by_source['fused_dark-factory']['disposition'] == 'UNRESOLVED'
+
+    @pytest.mark.asyncio
+    async def test_dry_run_sibling_unresolved_when_enumeration_capped(self):
+        """A sibling whose Entity enumeration hits --limit is UNRESOLVED,
+        not MERGE (same no-silent-caps guard as the collection scroll)."""
+        rows = [['uuid-1', 'Node A'], ['uuid-2', 'Node B']]
+        graphiti = _make_run_graphiti_mock(entity_rows_by_key={'know-live': rows})
+        qdrant_client = _make_run_qdrant_mock()
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=False), memory_service, limit=2)
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        assert graph_by_sibling['know-live']['disposition'] == 'UNRESOLVED'
