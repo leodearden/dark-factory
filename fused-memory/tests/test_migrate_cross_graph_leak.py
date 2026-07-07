@@ -683,6 +683,37 @@ class TestClassifyNode:
 
 
 # ===========================================================================
+# Tests: rekey_node_in_place (step-25/26 review-fix)
+# ===========================================================================
+
+class TestRekeyNodeInPlace:
+    """Tests for async rekey_node_in_place(graph, uuid, new_group_id).
+
+    Anti-data-loss invariant: an in-place re-key must NEVER open a
+    CREATE-then-DETACH-DELETE window -- it only ever SETs group_id.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rewrites_group_id_in_place_no_create_no_delete(self):
+        """Rewrites group_id via graph.query (a mutation, not ro_query): at
+        least one call carries 'SET' + 'group_id' with new_group_id as a
+        param, and NO call ever carries 'CREATE' or 'DETACH DELETE'."""
+        graph = _make_graph_mock()
+
+        await _mod.rekey_node_in_place(graph, 'u0', 'know_live')
+
+        graph.query.assert_awaited()
+        graph.ro_query.assert_not_called()
+        cyphers = [extract_cypher(call) for call in graph.query.call_args_list]
+        params_list = [extract_params(call) for call in graph.query.call_args_list]
+        assert any('SET' in c and 'group_id' in c for c in cyphers)
+        assert all('CREATE' not in c for c in cyphers)
+        assert all('DETACH DELETE' not in c for c in cyphers)
+        assert any(p.get('gid') == 'know_live' for p in params_list)
+        assert all(p.get('uuid') == 'u0' for p in params_list)
+
+
+# ===========================================================================
 # Tests: run() dry-run (step-13/14)
 # ===========================================================================
 
@@ -849,6 +880,104 @@ class TestRunApplyDispatch:
             'uuid': 'u-unresolved', 'disposition': _mod.UNRESOLVED,
             'applied': False, 'blocked': True,
         }]
+
+
+# ===========================================================================
+# Tests: run() REKEY apply + defensive source==target guard
+# (step-25/26 review-fix, Bug 1 data-loss)
+# ===========================================================================
+
+class TestRunApplyRekeyAndGuard:
+    """Tests for run() applying REKEY nodes and refusing malformed MOVE/MERGE
+    nodes whose source_graph == target_graph (the reviewer's data-loss trap:
+    dispatching either primitive with wrong==home DETACH DELETEs the node's
+    only copy)."""
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_apply_rekey_node_in_place_no_epsilon_call(self, tmp_path, monkeypatch):
+        """A REKEY node (source_graph == target_graph) never dispatches to
+        either epsilon primitive -- both are monkeypatched to explode if
+        invoked, as a hard guard against the data-loss bug this fixes.
+        Instead, the home graph receives an in-place group_id SET (no
+        CREATE/DETACH DELETE), the node is recorded applied (not blocked),
+        and a clean post-verify re-census yields exit_code 0."""
+        rekey_node = _classified_node(
+            'u-rekey', source_graph='know_live', target_graph='know_live',
+            disposition=_mod.REKEY,
+        )
+        manifest_path = self._write_manifest(tmp_path, [rekey_node], {'know_live': 1})
+
+        move_mock = AsyncMock(side_effect=AssertionError('must not be called for REKEY'))
+        merge_mock = AsyncMock(side_effect=AssertionError('must not be called for REKEY'))
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+
+        home_graph = _make_graph_mock(ro_pages=[[]])  # clean post-verify re-census
+        memory_service = _make_memory_service({'know_live': home_graph})
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        move_mock.assert_not_awaited()
+        merge_mock.assert_not_awaited()
+
+        cyphers = [extract_cypher(call) for call in home_graph.query.call_args_list]
+        assert cyphers, 'expected at least one graph.query mutation for the rekey'
+        assert any('SET' in c and 'group_id' in c for c in cyphers)
+        assert all('CREATE' not in c for c in cyphers)
+        assert all('DETACH DELETE' not in c for c in cyphers)
+
+        rekey_result = [r for r in report['apply_results'] if r['uuid'] == 'u-rekey']
+        assert rekey_result == [{
+            'uuid': 'u-rekey', 'disposition': _mod.REKEY, 'applied': True, 'blocked': False,
+        }]
+        assert report['exit_code'] == 0
+
+    @pytest.mark.asyncio
+    async def test_move_or_merge_with_source_equals_target_is_refused(self, tmp_path, monkeypatch):
+        """A malformed/hand-edited manifest carrying a MOVE or MERGE node
+        whose source_graph == target_graph (never produced by a correctly-
+        behaving classify_node -- that's REKEY's territory) is REFUSED, not
+        dispatched: dispatching it would make move_entity_across_graphs /
+        merge_foreign_duplicate DETACH DELETE the node's only copy. Both
+        nodes are recorded blocked and force a non-zero exit_code even
+        though the mock re-census otherwise reconciles."""
+        bad_move = _classified_node(
+            'u-bad-move', source_graph='know_live', target_graph='know_live',
+            disposition=_mod.MOVE,
+        )
+        bad_merge = _classified_node(
+            'u-bad-merge', source_graph='reify', target_graph='reify', disposition=_mod.MERGE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [bad_move, bad_merge], {'know_live': 1, 'reify': 1},
+        )
+
+        move_mock = AsyncMock()
+        merge_mock = AsyncMock()
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+
+        memory_service = _make_memory_service({
+            'know_live': _make_graph_mock(ro_pages=[[]]),
+            'reify': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        move_mock.assert_not_awaited()
+        merge_mock.assert_not_awaited()
+        blocked_uuids = {r['uuid'] for r in report['apply_results'] if r['blocked']}
+        assert blocked_uuids == {'u-bad-move', 'u-bad-merge'}
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] != 0
 
 
 # ===========================================================================
