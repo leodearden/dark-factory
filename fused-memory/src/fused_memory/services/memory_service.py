@@ -1039,7 +1039,13 @@ class MemoryService:
         # write-time guarantee rather than a best-effort post-hoc race. This
         # is what obsoletes the recurring "duplicate Graphiti node -> manual
         # FalkorDB merge" operator runbook (tasks 2073/2081/2110/2118, the
-        # /unblock Graphiti-dedup protocol). Graphiti-only critical section —
+        # /unblock Graphiti-dedup protocol). This method is the fallthrough
+        # dispatch target in _execute_durable_write (:474) for every queued
+        # operation other than 'mem0_add'/'mem0_classify_and_add' — so both
+        # 'add_episode' AND 'add_memory_graphiti' writes acquire this lock,
+        # meaning ALL Graphiti writes for a given group_id fully serialize,
+        # not just add_episode (intended per B1; distinct group_ids/projects
+        # still proceed concurrently). Graphiti-only critical section —
         # _execute_mem0_write never acquires this lock (B3).
         async with self.graphiti._identity_lock_for(payload['group_id']):
             result = await self._journaled_backend_call(
