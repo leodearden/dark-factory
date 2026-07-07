@@ -1238,6 +1238,16 @@ class Harness:
             except Exception as e:
                 logger.warning(f'Failed to reap orphaned merge worktrees: {e}')
 
+            # 1c0a3. Reconcile the durable LandedOutbox (task 2155, W1 γ):
+            # closes the crash window between a merge advancing main and the
+            # task being marked done. Runs after the reap block so a worker
+            # (and its bound LandedOutbox) is fully settled first. Own
+            # try/except so a reconciler fault never blocks startup.
+            try:
+                await self._reconcile_landed_outbox()
+            except Exception as e:
+                logger.warning(f'Failed to reconcile landed outbox: {e}')
+
             # 1c0b. File the L1 escalation for a pause restored from a prior
             # run (deferred from _load_persisted_scheduler_pause, which ran
             # before the escalation queue existed).  Placed after the stale-L0
@@ -6663,6 +6673,34 @@ Output JSON matching the schema. Every task must appear in the output.
             '_reap_orphaned_merge_worktrees: readopted=%d reaped=%d',
             len(report.get('readopted', [])),
             len(report.get('reaped', [])),
+        )
+
+    async def _reconcile_landed_outbox(self) -> None:
+        """Reconcile the durable LandedOutbox at startup (task 2155, W1 γ).
+
+        Closes the crash window between a merge advancing ``main`` and the
+        task being marked done: delegates to the module-level
+        :func:`reconcile_landed_outbox`, which resolves each unconsumed row
+        to RC-1 (not actually landed → prune, no phantom done), RC-2 (landed
+        but not yet marked done → drive the done-write, then prune), or RC-3
+        (already done → prune only, no second done-write).  A no-op when the
+        merge worker is absent (disabled / not yet constructed) or has no
+        bound ``LandedOutbox``, mirroring
+        :meth:`_reap_orphaned_merge_worktrees`'s None-guard.
+        """
+        if self._merge_worker is None or self._merge_worker._landed_outbox is None:
+            return
+        report = await reconcile_landed_outbox(
+            self._merge_worker._landed_outbox, self.git_ops, self.scheduler,
+        )
+        logger.info(
+            '_reconcile_landed_outbox: pruned_not_landed=%d marked_done=%d '
+            'already_done_pruned=%d skipped=%d errors=%d',
+            report.get('pruned_not_landed', 0),
+            report.get('marked_done', 0),
+            report.get('already_done_pruned', 0),
+            report.get('skipped', 0),
+            report.get('errors', 0),
         )
 
     async def _stop_escalation_server(self) -> None:
