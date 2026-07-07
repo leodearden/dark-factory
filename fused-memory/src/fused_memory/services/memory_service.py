@@ -8,6 +8,7 @@ import logging
 import re
 import time
 import uuid as uuid_mod
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -304,6 +305,27 @@ class SearchResults(list):
         self.failed_stores: list[str] = failed_stores if failed_stores is not None else []
 
 
+@dataclass
+class ReconcileStats:
+    """Aggregated counts from one ``_reconcile_episode_identity`` run.
+
+    Returned to the caller and logged for observability — NOT wired into the
+    durable write-journal schema (extending that schema is out of scope for
+    task 2202 / W6-β). Each field mirrors the int return of the
+    correspondingly-named post-write sweep. ``errors`` collects the label of
+    any sub-pass that raised (task 2202 step-4's best-effort guard); an
+    all-zeros, empty-errors instance signals a fully-converged, idempotent
+    reconcile.
+    """
+
+    edges_deduped: int = 0
+    dependency_edges_restored: int = 0
+    sibling_edges_restored: int = 0
+    nodes_resolved: int = 0
+    task_names_normalized: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
@@ -513,25 +535,30 @@ class MemoryService:
         return await self.graphiti.bulk_remove_edges(duplicates, group_id=group_id)
 
     async def _dedup_episode_nodes(self, result: Any, *, group_id: str) -> int:
-        """Merge exact-name duplicate entity nodes minted within a single add_episode call.
+        """Resolve/collapse exact-name duplicate entity nodes touched by one add_episode call.
 
         graphiti_core's ingestion-time entity resolution (resolve_extracted_nodes)
         only resolves each extracted node against candidates surfaced by hybrid
         embedding+BM25 search — there is no guaranteed exact-name Cypher lookup.
         When that search misses an existing canonical node, ingestion mints a
         brand-new node even though a node with the exact same name already
-        exists. This sweep re-checks each entity name this episode touched via
-        ``find_duplicate_entity_nodes`` and merges any duplicates it finds into
-        the canonical survivor (most valid edges, then oldest, then lowest
-        uuid) via ``merge_entities``.
+        exists. This sweep re-checks each entity name this episode touched by
+        delegating to α's (task 2198) write-time-identity chokepoint
+        ``GraphitiBackend._resolve_or_create_entity``, which resolves a lone
+        match, no-ops on zero matches, and collapses >=2 matches into a
+        canonical survivor via ``merge_entities``.
 
         Modelled on ``_dedup_episode_edges``; handles None / empty result the
-        same way. Each merge is best-effort (mirrors
+        same way. Each resolve is best-effort (mirrors
         ``_restore_superseded_dependency_edges``): a transient backend error
-        merging one duplicate must not fail an already-committed episode
-        write, and must not stop subsequent duplicates/names from being
-        processed. Unmerged duplicates simply survive to be healed the next
-        time an episode touches that name.
+        resolving one name must not fail an already-committed episode write,
+        and must not stop subsequent names from being processed. Unresolved
+        names simply survive to be healed the next time an episode touches
+        that name.
+
+        Callers (``_reconcile_episode_identity``) MUST run this under α's
+        ``_identity_lock_for(group_id)`` — ``_resolve_or_create_entity``
+        performs no locking of its own.
 
         Args:
             result: The value returned by ``add_episode`` (typically an
@@ -540,8 +567,10 @@ class MemoryService:
                     gracefully.
 
         Returns:
-            Number of duplicate nodes successfully merged into their
-            canonical survivor (0 when nothing to do).
+            Number of distinct names that resolved to a non-None uuid (0
+            when nothing to do). This is a resolve count, not a merge
+            count — a name can resolve without any collapse having been
+            necessary.
         """
         if result is None:
             return 0
@@ -559,39 +588,34 @@ class MemoryService:
             seen.add(name)
             names.append(name)
 
-        merged = 0
+        resolved = 0
         failed = 0
         for name in names:
-            matches = await self.graphiti.find_duplicate_entity_nodes(name, group_id=group_id)
-            if len(matches) < 2:
-                continue
-            survivor = matches[0]['uuid']
-            for dup in matches[1:]:
-                dup_uuid = dup['uuid']
-                try:
-                    await self.graphiti.merge_entities(dup_uuid, survivor, group_id=group_id)
-                    merged += 1
-                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                    raise
-                except Exception:
-                    # Best-effort: a transient backend error (lock contention,
-                    # write timeout) must not fail an already-committed episode
-                    # write.  Log and continue so the episode reports success.
-                    logger.exception(
-                        'Failed to merge exact-name duplicate node %s -> %s after '
-                        'add_episode; will retry on next episode',
-                        dup_uuid, survivor,
-                    )
-                    failed += 1
+            try:
+                uuid = await self.graphiti._resolve_or_create_entity(name, group_id=group_id)
+                if uuid is not None:
+                    resolved += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Best-effort: a transient backend error (lock contention,
+                # write timeout) must not fail an already-committed episode
+                # write.  Log and continue so the episode reports success.
+                logger.exception(
+                    'Failed to resolve exact-name entity %r after add_episode; '
+                    'will retry on next episode',
+                    name,
+                )
+                failed += 1
 
-        if merged > 0:
-            logger.info('Merged %d exact-name duplicate node(s) after add_episode', merged)
+        if resolved > 0:
+            logger.info('Resolved %d exact-name entity/entities after add_episode', resolved)
         if failed > 0:
             logger.warning(
-                'Failed to merge %d exact-name duplicate node(s) after add_episode',
+                'Failed to resolve %d exact-name entity/entities after add_episode',
                 failed,
             )
-        return merged
+        return resolved
 
     async def _restore_superseded_dependency_edges(
         self, result: Any, *, group_id: str
@@ -902,6 +926,88 @@ class MemoryService:
             )
         return fixed
 
+    async def _reconcile_episode_identity(
+        self, result: Any, *, group_id: str
+    ) -> ReconcileStats:
+        """Fold the five post-write identity/dedup sweeps into one call.
+
+        Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
+        runs immediately after ``add_episode``, inside α's (task 2198)
+        per-group identity lock — making entity identity a write-time
+        guarantee instead of a best-effort post-hoc sweep. This obsoletes the
+        recurring "duplicate Graphiti node -> manual FalkorDB merge" operator
+        runbook (tasks 2073/2081/2110/2118, the /unblock Graphiti-dedup
+        protocol): those incidents arose because the sweeps ran outside any
+        lock and could race with a concurrent same-group write; folding them
+        into one locked reconcile closes that race.
+
+        Runs the five sub-passes in their pre-existing chain order —
+        dependency-restore before sibling-restore, matching the ordering
+        this replaces at the ``_execute_graphiti_write`` call site (a
+        dependency edge must be un-superseded before the sibling-restore
+        pass considers it, so it is correctly skipped there rather than
+        double-processed) — and aggregates each sub-pass's int return into
+        the matching ``ReconcileStats`` field.
+
+        Each sub-pass runs under its own best-effort guard: a generic
+        ``Exception`` is logged and recorded as that sub-pass's label in
+        ``ReconcileStats.errors`` (leaving its count at 0), and the
+        remaining sub-passes still run — a single sub-pass failure must
+        never fail the already-committed episode write.
+        ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` are never
+        swallowed; they propagate immediately and skip any later sub-passes.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                AddEpisodeResults object), forwarded verbatim to every
+                sub-pass.
+            group_id: The project graph this episode was written to.
+
+        Returns:
+            A ReconcileStats aggregating every sub-pass's count (and any
+            per-sub-pass failure labels).
+        """
+        stats = ReconcileStats()
+
+        async def _run_pass(label: str, coro: Any) -> int:
+            try:
+                return await coro
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Best-effort: one sub-pass's transient backend error must
+                # not fail the others, nor the already-committed episode
+                # write. Log, record the label, and continue.
+                logger.exception(
+                    'Sub-pass %s failed during _reconcile_episode_identity; '
+                    'continuing with the remaining sub-passes',
+                    label,
+                )
+                stats.errors.append(label)
+                return 0
+
+        stats.edges_deduped = await _run_pass(
+            '_dedup_episode_edges',
+            self._dedup_episode_edges(result, group_id=group_id),
+        )
+        stats.dependency_edges_restored = await _run_pass(
+            '_restore_superseded_dependency_edges',
+            self._restore_superseded_dependency_edges(result, group_id=group_id),
+        )
+        stats.sibling_edges_restored = await _run_pass(
+            '_restore_falsely_superseded_sibling_edges',
+            self._restore_falsely_superseded_sibling_edges(result, group_id=group_id),
+        )
+        stats.nodes_resolved = await _run_pass(
+            '_dedup_episode_nodes',
+            self._dedup_episode_nodes(result, group_id=group_id),
+        )
+        stats.task_names_normalized = await _run_pass(
+            '_normalize_task_node_names',
+            self._normalize_task_node_names(result, group_id=group_id),
+        )
+        return stats
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -927,39 +1033,45 @@ class MemoryService:
                     reference_time_iso,
                 )
 
-        result = await self._journaled_backend_call(
-            write_op_id=write_op_id,
-            causation_id=causation_id,
-            backend='graphiti',
-            operation='add_episode',
-            payload={'content': payload['content'][:200], 'group_id': payload.get('group_id')},
-            coro=self.graphiti.add_episode(
-                name=payload.get('name', ''),
-                content=payload['content'],
-                source=episode_type,
-                group_id=payload['group_id'],
-                source_description=payload.get('source_description', ''),
-                uuid=payload.get('uuid'),
-                temporal_context=temporal_context,
-                reference_time=reference_time,
-            ),
-        )
-        # Post-write dedup: remove duplicate edges created within this episode
-        await self._dedup_episode_edges(result, group_id=payload['group_id'])
-        # Post-write restore: undo false dependency-edge supersessions
-        await self._restore_superseded_dependency_edges(result, group_id=payload['group_id'])
-        # Post-write restore: undo false sibling-edge supersessions — edges
-        # invalidated by graphiti's per-node-pair heuristic whose node-pair
-        # is not restated by any surviving edge in this same write (must run
-        # after the dependency restore above so already-cleared dependency
-        # edges are simply skipped here, not double-processed)
-        await self._restore_falsely_superseded_sibling_edges(result, group_id=payload['group_id'])
-        # Post-write node dedup: merge exact-name duplicate entity nodes that
-        # graphiti_core ingestion failed to reuse
-        await self._dedup_episode_nodes(result, group_id=payload['group_id'])
-        # Post-write task-node-name canonicalization: rename/merge non-canonical
-        # task-entity node names (e.g. 'task 132') to the canonical 'Task N' form
-        await self._normalize_task_node_names(result, group_id=payload['group_id'])
+        # Write-time identity gate (task 2202 / W6-β): add_episode and the
+        # folded post-write reconcile run as ONE critical section under α's
+        # (task 2198) per-group_id identity lock, so entity identity is a
+        # write-time guarantee rather than a best-effort post-hoc race. This
+        # is what obsoletes the recurring "duplicate Graphiti node -> manual
+        # FalkorDB merge" operator runbook (tasks 2073/2081/2110/2118, the
+        # /unblock Graphiti-dedup protocol). This method is the fallthrough
+        # dispatch target in _execute_durable_write (:474) for every queued
+        # operation other than 'mem0_add'/'mem0_classify_and_add' — so both
+        # 'add_episode' AND 'add_memory_graphiti' writes acquire this lock,
+        # meaning ALL Graphiti writes for a given group_id fully serialize,
+        # not just add_episode (intended per B1; distinct group_ids/projects
+        # still proceed concurrently). Graphiti-only critical section —
+        # _execute_mem0_write never acquires this lock (B3).
+        async with self.graphiti._identity_lock_for(payload['group_id']):
+            result = await self._journaled_backend_call(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend='graphiti',
+                operation='add_episode',
+                payload={'content': payload['content'][:200], 'group_id': payload.get('group_id')},
+                coro=self.graphiti.add_episode(
+                    name=payload.get('name', ''),
+                    content=payload['content'],
+                    source=episode_type,
+                    group_id=payload['group_id'],
+                    source_description=payload.get('source_description', ''),
+                    uuid=payload.get('uuid'),
+                    temporal_context=temporal_context,
+                    reference_time=reference_time,
+                ),
+            )
+            reconcile_stats = await self._reconcile_episode_identity(
+                result, group_id=payload['group_id'],
+            )
+            logger.debug(
+                'Reconciled episode identity for group_id=%r: %r',
+                payload['group_id'], reconcile_stats,
+            )
 
         # Register planning episodes so they can be filtered from search results
         if temporal_context == 'planning' and self.planned_episode_registry is not None:

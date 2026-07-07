@@ -29,6 +29,8 @@ async def service_with_real_registry(mock_config, tmp_path):
     The durable queue is also mocked so we can call internal methods directly
     without spinning up queue workers.
     """
+    from _fm_helpers import install_identity_mocks
+
     svc = MemoryService(mock_config)
 
     # Wire real registry (bypasses initialize() to avoid durable queue creation)
@@ -41,6 +43,7 @@ async def service_with_real_registry(mock_config, tmp_path):
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti.search = AsyncMock(return_value=[])
     svc.graphiti.bulk_remove_edges = AsyncMock(return_value=0)
+    install_identity_mocks(svc.graphiti)
 
     # Mock Mem0 backend
     svc.mem0 = MagicMock()

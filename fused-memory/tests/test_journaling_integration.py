@@ -21,6 +21,8 @@ async def write_journal(tmp_path):
 @pytest.fixture
 def service(mock_config, write_journal):
     """MemoryService with mocked backends and real WriteJournal."""
+    from _fm_helpers import install_identity_mocks
+
     svc = MemoryService(mock_config)
     svc.graphiti = MagicMock()
     svc.graphiti.search = AsyncMock(return_value=[])
@@ -28,6 +30,7 @@ def service(mock_config, write_journal):
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti.remove_episode = AsyncMock()
     svc.graphiti.remove_edge = AsyncMock()
+    install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})

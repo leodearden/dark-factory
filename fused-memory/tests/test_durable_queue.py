@@ -1104,9 +1104,23 @@ class TestStats:
             group_id='proj1', operation='add_episode',
             payload={'content': 'good2', 'group_id': 'proj1', 'name': 'ep3'},
         )
-        await asyncio.sleep(1.0)
+        # Poll until both successful items complete and the failing item
+        # dead-letters. A fixed sleep raced under full-suite CPU load: the two
+        # 'good' writes had not both drained yet, yielding completed==1 (see
+        # _poll_until_dead's rationale — same fix, both terminal counts).
+        deadline = asyncio.get_event_loop().time() + 5.0
+        while True:
+            stats = await q.get_stats()
+            counts = stats['counts']
+            if counts.get('completed', 0) >= 2 and counts.get('dead', 0) >= 1:
+                break
+            if asyncio.get_event_loop().time() >= deadline:
+                raise AssertionError(
+                    f'Timed out waiting for completed>=2 and dead>=1; '
+                    f'last counts={counts}'
+                )
+            await asyncio.sleep(0.05)
 
-        stats = await q.get_stats()
         assert stats['counts'].get('completed', 0) == 2
         assert stats['counts'].get('dead', 0) == 1
         await q.close()

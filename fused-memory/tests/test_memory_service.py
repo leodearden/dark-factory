@@ -17,6 +17,8 @@ from fused_memory.services.memory_service import MemoryService, _serialize_tempo
 @pytest.fixture
 def service(mock_config):
     """MemoryService with mocked backends (no real DB needed)."""
+    from _fm_helpers import install_identity_mocks
+
     svc = MemoryService(mock_config)
     # Mock backends
     svc.graphiti = MagicMock()
@@ -34,6 +36,7 @@ def service(mock_config):
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
@@ -2522,200 +2525,126 @@ class TestDedupEpisodeEdges:
 
 class TestDedupEpisodeNodes:
     """Unit tests for MemoryService._dedup_episode_nodes — the post-write
-    exact-name node-dedup sweep that merges duplicate entity nodes
-    graphiti_core's ingestion-time resolution failed to catch (task 2073).
+    node-identity sweep that routes each distinct touched entity name
+    through α's (task 2198) write-time-identity chokepoint
+    ``_resolve_or_create_entity``, instead of driving
+    find_duplicate_entity_nodes/merge_entities directly (task 2202 / W6-β,
+    step-1/2).
 
-    step-3: core behavior — merges deprecated dups into the canonical
-            survivor, de-dupes repeated names to a single lookup, no-ops on
-            None/empty/<2 matches, skips nodes with empty/missing name.
+    core behavior — awaits _resolve_or_create_entity once per distinct
+    touched name, de-dupes repeated names to a single call, no-ops on
+    None/empty result, skips nodes with empty/missing name, counts only
+    names that resolved to a non-None uuid.
 
-    step-5: best-effort resilience — a merge_entities failure for one
-            duplicate/name does not propagate and does not stop subsequent
-            duplicates/names from being processed.
+    best-effort resilience — a _resolve_or_create_entity failure for one
+    name does not propagate and does not stop subsequent names from being
+    processed.
+
+    B2 — a stateful fake demonstrates cross-episode convergence: two
+    episodes that each mint a node named 'Foo' collapse to one survivor
+    once _dedup_episode_nodes runs for each, and a further sweep on the
+    already-converged state is idempotent.
     """
 
     @pytest.mark.asyncio
-    async def test_merges_deprecated_into_canonical_survivor(self, service):
-        """3 canonical-ordered dups -> 2 merge_entities calls (dep, canon), returns 2."""
+    async def test_resolves_each_distinct_name_once(self, service):
+        """Repeated node names collapse to ONE _resolve_or_create_entity
+        call per distinct name; each call resolving to a non-None uuid
+        counts, so the total equals the number of distinct names."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'canon', 'created_at': 100, 'edge_count': 5},
-            {'uuid': 'd1', 'created_at': 200, 'edge_count': 2},
-            {'uuid': 'd2', 'created_at': 300, 'edge_count': 1},
-        ])
-        service.graphiti.merge_entities = AsyncMock(return_value={})
-
-        result = MockAddEpisodeResult(nodes=[
-            MockNode(name='orchestrator-reify.service'),
-            MockNode(name='orchestrator-reify.service'),
-        ])
-
-        merged = await service._dedup_episode_nodes(result, group_id='test')
-
-        assert merged == 2
-        assert service.graphiti.merge_entities.await_count == 2
-        calls = service.graphiti.merge_entities.call_args_list
-        assert calls[0][0] == ('d1', 'canon')
-        assert calls[0][1] == {'group_id': 'test'}
-        assert calls[1][0] == ('d2', 'canon')
-        assert calls[1][1] == {'group_id': 'test'}
-
-    @pytest.mark.asyncio
-    async def test_repeated_name_dedupes_lookup_to_one_call(self, service):
-        """Distinct names are collected; find_duplicate_entity_nodes awaited once per name."""
-        from _fm_helpers import MockAddEpisodeResult, MockNode
-
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'canon', 'created_at': 100, 'edge_count': 5},
-            {'uuid': 'd1', 'created_at': 200, 'edge_count': 2},
-        ])
-        service.graphiti.merge_entities = AsyncMock(return_value={})
-
-        result = MockAddEpisodeResult(nodes=[
-            MockNode(name='orchestrator-reify.service'),
-            MockNode(name='orchestrator-reify.service'),
-            MockNode(name='orchestrator-reify.service'),
-        ])
-
-        await service._dedup_episode_nodes(result, group_id='test')
-
-        service.graphiti.find_duplicate_entity_nodes.assert_awaited_once_with(
-            'orchestrator-reify.service', group_id='test',
+        service.graphiti._resolve_or_create_entity = AsyncMock(
+            side_effect=['uuid-a', 'uuid-b'],
         )
+
+        result = MockAddEpisodeResult(nodes=[
+            MockNode(name='ServiceA'),
+            MockNode(name='ServiceA'),
+            MockNode(name='ServiceB'),
+        ])
+
+        resolved = await service._dedup_episode_nodes(result, group_id='test')
+
+        assert resolved == 2
+        assert service.graphiti._resolve_or_create_entity.await_count == 2
+        calls = service.graphiti._resolve_or_create_entity.call_args_list
+        assert calls[0][0] == ('ServiceA',)
+        assert calls[0][1] == {'group_id': 'test'}
+        assert calls[1][0] == ('ServiceB',)
+        assert calls[1][1] == {'group_id': 'test'}
 
     @pytest.mark.asyncio
     async def test_none_result_returns_zero(self, service):
         """None result -> 0, no backend calls."""
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
-        service.graphiti.merge_entities = AsyncMock(return_value={})
+        service.graphiti._resolve_or_create_entity = AsyncMock(return_value=None)
 
-        merged = await service._dedup_episode_nodes(None, group_id='test')
+        resolved = await service._dedup_episode_nodes(None, group_id='test')
 
-        assert merged == 0
-        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
-        service.graphiti.merge_entities.assert_not_awaited()
+        assert resolved == 0
+        service.graphiti._resolve_or_create_entity.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_empty_nodes_returns_zero(self, service):
         """Empty result.nodes -> 0, no backend calls."""
         from _fm_helpers import MockAddEpisodeResult
 
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
-        service.graphiti.merge_entities = AsyncMock(return_value={})
+        service.graphiti._resolve_or_create_entity = AsyncMock(return_value=None)
 
         result = MockAddEpisodeResult(nodes=[])
-        merged = await service._dedup_episode_nodes(result, group_id='test')
+        resolved = await service._dedup_episode_nodes(result, group_id='test')
 
-        assert merged == 0
-        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
-        service.graphiti.merge_entities.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_zero_matches_is_noop(self, service):
-        """find_duplicate_entity_nodes returns [] -> no merge, returns 0."""
-        from _fm_helpers import MockAddEpisodeResult, MockNode
-
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
-        service.graphiti.merge_entities = AsyncMock(return_value={})
-
-        result = MockAddEpisodeResult(nodes=[MockNode(name='Solo')])
-        merged = await service._dedup_episode_nodes(result, group_id='test')
-
-        assert merged == 0
-        service.graphiti.merge_entities.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_single_match_is_noop(self, service):
-        """find_duplicate_entity_nodes returns exactly 1 match -> no merge, returns 0."""
-        from _fm_helpers import MockAddEpisodeResult, MockNode
-
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'only', 'created_at': 100, 'edge_count': 0},
-        ])
-        service.graphiti.merge_entities = AsyncMock(return_value={})
-
-        result = MockAddEpisodeResult(nodes=[MockNode(name='Solo')])
-        merged = await service._dedup_episode_nodes(result, group_id='test')
-
-        assert merged == 0
-        service.graphiti.merge_entities.assert_not_awaited()
+        assert resolved == 0
+        service.graphiti._resolve_or_create_entity.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skips_nodes_with_empty_or_missing_name(self, service):
         """Nodes with falsy or entirely absent 'name' are excluded from lookup."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
-        service.graphiti.merge_entities = AsyncMock(return_value={})
+        service.graphiti._resolve_or_create_entity = AsyncMock(return_value=None)
 
         result = MockAddEpisodeResult(nodes=[
             MockNode(name=''),
             MockNode(name=None),  # type: ignore[arg-type]  # deliberately invalid: exercises falsy-name skip
             types.SimpleNamespace(),  # type: ignore[arg-type]  # no .name attribute at all
         ])
-        merged = await service._dedup_episode_nodes(result, group_id='test')
+        resolved = await service._dedup_episode_nodes(result, group_id='test')
 
-        assert merged == 0
-        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
-
-    # step-5: best-effort resilience
+        assert resolved == 0
+        service.graphiti._resolve_or_create_entity.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_merge_failure_is_swallowed_and_second_merge_still_attempted(
-        self, service, caplog,
-    ):
-        """A merge_entities failure for the first duplicate is swallowed; the
-        second duplicate is still attempted; only successful merges count."""
+    async def test_none_resolve_result_not_counted(self, service):
+        """A name that resolves to None (0 exact-name matches — a
+        documented no-op per α's contract) is not counted as resolved."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'canon', 'created_at': 100, 'edge_count': 5},
-            {'uuid': 'd1', 'created_at': 200, 'edge_count': 2},
-            {'uuid': 'd2', 'created_at': 300, 'edge_count': 1},
-        ])
-        service.graphiti.merge_entities = AsyncMock(
-            side_effect=[RuntimeError('lock contention'), {}],
+        service.graphiti._resolve_or_create_entity = AsyncMock(return_value=None)
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='Ghost')])
+        resolved = await service._dedup_episode_nodes(result, group_id='test')
+
+        assert resolved == 0
+        service.graphiti._resolve_or_create_entity.assert_awaited_once_with(
+            'Ghost', group_id='test',
         )
 
-        result = MockAddEpisodeResult(nodes=[MockNode(name='orchestrator-reify.service')])
-
-        with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
-            merged = await service._dedup_episode_nodes(result, group_id='test')
-
-        assert merged == 1, 'Only the second (successful) merge should count'
-        assert service.graphiti.merge_entities.await_count == 2, (
-            'The second duplicate must still be attempted after the first fails'
-        )
-        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
-        assert error_records, 'Expected an exception/error log for the failed merge'
+    # best-effort resilience
 
     @pytest.mark.asyncio
-    async def test_merge_failure_for_one_name_does_not_block_next_name(
+    async def test_resolve_failure_is_swallowed_and_next_name_still_attempted(
         self, service, caplog,
     ):
-        """When the first name's merge raises, the second name is still processed."""
+        """A _resolve_or_create_entity failure for one name is swallowed;
+        the next name is still attempted; only successful resolves count."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        async def fake_find_duplicates(name, *, group_id):
+        async def fake_resolve(name, *, group_id):
             if name == 'ServiceA':
-                return [
-                    {'uuid': 'canon-a', 'created_at': 100, 'edge_count': 5},
-                    {'uuid': 'dup-a', 'created_at': 200, 'edge_count': 1},
-                ]
-            return [
-                {'uuid': 'canon-b', 'created_at': 100, 'edge_count': 5},
-                {'uuid': 'dup-b', 'created_at': 200, 'edge_count': 1},
-            ]
-
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
-
-        async def fake_merge(dep_uuid, survivor, *, group_id):
-            if dep_uuid == 'dup-a':
                 raise RuntimeError('transient write timeout')
-            return {}
+            return 'uuid-b'
 
-        service.graphiti.merge_entities = AsyncMock(side_effect=fake_merge)
+        service.graphiti._resolve_or_create_entity = AsyncMock(side_effect=fake_resolve)
 
         result = MockAddEpisodeResult(nodes=[
             MockNode(name='ServiceA'),
@@ -2723,14 +2652,78 @@ class TestDedupEpisodeNodes:
         ])
 
         with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
-            merged = await service._dedup_episode_nodes(result, group_id='test')
+            resolved = await service._dedup_episode_nodes(result, group_id='test')
 
-        assert merged == 1, 'Only the ServiceB duplicate merge should succeed'
-        assert service.graphiti.find_duplicate_entity_nodes.await_count == 2, (
-            'Both names must be looked up even though the first name\'s merge failed'
+        assert resolved == 1, 'Only ServiceB should count as resolved'
+        assert service.graphiti._resolve_or_create_entity.await_count == 2, (
+            'ServiceB must still be attempted after ServiceA raises'
         )
-        calls = [c[0][0] for c in service.graphiti.merge_entities.call_args_list]
-        assert calls == ['dup-a', 'dup-b'], 'Both duplicate merges must be attempted'
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records, 'Expected an exception/error log for the failed resolve'
+
+    @pytest.mark.asyncio
+    async def test_b2_cross_episode_duplicate_name_collapses_to_one_node(self, service):
+        """B2: two episodes that each mint a node named 'Foo' converge to a
+        single survivor once _dedup_episode_nodes runs for each; a further
+        sweep on the already-converged state changes nothing (idempotent)."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        # Tiny in-memory name -> [uuid, ...] store simulating α's exact-name
+        # collapse: resolving always returns uuids[0] (the survivor) and,
+        # when more than one uuid is registered, collapses the list down to
+        # just the survivor — mirroring graphiti_client.py's survivor-first
+        # merge outcome without re-implementing it here.
+        store: dict[str, list[str]] = {}
+        next_uuid = [0]
+
+        def mint(name: str) -> None:
+            next_uuid[0] += 1
+            store.setdefault(name, []).append(f'n{next_uuid[0]}')
+
+        async def fake_resolve(name, *, group_id):
+            uuids = store.get(name, [])
+            if not uuids:
+                return None
+            survivor = uuids[0]
+            store[name] = [survivor]
+            return survivor
+
+        service.graphiti._resolve_or_create_entity = AsyncMock(side_effect=fake_resolve)
+        # find_duplicate_entity_nodes/merge_entities must NOT be driven by
+        # the new _dedup_episode_nodes; left as harmless no-op mocks so a
+        # regression to the old code path fails loudly via the store
+        # assertions below rather than an unrelated crash.
+        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        service.graphiti.merge_entities = AsyncMock(return_value={})
+
+        # Episode A mints the first 'Foo' node, then the sweep runs.
+        mint('Foo')
+        resolved_a = await service._dedup_episode_nodes(
+            MockAddEpisodeResult(nodes=[MockNode(name='Foo')]), group_id='test',
+        )
+        assert resolved_a == 1
+        survivor = store['Foo'][0]
+        assert store['Foo'] == [survivor]
+
+        # Episode B mints a SECOND 'Foo' node (graphiti_core's hybrid-search
+        # miss) — two nodes now share the name, until B's sweep collapses them.
+        mint('Foo')
+        assert len(store['Foo']) == 2, 'both nodes must exist before the sweep collapses them'
+
+        resolved_b = await service._dedup_episode_nodes(
+            MockAddEpisodeResult(nodes=[MockNode(name='Foo')]), group_id='test',
+        )
+
+        assert store['Foo'] == [survivor], 'duplicate Foo nodes must collapse to the one survivor'
+        assert resolved_b == 1
+
+        # Idempotency: a further sweep on the already-converged state
+        # resolves the same survivor again and mutates nothing further.
+        resolved_c = await service._dedup_episode_nodes(
+            MockAddEpisodeResult(nodes=[MockNode(name='Foo')]), group_id='test',
+        )
+        assert store['Foo'] == [survivor]
+        assert resolved_c == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2966,6 +2959,159 @@ class TestNormalizeTaskNodeNames:
         )
         error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert error_records, 'Expected an exception/error log for the failed rename'
+
+
+# ---------------------------------------------------------------------------
+# Tests for _reconcile_episode_identity  (task 2202 / W6-β, step 3)
+# ---------------------------------------------------------------------------
+
+class TestReconcileEpisodeIdentity:
+    """Unit tests for MemoryService._reconcile_episode_identity — the single
+    orchestration point (task 2202 / W6-β) that folds the five post-write
+    sweeps (_dedup_episode_edges, _restore_superseded_dependency_edges,
+    _restore_falsely_superseded_sibling_edges, _dedup_episode_nodes,
+    _normalize_task_node_names) into one call, run under α's (task 2198)
+    per-group identity lock. Preserves the pre-existing chain order —
+    dependency-restore before sibling-restore, per the ordering comment at
+    the _execute_graphiti_write call site — and aggregates each sub-pass's
+    int return into a ReconcileStats.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invokes_five_sub_passes_once_each_in_order(self, service):
+        """All five sub-passes are awaited exactly once, each with
+        (result, group_id='test'), in the preserved chain order, and their
+        int returns land in the matching ReconcileStats field."""
+        from unittest.mock import Mock
+
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=2)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=3)
+        service._dedup_episode_nodes = AsyncMock(return_value=4)
+        service._normalize_task_node_names = AsyncMock(return_value=5)
+
+        manager = Mock()
+        manager.attach_mock(service._dedup_episode_edges, '_dedup_episode_edges')
+        manager.attach_mock(
+            service._restore_superseded_dependency_edges, '_restore_superseded_dependency_edges'
+        )
+        manager.attach_mock(
+            service._restore_falsely_superseded_sibling_edges,
+            '_restore_falsely_superseded_sibling_edges',
+        )
+        manager.attach_mock(service._dedup_episode_nodes, '_dedup_episode_nodes')
+        manager.attach_mock(service._normalize_task_node_names, '_normalize_task_node_names')
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._dedup_episode_edges.assert_awaited_once_with(mock_result, group_id='test')
+        service._restore_superseded_dependency_edges.assert_awaited_once_with(
+            mock_result, group_id='test'
+        )
+        service._restore_falsely_superseded_sibling_edges.assert_awaited_once_with(
+            mock_result, group_id='test'
+        )
+        service._dedup_episode_nodes.assert_awaited_once_with(mock_result, group_id='test')
+        service._normalize_task_node_names.assert_awaited_once_with(mock_result, group_id='test')
+
+        expected_order = [
+            '_dedup_episode_edges',
+            '_restore_superseded_dependency_edges',
+            '_restore_falsely_superseded_sibling_edges',
+            '_dedup_episode_nodes',
+            '_normalize_task_node_names',
+        ]
+        call_order = [c[0] for c in manager.mock_calls if c[0] in expected_order]
+        assert call_order == expected_order, (
+            f'sub-passes must run in the preserved chain order, got {call_order!r}'
+        )
+
+        assert stats.edges_deduped == 1
+        assert stats.dependency_edges_restored == 2
+        assert stats.sibling_edges_restored == 3
+        assert stats.nodes_resolved == 4
+        assert stats.task_names_normalized == 5
+
+    @pytest.mark.asyncio
+    async def test_returns_reconcile_stats_instance_with_no_errors_on_success(self, service):
+        """The aggregated return value is a ReconcileStats instance (typed
+        field access, not a bare dict/tuple) with an empty errors list when
+        every sub-pass succeeds."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        from fused_memory.services.memory_service import ReconcileStats
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=0)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=0)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=0)
+        service._dedup_episode_nodes = AsyncMock(return_value=0)
+        service._normalize_task_node_names = AsyncMock(return_value=0)
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        assert isinstance(stats, ReconcileStats)
+        assert stats.errors == []
+
+    # best-effort per-sub-pass guard
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_in_one_sub_pass_is_swallowed_and_others_still_run(
+        self, service,
+    ):
+        """A generic Exception raised by one sub-pass (_dedup_episode_nodes)
+        does not propagate: the remaining sub-passes still run, the failed
+        sub-pass's label lands in ReconcileStats.errors, and the other
+        counts still reflect the sub-passes that succeeded."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=2)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=3)
+        service._dedup_episode_nodes = AsyncMock(side_effect=RuntimeError('lock contention'))
+        service._normalize_task_node_names = AsyncMock(return_value=5)
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._normalize_task_node_names.assert_awaited_once_with(
+            mock_result, group_id='test'
+        )
+        assert stats.edges_deduped == 1
+        assert stats.dependency_edges_restored == 2
+        assert stats.sibling_edges_restored == 3
+        assert stats.nodes_resolved == 0, 'the failed sub-pass must leave its count at the default'
+        assert stats.task_names_normalized == 5, 'sub-passes after the failure must still run'
+        assert '_dedup_episode_nodes' in stats.errors
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+    async def test_cancelled_keyboard_interrupt_system_exit_propagate(
+        self, service, exc_type,
+    ):
+        """CancelledError/KeyboardInterrupt/SystemExit raised by a sub-pass
+        DO propagate out of _reconcile_episode_identity (never swallowed),
+        and a later sub-pass never runs."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=2)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=3)
+        service._dedup_episode_nodes = AsyncMock(side_effect=exc_type('interrupted'))
+        service._normalize_task_node_names = AsyncMock(return_value=5)
+
+        with pytest.raises(exc_type):
+            await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._normalize_task_node_names.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -3205,6 +3351,178 @@ class TestExecuteGraphitiWriteWithDedup:
         assert service._restore_falsely_superseded_sibling_edges.call_args == (
             (mock_result,), {'group_id': 'test'},
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for the write-time identity gate (task 2202 step-5/6): the identity
+# lock wraps add_episode + _reconcile_episode_identity as one critical
+# section in _execute_graphiti_write.
+# ---------------------------------------------------------------------------
+
+class TestWriteTimeIdentityGate:
+    """_execute_graphiti_write holds α's per-group identity lock
+    (GraphitiBackend._identity_lock_for) across add_episode AND the new
+    _reconcile_episode_identity, making entity identity a write-time
+    guarantee (task 2202 / W6-β) instead of a best-effort post-hoc sweep.
+
+    Boundary signals per the W6 PRD:
+      B1 — two concurrent same-group_id writes serialize (their
+           add_episode+reconcile critical sections do not interleave), no
+           unhandled error, scoped to ONE group_id — group-scoped identity
+           only. Cross-graph isolation is task 2115's concern and is NOT
+           asserted here.
+      B2 — cross-episode duplicate-name collapse via the reconcile's
+           _resolve_or_create_entity sub-pass; exercised directly in
+           TestDedupEpisodeNodes (step-1/2), not repeated here.
+      B3 — a Mem0 write for the group is not serialized by the identity
+           lock (_execute_mem0_write never touches it — the lock is
+           Graphiti-only).
+    """
+
+    @pytest.mark.asyncio
+    async def test_lock_held_across_add_episode_and_reconcile_then_released(self, service):
+        """The SAME Lock object is held (locked() is True) both while
+        add_episode runs and while _reconcile_episode_identity runs, and is
+        released (locked() is False) once _execute_graphiti_write returns.
+        _reconcile_episode_identity is awaited with the add_episode result.
+
+        RED: today _execute_graphiti_write acquires no lock and never calls
+        _reconcile_episode_identity (it calls the five sweeps directly), so
+        the lock is never held and the reconcile awaited-with assertion
+        also fails.
+        """
+        from _fm_helpers import MockAddEpisodeResult
+
+        from fused_memory.services.memory_service import ReconcileStats
+
+        mock_result = MockAddEpisodeResult()
+        lock = service.graphiti._identity_lock_for('test')
+        observed_locked: dict[str, bool] = {}
+        observed_same_lock: dict[str, bool] = {}
+
+        async def fake_add_episode(*args, **kwargs):
+            observed_locked['add_episode'] = lock.locked()
+            observed_same_lock['add_episode'] = (
+                service.graphiti._identity_lock_for('test') is lock
+            )
+            return mock_result
+
+        async def fake_reconcile(result, *, group_id):
+            observed_locked['reconcile'] = lock.locked()
+            observed_same_lock['reconcile'] = (
+                service.graphiti._identity_lock_for(group_id) is lock
+            )
+            assert result is mock_result
+            assert group_id == 'test'
+            return ReconcileStats()
+
+        service.graphiti.add_episode = AsyncMock(side_effect=fake_add_episode)
+        service._reconcile_episode_identity = AsyncMock(side_effect=fake_reconcile)
+
+        payload = {
+            'name': 'ep_test',
+            'content': 'test content',
+            'source': 'text',
+            'group_id': 'test',
+            'source_description': '',
+        }
+        await service._execute_graphiti_write('add_episode', payload)
+
+        assert observed_locked.get('add_episode') is True, 'lock must be held during add_episode'
+        assert observed_locked.get('reconcile') is True, (
+            'lock must be held during _reconcile_episode_identity'
+        )
+        assert observed_same_lock.get('add_episode') is True
+        assert observed_same_lock.get('reconcile') is True
+        assert lock.locked() is False, 'lock must be released after _execute_graphiti_write returns'
+        service._reconcile_episode_identity.assert_awaited_once_with(mock_result, group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_group_writes_serialize_b1(self, service):
+        """B1: two concurrent _execute_graphiti_write calls for the SAME
+        group_id='test' do not interleave their add_episode+reconcile
+        critical sections, and neither raises. Scoped to one group_id only
+        — cross-graph isolation is task 2115's concern, not asserted here.
+
+        RED: with no lock, both calls' add_episode invocations overlap
+        (each yields at ``await asyncio.sleep(0)``), so the overlap
+        detector trips.
+        """
+        from _fm_helpers import MockAddEpisodeResult
+
+        from fused_memory.services.memory_service import ReconcileStats
+
+        active = 0
+        max_active = 0
+        overlap_detected = False
+
+        async def _bump():
+            nonlocal active, max_active, overlap_detected
+            active += 1
+            max_active = max(max_active, active)
+            if active > 1:
+                overlap_detected = True
+            await asyncio.sleep(0)
+            active -= 1
+
+        async def fake_add_episode(*args, **kwargs):
+            await _bump()
+            return MockAddEpisodeResult()
+
+        async def fake_reconcile(result, *, group_id):
+            await _bump()
+            return ReconcileStats()
+
+        service.graphiti.add_episode = AsyncMock(side_effect=fake_add_episode)
+        service._reconcile_episode_identity = AsyncMock(side_effect=fake_reconcile)
+
+        def make_payload(name):
+            return {
+                'name': name,
+                'content': 'test content',
+                'source': 'text',
+                'group_id': 'test',
+                'source_description': '',
+            }
+
+        results = await asyncio.gather(
+            service._execute_graphiti_write('add_episode', make_payload('a')),
+            service._execute_graphiti_write('add_episode', make_payload('b')),
+            return_exceptions=True,
+        )
+
+        assert not any(isinstance(r, BaseException) for r in results), results
+        assert not overlap_detected, (
+            'two concurrent same-group_id critical sections interleaved'
+        )
+        assert max_active == 1
+
+    @pytest.mark.asyncio
+    async def test_mem0_write_not_serialized_by_identity_lock_b3(self, service):
+        """B3: a Mem0 write for the same group_id completes without
+        blocking while the identity lock is held, and never touches
+        _identity_lock_for at all — the lock is Graphiti-only.
+
+        Not RED today: _execute_mem0_write never touched the Graphiti
+        identity lock even before this task, so this is a non-regression
+        guard for the invariant, pinned alongside (a)/(b) above."""
+        lock = service.graphiti._identity_lock_for('test')
+        service.graphiti._identity_lock_for.reset_mock()
+
+        await lock.acquire()
+        try:
+            payload = {
+                'content': 'some fact',
+                'project_id': 'test',
+                'agent_id': 'agent-1',
+                'metadata': {},
+            }
+            result = await asyncio.wait_for(service._execute_mem0_write(payload), timeout=1.0)
+        finally:
+            lock.release()
+
+        assert result == {'results': [{'id': 'mem0-1'}]}
+        service.graphiti._identity_lock_for.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

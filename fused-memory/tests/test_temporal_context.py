@@ -45,6 +45,8 @@ def backend(mock_config):
 @pytest.fixture
 def service(mock_config):
     """MemoryService with fully-mocked backends and durable queue."""
+    from _fm_helpers import install_identity_mocks
+
     svc = MemoryService(mock_config)
     svc.graphiti = MagicMock()
     svc.graphiti.add_episode = AsyncMock(return_value=None)
@@ -54,6 +56,7 @@ def service(mock_config):
     svc.graphiti.remove_episode = AsyncMock()
     svc.graphiti.remove_edge = AsyncMock()
     svc.graphiti._require_client = MagicMock()
+    install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
