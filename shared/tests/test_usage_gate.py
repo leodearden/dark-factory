@@ -1747,6 +1747,45 @@ class TestUncapViaTransition:
 
         assert acct.phase == AccountPhase.PROBING
 
+    async def test_total_pause_secs_not_double_counted_via_real_cap_path(self):
+        """Regression (reviewer_comprehensive/correctness): the REAL production
+        path (_handle_cap_detected -> _transition) stamps BOTH the per-account
+        pause_started_at AND the gate-level _pause_started_at at the same
+        instant, because this is the sole account and its cap closes the gate.
+        The two isolated tests above (test_transition_from_capped_to_probing_
+        resets_probe_count_and_consumes_pause and test_refresh_capped_accounts_
+        past_reset_transitions_to_probing) each backdate only ONE of the two
+        clocks, so they never exercise this production state and miss that the
+        CAPPED->PROBING uncap used to consume the same elapsed interval TWICE
+        — once via the per-account recovery block and once via the gate-reopen
+        branch — reporting a 120s pause as ~240s."""
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        # wait_for_reset=False already makes _start_account_resume_probe a
+        # no-op, but neutralize it explicitly so this test's intent (isolating
+        # the pause-accounting bug) doesn't depend on that unrelated guard.
+        gate._start_account_resume_probe = lambda a: None
+
+        gate._handle_cap_detected('cap', datetime.now(UTC), acct.token)
+
+        # The real path must stamp BOTH clocks together — the state the two
+        # isolated tests above never build.
+        assert acct.pause_started_at is not None
+        assert gate._pause_started_at is not None
+
+        backdated = datetime.now(UTC) - timedelta(seconds=120)
+        acct.pause_started_at = backdated
+        gate._pause_started_at = backdated
+        acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
+
+        await gate._refresh_capped_accounts()
+
+        assert 119 <= gate._total_pause_secs <= 121, (
+            f'expected a single ~120s count, got {gate._total_pause_secs} — '
+            'looks double-counted across the per-account and gate-level clocks'
+        )
+        assert 119 <= gate.total_pause_secs <= 121
+
 
 # ---------------------------------------------------------------------------
 # step-11/12: the auth-recovery (_reprobe_account) and demotion (_run_probe)
