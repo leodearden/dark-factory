@@ -18,8 +18,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
-from pydantic import ValidationError
-
 # Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
 # escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
 # type annotation; a separate runtime import is needed here because
@@ -28,6 +26,7 @@ from pydantic import ValidationError
 # nothing in it imports orchestrator.
 from escalation.dedupe import submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES
+from pydantic import ValidationError
 from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,

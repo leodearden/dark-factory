@@ -262,4 +262,4 @@ def test_ledger_verdict_is_frozen():
     verdict = _evaluate_no_plan(ledger, 'SHA-A')
 
     with pytest.raises(dataclasses.FrozenInstanceError):
-        verdict.escalate = False
+        verdict.escalate = False  # type: ignore[misc]
