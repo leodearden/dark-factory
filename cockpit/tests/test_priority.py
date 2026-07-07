@@ -268,6 +268,69 @@ class TestMonotonicAge:
         assert score(skewed, weights, _NOW) == score(zero_age, weights, _NOW)
 
 
+class TestTimezoneHandling:
+    def test_naive_filed_at_assumed_utc(self):
+        """A naive filed_at must be treated as UTC, not raise TypeError against an aware now."""
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        naive_item = _make_item(state='open', filed_at=datetime(2026, 7, 1))
+        aware_item = _make_item(state='open', filed_at=datetime(2026, 7, 1, tzinfo=UTC))
+
+        assert score(naive_item, weights, _NOW) == score(aware_item, weights, _NOW)
+
+    def test_naive_now_assumed_utc(self):
+        """A naive `now` must be treated as UTC, not raise TypeError against an aware filed_at."""
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        item = _make_item(state='open', filed_at=datetime(2026, 7, 1, tzinfo=UTC))
+        naive_now = datetime(2026, 7, 7)
+        aware_now = datetime(2026, 7, 7, tzinfo=UTC)
+
+        assert score(item, weights, naive_now) == score(item, weights, aware_now)
+
+
+class TestAgeCurveSaturationGuard:
+    def test_non_positive_saturation_seconds_does_not_raise(self):
+        """A misconfigured saturation_seconds<=0 must not raise ZeroDivisionError."""
+        from dataclasses import replace
+
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        zero_saturation = replace(
+            weights, age_curve=replace(weights.age_curve, saturation_seconds=0.0)
+        )
+        negative_saturation = replace(
+            weights, age_curve=replace(weights.age_curve, saturation_seconds=-1.0)
+        )
+        item = _make_item(state='open', filed_at=_NOW - timedelta(days=1))
+
+        assert isinstance(score(item, zero_saturation, _NOW), float)
+        assert isinstance(score(item, negative_saturation, _NOW), float)
+
+    def test_non_positive_saturation_seconds_treated_as_instant_saturation(self):
+        """Any positive age should get the full max_bonus; zero age gets none — still monotonic."""
+        from dataclasses import replace
+
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        zero_saturation = replace(
+            weights, age_curve=replace(weights.age_curve, saturation_seconds=0.0)
+        )
+        brand_new = _make_item(state='open', filed_at=_NOW)
+        one_second_old = _make_item(state='open', filed_at=_NOW - timedelta(seconds=1))
+        ancient = _make_item(state='open', filed_at=_NOW - timedelta(days=3650))
+
+        # Zero age gets no bonus; any positive age instantly saturates to the same score.
+        assert score(brand_new, zero_saturation, _NOW) < score(
+            one_second_old, zero_saturation, _NOW
+        )
+        assert score(one_second_old, zero_saturation, _NOW) == score(ancient, zero_saturation, _NOW)
+
+
 class TestDroppedBelowOpen:
     @given(dropped_fields=_ITEM_FIELDS, open_fields=_ITEM_FIELDS)
     def test_dropped_scores_below_open(self, dropped_fields, open_fields):

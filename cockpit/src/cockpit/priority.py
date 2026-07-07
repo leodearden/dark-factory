@@ -11,7 +11,7 @@ from __future__ import annotations
 import importlib.resources
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -99,13 +99,30 @@ STATE_TIER: dict[str, float] = {
 
 
 def score(item: ScoringItem, weights: Priorities, now: datetime) -> float:
-    """Score `item` for queue ordering. Pure: `now` is injected, no RNG."""
+    """Score `item` for queue ordering. Pure: `now` is injected, no RNG.
+
+    `now` and `item.filed_at` may independently be naive or tz-aware; a naive
+    datetime is assumed to already be UTC so a caller mixing the two shapes
+    never raises TypeError — a view must never crash on a timestamp shape it
+    didn't control.
+    """
     clamped_boost = max(weights.manual_boost.min, min(item.manual_boost, weights.manual_boost.max))
-    # max(0.0, ...) tolerates clock skew (now earlier than filed_at) by treating it as age 0.
-    age_seconds = max(0.0, (now - item.filed_at).total_seconds())
-    age_term = weights.age_curve.max_bonus * min(
-        1.0, age_seconds / weights.age_curve.saturation_seconds
+    filed_at = (
+        item.filed_at if item.filed_at.tzinfo is not None else item.filed_at.replace(tzinfo=UTC)
     )
+    now_aware = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    # max(0.0, ...) tolerates clock skew (now earlier than filed_at) by treating it as age 0.
+    age_seconds = max(0.0, (now_aware - filed_at).total_seconds())
+    saturation_seconds = weights.age_curve.saturation_seconds
+    if saturation_seconds > 0:
+        age_term = weights.age_curve.max_bonus * min(1.0, age_seconds / saturation_seconds)
+    else:
+        # A non-positive saturation_seconds is a misconfiguration (e.g. a
+        # hand-edited priorities.yaml with age_curve.saturation_seconds: 0).
+        # Treat it as instant saturation rather than dividing by zero/negative
+        # — this branch is what keeps score() a total function over any
+        # operator-supplied config.
+        age_term = weights.age_curve.max_bonus if age_seconds > 0 else 0.0
     raw = (
         weights.severity_weights.get(item.severity, weights.defaults.severity)
         + weights.category_weights.get(item.category, weights.defaults.category)
@@ -123,11 +140,21 @@ def _default_priorities_path() -> Path:
     return Path.home() / '.claude' / 'fleet' / 'priorities.yaml'
 
 
+def _read_bundled_defaults_text() -> str:
+    """Read the package-bundled priorities.default.yaml as raw text.
+
+    Shared by _load_bundled_defaults (which parses it) and
+    ensure_priorities_file (which writes it out verbatim) so the
+    bundled-resource lookup lives in exactly one place.
+    """
+    defaults_path = importlib.resources.files('cockpit').joinpath('priorities.default.yaml')
+    with importlib.resources.as_file(defaults_path) as p:
+        return p.read_text()
+
+
 def _load_bundled_defaults() -> dict[str, Any]:
     """Load the package-bundled priorities.default.yaml."""
-    defaults_path = importlib.resources.files('cockpit').joinpath('priorities.default.yaml')
-    with importlib.resources.as_file(defaults_path) as p, open(p) as f:
-        return yaml.safe_load(f) or {}
+    return yaml.safe_load(_read_bundled_defaults_text()) or {}
 
 
 def _priorities_from_dict(data: dict[str, Any]) -> Priorities:
@@ -206,9 +233,7 @@ def ensure_priorities_file(path: Path | None = None) -> None:
         return
 
     try:
-        defaults_path = importlib.resources.files('cockpit').joinpath('priorities.default.yaml')
-        with importlib.resources.as_file(defaults_path) as p:
-            contents = p.read_text()
+        contents = _read_bundled_defaults_text()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(contents)
     except OSError as exc:
