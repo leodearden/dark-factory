@@ -107,16 +107,16 @@ So the orchestrator's agents get structured code retrieval over the new repo. Th
 
 ## Stage 7 — Route by code presence
 
-Decide whether the repo already has substantive source (real modules under `src/`/packages, not just README + config). Spawn sessions with the bundled `/spawn` helper (`<dark-factory>/skills/spawn/spawn-claude.sh <cwd> <skip_perms> '<title>' '<prompt>'`, run in background — it blocks until the spawned session exits, so the background task's completion is your "done" signal). Use `cwd=<target>`.
+Decide whether the repo already has substantive source (real modules under `src/`/packages, not just README + config). Spawn sessions with the bundled `/spawn` helper (`<dark-factory>/skills/spawn/spawn-claude.sh <cwd> <skip_perms> '<title>' '<prompt>'`, run in background — it blocks until the spawned session exits, so the background task's completion is your "done" signal). Use `cwd=<target>`. Pass a convention-shaped `<title>` per `skills/spawn/SKILL.md` (`<role>:<project> <short-slug>`, `<project>` being the chosen project_id — these are project-level spawns, so there's no `#<task-id>` segment, but `<short-slug>` is still included), e.g. `review-briefing:<proj> context-doc`, `review:<proj> existing-code-audit`, `prd:<proj> new-feature`.
 
 **Existing code:**
-1. `/spawn /review-briefing` — builds `review/briefing.yaml`, the durable project context `/review` consumes.
-2. When it completes → `/spawn /review` — surfaces the real state of the existing code and files tasks for the gaps it finds.
-3. Then **offer** (don't auto-run) `/spawn /prd` for net-new feature work.
+1. `/spawn /review-briefing` (title `review-briefing:<proj> context-doc`) — builds `review/briefing.yaml`, the durable project context `/review` consumes.
+2. When it completes → `/spawn /review` (title `review:<proj> existing-code-audit`) — surfaces the real state of the existing code and files tasks for the gaps it finds.
+3. Then **offer** (don't auto-run) `/spawn /prd` (title `prd:<proj> new-feature`) for net-new feature work.
 
 **Greenfield (no code yet):**
 1. Discuss with the user to get a crisp outline of the project's goals and a rough split into 1–5 PRD-sized slices.
-2. For each slice, `/spawn /prd "<framing of this slice>"` **serially** — wait for each to finish before starting the next. Serial because PRDs share seams (the /prd skill's G4 cross-PRD ownership gate), so later PRDs reference what earlier ones established.
+2. For each slice, `/spawn /prd "<framing of this slice>"` (title `prd:<proj> <slice-slug>`, replacing `<slice-slug>` with a short hyphenated summary of that slice, e.g. `prd:acme auth-flow`) **serially** — wait for each to finish before starting the next. Serial because PRDs share seams (the /prd skill's G4 cross-PRD ownership gate), so later PRDs reference what earlier ones established.
 3. The result is an initial batch of queued tasks, ready for `/orchestrate`.
 
 ## Stage 8 — Go unattended (optional, gated, post-queueing)
