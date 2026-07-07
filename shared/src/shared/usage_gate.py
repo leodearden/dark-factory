@@ -29,8 +29,10 @@ from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
+from shared.cli_invoke import AgentResult
 from shared.config_dir import TaskConfigDir
 from shared.config_models import UsageCapConfig
+from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:
@@ -715,6 +717,18 @@ class UsageGate:
     ) -> bool:
         """Scan stderr and result text for cap-hit patterns.
 
+        Delegates to ``classify_invocation`` (task W4-beta consumer-rewire):
+        builds a synthetic ``AgentResult`` from *stderr*/*result_text*
+        (``success=False`` so the OK short-circuit never fires; a real
+        ``api_error_status``/``timed_out`` is never available here, so those
+        default to None/False and AuthFailed/ZeroOutputWedge can never be
+        produced by this call) and classifies it with ``strict_confirm=True``
+        — the detect_cap_hit regime, which demands the CAP_CONFIRM_KEYWORDS
+        guard (see DD-2 on ``classify_invocation`` for the asymmetry with the
+        ``_run_probe`` regime). CliLocalError now outranks CapHit/NearCap
+        uniformly here, exactly as it already did at the cli_invoke layer
+        (reify-3604).
+
         Returns True if a cap-hit or near-cap pattern was detected **and** an
         account was successfully resolved and mutated.  Returns False both when
         no pattern matches and when a pattern matches but ``_resolve_account``
@@ -723,50 +737,28 @@ class UsageGate:
         consecutive_cap_hits or trigger a cooldown, since before_invoke() would
         return the same token on the next iteration.
         """
-        combined = f'{stderr}\n{result_text}'
+        result = AgentResult(success=False, output=result_text, stderr=stderr)
+        outcome = classify_invocation(result, strict_confirm=True, backend=backend)
 
-        # Check backend-specific patterns first
-        if backend == 'codex':
-            for pattern in CODEX_CAP_PATTERNS:
-                if pattern.lower() in combined.lower():
-                    return self._handle_cap_detected(
-                        f'Codex cap hit: {pattern}', None, oauth_token,
-                    )
-        elif backend == 'gemini':
-            for pattern in GEMINI_CAP_PATTERNS:
-                if pattern.lower() in combined.lower():
-                    return self._handle_cap_detected(
-                        f'Gemini cap hit: {pattern}', None, oauth_token,
-                    )
+        if isinstance(outcome, CapHit):
+            return self._handle_cap_detected(outcome.reason, outcome.resets_at, oauth_token)
+        if isinstance(outcome, NearCap):
+            return self._handle_near_cap_warning(outcome.reason, oauth_token)
 
-        # Claude cap/near-cap detection: require both a prefix match AND a
-        # secondary confirmation keyword (defence against false positives on
-        # generic prefixes like "You've used" or "You're close to").
-        combined_lower = combined.lower()
-        has_confirm_keyword = any(kw in combined_lower for kw in CAP_CONFIRM_KEYWORDS)
-        if has_confirm_keyword:
-            for prefix in CAP_HIT_PREFIXES:
-                if prefix.lower() in combined_lower:
-                    resets_at = _parse_resets_at(combined)
-                    reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
-                    return self._handle_cap_detected(reason, resets_at, oauth_token)
-
-            for prefix in NEAR_CAP_PREFIXES:
-                if prefix.lower() in combined_lower:
-                    reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
-                    return self._handle_near_cap_warning(reason, oauth_token)
-        else:
-            # No confirm keyword — the confirm-keyword guard above would have blocked
-            # detection anyway, but if a cap-like prefix IS present, emit a
-            # debug breadcrumb so silent false-negatives leave a trace
-            # (e.g. stderr truncation or Claude changes its message format).
-            for prefix in (*CAP_HIT_PREFIXES, *NEAR_CAP_PREFIXES):
-                if prefix.lower() in combined_lower:
-                    logger.debug(
-                        'Cap-like prefix %r seen but no confirm keyword; ignoring',
-                        prefix,
-                    )
-                    break  # first match is sufficient; avoid log spam
+        # Not a cap/near-cap verdict (Failure, or CliLocalError overriding a
+        # cap-like prefix) — if a cap-like prefix IS present, emit a debug
+        # breadcrumb so silent false-negatives leave a trace (e.g. stderr
+        # truncation, Claude changes its message format, or a CLI-error
+        # marker happened to co-occur with cap-like text). Kept as a direct
+        # prefix scan since classify_invocation has no "breadcrumb-only" outcome.
+        combined_lower = f'{stderr}\n{result_text}'.lower()
+        for prefix in (*CAP_HIT_PREFIXES, *NEAR_CAP_PREFIXES):
+            if prefix.lower() in combined_lower:
+                logger.debug(
+                    'Cap-like prefix %r seen but no confirm keyword; ignoring',
+                    prefix,
+                )
+                break  # first match is sufficient; avoid log spam
 
         return False
 
