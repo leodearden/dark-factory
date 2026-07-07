@@ -451,7 +451,14 @@ def reap_stale_records(
                 reason = None
 
         if reason is not None:
-            shutil.rmtree(slug_dir)
+            try:
+                shutil.rmtree(slug_dir)
+            except OSError:
+                # A single unreapable directory (permission error, a file held
+                # open, an ENOTEMPTY race with a concurrent writer) must not
+                # abort the sweep -- log and move on to the next candidate.
+                logger.error('reap_stale_records: failed to remove %s', slug_dir, exc_info=True)
+                continue
             reaped.append(ReapedSessionRecord(path=slug_dir, session_slug=slug, reason=reason))
 
     return reaped

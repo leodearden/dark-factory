@@ -378,6 +378,105 @@ def test_reap_removes_missing_body_past_heartbeat_ttl(tmp_path: Path) -> None:
     assert not record_path.parent.exists()
 
 
+def test_reap_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
+    """The reaper's whole point is sweeping many records in one pass; pin that
+    a kept/terminal_ttl/stale_pid/corrupt mix in a single sessions dir reaps
+    exactly the expected subset in one call and leaves survivors untouched.
+    """
+    kept_running = _make_record(
+        session_slug='kept-running', status=sr.Status.RUNNING, launcher_pid=os.getpid()
+    )
+    kept_recent_terminal = _make_record(
+        session_slug='kept-recent-terminal', status=sr.Status.EXITED, launcher_pid=os.getpid()
+    )
+    reap_terminal = _make_record(
+        session_slug='reap-terminal', status=sr.Status.EXITED, launcher_pid=os.getpid()
+    )
+    reap_stale = _make_record(
+        session_slug='reap-stale-pid', status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID
+    )
+
+    for r in (kept_running, kept_recent_terminal, reap_terminal, reap_stale):
+        sr.write_record(r, root=tmp_path)
+
+    _set_mtime(
+        sr.record_path_for_slug(kept_running.session_slug, root=tmp_path),
+        _NOW,
+        timedelta(days=30),  # long-lived but a live pid -> kept regardless of age
+    )
+    _set_mtime(
+        sr.record_path_for_slug(kept_recent_terminal.session_slug, root=tmp_path),
+        _NOW,
+        sr.TERMINAL_TTL - timedelta(hours=1),
+    )
+    _set_mtime(
+        sr.record_path_for_slug(reap_terminal.session_slug, root=tmp_path),
+        _NOW,
+        sr.TERMINAL_TTL + timedelta(hours=1),
+    )
+    _set_mtime(
+        sr.record_path_for_slug(reap_stale.session_slug, root=tmp_path),
+        _NOW,
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+
+    # A corrupt-body record dir, aged past the heartbeat TTL.
+    corrupt_dir = sr.sessions_dir(root=tmp_path) / 'reap-corrupt'
+    corrupt_dir.mkdir(parents=True)
+    corrupt_record = corrupt_dir / 'record.json'
+    corrupt_record.write_text('{not valid json')
+    _set_mtime(corrupt_record, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+    reaped_by_slug = {r.session_slug: r.reason for r in reaped}
+    assert reaped_by_slug == {
+        'reap-terminal': 'terminal_ttl',
+        'reap-stale-pid': 'stale_pid',
+        'reap-corrupt': 'corrupt',
+    }
+
+    remaining = {p.name for p in sr.sessions_dir(root=tmp_path).iterdir()}
+    assert remaining == {'kept-running', 'kept-recent-terminal'}
+
+
+def test_reap_continues_sweep_when_one_directory_fails_to_remove(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A single unreapable directory (permission error, a file held open, an
+    ENOTEMPTY race with a concurrent writer) must not abort the sweep -- a
+    later stale directory in the same sessions dir is still reaped.
+    """
+    poison = _make_record(session_slug='poison', status=sr.Status.EXITED, launcher_pid=os.getpid())
+    victim = _make_record(session_slug='victim', status=sr.Status.EXITED, launcher_pid=os.getpid())
+    for r in (poison, victim):
+        sr.write_record(r, root=tmp_path)
+        _set_mtime(
+            sr.record_path_for_slug(r.session_slug, root=tmp_path),
+            _NOW,
+            sr.TERMINAL_TTL + timedelta(hours=1),
+        )
+
+    poison_dir = sr.record_path_for_slug(poison.session_slug, root=tmp_path).parent
+    real_rmtree = sr.shutil.rmtree
+
+    def _flaky_rmtree(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
+        if Path(path) == poison_dir:
+            raise OSError('simulated ENOTEMPTY race')
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(sr.shutil, 'rmtree', _flaky_rmtree)
+
+    with caplog.at_level(logging.ERROR):
+        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+    assert {r.session_slug for r in reaped} == {'victim'}
+    assert poison_dir.is_dir()  # left behind, not silently claimed as reaped
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Step-9: CLI + fail-soft
 # ---------------------------------------------------------------------------
