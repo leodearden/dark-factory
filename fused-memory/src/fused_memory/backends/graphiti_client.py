@@ -1277,6 +1277,12 @@ class GraphitiBackend:
         never raises on zero or multiple matches — callers (e.g. MemoryService.get_entity)
         treat an empty result as "fall back to fuzzy search" and pick nodes[0] on a hit.
 
+        Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
+        amendment), not just the graph key selected via _graph_for — task-2115's active
+        cross-graph leak can plant a misrouted foreign node (group_id property of
+        ANOTHER project) physically inside this graph key, and this predicate keeps
+        such a clone from ever surfacing here.
+
         Uses ro_query since no writes are performed.
 
         Args:
@@ -1291,8 +1297,11 @@ class GraphitiBackend:
             RuntimeError: if the backend is not initialized.
         """
         graph = self._graph_for(group_id)
-        cypher = 'MATCH (n:Entity {name: $name}) RETURN n.uuid, n.name, n.summary, labels(n)'
-        result = await graph.ro_query(cypher, {'name': name})
+        cypher = (
+            'MATCH (n:Entity {name: $name}) WHERE n.group_id = $group_id '
+            'RETURN n.uuid, n.name, n.summary, labels(n)'
+        )
+        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
         return [
             {
                 'uuid': row[0],
@@ -1315,6 +1324,12 @@ class GraphitiBackend:
         uuid — so callers can treat matches[0] as the merge survivor and
         matches[1:] as the deprecated duplicates to fold into it.
 
+        Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
+        amendment), not just the graph key selected via _graph_for — task-2115's active
+        cross-graph leak can plant a misrouted foreign node (group_id property of
+        ANOTHER project) physically inside this graph key, and this predicate keeps
+        such a clone from ever being treated as a duplicate to collapse.
+
         Uses ro_query since no writes are performed.
 
         Args:
@@ -1332,12 +1347,13 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {name: $name}) '
+            'WHERE n.group_id = $group_id '
             'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
             'WITH n, count(DISTINCT e) AS edge_count '
             'RETURN n.uuid, n.created_at, edge_count '
             'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
         )
-        result = await graph.ro_query(cypher, {'name': name})
+        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
         return [
             {
                 'uuid': row[0],
