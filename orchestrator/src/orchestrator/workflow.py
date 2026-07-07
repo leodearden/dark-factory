@@ -115,6 +115,20 @@ _MCP_CONFIG_ROLES = (
 _PLAN_TOOLS_ROLES = ('architect', 'implementer', 'debugger', 'simple_task')
 
 
+def _meta_root_for_worktree(worktree: Path) -> Path:
+    """Derive the `.task-meta` root for *worktree* — the single DRY seam used
+    by both the orchestrator-side ``TaskArtifacts`` construction (``_setup``)
+    and the agent-side plan-tools MCP injection (``_inject_plan_tools_mcp``),
+    so both sides compute the IDENTICAL meta_root for a given worktree
+    (worktree-lane-lifecycle PRD task ε1).
+
+    Thin wrapper around ``TaskArtifacts.meta_root_for`` — the single owner of
+    the `.task-meta` path shape — so callers here never hand-join ``.task``
+    or ``.task-meta`` themselves.
+    """
+    return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+
+
 def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
 
@@ -137,11 +151,16 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
       ``plan_tools_mcp_server`` for callers that cannot supply an interpreter.
     - Task 1776 (this): ``python_executable=sys.executable`` eliminates ``uv``
       from the hot path entirely, collapsing the proc tree to ``claude → python3``.
+    - Task 2258 (W11-ε1): ``meta_root=_meta_root_for_worktree(cwd)`` passes the
+      sibling `.task-meta` root through as ``--meta-root``, so the agent-side
+      plan-tools server writes plan.json to the same relocated artifacts root
+      the orchestrator's own ``TaskArtifacts`` instance reads from.
     """
     if not mcp_config:
         mcp_config = {'mcpServers': {}}
     mcp_config.setdefault('mcpServers', {})['plan-tools'] = plan_tools_mcp_server(
-        _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable
+        _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
+        meta_root=_meta_root_for_worktree(cwd),
     )
     return mcp_config
 
@@ -1714,7 +1733,9 @@ class TaskWorkflow:
         if not self._worktree_external:
             await self._sync_worktree_venvs()
 
-        self.artifacts = TaskArtifacts(self.worktree)
+        self.artifacts = TaskArtifacts(
+            self.worktree, _meta_root_for_worktree(self.worktree),
+        )
         # Capture old base_commit before init() overwrites metadata.json
         # — _plan() uses it for revalidation diff.
         self._old_plan_base = self.artifacts.read_base_commit()
@@ -3294,7 +3315,7 @@ class TaskWorkflow:
         if not broken_plan:
             return False
 
-        plan_path = str(self.worktree / '.task' / 'plan.json')
+        plan_path = str(self.artifacts.root / 'plan.json')
         plan_dump = json.dumps(broken_plan, indent=2)[:6000]
 
         repair_prompt = (
