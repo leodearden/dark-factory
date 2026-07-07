@@ -12,12 +12,17 @@ DS-2's ``enforce_transition``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from shared.deploy_state import DeployPhase, DeployState, VerifyBaseline
 
 __all__ = [
     'DeployPhase',
     'DeployState',
     'VerifyBaseline',
+    'IllegalDeployTransition',
+    'TransitionEscalationSink',
+    'enforce_transition',
     'is_legal_transition',
 ]
 
@@ -52,3 +57,34 @@ _LEGAL: dict[tuple[DeployPhase, DeployPhase], bool] = {
 def is_legal_transition(old: DeployPhase, new: DeployPhase) -> bool:
     """Whether ``old -> new`` is a legal deploy-phase transition."""
     return _LEGAL.get((old, new), False)
+
+
+class IllegalDeployTransition(RuntimeError):
+    """Raised by :func:`enforce_transition` on an illegal deploy-phase edge."""
+
+
+# ζ wires the concrete sink — a born-at-L2 orchestrator-deterministic-sentinel
+# EscalationQueue-backed callable (mirroring deterministic_runner's Escalation
+# filing pattern). Required (no default) so DS-2 loudness cannot be bypassed.
+TransitionEscalationSink = Callable[[str, DeployPhase, DeployPhase], None]
+
+
+def enforce_transition(
+    old: DeployPhase | None,
+    new: DeployPhase,
+    *,
+    task_id: str,
+    escalation_sink: TransitionEscalationSink,
+) -> None:
+    """Enforce DS-2: an illegal deploy-phase edge files a loud escalation, then raises.
+
+    ``old is None`` is an initial write, not a transition, and is always
+    legal. Otherwise an illegal ``old -> new`` edge files via
+    ``escalation_sink`` FIRST (crash-safe file-before-raise ordering — the
+    loud signal is emitted even if the subsequent exception propagation is
+    interrupted) and THEN raises :class:`IllegalDeployTransition`.
+    """
+    if old is None or is_legal_transition(old, new):
+        return
+    escalation_sink(task_id, old, new)
+    raise IllegalDeployTransition(f'illegal deploy transition {old} -> {new} for task {task_id}')

@@ -156,9 +156,7 @@ class TestEnforceTransition:
         calls = []
         sink = lambda task_id, old, new: calls.append((task_id, old, new))  # noqa: E731
 
-        result = enforce_transition(
-            None, DeployPhase.SCHEDULED, task_id='t1', escalation_sink=sink
-        )
+        result = enforce_transition(None, DeployPhase.SCHEDULED, task_id='t1', escalation_sink=sink)
 
         assert result is None
         assert calls == []
