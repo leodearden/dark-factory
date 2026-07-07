@@ -1720,3 +1720,68 @@ async def test_sample_curator_fallback_degrades_to_zero_when_helper_raises(
         'in exactly the 1-open-of-N scenario the new helper would have returned 0 for — '
         'reviewer stale_fallback_logic.'
     )
+
+
+# ---------------------------------------------------------------------------
+# task-2218 step-1: fan_out_list_tickets invalidates a failing URL's cached
+# MCP session on failover (pins the mcp_fanout.first_success conversion).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_invalidates_session_on_failover(tmp_path: Path):
+    """A failing URL's cached MCP session must be invalidated on failover.
+
+    Setup: single root (tmp_path), two fused_memory_urls ['http://bad', 'http://good'].
+    'http://bad' has a pre-populated session (memory._get_session) before the call
+    so invalidation is observable. mcp_tool_call raises httpx.HTTPError for
+    'http://bad' and returns count=3 for 'http://good'.
+
+    Assertions:
+    - 'http://bad' is no longer a key in memory._sessions afterwards (invalidated
+      on failover — this is the behavior mcp_fanout.first_success adds that the
+      hand-rolled loop in _fan_out_one_root never had).
+    - pending_total == 3 (counted once via failover, not double-counted)
+    - mock_mcp.call_count == 2 (both URLs attempted)
+
+    RED today: _fan_out_one_root's `except (httpx.HTTPError, ValueError):` branch
+    only logs at DEBUG — it never calls invalidate_session, so 'http://bad' would
+    still be present in memory._sessions after the call.
+    """
+    from dashboard.data import memory
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://bad', 'http://good'],
+        known_project_roots=[],
+    )
+
+    reset_sessions()
+    try:
+        memory._get_session('http://bad')  # pre-populate so invalidation is observable
+        assert 'http://bad' in memory._sessions
+
+        async def _side_effect(http_client, url, *args, **kwargs):
+            if url == 'http://bad':
+                raise httpx.HTTPError('boom')
+            return {'count': 3, 'tickets': [], 'project_id': 'p'}
+
+        mock_mcp = AsyncMock(side_effect=_side_effect)
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+        with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+            async with httpx.AsyncClient(transport=transport) as http_client:
+                tickets, pending_total = await fan_out_list_tickets(http_client, cfg)
+
+        assert 'http://bad' not in memory._sessions, (
+            "'http://bad' session must be invalidated on failover"
+        )
+        assert pending_total == 3, f'Expected pending_total=3, got {pending_total}'
+        assert mock_mcp.call_count == 2, (
+            f'Expected 2 mcp_tool_call invocations (both URLs tried), got {mock_mcp.call_count}'
+        )
+        assert tickets == []
+    finally:
+        reset_sessions()
