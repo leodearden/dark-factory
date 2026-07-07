@@ -39,6 +39,11 @@ def backend(mock_config):
     mock_client = MagicMock()
     mock_client.add_episode = AsyncMock(return_value=None)
     b.client = mock_client
+    # add_episode now routes via _client_for(group_id) (per-group client cache,
+    # task 2266). Point _client_for at the same mock so assertions on
+    # backend.client.add_episode still observe the call — mirrors the pattern in
+    # tests/test_per_group_client_cache.py (backend._client_for = MagicMock(...)).
+    b._client_for = MagicMock(return_value=mock_client)
     return b
 
 
