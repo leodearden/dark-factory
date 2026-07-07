@@ -721,7 +721,19 @@ class SqliteTaskBackend:
         status: str,
         project_root: str,
         tag: str | None = None,
+        *,
+        claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
     ) -> SetTaskStatusResult:
+        """Update ``status``, optionally stamping/clearing the claimant columns.
+
+        ``claimant_run_id``/``heartbeat_at`` are tri-state (task 2182, PRD
+        C4/D4): a string stamps the column, explicit ``None`` clears it to
+        NULL (release), and the default ``_UNSET`` leaves it untouched — a
+        plain status change must never wipe a live claimant. Fails safe
+        (WARNING, status-only write, no error) when the claimant columns are
+        absent from a not-yet-migrated connection.
+        """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
@@ -737,10 +749,30 @@ class SqliteTaskBackend:
                     f'No tasks found for ID(s): {task_id}',
                 )
             old_status = row['status']
+
+            set_columns = ['status = ?', 'updated_at = ?']
+            set_values: list[Any] = [status, _now()]
+            if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
+                if await _claimant_columns_present(conn):
+                    if claimant_run_id is not _UNSET:
+                        set_columns.append('claimant_run_id = ?')
+                        set_values.append(claimant_run_id)
+                    if heartbeat_at is not _UNSET:
+                        set_columns.append('heartbeat_at = ?')
+                        set_values.append(heartbeat_at)
+                else:
+                    logger.warning(
+                        'set_task_status: claimant_run_id/heartbeat_at columns absent '
+                        '(pre-migration connection) — writing status only for '
+                        'task_id=%s project_root=%s',
+                        task_id, project_root,
+                    )
+
+            set_values.extend([tag, tid])
             await conn.execute(
-                'UPDATE tasks SET status = ?, updated_at = ? '
+                f'UPDATE tasks SET {", ".join(set_columns)} '
                 'WHERE tag = ? AND id = ?',
-                (status, _now(), tag, tid),
+                set_values,
             )
         return {
             'message': f'Successfully updated 1 task(s) to "{status}"',
