@@ -406,12 +406,34 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     # relies on is only supplied at WORKSTATION startup, not on the laptop.
     # Knob OFF -> fd stays None -> byte-identical back-compat (no lock).
     fd: int | None = None
+    contention_result = None
     if config.git.persistent_merge_worktree:
         fd = acquire_merge_verify_flock(
             merge_verify_lock_path(git_ops.worktree_base), MERGE_VERIFY_FLOCK_WAIT_SECS
         )
         if fd is not None:
             write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        else:
+            # Bounded wait timed out: another verify-merge invocation holds the
+            # persistent worktree lock. Emit the distinguished contention result
+            # WITHOUT ever touching the tree (no acquire_host_verify_worktree, no
+            # ephemeral _merge-<uuid> fallback — PRD Invariant 5).
+            holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
+            contention_result = make_flock_contention_result(
+                host=socket.gethostname(),
+                holder_pgid=holder_pgid,
+                waiter_pgid=os.getpgrp(),
+            )
+
+    if contention_result is not None:
+        # Always remove the pgid file so cancel-verify knows this run is done.
+        if pgf is not None:
+            remove_pgid_file(pgf)
+        # Contention must exit 0: a passed=False VerifyResult on stdout is the
+        # only delivery channel to beta — a non-zero exit makes RemoteRunner
+        # treat this as RunnerUnavailable and beta never sees the discriminant.
+        click.echo(result_to_json(contention_result))
+        return
 
     try:
         result = asyncio.run(_run())
