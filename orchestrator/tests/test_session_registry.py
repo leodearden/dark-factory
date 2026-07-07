@@ -52,6 +52,20 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
     return sr.SessionRecord(**fields)
 
 
+# A pid virtually guaranteed dead on any host (matches the convention already
+# established by orchestrator.harness._pid_alive's own test suite: 2**31 - 1,
+# orchestrator/tests/test_reconcile_stranded.py:34).
+_DEAD_PID = 2**31 - 1
+
+_NOW = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+
+
+def _set_mtime(path: Path, now: datetime, age: timedelta) -> None:
+    """Backdate *path*'s mtime to ``now - age`` (reap_stale_records' heartbeat clock)."""
+    ts = (now - age).timestamp()
+    os.utime(path, (ts, ts))
+
+
 # ---------------------------------------------------------------------------
 # Step-1: schema / contract
 # ---------------------------------------------------------------------------
@@ -246,3 +260,109 @@ def test_refresh_record_updates_existing_record_under_same_key(tmp_path: Path) -
     reread = sr.read_record(r.session_slug, root=tmp_path)
     assert reread.status == sr.Status.RUNNING
     assert sr.record_path_for_slug(r.session_slug, root=tmp_path) == path_before
+
+
+# ---------------------------------------------------------------------------
+# Step-7: TTL / pid stale-record reaper matrix
+# ---------------------------------------------------------------------------
+
+
+def test_ttl_constants_are_module_level_timedeltas() -> None:
+    assert sr.TERMINAL_TTL == timedelta(hours=24)
+    assert sr.NON_TERMINAL_HEARTBEAT_TTL == timedelta(hours=1)
+
+
+def test_reap_removes_terminal_record_past_ttl(tmp_path: Path) -> None:
+    r = _make_record(status=sr.Status.EXITED, launcher_pid=os.getpid())
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.TERMINAL_TTL + timedelta(hours=1))
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+    assert len(reaped) == 1
+    assert reaped[0].session_slug == r.session_slug
+    assert reaped[0].reason == 'terminal_ttl'
+    assert reaped[0].path == record_path.parent
+    assert not record_path.parent.exists()
+
+
+def test_reap_keeps_terminal_record_within_ttl(tmp_path: Path) -> None:
+    r = _make_record(status=sr.Status.EXITED, launcher_pid=os.getpid())
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.TERMINAL_TTL - timedelta(hours=1))
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+    assert reaped == []
+    assert record_path.is_file()
+
+
+def test_reap_removes_non_terminal_dead_pid_past_heartbeat_ttl(tmp_path: Path) -> None:
+    r = _make_record(status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+    assert len(reaped) == 1
+    assert reaped[0].session_slug == r.session_slug
+    assert reaped[0].reason == 'stale_pid'
+    assert not record_path.parent.exists()
+
+
+def test_reap_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> None:
+    r = _make_record(status=sr.Status.RUNNING, launcher_pid=os.getpid())
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, timedelta(days=30))  # past both TTLs
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+    assert reaped == []
+    assert record_path.is_file()
+
+
+def test_reap_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -> None:
+    r = _make_record(status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1))
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+    assert reaped == []
+    assert record_path.is_file()
+
+
+def test_reap_removes_corrupt_body_past_heartbeat_ttl(tmp_path: Path) -> None:
+    r = _make_record(status=sr.Status.LAUNCHING, launcher_pid=os.getpid())
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    record_path.write_text('{not valid json')
+    _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+    assert len(reaped) == 1
+    assert reaped[0].session_slug == r.session_slug
+    assert reaped[0].reason == 'corrupt'
+    assert not record_path.parent.exists()
+
+
+def test_reap_removes_missing_body_past_heartbeat_ttl(tmp_path: Path) -> None:
+    """A slug dir with no record.json at all is still reaped by path identity."""
+    r = _make_record(status=sr.Status.LAUNCHING, launcher_pid=os.getpid())
+    sr.write_record(r, root=tmp_path)
+    record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
+    record_path.unlink()
+    _set_mtime(record_path.parent, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+    assert len(reaped) == 1
+    assert reaped[0].session_slug == r.session_slug
+    assert reaped[0].reason == 'corrupt'
+    assert not record_path.parent.exists()
