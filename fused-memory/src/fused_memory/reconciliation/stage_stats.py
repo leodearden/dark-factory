@@ -9,6 +9,16 @@ write journal for a given stage's own ``agent_id`` — the LLM's self-report is
 no longer on the read path for these keys (see ``stats_verifier``, which
 applies these computed values as overrides and keeps the LLM's originals
 under ``stats['_reported']`` purely as a divergence signal for the judge).
+
+Correct counting depends on every stage write being stamped with the
+canonical ``agent_id=f'recon-stage-{stage_id}'`` (see ``stages/base.py``).
+Harness-authored writes (e.g. ``task_knowledge_sync.py``) always carry this
+tag, but writes made by the LLM CLI agent carry it only because the agent's
+prompt instructs it to — a stage that omits or mistypes its ``agent_id``
+silently yields 0 for every counter here rather than an error.
+``stats_verifier.verify_and_rewrite_stats`` logs an INFO diagnostic when a
+write op carries a ``recon-stage-*`` agent_id that matches no known stage,
+which backstops (but does not fully cover) this dependency.
 """
 
 from __future__ import annotations
