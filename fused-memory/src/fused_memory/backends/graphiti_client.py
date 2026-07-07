@@ -13,6 +13,7 @@ from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
@@ -232,6 +233,9 @@ class GraphitiBackend:
         self._indexed_graphs: set[str] = set()
         self._cloned_drivers: dict[str, GraphDriver] = {}
         self._identity_locks: dict[str, asyncio.Lock] = {}
+        self._llm_client = None
+        self._embedder = None
+        self._cross_encoder = None
 
     # --- Per-request driver routing ---
 
@@ -368,10 +372,15 @@ class GraphitiBackend:
             password=falkor_cfg.password,
         )
 
+        self._llm_client = llm_client
+        self._embedder = embedder_client
+        self._cross_encoder = OpenAIRerankerClient()
+
         self.client = Graphiti(
             graph_driver=self._driver,
-            llm_client=llm_client,
-            embedder=embedder_client,
+            llm_client=self._llm_client,
+            embedder=self._embedder,
+            cross_encoder=self._cross_encoder,
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
 
