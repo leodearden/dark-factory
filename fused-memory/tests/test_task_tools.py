@@ -686,6 +686,30 @@ async def test_set_task_status_accepts_merge_deferred(
     )
 
 
+@pytest.mark.asyncio
+async def test_set_task_status_forwards_agent_id_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """set_task_status forwards caller identity (agent_id) to the interceptor
+    so the transition-legality gate (task 2175/rho1b) can classify an actor.
+    """
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_status',
+        {
+            'id': '1',
+            'project_root': '/project',
+            'status': 'blocked',
+            'agent_id': 'recon-stage-7',
+        },
+    )
+    task_interceptor.set_task_status.assert_awaited_once()
+    assert task_interceptor.set_task_status.call_args.kwargs.get('agent_id') == 'recon-stage-7', (
+        f'Expected agent_id to be forwarded to the interceptor; '
+        f'call_args={task_interceptor.set_task_status.call_args!r}'
+    )
+
+
 # ------------------------------------------------------------------
 # trigger_reconciliation without taskmaster
 # ------------------------------------------------------------------
