@@ -22,8 +22,10 @@ from fused_memory.backends.sqlite_task_backend import (
 )
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
+    StatusWriteAuthorityError,
     TaskmasterError,
     done_provenance_via_update_task_error,
+    status_via_update_task_error,
 )
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -731,16 +733,18 @@ async def test_add_task_accepts_infra_hold(backend, project_root):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('status', ['done', 'pending', 'cancelled', 'in-progress', 'blocked', ''])
 async def test_update_task_rejects_non_none_status(backend, project_root, status):
-    """Backend floor: update_task must raise TaskmasterError for any non-None status.
+    """Backend floor: update_task must raise StatusWriteAuthorityError for any non-None status.
 
     (a) Seeded-task rejection — the write is blocked and the task stays 'pending'.
     (b) Empty-string '' pins is-not-None semantics over truthiness.
+    (c) The subclass IS-A TaskmasterError, so the code/message assertions stay valid.
     """
     await backend.add_task(project_root=project_root, title='x')
-    with pytest.raises(TaskmasterError) as exc:
+    with pytest.raises(StatusWriteAuthorityError) as exc:
         await backend.update_task('1', project_root=project_root, status=status)
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'set_task_status' in exc.value.message
+    assert exc.value.to_error_dict() == status_via_update_task_error('1', status)
     # Confirm the write was blocked — status must still be 'pending'
     task = await backend.get_task('1', project_root=project_root)
     assert task['status'] == 'pending'
@@ -749,10 +753,11 @@ async def test_update_task_rejects_non_none_status(backend, project_root, status
 @pytest.mark.asyncio
 async def test_update_task_status_rejection_precedes_existence_check(backend, project_root):
     """Status guard runs BEFORE the task SELECT, so rejection beats 'No tasks found'."""
-    with pytest.raises(TaskmasterError) as exc:
+    with pytest.raises(StatusWriteAuthorityError) as exc:
         await backend.update_task('999', project_root=project_root, status='done')
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'set_task_status' in exc.value.message
+    assert exc.value.to_error_dict() == status_via_update_task_error('999', 'done')
     assert 'No tasks found' not in exc.value.message
 
 
@@ -769,10 +774,11 @@ async def test_update_task_status_rejection_precedes_connection_error(tmp_path, 
     await closed_backend.start()
     await closed_backend.close()  # ensure_connected() now raises RuntimeError
 
-    with pytest.raises(TaskmasterError) as exc:
+    with pytest.raises(StatusWriteAuthorityError) as exc:
         await closed_backend.update_task('1', project_root=project_root, status='done')
     assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
     assert 'set_task_status' in exc.value.message
+    assert exc.value.to_error_dict() == status_via_update_task_error('1', 'done')
 
 
 # ── update_task: done_provenance write-authority floor ─────────────
