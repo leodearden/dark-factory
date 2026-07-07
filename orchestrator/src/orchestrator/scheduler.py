@@ -24,6 +24,7 @@ from shared.locking import (
     strip_directory_locks,
 )
 from shared.mcp_envelope import parse_tool_result, resolver_failed
+from shared.task_metadata import parse_metadata
 
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -968,6 +969,31 @@ def _iter_pending_deps_in(
             dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
             if dep_id in dep_set:
                 yield tid, dep_id
+
+
+def _task_external_deps(task: dict) -> list[str]:
+    """Return *task*'s ``metadata.external_deps`` as canonical wire strings.
+
+    THE single seam every scheduler external_deps read routes through
+    (task 2167 — W3-δ SEAM A).  Delegates to the shared, versioned
+    ``shared.task_metadata.parse_metadata`` parser instead of the old untyped
+    ``(task.get('metadata') or {}).get('external_deps') or []`` idiom, which
+    ``AttributeError``s on JSON-string metadata (str has no ``.get``).
+
+    ``direction='read'`` makes this best-effort — it never raises, even on
+    corrupt/unparseable metadata — so a bad historical metadata row cannot
+    break a scheduler dispatch tick (matches the scheduler's existing
+    fail-safe philosophy).
+
+    The return value stays ``list[str]`` — the canonical "project_id:task_id"
+    wire form fed to ``get_external_statuses`` / the external-status cache —
+    and is intentionally NOT converted to ``list[ExternalDep]`` (PRD Open
+    Question #4): a malformed dep must still reach ``get_external_statuses``
+    so it can resolve to the ``malformed`` sentinel and escalate, which
+    pre-filtering with ``ExternalDep.parse`` would silently prevent.
+    """
+    metadata, _warnings = parse_metadata(task.get('metadata'), direction='read')
+    return metadata.external_deps
 
 
 class Scheduler:
@@ -2030,9 +2056,7 @@ class Scheduler:
             # tolerance window should raise max_external_dep_unresolved_cycles.
             for task in pending_tasks:
                 task_id = str(task.get('id', '?'))
-                external_deps: list = (
-                    (task.get('metadata') or {}).get('external_deps') or []
-                )
+                external_deps: list = _task_external_deps(task)
                 if not external_deps:
                     continue
                 count = self._streak_resolver_degraded.bump(task_id)
@@ -2085,9 +2109,7 @@ class Scheduler:
 
         for task in pending_tasks:
             task_id = str(task.get('id', '?'))
-            external_deps: list = (
-                (task.get('metadata') or {}).get('external_deps') or []
-            )
+            external_deps: list = _task_external_deps(task)
             # Resolver succeeded this tick → reset the resolver-degraded
             # consecutive-tick streak so only CONSECUTIVE degraded ticks count
             # toward escalation.  A transient blip that self-heals never
@@ -2673,9 +2695,7 @@ class Scheduler:
         # External-dep gate (cross-project).  Only active when the cache is
         # supplied (not None) — defaults reproduce byte-identical legacy behaviour.
         if external_status_cache is not None:
-            external_deps: list = (
-                (task.get('metadata') or {}).get('external_deps') or []
-            )
+            external_deps: list = _task_external_deps(task)
             for ext_dep in external_deps:
                 if external_resolver_failed:
                     logger.debug(
@@ -3687,15 +3707,22 @@ class Scheduler:
         # (counter increments, escalation callbacks) exactly once per tick.
         # The _park_gc call site above does NOT receive the cache, preserving park-GC
         # semantics (design decision 4: scope containment).
-        _pending_tasks_with_ext: list[dict] = [
-            t for t in tasks
+        # _task_external_deps(t) runs the full parse_metadata pipeline (JSON parse,
+        # apply_migrations copy, sub-model validation, TaskMetadata construction) —
+        # noticeably heavier than the old dict.get idiom.  Compute it once per
+        # pending task here and reuse the cached list for both the filter and the
+        # union, instead of calling it again per task in a second comprehension.
+        _pending_ext_deps: list[tuple[dict, list[str]]] = [
+            (t, deps)
+            for t in tasks
             if t.get('status') == 'pending'
-            and (t.get('metadata') or {}).get('external_deps')
+            and (deps := _task_external_deps(t))
         ]
+        _pending_tasks_with_ext: list[dict] = [t for t, _ in _pending_ext_deps]
         _ext_dep_union: list[str] = list({
             dep
-            for t in _pending_tasks_with_ext
-            for dep in ((t.get('metadata') or {}).get('external_deps') or [])
+            for _, deps in _pending_ext_deps
+            for dep in deps
         })
         if _ext_dep_union:
             external_cache, external_err = await self.get_external_statuses(_ext_dep_union)
