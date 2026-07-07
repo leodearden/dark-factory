@@ -97,7 +97,19 @@ class TaskBackendProtocol(Protocol):
         status: str,
         project_root: str,
         tag: str | None = None,
-    ) -> SetTaskStatusResult: ...
+        *,
+        claimant_run_id: str | None = None,
+        heartbeat_at: str | None = None,
+    ) -> SetTaskStatusResult:
+        """Update ``status``, optionally stamping the claimant columns.
+
+        ``claimant_run_id``/``heartbeat_at`` (task 2182, PRD C4/D4) are
+        optional keyword-only params. Implementations treat them as tri-state
+        (a sentinel default leaves the column untouched); the protocol exposes
+        them as ``None``-defaulted so callers may supply them and backends stay
+        assignable to this shape.
+        """
+        ...
 
     async def add_task(
         self,
