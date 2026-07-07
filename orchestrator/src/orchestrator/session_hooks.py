@@ -365,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(run_stop(hook_input, env))
         elif args.verb == 'install':
-            pass  # wired in task 2288 step-12
+            _run_install(args.settings_path)
     except Exception:
         logger.error('session_hooks %s failed', args.verb, exc_info=True)
         return 0
