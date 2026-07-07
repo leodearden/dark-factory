@@ -31,7 +31,7 @@ from dashboard.data.db import with_db
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.stats_utils import percentile
 from dashboard.data.tasks import fetch_tasks
-from dashboard.data.utils import parse_utc, safe_gather_result
+from dashboard.data.utils import parse_utc, resolve_now, safe_gather_result
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ def _cutoff_iso(hours: int, *, now: datetime | None = None) -> str:
             is used. Pass an explicit value to get deterministic results or to
             share a single timestamp across concurrent per-DB calls.
     """
-    effective_now = now if now is not None else datetime.now(UTC)
+    effective_now = resolve_now(now)
     return (effective_now - timedelta(hours=hours)).isoformat()
 
 
@@ -189,7 +189,7 @@ async def queue_depth_timeseries(
         return {'labels': [], 'values': []}
 
     async def _query(conn: aiosqlite.Connection) -> ChartData:
-        effective_now = now if now is not None else datetime.now(UTC)
+        effective_now = resolve_now(now)
         cutoff = effective_now - timedelta(hours=hours)
 
         # Determine adaptive bucket width for this window
@@ -745,7 +745,7 @@ async def active_queued_merges(
     if db is None:
         return []
 
-    effective_now = now if now is not None else datetime.now(UTC)
+    effective_now = resolve_now(now)
     cutoff = (effective_now - timedelta(minutes=ttl_minutes)).isoformat()
     et_placeholders = ','.join('?' * len(_ACTIVE_EVENT_TYPES))
 
@@ -822,7 +822,7 @@ def filter_merges_within(
         A new list preserving the input order.  Rows with missing or malformed
         timestamps are silently dropped.
     """
-    effective_now = now if now is not None else datetime.now(UTC)
+    effective_now = resolve_now(now)
     cutoff = effective_now - timedelta(minutes=minutes)
     result: list[dict] = []
     for row in merges:

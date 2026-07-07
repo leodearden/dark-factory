@@ -146,7 +146,7 @@ async def get_scheduler_snapshot(
         # avoids re-running a multi-second fan-out that would just report the
         # same offline state again; ≤5 s of stale-offline is acceptable.
         six_tuple = await collect_scheduler_state(client, config)
-        snapshot_at = datetime.now(UTC).isoformat()
+        snapshot_at = datetime.now(UTC).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
         _scheduler_cache = (time.monotonic(), six_tuple, snapshot_at)
         return six_tuple, snapshot_at
 
@@ -322,7 +322,7 @@ def _park_age_seconds(installed_at) -> int:
     installed_at_str = str(installed_at or '')
     try:
         ts = datetime.fromisoformat(installed_at_str.replace('Z', '+00:00'))
-        return max(0, int((datetime.now(UTC) - ts).total_seconds()))
+        return max(0, int((datetime.now(UTC) - ts).total_seconds()))  # clock-exempt: deferred-consolidation (task 2281)
     except (ValueError, TypeError):
         if installed_at_str:
             logger.warning(
@@ -460,7 +460,7 @@ def _compose_rows(
                     installed_at_str.replace('Z', '+00:00')
                 )
                 age_seconds = int(
-                    (datetime.now(UTC) - installed_at).total_seconds()
+                    (datetime.now(UTC) - installed_at).total_seconds()  # clock-exempt: deferred-consolidation (task 2281)
                 )
                 age_seconds = max(age_seconds, 0)
             except (ValueError, TypeError):
@@ -524,7 +524,7 @@ def _skip_event_sparkline(
     # Filter to task_skipped events only
     skipped = [e for e in events if e.get('event_type') == 'task_skipped']
 
-    now = until if until is not None else datetime.now(UTC)
+    now = until if until is not None else datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
     # Normalise since to UTC
     if since.tzinfo is None:
         since = since.replace(tzinfo=UTC)
@@ -586,7 +586,7 @@ async def collect_scheduler_state(
                           Empty list when no project is paused or the snapshot
                           lacks ``is_paused`` (pre-upgrade on-disk degradation).
     """
-    since = datetime.now(UTC) - timedelta(hours=1)
+    since = datetime.now(UTC) - timedelta(hours=1)  # clock-exempt: deferred-consolidation (task 2281)
 
     # Fetch active tasks (for lock sets and titles)
     all_active, active_offline = await collect_active_tasks(client, config)

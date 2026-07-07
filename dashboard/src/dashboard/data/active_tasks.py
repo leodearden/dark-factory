@@ -80,7 +80,7 @@ def _minutes_since(iso: str | None) -> int:
         return 0
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
-    delta = datetime.now(UTC) - ts
+    delta = datetime.now(UTC) - ts  # clock-exempt: deferred-consolidation (task 2281)
     minutes = int(delta.total_seconds() // 60)
     return max(minutes, 0)
 

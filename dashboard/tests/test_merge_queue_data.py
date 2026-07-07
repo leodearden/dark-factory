@@ -14,7 +14,6 @@ from unittest.mock import patch
 import aiosqlite
 import httpx
 import pytest
-from _dt_helpers import make_fixed_datetime_cls
 
 import dashboard.data.merge_queue as _mqmod
 
@@ -1154,16 +1153,21 @@ class TestCutoffIso:
         assert result == expected
 
     def test_cutoff_iso_no_now_uses_current_time(self):
-        """Without now, _cutoff_iso uses datetime.now(UTC) — result matches mocked clock exactly."""
-        FIXED_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
-        expected = (FIXED_NOW - timedelta(hours=24)).isoformat()
+        """Without now, _cutoff_iso derives its cutoff from the current UTC clock.
 
-        _FixedDT = make_fixed_datetime_cls(FIXED_NOW)
+        Brackets the real clock read with before/after captures (rather than
+        patching a module-level ``datetime`` symbol) because the no-now branch
+        resolves through ``resolve_now`` in ``dashboard.data.utils``, not a
+        clock read local to ``merge_queue.py``.
+        """
+        before = datetime.now(UTC)
+        result = _cutoff_iso(24)
+        after = datetime.now(UTC)
 
-        with patch.object(_mqmod, 'datetime', _FixedDT):
-            result = _cutoff_iso(24)
-
-        assert result == expected
+        result_dt = datetime.fromisoformat(result)
+        lower = before - timedelta(hours=24) - timedelta(seconds=5)
+        upper = after - timedelta(hours=24) + timedelta(seconds=5)
+        assert lower <= result_dt <= upper
 
 
 # ---------------------------------------------------------------------------

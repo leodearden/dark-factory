@@ -340,6 +340,47 @@ def test_burndown_returns_aggregate_and_per_project(client):
     assert {'labels', 'done', 'in_progress', 'blocked', 'pending'} <= set(aggregate)
 
 
+def test_burndown_route_threads_shared_now_to_all_aggregates(client):
+    """api_burndown must capture one `now` and pass the SAME now to every
+    per-project aggregate_burndown_series call (mirrors
+    test_costs_route_threads_shared_now_to_all_aggregates). Closes the
+    per-project clock-skew race at the route layer, on top of the
+    aggregator-level guarantee from task 2192 step-2."""
+    mock_projects = AsyncMock(return_value=['p1', 'p2'])
+    mock_series = AsyncMock(return_value={
+        'labels': [], 'done': [], 'cancelled': [], 'blocked': [],
+        'deferred': [], 'in_progress': [], 'pending': [],
+    })
+
+    with (
+        patch('dashboard.app.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.app.aggregate_burndown_series', new=mock_series),
+    ):
+        resp = client.get('/api/v2/dashboard/burndown?window=30d')
+
+    assert resp.status_code == 200
+
+    assert mock_series.await_count == 2, (
+        f'expected aggregate_burndown_series to be awaited twice (once per '
+        f'project), got {mock_series.await_count}'
+    )
+    nows = []
+    for call in mock_series.await_args_list:
+        assert 'now' in call.kwargs, (
+            f'aggregate_burndown_series was not called with now= (got {call.kwargs!r})'
+        )
+        now = call.kwargs['now']
+        assert now is not None, 'aggregate_burndown_series received now=None'
+        assert now.tzinfo is not None, (
+            f'aggregate_burndown_series received a naive (non-UTC-aware) datetime: {now!r}'
+        )
+        nows.append(now)
+
+    assert all(n == nows[0] for n in nows), (
+        f'expected all per-project aggregates to share one reference now, got {nows!r}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Escalations endpoint
 # ---------------------------------------------------------------------------
