@@ -5450,28 +5450,45 @@ def _make_harness_with_known_projects(
 
 
 class TestKnownProjectRootFor:
-    """Tests for ReconciliationHarness._known_project_root_for (task 1143)."""
+    """Tests for ReconciliationHarness._known_project_scope_for (task 1143;
+    renamed + scope-returning per task 2146 β)."""
 
     @pytest.mark.asyncio
     async def test_known_project_root_for_returns_mapped_root(
         self, journal, event_buffer, mock_memory_service
     ):
-        """_known_project_root_for returns the correct project_root for each project_id."""
+        """_known_project_scope_for returns a ProjectScope with the correct
+        project_root and project_id for each project_id."""
         harness = _make_harness_with_known_projects(
             journal, event_buffer, mock_memory_service, _FIVE_PROJECT_MAP
         )
 
-        assert harness._known_project_root_for('autopilot_video') == '/home/leo/src/autopilot-video'
-        assert harness._known_project_root_for('reify') == '/home/leo/src/reify'
-        assert harness._known_project_root_for('dark_factory') == '/home/leo/src/dark-factory'
-        assert harness._known_project_root_for('autotrade') == '/home/leo/src/autotrade'
-        assert harness._known_project_root_for('know_live') == '/home/leo/src/know-live'
+        scope = harness._known_project_scope_for('autopilot_video')
+        assert scope.project_root == '/home/leo/src/autopilot-video'
+        assert scope.project_id == 'autopilot_video'
+
+        scope = harness._known_project_scope_for('reify')
+        assert scope.project_root == '/home/leo/src/reify'
+        assert scope.project_id == 'reify'
+
+        scope = harness._known_project_scope_for('dark_factory')
+        assert scope.project_root == '/home/leo/src/dark-factory'
+        assert scope.project_id == 'dark_factory'
+
+        scope = harness._known_project_scope_for('autotrade')
+        assert scope.project_root == '/home/leo/src/autotrade'
+        assert scope.project_id == 'autotrade'
+
+        scope = harness._known_project_scope_for('know_live')
+        assert scope.project_root == '/home/leo/src/know-live'
+        assert scope.project_id == 'know_live'
 
     @pytest.mark.asyncio
     async def test_known_project_root_for_raises_for_unknown_project_id(
         self, journal, event_buffer, mock_memory_service
     ):
-        """_known_project_root_for raises ValueError for an unknown project_id.
+        """_known_project_scope_for raises UnknownProjectError (a ValueError
+        subclass) for an unknown project_id.
 
         The error message must include both the unknown project_id and the sorted list
         of known project_ids so the operator can immediately diagnose the misconfiguration.
@@ -5481,7 +5498,7 @@ class TestKnownProjectRootFor:
         )
 
         with pytest.raises(ValueError) as exc_info:
-            harness._known_project_root_for('not_a_real_project')
+            harness._known_project_scope_for('not_a_real_project')
 
         err_msg = str(exc_info.value)
         assert 'not_a_real_project' in err_msg, (
@@ -5915,7 +5932,7 @@ class TestUnknownProjectError:
     async def test_known_project_root_for_raises_unknown_project_error_specifically(
         self, journal, event_buffer, mock_memory_service
     ):
-        """_known_project_root_for raises UnknownProjectError (not bare ValueError).
+        """_known_project_scope_for raises UnknownProjectError (not bare ValueError).
 
         After step-20, the narrow exception type lets _project_loop distinguish
         a KNOWN_PROJECT_ROOTS misconfiguration from generic ValueErrors raised by
@@ -5929,7 +5946,7 @@ class TestUnknownProjectError:
         )
 
         with pytest.raises(UnknownProjectError) as exc_info:
-            harness._known_project_root_for('not_a_real_project')
+            harness._known_project_scope_for('not_a_real_project')
 
         # Subclass relationship — must also satisfy bare ValueError catches
         assert isinstance(exc_info.value, ValueError) is True, (
