@@ -86,3 +86,51 @@ def hook_session_slug(
     return session_registry.build_session_slug(
         identity.role, identity.project, identity.task_id, session_id
     )
+
+
+# ---------------------------------------------------------------------------
+# Pure OSC-retitle + display-title helpers (PRD §4.6)
+# ---------------------------------------------------------------------------
+
+_GLYPH_BY_STATUS: dict[session_registry.Status, str] = {
+    session_registry.Status.RUNNING: '⚙',
+    session_registry.Status.AWAITING_INPUT: '⏸ AWAITING',
+    session_registry.Status.IDLE: '✅',
+}
+"""PRD §4.6 default glyph prefixes: running=gear, awaiting-input=pause+label,
+idle=check. Statuses this hook trio never emits (LAUNCHING/EXITED/
+FAILED_TO_START) have no entry and fall back to no glyph prefix."""
+
+
+def osc_retitle_sequence(status: session_registry.Status, title: str) -> str:
+    """Build the emulator-agnostic terminal-retitle OSC escape sequence.
+
+    Pure string builder -- PRD §4.6: ``\\033]0;<title>\\007``, no konsole
+    DBus. *status* selects the glyph prefix (see ``_GLYPH_BY_STATUS``); the
+    result is ``'<glyph-prefix> <title>'`` spliced into that OSC template.
+    """
+    prefix = _GLYPH_BY_STATUS.get(session_registry.Status(status), '')
+    label = f'{prefix} {title}' if prefix else title
+    return f'\033]0;{label}\007'
+
+
+def hook_display_title(
+    identity: session_registry.SpawnIdentity,
+    env: Mapping[str, str],
+    record: session_registry.SessionRecord | None = None,
+) -> str:
+    """Resolve the display title to retitle a hook's terminal tab with.
+
+    Prefers an explicit title -- ``CLAUDE_SPAWN_TITLE`` env, else a non-empty
+    ``record.title`` (persisted by an earlier hook in this session, e.g.
+    SessionStart) -- and only falls back to a project-derived title
+    (``'<role>:<project>#<task_id>'``, or ``'<role>:<project>'`` when there is
+    no task_id) matching the documented spawn terminal-title convention
+    (skills/spawn/SKILL.md) when neither explicit source is present.
+    """
+    explicit = env.get('CLAUDE_SPAWN_TITLE') or (record.title if record else '') or ''
+    if explicit:
+        return explicit
+    if identity.task_id:
+        return f'{identity.role}:{identity.project}#{identity.task_id}'
+    return f'{identity.role}:{identity.project}'
