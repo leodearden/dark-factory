@@ -16,6 +16,8 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
+from orchestrator.lane_lifecycle import LaneLifecycle
+from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 
 # ---------------------------------------------------------------------------
@@ -2587,6 +2589,139 @@ class TestRestoreAssignment:
         pool.restore_assignment('42', lane_0)
 
         assert pool.state(lane_1) == LaneState.FREE
+
+
+# ===========================================================================
+# Task 2257 (W11 delta) step-3 RED: WarmLanePool routes
+# restore_assignment/note_assignment through an OPTIONAL injected
+# LaneLifecycle so the durable record never drifts from the in-memory cache
+# (PRD dec.3, I1). Default None (no set_lane_lifecycle call) keeps every
+# pre-existing pure unit test above byte-identical (locked by the first two
+# tests here).
+# ===========================================================================
+
+
+class TestLaneLifecycleRouting:
+    def test_restore_assignment_without_lifecycle_is_cache_only(self, tmp_path: Path):
+        """No lifecycle wired (default None): behavior is unchanged (cache-only)."""
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        lane = base / '_lane-0'
+
+        pool.restore_assignment('42', lane)
+
+        assert pool.state(lane) == LaneState.ASSIGNED
+        assert pool.assignment_for('42') == lane
+        # No lifecycle wired => no durable record written anywhere.
+        assert not (base / '.lane-state').exists()
+
+    def test_note_assignment_without_lifecycle_is_cache_only(self, tmp_path: Path):
+        pool = _make_pool(tmp_path, size=2)
+        base = tmp_path / 'worktrees'
+        lane = base / '_lane-0'
+
+        pool.note_assignment('42', lane)
+
+        assert pool.assignment_for('42') == lane
+        assert not (base / '.lane-state').exists()
+
+    def test_restore_assignment_with_lifecycle_updates_durable_record(
+        self, tmp_path: Path,
+    ):
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/42')
+        lifecycle.transition(lane, DurableLaneState.ASSIGNED, task_id='42')
+        lifecycle.transition(lane, DurableLaneState.RELEASED)
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        pool.restore_assignment('42', lane)
+
+        assert pool.state(lane) == LaneState.ASSIGNED
+        assert pool.assignment_for('42') == lane
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == '42'
+
+    def test_note_assignment_with_lifecycle_updates_durable_record(
+        self, tmp_path: Path,
+    ):
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/42')
+        lifecycle.transition(lane, DurableLaneState.ASSIGNED, task_id='42')
+        lifecycle.transition(lane, DurableLaneState.RELEASED)
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        pool.note_assignment('42', lane)
+
+        assert pool.assignment_for('42') == lane
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == '42'
+
+    def test_restore_assignment_idempotent_when_record_already_assigned(
+        self, tmp_path: Path,
+    ):
+        """restore_assignment on an already-ASSIGNED:'42' record does not raise."""
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/42')
+        lifecycle.transition(lane, DurableLaneState.ASSIGNED, task_id='42')
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        pool.restore_assignment('42', lane)  # must not raise
+
+        assert pool.state(lane) == LaneState.ASSIGNED
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == '42'
+
+    def test_restore_assignment_swallows_conflicting_record_but_still_updates_cache(
+        self, tmp_path: Path,
+    ):
+        """A DIFFERENT task's ASSIGNED record must not crash restore_assignment
+        — the cache mutation (the caller's decision to pin) still applies;
+        only the conflicting durable record is left as-is (never silently
+        stolen, mirrors LaneLifecycle.note_assigned's own conflict contract).
+        """
+        base = tmp_path / 'worktrees'
+        base.mkdir(parents=True, exist_ok=True)
+        lifecycle = LaneLifecycle(worktree_base=base)
+        lane = base / '_lane-0'
+        lifecycle.transition(lane, DurableLaneState.SEED, seeded_from_sha='abc')
+        lifecycle.transition(lane, DurableLaneState.REGISTERED, branch='task/99')
+        lifecycle.transition(lane, DurableLaneState.ASSIGNED, task_id='99')
+
+        pool = _make_pool(tmp_path, size=2)
+        pool.set_lane_lifecycle(lifecycle)
+
+        pool.restore_assignment('42', lane)  # must not raise despite conflict
+
+        assert pool.state(lane) == LaneState.ASSIGNED
+        assert pool.assignment_for('42') == lane
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == '99'  # untouched — never silently stolen
 
 
 # ===========================================================================
