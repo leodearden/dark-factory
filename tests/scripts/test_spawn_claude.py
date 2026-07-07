@@ -11,6 +11,7 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import textwrap
 import time
 
@@ -18,6 +19,17 @@ import pytest  # pyright: ignore[reportMissingImports]
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
+
+# Insert this worktree's orchestrator/src onto sys.path (ahead of any
+# editable install pointing at a different checkout) so `import
+# orchestrator.session_registry` resolves to the module spawn-claude.sh
+# itself invokes by absolute path (task 2285) -- letting this file assert
+# in-process against the exact same record/reap contract.
+_ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
+if str(_ORCH_SRC) not in sys.path:
+    sys.path.insert(0, str(_ORCH_SRC))
+
+from orchestrator import session_registry  # noqa: E402
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
 FOREGROUND_NAMES = ["gnome-terminal", "xterm", "kitty"]
@@ -181,6 +193,10 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     env.pop("ESCALATION_TERMINAL_CMD", None)
     # Keep the genuine-launcher-failure grace short so tests don't hang.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
+    # Isolate the session-registry writes spawn-claude.sh now performs
+    # (task 2285) to a tmp dir sibling of bin_dir, so this suite never reads
+    # or writes the real ~/.claude/fleet tree.
+    env["CLAUDE_FLEET_ROOT"] = str(bin_dir.parent / "fleet")
     return env
 
 
@@ -503,3 +519,44 @@ def test_window_close_129_robust_to_delayed_trap_install(
             f"with {DELAY}s trap-install delay), got {rc}\n"
             f"stderr: {proc.stderr.read().decode()}"  # type: ignore[union-attr]
         )
+
+
+# ===========================================================================
+# task-2285 step-11: session-registry record lifecycle
+# ===========================================================================
+# Real spawn-claude.sh run, CLAUDE_FLEET_ROOT isolated to a tmp dir (via
+# _base_env). The registry write must be purely additive: the pre-existing
+# exit-code contract (result.returncode == the fake claude's own code) holds
+# unchanged alongside the new launching -> exited record.json lifecycle.
+
+
+def _find_one_record(fleet_root: pathlib.Path) -> pathlib.Path:
+    """Return the single record.json under *fleet_root*/sessions/, or fail loudly."""
+    records = list((fleet_root / "sessions").glob("*/record.json"))
+    assert len(records) == 1, f"expected exactly one record.json, found {records}"
+    return records[0]
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_spawn_writes_session_record_lifecycle(
+    tmp_path: pathlib.Path, exit_code: int,
+) -> None:
+    """A real spawn writes launching -> exited with the session's own exit code."""
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=exit_code)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == exit_code, (
+        f"registry wiring must be additive to the exit-code contract: "
+        f"expected {exit_code}, got {result.returncode}\n"
+        f"stderr: {result.stderr.decode()}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.EXITED
+    assert record.exit_code == exit_code
