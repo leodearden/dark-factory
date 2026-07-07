@@ -686,7 +686,9 @@ class TestReportBlockingDependencyToolResolvesRealWorktree:
         tool = await server.get_tool('report_blocking_dependency')
         assert tool is not None
         # report_blocking_dependency is a sync def — call tool.fn() directly.
-        result = tool.fn(depends_on_task_id='42', reason='missing foo()')
+        result = tool.fn(  # type: ignore[union-attr]
+            depends_on_task_id='42', reason='missing foo()'
+        )
 
         assert result['status'] == 'ok'
         assert captured == [artifacts.worktree]
