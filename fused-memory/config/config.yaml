@@ -84,6 +84,14 @@ taskmaster:
   project_root: "${PROJECT_ROOT:.}"
   tool_mode: "all"
 
+# task_metadata.enforce — RED-TIER / restart-only (task 2162, W3-β). warn-mode
+# (false) logs a task_metadata.schema_warning line per SchemaWarning and lets
+# the write proceed; true rejects a schema-violating add_task/update_task with
+# ValidationError. See shared/src/shared/task_metadata.py and
+# plans/task-metadata-schema-prd.md.
+task_metadata:
+  enforce: false
+
 reconciliation:
   enabled: true
   # Phase 2 enforcement of done_provenance: require commit|note payload on done transitions
