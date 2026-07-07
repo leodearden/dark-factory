@@ -907,7 +907,7 @@ class TaskInterceptor:
                 if _hook_err is not None:
                     return _hook_err
 
-            # 2e. Transition-legality gate (Table A, task 2175/rho1b): LOG-MODE.
+            # 2e. Transition-legality gate (Table A, task 2175/rho1b).
             # Classifies the caller into an ActorClass and checks the
             # (old_status, status, actor) triple against the shared transition
             # authority (shared.task_transitions). Runs after every other gate
@@ -918,8 +918,10 @@ class TaskInterceptor:
             # reopen mirrors the terminal-exit gate above (2a): a terminal->X
             # write that already cleared that gate (resolved_reopen_reason set)
             # is treated as a legal reopen by the table, not double-flagged.
-            # LOG-ONLY at this step: always proceed regardless of verdict; the
-            # enforce-mode reject branch lands separately.
+            # Default (task_status.enforce_transitions=False) is LOG-MODE: an
+            # illegal verdict logs a grep-stable WARNING and the write still
+            # proceeds. Set True only after the Gamma soak: a typed
+            # illegal_transition rejection short-circuits before the write.
             actor = derive_actor_class(agent_id)
             try:
                 _legal_transition = is_legal_transition(
@@ -931,6 +933,8 @@ class TaskInterceptor:
             except ValueError:
                 _legal_transition = True
             if not _legal_transition:
+                if self._enforce_transitions():
+                    return _illegal_transition_error(task_id, old_status, status, str(actor))
                 logger.warning(
                     'illegal_transition would-reject %s->%s actor=%s',
                     old_status,
@@ -3673,6 +3677,20 @@ class TaskInterceptor:
         recon = getattr(cfg, 'reconciliation', None)
         return bool(getattr(recon, 'require_done_provenance', False))
 
+    def _enforce_transitions(self) -> bool:
+        """True when the transition-legality gate is enforcing (reject illegal).
+
+        False during phased rollout (log-mode default) — in that mode an
+        illegal ``(from, to, actor)`` transition logs a
+        ``illegal_transition would-reject`` WARNING and the transition
+        proceeds. Mirrors :meth:`_require_done_provenance`.
+        """
+        cfg = self._config
+        if cfg is None:
+            return False
+        task_status = getattr(cfg, 'task_status', None)
+        return bool(getattr(task_status, 'enforce_transitions', False))
+
 
 def _extract_status(task_data: dict) -> str:
     """Extract status from Taskmaster get_task response."""
@@ -3750,6 +3768,35 @@ def _terminal_exit_error(task_id: str, from_status: str, to_status: str) -> dict
             "override — e.g. 'un-defer script', 'manual re-scope', "
             "'reconciliation: re-implementation required'. The reason is "
             'persisted as task metadata for audit.'
+        ),
+    }
+
+
+def _illegal_transition_error(
+    task_id: str, from_status: str, to_status: str, actor: str,
+) -> dict:
+    """Structured error returned when the transition-legality gate rejects (enforce-mode).
+
+    Mirrors :func:`_terminal_exit_error` in shape so MCP callers handle the
+    rejection uniformly. Only returned when
+    ``task_status.enforce_transitions=True``; in the default log-mode the
+    same illegal verdict instead logs a ``illegal_transition would-reject``
+    WARNING and the transition proceeds.
+    """
+    return {
+        'success': False,
+        'error': 'illegal_transition',
+        'task_id': task_id,
+        'from_status': from_status,
+        'to_status': to_status,
+        'actor': actor,
+        'hint': (
+            f'Transition from {from_status!r} to {to_status!r} is not permitted '
+            f'for actor {actor!r} (task-status-authority Table A). This is '
+            'enforced because task_status.enforce_transitions=True; during the '
+            'phased log-mode rollout the same verdict only logs a warning and '
+            'proceeds. If this transition should be legal, the shared Table A '
+            '(shared/src/shared/task_transitions.py) needs updating, not this gate.'
         ),
     }
 
