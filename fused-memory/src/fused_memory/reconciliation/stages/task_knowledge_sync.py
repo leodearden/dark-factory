@@ -2767,6 +2767,25 @@ class TaskKnowledgeSync(BaseStage):
             verified_count if verified_count is not None else 0
         )
 
+        # --- task_count_snapshot freshness stat (task 2278) ---
+        # Best-effort structural guard against the Mem0 task_count_snapshot
+        # write-cadence gap: written is None when the run window is unknown
+        # or the freshness query itself failed transiently, in which case the
+        # stat key is left absent entirely so the harness
+        # (_maybe_escalate_stale_task_count_snapshot) can distinguish a
+        # CONFIRMED miss (0) from "unknown" (never miscounted as a miss).
+        # run_window_start forwards whatever assemble_payload stashed on
+        # self._run_window_start this cycle, mirroring the
+        # _sweep_stale_flag_markers forwarding immediately below.
+        task_count_snapshot_written = await _verify_task_count_snapshot_written(
+            self.memory, self.project_id,
+            getattr(self, '_run_window_start', None),
+        )
+        if task_count_snapshot_written is not None:
+            report.stats['task_count_snapshot_written'] = (
+                1 if task_count_snapshot_written else 0
+            )
+
         # --- stage1_flag_marker age-based + cross-cycle fp: GC (task 1944, task-2047 Gap 2) ---
         # The stage1_flag_marker pool is written by Stage 1, not by this stage's
         # agent write, so post-write placement is correct (unlike the pre-write
