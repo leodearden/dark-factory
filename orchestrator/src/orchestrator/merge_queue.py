@@ -2755,19 +2755,24 @@ async def reconcile_landed_row(
       done via the existing ``merged`` done-write path, THEN consume the
       row — that ordering means a crash between the two re-drives cleanly
       on the next startup (the row survives to retry).
+    * ``'skipped'`` — ``scheduler.get_status`` returned ``None`` (a
+      transient MCP failure): fail-safe, leave the row unconsumed for the
+      next startup to retry rather than guessing done-or-not (no
+      phantom-done, no premature prune).
     """
     if not await git_ops.is_ancestor(row.advanced_sha, main_sha):
         outbox.consume(row.task_id)
         return 'pruned_not_landed'
 
     status = await scheduler.get_status(row.task_id)
+    if status is None:
+        return 'skipped'
     if status == 'done':
         outbox.consume(row.task_id)
         return 'already_done_pruned'
-    if status is not None:
-        await scheduler.mark_done(row.task_id, kind='merged', sha=row.advanced_sha)
-        outbox.consume(row.task_id)
-        return 'marked_done'
+    await scheduler.mark_done(row.task_id, kind='merged', sha=row.advanced_sha)
+    outbox.consume(row.task_id)
+    return 'marked_done'
 
 
 async def reconcile_landed_outbox(
@@ -2779,7 +2784,10 @@ async def reconcile_landed_outbox(
 
     Resolves ``main_sha`` once for the whole scan, then delegates each row to
     :func:`reconcile_landed_row`, tallying dispositions into the returned
-    report (mirrors ``recover_pending_merges``'s count-report shape).
+    report (mirrors ``recover_pending_merges``'s count-report shape). A
+    per-row try/except (fail-open, mirroring ``recover_pending_merges``)
+    ensures one bad row never aborts the scan — its exception is logged and
+    tallied under ``'errors'`` while the remaining rows still get reconciled.
     """
     report = {
         'pruned_not_landed': 0,
@@ -2790,10 +2798,17 @@ async def reconcile_landed_outbox(
     }
     main_sha = await git_ops.get_main_sha()
     for row in outbox.all():
-        disposition = await reconcile_landed_row(
-            row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
-        )
-        report[disposition] += 1
+        try:
+            disposition = await reconcile_landed_row(
+                row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
+            )
+            report[disposition] += 1
+        except Exception:
+            logger.warning(
+                'reconcile_landed_outbox: failed to reconcile row task_id=%s',
+                row.task_id, exc_info=True,
+            )
+            report['errors'] += 1
     return report
 
 
