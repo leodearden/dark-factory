@@ -779,6 +779,27 @@ class SoloVerifyResult:
     solo_branch: str | None = None
 
 
+@dataclass(eq=False)
+class SpecPermit:
+    """Opaque speculation-slot permit token (MQ-refactor zeta / task 2159).
+
+    Returned by ``PermitLedger.acquire()`` (see
+    ``merge_speculation_controller.py``) and stored on the pipeline item /
+    in-flight entry that owns it. ``eq=False`` leaves ``__eq__``/``__hash__``
+    at their ``object`` defaults — IDENTITY, not field-value — comparison, so
+    a ``PermitLedger``'s ``live`` set treats every acquired token as a
+    distinct member even though two permits' fields may compare equal.
+
+    ``released`` starts False and is flipped to True exactly once, by
+    ``PermitLedger.release`` — which checks this flag FIRST, so a second
+    release of the same token is a silent no-op rather than an over-release
+    or an assertion failure (kills the known CancelledError-after-put
+    double-release race).
+    """
+
+    released: bool = False
+
+
 @dataclass
 class RealMergeItem:
     """Internal message passed from Merger coroutine to Verifier coroutine:

@@ -110,6 +110,7 @@ from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     parse_per_test_results,
 )
 from orchestrator.merge_speculation_controller import (  # noqa: F401  re-export shim
+    PermitLedger,
     SpeculationController,
 )
 from orchestrator.merge_types import (  # noqa: F401  re-export shim

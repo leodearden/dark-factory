@@ -77,10 +77,91 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from orchestrator.merge_types import SpecPermit
+
 if TYPE_CHECKING:
     import asyncio
 
     from orchestrator.merge_types import MergeRequest
+
+
+class PermitLedger:
+    """Single owner of a shared speculation-slot semaphore (MQ-refactor zeta
+    / task 2159).
+
+    Wraps an externally-owned ``asyncio.Semaphore`` (injected — never owns or
+    creates its own, mirroring :class:`SpeculationController`'s existing
+    contract) and mediates acquire/release through a :class:`SpecPermit`
+    token registered in ``live``. Conservation is structural: ``slot_available
+    + len(live) == depth`` holds after every acquire/release call because
+    neither mutates across an ``await`` boundary — on the single asyncio
+    event loop, each pair (semaphore + ``live``) is therefore atomic from
+    every other coroutine's perspective.
+
+    In task zeta this ledger WRAPS the worker's existing
+    ``_speculation_slot`` while the verifier side continues to release that
+    same semaphore directly (raw, not through this ledger) — task eta
+    migrates those call sites to ``ledger.release(item.permit)``. Until then,
+    ``live`` is not yet the pipeline's sole source of truth for in-flight
+    permits; only the acquire/release paths already routed through this
+    ledger (currently just :class:`SpeculationController`'s merger-side
+    lifecycle) are covered by the identity above.
+    """
+
+    def __init__(self, slot: asyncio.Semaphore, depth: int) -> None:
+        self._slot = slot
+        self._depth = depth
+        self._live: set[SpecPermit] = set()
+
+    @property
+    def depth(self) -> int:
+        return self._depth
+
+    @property
+    def slot_available(self) -> int:
+        """Read the wrapped semaphore's internal counter directly.
+
+        Safe without a lock: both this read and every mutation happen on the
+        single asyncio event loop (mirrors
+        ``SpeculationController.snapshot()``'s existing non-blocking
+        contract).
+        """
+        return self._slot._value  # type: ignore[attr-defined]
+
+    @property
+    def live(self) -> frozenset[SpecPermit]:
+        """Read-only view of the currently-outstanding permits."""
+        return frozenset(self._live)
+
+    async def acquire(self) -> SpecPermit:
+        """Acquire one permit, returning a fresh token registered in ``live``.
+
+        No ``await`` between the semaphore acquire and the ``live``
+        registration below, so the pair is atomic from every other
+        coroutine's perspective.
+        """
+        await self._slot.acquire()
+        permit = SpecPermit()
+        self._live.add(permit)
+        return permit
+
+    def release(self, permit: SpecPermit) -> None:
+        """Release *permit*, restoring one slot. Idempotent + live-checked.
+
+        Checks ``permit.released`` FIRST so a double-release is a silent
+        no-op — never an over-release, never an assertion failure. Only past
+        that guard does it assert the token is actually live, catching a
+        genuinely-unknown token as a programming error.
+        """
+        if permit.released:
+            return
+        assert permit in self._live, (
+            f'PermitLedger.release: permit {permit!r} is not live (a token '
+            'this ledger never issued, or already discarded)'
+        )
+        permit.released = True
+        self._live.discard(permit)
+        self._slot.release()
 
 
 class SpeculationController:
