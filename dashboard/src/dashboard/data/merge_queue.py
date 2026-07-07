@@ -50,10 +50,15 @@ def _ts_sort_key(entry: dict) -> datetime:
 
 _CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
 
-_TERMINAL_MERGE_OUTCOMES: frozenset[str] = frozenset({
-    'done', 'already_merged', 'conflict', 'blocked',
-    'dropped_plan_targets', 'cas_exhausted', 'abandoned_verify_timeouts',
-    'unknown_branch',
+# _ACTIVE_ONLY mirrors the non-terminal members of orchestrator merge_types.OutcomeKind
+# (_NON_TERMINAL_OUTCOMES in orchestrator/src/orchestrator/merge_types.py). The dashboard
+# has NO dependency on the orchestrator package, so this is a hand-maintained mirror, not an
+# import; the orchestrator-side frozen-contract test
+# (tests/test_outcome_kind.py::TestOutcomeKindFrozenContract) is the drift tripwire. A latest
+# merge_attempt event is TERMINAL (drops off the active panel) UNLESS its outcome is listed
+# here — new/unknown terminal outcomes fail SAFE instead of phantoming for the full TTL.
+_ACTIVE_ONLY: frozenset[str] = frozenset({
+    'cas_retry', 'gate_retry', 'post_merge_generation_chained', 'plan_files_narrowed',
 })
 _ACTIVE_EVENT_TYPES: tuple[str, ...] = ('merge_queued', 'merge_dequeued', 'merge_attempt')
 
@@ -724,9 +729,11 @@ async def active_queued_merges(
 
     Queries events with event_type IN ('merge_queued', 'merge_dequeued',
     'merge_attempt'), picks the latest row per task_id within the TTL window,
-    and excludes tasks whose latest event is a terminal merge_attempt outcome
-    (done, already_merged, conflict, blocked, dropped_plan_targets,
-    cas_exhausted, abandoned_verify_timeouts, unknown_branch).
+    and excludes tasks whose latest event is a terminal merge_attempt outcome.
+    A merge_attempt outcome is terminal UNLESS it is listed in _ACTIVE_ONLY
+    (cas_retry, gate_retry, post_merge_generation_chained, plan_files_narrowed)
+    — this fails safe: new or unrecognized outcomes drop off the active panel
+    instead of phantoming as in_flight for the full TTL.
 
     Args:
         db:  Async SQLite connection, or None (returns []).
@@ -779,8 +786,8 @@ async def active_queued_merges(
         for row in rows:
             et = row['event_type']
             outcome = row['outcome']
-            # Exclude terminal merge_attempt rows
-            if et == 'merge_attempt' and outcome in _TERMINAL_MERGE_OUTCOMES:
+            # Exclude terminal merge_attempt rows (terminal-unless-listed: fail safe)
+            if et == 'merge_attempt' and outcome not in _ACTIVE_ONLY:
                 continue
             # Derive state
             state = 'queued' if et == 'merge_queued' else 'in_flight'
