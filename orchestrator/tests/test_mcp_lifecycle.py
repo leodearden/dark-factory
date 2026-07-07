@@ -368,3 +368,54 @@ class TestPlanToolsLaunchDirectInterpreter:
             "Empty string python_executable must fall back to uv path, "
             f"not launch with command={cfg['command']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-1/Step-2 (task 2258, W11-ε1): plan_tools_mcp_server(meta_root=...)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanToolsLaunchMetaRoot:
+    """plan_tools_mcp_server(meta_root=...) appends '--meta-root <path>' to
+    args for BOTH the uv-fallback and direct-interpreter forms; omitting
+    meta_root (the default) leaves args byte-identical to before this
+    parameter existed (worktree-lane-lifecycle PRD task ε1)."""
+
+    def test_uv_fallback_contains_meta_root_flag(self):
+        """uv-fallback form: '--meta-root' immediately followed by the path."""
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            meta_root=Path('/base/.task-meta/wt'),
+        )
+        args = cfg['args']
+        idx = args.index('--meta-root')
+        assert args[idx + 1] == '/base/.task-meta/wt'
+
+    def test_direct_interpreter_contains_meta_root_flag(self):
+        """direct-interpreter form: '--meta-root' immediately followed by the path."""
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+            meta_root=Path('/base/.task-meta/wt'),
+        )
+        args = cfg['args']
+        idx = args.index('--meta-root')
+        assert args[idx + 1] == '/base/.task-meta/wt'
+
+    def test_uv_fallback_omits_meta_root_flag_by_default(self):
+        """Regression guard: meta_root omitted (None) → no '--meta-root' token
+        anywhere in args, so existing exact-match tests stay valid."""
+        cfg = plan_tools_mcp_server(orch_project_dir=Path('/orch'), worktree=Path('/wt'))
+        assert '--meta-root' not in cfg['args']
+
+    def test_direct_interpreter_omits_meta_root_flag_by_default(self):
+        """Regression guard: meta_root omitted (None) → no '--meta-root' token
+        anywhere in args for the direct-interpreter form either."""
+        cfg = plan_tools_mcp_server(
+            orch_project_dir=Path('/orch'),
+            worktree=Path('/wt'),
+            python_executable='/venv/bin/python',
+        )
+        assert '--meta-root' not in cfg['args']
