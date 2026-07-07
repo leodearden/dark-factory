@@ -498,28 +498,57 @@ async def run(args: Any, memory_service: Any) -> dict:
             # home-graph name, so it is no longer foreign after the move --
             # a safe no-op for displaced-only moves where target_graph
             # already equals the node's group_id.
-            await move_entity_across_graphs(
-                graphiti, uuid, node['source_graph'], node['target_graph'],
-                rewrite_group_id=node['target_graph'],
-            )
-            apply_results.append(
-                {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
-            )
+            #
+            # The dispatch is isolated in a try/except: a hand-edited
+            # manifest mislabeling an Episodic node as MOVE (escaping the
+            # classify-time EPISODIC_SKIP gate), a ForeignDuplicateSuspected-
+            # Error, or a transient FalkorDB error must not abort the whole
+            # batch mid-run after earlier nodes were already mutated -- the
+            # failure is recorded against THIS node only and the loop moves
+            # on to the next one.
+            try:
+                await move_entity_across_graphs(
+                    graphiti, uuid, node['source_graph'], node['target_graph'],
+                    rewrite_group_id=node['target_graph'],
+                )
+            except Exception as exc:
+                apply_results.append({
+                    'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True,
+                    'error': str(exc),
+                })
+            else:
+                apply_results.append(
+                    {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
+                )
         elif disposition == MERGE:
-            await merge_foreign_duplicate(
-                graphiti, uuid,
-                wrong_graph=node['source_graph'], home_graph=node['target_graph'],
-            )
-            apply_results.append(
-                {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
-            )
+            try:
+                await merge_foreign_duplicate(
+                    graphiti, uuid,
+                    wrong_graph=node['source_graph'], home_graph=node['target_graph'],
+                )
+            except Exception as exc:
+                apply_results.append({
+                    'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True,
+                    'error': str(exc),
+                })
+            else:
+                apply_results.append(
+                    {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
+                )
         elif disposition == REKEY:
-            await rekey_node_in_place(
-                graphiti._graph_for(node['source_graph']), uuid, node['target_graph'],
-            )
-            apply_results.append(
-                {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
-            )
+            try:
+                await rekey_node_in_place(
+                    graphiti._graph_for(node['source_graph']), uuid, node['target_graph'],
+                )
+            except Exception as exc:
+                apply_results.append({
+                    'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True,
+                    'error': str(exc),
+                })
+            else:
+                apply_results.append(
+                    {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
+                )
         elif disposition == EPISODIC_SKIP:
             # Non-:Entity foreign node (Episodic/Community/unlabeled): the
             # epsilon primitives and rekey_node_in_place are all :Entity-
