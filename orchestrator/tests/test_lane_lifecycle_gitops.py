@@ -12,10 +12,12 @@ stub scripts rather than depending on test_git_ops.py's module-level helpers.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     GitOps,
@@ -201,3 +203,49 @@ class TestPoolStorageSentinelDelegation:
         # Same record LaneLifecycle owns — delegation, not a parallel/
         # duplicate implementation.
         assert git_ops._lane_lifecycle.pool_storage_present() is True
+
+
+# ---------------------------------------------------------------------------
+# Disk-backstop plan.json relocation: new-then-old via TaskArtifacts.meta_root_for
+# ---------------------------------------------------------------------------
+
+
+class TestDiskBackstopPlanJsonRelocation:
+    """_find_lane_by_plan_task_id (the on-disk backstop scan) must read
+    plan.json from the NEW .task-meta location first, falling back to the
+    legacy <lane>/.task/plan.json path (W11 gamma .task -> .task-meta
+    relocation, PRD decision 7: new-then-old reads, side-effect-free)."""
+
+    def test_finds_lane_via_new_task_meta_path(self, tmp_path: Path):
+        project_root = tmp_path / 'project'
+        project_root.mkdir()
+        git_ops = GitOps(_warm_config(), project_root, warm_lane_pool_size=1)
+        lane = git_ops.worktree_base / '_lane-0'
+        lane.mkdir(parents=True)
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, '_lane-0')
+        meta_root.mkdir(parents=True)
+        (meta_root / 'plan.json').write_text(json.dumps({'task_id': '777'}))
+
+        found = git_ops._find_lane_by_plan_task_id('777')
+
+        assert found == lane, (
+            f'expected the new .task-meta/plan.json to resolve lane {lane}, '
+            f'got {found!r}'
+        )
+
+    def test_falls_back_to_legacy_task_path(self, tmp_path: Path):
+        project_root = tmp_path / 'project'
+        project_root.mkdir()
+        git_ops = GitOps(_warm_config(), project_root, warm_lane_pool_size=1)
+        lane = git_ops.worktree_base / '_lane-0'
+        legacy_dir = lane / '.task'
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / 'plan.json').write_text(json.dumps({'task_id': '777'}))
+        # Deliberately no plan.json at the new .task-meta path at all.
+
+        found = git_ops._find_lane_by_plan_task_id('777')
+
+        assert found == lane, (
+            f'expected new-then-old fallback to find legacy plan.json at '
+            f'{legacy_dir}, got {found!r}'
+        )
