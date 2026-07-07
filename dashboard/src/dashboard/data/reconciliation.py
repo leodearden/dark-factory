@@ -44,7 +44,7 @@ def partition_burst_state(
     Active means ``state != 'idle'`` **or** ``last_write_at`` within
     *active_threshold_seconds*.  Everything else is idle/stale.
     """
-    now = datetime.now(UTC)
+    now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
     active: list[dict] = []
     idle: list[dict] = []
     for agent in burst_state:
@@ -250,7 +250,7 @@ async def get_buffer_stats(db: aiosqlite.Connection | None) -> dict:
         age = None
         if oldest_ts is not None:
             oldest_dt = parse_utc(oldest_ts).astimezone(UTC)
-            age = (datetime.now(UTC) - oldest_dt).total_seconds()
+            age = (datetime.now(UTC) - oldest_dt).total_seconds()  # clock-exempt: deferred-consolidation (task 2281)
 
         return {'buffered_count': count, 'oldest_event_age_seconds': age}
 
@@ -277,7 +277,7 @@ async def get_burst_state(
         ) as cursor:
             rows = await cursor.fetchall()
 
-        now = datetime.now(UTC)
+        now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
         results = []
         for row in rows:
             state = row['state']

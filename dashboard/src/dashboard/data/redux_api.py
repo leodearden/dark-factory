@@ -235,7 +235,7 @@ def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     worst_status: str = 'ok'
     worst_reason: str | None = None
-    now = datetime.now(UTC)
+    now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
 
     for server_url, stores in (wal.get('stores') or {}).items():
         if not isinstance(stores, Mapping):

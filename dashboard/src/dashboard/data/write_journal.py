@@ -31,7 +31,7 @@ async def get_memory_timeseries(db: aiosqlite.Connection | None, *, hours: int =
     Returns ``{labels: ["HH:00", ...], reads: [int, ...], writes: [int, ...]}``.
     Labels cover every hour in the window, with zeros for gaps.
     """
-    now = datetime.now(UTC)
+    now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
     since = now - timedelta(hours=hours)
 
     # Pre-fill all hour buckets
@@ -71,7 +71,7 @@ async def get_operations_breakdown(db: aiosqlite.Connection | None, *, hours: in
 
     Returns ``{labels: [str, ...], values: [int, ...]}``.
     """
-    since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+    since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
 
     async def _query(db: aiosqlite.Connection) -> dict:
         async with db.execute(
@@ -93,7 +93,7 @@ async def get_agent_breakdown(db: aiosqlite.Connection | None, *, hours: int = 2
 
     Returns ``{labels: [str, ...], values: [int, ...]}``.
     """
-    since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+    since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
 
     async def _query(db: aiosqlite.Connection) -> dict:
         async with db.execute(

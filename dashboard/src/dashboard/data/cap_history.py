@@ -77,7 +77,7 @@ def _to_utc(dt: datetime | None) -> datetime:
     - naive (no ``tzinfo``) → assumed UTC, attached via ``replace(tzinfo=UTC)``
     - tz-aware but non-UTC → converted via ``astimezone(UTC)``
     """
-    effective = dt if dt is not None else datetime.now(UTC)
+    effective = dt if dt is not None else datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
     if effective.tzinfo is None:
         return effective.replace(tzinfo=UTC)
     return effective.astimezone(UTC)

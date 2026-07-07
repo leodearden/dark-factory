@@ -321,7 +321,7 @@ async def _sample_curator(
         are swallowed and treated as 0/None — the function never propagates
         a top-level exception to the caller.
     """
-    effective_now = now if now is not None else datetime.now(UTC)
+    effective_now = now if now is not None else datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
 
     # 1. HTTP pending count via fan_out_list_tickets (de-duped roots, first-success-per-root).
     _, pending_total = await fan_out_list_tickets(
@@ -452,7 +452,7 @@ async def collect_metrics_snapshot(
             sampling. Optional — when None the curator block records None
             centiles but still captures pending_total and capped_now.
     """
-    now_dt = datetime.now(UTC)
+    now_dt = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
     now = now_dt.isoformat()
 
     # Orchestrators (synchronous; subprocess in to_thread).
@@ -590,7 +590,7 @@ async def downsample_metrics(conn: aiosqlite.Connection) -> None:
     For per-project tables, partition key is (project_id, hour); for
     system-wide tables, partition key is just hour.
     """
-    now = datetime.now(UTC)
+    now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
     cutoff_7d = (now - timedelta(days=7)).isoformat()
     cutoff_90d = (now - timedelta(days=90)).isoformat()
 
@@ -651,7 +651,7 @@ async def get_orchestrators_running_series(
     """
     if db is None:
         return dict(_EMPTY_SERIES)
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
     try:
         if project_id is None:
             sql = (
@@ -686,7 +686,7 @@ async def get_memory_sparks(
     empty = {'graphiti_nodes': dict(_EMPTY_SERIES), 'mem0_memories': dict(_EMPTY_SERIES)}
     if db is None:
         return empty
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
     try:
         async with db.execute(
             'SELECT ts, SUM(graphiti_nodes), SUM(mem0_memories) '
@@ -718,7 +718,7 @@ async def get_memory_24h_ago(
     """
     if db is None:
         return {}
-    target = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+    target = (datetime.now(UTC) - timedelta(hours=24)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
     try:
         async with db.execute(
             """
@@ -749,7 +749,7 @@ async def get_queue_pending_series(
     """Return write-queue pending depth over time."""
     if db is None:
         return dict(_EMPTY_SERIES)
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
     try:
         async with db.execute(
             'SELECT ts, pending FROM queue_snapshots WHERE ts >= ? ORDER BY ts',
@@ -771,7 +771,7 @@ async def get_recon_sparks(
     empty = {'buffered_count': dict(_EMPTY_SERIES), 'active_agents': dict(_EMPTY_SERIES)}
     if db is None:
         return empty
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
     try:
         async with db.execute(
             'SELECT ts, buffered_count, active_agents FROM recon_snapshots '
@@ -807,7 +807,7 @@ async def get_curator_sparks(
     }
     if db is None:
         return empty
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
     try:
         async with db.execute(
             'SELECT ts, pending_total, p50_active_ms, p90_active_ms, p99_active_ms '
@@ -839,7 +839,7 @@ async def get_merge_active_series(
     """
     if db is None:
         return dict(_EMPTY_SERIES)
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
     try:
         if project_id is None:
             sql = (
