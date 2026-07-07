@@ -295,13 +295,28 @@ class InvokeSlot:
         # any other exit: __aexit__ calls release_probe_slot
     """
 
-    __slots__ = ('_gate', 'token', 'account_name', '_settled')
+    __slots__ = ('_gate', 'lease', '_settled')
 
-    def __init__(self, gate: UsageGate, token: str | None) -> None:
+    def __init__(self, gate: UsageGate, lease: AccountLease | None) -> None:
         self._gate = gate
-        self.token = token
-        self.account_name = gate.active_account_name or ''
+        self.lease = lease
         self._settled = False
+
+    @property
+    def token(self) -> str | None:
+        """OAuth token of the leased account (task W4-δ, PRD §7.4)."""
+        return self.lease.token if self.lease is not None else None
+
+    @property
+    def account_name(self) -> str:
+        """Name of the leased account — the SAME account ``token`` came from.
+
+        Derived from ``lease`` rather than independently re-resolved (the
+        old ``gate.active_account_name`` re-derivation omitted
+        ``probe_in_flight`` from its predicate, so it could name a
+        *different* account than ``token`` — finding 3 / boundary test B5).
+        """
+        return self.lease.name if self.lease is not None else ''
 
     def detect_cap_hit(
         self,
@@ -586,10 +601,14 @@ class UsageGate:
             len(self._accounts),
         )
 
-    async def before_invoke(self) -> str | None:
-        """Block until at least one account is available. Return its OAuth token.
+    async def before_invoke(self) -> AccountLease | None:
+        """Block until at least one account is available. Return its lease.
 
-        Returns ``None`` if no accounts are configured (no token override).
+        Returns an :class:`AccountLease` snapshotting the selected account's
+        name/token/generation (task W4-δ, PRD §7.4) — built IN-LOCK, after
+        any PROBING -> PROBE_IN_FLIGHT claim, so the returned lease always
+        names the SAME account as its token. Returns ``None`` if no accounts
+        are configured (no token override).
         """
         # Session budget check
         if (self._config.session_budget_usd is not None
@@ -635,7 +654,9 @@ class UsageGate:
                             )
                     else:
                         self._last_account_name = acct.name
-                    return acct.token
+                    return AccountLease(
+                        name=acct.name, token=acct.token, generation=acct.generation,
+                    )
 
             # All capped — check if any reset times have passed before blocking.
             refreshed = await self._refresh_capped_accounts()
@@ -677,13 +698,13 @@ class UsageGate:
                     break          # probe settled by confirm
                 # any other exit path (continue, exception): auto-released
         """
-        token = await self.before_invoke()
-        slot = InvokeSlot(self, token)
+        lease = await self.before_invoke()
+        slot = InvokeSlot(self, lease)
         try:
             yield slot
         finally:
             if not slot._settled:
-                self.release_probe_slot(token)
+                self.release_probe_slot(lease.token if lease is not None else None)
 
     def detect_cap_hit(
         self,
