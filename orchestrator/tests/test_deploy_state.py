@@ -179,3 +179,25 @@ class TestEnforceTransition:
 
         assert result is None
         assert calls == []
+
+    def test_sink_raising_still_raises_illegal_transition_with_sink_as_context(self) -> None:
+        """The ``finally: raise`` is load-bearing: a sink that itself raises must not
+
+        change the observed error type. The sink is still invoked (and observed via
+        ``calls`` before the raise), and its exception is preserved as
+        ``__context__`` via Python's implicit chaining rather than swallowed.
+        """
+        calls = []
+
+        def failing_sink(task_id: str, old: DeployPhase, new: DeployPhase) -> None:
+            calls.append((task_id, old, new))
+            raise RuntimeError('delivery failed')
+
+        with pytest.raises(IllegalDeployTransition) as excinfo:
+            enforce_transition(
+                DeployPhase.SCHEDULED, DeployPhase.DONE, task_id='t1', escalation_sink=failing_sink
+            )
+
+        assert calls == [('t1', DeployPhase.SCHEDULED, DeployPhase.DONE)]
+        assert isinstance(excinfo.value.__context__, RuntimeError)
+        assert str(excinfo.value.__context__) == 'delivery failed'

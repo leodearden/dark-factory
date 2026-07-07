@@ -30,6 +30,15 @@ __all__ = [
 # illegal by construction (is_legal_transition defaults to False). Per the
 # PRD §5.2 chart (scheduled→ran→{verified|failed|escalated}→done) plus the
 # DeterministicRunner field-combo presets (CLAUDE.md "Field-combo presets").
+#
+# Deliberately a `dict` (not a `frozenset` of legal pairs), even though every
+# stored value is `True`: TestLegalTransitionTable subscripts
+# `_LEGAL[(old, new)]`, asserts `isinstance(_LEGAL, dict)`, and iterates
+# `.items()` — that is the pinned test contract (plan.json step-5). A
+# frozenset swap was tried once already (in a WIP rebase commit) and reverted
+# in 626d4a9a1d because it broke that contract without updating the tests.
+# Keep the dict shape unless TestLegalTransitionTable is deliberately
+# rewritten in the same change.
 _LEGAL: dict[tuple[DeployPhase, DeployPhase], bool] = {
     # scheduled -> ran: the deploy script was launched (before_done_ran_at).
     (DeployPhase.SCHEDULED, DeployPhase.RAN): True,
