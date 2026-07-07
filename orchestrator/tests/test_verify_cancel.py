@@ -324,6 +324,145 @@ class TestStartOwnProcessGroup:
 
 
 # ---------------------------------------------------------------------------
+# Task 2306 step-5: acquire_merge_verify_flock / release_merge_verify_flock —
+# bounded-wait fcntl.flock guarding the laptop persistent merge-verify worktree.
+# ---------------------------------------------------------------------------
+
+
+class TestMergeVerifyLockPath:
+    """merge_verify_lock_path resolves to a fixed filename under worktree_base."""
+
+    def test_fixed_path(self, tmp_path: Path):
+        from orchestrator.verify_cancel import merge_verify_lock_path
+
+        path = merge_verify_lock_path(tmp_path)
+        assert path == tmp_path / '.merge_verify.lock'
+
+
+class TestAcquireReleaseMergeVerifyFlock:
+    """acquire_merge_verify_flock / release_merge_verify_flock against a real temp file."""
+
+    def test_acquire_when_free_returns_fd(self, tmp_path: Path):
+        from orchestrator.verify_cancel import (
+            acquire_merge_verify_flock,
+            release_merge_verify_flock,
+        )
+
+        path = tmp_path / '.merge_verify.lock'
+        fd = acquire_merge_verify_flock(path, timeout_secs=1.0)
+        assert isinstance(fd, int)
+        release_merge_verify_flock(fd)
+
+    def test_release_then_reacquire_succeeds(self, tmp_path: Path):
+        """release_merge_verify_flock frees the lock so a subsequent acquire succeeds."""
+        from orchestrator.verify_cancel import (
+            acquire_merge_verify_flock,
+            release_merge_verify_flock,
+        )
+
+        path = tmp_path / '.merge_verify.lock'
+        fd1 = acquire_merge_verify_flock(path, timeout_secs=1.0)
+        assert fd1 is not None
+        release_merge_verify_flock(fd1)
+
+        fd2 = acquire_merge_verify_flock(path, timeout_secs=1.0)
+        assert isinstance(fd2, int)
+        release_merge_verify_flock(fd2)
+
+    def test_contention_returns_none_within_timeout(self, tmp_path: Path):
+        """A separate fd already holding LOCK_EX on the same path -> bounded-wait timeout.
+
+        flock conflicts across independent fds even within one process, so a
+        second os.open + fcntl.flock(LOCK_EX) on the same path from this same
+        test process is sufficient to simulate a concurrent holder.
+        """
+        import fcntl
+        import os
+        import time
+
+        from orchestrator.verify_cancel import acquire_merge_verify_flock
+
+        path = tmp_path / '.merge_verify.lock'
+        holder_fd = os.open(path, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(holder_fd, fcntl.LOCK_EX)
+        try:
+            start = time.monotonic()
+            fd = acquire_merge_verify_flock(path, timeout_secs=0.3)
+            elapsed = time.monotonic() - start
+            assert fd is None
+            assert elapsed >= 0.25
+        finally:
+            os.close(holder_fd)
+
+
+# ---------------------------------------------------------------------------
+# Task 2306 step-7: LOCK_HOLDER_PGID_KEY + write/read/remove_lock_holder_pgid —
+# fixed-key holder-pgid rendezvous.  A waiter cannot know the holder's
+# per-dispatch --request-id, so this uses a request-id-independent fixed key
+# built directly on pgid_file/write_pgid_file/remove_pgid_file.
+# ---------------------------------------------------------------------------
+
+
+class TestLockHolderPgidRendezvous:
+    """write/read/remove_lock_holder_pgid built on the existing pgid-file helpers."""
+
+    def test_key_is_stable_nonempty_string(self):
+        from orchestrator.verify_cancel import LOCK_HOLDER_PGID_KEY
+
+        assert isinstance(LOCK_HOLDER_PGID_KEY, str)
+        assert LOCK_HOLDER_PGID_KEY != ''
+
+    def test_write_lands_at_fixed_key_pgid_file(self, tmp_path: Path):
+        from orchestrator.verify_cancel import (
+            LOCK_HOLDER_PGID_KEY,
+            pgid_file,
+            write_lock_holder_pgid,
+        )
+
+        write_lock_holder_pgid(tmp_path, 5150)
+        expected_path = pgid_file(tmp_path, LOCK_HOLDER_PGID_KEY)
+        assert expected_path.exists()
+        assert expected_path.read_text().strip() == '5150'
+
+    def test_read_returns_written_value(self, tmp_path: Path):
+        from orchestrator.verify_cancel import read_lock_holder_pgid, write_lock_holder_pgid
+
+        write_lock_holder_pgid(tmp_path, 5150)
+        assert read_lock_holder_pgid(tmp_path) == 5150
+
+    def test_remove_deletes_file_and_read_returns_none(self, tmp_path: Path):
+        from orchestrator.verify_cancel import (
+            LOCK_HOLDER_PGID_KEY,
+            pgid_file,
+            read_lock_holder_pgid,
+            remove_lock_holder_pgid,
+            write_lock_holder_pgid,
+        )
+
+        write_lock_holder_pgid(tmp_path, 5150)
+        remove_lock_holder_pgid(tmp_path)
+        assert not pgid_file(tmp_path, LOCK_HOLDER_PGID_KEY).exists()
+        assert read_lock_holder_pgid(tmp_path) is None
+
+    def test_read_returns_none_when_absent(self, tmp_path: Path):
+        from orchestrator.verify_cancel import read_lock_holder_pgid
+
+        assert read_lock_holder_pgid(tmp_path) is None
+
+    def test_read_returns_none_when_corrupt(self, tmp_path: Path):
+        from orchestrator.verify_cancel import (
+            LOCK_HOLDER_PGID_KEY,
+            pgid_file,
+            read_lock_holder_pgid,
+        )
+
+        path = pgid_file(tmp_path, LOCK_HOLDER_PGID_KEY)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('not-an-int')
+        assert read_lock_holder_pgid(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
 # Step-13 (part 1): real-process capstone — setsid + start_new_session escapes
 # ---------------------------------------------------------------------------
 

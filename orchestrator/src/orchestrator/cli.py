@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 from collections.abc import Callable
@@ -16,10 +17,16 @@ from dotenv import load_dotenv
 
 from orchestrator.config import ConfigRequiredError, load_config
 from orchestrator.verify_cancel import (
+    acquire_merge_verify_flock,
     cancel_request,
+    merge_verify_lock_path,
     pgid_file,
+    read_lock_holder_pgid,
+    release_merge_verify_flock,
+    remove_lock_holder_pgid,
     remove_pgid_file,
     start_own_process_group,
+    write_lock_holder_pgid,
     write_pgid_file,
 )
 
@@ -33,6 +40,13 @@ DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 # long orchestration runs are never affected. After this deadline a diagnostic
 # dump is written to stderr and os._exit(137) fires.
 SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
+
+# Bounded wait (task 2306 α) for acquiring the laptop persistent-worktree
+# merge-verify fcntl.flock (verify_cancel.acquire_merge_verify_flock) when
+# git.persistent_merge_worktree is on. On timeout, verify-merge emits a
+# distinguished contention VerifyResult instead of ever falling back to an
+# ephemeral worktree. Monkeypatchable so tests run the bounded wait fast.
+MERGE_VERIFY_FLOCK_WAIT_SECS = 10.0
 
 
 class WatchdogHandle(NamedTuple):
@@ -347,6 +361,7 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
     """
     from orchestrator.git_ops import GitOps
     from orchestrator.verify_runner import (
+        make_flock_contention_result,
         result_to_json,
         run_merge_verify_on_worktree,
         spec_from_json,
@@ -385,12 +400,50 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         finally:
             await git_ops.cleanup_merge_worktree(wt)
 
+    # Flock guard (task 2306 α): serialize the whole verify span under a
+    # laptop-side exclusive fcntl.flock when the persistent-worktree knob is
+    # on — the per-host serial invariant that _bump_host_verify_attempt_count
+    # relies on is only supplied at WORKSTATION startup, not on the laptop.
+    # Knob OFF -> fd stays None -> byte-identical back-compat (no lock).
+    fd: int | None = None
+    contention_result = None
+    if config.git.persistent_merge_worktree:
+        fd = acquire_merge_verify_flock(
+            merge_verify_lock_path(git_ops.worktree_base), MERGE_VERIFY_FLOCK_WAIT_SECS
+        )
+        if fd is not None:
+            write_lock_holder_pgid(git_ops.worktree_base, os.getpgrp())
+        else:
+            # Bounded wait timed out: another verify-merge invocation holds the
+            # persistent worktree lock. Emit the distinguished contention result
+            # WITHOUT ever touching the tree (no acquire_host_verify_worktree, no
+            # ephemeral _merge-<uuid> fallback — PRD Invariant 5).
+            holder_pgid = read_lock_holder_pgid(git_ops.worktree_base)
+            contention_result = make_flock_contention_result(
+                host=socket.gethostname(),
+                holder_pgid=holder_pgid,
+                waiter_pgid=os.getpgrp(),
+            )
+
+    if contention_result is not None:
+        # Always remove the pgid file so cancel-verify knows this run is done.
+        if pgf is not None:
+            remove_pgid_file(pgf)
+        # Contention must exit 0: a passed=False VerifyResult on stdout is the
+        # only delivery channel to beta — a non-zero exit makes RemoteRunner
+        # treat this as RunnerUnavailable and beta never sees the discriminant.
+        click.echo(result_to_json(contention_result))
+        return
+
     try:
         result = asyncio.run(_run())
     except Exception as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
     finally:
+        if fd is not None:
+            remove_lock_holder_pgid(git_ops.worktree_base)
+            release_merge_verify_flock(fd)
         # Always remove the pgid file so cancel-verify knows this run is done.
         if pgf is not None:
             remove_pgid_file(pgf)

@@ -102,6 +102,9 @@ __all__ = [
     # β additions
     "HostLease",
     "HostAllocator",
+    # α additions (task 2306 — laptop flock-guard contention outcome)
+    "FLOCK_CONTENTION_CATEGORY",
+    "make_flock_contention_result",
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
@@ -113,6 +116,48 @@ _UNSCOPED_SENTINEL_CATEGORIES = frozenset({
     UNSCOPED_TYPECHECK_FAILED_CATEGORY,
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
 })
+
+# Sentinel category for a laptop-side flock-contention outcome (task 2306 α,
+# PRD plans/laptop-warm-verify-flock-orphan-prd.md Change A).  Mirrors the
+# UNSCOPED_* precedent above: a stable constant on VerifyResult.category that
+# consumers (task beta, the workstation side) key on.
+FLOCK_CONTENTION_CATEGORY = 'flock_contention'
+
+
+def make_flock_contention_result(
+    host: str,
+    holder_pgid: int | None,
+    waiter_pgid: int,
+) -> VerifyResult:
+    """Build the distinguished VerifyResult emitted on bounded-wait flock contention.
+
+    Emitted by ``orchestrator verify-merge`` (cli.py) when
+    ``config.git.persistent_merge_worktree`` is on and the laptop-side
+    ``.merge_verify.lock`` could not be acquired within the bounded wait —
+    i.e. another verify invocation already holds the persistent warm
+    merge-verify worktree.  Returned instead of ever falling back to an
+    ephemeral worktree (PRD Invariant 5).
+
+    The ``contention`` field is a plain JSON-native dict (not a nested
+    dataclass) so it round-trips losslessly through the generic
+    ``result_to_dict``/``result_from_dict`` codec — task beta parses it back
+    out of stdout unchanged.  ``holder_pgid`` is ``None`` when the holder's
+    pgid file is absent or corrupt (fail-safe; see
+    ``verify_cancel.read_lock_holder_pgid``).
+    """
+    return VerifyResult(
+        passed=False,
+        test_output='',
+        lint_output='',
+        type_output='',
+        summary=(
+            'flock contention on .merge_verify.lock; another verify holds '
+            'the persistent worktree lock'
+        ),
+        timed_out=False,
+        category=FLOCK_CONTENTION_CATEGORY,
+        contention={'host': host, 'holder_pgid': holder_pgid, 'waiter_pgid': waiter_pgid},
+    )
 
 
 # ---------------------------------------------------------------------------

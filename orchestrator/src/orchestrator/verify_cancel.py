@@ -51,9 +51,11 @@ normal checkout sync — no separate deploy step required.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 import re
 import signal
+import time
 from collections import deque
 from pathlib import Path
 
@@ -340,3 +342,118 @@ def cancel_request(
         return 1
     remove_pgid_file(path)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Flock guard — laptop persistent-worktree verify span (task 2306 α)
+#
+# PRD: plans/laptop-warm-verify-flock-orphan-prd.md, Change A.  Serializes the
+# laptop's persistent warm merge-verify worktree (git.persistent_merge_worktree)
+# under a laptop-side exclusive fcntl.flock, since the per-host serial
+# invariant that `GitOps._bump_host_verify_attempt_count` relies on is only
+# supplied by `enforce_persistent_worktree_serial_lane` at WORKSTATION
+# startup — not on the laptop.  On bounded-wait contention, the caller (cli.py
+# verify-merge) emits a distinguished VerifyResult
+# (verify_runner.make_flock_contention_result) instead of ever falling back to
+# an ephemeral worktree.
+# ---------------------------------------------------------------------------
+
+#: Fixed filename (under worktree_base) for the laptop persistent-worktree
+#: verify-span exclusive lock.
+MERGE_VERIFY_LOCK_FILENAME: str = '.merge_verify.lock'
+
+
+def merge_verify_lock_path(worktree_base: Path) -> Path:
+    """Return the fixed lock-file path guarding the persistent merge-verify worktree."""
+    return worktree_base / MERGE_VERIFY_LOCK_FILENAME
+
+
+def acquire_merge_verify_flock(
+    path: Path,
+    timeout_secs: float,
+    *,
+    poll_interval: float = 0.1,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> int | None:
+    """Acquire an exclusive ``fcntl.flock`` on *path* with a bounded wait.
+
+    Polls ``fcntl.flock(fd, LOCK_EX | LOCK_NB)`` with short sleeps until
+    either the lock is acquired or *timeout_secs* elapses.  This bounded-wait
+    polling design avoids the fragility of a blocking ``LOCK_EX`` interrupted
+    by ``SIGALRM``.
+
+    Returns the open, locked fd on success — the caller must release it via
+    :func:`release_merge_verify_flock`.  Returns ``None`` on timeout (the fd
+    is closed before returning).
+
+    *monotonic* / *sleep* are injectable (default ``time.monotonic`` /
+    ``time.sleep``) so tests can run the bounded wait fast and deterministically.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    deadline = monotonic() + timeout_secs
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except (BlockingIOError, OSError):
+            # Lock held by another holder (EAGAIN/EACCES) — poll until deadline.
+            pass
+        if monotonic() >= deadline:
+            os.close(fd)
+            return None
+        sleep(poll_interval)
+
+
+def release_merge_verify_flock(fd: int) -> None:
+    """Best-effort release of a flock fd acquired via :func:`acquire_merge_verify_flock`.
+
+    Suppresses ``OSError`` from either the unlock or the close — release is
+    inherently best-effort (mirrors :func:`remove_pgid_file`'s idempotent,
+    exception-suppressing style).
+    """
+    with contextlib.suppress(OSError):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Holder-pgid rendezvous — fixed key (task 2306 α)
+#
+# A waiter (a verify-merge invocation that lost the bounded wait on the flock)
+# cannot know the holder's per-dispatch --request-id, so the holder's pgid is
+# recorded at a request-id-independent FIXED key rather than under the
+# per-request pgid file.  Built directly on pgid_file/write_pgid_file/
+# remove_pgid_file — same atomic write, same never-git-cleaned directory.
+# ---------------------------------------------------------------------------
+
+#: Fixed rendezvous key (under PGID_DIR_NAME) recording the pgid of whichever
+#: verify-merge invocation currently holds the merge-verify flock.
+LOCK_HOLDER_PGID_KEY: str = '_merge_verify_lock_holder'
+
+
+def write_lock_holder_pgid(worktree_base: Path, pgid: int) -> None:
+    """Record *pgid* as the current merge-verify flock holder."""
+    write_pgid_file(pgid_file(worktree_base, LOCK_HOLDER_PGID_KEY), pgid)
+
+
+def read_lock_holder_pgid(worktree_base: Path) -> int | None:
+    """Return the recorded flock-holder pgid, or ``None`` if absent/corrupt.
+
+    Fail-safe: a missing file (``FileNotFoundError``), unparseable content
+    (``ValueError``), or any other read error (``OSError``) all yield
+    ``None`` rather than raising — mirrors the ``_bump_host_verify_attempt_count``
+    counter-read precedent.
+    """
+    path = pgid_file(worktree_base, LOCK_HOLDER_PGID_KEY)
+    try:
+        return int(path.read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def remove_lock_holder_pgid(worktree_base: Path) -> None:
+    """Remove the recorded flock-holder pgid file; idempotent when absent."""
+    remove_pgid_file(pgid_file(worktree_base, LOCK_HOLDER_PGID_KEY))
