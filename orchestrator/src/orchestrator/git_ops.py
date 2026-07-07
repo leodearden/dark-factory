@@ -3638,7 +3638,32 @@ class GitOps:
         await self._delete_branch_if_on_main(full_branch, context='release_warm_lane')
 
         await self.warm_lane_pool.release(lane_dir)
+        self._lifecycle_note_released(lane_dir)
         logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
+
+    def _lifecycle_note_released(self, lane: Path) -> None:
+        """Best-effort durable RELEASED write for :meth:`release_warm_lane`.
+
+        Only ASSIGNED or IN_USE legally transition to RELEASED — a lane with
+        no record, or already REGISTERED/RELEASED, is left untouched (a
+        REGISTERED -> RELEASED or RELEASED -> RELEASED edge is not legal, so
+        this never attempts either).
+
+        Best-effort / never-raise (mirrors :meth:`mark_pool_storage_present`
+        and :meth:`_lifecycle_note_assigned`): any exception is logged and
+        swallowed so a durable-record hiccup never regresses
+        ``release_warm_lane`` itself (contractually never-raise).
+        """
+        try:
+            rec = self._lane_lifecycle.read(lane)
+            if rec is not None and rec.state in (LaneState.ASSIGNED, LaneState.IN_USE):
+                self._lane_lifecycle.transition(lane, LaneState.RELEASED)
+        except Exception:
+            logger.warning(
+                '_lifecycle_note_released: failed to record RELEASED for lane '
+                '%s — durable record may be stale/inconsistent',
+                lane, exc_info=True,
+            )
 
     async def detach_lane_checkout(self, lane: Path, bare_id: str) -> bool:
         """Commit WIP then detach *lane*'s HEAD, preserving branch and worktree.
