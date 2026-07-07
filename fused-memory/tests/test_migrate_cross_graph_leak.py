@@ -908,3 +908,42 @@ class TestRunPostVerify:
 
         assert report['post_verify']['matched'] is True
         assert report['exit_code'] != 0
+
+
+# ===========================================================================
+# Tests: build_arg_parser (step-21/22)
+# ===========================================================================
+
+class TestBuildArgParser:
+    """Tests for build_arg_parser() -- the testable half of the CLI surface.
+
+    main() itself (live MemoryService wiring) is untested, matching
+    purge_knowlive_namespace.py's convention -- see the module docstring.
+    """
+
+    def test_defaults_with_no_argv(self):
+        """No flags -> apply=False, manifest=None, page_size=DEFAULT_PAGE_SIZE, config=None."""
+        parser = _mod.build_arg_parser()
+
+        args = parser.parse_args([])
+
+        assert args.apply is False
+        assert args.manifest is None
+        assert args.page_size == _mod.DEFAULT_PAGE_SIZE
+        assert args.config is None
+
+    def test_overrides_are_parsed(self):
+        """Every flag can be overridden from argv."""
+        parser = _mod.build_arg_parser()
+
+        args = parser.parse_args([
+            '--apply',
+            '--manifest', 'm.json',
+            '--page-size', '500',
+            '--config', 'c.yaml',
+        ])
+
+        assert args.apply is True
+        assert args.manifest == 'm.json'
+        assert args.page_size == 500
+        assert args.config == 'c.yaml'
