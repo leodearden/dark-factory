@@ -26,6 +26,13 @@
 
 set -u
 
+# Absolute path to the repo root, computed from this script's own location
+# (skills/spawn/spawn-claude.sh -> skills/spawn -> skills -> repo root) so the
+# session-registry helper (task 2285) can be invoked by absolute path with no
+# venv, PYTHONPATH, or install required.
+REPO_ROOT="$(cd "$(dirname "$(dirname "$(dirname "${BASH_SOURCE[0]}")")")" && pwd)"
+SESSION_REGISTRY_PY="$REPO_ROOT/orchestrator/src/orchestrator/session_registry.py"
+
 if [ $# -ne 4 ]; then
   echo "usage: spawn-claude.sh <cwd> <skip_perms:true|false> <title> <prompt>" >&2
   exit 2
@@ -35,6 +42,24 @@ cwd="$1"
 skip_perms="$2"
 title="$3"
 prompt="$4"
+
+# Session-registry: record this spawn as LAUNCHING (task 2285, Attention Rail
+# T3). Best-effort and fully additive -- a missing python3 or any registry
+# fault must never change this script's exit-code contract. Only stdout (the
+# record dir, printed on success) is captured; stderr flows through to this
+# script's own stderr for loud, caller-visible diagnostics. CLAUDE_SPAWN_ROLE/
+# PROJECT/TASK_ID/ESCALATION_ID pass through from this process's own
+# environment when a caller already set them.
+SESSION_RECORD_DIR=""
+if command -v python3 >/dev/null 2>&1; then
+  SESSION_RECORD_DIR=$(
+    CLAUDE_SPAWN_TITLE="$title" \
+    CLAUDE_SPAWN_PROMPT="$prompt" \
+    CLAUDE_SPAWN_CWD="$cwd" \
+    CLAUDE_SPAWN_LAUNCHER_PID="$$" \
+    python3 "$SESSION_REGISTRY_PY" launching
+  ) || true
+fi
 
 flags=""
 [ "$skip_perms" = "true" ] && flags="--dangerously-skip-permissions"
@@ -95,6 +120,12 @@ finish() {
     rc=$(cat "$sentinel" 2>/dev/null || echo 127)
   fi
   rm -f "$sentinel"
+  # Session-registry: record the final exit code (task 2285). rc is already
+  # fully determined from the sentinel above, independent of this call, so a
+  # registry fault here can never change the spawn's exit-code contract.
+  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$SESSION_REGISTRY_PY" exit --record "$SESSION_RECORD_DIR" --code "$rc" || true
+  fi
   exit "$rc"
 }
 
