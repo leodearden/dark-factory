@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.models.reconciliation import StageId, StageReport
+from fused_memory.reconciliation.stage_stats import _COMPUTED_STAT_KEYS
 from fused_memory.reconciliation.stats_verifier import (
     _OP_TO_STAT,
     _STAT_ALIASES,
@@ -247,7 +248,8 @@ async def test_verify_rewrites_inflated_stats(journal):
 
 @pytest.mark.asyncio
 async def test_verify_adds_zero_when_stage_claimed_none(journal):
-    """Unknown stat keys stay absent; known keys are always written as observed."""
+    """Unknown stat keys stay absent; every canonical key is always written as
+    observed, 0-default, even when no ops occurred."""
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC)
     reports: dict[str, StageReport | dict] = {
@@ -262,9 +264,9 @@ async def test_verify_adds_zero_when_stage_claimed_none(journal):
     await verify_and_rewrite_stats(run_id, reports, journal)
 
     stats = reports['integrity_check'].stats  # type: ignore[union-attr]
-    # Known stat-keys present as 0 (no ops occurred).
-    assert stats['memories_added'] == 0
-    assert stats['memories_deleted'] == 0
+    # Every canonical stat-key present as 0 (no ops occurred).
+    for key in _COMPUTED_STAT_KEYS:
+        assert stats[key] == 0
     # Unrelated stat untouched.
     assert stats['tasks_checked'] == 5
     # No _reported snapshot because stage didn't report any known keys.
@@ -354,13 +356,14 @@ async def test_verify_tracks_graphiti_writes_queued_separately(journal):
 
 
 @pytest.mark.asyncio
-async def test_verify_overrides_all_three_with_divergent_originals(journal):
+async def test_verify_overrides_all_computed_keys_with_divergent_originals(journal):
     """LLM reports inflated memories_added=9, memories_written=9, graphiti_writes_queued=7.
 
-    Observed: 1 mem0-id op + 1 graphiti-only enqueue.
-    Verifier must overwrite all three to 1 and snapshot all three originals under
-    _reported, exercising both the alias mechanism and the queued-counter override
-    in a single pass.
+    Observed: 1 mem0-id op + 1 graphiti-only enqueue. Verifier overwrites both
+    computed keys (memories_added, graphiti_writes_queued) to 1 and snapshots
+    all three originals under _reported; memories_written is a recognised LLM
+    counter that is no longer computed, so it is dropped from the top level
+    entirely rather than mirrored.
     """
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC)
@@ -391,10 +394,11 @@ async def test_verify_overrides_all_three_with_divergent_originals(journal):
     assert observed['memory_consolidator']['graphiti_writes_queued'] == 1
 
     stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
-    # All three keys overwritten with observed values.
+    # Both computed keys overwritten with observed values.
     assert stats['memories_added'] == 1
-    assert stats['memories_written'] == 1  # alias mirrors canonical's observed value
     assert stats['graphiti_writes_queued'] == 1
+    # memories_written is recognised but not computed — dropped from the top level.
+    assert 'memories_written' not in stats
     # All three originals snapshotted under _reported.
     assert stats['_reported']['memories_added'] == 9
     assert stats['_reported']['memories_written'] == 9
@@ -419,6 +423,84 @@ async def test_verify_returns_empty_when_no_write_journal():
     assert observed == {}
     # Stage reports untouched.
     assert reports['memory_consolidator'].stats == {'memories_added': 2}  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_verify_handles_plain_dict_report_without_stats_key(journal):
+    """A stage report given as a plain dict (not a StageReport), with no
+    pre-existing 'stats' key, gets one created and populated from observed
+    computed counters — same override behaviour as the StageReport branch."""
+    run_id = str(uuid.uuid4())
+
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+
+    reports: dict[str, StageReport | dict] = {'memory_consolidator': {}}
+
+    await verify_and_rewrite_stats(run_id, reports, journal)
+
+    stats = reports['memory_consolidator']['stats']  # type: ignore[index]
+    assert stats['memories_added'] == 1
+    assert '_reported' not in stats
+
+
+@pytest.mark.asyncio
+async def test_verify_per_stage_isolation_across_two_stages(journal):
+    """Ops stamped for one stage's agent_id must not count toward a sibling
+    stage processed in the same verify_and_rewrite_stats call — agent_id
+    bucketing is exact, unlike the old timestamp-window bucketing it replaced."""
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    stage_start = now - timedelta(minutes=1)
+    stage_end = now + timedelta(minutes=1)
+
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        agent_id='recon-stage-memory_consolidator',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+    await _log_write(
+        journal, causation_id=run_id, operation='delete_memory',
+        agent_id='recon-stage-task_knowledge_sync',
+        result_summary={'status': 'deleted'},
+    )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator, stage_start, stage_end,
+        ),
+        'task_knowledge_sync': _stage_report(
+            StageId.task_knowledge_sync, stage_start, stage_end,
+        ),
+    }
+
+    await verify_and_rewrite_stats(run_id, reports, journal)
+
+    mc_stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    tks_stats = reports['task_knowledge_sync'].stats  # type: ignore[union-attr]
+
+    assert mc_stats['memories_added'] == 1
+    assert mc_stats['memories_deleted'] == 0
+    assert tks_stats['memories_added'] == 0
+    assert tks_stats['memories_deleted'] == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_skips_non_stage_id_keys_like_error(journal):
+    """A non-StageId key such as '_error' (injected by the harness/judge for a
+    crashed stage) is skipped entirely — no counter keys are ever injected."""
+    run_id = str(uuid.uuid4())
+
+    reports: dict[str, StageReport | dict] = {
+        '_error': {'message': 'stage crashed', 'stats': {}},
+    }
+
+    observed = await verify_and_rewrite_stats(run_id, reports, journal)
+
+    assert '_error' not in observed
+    assert reports['_error'] == {'message': 'stage crashed', 'stats': {}}
 
 
 @pytest.mark.asyncio
