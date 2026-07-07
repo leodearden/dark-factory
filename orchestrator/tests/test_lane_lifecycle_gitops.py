@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -288,4 +288,84 @@ class TestInteractiveWorktreeStampRelocation:
         legacy_path = info.path / '.task' / 'interactive.json'
         assert not legacy_path.exists(), (
             f'expected NO interactive.json written under the legacy path {legacy_path}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Interactive reaper stamp read: new-then-old via TaskArtifacts.meta_root_for
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReapInteractiveWorktreesStampRelocation:
+    """reap_interactive_worktrees must resolve the interactive.json stamp
+    new-then-old (W11 gamma .task -> .task-meta relocation, PRD decision 7):
+    the NEW TaskArtifacts.meta_root_for(...)/interactive.json path first,
+    falling back to the legacy <wt>/.task/interactive.json path."""
+
+    async def test_reaps_expired_stamp_found_at_new_path(self, git_repo: Path):
+        """create_interactive_worktree writes only to the new path (S10);
+        confirm the reaper actually reads created_at from there — a
+        'ttl_idle' reason proves a real stamp read, vs. 'stale_no_stamp'
+        which would mean the reaper never found it."""
+        git_ops = GitOps(GitConfig(), git_repo)
+        info = await git_ops.create_interactive_worktree('new-path-expired')
+
+        new_stamp_path = (
+            TaskArtifacts.meta_root_for(git_ops.worktree_base, info.path.name)
+            / 'interactive.json'
+        )
+        stamp = json.loads(new_stamp_path.read_text())
+        now = datetime.now(UTC)
+        stamp['created_at'] = (
+            now - timedelta(seconds=git_ops.config.interactive_worktree_ttl + 3600)
+        ).isoformat()
+        new_stamp_path.write_text(json.dumps(stamp))
+
+        reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        reaped_paths = {r.path.resolve() for r in reaped}
+        assert info.path.resolve() in reaped_paths, (
+            f'expected the expired new-path stamp to trigger a ttl_idle reap; '
+            f'got {reaped!r}'
+        )
+        record = next(r for r in reaped if r.path.resolve() == info.path.resolve())
+        assert record.reason == 'ttl_idle', (
+            f"expected reason == 'ttl_idle' (a real stamp read, not "
+            f"'stale_no_stamp'), got {record.reason!r}"
+        )
+
+    async def test_falls_back_to_legacy_stamp_when_new_path_absent(
+        self, git_repo: Path,
+    ):
+        """No .task-meta stamp at all (pre-migration lane); a legacy
+        <wt>/.task/interactive.json stamp must still be read."""
+        git_ops = GitOps(GitConfig(), git_repo)
+        info = await git_ops.create_interactive_worktree('legacy-path-expired')
+
+        new_stamp_path = (
+            TaskArtifacts.meta_root_for(git_ops.worktree_base, info.path.name)
+            / 'interactive.json'
+        )
+        stamp = json.loads(new_stamp_path.read_text())
+        new_stamp_path.unlink()  # simulate a pre-migration lane: no new-path stamp
+
+        now = datetime.now(UTC)
+        stamp['created_at'] = (
+            now - timedelta(seconds=git_ops.config.interactive_worktree_ttl + 3600)
+        ).isoformat()
+        legacy_dir = info.path / '.task'
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        (legacy_dir / 'interactive.json').write_text(json.dumps(stamp))
+
+        reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        reaped_paths = {r.path.resolve() for r in reaped}
+        assert info.path.resolve() in reaped_paths, (
+            f'expected the expired legacy-path stamp to trigger a ttl_idle '
+            f'reap via the new-then-old fallback; got {reaped!r}'
+        )
+        record = next(r for r in reaped if r.path.resolve() == info.path.resolve())
+        assert record.reason == 'ttl_idle', (
+            f"expected reason == 'ttl_idle', got {record.reason!r}"
         )

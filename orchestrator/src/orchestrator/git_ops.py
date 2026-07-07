@@ -1966,11 +1966,16 @@ class GitOps:
                     f'{add_err.strip()!r}'
                 )
 
-        # .task/interactive.json stamp for the δ reaper (owner/created_at let
-        # the reaper age out worktrees with no activity past the TTL).
+        # .task-meta/<name>/interactive.json stamp for the δ reaper
+        # (owner/created_at let the reaper age out worktrees with no activity
+        # past the TTL). Written to the NEW .task-meta location ONLY (W11
+        # gamma relocation; PRD `.task-meta` path-derivation contract: writes
+        # new-path-only) — a worktree_base sibling of the worktree, so
+        # `git add -A` in the lane can never stage it.
         # _ensure_task_gitignore writes .task/.gitignore('*') first (and
-        # creates the .task/ dir) so the stamp is never staged/committed —
-        # keeps /merge-queue from ever landing it on task/<slug>.
+        # creates the legacy .task/ dir) — kept as-is (guard-layer deletion
+        # is θ/ι scope, out of scope here) even though the stamp itself no
+        # longer lands under it.
         _ensure_task_gitignore(path)
         stamp = {
             'owner': slug,
@@ -1978,7 +1983,9 @@ class GitOps:
             'branch': full_branch,
             'slug': slug,
         }
-        (path / '.task' / 'interactive.json').write_text(json.dumps(stamp))
+        meta_root = TaskArtifacts.meta_root_for(self.worktree_base, path.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'interactive.json').write_text(json.dumps(stamp))
 
         # FAIL-SOFT (the key deviation from acquire_warm_lane): a seed fault
         # never removes the worktree and never raises — the worktree + stamp
@@ -5947,8 +5954,7 @@ class GitOps:
         :meth:`create_interactive_worktree` used to create it
         (``worktree_base/{iact_prefix}{slug}`` on branch
         ``{branch_prefix}{slug}``) — both are always derivable this way, so
-        this does not depend on the ``.task/interactive.json`` stamp being
-        intact.
+        this does not depend on the ``interactive.json`` stamp being intact.
 
         Per-worktree reap predicate:
 
@@ -5974,8 +5980,10 @@ class GitOps:
           under them.
         * Otherwise, when :meth:`worktree_head_beyond_main` is ``None`` (no
           commits beyond main) → age is measured from the
-          ``.task/interactive.json`` stamp's ``created_at``.  Reaped
-          (``'ttl_idle'``) when that age exceeds
+          ``interactive.json`` stamp's ``created_at``, resolved new-then-old
+          (the ``.task-meta/<name>/interactive.json`` path first, falling
+          back to the legacy ``<wt>/.task/interactive.json`` path — W11
+          gamma relocation).  Reaped (``'ttl_idle'``) when that age exceeds
           ``config.interactive_worktree_ttl``; otherwise, when
           ``_run_warm_lane_disk_guard()`` reports disk pressure (rc==75),
           reaped anyway (``'disk_pressure'``) regardless of age — safe
@@ -6063,7 +6071,11 @@ class GitOps:
                     # post-merge editing with no new commit yet) — either way
                     # there are no commits beyond main, so age on the stamp
                     # exactly like any other idle candidate.
-                    stamp_path = wt_path / '.task' / 'interactive.json'
+                    stamp_path = TaskArtifacts.meta_root_for(
+                        self.worktree_base, wt_resolved.name,
+                    ) / 'interactive.json'
+                    if not stamp_path.exists():
+                        stamp_path = wt_path / '.task' / 'interactive.json'
                     try:
                         stamp = json.loads(stamp_path.read_text())
                         created_at = datetime.fromisoformat(stamp['created_at'])
