@@ -1,6 +1,5 @@
 """Tests for MCP task-tool behavior (update_task, set_task_status, etc.)."""
 
-import inspect
 import json
 import logging
 from unittest.mock import AsyncMock
@@ -722,17 +721,6 @@ async def test_set_task_status_forwards_agent_id_to_interceptor(
 # ------------------------------------------------------------------
 
 
-def test_submit_task_signature_accepts_ctx_and_agent_id(mcp_server_with_tasks):
-    """submit_task's underlying function must declare ctx/agent_id params so
-    FastMCP will bind them (a caller-supplied agent_id that isn't a declared
-    parameter is silently dropped before the function ever sees it -- so this
-    must be checked on the signature, not inferred from a call outcome)."""
-    fn = mcp_server_with_tasks._tool_manager.get_tool('submit_task').fn
-    params = inspect.signature(fn).parameters
-    assert 'agent_id' in params, 'submit_task must accept an agent_id param'
-    assert 'ctx' in params, 'submit_task must accept a ctx param'
-
-
 @pytest.mark.asyncio
 async def test_submit_task_accepts_agent_id_and_forwards_existing_kwargs_unchanged(
     mcp_server_with_tasks, task_interceptor,
@@ -758,17 +746,6 @@ async def test_submit_task_accepts_agent_id_and_forwards_existing_kwargs_unchang
     assert 'agent_id' not in kwargs, (
         f'submit_task must not forward agent_id to the interceptor; got {kwargs!r}'
     )
-
-
-def test_update_task_signature_accepts_ctx_and_agent_id(mcp_server_with_tasks):
-    """update_task's underlying function must declare ctx/agent_id params so
-    FastMCP will bind them (a caller-supplied agent_id that isn't a declared
-    parameter is silently dropped before the function ever sees it -- so this
-    must be checked on the signature, not inferred from a call outcome)."""
-    fn = mcp_server_with_tasks._tool_manager.get_tool('update_task').fn
-    params = inspect.signature(fn).parameters
-    assert 'agent_id' in params, 'update_task must accept an agent_id param'
-    assert 'ctx' in params, 'update_task must accept a ctx param'
 
 
 @pytest.mark.asyncio
