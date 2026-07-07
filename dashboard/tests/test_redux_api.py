@@ -363,6 +363,74 @@ def test_shape_wal_status_benign_on_missing_ts(caplog):
 
 
 # ---------------------------------------------------------------------------
+# _shape_wal_status now-threading (task 2281)
+# ---------------------------------------------------------------------------
+
+
+def test_shape_wal_status_now_threading_age_seconds():
+    """_shape_wal_status(wal, now=fixed) computes age_seconds against the passed now."""
+    from datetime import UTC, datetime, timedelta
+
+    fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+    ts = fixed - timedelta(minutes=10)
+    wal = {'stores': {'http://srv': {
+        'task_backend': {'ts': ts.isoformat(), 'busy': 0, 'log': 0, 'checkpointed': 0,
+                          'detail': None},
+    }}}
+
+    body = redux_api._shape_wal_status(wal, now=fixed)
+
+    assert body['rows'][0]['age_seconds'] == 600
+
+
+def test_shape_wal_status_now_threading_stale_boundary():
+    """Stale/red status flips exactly at _WAL_STALE_SECONDS relative to the passed now."""
+    from datetime import UTC, datetime, timedelta
+
+    fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+    just_inside = fixed - timedelta(seconds=redux_api._WAL_STALE_SECONDS)
+    just_outside = fixed - timedelta(seconds=redux_api._WAL_STALE_SECONDS + 1)
+
+    def _wal_at(ts):
+        return {'stores': {'http://srv': {
+            'task_backend': {'ts': ts.isoformat(), 'busy': 0, 'log': 0, 'checkpointed': 0,
+                              'detail': None},
+        }}}
+
+    ok_body = redux_api._shape_wal_status(_wal_at(just_inside), now=fixed)
+    red_body = redux_api._shape_wal_status(_wal_at(just_outside), now=fixed)
+
+    assert ok_body['status'] == 'ok'
+    assert red_body['status'] == 'red'
+    assert 'stale' in (red_body['reason'] or '')
+
+
+def test_shape_wal_status_no_now_brackets_real_clock():
+    """Without now, _shape_wal_status still derives age_seconds from the current UTC clock.
+
+    Brackets the real clock read with before/after captures (rather than patching
+    a module-level ``datetime`` symbol) because the no-now branch resolves through
+    ``resolve_now`` in ``dashboard.data.utils``.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    before = datetime.now(UTC)
+    ts = before - timedelta(minutes=5)
+    wal = {'stores': {'http://srv': {
+        'task_backend': {'ts': ts.isoformat(), 'busy': 0, 'log': 0, 'checkpointed': 0,
+                          'detail': None},
+    }}}
+
+    body = redux_api._shape_wal_status(wal)
+    after = datetime.now(UTC)
+
+    age = body['rows'][0]['age_seconds']
+    lower = int((before - ts).total_seconds())
+    upper = int((after - ts).total_seconds()) + 1
+    assert lower <= age <= upper
+
+
+# ---------------------------------------------------------------------------
 # shape_memory_graphs
 # ---------------------------------------------------------------------------
 
