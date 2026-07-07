@@ -1114,6 +1114,14 @@ class SqliteTaskBackend:
                     mode=resolved_mode,
                     project_root=project_root, tag=tag, task_id=tid,
                 )
+                # Validate the POST-MERGE blob so the deterministic
+                # cross-field invariant (I3) is caught on update, not only
+                # on submit. Warn-mode logs the census line and proceeds;
+                # enforce-mode's raise propagates out of this `async with
+                # self._txn(...)`, rolling back the UPDATE below.
+                await self._validate_metadata_on_write(
+                    new_metadata, project_root=project_root, tag=tag, task_id=tid,
+                )
                 set_columns.append('metadata = ?')
                 set_values.append(new_metadata)
 
