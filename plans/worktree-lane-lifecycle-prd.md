@@ -330,15 +330,18 @@ chain** (γ→η→θ on git_ops.py; δ on harness.py) to avoid narrow-lock star
 | ω | **B+H integration gate** (mechanisms 1+2): the two-way boundary suite B1–B6 | `orchestrator/tests/test_lane_lifecycle_integration.py` (new) | γ, δ, ε1, ε2 | `pytest` of the B1–B6 boundary suite is green: writer↔reader round-trip, crash→quarantine, illegal→escalate, hostile-`git add -A` stages nothing, survives-clean, dashboard reader. Unlocks θ. |
 | θ | Delete the guard layer (git_ops scrub call sites + `commit()` `:!.task` net; merge_gates ×4 `:!.task/` exclusions), keep `_assert_no_task_dir` as tripwire | `git_ops.py`, `merge_gates.py`, tests | ω | With guards deleted, the ω contamination test (B4) still passes (structural, not guard-defended); no `:!.task` pathspec remains except the retained tripwire; full `pytest` green. Unlocks ι. |
 | ι | Final compat-close leaf: drop new-then-old fallback (new-path-only) + delete `.gitignore` writers + `_assert_no_task_dir` tripwire | `git_ops.py`, `artifacts.py`, tests | θ (gated on a full green cycle) | Grep shows zero legacy `<worktree>/.task` reads and zero `.task/.gitignore` writers remain; `pytest` green; a migrated lane has no `.task/` dir at all. |
-| η | Unify `acquire_warm_lane`'s 7 routes over `LaneLifecycle` transitions; delegate every fault exit to M1 `_abort_lane_acquisition` (**independent leaf — off ω's critical path**) | `git_ops.py`, `lane_lifecycle.py`, test | γ, **M1 δ (to-wire; anchor 2185)** | Route table test: each of the 7 routes is a named `from→to` transition; fault-injection (B7) delegates to `_abort_lane_acquisition` (lane detached + FREE + no `already used by worktree` on re-acquire). Unlocks κ. |
-| κ | Migration adopt + orchestrator restart deploy capstone (deferred-filer, ε2/2233 pattern): commit a one-shot adopt+restart script (adopt writes initial `.lane-state` records for live lanes), then file a `task_kind='deterministic'` self-restart-and-verify task depending on the full W11 batch | `scripts/deploy-w11-lane-lifecycle.sh` (new), deterministic task | ι, η (transitively whole batch) | The committed adopt+restart script exists+executable; a `task_kind='deterministic'` self-restart task is filed (get_task shows it) depending on the full W11 batch; on dispatch the orchestrator restarts and serves LaneLifecycle-backed acquire with `.task-meta` relocation live (fresh-PID verify). |
+| η | Unify `acquire_warm_lane`'s 7 routes over `LaneLifecycle` transitions; delegate every fault exit to M1 `_abort_lane_acquisition` (**mechanism 3 — filed DEFERRED, held until M1 δ is filed+wired**) | `git_ops.py`, `lane_lifecycle.py`, test | γ, **M1 δ (hard; filed but unwired — anchor 2185)** | Route table test: each of the 7 routes is a named `from→to` transition; fault-injection (B7) delegates to `_abort_lane_acquisition` (lane detached + FREE + no `already used by worktree` on re-acquire). Follow-on; not on the mechanism-1+2 deploy path. |
+| κ | Migration adopt + orchestrator restart deploy capstone (deferred-filer, ε2/2233 pattern): commit a one-shot adopt+restart script (adopt writes initial `.lane-state` records for live lanes), then file a `task_kind='deterministic'` self-restart-and-verify task depending on the mechanism-1+2 spine | `scripts/deploy-w11-lane-lifecycle.sh` (new), deterministic task | ι (transitively α,β,γ,δ,ε1,ε2,ω,θ) | The committed adopt+restart script exists+executable; a `task_kind='deterministic'` self-restart task is filed (get_task shows it) depending on the mechanism-1+2 spine; on dispatch the orchestrator restarts and serves LaneLifecycle-backed acquire with `.task-meta` relocation live (fresh-PID verify). |
 
 α, β are foundations; γ, δ, ε1, ε2 are intermediates feeding the ω gate; ω is the
 B+H integration-gate leaf for mechanisms 1+2; θ, ι are the gated guard-deletion +
-compat-close leaves; η is the independent mechanism-3 leaf (its single M1-δ
-prerequisite gates only η); κ is the deploy capstone gated on the whole batch. The
-`.task-meta` migration (β→ε1/ε2→ω→θ→ι) and the LaneLifecycle spine (α→γ→δ→ω) share
-the ω gate; η hangs off γ in parallel.
+compat-close leaves; κ is the deploy capstone for **mechanisms 1+2** (gated on ι).
+**η (mechanism 3) is filed DEFERRED and held off the flip** — its hard `_abort_lane_acquisition`
+prerequisite (M1 δ) is not yet a filed task, so queueing it now would dispatch against
+absent substrate. It is flipped to pending in a one-line follow-up once M1 δ is filed
+and the η→δ edge is wired; mechanism 3 is a pure route-structure refactor on top of γ
+and needs only a routine restart (no separate deploy). The `.task-meta` migration
+(β→ε1/ε2→ω→θ→ι) and the LaneLifecycle spine (α→γ→δ→ω) share the ω gate.
 
 ## Out of scope
 
@@ -355,9 +358,14 @@ the ω gate; η hangs off γ in parallel.
 
 1. **M1 δ/ε dependency wiring.** Only M1 α (2185) is filed as of 2026-07-06; δ
    (`_abort_lane_acquisition`) and ε (`PROTECTED_PREFIXES`) are not yet in
-   fused-memory. **Safe default (taken):** wire γ/η on 2185 as the M1 anchor and place
-   η late; when M1's δ/ε leaves are filed, add the precise `add_dependency` edges
-   (η→δ, γ→ε). Decide/wire at first W11 dispatch or when M1 completes decompose.
+   fused-memory. **Safe default (taken):** the mechanism-1+2 spine (α,β,γ,δ,ε1,ε2,ω,θ,ι,κ)
+   is flipped to pending, anchored on 2185; **η is filed DEFERRED and NOT flipped**
+   (its `_abort_lane_acquisition` hard prerequisite is not yet a filed task — queueing
+   it would dispatch against absent substrate, the exact manifest FAIL the gate blocks).
+   When M1's δ/ε leaves are filed: add `add_dependency(η→M1-δ)` and `add_dependency(γ→M1-ε)`
+   and flip η to pending (one `commit_planning` call). Until then γ's `PROTECTED_PREFIXES`
+   use self-protects (W11 registers its own bands) and the `.pool-root` fold does not
+   need ε. Re-check `search_tasks("gitops-chokepoints")` before the follow-up.
 2. **`meta_root` config surface.** Whether the `.task-meta` base is a new
    `config.task_meta_dir` field or derived from `worktree_dir` — either is coherent;
    derive-from-`worktree_dir` (no new config knob) is the suggested default. Decide in
