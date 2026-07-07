@@ -439,3 +439,105 @@ class TestCensusForeignNodes:
             await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1000)
 
         assert caplog.records == []
+
+
+# ===========================================================================
+# Tests: node_present_in_graph / count_node_edges_episodes (step-9/10)
+# ===========================================================================
+
+class TestNodePresentInGraph:
+    """Tests for async node_present_in_graph(graph, uuid) -> bool."""
+
+    @pytest.mark.asyncio
+    async def test_true_when_result_set_has_a_row(self):
+        """A non-empty result_set (the uuid was found) -> True."""
+        graph = _make_graph_mock(ro_pages=[[['u0']]])
+
+        present = await _mod.node_present_in_graph(graph, 'u0')
+
+        assert present is True
+
+    @pytest.mark.asyncio
+    async def test_false_when_result_set_empty(self):
+        """An empty result_set (uuid not found) -> False."""
+        graph = _make_graph_mock(ro_pages=[[]])
+
+        present = await _mod.node_present_in_graph(graph, 'missing-uuid')
+
+        assert present is False
+
+    @pytest.mark.asyncio
+    async def test_uses_ro_query_not_query(self):
+        """Presence probe is read-only: ro_query is used, .query is NEVER called."""
+        graph = _make_graph_mock(ro_pages=[[]])
+
+        await _mod.node_present_in_graph(graph, 'u0')
+
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probes_by_uuid_param(self):
+        """The probe's uuid param matches the uuid argument."""
+        graph = _make_graph_mock(ro_pages=[[]])
+
+        await _mod.node_present_in_graph(graph, 'target-uuid')
+
+        params = extract_params(graph.ro_query.call_args)
+        assert params.get('uuid') == 'target-uuid'
+
+
+class TestCountNodeEdgesEpisodes:
+    """Tests for async count_node_edges_episodes(graph, uuid) -> dict."""
+
+    @pytest.mark.asyncio
+    async def test_returns_edges_and_episodes_counts(self):
+        """Returns {'edges': int, 'episodes': int} from two count() reads."""
+        graph = _make_graph_mock(ro_side_effect=[
+            _result([[4]]),  # RELATES_TO count
+            _result([[2]]),  # MENTIONS count
+        ])
+
+        counts = await _mod.count_node_edges_episodes(graph, 'u0')
+
+        assert counts == {'edges': 4, 'episodes': 2}
+
+    @pytest.mark.asyncio
+    async def test_zero_when_no_edges_or_episodes(self):
+        """Empty result_sets (no rows -- e.g. count() over zero matches
+        never returning a row) normalize to zero, not an error."""
+        graph = _make_graph_mock(ro_side_effect=[
+            _result([]),
+            _result([]),
+        ])
+
+        counts = await _mod.count_node_edges_episodes(graph, 'u0')
+
+        assert counts == {'edges': 0, 'episodes': 0}
+
+    @pytest.mark.asyncio
+    async def test_read_only_no_query_call(self):
+        """Both count reads are read-only: .query is NEVER called."""
+        graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
+
+        await _mod.count_node_edges_episodes(graph, 'u0')
+
+        graph.query.assert_not_called()
+        assert graph.ro_query.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_probes_relates_to_and_mentions_by_uuid(self):
+        """First read counts RELATES_TO edges, second counts Episodic
+        MENTIONS -- both scoped to the given uuid."""
+        graph = _make_graph_mock(ro_side_effect=[_result([[1]]), _result([[1]])])
+
+        await _mod.count_node_edges_episodes(graph, 'target-uuid')
+
+        first_cypher = extract_cypher(graph.ro_query.call_args_list[0])
+        first_params = extract_params(graph.ro_query.call_args_list[0])
+        second_cypher = extract_cypher(graph.ro_query.call_args_list[1])
+        second_params = extract_params(graph.ro_query.call_args_list[1])
+        assert 'RELATES_TO' in first_cypher
+        assert first_params.get('uuid') == 'target-uuid'
+        assert 'MENTIONS' in second_cypher
+        assert second_params.get('uuid') == 'target-uuid'
