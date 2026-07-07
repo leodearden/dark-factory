@@ -7580,10 +7580,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         run merged the branch but failed before writing DONE status, this guard
         detects the merged branch and immediately marks the task done.
 
+        Journal-first (PRD workflow-state-machine α, MP-1): a
+        :meth:`MergeProvenance.lookup` hit is authoritative and short-circuits
+        before the git-layer probe or the legacy heuristic are ever consulted.
+        A miss falls through to the existing git-layer/artifacts-layer checks.
+
         Returns WorkflowOutcome.DONE if the branch is already merged to main AND
         there is prior implementation work.  Returns None in all other cases
         (branch not merged, no prior work, missing worktree/git_ops, exceptions).
         """
+        row: LandedRow | None = MergeProvenance.lookup(self.task_id)
+        if row is not None:
+            return await self._finalise_recovery_done(
+                basis='journal', sha=row.advanced_sha, kind='merged',
+                note='landed-outbox journal hit (pre-PLAN recovery)',
+            )
+
         # Intentional double-check: _check_branch_on_main() has its own
         # None-guard and would return None silently, but this outer check lets
         # us emit the 'skipping merge-recovery' DEBUG log so the missing-wiring
@@ -7675,28 +7687,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             'Task %s: branch already on main — completing instead of re-queueing',
             self.task_id,
         )
-        self._enter_phase(WorkflowState.DONE)
-        await self._reconcile_metadata_files_for_done()
-        try:
-            await self.scheduler.mark_done(
-                self.task_id,
-                kind='found_on_main',
-                sha=main_sha,
-                note=(
-                    'branch already on main at workflow start '
-                    '(pre-PLAN recovery)'
-                ),
-            )
-        except SetTaskStatusRejected as exc:
-            logger.error(
-                'Task %s: pre-PLAN recovery mark_done rejected — %s: %s',
-                self.task_id, exc.error_code, exc.raw,
-            )
-            return await self._mark_blocked(
-                f'Pre-PLAN recovery rejected: {exc.error_code} — {exc.raw}',
-                escalate_to_human=True,
-            )
-        return WorkflowOutcome.DONE
+        return await self._finalise_recovery_done(
+            basis='fallback', sha=main_sha, kind='found_on_main',
+            note='branch already on main at workflow start (pre-PLAN recovery)',
+        )
 
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.
