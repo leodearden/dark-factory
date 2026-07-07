@@ -40,7 +40,11 @@ from typing import Any, Literal, NamedTuple, TypedDict
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
-from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
+from orchestrator.lane_lifecycle import (
+    POOL_ROOT_SENTINEL,  # noqa: F401  re-export shim (test_pool_storage_guard.py)
+    LaneLifecycle,
+    LaneState,
+)
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
@@ -174,7 +178,12 @@ PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
 # alike — substrate-independent, no config knob), so it disappears along
 # with an unmounted mountpoint even though the mountpoint DIR still exists.
 # See GitOps.pool_storage_present() / mark_pool_storage_present().
-POOL_ROOT_SENTINEL: str = '.pool-root'
+#
+# Folded into orchestrator.lane_lifecycle (W11 gamma sentinel fold): the
+# sentinel FS read/write now live ONLY there (LaneLifecycle.
+# pool_storage_present() / mark_pool_storage_present()), and this name is a
+# re-export so `from orchestrator.git_ops import POOL_ROOT_SENTINEL` (and
+# the literal '.pool-root') keep working for existing callers/tests.
 
 # The _iact-* band (worktree_base/<iact_prefix><slug>, config.iact_prefix
 # default '_iact-') minted by GitOps.create_interactive_worktree is
@@ -1052,49 +1061,30 @@ class GitOps:
     def pool_storage_present(self) -> bool:
         """True iff worktree_base is backed by live pool storage (task 2099).
 
-        Checks for the ``POOL_ROOT_SENTINEL`` (``.pool-root``) sentinel FILE
-        directly inside :attr:`worktree_base`.  The sentinel lives ON the pool
-        storage itself, so it disappears along with an unmounted mountpoint
-        even though the mountpoint directory still exists — unlike
-        ``worktree_base.exists()``, which is True for an empty, unmounted
-        mountpoint dir (the root cause of the Jul-3 incident this guards
-        against).
-
-        Fail-safe: any ``OSError`` (e.g. a torn read racing a concurrent
-        mount transition) is treated as absent.  Never raises.
+        Thin delegator (W11 gamma sentinel fold) to
+        ``self._lane_lifecycle.pool_storage_present()`` — the ``.pool-root``
+        sentinel FS read now lives only in ``lane_lifecycle.py``.  Public
+        contract (fail-safe on ``OSError``, never raises) is unchanged; see
+        :meth:`LaneLifecycle.pool_storage_present` for the full rationale.
         """
-        try:
-            return (self.worktree_base / POOL_ROOT_SENTINEL).is_file()
-        except OSError:
-            logger.debug(
-                'pool_storage_present: stat error checking %s — treating as '
-                'absent (fail-safe)',
-                self.worktree_base,
-                exc_info=True,
-            )
-            return False
+        return self._lane_lifecycle.pool_storage_present()
 
     def mark_pool_storage_present(self) -> None:
         """Write the ``.pool-root`` sentinel marking storage as present.
 
-        Idempotent best-effort: creates :attr:`worktree_base` if missing,
-        then writes the sentinel file (a no-op if it already exists).  Any
-        ``OSError`` is logged and swallowed — never raises, since a failed
-        mark must not block whatever seed/warmup operation triggered it.
+        Thin delegator (W11 gamma sentinel fold) to
+        ``self._lane_lifecycle.mark_pool_storage_present()`` — the
+        ``.pool-root`` sentinel FS write now lives only in
+        ``lane_lifecycle.py``.  Public contract (idempotent, best-effort,
+        never raises) is unchanged; see
+        :meth:`LaneLifecycle.mark_pool_storage_present` for the full
+        rationale.
 
         Called from exactly ONE chokepoint — :meth:`_seed_warm_lane` on
         ``rc == 0`` — because a successful seed proves the mount is present
         and writable (see that method's docstring for the full rationale).
         """
-        try:
-            self.worktree_base.mkdir(parents=True, exist_ok=True)
-            (self.worktree_base / POOL_ROOT_SENTINEL).touch(exist_ok=True)
-        except OSError:
-            logger.warning(
-                'mark_pool_storage_present: failed to write sentinel under %s',
-                self.worktree_base,
-                exc_info=True,
-            )
+        self._lane_lifecycle.mark_pool_storage_present()
 
     def _note_pool_storage_absent(self) -> None:
         """Best-effort dispatch to the injected ``_on_pool_storage_absent`` hook.
