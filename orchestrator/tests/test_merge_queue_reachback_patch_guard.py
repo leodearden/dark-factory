@@ -1,4 +1,4 @@
-"""Guard test: no NEW orchestrator.merge_queue.<private> reach-back string-path
+"""Guard test: no NEW orchestrator.merge_queue.<private> reach-back
 monkeypatches in orchestrator/tests/*.py (merge-queue-reliability PRD, scope epsilon).
 
 merge_queue.py re-exports private (`_`-prefixed) helpers from four satellite
@@ -20,6 +20,17 @@ anywhere, or an existing forbidden name spreading into a new test file --
 fails this test.  As later scopes delete back-imports and shrink the shim,
 ``_forbidden_reachback_names()`` narrows automatically and the allowlist can
 shrink to match.
+
+Both idioms observed in this suite are detected: the string-path form
+(``patch('orchestrator.merge_queue.<leaf>', ...)`` /
+``monkeypatch.setattr('orchestrator.merge_queue.<leaf>', ...)``) and the
+object-path form (``monkeypatch.setattr(merge_queue, '<leaf>', ...)`` /
+``patch.object(merge_queue, '<leaf>', ...)``, where ``merge_queue`` is bound
+via ``import orchestrator.merge_queue as merge_queue`` or
+``from orchestrator import merge_queue``, or referenced via the bare
+``orchestrator.merge_queue`` attribute chain). Both forms resolve to the
+identical reach-back lookup site at runtime, so both must freeze the same
+surface -- see `_merge_queue_module_aliases()`.
 
 This test uses AST parsing (not regex) so comments and docstrings that merely
 mention the string -- including the reach-back notes in the satellite module
@@ -43,31 +54,99 @@ _SATELLITE_MODULES = {
     'orchestrator.merge_shadow',
     'orchestrator.merge_liveness',
 }
+# Last path segment of each satellite module (e.g. 'merge_gates'). A relative
+# shim import (`from .merge_gates import ...`) carries no package prefix --
+# `ast.ImportFrom.module` is just the leaf name and `.level > 0` -- so it
+# cannot be matched against the fully-qualified `_SATELLITE_MODULES` strings.
+# See `_forbidden_reachback_names_from_source()`.
+_SATELLITE_LEAF_NAMES = {name.rsplit('.', 1)[-1] for name in _SATELLITE_MODULES}
 
 
-def _forbidden_reachback_names() -> set[str]:
+def _forbidden_reachback_names_from_source(source: str) -> set[str]:
     """The merge_queue-private reach-back patch surface: `_`-prefixed names
-    merge_queue.py re-exports from the four satellite modules via its shim
-    import blocks.
+    re-exported from the four satellite modules via shim import blocks in
+    *source*.
 
-    Derived by AST-parsing merge_queue.py itself rather than a hardcoded
-    list, so the forbidden set self-narrows as later PRD scopes delete names
-    from the shim.
+    Recognizes both the current absolute-import shim form
+    (``from orchestrator.merge_gates import ...``) and a relative-import
+    form (``from .merge_gates import ...``), matching on the last path
+    segment when ``node.level > 0`` since a relative import has no package
+    prefix to compare against ``_SATELLITE_MODULES``. Without this, a future
+    switch to relative imports would silently collapse the forbidden set to
+    empty and this ratchet would pass vacuously instead of loudly failing
+    (see the non-empty assertion in
+    `test_no_new_merge_queue_private_reachback_patches`).
+
+    Split out from `_forbidden_reachback_names()` so the relative-import
+    branch is unit-testable against a synthetic snippet without touching
+    merge_queue.py.
     """
-    source = _MERGE_QUEUE_PATH.read_text(encoding='utf-8')
-    tree = ast.parse(source, filename=str(_MERGE_QUEUE_PATH))
+    tree = ast.parse(source)
     forbidden: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module in _SATELLITE_MODULES:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        expected_modules = _SATELLITE_LEAF_NAMES if node.level else _SATELLITE_MODULES
+        if node.module in expected_modules:
             forbidden.update(alias.name for alias in node.names if alias.name.startswith('_'))
     return forbidden
 
 
+def _forbidden_reachback_names() -> set[str]:
+    """The merge_queue-private reach-back patch surface, derived by
+    AST-parsing merge_queue.py itself rather than a hardcoded list, so the
+    forbidden set self-narrows as later PRD scopes delete names from the
+    shim.
+    """
+    source = _MERGE_QUEUE_PATH.read_text(encoding='utf-8')
+    return _forbidden_reachback_names_from_source(source)
+
+
+def _merge_queue_module_aliases(tree: ast.AST) -> set[str]:
+    """Names bound directly to the `orchestrator.merge_queue` module object by
+    an import statement anywhere in *tree* (module-level or function-local),
+    e.g. ``import orchestrator.merge_queue as merge_queue`` or
+    ``from orchestrator import merge_queue``.
+
+    Used by `_find_merge_queue_private_patches()` to recognize the
+    object-path reach-back idiom (``setattr(merge_queue, '<leaf>', ...)`` /
+    ``patch.object(merge_queue, '<leaf>', ...)``), which targets the exact
+    same reach-back lookup site as the string-path form without embedding
+    the module path as a string constant.
+    """
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == 'orchestrator.merge_queue' and alias.asname:
+                    aliases.add(alias.asname)
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module == 'orchestrator'
+            and not node.level
+        ):
+            for alias in node.names:
+                if alias.name == 'merge_queue':
+                    aliases.add(alias.asname or 'merge_queue')
+    return aliases
+
+
 def _find_merge_queue_private_patches(source: str, forbidden: set[str]) -> list[tuple[int, str]]:
-    """Return ``(lineno, leaf)`` for each ``patch(...)`` / ``<attr>.patch(...)`` /
-    ``<attr>.setattr(...)`` call in *source* whose first positional argument is
-    a string constant ``orchestrator.merge_queue.<leaf>`` with *leaf* in
-    *forbidden*.
+    """Return ``(lineno, leaf)`` for each reach-back patch call in *source*
+    targeting a merge_queue-private *leaf* in *forbidden*, in either idiom:
+
+    * string-path -- ``patch(...)`` / ``<attr>.patch(...)`` /
+      ``<attr>.setattr(...)`` whose first positional argument is a string
+      constant ``orchestrator.merge_queue.<leaf>``; or
+    * object-path -- ``<attr>.setattr(<ref>, '<leaf>', ...)`` /
+      ``patch.object(<ref>, '<leaf>', ...)`` where ``<ref>`` is a name bound
+      to the `orchestrator.merge_queue` module (see
+      `_merge_queue_module_aliases()`) or the bare ``orchestrator.merge_queue``
+      attribute chain, and the second positional argument is the string
+      constant ``'<leaf>'``.
+
+    Both idioms resolve to the identical reach-back lookup site at runtime,
+    so both must be frozen by the same ratchet.
 
     AST-based (returns ``[]`` on a ``SyntaxError``) so comments, docstrings,
     and the ``ALLOWLIST`` literal below are never mistaken for a real patch
@@ -77,24 +156,60 @@ def _find_merge_queue_private_patches(source: str, forbidden: set[str]) -> list[
         tree = ast.parse(source)
     except SyntaxError:
         return []
+
+    merge_queue_aliases = _merge_queue_module_aliases(tree)
+
+    def _is_merge_queue_ref(expr: ast.expr) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in merge_queue_aliases
+        return (
+            isinstance(expr, ast.Attribute)
+            and expr.attr == 'merge_queue'
+            and isinstance(expr.value, ast.Name)
+            and expr.value.id == 'orchestrator'
+        )
+
     hits: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not node.args:
             continue
         func = node.func
-        is_patch_or_setattr = (
-            (isinstance(func, ast.Attribute) and func.attr in ('patch', 'setattr'))
-            or (isinstance(func, ast.Name) and func.id == 'patch')
+        is_setattr = isinstance(func, ast.Attribute) and func.attr == 'setattr'
+        is_dotted_patch = isinstance(func, ast.Attribute) and func.attr == 'patch'
+        is_bare_patch = isinstance(func, ast.Name) and func.id == 'patch'
+        is_patch_object = (
+            isinstance(func, ast.Attribute)
+            and func.attr == 'object'
+            and (
+                (isinstance(func.value, ast.Name) and func.value.id == 'patch')
+                or (isinstance(func.value, ast.Attribute) and func.value.attr == 'patch')
+            )
         )
-        if not is_patch_or_setattr:
-            continue
-        first_arg = node.args[0]
-        if not (isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str)):
-            continue
-        if not first_arg.value.startswith(_MERGE_QUEUE_PATCH_PREFIX):
-            continue
-        leaf = first_arg.value[len(_MERGE_QUEUE_PATCH_PREFIX):]
-        if leaf in forbidden:
+
+        leaf: str | None = None
+
+        # String-path form: the dotted path IS the first positional arg.
+        if is_setattr or is_dotted_patch or is_bare_patch:
+            first_arg = node.args[0]
+            if (
+                isinstance(first_arg, ast.Constant)
+                and isinstance(first_arg.value, str)
+                and first_arg.value.startswith(_MERGE_QUEUE_PATCH_PREFIX)
+            ):
+                leaf = first_arg.value[len(_MERGE_QUEUE_PATCH_PREFIX):]
+
+        # Object-path form: first positional arg is a merge_queue module
+        # reference, second positional arg is the leaf name string.
+        if leaf is None and (is_setattr or is_patch_object) and len(node.args) >= 2:
+            target, name_arg = node.args[0], node.args[1]
+            if (
+                _is_merge_queue_ref(target)
+                and isinstance(name_arg, ast.Constant)
+                and isinstance(name_arg.value, str)
+            ):
+                leaf = name_arg.value
+
+        if leaf is not None and leaf in forbidden:
             hits.append((node.lineno, leaf))
     return hits
 
@@ -245,6 +360,112 @@ def test_find_merge_queue_private_patches_flags_monkeypatch_setattr() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _find_merge_queue_private_patches(source, forbidden) -- object-path form:
+# setattr(merge_queue, '<leaf>', ...) / patch.object(merge_queue, '<leaf>', ...).
+# This is the same reach-back lookup site as the string-path form above, just
+# without embedding the module path as a string constant.
+# ---------------------------------------------------------------------------
+
+
+def test_find_merge_queue_private_patches_flags_object_form_setattr_via_from_import() -> None:
+    """`monkeypatch.setattr(merge_queue, '<forbidden>', ...)` -- object-path form
+    with `merge_queue` bound via `from orchestrator import merge_queue` (the
+    idiom already used for `merge_queue._DEBUG_ASSERTS` elsewhere in this
+    suite) -- is flagged just like the string-path form."""
+    source = (
+        "from orchestrator import merge_queue\n"
+        "\n"
+        "def test_something(monkeypatch):\n"
+        "    monkeypatch.setattr(merge_queue, '_check_post_merge_equivalence', object())\n"
+    )
+    forbidden = {'_check_post_merge_equivalence'}
+    hits = _find_merge_queue_private_patches(source, forbidden)
+    assert [leaf for _lineno, leaf in hits] == ['_check_post_merge_equivalence']
+
+
+def test_find_merge_queue_private_patches_flags_patch_object_form_via_import_as() -> None:
+    """`patch.object(merge_queue, '<forbidden>', ...)` -- object-path form with
+    `merge_queue` bound via `import orchestrator.merge_queue as merge_queue`
+    -- is flagged."""
+    source = (
+        "import orchestrator.merge_queue as merge_queue\n"
+        "from unittest.mock import patch\n"
+        "\n"
+        "def test_something():\n"
+        "    with patch.object(merge_queue, '_run_drift_check', object()):\n"
+        "        pass\n"
+    )
+    forbidden = {'_run_drift_check'}
+    hits = _find_merge_queue_private_patches(source, forbidden)
+    assert [leaf for _lineno, leaf in hits] == ['_run_drift_check']
+
+
+def test_find_merge_queue_private_patches_flags_object_form_dotted_attribute_chain() -> None:
+    """`patch.object(orchestrator.merge_queue, '<forbidden>', ...)` -- the bare
+    dotted attribute chain with no `as` alias -- is also recognized as a
+    merge_queue module reference."""
+    source = (
+        "import orchestrator.merge_queue\n"
+        "from unittest.mock import patch\n"
+        "\n"
+        "def test_something():\n"
+        "    with patch.object(orchestrator.merge_queue, '_run_drift_check', object()):\n"
+        "        pass\n"
+    )
+    forbidden = {'_run_drift_check'}
+    hits = _find_merge_queue_private_patches(source, forbidden)
+    assert [leaf for _lineno, leaf in hits] == ['_run_drift_check']
+
+
+def test_find_merge_queue_private_patches_ignores_object_form_on_other_module() -> None:
+    """`patch.object(merge_gates, '<forbidden>', ...)` targets the defining
+    satellite module directly (already repointed) -- object-path form must
+    NOT be flagged just because it is a `.object(...)` call; the target must
+    actually resolve to the merge_queue module."""
+    source = (
+        "import orchestrator.merge_gates as merge_gates\n"
+        "from unittest.mock import patch\n"
+        "\n"
+        "def test_something():\n"
+        "    with patch.object(merge_gates, '_check_post_merge_equivalence', object()):\n"
+        "        pass\n"
+    )
+    forbidden = {'_check_post_merge_equivalence'}
+    assert _find_merge_queue_private_patches(source, forbidden) == []
+
+
+def test_find_merge_queue_private_patches_ignores_unrelated_merge_queue_attribute() -> None:
+    """A `workflow.merge_queue` attribute (e.g. an `asyncio.Queue` instance
+    stored on an unrelated object, an idiom already used elsewhere in this
+    suite) is NOT a reference to the `orchestrator.merge_queue` module and
+    must not be flagged just because its attribute name happens to be
+    `merge_queue`."""
+    source = (
+        "from unittest.mock import patch\n"
+        "\n"
+        "def test_something(workflow):\n"
+        "    with patch.object(workflow.merge_queue, '_run_drift_check', object()):\n"
+        "        pass\n"
+    )
+    forbidden = {'_run_drift_check'}
+    assert _find_merge_queue_private_patches(source, forbidden) == []
+
+
+def test_merge_queue_module_aliases_recognizes_import_forms() -> None:
+    """`_merge_queue_module_aliases()` collects names bound to the
+    `orchestrator.merge_queue` module via either import form, and ignores
+    unrelated satellite imports."""
+    source = (
+        "import orchestrator.merge_queue as merge_queue\n"
+        "from orchestrator import merge_queue as mq2\n"
+        "from orchestrator import merge_queue\n"
+        "import orchestrator.merge_gates as merge_gates\n"
+    )
+    tree = ast.parse(source)
+    assert _merge_queue_module_aliases(tree) == {'merge_queue', 'mq2'}
+
+
+# ---------------------------------------------------------------------------
 # _forbidden_reachback_names() -- derives the forbidden set from merge_queue.py
 # itself (the four satellite shim blocks), not a hardcoded list.
 # ---------------------------------------------------------------------------
@@ -268,6 +489,24 @@ def test_forbidden_reachback_names_derives_from_shim_blocks() -> None:
     # are never forbidden -- only the four satellite blocks are in scope.
     assert 'run_scoped_verification' not in forbidden
     assert '_run' not in forbidden
+
+
+def test_forbidden_reachback_names_from_source_handles_relative_imports() -> None:
+    """If merge_queue.py's shim blocks ever switch to relative-import form
+    (`from .merge_gates import ...`), the forbidden set must still be
+    derived correctly instead of silently collapsing to empty (which would
+    make the tree-scan ratchet pass vacuously rather than loudly fail --
+    see the non-empty assertion in
+    `test_no_new_merge_queue_private_reachback_patches`)."""
+    source = (
+        "from .merge_gates import (\n"
+        "    _check_post_merge_equivalence,  # noqa: F401 re-export shim\n"
+        "    PostMergePyrightResult,  # noqa: F401 re-export shim\n"
+        ")\n"
+        "from .merge_drift import _run_drift_check  # noqa: F401 re-export shim\n"
+    )
+    forbidden = _forbidden_reachback_names_from_source(source)
+    assert forbidden == {'_check_post_merge_equivalence', '_run_drift_check'}
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +543,15 @@ def test_no_new_merge_queue_private_reachback_patches() -> None:
     """No orchestrator test file may introduce a NEW orchestrator.merge_queue.<private>
     reach-back string-path monkeypatch beyond the frozen ALLOWLIST residual."""
     forbidden = _forbidden_reachback_names()
+    assert forbidden, (
+        'expected a non-empty forbidden reach-back name set derived from '
+        "merge_queue.py's satellite shim blocks -- an empty set would mean "
+        'this ratchet is passing vacuously (e.g. merge_queue.py stopped '
+        'using an import form _forbidden_reachback_names_from_source() '
+        'recognizes). See test_forbidden_reachback_names_derives_from_shim_blocks '
+        'and test_forbidden_reachback_names_from_source_handles_relative_imports '
+        'for the contract this depends on.'
+    )
     violations: set[tuple[str, str]] = set()
     offenders: list[str] = []
 
