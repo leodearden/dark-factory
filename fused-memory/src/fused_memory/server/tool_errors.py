@@ -51,8 +51,11 @@ def mcp_tool_errors(
                 return {'error': str(e), 'error_type': type(e).__name__}
 
         # Set after functools.wraps: update_wrapper copies fn.__dict__ onto
-        # wrapper, which would otherwise clobber this marker.
-        wrapper.__mcp_tool_errors__ = True
+        # wrapper, which would otherwise clobber this marker. pyright types
+        # the decorated wrapper as functools' synthetic _Wrapped[...] class,
+        # which only declares __call__/__wrapped__, so it doesn't know about
+        # this dynamically-stamped attribute -- harmless at runtime.
+        wrapper.__mcp_tool_errors__ = True  # pyright: ignore[reportAttributeAccessIssue]
         return wrapper
 
     return decorator

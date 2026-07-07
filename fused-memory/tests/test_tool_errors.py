@@ -21,7 +21,6 @@ import pytest
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.server.tools import create_mcp_server
 
-
 # ---------------------------------------------------------------------------
 # Core contract (step-1 / step-2)
 # ---------------------------------------------------------------------------
@@ -104,7 +103,11 @@ async def test_wraps_preserves_metadata():
 
     assert wrapped.__name__ == 'h'
     assert wrapped.__doc__ == "h's docstring."
-    assert wrapped.__wrapped__ is h
+    # __wrapped__ exists at runtime (set by functools.wraps) but pyright types
+    # mcp_tool_errors()(h)'s result as a plain function, which doesn't declare
+    # it -- see test_project_scope.py's __supertype__ tests for the same
+    # documented pyright limitation.
+    assert wrapped.__wrapped__ is h  # pyright: ignore[reportFunctionMemberAccess]
     assert inspect.signature(wrapped) == inspect.signature(h)
 
 
