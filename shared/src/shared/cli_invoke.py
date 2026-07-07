@@ -799,6 +799,20 @@ async def invoke_with_cap_retry(
                 )
                 completed_at = datetime.now(UTC).isoformat()
 
+                # Lazy (function-local) import: invocation_outcome.py imports
+                # shared.cli_invoke at module top (for is_zero_output_timeout),
+                # so a module-top import here would create a circular import.
+                # Importing inside the loop body runs after both modules are
+                # fully loaded, breaking the cycle at negligible cost (the
+                # module is already in sys.modules).
+                from shared.invocation_outcome import (
+                    AuthFailed,
+                    CliLocalError,
+                    ZeroOutputWedge,
+                    classify_invocation,
+                )
+                outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+
                 # Auth-failure routing (401/403): distinct from cap hits.
                 # Mark the account auth_failed and fail over; don't count
                 # toward consecutive_cap_hits so the cooldown doesn't compound.
@@ -808,7 +822,9 @@ async def invoke_with_cap_retry(
                 # we route 429 here the slot.detect_cap_hit() call never runs,
                 # AllAccountsCappedException never fires, and the curator
                 # worker's cap-defer machinery silently never engages.
-                if result.api_error_status in (401, 403):
+                # classify_invocation mirrors this exact narrowing: AuthFailed
+                # is only returned for {401, 403} (see invocation_outcome.py).
+                if isinstance(outcome, AuthFailed):
                     auth_marked = usage_gate._handle_auth_failure(
                         f'HTTP {result.api_error_status}: {result.output[:120]}',
                         slot.token,
@@ -846,7 +862,7 @@ async def invoke_with_cap_retry(
                 # on the very next iteration.  At most one extra full-timeout
                 # (~configured_timeout_ms) is incurred before the cap is re-detected.
                 if (
-                    is_zero_output_timeout(result)
+                    isinstance(outcome, ZeroOutputWedge)
                     and invoke_kwargs.get('resume_session_id')
                 ):
                     logger.warning(
@@ -919,7 +935,7 @@ async def invoke_with_cap_retry(
                     and result.turns <= 1
                     and result.duration_ms < 5000
                 ):
-                    if _is_non_cap_cli_error(result.stderr, result.output):
+                    if isinstance(outcome, CliLocalError):
                         # A recognised local CLI/usage error (e.g. --session-id
                         # collision) exits zero-cost and instantly, but it is NOT a
                         # usage cap.  Counting it as a cap loops forever (reify-3604).
