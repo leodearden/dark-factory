@@ -10,15 +10,20 @@ Covers (grown step-by-step per plan.json):
 - TestComputeSnapshotMissStreak         (step-1/2)
 - TestEvaluateSnapshotCadence           (step-3/4)
 - TestBuildStaleSnapshotFinding         (step-3/4)
+- TestVerifyTaskCountSnapshotWritten    (step-5/6)
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
 from fused_memory.models.reconciliation import StageId, StageReport
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _verify_task_count_snapshot_written,
+)
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
     SNAPSHOT_WRITTEN_STAT_KEY,
@@ -199,3 +204,88 @@ class TestBuildStaleSnapshotFinding:
         second = build_stale_snapshot_finding('reify')
         assert first['description']
         assert first['description'] == second['description']
+
+
+# ---------------------------------------------------------------------------
+# _verify_task_count_snapshot_written (stages/task_knowledge_sync.py)
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyTaskCountSnapshotWritten:
+    """_verify_task_count_snapshot_written(memory_service, project_id, run_window_start).
+
+    Best-effort freshness check, mirrors _verify_stage2_summary_written's
+    never-raises / None-on-transient contract.
+    """
+
+    @pytest.mark.asyncio
+    async def test_record_within_window_returns_true_and_uses_kind_filter(self):
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'm1',
+                'created_at': (window_start + timedelta(seconds=5)).isoformat(),
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+        ]
+
+        result = await _verify_task_count_snapshot_written(
+            memory_service, 'reify', window_start,
+        )
+
+        assert result is True
+        memory_service.get_memories_by_metadata.assert_awaited_once()
+        _, kwargs = memory_service.get_memories_by_metadata.await_args
+        assert kwargs['filters'] == {'kind': 'task_count_snapshot'}
+
+    @pytest.mark.asyncio
+    async def test_only_records_before_window_returns_false(self):
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = [
+            {
+                'id': 'm-old',
+                'created_at': (window_start - timedelta(hours=1)).isoformat(),
+                'metadata': {'kind': 'task_count_snapshot'},
+            },
+        ]
+
+        result = await _verify_task_count_snapshot_written(
+            memory_service, 'reify', window_start,
+        )
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_no_records_returns_false(self):
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+
+        result = await _verify_task_count_snapshot_written(
+            memory_service, 'reify', window_start,
+        )
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_none_run_window_start_returns_none_without_querying(self):
+        memory_service = AsyncMock()
+
+        result = await _verify_task_count_snapshot_written(memory_service, 'reify', None)
+
+        assert result is None
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_query_failure_returns_none_not_false(self):
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.side_effect = RuntimeError('mem0 down')
+
+        result = await _verify_task_count_snapshot_written(
+            memory_service, 'reify', window_start,
+        )
+
+        assert result is None
