@@ -40,6 +40,28 @@ def _make_item(**overrides):
     return ScoringItem(**fields)
 
 
+_ITEM_FIELDS = st.fixed_dictionaries(
+    {
+        'severity': _SHORT_TEXT,
+        'category': _SHORT_TEXT,
+        'project': _SHORT_TEXT,
+        'age_seconds': _AGES_SECONDS,
+        'manual_boost': _BOOSTS,
+    }
+)
+
+
+def _item_from_fields(fields, state):
+    return _make_item(
+        severity=fields['severity'],
+        category=fields['category'],
+        project=fields['project'],
+        filed_at=_NOW - timedelta(seconds=fields['age_seconds']),
+        manual_boost=fields['manual_boost'],
+        state=state,
+    )
+
+
 class TestScorePureFloat:
     def test_returns_float_for_open_item(self):
         from cockpit.priority import Priorities, ScoringItem, score
@@ -244,3 +266,56 @@ class TestMonotonicAge:
         zero_age = _make_item(state='open', filed_at=_NOW)
 
         assert score(skewed, weights, _NOW) == score(zero_age, weights, _NOW)
+
+
+class TestDroppedBelowOpen:
+    @given(dropped_fields=_ITEM_FIELDS, open_fields=_ITEM_FIELDS)
+    def test_dropped_scores_below_open(self, dropped_fields, open_fields):
+        """Section 6.3 invariant 3: any dropped item scores below any open item.
+
+        Two fully independent, arbitrary items — only the state differs by
+        construction. RED: state tiers are not yet applied, so this is only
+        true by chance today.
+        """
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        dropped = _item_from_fields(dropped_fields, 'dropped')
+        open_item = _item_from_fields(open_fields, 'open')
+
+        assert score(dropped, weights, _NOW) < score(open_item, weights, _NOW)
+
+    @given(answered_fields=_ITEM_FIELDS, open_fields=_ITEM_FIELDS)
+    def test_answered_scores_below_open(self, answered_fields, open_fields):
+        """An answered item also scores below any open item, independent of weights."""
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        answered = _item_from_fields(answered_fields, 'answered')
+        open_item = _item_from_fields(open_fields, 'open')
+
+        assert score(answered, weights, _NOW) < score(open_item, weights, _NOW)
+
+    def test_adversarial_huge_dropped_vs_near_zero_open(self):
+        """Explicit pin: a maximally-weighted dropped item still loses to a near-zero open one."""
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        dropped = _make_item(
+            severity='critical',
+            category='security',
+            project='huge-project',
+            filed_at=_NOW - timedelta(days=3650),
+            manual_boost=10_000,
+            state='dropped',
+        )
+        near_zero_open = _make_item(
+            severity='unmapped',
+            category='unmapped',
+            project='unmapped',
+            filed_at=_NOW,
+            manual_boost=0,
+            state='open',
+        )
+
+        assert score(dropped, weights, _NOW) < score(near_zero_open, weights, _NOW)
