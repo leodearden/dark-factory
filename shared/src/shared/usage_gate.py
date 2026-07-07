@@ -44,14 +44,16 @@ __all__ = [
     'AccountState',
     'SessionBudgetExhausted',
 ]
-# NOTE: AccountPhase and IllegalTransitionError are intentionally NOT listed
-# here even though they are part of this module's public surface (imported
-# directly by shared.tests.test_usage_gate). shared/tests/test_public_api.py
-# pins this module's __all__ to an exact set (and shared.__all__ to the union
-# of every submodule's __all__) — both out of this task's edit scope. Adding
+# NOTE: AccountPhase, IllegalTransitionError, and AccountLease are
+# intentionally NOT listed here even though they are part of this module's
+# public surface (AccountPhase/IllegalTransitionError are imported directly
+# by shared.tests.test_usage_gate; AccountLease by consumers of
+# before_invoke()/InvokeSlot.lease). shared/tests/test_public_api.py pins
+# this module's __all__ to an exact set (and shared.__all__ to the union of
+# every submodule's __all__) — both out of this task's edit scope. Adding
 # entries here would fail that pinned assertion. __all__ only governs
 # `from shared.usage_gate import *`; explicit `from shared.usage_gate import
-# AccountPhase` works regardless of __all__ membership.
+# AccountPhase` (or `AccountLease`) works regardless of __all__ membership.
 
 # Patterns that indicate a usage cap has been hit (from Claude Code CLI output)
 CAP_HIT_PREFIXES = [
@@ -241,6 +243,29 @@ class AccountState:
             self.phase = AccountPhase.AUTH_FAILED
         elif self.phase == AccountPhase.AUTH_FAILED:
             self.phase = AccountPhase.AVAILABLE
+
+
+@dataclass(frozen=True)
+class AccountLease:
+    """Frozen snapshot of the account :meth:`UsageGate.before_invoke` selected
+    (task W4-δ, PRD §7.4).
+
+    Built IN-LOCK at selection time (after any PROBING -> PROBE_IN_FLIGHT
+    claim), so ``name`` and ``token`` always identify the SAME account —
+    closing a skew where :class:`InvokeSlot` used to re-derive
+    ``account_name`` from :attr:`UsageGate.active_account_name` independently
+    of the ``token`` ``before_invoke`` returned, which could name a
+    different account (finding 3 / boundary test B5).
+
+    ``generation`` is a snapshot of :attr:`AccountState.generation` at
+    capture time — compare it against the account's live value (see
+    :meth:`UsageGate.lease_is_current`) to detect a lease gone stale from a
+    mid-flight re-transition.
+    """
+
+    name: str
+    token: str | None
+    generation: int
 
 
 class SessionBudgetExhausted(Exception):
