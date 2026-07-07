@@ -11,6 +11,7 @@ tests/scripts/test_spawn_claude.py's bash-level harness.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import UTC, datetime, timedelta
@@ -366,3 +367,195 @@ def test_reap_removes_missing_body_past_heartbeat_ttl(tmp_path: Path) -> None:
     assert reaped[0].session_slug == r.session_slug
     assert reaped[0].reason == 'corrupt'
     assert not record_path.parent.exists()
+
+
+# ---------------------------------------------------------------------------
+# Step-9: CLI + fail-soft
+# ---------------------------------------------------------------------------
+
+
+def _launching_env(
+    tmp_path: Path,
+    *,
+    role: str = 'unblock',
+    project: str = 'df',
+    task_id: str = '2085',
+    escalation_id: str = 'esc-9',
+    title: str = 'unblock:df#2085 routing-mechanism',
+    prompt: str = '/unblock 2085',
+    cwd: str = '/home/leo/src/dark-factory',
+    launcher_pid: str = '4242',
+) -> dict[str, str]:
+    """Build the CLAUDE_SPAWN_* env mapping spawn-claude.sh passes to `launching`."""
+    return {
+        'CLAUDE_FLEET_ROOT': str(tmp_path),
+        'CLAUDE_SPAWN_ROLE': role,
+        'CLAUDE_SPAWN_PROJECT': project,
+        'CLAUDE_SPAWN_TASK_ID': task_id,
+        'CLAUDE_SPAWN_ESCALATION_ID': escalation_id,
+        'CLAUDE_SPAWN_TITLE': title,
+        'CLAUDE_SPAWN_PROMPT': prompt,
+        'CLAUDE_SPAWN_CWD': cwd,
+        'CLAUDE_SPAWN_LAUNCHER_PID': launcher_pid,
+    }
+
+
+def _set_env(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_main_launching_writes_record_and_prints_only_record_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    captured = capsys.readouterr()
+    assert captured.out.strip() == str(expected_dir)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.LAUNCHING
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '2085'
+    assert record.escalation_id == 'esc-9'
+    assert record.title == 'unblock:df#2085 routing-mechanism'
+    assert record.prompt == '/unblock 2085'
+    assert record.cwd == '/home/leo/src/dark-factory'
+    assert record.launcher_pid == 4242
+
+
+def test_main_exit_sets_status_exited_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+
+    rc = sr.main(['exit', '--record', record_dir, '--code', '3'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.EXITED
+    assert record.exit_code == 3
+
+
+def test_main_refresh_sets_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+
+    rc = sr.main(['refresh', '--record', record_dir, '--status', 'running'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+
+
+# --- identity fallback (parse_spawn_identity) -------------------------------
+
+
+def test_parse_spawn_identity_env_first_overrides_conflicting_title() -> None:
+    env = {
+        'CLAUDE_SPAWN_ROLE': 'review',
+        'CLAUDE_SPAWN_PROJECT': 'other',
+        'CLAUDE_SPAWN_TASK_ID': '999',
+        'CLAUDE_SPAWN_ESCALATION_ID': 'esc-5',
+    }
+    identity = sr.parse_spawn_identity(
+        env=env, title='unblock:df#2085 routing-mechanism', prompt='', cwd='/x',
+    )
+    assert identity.role == 'review'
+    assert identity.project == 'other'
+    assert identity.task_id == '999'
+    assert identity.escalation_id == 'esc-5'
+
+
+def test_parse_spawn_identity_falls_back_to_task_scoped_title() -> None:
+    identity = sr.parse_spawn_identity(
+        env={}, title='unblock:df#2085 routing-mechanism', prompt='', cwd='/x',
+    )
+    assert identity.role == 'unblock'
+    assert identity.project == 'df'
+    assert identity.task_id == '2085'
+
+
+def test_parse_spawn_identity_falls_back_to_project_level_title_with_no_hash() -> None:
+    identity = sr.parse_spawn_identity(
+        env={}, title='prd:df attention-rail', prompt='', cwd='/x',
+    )
+    assert identity.role == 'prd'
+    assert identity.project == 'df'
+    assert identity.task_id is None
+
+
+def test_parse_spawn_identity_defaults_when_env_and_title_absent() -> None:
+    identity = sr.parse_spawn_identity(
+        env={}, title='', prompt='', cwd='/home/leo/src/dark-factory',
+    )
+    assert identity.role == 'session'
+    assert identity.project == 'dark-factory'
+    assert identity.task_id is None
+    assert identity.escalation_id is None
+
+
+def test_parse_spawn_identity_defaults_project_unknown_when_cwd_has_no_basename() -> None:
+    identity = sr.parse_spawn_identity(env={}, title='', prompt='', cwd='')
+    assert identity.role == 'session'
+    assert identity.project == 'unknown'
+
+
+# --- fail-soft ---------------------------------------------------------------
+
+
+def test_main_launching_fail_soft_when_write_record_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path))
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(sr, 'write_record', _boom)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(['launching'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ''
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_main_launching_fail_soft_when_fleet_root_under_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A CLAUDE_FLEET_ROOT rooted under a pre-created regular file makes the
+    # write's mkdir(parents=True) raise NotADirectoryError deterministically.
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('not a directory')
+    env = _launching_env(tmp_path)
+    env['CLAUDE_FLEET_ROOT'] = str(blocker / 'fleet')
+    _set_env(monkeypatch, env)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(['launching'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ''
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert not (blocker / 'fleet').exists()
