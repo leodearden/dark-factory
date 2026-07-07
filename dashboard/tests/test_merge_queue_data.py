@@ -640,8 +640,31 @@ class TestOutcomeDistribution:
         assert result['values'][idx_conflict] == 2
 
     @pytest.mark.asyncio
-    async def test_canonical_order(self, merge_events_db):
-        """Canonical outcomes appear first in deterministic order."""
+    async def test_outcome_distribution_count_descending_with_alpha_tiebreak(self, merge_events_db):
+        """Outcomes are ordered by count descending; ties break alphabetically."""
+        now = datetime.now(UTC)
+        conn_sync = sqlite3.connect(str(merge_events_db))
+        outcomes = (
+            ['conflict'] * 3 + ['blocked'] * 2 + ['done'] * 2
+            + ['zzz'] * 1 + ['aaa'] * 1
+        )
+        for outcome in outcomes:
+            _insert_event(conn_sync, event_type='merge_attempt',
+                          timestamp=now - timedelta(minutes=5),
+                          data={'outcome': outcome})
+        conn_sync.commit()
+        conn_sync.close()
+
+        async with aiosqlite.connect(str(merge_events_db)) as db:
+            db.row_factory = aiosqlite.Row
+            result = await outcome_distribution(db, hours=24)
+
+        assert result['labels'] == ['conflict', 'blocked', 'done', 'aaa', 'zzz']
+        assert result['values'] == [3, 2, 2, 1, 1]
+
+    @pytest.mark.asyncio
+    async def test_equal_counts_sorted_alphabetically(self, merge_events_db):
+        """When all counts tie, outcomes are ordered alphabetically."""
         now = datetime.now(UTC)
         conn_sync = sqlite3.connect(str(merge_events_db))
         for outcome in ['already_merged', 'done', 'conflict', 'blocked']:
@@ -655,8 +678,8 @@ class TestOutcomeDistribution:
             db.row_factory = aiosqlite.Row
             result = await outcome_distribution(db, hours=24)
 
-        # First four labels must be the canonical ones in canonical order
-        assert result['labels'][:4] == ['done', 'conflict', 'blocked', 'already_merged']
+        # All four counts tie at 1, so order is purely alphabetical.
+        assert result['labels'][:4] == ['already_merged', 'blocked', 'conflict', 'done']
 
     @pytest.mark.asyncio
     async def test_unknown_outcome_included(self, merge_events_db):
