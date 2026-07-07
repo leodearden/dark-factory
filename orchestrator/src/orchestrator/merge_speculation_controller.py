@@ -207,6 +207,19 @@ class SpeculationController:
         self.pending_predecessor: MergeRequest | None = None
 
     @property
+    def _slot(self) -> asyncio.Semaphore:
+        """Back-compat accessor for the raw semaphore the ledger wraps.
+
+        Pre-dates the ledger indirection (task 2159); kept so
+        ``test_merge_queue_permit_conservation.py``'s task-1993
+        same-object-identity assertion — outside this task's file scope —
+        keeps passing unchanged: ``self._ledger._slot`` IS
+        ``worker._speculation_slot``, the same object the verifier's raw
+        releases still target directly until task eta.
+        """
+        return self._ledger._slot
+
+    @property
     def held_by_merger(self) -> int:
         """1 if the merger currently holds a speculation permit, else 0.
 
