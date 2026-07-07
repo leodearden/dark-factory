@@ -520,6 +520,18 @@ async def run(args: Any, memory_service: Any) -> dict:
             apply_results.append(
                 {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
             )
+        elif disposition == EPISODIC_SKIP:
+            # Non-:Entity foreign node (Episodic/Community/unlabeled): the
+            # epsilon primitives and rekey_node_in_place are all :Entity-
+            # scoped, so this node is never dispatched to any of them.
+            # Blocks this node only; its live relocation is eta's concern.
+            apply_results.append({
+                'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True,
+                'reason': (
+                    'non-:Entity node -- epsilon primitives are :Entity-scoped; '
+                    'deferred to eta live relocation'
+                ),
+            })
         else:
             # UNRESOLVED: never dispatched to a primitive (PRD decision 4 --
             # no silent drop, no silent routing to a new/unpopulated graph).
@@ -530,11 +542,13 @@ async def run(args: Any, memory_service: Any) -> dict:
             )
 
     # POST-VERIFY: re-census foreign counts per graph and compare to the
-    # expected residual -- the per-graph count of UNRESOLVED manifest nodes,
-    # which are the only foreign nodes a clean apply should ever leave
-    # behind. A mismatch means a MOVE/MERGE silently failed to clear its
-    # source copy; any UNRESOLVED node blocks success outright regardless of
-    # whether the counts otherwise reconcile (PRD decision 4).
+    # expected residual -- the per-graph count of UNRESOLVED + EPISODIC_SKIP
+    # manifest nodes, which are the only foreign nodes a clean apply should
+    # ever leave behind (EPISODIC_SKIP nodes are never actioned -- see the
+    # EPISODIC_SKIP constant -- so their foreign copy necessarily survives).
+    # A mismatch means a MOVE/MERGE silently failed to clear its source
+    # copy; any UNRESOLVED/EPISODIC_SKIP node blocks success outright
+    # regardless of whether the counts otherwise reconcile (PRD decision 4).
     populated = set(await graphiti.list_graphs())
     after_counts: dict[str, int] = {}
     for graph_key in populated:
@@ -543,7 +557,7 @@ async def run(args: Any, memory_service: Any) -> dict:
 
     expected_residual: dict[str, int] = dict.fromkeys(populated, 0)
     for node in manifest['nodes']:
-        if node['disposition'] == UNRESOLVED:
+        if node['disposition'] in (UNRESOLVED, EPISODIC_SKIP):
             expected_residual[node['source_graph']] = (
                 expected_residual.get(node['source_graph'], 0) + 1
             )
