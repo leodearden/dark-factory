@@ -10,7 +10,7 @@ every later implementation step.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from hypothesis import given
 from hypothesis import strategies as st
@@ -20,6 +20,7 @@ _STATES = ['open', 'answered', 'dropped']
 _TIMESTAMPS = st.datetimes(timezones=st.just(UTC))
 _SHORT_TEXT = st.text(max_size=20)
 _BOOSTS = st.integers(min_value=-10_000, max_value=10_000)
+_AGES_SECONDS = st.floats(min_value=0, max_value=100_000_000, allow_nan=False, allow_infinity=False)
 
 _NOW = datetime(2026, 7, 7, tzinfo=UTC)
 
@@ -194,3 +195,52 @@ class TestMonotonicBoost:
         assert s(-5) < s(-2) < s(0) < s(3) < s(5)
         # Monotonic non-decreasing across the full span, clamp regions included.
         assert s(-100) <= s(-50) <= s(-5) <= s(-2) <= s(0) <= s(3) <= s(5) <= s(50) <= s(100)
+
+
+class TestMonotonicAge:
+    @given(ages=st.tuples(_AGES_SECONDS, _AGES_SECONDS).map(sorted))
+    def test_score_nondecreasing_in_age(self, ages):
+        """Section 6.3 invariant 2: score is monotonic non-decreasing in age.
+
+        The item is otherwise fixed (open, default fields) — only age varies.
+        """
+        from cockpit.priority import Priorities, score
+
+        a1, a2 = ages
+        weights = Priorities.default()
+        younger = _make_item(state='open', filed_at=_NOW - timedelta(seconds=a1))
+        older = _make_item(state='open', filed_at=_NOW - timedelta(seconds=a2))
+
+        assert score(older, weights, _NOW) >= score(younger, weights, _NOW)
+
+    def test_age_before_saturation_strictly_increases_score(self):
+        """RED: age is not yet summed into raw, so this strict pin fails today."""
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        younger = _make_item(state='open', filed_at=_NOW - timedelta(days=1))
+        older = _make_item(state='open', filed_at=_NOW - timedelta(days=3))
+
+        assert score(older, weights, _NOW) > score(younger, weights, _NOW)
+
+    def test_ages_past_saturation_give_equal_contribution(self):
+        """Bounded curve: age contribution flatlines once age >= saturation_seconds."""
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        past_saturation = _make_item(state='open', filed_at=_NOW - timedelta(days=10))
+        further_past_saturation = _make_item(state='open', filed_at=_NOW - timedelta(days=30))
+
+        assert score(past_saturation, weights, _NOW) == score(
+            further_past_saturation, weights, _NOW
+        )
+
+    def test_clock_skew_treated_as_zero_age_no_exception(self):
+        """filed_at after now (clock skew) must not raise and must not go negative."""
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        skewed = _make_item(state='open', filed_at=_NOW + timedelta(days=5))
+        zero_age = _make_item(state='open', filed_at=_NOW)
+
+        assert score(skewed, weights, _NOW) == score(zero_age, weights, _NOW)
