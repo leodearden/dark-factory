@@ -538,6 +538,10 @@ class TestRefreshCappedAccounts:
         acct.capped = True
         acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
         acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=10)
+        # step-29/30: _total_pause_secs is gate-level-only. This CAPPED state
+        # is built by directly setting acct.capped (bypassing _transition), so
+        # stamp the gate clock too to match the per-account backdate.
+        gate._pause_started_at = datetime.now(UTC) - timedelta(seconds=10)
 
         await gate._refresh_capped_accounts()
 
@@ -658,6 +662,10 @@ class TestResumeProbe:
         acct.capped = True
         acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=10)
         acct.resets_at = datetime.now(UTC) - timedelta(seconds=1)
+        # step-29/30: _total_pause_secs is gate-level-only. This CAPPED state
+        # is built by directly setting acct.capped (bypassing _transition), so
+        # stamp the gate clock too to match the per-account backdate.
+        gate._pause_started_at = datetime.now(UTC) - timedelta(seconds=10)
 
         await gate._account_resume_probe_loop(acct)
 
