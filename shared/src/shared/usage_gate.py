@@ -23,6 +23,7 @@ import re
 import signal
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -43,6 +44,14 @@ __all__ = [
     'AccountState',
     'SessionBudgetExhausted',
 ]
+# NOTE: AccountPhase and IllegalTransitionError are intentionally NOT listed
+# here even though they are part of this module's public surface (imported
+# directly by shared.tests.test_usage_gate). shared/tests/test_public_api.py
+# pins this module's __all__ to an exact set (and shared.__all__ to the union
+# of every submodule's __all__) — both out of this task's edit scope. Adding
+# entries here would fail that pinned assertion. __all__ only governs
+# `from shared.usage_gate import *`; explicit `from shared.usage_gate import
+# AccountPhase` works regardless of __all__ membership.
 
 # Patterns that indicate a usage cap has been hit (from Claude Code CLI output)
 CAP_HIT_PREFIXES = [
@@ -110,30 +119,123 @@ def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
     return isinstance(obj, dict) and obj.get('subtype') == 'error_max_budget_usd'
 
 
+class AccountPhase(StrEnum):
+    """Explicit lifecycle phase for one account (PRD §7.3, task W4-γ).
+
+    Exactly one phase is active per account at any time — this is the single
+    source of truth that replaces the old, independently-mutable
+    ``capped``/``probing``/``probe_in_flight``/``auth_failed`` booleans on
+    :class:`AccountState` (which could — and did — drift out of sync, e.g.
+    ``capped`` and ``auth_failed`` both True simultaneously).
+    """
+
+    AVAILABLE = 'available'
+    PROBING = 'probing'
+    PROBE_IN_FLIGHT = 'probe_in_flight'
+    CAPPED = 'capped'
+    AUTH_FAILED = 'auth_failed'
+
+
+class IllegalTransitionError(Exception):
+    """Raised by :meth:`UsageGate._transition` on a phase edge not present in
+    ``_LEGAL_TRANSITIONS``. Account state is left unchanged."""
+
+
+# Legal phase edges (PRD §7.3, task W4-γ). Any edge not listed here raises
+# IllegalTransitionError from _transition unless called with force=True (the
+# escape hatch reserved for _on_sighup_async's operator-driven hard reset).
+_LEGAL_TRANSITIONS: dict[AccountPhase, frozenset[AccountPhase]] = {
+    AccountPhase.AVAILABLE: frozenset({AccountPhase.CAPPED, AccountPhase.AUTH_FAILED}),
+    AccountPhase.PROBING: frozenset({
+        AccountPhase.AVAILABLE,
+        AccountPhase.PROBE_IN_FLIGHT,
+        AccountPhase.CAPPED,
+        AccountPhase.AUTH_FAILED,
+    }),
+    AccountPhase.PROBE_IN_FLIGHT: frozenset({
+        AccountPhase.AVAILABLE,
+        AccountPhase.CAPPED,
+        AccountPhase.AUTH_FAILED,
+    }),
+    AccountPhase.CAPPED: frozenset({AccountPhase.PROBING}),
+    AccountPhase.AUTH_FAILED: frozenset({AccountPhase.AVAILABLE, AccountPhase.CAPPED}),
+}
+
+
 @dataclass
 class AccountState:
     """Per-account cap tracking."""
 
     name: str
     token: str | None          # None = default account (no override)
-    capped: bool = False
+    phase: AccountPhase = AccountPhase.AVAILABLE
     resets_at: datetime | None = None
     pause_started_at: datetime | None = None
     resume_task: asyncio.Task | None = field(default=None, repr=False)
     probe_count: int = 0
     near_cap: bool = False
-    # Probe lifecycle:
-    #   probing=True  → freshly uncapped by probe, first task should claim it
-    #   probe_in_flight=True → one task is testing, others must wait
-    probing: bool = False
-    probe_in_flight: bool = False
-    # Auth-failure lifecycle (distinct from cap): 4xx responses indicate the
-    # account is not authorised (e.g. org access revoked, token expired).
-    # Unlike cap, auth_failed only clears on an explicit re-probe after the
-    # configured interval or a SIGHUP-triggered env reload.
-    auth_failed: bool = False
     auth_failed_at: datetime | None = None
     auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
+
+    # --- Legacy-compat boolean shim -----------------------------------
+    #
+    # capped/probing/probe_in_flight/auth_failed used to be four independent
+    # dataclass fields, mutated directly across ~10 sites in this module and
+    # read/written by sibling test files outside this task's edit scope
+    # (test_concurrency.py, test_usage_gate_exhaustive.py, test_auth_failed.py,
+    # test_probe_loop.py, test_failover_integration.py, and
+    # orchestrator/tests/test_usage_gate.py via its re-export shim).
+    #
+    # Production code (UsageGate._transition) now writes `phase` exclusively.
+    # These properties keep the old boolean attribute-access surface working
+    # for those out-of-scope callers: getter compares to the matching phase;
+    # setter(True) enters that phase, setter(False) reverts to AVAILABLE only
+    # if the flag being cleared is the account's *current* phase (clearing a
+    # non-current flag is a no-op, matching legacy behavior where the other
+    # flags were already False).
+    @property
+    def capped(self) -> bool:
+        return self.phase == AccountPhase.CAPPED
+
+    @capped.setter
+    def capped(self, value: bool) -> None:
+        if value:
+            self.phase = AccountPhase.CAPPED
+        elif self.phase == AccountPhase.CAPPED:
+            self.phase = AccountPhase.AVAILABLE
+
+    @property
+    def probing(self) -> bool:
+        return self.phase == AccountPhase.PROBING
+
+    @probing.setter
+    def probing(self, value: bool) -> None:
+        if value:
+            self.phase = AccountPhase.PROBING
+        elif self.phase == AccountPhase.PROBING:
+            self.phase = AccountPhase.AVAILABLE
+
+    @property
+    def probe_in_flight(self) -> bool:
+        return self.phase == AccountPhase.PROBE_IN_FLIGHT
+
+    @probe_in_flight.setter
+    def probe_in_flight(self, value: bool) -> None:
+        if value:
+            self.phase = AccountPhase.PROBE_IN_FLIGHT
+        elif self.phase == AccountPhase.PROBE_IN_FLIGHT:
+            self.phase = AccountPhase.AVAILABLE
+
+    @property
+    def auth_failed(self) -> bool:
+        return self.phase == AccountPhase.AUTH_FAILED
+
+    @auth_failed.setter
+    def auth_failed(self, value: bool) -> None:
+        if value:
+            self.phase = AccountPhase.AUTH_FAILED
+        elif self.phase == AccountPhase.AUTH_FAILED:
+            self.phase = AccountPhase.AVAILABLE
 
 
 class SessionBudgetExhausted(Exception):
@@ -207,6 +309,27 @@ class UsageGate:
     Tracks cap status per account and returns the first available account's
     token from ``before_invoke()``. Only blocks when *all* accounts are
     capped.  Works with 1 or N accounts.
+
+    Phase precedence — CAPPED takes precedence over AUTH_FAILED: an account
+    already CAPPED that then also hits an auth failure (e.g. a concurrent
+    caller's 403 on a token that gets revoked while the account is capped)
+    stays CAPPED rather than demoting to AUTH_FAILED — see
+    ``_handle_auth_failure`` and ``_LEGAL_TRANSITIONS`` (CAPPED's only legal
+    outbound edge is PROBING; CAPPED -> AUTH_FAILED is not legal). This is a
+    deliberate choice, not a defect, but it does mean the two blocked
+    reasons are not independently observable while an account is CAPPED.
+
+    Recovery for a genuinely revoked token while CAPPED: if ``resets_at`` is
+    known, ``_refresh_capped_accounts``/``before_invoke`` will move the
+    account CAPPED -> PROBING -> PROBE_IN_FLIGHT once ``resets_at`` passes
+    and hand it a real invocation, which will correctly reclassify it as
+    AUTH_FAILED on a genuine 401/403 (the account is no longer CAPPED at
+    that point, so the edge is legal). If ``resets_at`` is unknown (unset),
+    ``_account_resume_probe_loop`` has no such deadline and will keep
+    re-probing indefinitely at the ``max_probe_interval_secs`` backoff
+    ceiling — recovery then requires an operator token refresh + SIGHUP
+    (``_on_sighup_async`` force-resets every account to AVAILABLE). See
+    PRD §7.3 (task W4-γ) for the full transition table.
     """
 
     def __init__(self, config: UsageCapConfig, *, cost_store: CostStore | None = None):
@@ -223,6 +346,7 @@ class UsageGate:
         self._run_id: str | None = None
         self._last_account_name: str | None = None
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
+        self._shutting_down: bool = False
 
         self._probe_config_dir = TaskConfigDir('usage-gate-probe')
         self._accounts: list[AccountState] = self._init_accounts()
@@ -261,6 +385,156 @@ class UsageGate:
             )
         return accounts
 
+    def _transition(
+        self,
+        acct: AccountState,
+        new_phase: AccountPhase,
+        *,
+        resets_at: datetime | None = None,
+        reason: str = '',
+        force: bool = False,
+        clear_near_cap: bool = True,
+    ) -> None:
+        """Sole writer of ``AccountState.phase`` (PRD §7.3, task W4-γ).
+
+        Writes the new phase, then recomputes the shared ``_open`` event in
+        ONE place from the current phase of every account (DD-5 invariant:
+        ``_open.is_set() <=> any(a.phase in {AVAILABLE, PROBING})``) —
+        replacing the ~10 scattered ``self._open.set()``/``.clear()`` call
+        sites this method's callers used to own directly.
+
+        Also owns the per-phase side effects that used to be scattered
+        across callers: starting/cancelling the resume and auth-reprobe
+        background tasks, firing the ``cap_hit``/``auth_failed`` cost
+        events (entering CAPPED/AUTH_FAILED), stamping gate-level
+        ``_pause_started_at``/``_paused_reason`` when the edge closes the
+        gate for every account — and, symmetrically, consuming the elapsed
+        gate-level pause into ``_total_pause_secs`` and clearing
+        ``_pause_started_at`` when an edge reopens the gate — plus recovery
+        bookkeeping when leaving a blocked phase (probe_count reset,
+        per-account ``pause_started_at``/``auth_failed_at`` clearing).
+        ``_total_pause_secs`` is a purely gate-level measure: only the
+        gate-level ``_pause_started_at`` clock above feeds it, so a pause is
+        counted exactly once regardless of how many accounts it affects. The
+        ``resumed``/``auth_resumed`` cost events are NOT fired here — they
+        stay in the async callers that carry a probe-count label.
+
+        ``clear_near_cap`` defaults to True (the phase write always implies
+        a fresh near-cap read for every caller except one): ``release_probe_slot``
+        passes ``clear_near_cap=False`` because it fires on an *exception*
+        path unrelated to cap status, and must leave a stale ``near_cap``
+        warning exactly as ``confirm_account_ok``/``detect_cap_hit`` left it.
+
+        Raises :class:`IllegalTransitionError` — without mutating any state
+        — if ``new_phase`` is not a legal edge from ``acct.phase`` per
+        ``_LEGAL_TRANSITIONS``, unless ``force=True`` (reserved for
+        ``_on_sighup_async``'s operator-driven hard reset to AVAILABLE).
+        """
+        if not force and new_phase not in _LEGAL_TRANSITIONS.get(acct.phase, frozenset()):
+            logger.error(
+                'Illegal phase transition for account %r: %s -> %s (reason=%r)',
+                acct.name, acct.phase, new_phase, reason,
+            )
+            raise IllegalTransitionError(
+                f'Illegal phase transition for account {acct.name!r}: '
+                f'{acct.phase} -> {new_phase}'
+            )
+
+        old_phase = acct.phase
+        acct.phase = new_phase
+        if clear_near_cap:
+            acct.near_cap = False
+
+        # --- Recovery bookkeeping for the edge just taken -----------------
+        # NOTE: this per-account clock does NOT feed _total_pause_secs — that
+        # would double-count alongside the gate-level consumption below,
+        # since the real cap-entry path stamps both clocks at the same
+        # instant when this is the sole/last open account (regression fixed
+        # at step-29/30). acct.pause_started_at is retained only for
+        # per-account diagnostics / field hygiene (e.g. the SIGHUP field-clear
+        # assertion).
+        if old_phase == AccountPhase.CAPPED and new_phase != AccountPhase.CAPPED:
+            acct.pause_started_at = None
+        if old_phase == AccountPhase.AUTH_FAILED and new_phase != AccountPhase.AUTH_FAILED:
+            acct.auth_failed_at = None
+        if (
+            (old_phase == AccountPhase.CAPPED and new_phase == AccountPhase.PROBING)
+            or (old_phase == AccountPhase.PROBE_IN_FLIGHT and new_phase == AccountPhase.AVAILABLE)
+        ):
+            acct.probe_count = 0
+
+        # --- Force hard-reset cleanup (operator-driven, SIGHUP only) ------
+        # force=True is reserved for _on_sighup_async's per-account hard
+        # reset to AVAILABLE — cancel whichever background task was running
+        # (the CAPPED/AUTH_FAILED-entry branches below only ever start the
+        # OPPOSITE task, so neither would otherwise cancel a stale one here)
+        # and clear the fields the two edge-specific bookkeeping blocks
+        # above don't cover for a CAPPED/AVAILABLE-self-loop source.
+        if force:
+            if acct.resume_task is not None and not acct.resume_task.done():
+                acct.resume_task.cancel()
+            if acct.auth_reprobe_task is not None and not acct.auth_reprobe_task.done():
+                acct.auth_reprobe_task.cancel()
+            acct.probe_count = 0
+            acct.resets_at = None
+
+        # --- Centralized _open recompute (DD-5) ---------------------------
+        if any(
+            a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING)
+            for a in self._accounts
+        ):
+            self._open.set()
+            # Symmetric counterpart to the closing branch below: consume the
+            # gate-level pause into _total_pause_secs and clear
+            # _pause_started_at on reopen. This is the SOLE accumulation site
+            # for _total_pause_secs (gate-level-only — see _transition's
+            # docstring); the per-account recovery block above intentionally
+            # does not also add to it, to avoid double-counting the same
+            # elapsed interval. Without this branch, total_pause_secs (which
+            # adds "now - _pause_started_at" whenever the latter is truthy)
+            # would keep growing forever after the very first full-gate
+            # pause, even while the gate sits open and accounts serve
+            # traffic.
+            if self._pause_started_at is not None:
+                self._total_pause_secs += (
+                    datetime.now(UTC) - self._pause_started_at
+                ).total_seconds()
+                self._pause_started_at = None
+        else:
+            self._open.clear()
+            if self._pause_started_at is None:
+                self._pause_started_at = datetime.now(UTC)
+            if reason:
+                self._paused_reason = reason
+            # else: a reason-less closing edge (e.g. before_invoke's
+            # PROBE_IN_FLIGHT probe-slot claim, reason='' by default) must
+            # not clobber a real cap/auth reason already recorded here.
+            # SIGHUP is the sole clearer of _paused_reason (see
+            # _on_sighup_async).
+
+        # --- Enter-phase side effects: task lifecycle + cost event --------
+        if new_phase == AccountPhase.CAPPED:
+            if acct.pause_started_at is None:
+                acct.pause_started_at = datetime.now(UTC)
+            if acct.auth_reprobe_task is not None and not acct.auth_reprobe_task.done():
+                acct.auth_reprobe_task.cancel()
+            self._start_account_resume_probe(acct)
+            if self._cost_store:
+                details: dict[str, str] = {'reason': reason}
+                if resets_at is not None:
+                    details['resets_at'] = resets_at.isoformat()
+                self._fire_cost_event(acct.name, 'cap_hit', json.dumps(details))
+        elif new_phase == AccountPhase.AUTH_FAILED:
+            acct.auth_failed_at = datetime.now(UTC)
+            if acct.resume_task is not None and not acct.resume_task.done():
+                acct.resume_task.cancel()
+            self._start_auth_reprobe(acct)
+            if self._cost_store:
+                details = {'reason': reason}
+                if resets_at is not None:
+                    details['resets_at'] = resets_at.isoformat()
+                self._fire_cost_event(acct.name, 'auth_failed', json.dumps(details))
+
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
 
@@ -298,9 +572,9 @@ class UsageGate:
                     if acct.probing:
                         # First task claims the probe slot — others block
                         # until confirm_account_ok() or _handle_cap_detected().
-                        acct.probing = False
-                        acct.probe_in_flight = True
-                        self._open.clear()
+                        # _transition owns: the phase write, probe_count
+                        # reset, and the centralized _open recompute.
+                        self._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
                         logger.info(
                             f'Account {acct.name}: probe slot claimed — '
                             f'single task testing',
@@ -330,7 +604,17 @@ class UsageGate:
             if refreshed:
                 continue  # re-check accounts with updated flags
 
-            # Still all capped after fresh check — wait on global gate
+            # Still all capped after fresh check — wait on global gate.
+            # NOTE: this clear() is NOT redundant with _transition's centralized
+            # recompute, despite _transition being the sole writer of every
+            # PRODUCTION phase change. Out-of-scope sibling test suites (and any
+            # other caller of the retained legacy capped/probing/probe_in_flight/
+            # auth_failed shims — see AccountState) mutate `phase` directly
+            # through those property setters, bypassing _transition and its
+            # _open recompute entirely. This clear() is derived independently:
+            # the for-loop above just confirmed every account is non-AVAILABLE
+            # and non-PROBING, so clearing here is always correct regardless of
+            # how _open drifted.
             logger.info('All accounts capped — waiting for any to reopen')
             self._open.clear()
             await self._open.wait()
@@ -443,30 +727,20 @@ class UsageGate:
             logger.warning(f'Cap detected but no matching account: {reason}')
             return False
 
-        acct.capped = True
-        acct.near_cap = False
-        acct.probing = False
-        acct.probe_in_flight = False
+        # resets_at is refreshed unconditionally (even on a same-phase repeat
+        # detection) — it feeds the resume-probe backoff target and
+        # _refresh_capped_accounts, independent of whether a phase edge fires.
         acct.resets_at = resets_at
-        if acct.pause_started_at is None:
-            acct.pause_started_at = datetime.now(UTC)
         logger.warning(f'Account {acct.name} CAPPED: {reason}')
-        if self._cost_store:
-            # Persist resets_at alongside reason so the dashboard can surface
-            # per-account uncap ETAs without re-parsing the reason string.
-            details: dict[str, str] = {'reason': reason}
-            if resets_at is not None:
-                details['resets_at'] = resets_at.isoformat()
-            self._fire_cost_event(acct.name, 'cap_hit', json.dumps(details))
-        self._start_account_resume_probe(acct)
-
-        # If all accounts are now unavailable (capped or auth_failed), close the global gate
-        if all(a.capped or a.auth_failed for a in self._accounts):
-            self._open.clear()
-            self._paused_reason = f'All accounts capped (last: {reason})'
-            if self._pause_started_at is None:
-                self._pause_started_at = datetime.now(UTC)
-            logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
+        if acct.phase != AccountPhase.CAPPED:
+            # _transition owns: the phase write, near_cap clear, the
+            # centralized _open recompute, cancelling/starting the
+            # opposite/matching background task, the cap_hit cost event, and
+            # gate-level pause bookkeeping. A same-phase repeat call (already
+            # CAPPED) is a pure no-op here — the old inline mutations had no
+            # legality concept and would silently re-run every field write
+            # and re-fire the cost event on every repeat detection.
+            self._transition(acct, AccountPhase.CAPPED, resets_at=resets_at, reason=reason)
         return True
 
     def _handle_near_cap_warning(
@@ -506,41 +780,50 @@ class UsageGate:
         ``before_invoke`` until an explicit re-probe succeeds — usually
         after the operator updates the token in ``.env`` and sends SIGHUP,
         or after ``auth_reprobe_secs`` elapses.
+
+        No-ops (returns True without transitioning) when the account is
+        already CAPPED — CAPPED takes precedence over AUTH_FAILED by design;
+        see the "Phase precedence" note in :class:`UsageGate`'s docstring
+        for the full recovery-semantics writeup and its known gap.
         """
         acct = self._resolve_account(oauth_token)
         if acct is None:
             logger.warning(f'Auth failure but no matching account: {reason}')
             return False
 
-        acct.auth_failed = True
-        acct.auth_failed_at = datetime.now(UTC)
-        acct.probe_in_flight = False
-        acct.probing = False
         logger.warning(f'Account {acct.name} AUTH-FAILED: {reason}')
-        if self._cost_store:
+        if acct.phase not in (AccountPhase.AUTH_FAILED, AccountPhase.CAPPED):
             # In production, HTTP 429 with "out of extra usage" carries a
             # "resets ..." phrase in the body — parse and persist it so the
             # dashboard can surface a reset ETA without re-parsing reason
             # strings downstream. Skip the 1h fallback when there's no
             # "resets" hint at all (true 401/403 token revocation).
-            details: dict[str, str] = {'reason': reason}
-            if 'resets' in reason.lower():
-                details['resets_at'] = _parse_resets_at(reason).isoformat()
-            self._fire_cost_event(
-                acct.name, 'auth_failed', json.dumps(details),
-            )
-        self._start_auth_reprobe(acct)
-
-        if all(a.capped or a.auth_failed for a in self._accounts):
-            self._open.clear()
-            self._paused_reason = f'All accounts unavailable (last: {reason})'
-            if self._pause_started_at is None:
-                self._pause_started_at = datetime.now(UTC)
-            logger.warning(f'Usage gate PAUSED: {self._paused_reason}')
+            resets_at = _parse_resets_at(reason) if 'resets' in reason.lower() else None
+            # _transition owns: the phase write, near_cap clear, the
+            # centralized _open recompute, cancelling/starting the
+            # opposite/matching background task, the auth_failed cost event,
+            # and gate-level pause bookkeeping. A same-phase repeat call
+            # (already AUTH_FAILED) is a pure no-op here.
+            self._transition(acct, AccountPhase.AUTH_FAILED, resets_at=resets_at, reason=reason)
+        # else: already AUTH_FAILED (no-op repeat) OR already CAPPED —
+        # CAPPED->AUTH_FAILED is not a legal edge (_LEGAL_TRANSITIONS[CAPPED]
+        # == {PROBING}), so demoting a time-bounded cap to an operator-gated
+        # auth_failed would raise IllegalTransitionError. A concurrent
+        # sibling task can cap this account (via _handle_cap_detected) after
+        # before_invoke already handed it out AVAILABLE; when the in-flight
+        # caller's request then fails with a 403, the cap already makes the
+        # account unavailable and self-recovers via resets_at/resume-probe,
+        # which takes precedence over auth_failed. Return True unconditionally
+        # (below) regardless of which branch ran so cli_invoke.py's
+        # invoke_slot() still settles the slot and fails over.
         return True
 
     def _start_auth_reprobe(self, acct: AccountState) -> None:
         """Schedule a background re-probe loop for an auth_failed account."""
+        # getattr default: some test fixtures construct UsageGate via
+        # __new__ (bypassing __init__) and predate this field.
+        if getattr(self, '_shutting_down', False):
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -595,14 +878,21 @@ class UsageGate:
         logger.info(f'Account {acct.name}: firing auth re-probe')
         ok = await self._run_probe(acct)
         if ok:
-            acct.auth_failed = False
-            acct.auth_failed_at = None
-            logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
-            self._open.set()
-            if self._cost_store:
-                self._fire_cost_event(
-                    acct.name, 'auth_resumed', json.dumps({}),
-                )
+            if acct.phase == AccountPhase.AUTH_FAILED:
+                # _transition owns: the phase write, clearing auth_failed_at,
+                # and the centralized _open recompute. A phase mismatch here
+                # (e.g. SIGHUP's fan-out reprobing an account that was never
+                # auth_failed) is a pure no-op — mirrors the idempotency
+                # guards on _handle_cap_detected/_handle_auth_failure. The
+                # old unconditional field writes + event fire re-ran (and
+                # re-fired 'auth_resumed') on every successful call
+                # regardless of the account's current phase.
+                self._transition(acct, AccountPhase.AVAILABLE)
+                logger.info(f'Account {acct.name} AUTH RESUMED (probe confirmed)')
+                if self._cost_store:
+                    self._fire_cost_event(
+                        acct.name, 'auth_resumed', json.dumps({}),
+                    )
         else:
             logger.info(
                 f'Account {acct.name}: auth re-probe failed — staying auth_failed',
@@ -665,10 +955,8 @@ class UsageGate:
 
         Treats SIGHUP as an operator-driven "refresh everything" signal:
         - reload .env (override existing env vars)
-        - cancel any in-flight resume / auth-reprobe tasks
         - refresh each account's token from its env var if it changed
-        - clear capped / auth_failed / probing state so every account is
-          probe-worthy
+        - force every account to AVAILABLE so it is probe-worthy
         - reopen the global gate
         - fire a probe per account in parallel
 
@@ -677,10 +965,6 @@ class UsageGate:
         """
         load_dotenv(override=True)
         for acct in self._accounts:
-            if acct.resume_task is not None and not acct.resume_task.done():
-                acct.resume_task.cancel()
-            if acct.auth_reprobe_task is not None and not acct.auth_reprobe_task.done():
-                acct.auth_reprobe_task.cancel()
             token_env = self._token_env_for(acct)
             if token_env:
                 fresh = os.environ.get(token_env)
@@ -689,16 +973,13 @@ class UsageGate:
                         f'SIGHUP: account {acct.name} env token changed — refreshing'
                     )
                     acct.token = fresh
-            acct.capped = False
-            acct.resets_at = None
-            acct.pause_started_at = None
-            acct.auth_failed = False
-            acct.auth_failed_at = None
-            acct.near_cap = False
-            acct.probing = False
-            acct.probe_in_flight = False
-            acct.probe_count = 0
-        self._open.set()
+            # _transition owns: the phase write, cancelling any in-flight
+            # resume/auth-reprobe task, probe_count/resets_at reset,
+            # pause-time consumption, auth_failed_at clearing, and the
+            # centralized _open recompute. force=True is required because
+            # CAPPED/AUTH_FAILED -> AVAILABLE is not a legal edge outside
+            # this operator-driven hard reset.
+            self._transition(acct, AccountPhase.AVAILABLE, force=True)
         self._paused_reason = ''
         logger.info(
             f'SIGHUP: reloaded {len(self._accounts)} account(s); firing probes'
@@ -749,6 +1030,10 @@ class UsageGate:
 
     def _start_account_resume_probe(self, acct: AccountState) -> None:
         """Start an async resume probe for a specific account."""
+        # getattr default: some test fixtures construct UsageGate via
+        # __new__ (bypassing __init__) and predate this field.
+        if getattr(self, '_shutting_down', False):
+            return
         if not self._config.wait_for_reset:
             return
         try:
@@ -822,16 +1107,13 @@ class UsageGate:
                 continue
             if acct.resets_at is not None and now >= acct.resets_at:
                 logger.info(f'Account {acct.name}: reset time passed — uncapping (probing)')
-                acct.capped = False
-                acct.near_cap = False
-                acct.probing = True  # gate: one task confirms before opening to all
-                if acct.pause_started_at:
-                    self._total_pause_secs += (now - acct.pause_started_at).total_seconds()
-                acct.pause_started_at = None
+                # _transition owns: the phase write, near_cap clear, probe_count
+                # reset, pause-time consumption into _total_pause_secs, and the
+                # centralized _open recompute (gate: one task confirms before
+                # opening to all — PROBING, not AVAILABLE).
+                self._transition(acct, AccountPhase.PROBING)
                 any_uncapped = True
 
-        if any_uncapped:
-            self._open.set()
         return any_uncapped
 
     def on_agent_complete(self, cost: float) -> None:
@@ -883,23 +1165,30 @@ class UsageGate:
             ok = await self._run_probe(acct)
 
             if ok:
-                confirmed_probe_num = acct.probe_count
-                acct.capped = False
-                acct.near_cap = False
-                acct.probing = True  # gate: let one real task confirm first
-                acct.probe_count = 0
-                if acct.pause_started_at:
-                    self._total_pause_secs += (
-                        datetime.now(UTC) - acct.pause_started_at
-                    ).total_seconds()
-                acct.pause_started_at = None
-                logger.info(f'Account {acct.name} RESUMED (probe confirmed)')
-                self._open.set()
-                if self._cost_store:
-                    await self._write_cost_event(
-                        acct.name, 'resumed',
-                        json.dumps({'label': f'probe #{confirmed_probe_num} confirmed'}),
-                    )
+                # _refresh_capped_accounts runs from before_invoke OUTSIDE
+                # self._lock and targets the same resets_at event, so it can win
+                # the CAPPED->PROBING race while we awaited _run_probe above.
+                # Only CAPPED->PROBING is a legal edge here, so a raced-away
+                # phase (already PROBING/AVAILABLE/PROBE_IN_FLIGHT) makes the
+                # success block a pure no-op — mirrors the auth-reprobe guard in
+                # _reprobe_account. Without this guard _transition would raise
+                # IllegalTransitionError inside this fire-and-forget task. The
+                # confirmed probe still ends the loop either way (return below).
+                if acct.phase == AccountPhase.CAPPED:
+                    # Captured before _transition resets probe_count — the event
+                    # label below reports the probe number that confirmed.
+                    confirmed_probe_num = acct.probe_count
+                    # _transition owns: the phase write (-> PROBING, gate: let one
+                    # real task confirm first), near_cap clear, probe_count reset,
+                    # pause-time consumption into _total_pause_secs, and the
+                    # centralized _open recompute.
+                    self._transition(acct, AccountPhase.PROBING)
+                    logger.info(f'Account {acct.name} RESUMED (probe confirmed)')
+                    if self._cost_store:
+                        await self._write_cost_event(
+                            acct.name, 'resumed',
+                            json.dumps({'label': f'probe #{confirmed_probe_num} confirmed'}),
+                        )
                 return
             else:
                 logger.info(
@@ -981,20 +1270,18 @@ class UsageGate:
         # safety-margin implications — see
         # test_probe_prefix_only_without_confirm_keyword_still_returns_false.
         #
-        # Demote auth_failed → capped on cap-prefix:
-        # An auth_failed account whose reprobe shows a cap-prefix is a 429
-        # misclassification we now correct in-flight (the cap-retry path
-        # already routes 429 to _handle_cap_detected on the entry side; this
-        # closes the recovery gap for accounts marked auth_failed before that
-        # routing landed, and for any provider whose error body conflates
-        # auth + cap).
+        # Demote auth_failed → capped on cap-prefix: an auth_failed account
+        # whose reprobe shows a cap-prefix is a 429 misclassification we
+        # correct in-flight via the single legal AUTH_FAILED -> CAPPED edge
+        # (see _LEGAL_TRANSITIONS) rather than leaving it on the
+        # longer-cadence auth-reprobe loop.
         for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
             for prefix in prefixes:
                 if prefix.lower() in combined.lower():
                     logger.info(
                         f'Account {acct.name}: probe got cap message: {prefix}',
                     )
-                    if acct.auth_failed:
+                    if acct.phase == AccountPhase.AUTH_FAILED:
                         resets_at = _parse_resets_at(combined)
                         reason = (
                             _extract_cap_message(combined, prefix)
@@ -1004,27 +1291,30 @@ class UsageGate:
                             f'Account {acct.name}: auth-reprobe saw cap '
                             f'message — demoting auth_failed → capped'
                         )
-                        # Cancel the auth-reprobe task BEFORE _handle_cap_detected
-                        # so a stray reprobe iteration doesn't race the new
-                        # account-resume probe loop. The current call IS the
-                        # auth-reprobe loop; calling cancel() on its task will
-                        # take effect at the next suspension point.
+                        # Cancel + clear the stale auth-reprobe task now (the
+                        # current call IS that task; cancel() only takes
+                        # effect at its next suspension point, so the field
+                        # is cleared explicitly here rather than left to
+                        # settle asynchronously).
                         if (
                             acct.auth_reprobe_task is not None
                             and not acct.auth_reprobe_task.done()
                         ):
                             acct.auth_reprobe_task.cancel()
                         acct.auth_reprobe_task = None
-                        # _handle_cap_detected sets capped=True, clears
-                        # auth_failed implicitly via the all-blocked invariant
-                        # check (still-pending), fires the cost event, and
-                        # starts the account-resume probe loop. We clear
-                        # auth_failed here explicitly so the all-blocked
-                        # invariant doesn't double-flip (capped + auth_failed
-                        # would mis-render in the dashboard).
-                        acct.auth_failed = False
-                        acct.auth_failed_at = None
-                        self._handle_cap_detected(reason, resets_at, acct.token)
+                        # resets_at is persisted here (mirrors
+                        # _handle_cap_detected) — _transition only threads
+                        # resets_at into the cap_hit cost-event details, it
+                        # does not write acct.resets_at itself.
+                        acct.resets_at = resets_at
+                        # _transition owns: the phase write, clearing
+                        # auth_failed_at, starting the account-resume probe
+                        # loop, the cap_hit cost event, and the centralized
+                        # _open recompute.
+                        self._transition(
+                            acct, AccountPhase.CAPPED,
+                            resets_at=resets_at, reason=reason,
+                        )
                     return False
 
         if proc.returncode != 0:
@@ -1051,6 +1341,12 @@ class UsageGate:
 
     async def shutdown(self) -> None:
         """Cancel all resume probe tasks and drain in-flight background cost-event tasks."""
+        # Arm the B10 guard FIRST — before cancelling/draining anything —
+        # so a _transition racing this teardown (e.g. a probe or cost-event
+        # task completing concurrently) cannot start a new resume/reprobe
+        # task via _start_account_resume_probe/_start_auth_reprobe, which
+        # would otherwise leak a background task past shutdown.
+        self._shutting_down = True
         for acct in self._accounts:
             if acct.resume_task and not acct.resume_task.done():
                 acct.resume_task.cancel()
@@ -1170,11 +1466,11 @@ class UsageGate:
         # A successful invocation clears any stale near_cap flag; it will be
         # re-set on the next near-cap warning if still applicable.
         acct.near_cap = False
-        if acct.probe_in_flight:
-            acct.probe_in_flight = False
-            acct.probe_count = 0
+        if acct.phase == AccountPhase.PROBE_IN_FLIGHT:
             logger.info(f'Account {acct.name}: probe confirmed OK — opening to all tasks')
-            self._open.set()
+            # _transition owns: the phase write, probe_count reset, and the
+            # centralized _open recompute.
+            self._transition(acct, AccountPhase.AVAILABLE)
 
     def release_probe_slot(self, oauth_token: str | None) -> None:
         """Release a probe slot claimed by before_invoke() when invoke raises an exception.
@@ -1201,14 +1497,16 @@ class UsageGate:
         acct = self._find_account_by_token(oauth_token)
         if acct is None:
             return
-        if acct.probe_in_flight:
-            acct.probe_in_flight = False
-            acct.probe_count = 0
+        if acct.phase == AccountPhase.PROBE_IN_FLIGHT:
             logger.info(
                 f'Account {acct.name}: probe slot released after exception — '
                 f'opening to all tasks',
             )
-            self._open.set()
+            # _transition owns: the phase write, probe_count reset, and the
+            # centralized _open recompute. clear_near_cap=False preserves
+            # this method's documented "does NOT touch near_cap" contract —
+            # this is an exception path, orthogonal to cap status.
+            self._transition(acct, AccountPhase.AVAILABLE, clear_near_cap=False)
 
     @property
     def project_id(self) -> str | None:

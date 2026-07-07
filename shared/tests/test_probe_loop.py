@@ -401,6 +401,10 @@ class TestProbeLoopLifecycle:
 
         gate._run_probe = AsyncMock(return_value=True)
         gate._total_pause_secs = 0.0
+        # step-29/30: _total_pause_secs is gate-level-only. _capped_account
+        # builds CAPPED state without calling _transition, so the gate clock
+        # is never stamped — do it here to match the per-account backdate.
+        gate._pause_started_at = start_time
 
         await asyncio.wait_for(
             gate._account_resume_probe_loop(acct), timeout=5,

@@ -1335,6 +1335,10 @@ class TestRefreshCappedAccounts:
         gate._accounts[0].capped = True
         gate._accounts[0].resets_at = datetime.now(UTC) - timedelta(minutes=1)
         gate._accounts[0].pause_started_at = datetime.now(UTC) - timedelta(seconds=60)
+        # step-29/30: _total_pause_secs is gate-level-only. This CAPPED state
+        # is built by directly setting acct.capped (bypassing _transition), so
+        # stamp the gate clock too to match the per-account backdate.
+        gate._pause_started_at = datetime.now(UTC) - timedelta(seconds=60)
         await gate._refresh_capped_accounts()
         assert gate._total_pause_secs == pytest.approx(60, abs=2)
 

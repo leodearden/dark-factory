@@ -408,6 +408,10 @@ class TestRefreshVsProbeRace:
         acct.capped = True
         start_time = datetime.now(UTC) - timedelta(minutes=10)
         acct.pause_started_at = start_time
+        # step-29/30: _total_pause_secs is gate-level-only, fed solely by the
+        # gate clock. This CAPPED state is built by directly setting
+        # acct.capped (bypassing _transition), so stamp the gate clock too.
+        gate._pause_started_at = start_time
         acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
 
         initial_pause = gate._total_pause_secs
