@@ -157,3 +157,37 @@ def disposition_for(target_graph: str | None, present_in_target: bool) -> str:
     if present_in_target:
         return MERGE
     return MOVE
+
+
+def build_manifest(
+    classified_nodes: list[dict],
+    census_counts: dict[str, int],
+    *,
+    dry_run: bool,
+    alias_map: dict[str, str] = ALIAS_MAP,
+) -> dict:
+    """Assemble the migration manifest dict from already-classified inputs. No I/O.
+
+    The manifest IS the recovery record (see module docstring): it echoes
+    *alias_map* (so a human reviewer sees exactly which mapping produced
+    each MOVE/MERGE target), the per-graph *census_counts*, every classified
+    node record verbatim, summary tallies, and the uuids of any UNRESOLVED
+    node (which block --apply for that node only).
+    """
+    summary = {MOVE: 0, MERGE: 0, UNRESOLVED: 0}
+    unresolved_uuids: list[str] = []
+    for node in classified_nodes:
+        disposition = node['disposition']
+        summary[disposition] = summary.get(disposition, 0) + 1
+        if disposition == UNRESOLVED:
+            unresolved_uuids.append(node['uuid'])
+    summary['total'] = len(classified_nodes)
+
+    return {
+        'dry_run': dry_run,
+        'alias_map': dict(alias_map),
+        'nodes': list(classified_nodes),
+        'census': dict(census_counts),
+        'summary': summary,
+        'unresolved_uuids': unresolved_uuids,
+    }
