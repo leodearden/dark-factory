@@ -66,6 +66,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
+# value was discarded — parse_metadata could not resolve any dict at all.
+# Only these are loud from the done-provenance rejection check below;
+# 'unknown_key' / 'invalid_field' / 'invalid_submodel' etc. are expected on
+# legitimate metadata shapes and belong to the write boundary (W3-β's
+# _emit_schema_warning census), not this read-path guard.
+_METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
+
 # ---------------------------------------------------------------------------
 # Scheduler-override constants
 #
@@ -2489,15 +2497,34 @@ def create_mcp_server(
         ``update_task`` to write the field bypasses that gate, which is how
         a workflow agent stamped a self-contradicting "done" record on
         2026-04-27. Reject the call before it reaches the interceptor.
+
+        The ``str`` branch delegates its malformed-input policy to
+        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
+        and emits a ``task_metadata.schema_warning`` WARNING when *metadata*
+        cannot be resolved to a JSON object at all (unparseable JSON /
+        non-object) — I4: this replaces a silent discard. The
+        done_provenance gate and the dict-passthrough branch are unchanged.
         """
         parsed: dict | None = None
         if isinstance(metadata, dict):
             parsed = metadata
         elif isinstance(metadata, str):
-            try:
-                loaded = json.loads(metadata)
-            except (ValueError, TypeError):
+            _, warnings = parse_metadata(metadata, direction='read')
+            discard = [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
+            if discard:
+                reason = '; '.join(w.message for w in discard) or 'unrecognised shape'
+                logger.warning(
+                    'task_metadata.schema_warning source=%s error=%s (type=%s); '
+                    'metadata discarded',
+                    '_reject_done_provenance_in_metadata',
+                    reason,
+                    type(metadata).__name__,
+                )
                 return None
+            # parse_metadata already confirmed this parses to a JSON object —
+            # reparse independently for the raw dict (never model_dump(), so
+            # this stays consistent with the other collapsed parsers).
+            loaded = json.loads(metadata)
             parsed = loaded if isinstance(loaded, dict) else None
         if parsed is not None and 'done_provenance' in parsed:
             return {
