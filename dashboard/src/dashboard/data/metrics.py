@@ -29,6 +29,7 @@ from dashboard.data.cap_history import (
     compute_overlap_ms,
     read_cap_intervals,
 )
+from dashboard.data.mcp_fanout import first_success
 from dashboard.data.memory import (
     get_curator_state,
     get_memory_status,
@@ -98,11 +99,14 @@ async def fan_out_list_tickets(
     async def _fan_out_one_root(root_str: str) -> tuple[int, list[dict]]:
         """Query list_tickets for *root_str* across all configured URLs.
 
-        URLs are tried sequentially; the first success returns immediately
-        (equivalent to ``break`` in the outer URL loop) to avoid double-counting.
-        Returns ``(count, tickets_with_project_id)`` or ``(0, [])`` if every URL fails.
+        Delegates the per-URL failover to ``mcp_fanout.first_success``: URLs
+        are tried sequentially and the first success wins (avoiding double-
+        counting); on any failure the failing URL's cached MCP session is
+        invalidated and the next URL is tried.  Returns ``(count,
+        tickets_with_project_id)`` or ``(0, [])`` if every URL fails.
         """
-        for url in config.fused_memory_urls:
+
+        async def _call(url: str) -> tuple[int, list[dict]]:
             try:
                 result = await asyncio.wait_for(
                     mcp_tool_call(
@@ -125,8 +129,10 @@ async def fan_out_list_tickets(
                         root_str,
                     )
                 project_id = result.get('project_id', '')
-                root_tickets = [{**r, 'project_id': project_id} for r in result.get('tickets', [])]
-                return count, root_tickets  # first success wins; skip remaining URLs
+                root_tickets = [
+                    {**r, 'project_id': project_id} for r in result.get('tickets', [])
+                ]
+                return count, root_tickets
             except TimeoutError:
                 logger.warning(
                     'list_tickets timed out for project_root=%s url=%s after %.1fs',
@@ -134,6 +140,7 @@ async def fan_out_list_tickets(
                     url,
                     timeout,
                 )
+                raise ValueError('timeout') from None
             except (httpx.HTTPError, ValueError):
                 logger.debug(
                     'list_tickets failed for %s / %s',
@@ -141,14 +148,27 @@ async def fan_out_list_tickets(
                     root_str,
                     exc_info=True,
                 )
+                raise ValueError('http') from None
             except Exception:
+                # Also catches a buggy/older MCP server returning a non-dict
+                # (list/None) for list_tickets: result.get(...) above raises
+                # AttributeError, which must be caught HERE (inside the try)
+                # so it is normalized to ValueError and first_success falls
+                # through to the next URL instead of the whole root aborting.
                 logger.warning(
                     'list_tickets unexpected error for %s / %s',
                     url,
                     root_str,
                     exc_info=True,
                 )
-        return 0, []
+                raise ValueError('unexpected') from None
+
+        return await first_success(
+            config.fused_memory_urls,
+            _call,
+            log_label='list_tickets',
+            offline_result=lambda errs: (0, []),
+        )
 
     raw_results = await asyncio.gather(
         *(_fan_out_one_root(r) for r in all_roots), return_exceptions=True

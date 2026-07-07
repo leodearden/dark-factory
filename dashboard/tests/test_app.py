@@ -574,6 +574,67 @@ def test_load_task_cards_ttl_expiry(client, tmp_path):
     )
 
 
+# ---------------------------------------------------------------------------
+# task-2218 step-9: _load_task_cards single-flight (direct calls, no endpoint)
+# ---------------------------------------------------------------------------
+
+
+async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
+    dummy_client, dummy_config
+):
+    """Concurrent cold callers for one project_root collapse onto one fetch_tasks call.
+
+    Case 1: three concurrent asyncio tasks hitting a cold cache for the same
+    project_root must share a single in-flight fetch_tasks call and all
+    receive the same result (TTLCache single-flight — the plain-dict cache
+    this replaces has no refresh lock, so today each of the three fetches).
+
+    Case 2 (reuse of existing behavior): an offline dict result from
+    fetch_tasks is never cached, so each direct call re-fetches.
+    """
+    import asyncio
+
+    from dashboard.app import _load_task_cards, _task_cards_cache_clear
+
+    # Case 1: single-flight collapse
+    _task_cards_cache_clear()
+    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '',
+                  'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}]
+    started = asyncio.Event()
+    release = asyncio.Event()
+    call_count = 0
+
+    async def slow_fetch_tasks(client, config, project_root):
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        await release.wait()
+        return list(task_list)
+
+    with patch('dashboard.app.fetch_tasks', new=AsyncMock(side_effect=slow_fetch_tasks)):
+        tasks = [
+            asyncio.create_task(_load_task_cards(dummy_client, dummy_config, '/proj/X'))
+            for _ in range(3)
+        ]
+        await started.wait()
+        await asyncio.sleep(0)  # let the other two queue on the lock
+        release.set()
+        results = await asyncio.gather(*tasks)
+
+    assert call_count == 1, f'expected a single fetch_tasks call, got {call_count}'
+    assert all(r == task_list for r in results)
+
+    # Case 2: offline result NOT cached — each direct call re-fetches.
+    _task_cards_cache_clear()
+    mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
+    with patch('dashboard.app.fetch_tasks', new=mock_offline):
+        r1 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
+        r2 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
+
+    assert r1 == [] and r2 == []
+    assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
+
+
 def test_escalations_endpoint_multi_root_gather(client, tmp_path):
     """Endpoint fetches each orchestrator root separately and maps tasks to the right subsection."""
     from dashboard.app import _task_cards_cache_clear

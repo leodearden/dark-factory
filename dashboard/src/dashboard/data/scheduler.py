@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -52,7 +51,8 @@ from shared.locking import files_to_modules, modules_conflict
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import _all_project_roots, _project_label, collect_active_tasks
-from dashboard.data.memory import invalidate_session, mcp_tool_call
+from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.memory import mcp_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -78,25 +78,24 @@ _SCHEDULER_TTL_SECONDS: float = 5.0
 # ever changes (mirrors the producer→reader hardening from task-1188).
 # 200 matches the current effective cap so no sparkline data is lost.
 _SCHEDULER_EVENTS_LIMIT: int = 200
-# Cache entry: (monotonic_ts: float, six_tuple: tuple, snapshot_at: str) | None
-_scheduler_cache: tuple[float, tuple, str] | None = None
-# Single-flight lock: only one cold-cache caller runs the collection;
-# waiters re-check the cache after acquiring the lock and return early if
-# another waiter already filled it (double-checked locking pattern).
-_scheduler_refresh_lock: asyncio.Lock = asyncio.Lock()
+# Constant cache key — the cache holds exactly one entry (see the
+# single-config assumption in get_scheduler_snapshot's docstring below).
+_SCHEDULER_CACHE_KEY = 'scheduler'
+_scheduler_cache: TTLCache[tuple[tuple, str]] = TTLCache(
+    ttl_seconds=lambda: _SCHEDULER_TTL_SECONDS
+)
 
 
 def _scheduler_cache_clear() -> None:
-    """Clear the scheduler snapshot TTL cache and reset the refresh lock.
+    """Clear the scheduler snapshot TTL cache and reset its refresh lock.
 
-    Test/admin hook.  Resetting the Lock creates a fresh instance bound to
-    no event loop, preventing "got Future attached to a different loop" when
-    pytest-asyncio's function-scoped loops reuse the module-level Lock across
-    successive test functions.
+    Test/admin hook.  Delegates to ``TTLCache.clear()``, which resets both
+    the stored entry and the per-key ``asyncio.Lock`` — preventing "got
+    Future attached to a different loop" when pytest-asyncio's
+    function-scoped loops reuse the module-level cache across successive
+    test functions.
     """
-    global _scheduler_cache, _scheduler_refresh_lock
-    _scheduler_cache = None
-    _scheduler_refresh_lock = asyncio.Lock()
+    _scheduler_cache.clear()
 
 
 async def get_scheduler_snapshot(
@@ -112,34 +111,25 @@ async def get_scheduler_snapshot(
 
     Single-flight: when the cache is cold, only the first concurrent caller
     runs the collection; others await the lock and then return from the
-    freshly-filled cache (double-checked locking).
+    freshly-filled cache (double-checked locking, via
+    ``TTLCache.get_or_refresh``).
 
     ``snapshot_at`` is an ISO-8601 wall-clock string stamped at cache-fill
-    time.  The value propagates through ``api_scheduler`` → ``shape_scheduler``
-    → the JS envelope so the UI can show a truthful "data as of" timestamp.
+    time, inside ``_refresh`` — so every concurrent cold caller that
+    collapses onto the same in-flight refresh receives an identical
+    ``snapshot_at``.  The value propagates through ``api_scheduler`` →
+    ``shape_scheduler`` → the JS envelope so the UI can show a truthful
+    "data as of" timestamp.
 
-    Single-config assumption: the cache is unkeyed (ignores ``client`` and
-    ``config``).  This is correct for the dashboard process, which is always
-    started with a single process-wide :class:`DashboardConfig`.  If the
-    process ever served multiple configs (multi-tenant), callers with a
-    different ``config`` would silently receive another config's snapshot.
+    Single-config assumption: the cache is keyed by the constant
+    ``_SCHEDULER_CACHE_KEY``, ignoring ``client`` and ``config``.  This is
+    correct for the dashboard process, which is always started with a single
+    process-wide :class:`DashboardConfig`.  If the process ever served
+    multiple configs (multi-tenant), callers with a different ``config``
+    would silently receive another config's snapshot.
     """
-    global _scheduler_cache  # must precede first use of the name
 
-    # Fast path — no lock needed for a warm cache hit.
-    now = time.monotonic()
-    cached = _scheduler_cache
-    if cached is not None and (now - cached[0]) < _SCHEDULER_TTL_SECONDS:
-        return cached[1], cached[2]
-
-    # Slow path — acquire the lock; re-check after acquiring (double-check).
-    async with _scheduler_refresh_lock:
-        now = time.monotonic()
-        cached = _scheduler_cache
-        if cached is not None and (now - cached[0]) < _SCHEDULER_TTL_SECONDS:
-            return cached[1], cached[2]
-
-        # We are the one caller responsible for filling the cache.
+    async def _refresh() -> tuple[tuple, str]:
         # collect_scheduler_state never raises (per-project errors surface as
         # offline_projects), so we always cache the result — even a degraded
         # snapshot where some projects are offline.  Caching a partial result
@@ -147,8 +137,9 @@ async def get_scheduler_snapshot(
         # same offline state again; ≤5 s of stale-offline is acceptable.
         six_tuple = await collect_scheduler_state(client, config)
         snapshot_at = datetime.now(UTC).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
-        _scheduler_cache = (time.monotonic(), six_tuple, snapshot_at)
         return six_tuple, snapshot_at
+
+    return await _scheduler_cache.get_or_refresh(_SCHEDULER_CACHE_KEY, _refresh)
 
 
 # ---------------------------------------------------------------------------
@@ -602,15 +593,18 @@ async def collect_scheduler_state(
     async def _one_project(root) -> tuple[str, dict | None, list[dict]]:
         """Fetch snapshot + events for one project root.
 
-        URLs are tried sequentially (first-success wins).  On success the
-        function returns immediately from inside the ``try`` block, so there is
-        no risk of bleed between a partial success on url1 and a failure on url2.
+        Delegates the per-URL failover to ``mcp_fanout.first_success``: URLs
+        are tried sequentially and the first success wins; on a transport
+        error or soft failure the failing URL's cached MCP session is
+        invalidated and the next URL is tried.
 
         Simplicity trade-off: if the snapshot call succeeds on url1 but the
         events call raises, the whole pair is re-issued against url2 rather
-        than retrying only the events leg.  This amplifies load slightly on
-        the surviving URL but keeps the retry logic single-axis; both calls
-        are idempotent and small, so the re-fetch is cheap.
+        than retrying only the events leg — both calls live inside one
+        ``_call(url)`` coroutine, so a failure anywhere in it re-runs both on
+        the next URL.  This amplifies load slightly on the surviving URL but
+        keeps the retry logic single-axis; both calls are idempotent and
+        small, so the re-fetch is cheap.
 
         Returns ``(label, snapshot, events)`` on success — ``snapshot`` may be
         ``{}`` for a project with no scheduler state yet (online but empty),
@@ -622,49 +616,45 @@ async def collect_scheduler_state(
         """
         label = _project_label(root)
 
-        for url in config.fused_memory_urls:
-            try:
-                snapshot = await mcp_tool_call(
-                    client,
-                    url,
-                    'get_scheduler_state',
-                    {'project_root': str(root)},
-                )
-                # Normalise: a buggy/older MCP server returning a list or
-                # None must not propagate as AttributeError on downstream
-                # `.get(...)` calls.  Treat as online-but-empty.
-                if not isinstance(snapshot, dict):
-                    snapshot = {}
-                events_raw = await mcp_tool_call(
-                    client,
-                    url,
-                    'get_scheduler_events',
-                    {
-                        'project_root': str(root),
-                        'since': since.isoformat(),
-                        'event_types': ['task_skipped'],
-                        'limit': _SCHEDULER_EVENTS_LIMIT,
-                    },
-                )
-                if isinstance(events_raw, list):
-                    events: list[dict] = events_raw
-                elif isinstance(events_raw, dict):
-                    # events may be wrapped: {'events': [...]}
-                    events = events_raw.get('events') or []
-                else:
-                    events = []
-                return label, snapshot, events  # first-success wins
-            except (
-                httpx.ConnectError,
-                httpx.TimeoutException,
-                httpx.HTTPStatusError,
-                ValueError,
-            ) as exc:
-                logger.debug('get_scheduler_state failed for %s / %s: %s', label, url, exc)
-                invalidate_session(url)
-                continue
+        async def _call(url: str) -> tuple[dict, list[dict]]:
+            snapshot = await mcp_tool_call(
+                client,
+                url,
+                'get_scheduler_state',
+                {'project_root': str(root)},
+            )
+            # Normalise: a buggy/older MCP server returning a list or
+            # None must not propagate as AttributeError on downstream
+            # `.get(...)` calls.  Treat as online-but-empty.
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            events_raw = await mcp_tool_call(
+                client,
+                url,
+                'get_scheduler_events',
+                {
+                    'project_root': str(root),
+                    'since': since.isoformat(),
+                    'event_types': ['task_skipped'],
+                    'limit': _SCHEDULER_EVENTS_LIMIT,
+                },
+            )
+            if isinstance(events_raw, list):
+                events: list[dict] = events_raw
+            elif isinstance(events_raw, dict):
+                # events may be wrapped: {'events': [...]}
+                events = events_raw.get('events') or []
+            else:
+                events = []
+            return snapshot, events
 
-        return label, None, []  # all URLs failed; None signals offline
+        snapshot, events = await first_success(
+            config.fused_memory_urls,
+            _call,
+            log_label=f'get_scheduler_state[{label}]',
+            offline_result=lambda errs: (None, []),
+        )
+        return label, snapshot, events
 
     # Build a label→root map for O(1) lookup after asyncio.gather.
     # (A linear next(...) search over roots_to_query would be O(n²) in the

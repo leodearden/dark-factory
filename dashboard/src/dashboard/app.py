@@ -61,6 +61,7 @@ from dashboard.data.costs import (
 from dashboard.data.db import DbPool
 from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.load import get_load_metrics
+from dashboard.data.mcp_fanout import TTLCache, first_success
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
@@ -137,7 +138,9 @@ def _parse_window(query_params: Mapping[str, str], default: int = 30) -> int:
 # ---------------------------------------------------------------------------
 
 _TASK_CARDS_TTL_SECONDS = 10.0
-_task_cards_cache: dict[str, tuple[float, list[dict]]] = {}
+_task_cards_cache: TTLCache[list[dict] | dict] = TTLCache(
+    ttl_seconds=lambda: _TASK_CARDS_TTL_SECONDS
+)
 
 
 def _task_cards_cache_clear() -> None:
@@ -156,21 +159,20 @@ async def _load_task_cards(
     to avoid hammering the MCP server on every dashboard poll.  An offline
     marker or MCP failure returns ``[]`` WITHOUT writing to the cache, so a
     transient blip doesn't pin empty results for the full TTL window.
+    Concurrent cold callers for the same project_root collapse onto one
+    in-flight fetch_tasks call (TTLCache single-flight).
 
     Test hook: call ``_task_cards_cache_clear()`` to reset cache state between
     test cases.
     """
-    now = time.monotonic()
-    cached = _task_cards_cache.get(project_root)
-    if cached is not None and (now - cached[0]) < _TASK_CARDS_TTL_SECONDS:
-        return list(cached[1])
 
-    fetched = await fetch_tasks(client, config, project_root)
-    if not isinstance(fetched, list):
-        # Offline or MCP failure — degrade gracefully, do NOT cache.
-        return []
-    _task_cards_cache[project_root] = (now, fetched)
-    return list(fetched)
+    async def _refresh() -> list[dict] | dict:
+        return await fetch_tasks(client, config, project_root)
+
+    result = await _task_cards_cache.get_or_refresh(
+        project_root, _refresh, cache_ok=lambda v: isinstance(v, list),
+    )
+    return list(result) if isinstance(result, list) else []
 
 
 # ---------------------------------------------------------------------------
@@ -797,7 +799,7 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
 
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    errors: list[str] = []
+
     # Single-Homed Ticket Invariant: each ticket lives on exactly one
     # fused-memory instance, enforced at two independent levels:
     #   • OS-wide singleton lock — fused-memory/src/fused_memory/server/
@@ -818,7 +820,7 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     # If a future infra change introduces ticket replication or multi-region
     # deployment, this assumption must be re-evaluated and the loop relaxed to
     # fan-out-then-quorum.
-    for url in config.fused_memory_urls:
+    async def _call(url: str) -> JSONResponse:
         try:
             result = await memory_data.mcp_tool_call(
                 http_client,
@@ -833,19 +835,21 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
             ValueError,
         ) as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
-            errors.append(
-                f'{url}: {type(exc).__name__}: {str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
-            )
-            # Invalidate the cached MCP session so the next caller retries
-            # session initialisation — mirrors get_memory_status/get_queue_stats.
-            memory_data.invalidate_session(url)
-            continue
+            raise ValueError(
+                f'{type(exc).__name__}: {str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
+            ) from exc
         if result.get('error') == 'not_found':
             return JSONResponse(result, status_code=404)
         return JSONResponse(result)
-    return JSONResponse(
-        {'error': 'fused_memory_unreachable', 'detail': '; '.join(errors)},
-        status_code=502,
+
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label='cancel_ticket',
+        offline_result=lambda errs: JSONResponse(
+            {'error': 'fused_memory_unreachable', 'detail': '; '.join(errs)},
+            status_code=502,
+        ),
     )
 
 
@@ -1040,8 +1044,8 @@ async def _scheduler_proxy(
     this helper is responsible only for the fan-out, transport error handling,
     and status-code mapping (502 when all URLs fail, optional 404 on not_found).
     """
-    errors: list[str] = []
-    for url in config.fused_memory_urls:
+
+    async def _call(url: str) -> JSONResponse:
         try:
             result = await memory_data.mcp_tool_call(http_client, url, tool_name, args)
         except (
@@ -1051,9 +1055,7 @@ async def _scheduler_proxy(
             ValueError,
         ) as exc:
             logger.warning('%s failed for %s: %s', tool_name, url, exc)
-            errors.append(f'{url}: {str(exc)[:200]}')
-            memory_data.invalidate_session(url)
-            continue
+            raise ValueError(str(exc)[:200]) from exc
         # Guard the not_found mapping with isinstance: an MCP tool that
         # returns a list or None (buggy/older server) would AttributeError
         # on `.get(...)` and escape as a 500.  Defensive at the single
@@ -1065,7 +1067,10 @@ async def _scheduler_proxy(
         ):
             return JSONResponse(result, status_code=404)
         return JSONResponse(result)
-    return _sched_fan_out_error(errors)
+
+    return await first_success(
+        config.fused_memory_urls, _call, log_label=tool_name, offline_result=_sched_fan_out_error,
+    )
 
 
 @app.post('/api/v2/dashboard/scheduler/override')

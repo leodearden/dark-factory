@@ -1548,6 +1548,50 @@ class TestLoadTaskTitles:
         second = await load_task_titles(client=dummy_client, config=dummy_config, project_root='/proj/H')
         assert second == {'1': 'A'}
 
+    async def test_load_task_titles_single_flight_collapses_concurrent_cold_callers(
+        self, dummy_client, dummy_config
+    ):
+        """Concurrent cold callers for one project_root collapse onto one fetch_tasks call.
+
+        Regression guard ahead of routing ``_task_titles_cache`` onto
+        ``mcp_fanout.TTLCache`` (task 2218 step-12): the plain-dict cache has
+        no refresh lock, so today each of three concurrent callers on a cold
+        cache runs its own ``fetch_tasks`` call (RED — call_count == 3).
+        """
+        import asyncio
+
+        import dashboard.data.merge_queue as _mq
+
+        _mq._task_titles_cache_clear()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        call_count = 0
+
+        async def slow_fetch_tasks(client, config, project_root):
+            nonlocal call_count
+            call_count += 1
+            started.set()
+            await release.wait()
+            return [{'id': 1, 'title': 'A'}]
+
+        with patch('dashboard.data.merge_queue.fetch_tasks', new=slow_fetch_tasks):
+            tasks = [
+                asyncio.create_task(
+                    _mq.load_task_titles(
+                        client=dummy_client, config=dummy_config, project_root='/proj/SF'
+                    )
+                )
+                for _ in range(3)
+            ]
+            await started.wait()
+            await asyncio.sleep(0)  # let the other two queue on the lock
+            release.set()
+            results = await asyncio.gather(*tasks)
+
+        assert call_count == 1, f'expected a single fetch_tasks call, got {call_count}'
+        assert all(r == {'1': 'A'} for r in results)
+
 
 # ---------------------------------------------------------------------------
 # TestBuildPerProjectMergeQueue (step-9)

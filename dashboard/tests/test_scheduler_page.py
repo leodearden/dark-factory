@@ -411,6 +411,148 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
 
 
 # ---------------------------------------------------------------------------
+# task-2218 step-3: guard the first_success + whole-pair-retry + None-sentinel
+# contract that the upcoming _one_project -> first_success conversion must
+# preserve.
+# ---------------------------------------------------------------------------
+
+
+async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_events_fail(
+    dummy_client, two_url_config
+):
+    """A mid-pair failure on url1 re-issues BOTH calls on url2, not just events.
+
+    url1's get_scheduler_state succeeds but get_scheduler_events raises; the
+    whole (state, events) pair is then re-issued against url2 rather than
+    reusing url1's already-successful snapshot. Distinguishes the two URLs'
+    snapshots (skip_counts 99 vs 7) so a stray use of url1's snapshot would
+    be caught, and asserts get_scheduler_state is called again on url2
+    (total 2 calls) rather than only retrying the events leg (which would
+    be 1 state call + 2 events calls).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import httpx
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = two_url_config.project_root.name
+    url1, url2 = two_url_config.fused_memory_urls
+    calls: list[tuple[str, str]] = []
+    # Comfortably inside collect_scheduler_state's [since, now) ~1h window
+    # (since = now - 1h at call time) — avoids the edge-of-window flakiness
+    # of stamping the event at exactly "now".
+    event_ts = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()  # clock-exempt: test fixture
+
+    async def mcp_side_effect(_client, url, tool_name, _args):
+        calls.append((url, tool_name))
+        if url == url1:
+            if tool_name == 'get_scheduler_state':
+                return _scheduler_snapshot(skip_counts={'1': 99})
+            raise httpx.ConnectError('refused')  # get_scheduler_events fails
+        # url2 — both calls succeed
+        if tool_name == 'get_scheduler_state':
+            return _scheduler_snapshot(skip_counts={'1': 7})
+        return [{
+            'event_type': 'task_skipped',
+            'task_id': '1',
+            'timestamp': event_ts,
+        }]
+
+    active_tasks = [
+        {
+            'id': f'{project}/T-1',
+            'project': project,
+            'title': 'Task One',
+            'priority': 'medium',
+            'status': 'in-progress',
+            'started': 5,
+            'meta_files': [],
+        }
+    ]
+    mock_active = AsyncMock(return_value=(active_tasks, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mcp_side_effect),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        rows, _modules, _pin_queue, events_by_task, offline_projects, _paused = \
+            await collect_scheduler_state(dummy_client, two_url_config)
+
+    assert project not in offline_projects
+    assert len(rows) == 1
+    assert rows[0]['skip_count'] == 7, (
+        'row must reflect url2 snapshot (7) — a stray url1 value (99) means '
+        'the pair was not fully re-issued on url2'
+    )
+
+    composite_key = f'{project}/1'
+    assert composite_key in events_by_task
+    assert sum(events_by_task[composite_key]['values']) == 1
+
+    state_calls = [c for c in calls if c[1] == 'get_scheduler_state']
+    events_calls = [c for c in calls if c[1] == 'get_scheduler_events']
+    assert len(state_calls) == 2, (
+        'get_scheduler_state must be re-issued on url2, not reused from url1'
+    )
+    assert len(events_calls) == 2
+    assert [c[0] for c in calls] == [url1, url1, url2, url2]
+
+
+async def test_collect_scheduler_state_all_urls_fail_marks_project_offline(
+    dummy_client, two_url_config
+):
+    """Every configured URL failing (not just the first) still lands offline.
+
+    Complements test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable
+    (a single-URL config, where "every URL fails" is trivially just one URL)
+    by using two_url_config to pin that first_success actually exhausts BOTH
+    URLs before falling through to the None sentinel -> offline_projects.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    import httpx
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = two_url_config.project_root.name
+    calls: list[str] = []
+
+    async def mcp_side_effect(_client, url, _tool_name, _args):
+        calls.append(url)
+        raise httpx.ConnectError('refused')
+
+    active_tasks = [
+        {
+            'id': f'{project}/T-1',
+            'project': project,
+            'title': 'Task One',
+            'priority': 'medium',
+            'status': 'in-progress',
+            'started': 5,
+            'meta_files': [],
+        }
+    ]
+    mock_active = AsyncMock(return_value=(active_tasks, []))
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mcp_side_effect),
+        patch('dashboard.data.scheduler.collect_active_tasks', mock_active),
+    ):
+        rows, modules, pin_queue, events_by_task, offline_projects, _paused = \
+            await collect_scheduler_state(dummy_client, two_url_config)
+
+    assert offline_projects == [project]
+    assert rows == []
+    assert modules == []
+    assert pin_queue == []
+    assert events_by_task == {}
+    assert set(calls) == set(two_url_config.fused_memory_urls), (
+        'both urls must be attempted before the project is marked offline'
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-1370-5: collect_scheduler_state surfaces paused_projects
 # ---------------------------------------------------------------------------
 
@@ -804,6 +946,94 @@ async def test_get_scheduler_snapshot_single_flight_collapses_concurrent_misses(
     snapshot_ats = [r[1] for r in results]
     assert len(set(snapshot_ats)) == 1, (
         f'all callers must receive the same snapshot_at, got {snapshot_ats}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task-2218 step-5: guard the TTLCache swap — hooks (_scheduler_cache_clear,
+# runtime-monkeypatchable _SCHEDULER_TTL_SECONDS) and single-flight must
+# survive get_scheduler_snapshot's cache moving onto mcp_fanout.TTLCache.
+# ---------------------------------------------------------------------------
+
+
+async def test_get_scheduler_snapshot_ttlcache_preserves_hooks_and_single_flight(
+    dummy_client, dummy_config, monkeypatch
+):
+    """One test exercising all three TTLCache-backed seams together.
+
+    (a) Within TTL: two sequential calls invoke the collector once and return
+        an identical (six_tuple, snapshot_at) pair.
+    (b) After _scheduler_cache_clear() + monkeypatching _SCHEDULER_TTL_SECONDS
+        to 0.0: two calls each invoke the collector (the callable/monkeypatched
+        TTL must still be honored, not a value captured once at construction).
+    (c) After _scheduler_cache_clear() + TTL 9999.0: three concurrent callers
+        on a cold cache (gated by an asyncio.Event) collapse onto exactly one
+        collector invocation and all three receive the same snapshot_at
+        (single-flight is preserved by TTLCache.get_or_refresh).
+
+    Complements (rather than replaces) the pre-existing dedicated cache and
+    single-flight tests above — this test's job is specifically to guard that
+    swapping the hand-rolled double-checked-locking implementation for
+    mcp_fanout.TTLCache doesn't silently drop any of these three seams.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    import dashboard.data.scheduler as sched
+
+    empty_6tuple = ([], [], [], {}, [], [])
+
+    # (a) within TTL
+    sched._scheduler_cache_clear()
+    mock_collector_a = AsyncMock(return_value=empty_6tuple)
+    with patch('dashboard.data.scheduler.collect_scheduler_state', new=mock_collector_a):
+        result1 = await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+        result2 = await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+
+    assert mock_collector_a.call_count == 1
+    assert result1 == result2
+    assert result1[1] is not None
+
+    # (b) TTL=0.0 monkeypatch — still honored after clear
+    sched._scheduler_cache_clear()
+    monkeypatch.setattr(sched, '_SCHEDULER_TTL_SECONDS', 0.0)
+    mock_collector_b = AsyncMock(return_value=empty_6tuple)
+    with patch('dashboard.data.scheduler.collect_scheduler_state', new=mock_collector_b):
+        await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+        await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+
+    assert mock_collector_b.call_count == 2, (
+        'callable/monkeypatched TTL=0.0 must force a re-fetch on every call'
+    )
+
+    # (c) single-flight on a cold cache with TTL restored to a large value
+    sched._scheduler_cache_clear()
+    monkeypatch.setattr(sched, '_SCHEDULER_TTL_SECONDS', 9999.0)
+    counter = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_collector(_client, _config):
+        nonlocal counter
+        counter += 1
+        started.set()
+        await release.wait()
+        return empty_6tuple
+
+    with patch('dashboard.data.scheduler.collect_scheduler_state', side_effect=slow_collector):
+        tasks = [
+            asyncio.create_task(sched.get_scheduler_snapshot(dummy_client, dummy_config))
+            for _ in range(3)
+        ]
+        await started.wait()
+        await asyncio.sleep(0)  # yield so the other two callers queue up
+        release.set()
+        results = await asyncio.gather(*tasks)
+
+    assert counter == 1, f'expected a single underlying collection, got counter={counter}'
+    snapshot_ats = [r[1] for r in results]
+    assert len(set(snapshot_ats)) == 1, (
+        f'all concurrent cold callers must receive the same snapshot_at, got {snapshot_ats}'
     )
 
 
