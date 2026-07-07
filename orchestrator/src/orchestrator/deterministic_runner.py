@@ -188,10 +188,17 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     the 1902/1976/1982 permanently-blocked self-restart failure mode (a
     ``kind`` fused-memory silently rejects).
 
-    ``exclude_none=True`` keeps the emitted wire dict byte-compatible with
-    the hand-written literals this replaces (they never carried explicit
-    ``None`` values either); extra fields such as ``transient_unit`` /
-    ``fire_delay_secs`` survive via ``DoneProvenance``'s ``extra='allow'``.
+    ``exclude_none=True`` keeps the emitted wire dict compatible with the
+    hand-written literals this replaces for every key that carries a
+    non-``None`` value (they never carried explicit ``None`` values either).
+    One path diverges: the crash-resume call at ``before_done_verified_pid``
+    used to always emit a ``pid`` key (``None`` when that metadata field was
+    absent), whereas ``exclude_none`` now omits the key entirely in that
+    case.  All known consumers (``task_interceptor.py`` and this module's
+    tests) read it via ``.get('pid')``, so a missing key and an explicit
+    ``None`` are observationally identical there; extra fields such as
+    ``transient_unit`` / ``fire_delay_secs`` survive via ``DoneProvenance``'s
+    ``extra='allow'``.
 
     ``kind``/``**fields`` are intentionally loosely typed (``str``/``object``):
     the six call sites forward heterogeneous field subsets, so pyright's
