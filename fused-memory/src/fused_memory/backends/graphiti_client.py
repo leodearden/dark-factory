@@ -2194,3 +2194,11 @@ class GraphitiBackend:
                 await self._driver.close()
         self.client = None
         self._driver = None
+        # Per-group clients each hold a driver that aliases an entry already
+        # closed above via the _cloned_drivers loop (or self._driver itself) —
+        # drop the references only; do NOT call .close() per-client, which
+        # would double-close the single shared FalkorDB connection.
+        self._group_clients.clear()
+        self._llm_client = None
+        self._embedder = None
+        self._cross_encoder = None
