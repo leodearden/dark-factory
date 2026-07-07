@@ -1737,6 +1737,21 @@ class GitOps:
             cwd=self.project_root,
         )
         if rc == 0:
+            # ── γ reattach guard (cold path) ──────────────────────────────
+            # Mirrors acquire_warm_lane's create-once γ reattach site: if the
+            # leftover branch's worktree dir is gone (e.g. the stranded-in-
+            # progress reconciler's stale-lock path reaped it via
+            # cleanup_worktree, which retains a branch carrying commits
+            # beyond main) AND the branch still carries commits beyond main,
+            # re-attach and resume it instead of raising via
+            # _cleanup_leftover_branch. _orphan_has_commits is existence-
+            # gated (False for a nonexistent/zero-commit branch), so brand-
+            # new task ids fall through to _cleanup_leftover_branch /
+            # fresh-create unchanged.
+            if not worktree_path.exists() and await self._orphan_has_commits(full_branch):
+                return await self._reattach_cold_worktree(
+                    worktree_path, full_branch, stale_commits,
+                )
             await self._cleanup_leftover_branch(full_branch, branch_name)
 
         # Create worktree with new branch from the freshened ref
@@ -1805,6 +1820,61 @@ class GitOps:
             base_commit=post_create_base,
             stale_commits=stale_commits,
             reify_debug_port=port,
+        )
+
+    async def _reattach_cold_worktree(
+        self, worktree_path: Path, full_branch: str, stale_commits: int | None,
+    ) -> 'WorktreeInfo':
+        """Re-attach ``worktree_path`` to a surviving orphan ``full_branch``.
+
+        Called by :meth:`create_worktree`'s cold path (the γ reattach guard)
+        when the worktree directory is gone but the branch still carries
+        commits beyond main — the reaped-but-retained shape left behind by
+        ``cleanup_worktree`` -> ``_delete_branch_if_on_main``. Mirrors
+        :meth:`acquire_warm_lane`'s create-once γ reattach site
+        (``git worktree add`` with no ``-b``, raise-not-destroy on failure,
+        delegate the resume tail to :meth:`_reuse_warm_lane`) minus the
+        warm-lane-pool-only seeding/route-recording calls, which do not apply
+        to the cold (unpooled) path.
+
+        Raises:
+            RuntimeError: ``git worktree add`` failed (e.g. *full_branch* is
+                still checked out in another live worktree). The branch is
+                left intact; the caller's RuntimeError routes to blocked+L1
+                (non-stranding via Harness Fix #1a) rather than destroying
+                anything.
+
+        Returns:
+            WorktreeInfo for the resumed worktree, with *stale_commits*
+            carried over from the freshen result (mirrors create_worktree's
+            reuse-existing path).
+        """
+        logger.info(
+            'create_worktree: cold-path reattach — orphan %s has commits; '
+            'attaching %s without -b',
+            full_branch, worktree_path,
+        )
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', str(worktree_path), full_branch],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f'create_worktree: refusing to reset {full_branch!r} — it '
+                f'carries commits beyond {self.config.main_branch} and '
+                f'cannot be safely re-attached to {worktree_path} (git '
+                f'worktree add failed: {err.strip()!r}). This would destroy '
+                f'work. Inspect the branch and, once any wanted work is '
+                f'preserved, remove the other worktree and retry: '
+                f'`git branch -D {full_branch}` only after preserving work.'
+            )
+        info = await self._reuse_warm_lane(worktree_path, full_branch)
+        return WorktreeInfo(
+            path=info.path,
+            base_commit=info.base_commit,
+            stale_commits=stale_commits,
+            reify_debug_port=info.reify_debug_port,
         )
 
     async def create_interactive_worktree(
