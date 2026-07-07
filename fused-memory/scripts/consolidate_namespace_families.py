@@ -330,3 +330,86 @@ async def delete_junk_key(graphiti: Any, key: str, node_count: int) -> str:
         )
         return 'UNRESOLVED'
     return 'DELETE'
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+async def run(
+    args: Any,
+    memory_service: Any,
+    *,
+    limit: int = 1000,
+) -> dict:
+    """Enumerate/scroll/count every configured family, collection, and junk
+    key and, with ``args.apply``, perform the merges + guarded deletions.
+
+    Dry-run (``args.apply`` falsy) performs ZERO mutations: every section's
+    ``disposition`` is a PREVIEW of what ``--apply`` would do, computed from
+    read-only enumeration/count/scroll alone -- ``merge_graph_family``,
+    ``merge_collection``, and the mutating half of ``delete_junk_key`` are
+    only invoked when ``args.apply`` is true.
+
+    A capped enumeration/scroll (row or point count hits *limit*) is
+    reported ``UNRESOLVED`` rather than ``MERGE`` for that item, mirroring
+    the junk-key count>0 guard: a partial read must never be mistaken for a
+    clean, complete one (no-silent-caps).
+    """
+    graphiti = memory_service.graphiti
+    qdrant_client = await memory_service.mem0._get_async_qdrant()
+
+    # --- 1. Graph-family merges (identity rewrite) -------------------------
+    graph_family_items: list[dict] = []
+    for sibling, canonical in GRAPH_FAMILY_ALIASES.items():
+        rows = await enumerate_graph_entity_nodes(graphiti, sibling, limit=limit)
+        capped = len(rows) >= limit
+        item: dict[str, Any] = {
+            'sibling': sibling,
+            'canonical': canonical,
+            'node_count': len(rows),
+            'node_uuids': [row['uuid'] for row in rows],
+            'disposition': 'UNRESOLVED' if capped else 'MERGE',
+        }
+        if args.apply and not capped:
+            item.update(await merge_graph_family(graphiti, sibling, canonical, rows))
+        graph_family_items.append(item)
+
+    # --- 2. Qdrant collection merges ----------------------------------------
+    collection_items: list[dict] = []
+    for source, target in COLLECTION_MERGES.items():
+        points = await scroll_collection_points(qdrant_client, source, limit=limit)
+        capped = len(points) >= limit
+        canonical_user_id = canonical_user_id_for(target)
+        item = {
+            'source': source,
+            'target': target,
+            'canonical_user_id': canonical_user_id,
+            'point_count': len(points),
+            'disposition': 'UNRESOLVED' if capped else 'MERGE',
+        }
+        if args.apply:
+            item.update(
+                await merge_collection(
+                    qdrant_client, source, target, canonical_user_id, points, capped=capped,
+                ),
+            )
+        collection_items.append(item)
+
+    # --- 3. Guarded junk-key deletion (JUNK_KEYS + emptied siblings) --------
+    junk_key_items: list[dict] = []
+    for key in (*JUNK_KEYS, *GRAPH_FAMILY_ALIASES.keys()):
+        node_count = await count_graph_nodes(graphiti, key)
+        if args.apply:
+            disposition = await delete_junk_key(graphiti, key, node_count)
+        else:
+            disposition = 'DELETE' if node_count == 0 else 'UNRESOLVED'
+        junk_key_items.append({
+            'key': key,
+            'node_count': node_count,
+            'disposition': disposition,
+        })
+
+    return build_consolidation_report(
+        graph_family_items, collection_items, junk_key_items, dry_run=not args.apply,
+    )
