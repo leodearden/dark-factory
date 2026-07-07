@@ -456,3 +456,71 @@ async def run(args: Any, memory_service: Any) -> dict:
     }
     report['exit_code'] = 0 if (matched and not has_unresolved) else 1
     return report
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser (split out from main() so it's testable)."""
+    parser = argparse.ArgumentParser(
+        description=(
+            'Census, classify, and (with --apply) migrate cross-graph-leaked '
+            'Graphiti nodes to their resolved home graph.'
+        ),
+    )
+    parser.add_argument(
+        '--apply', action='store_true', default=False,
+        help=(
+            'Apply an existing, reviewed manifest (requires --manifest). '
+            'Default: dry-run only -- census, classify, print the manifest, exit.'
+        ),
+    )
+    parser.add_argument(
+        '--manifest', default=None,
+        help='Path to a previously emitted, human-reviewed manifest JSON file (required with --apply).',
+    )
+    parser.add_argument(
+        '--page-size', type=int, default=DEFAULT_PAGE_SIZE,
+        help=f'Census page size (default: {DEFAULT_PAGE_SIZE}).',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
+    )
+    return parser
+
+
+def main() -> int:
+    """Parse CLI args, build a live MemoryService, and run the census/apply."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+    )
+    args = build_arg_parser().parse_args()
+
+    if args.config:
+        import os  # noqa: PLC0415
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    async def _run_live() -> dict:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        try:
+            await memory.initialize()
+            return await run(args, memory)
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+
+    report = asyncio.run(_run_live())
+    print(json.dumps(report, indent=2, default=str))
+    return report['exit_code']
+
+
+if __name__ == '__main__':
+    sys.exit(main())
