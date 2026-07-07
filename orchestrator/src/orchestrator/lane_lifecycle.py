@@ -37,6 +37,20 @@ logger = logging.getLogger(__name__)
 # stays L2 (routes straight to a human). PRD Open Q4.
 ESCALATION_SENTINEL_ROLE = 'harness-lane-lifecycle'
 
+# Directory (a direct child of worktree_base) holding every lane's durable
+# LaneRecord — see LaneLifecycle.state_dir.
+LANE_STATE_DIRNAME = '.lane-state'
+
+# Sentinel filename marking worktree_base as backed by live pool storage
+# (task 2099; folded into this module by W11 gamma).  Lives ON the pool
+# storage itself (plain dir or real mount alike — substrate-independent, no
+# config knob), so it disappears along with an unmounted mountpoint even
+# though the mountpoint DIR still exists.  See
+# LaneLifecycle.pool_storage_present() / mark_pool_storage_present().
+# GitOps re-exports this constant and delegates both methods to a shared
+# LaneLifecycle instance so the literal '.pool-root' lives only here.
+POOL_ROOT_SENTINEL = '.pool-root'
+
 
 class LaneState(Enum):
     """Lifecycle states for a single warm lane (PRD W11 Contract)."""
@@ -155,7 +169,7 @@ class LaneLifecycle:
     @property
     def state_dir(self) -> Path:
         """Directory holding every lane's durable record."""
-        return self._worktree_base / '.lane-state'
+        return self._worktree_base / LANE_STATE_DIRNAME
 
     def _record_path(self, lane: Path | str) -> Path:
         return self.state_dir / f'{Path(lane).name}.json'
@@ -367,3 +381,52 @@ class LaneLifecycle:
         dest = await self._quarantine_worktree(lane, branch, reason)
         self.transition(lane, LaneState.QUARANTINED)
         return dest
+
+    def pool_storage_present(self) -> bool:
+        """True iff worktree_base is backed by live pool storage (task 2099).
+
+        Checks for the ``POOL_ROOT_SENTINEL`` (``.pool-root``) sentinel FILE
+        directly inside ``worktree_base``.  The sentinel lives ON the pool
+        storage itself, so it disappears along with an unmounted mountpoint
+        even though the mountpoint directory still exists — unlike
+        ``worktree_base.exists()``, which is True for an empty, unmounted
+        mountpoint dir (the root cause of the Jul-3 incident this guards
+        against).
+
+        Fail-safe: any ``OSError`` (e.g. a torn read racing a concurrent
+        mount transition) is treated as absent. Never raises. Ported
+        verbatim (W11 gamma sentinel fold) from the original
+        ``GitOps.pool_storage_present`` — that method is now a thin
+        delegator to this one.
+        """
+        try:
+            return (self._worktree_base / POOL_ROOT_SENTINEL).is_file()
+        except OSError:
+            logger.debug(
+                'pool_storage_present: stat error checking %s — treating as '
+                'absent (fail-safe)',
+                self._worktree_base,
+                exc_info=True,
+            )
+            return False
+
+    def mark_pool_storage_present(self) -> None:
+        """Write the ``.pool-root`` sentinel marking storage as present.
+
+        Idempotent best-effort: creates ``worktree_base`` if missing, then
+        writes the sentinel file (a no-op if it already exists). Any
+        ``OSError`` is logged and swallowed — never raises, since a failed
+        mark must not block whatever seed/warmup operation triggered it.
+        Ported verbatim (W11 gamma sentinel fold) from the original
+        ``GitOps.mark_pool_storage_present`` — that method is now a thin
+        delegator to this one.
+        """
+        try:
+            self._worktree_base.mkdir(parents=True, exist_ok=True)
+            (self._worktree_base / POOL_ROOT_SENTINEL).touch(exist_ok=True)
+        except OSError:
+            logger.warning(
+                'mark_pool_storage_present: failed to write sentinel under %s',
+                self._worktree_base,
+                exc_info=True,
+            )

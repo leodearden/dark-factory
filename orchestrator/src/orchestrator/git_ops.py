@@ -38,7 +38,14 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
-from orchestrator.config import GitConfig
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import TASK_META_DIRNAME, GitConfig
+from orchestrator.lane_lifecycle import (
+    LANE_STATE_DIRNAME,
+    POOL_ROOT_SENTINEL,  # noqa: F401  re-export shim (test_pool_storage_guard.py)
+    LaneLifecycle,
+    LaneState,
+)
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
@@ -172,7 +179,12 @@ PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
 # alike — substrate-independent, no config knob), so it disappears along
 # with an unmounted mountpoint even though the mountpoint DIR still exists.
 # See GitOps.pool_storage_present() / mark_pool_storage_present().
-POOL_ROOT_SENTINEL: str = '.pool-root'
+#
+# Folded into orchestrator.lane_lifecycle (W11 gamma sentinel fold): the
+# sentinel FS read/write now live ONLY there (LaneLifecycle.
+# pool_storage_present() / mark_pool_storage_present()), and this name is a
+# re-export so `from orchestrator.git_ops import POOL_ROOT_SENTINEL` (and
+# the literal '.pool-root') keep working for existing callers/tests.
 
 # The _iact-* band (worktree_base/<iact_prefix><slug>, config.iact_prefix
 # default '_iact-') minted by GitOps.create_interactive_worktree is
@@ -201,6 +213,8 @@ PROTECTED_PREFIXES: dict[str, str] = {
     '_substrate-gate-': 'harness-substrate-gate',
     PERSISTENT_MERGE_WORKTREE_NAME: 'persistent-merge-verify',
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: 'persistent-offline-deep',
+    LANE_STATE_DIRNAME: 'warm-lane-lifecycle',
+    TASK_META_DIRNAME: 'task-artifacts',
 }
 
 
@@ -868,6 +882,16 @@ class GitOps:
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
+        # Durable per-lane lifecycle record writer (W11 gamma).  Shared by
+        # acquire_warm_lane/release_warm_lane (durable ASSIGNED/RELEASED
+        # writes below) and the .pool-root sentinel delegators. escalation_
+        # queue=None: GitOps has no escalation queue wired (mirrors the other
+        # unwired-callback attributes in this constructor) — delta/harness can
+        # inject a real one later. quarantine_worktree is wired now (harmless
+        # in gamma; consumed by delta).
+        self._lane_lifecycle = LaneLifecycle(
+            self.worktree_base, quarantine_worktree=self.quarantine_worktree,
+        )
         # Warm-lane pool — None when knob off or size=0 (default-off, trivially
         # revertible, mirrors persistent_merge_worktree).  Size is passed from
         # OrchestratorConfig.max_concurrent_tasks by Harness at startup (D9).
@@ -1040,49 +1064,30 @@ class GitOps:
     def pool_storage_present(self) -> bool:
         """True iff worktree_base is backed by live pool storage (task 2099).
 
-        Checks for the ``POOL_ROOT_SENTINEL`` (``.pool-root``) sentinel FILE
-        directly inside :attr:`worktree_base`.  The sentinel lives ON the pool
-        storage itself, so it disappears along with an unmounted mountpoint
-        even though the mountpoint directory still exists — unlike
-        ``worktree_base.exists()``, which is True for an empty, unmounted
-        mountpoint dir (the root cause of the Jul-3 incident this guards
-        against).
-
-        Fail-safe: any ``OSError`` (e.g. a torn read racing a concurrent
-        mount transition) is treated as absent.  Never raises.
+        Thin delegator (W11 gamma sentinel fold) to
+        ``self._lane_lifecycle.pool_storage_present()`` — the ``.pool-root``
+        sentinel FS read now lives only in ``lane_lifecycle.py``.  Public
+        contract (fail-safe on ``OSError``, never raises) is unchanged; see
+        :meth:`LaneLifecycle.pool_storage_present` for the full rationale.
         """
-        try:
-            return (self.worktree_base / POOL_ROOT_SENTINEL).is_file()
-        except OSError:
-            logger.debug(
-                'pool_storage_present: stat error checking %s — treating as '
-                'absent (fail-safe)',
-                self.worktree_base,
-                exc_info=True,
-            )
-            return False
+        return self._lane_lifecycle.pool_storage_present()
 
     def mark_pool_storage_present(self) -> None:
         """Write the ``.pool-root`` sentinel marking storage as present.
 
-        Idempotent best-effort: creates :attr:`worktree_base` if missing,
-        then writes the sentinel file (a no-op if it already exists).  Any
-        ``OSError`` is logged and swallowed — never raises, since a failed
-        mark must not block whatever seed/warmup operation triggered it.
+        Thin delegator (W11 gamma sentinel fold) to
+        ``self._lane_lifecycle.mark_pool_storage_present()`` — the
+        ``.pool-root`` sentinel FS write now lives only in
+        ``lane_lifecycle.py``.  Public contract (idempotent, best-effort,
+        never raises) is unchanged; see
+        :meth:`LaneLifecycle.mark_pool_storage_present` for the full
+        rationale.
 
         Called from exactly ONE chokepoint — :meth:`_seed_warm_lane` on
         ``rc == 0`` — because a successful seed proves the mount is present
         and writable (see that method's docstring for the full rationale).
         """
-        try:
-            self.worktree_base.mkdir(parents=True, exist_ok=True)
-            (self.worktree_base / POOL_ROOT_SENTINEL).touch(exist_ok=True)
-        except OSError:
-            logger.warning(
-                'mark_pool_storage_present: failed to write sentinel under %s',
-                self.worktree_base,
-                exc_info=True,
-            )
+        self._lane_lifecycle.mark_pool_storage_present()
 
     def _note_pool_storage_absent(self) -> None:
         """Best-effort dispatch to the injected ``_on_pool_storage_absent`` hook.
@@ -1964,11 +1969,16 @@ class GitOps:
                     f'{add_err.strip()!r}'
                 )
 
-        # .task/interactive.json stamp for the δ reaper (owner/created_at let
-        # the reaper age out worktrees with no activity past the TTL).
+        # .task-meta/<name>/interactive.json stamp for the δ reaper
+        # (owner/created_at let the reaper age out worktrees with no activity
+        # past the TTL). Written to the NEW .task-meta location ONLY (W11
+        # gamma relocation; PRD `.task-meta` path-derivation contract: writes
+        # new-path-only) — a worktree_base sibling of the worktree, so
+        # `git add -A` in the lane can never stage it.
         # _ensure_task_gitignore writes .task/.gitignore('*') first (and
-        # creates the .task/ dir) so the stamp is never staged/committed —
-        # keeps /merge-queue from ever landing it on task/<slug>.
+        # creates the legacy .task/ dir) — kept as-is (guard-layer deletion
+        # is θ/ι scope, out of scope here) even though the stamp itself no
+        # longer lands under it.
         _ensure_task_gitignore(path)
         stamp = {
             'owner': slug,
@@ -1976,7 +1986,9 @@ class GitOps:
             'branch': full_branch,
             'slug': slug,
         }
-        (path / '.task' / 'interactive.json').write_text(json.dumps(stamp))
+        meta_root = TaskArtifacts.meta_root_for(self.worktree_base, path.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'interactive.json').write_text(json.dumps(stamp))
 
         # FAIL-SOFT (the key deviation from acquire_warm_lane): a seed fault
         # never removes the worktree and never raises — the worktree + stamp
@@ -2654,6 +2666,36 @@ class GitOps:
         *,
         expected_title: str | None = None,
     ) -> 'WorktreeInfo | WarmLaneUnavailable':
+        """Thin durable-record chokepoint wrapping :meth:`_acquire_warm_lane_impl`.
+
+        Delegates to :meth:`_acquire_warm_lane_impl` for the full acquire
+        logic (see that method's docstring for the complete contract) and,
+        iff it returns a :class:`WorktreeInfo` (success), records the durable
+        ASSIGNED lifecycle edge via :meth:`_lifecycle_note_assigned` — the
+        SINGLE chokepoint covering all of the impl's internal routes (reuse,
+        create-once, disk-backstop, reset-in-place, and their reattach
+        variants) without restructuring any of them (per-route named edges
+        are task eta's job, PRD Mechanism 3). Fault paths return
+        WarmLaneUnavailable (never WorktreeInfo), so they never write
+        ASSIGNED — consistent with :meth:`_abort_lane_acquisition` teardown.
+        """
+        result = await self._acquire_warm_lane_impl(
+            branch_name, start_ref, expected_title=expected_title,
+        )
+        if isinstance(result, WorktreeInfo):
+            self._lifecycle_note_assigned(
+                result.path, branch_name, expected_title,
+                f'{self.config.branch_prefix}{branch_name}',
+            )
+        return result
+
+    async def _acquire_warm_lane_impl(
+        self,
+        branch_name: str,
+        start_ref: str,
+        *,
+        expected_title: str | None = None,
+    ) -> 'WorktreeInfo | WarmLaneUnavailable':
         """Allocate a FREE warm lane, seed/reset it, and return a WorktreeInfo.
 
         **Create-once path** (lane not yet a registered worktree):
@@ -3204,6 +3246,66 @@ class GitOps:
             await self._abort_lane_acquisition(lane, branch_name, remove_worktree=False)
             return WarmLaneUnavailable.FAULT
 
+    def _lifecycle_note_assigned(
+        self, lane: Path, task_id: str, title: str | None, branch: str,
+    ) -> None:
+        """Best-effort durable ASSIGNED write for :meth:`acquire_warm_lane`.
+
+        Normalizes whatever state the lane's durable record is CURRENTLY in
+        onto a legal edge ending at ASSIGNED, rather than calling
+        ``transition(lane, ASSIGNED)`` directly — ``LEGAL_TRANSITIONS``
+        forbids ``(None, ASSIGNED)`` and ``(ASSIGNED, ASSIGNED)``, and the
+        pool's 2-value FREE/ASSIGNED cache does not map 1:1 onto the 6-state
+        durable model (pre-gamma live lanes have no record at all until
+        task kappa's migration adopt):
+
+        * Same-task reuse (already ASSIGNED to this task_id): no-op —
+          idempotent.
+        * Currently ASSIGNED (to a DIFFERENT task) or IN_USE (steal/recycle):
+          released first, so RELEASED -> ASSIGNED is the edge actually taken.
+        * No record yet (``None``): bootstrapped ``SEED -> REGISTERED``
+          before the ASSIGNED write.
+        * SEED (should not normally occur pre-gamma, but handled for
+          completeness): registered before the ASSIGNED write.
+        * REGISTERED or RELEASED: assigned directly (both are legal
+          predecessors of ASSIGNED).
+
+        Best-effort / never-raise (mirrors :meth:`mark_pool_storage_present`):
+        any exception (including a genuine ``IllegalLaneTransition``, e.g. a
+        QUARANTINED lane) is logged and swallowed so a durable-record hiccup
+        never regresses ``acquire_warm_lane`` itself.
+        """
+        try:
+            rec = self._lane_lifecycle.read(lane)
+            if (
+                rec is not None
+                and rec.state is LaneState.ASSIGNED
+                and rec.task_id == str(task_id)
+            ):
+                return  # idempotent same-task reuse
+            state = rec.state if rec is not None else None
+            if state in (LaneState.ASSIGNED, LaneState.IN_USE):
+                self._lane_lifecycle.transition(lane, LaneState.RELEASED)
+                state = LaneState.RELEASED
+            if state is None:
+                self._lane_lifecycle.transition(lane, LaneState.SEED)
+                self._lane_lifecycle.transition(
+                    lane, LaneState.REGISTERED, branch=branch,
+                )
+            elif state is LaneState.SEED:
+                self._lane_lifecycle.transition(
+                    lane, LaneState.REGISTERED, branch=branch,
+                )
+            self._lane_lifecycle.transition(
+                lane, LaneState.ASSIGNED, task_id=str(task_id), title=title, branch=branch,
+            )
+        except Exception:
+            logger.warning(
+                '_lifecycle_note_assigned: failed to record ASSIGNED for lane '
+                '%s (task %s) — durable record may be stale/inconsistent',
+                lane, task_id, exc_info=True,
+            )
+
     async def _reuse_warm_lane(
         self, lane_dir: Path, full_branch: str,
     ) -> 'WorktreeInfo':
@@ -3536,7 +3638,32 @@ class GitOps:
         await self._delete_branch_if_on_main(full_branch, context='release_warm_lane')
 
         await self.warm_lane_pool.release(lane_dir)
+        self._lifecycle_note_released(lane_dir)
         logger.info('release_warm_lane: released %s (branch %s)', lane_dir, full_branch)
+
+    def _lifecycle_note_released(self, lane: Path) -> None:
+        """Best-effort durable RELEASED write for :meth:`release_warm_lane`.
+
+        Only ASSIGNED or IN_USE legally transition to RELEASED — a lane with
+        no record, or already REGISTERED/RELEASED, is left untouched (a
+        REGISTERED -> RELEASED or RELEASED -> RELEASED edge is not legal, so
+        this never attempts either).
+
+        Best-effort / never-raise (mirrors :meth:`mark_pool_storage_present`
+        and :meth:`_lifecycle_note_assigned`): any exception is logged and
+        swallowed so a durable-record hiccup never regresses
+        ``release_warm_lane`` itself (contractually never-raise).
+        """
+        try:
+            rec = self._lane_lifecycle.read(lane)
+            if rec is not None and rec.state in (LaneState.ASSIGNED, LaneState.IN_USE):
+                self._lane_lifecycle.transition(lane, LaneState.RELEASED)
+        except Exception:
+            logger.warning(
+                '_lifecycle_note_released: failed to record RELEASED for lane '
+                '%s — durable record may be stale/inconsistent',
+                lane, exc_info=True,
+            )
 
     async def detach_lane_checkout(self, lane: Path, bare_id: str) -> bool:
         """Commit WIP then detach *lane*'s HEAD, preserving branch and worktree.
@@ -3803,11 +3930,18 @@ class GitOps:
             return False
 
     def _find_lane_by_plan_task_id(self, task_id: str) -> Path | None:
-        """Scan ``worktree_base/_lane-*/.task/plan.json`` for *task_id*.
+        """Scan each pool lane's plan.json (new-then-old) for *task_id*.
 
         On-disk backstop for :meth:`release_lane_for_terminal_task`: used when
         ``pool.assignment_for`` returns None (e.g. post-restart where the
         in-memory assignment map was not rebuilt for a terminal task).
+
+        Reads plan.json new-then-old (W11 gamma ``.task`` -> ``.task-meta``
+        relocation, PRD decision 7 — side-effect-free reads, no migration
+        write-back here): first ``TaskArtifacts.meta_root_for(worktree_base,
+        entry.name) / 'plan.json'`` (the new location, a sibling of the lane
+        dir), falling back to the legacy ``entry / '.task' / 'plan.json'`` so
+        lanes seeded before this relocation still resolve.
 
         Uses a local ``import json as _json`` (mirrors git_ops.py:1816 idiom —
         no module-level ``import json``).  Hoisted once above the loop rather
@@ -3835,9 +3969,11 @@ class GitOps:
             if not pool.is_lane(entry):
                 continue
             try:
-                plan_path = entry / '.task' / 'plan.json'
+                plan_path = TaskArtifacts.meta_root_for(base, entry.name) / 'plan.json'
                 if not plan_path.exists():
-                    continue
+                    plan_path = entry / '.task' / 'plan.json'
+                    if not plan_path.exists():
+                        continue
                 data = _json.loads(plan_path.read_text())
                 if str(data.get('task_id')) == task_id:
                     return entry
@@ -5821,8 +5957,7 @@ class GitOps:
         :meth:`create_interactive_worktree` used to create it
         (``worktree_base/{iact_prefix}{slug}`` on branch
         ``{branch_prefix}{slug}``) — both are always derivable this way, so
-        this does not depend on the ``.task/interactive.json`` stamp being
-        intact.
+        this does not depend on the ``interactive.json`` stamp being intact.
 
         Per-worktree reap predicate:
 
@@ -5848,8 +5983,10 @@ class GitOps:
           under them.
         * Otherwise, when :meth:`worktree_head_beyond_main` is ``None`` (no
           commits beyond main) → age is measured from the
-          ``.task/interactive.json`` stamp's ``created_at``.  Reaped
-          (``'ttl_idle'``) when that age exceeds
+          ``interactive.json`` stamp's ``created_at``, resolved new-then-old
+          (the ``.task-meta/<name>/interactive.json`` path first, falling
+          back to the legacy ``<wt>/.task/interactive.json`` path — W11
+          gamma relocation).  Reaped (``'ttl_idle'``) when that age exceeds
           ``config.interactive_worktree_ttl``; otherwise, when
           ``_run_warm_lane_disk_guard()`` reports disk pressure (rc==75),
           reaped anyway (``'disk_pressure'``) regardless of age — safe
@@ -5937,7 +6074,11 @@ class GitOps:
                     # post-merge editing with no new commit yet) — either way
                     # there are no commits beyond main, so age on the stamp
                     # exactly like any other idle candidate.
-                    stamp_path = wt_path / '.task' / 'interactive.json'
+                    stamp_path = TaskArtifacts.meta_root_for(
+                        self.worktree_base, wt_resolved.name,
+                    ) / 'interactive.json'
+                    if not stamp_path.exists():
+                        stamp_path = wt_path / '.task' / 'interactive.json'
                     try:
                         stamp = json.loads(stamp_path.read_text())
                         created_at = datetime.fromisoformat(stamp['created_at'])
@@ -6000,6 +6141,17 @@ class GitOps:
                     cwd=self.project_root,
                 )
                 if rc_rm == 0:
+                    # The interactive.json stamp now lives in the .task-meta
+                    # sibling dir (S10), OUTSIDE the worktree, so `git
+                    # worktree remove` above no longer cleans it up
+                    # incidentally the way it did when the stamp lived inside
+                    # the worktree. Remove it here, best-effort, so a reaped
+                    # worktree never leaves an orphaned .task-meta/<name> dir
+                    # behind (I2: never an indefinite leak).
+                    shutil.rmtree(
+                        TaskArtifacts.meta_root_for(self.worktree_base, wt_resolved.name),
+                        ignore_errors=True,
+                    )
                     reaped.append(ReapedInteractiveWorktree(
                         path=wt_path, branch=full_branch, slug=slug, reason=reason,
                     ))

@@ -537,12 +537,16 @@ class TestPoolBoundedExhausted:
             'worktree_base must exist after create_worktree("X") succeeds'
         )
         dirs = [d.name for d in worktree_base.iterdir() if d.is_dir()]
+        # .lane-state is the W11-gamma durable lifecycle-record directory —
+        # an expected metadata band (not a worktree, cold or otherwise),
+        # written as a side effect of the successful acquire above.
+        lane_state_dirname = git_ops._lane_lifecycle.state_dir.name
         non_pool_dirs = [
             d for d in dirs
-            if not d.startswith('_lane-') and d != '_merge-verify'
+            if not d.startswith('_lane-') and d not in ('_merge-verify', lane_state_dirname)
         ]
         assert non_pool_dirs == [], (
-            f'Only _lane-* and _merge-verify dirs expected; '
+            f'Only _lane-*, _merge-verify, and {lane_state_dirname} dirs expected; '
             f'found extra dirs (cold worktrees?): {non_pool_dirs}'
         )
 
