@@ -308,6 +308,20 @@ class TestBuildManifest:
 
         assert r1 == r2
 
+    def test_episodic_skip_tally_is_not_unresolved(self):
+        """EPISODIC_SKIP is a distinct disposition from UNRESOLVED -- it must
+        be tallied in summary (dynamically, like REKEY) but must NOT leak
+        into unresolved_uuids, which collects ONLY UNRESOLVED nodes."""
+        node = _classified_node(
+            'u-ep', target_graph='dark_factory', disposition=_mod.EPISODIC_SKIP,
+        )
+
+        manifest = _mod.build_manifest([node], {'reify': 1}, dry_run=True)
+
+        assert manifest['summary']['EPISODIC_SKIP'] == 1
+        assert manifest['summary']['total'] == 1
+        assert manifest['unresolved_uuids'] == []
+
 
 # ===========================================================================
 # Tests: census_foreign_nodes (step-7/8)
@@ -963,6 +977,88 @@ class TestRunApplyDispatch:
         assert move_mock.await_args is not None
         call_kwargs = move_mock.await_args.kwargs
         assert call_kwargs.get('rewrite_group_id') == 'know_live'
+
+
+# ===========================================================================
+# Tests: run() apply skips EPISODIC_SKIP (step-31/32 review-fix, cycle 2)
+# ===========================================================================
+
+class TestRunApplyEpisodicSkip:
+    """Tests for run() never dispatching an EPISODIC_SKIP node to a
+    primitive -- foreign Episodic/Community/unlabeled nodes are not
+    :Entity-scoped-primitive-compatible; see classify_node's label gate."""
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_episodic_skip_node_never_dispatched(self, tmp_path, monkeypatch):
+        """An EPISODIC_SKIP node is never passed to move_entity_across_graphs
+        or merge_foreign_duplicate, and receives no rekey mutation either --
+        it is recorded blocked, not applied."""
+        ep_node = _classified_node(
+            'u-ep', source_graph='reify', target_graph='dark_factory',
+            disposition=_mod.EPISODIC_SKIP,
+        )
+        manifest_path = self._write_manifest(tmp_path, [ep_node], {'reify': 1})
+
+        move_mock = AsyncMock(side_effect=AssertionError('must not dispatch EPISODIC_SKIP'))
+        merge_mock = AsyncMock(side_effect=AssertionError('must not dispatch EPISODIC_SKIP'))
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+
+        reify_graph = _make_graph_mock(
+            ro_pages=[[_foreign_row('u-ep', 'dark_factory', labels=['Episodic'])]],
+        )
+        memory_service = _make_memory_service({'reify': reify_graph})
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        move_mock.assert_not_awaited()
+        merge_mock.assert_not_awaited()
+        reify_graph.query.assert_not_awaited()
+
+        ep_results = [r for r in report['apply_results'] if r['uuid'] == 'u-ep']
+        assert len(ep_results) == 1
+        assert ep_results[0]['applied'] is False
+        assert ep_results[0]['blocked'] is True
+        assert ep_results[0]['disposition'] == _mod.EPISODIC_SKIP
+
+    @pytest.mark.asyncio
+    async def test_episodic_skip_residual_matches_but_still_blocks_exit(
+        self, tmp_path, monkeypatch,
+    ):
+        """EPISODIC_SKIP is counted in expected_residual (mirroring
+        UNRESOLVED), so a graph still holding the un-actioned foreign
+        Episodic node after apply reconciles (matched=True -- NOT mistaken
+        for a silently-failed MOVE) -- but it still forces a non-zero,
+        blocking exit_code (has_blocked), since a foreign Episodic node was
+        never actually resolved."""
+        ep_node = _classified_node(
+            'u-ep', source_graph='reify', target_graph='dark_factory',
+            disposition=_mod.EPISODIC_SKIP,
+        )
+        manifest_path = self._write_manifest(tmp_path, [ep_node], {'reify': 1, 'dark_factory': 0})
+
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', AsyncMock())
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(
+                ro_pages=[[_foreign_row('u-ep', 'dark_factory', labels=['Episodic'])]],
+            ),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] != 0
 
 
 # ===========================================================================
