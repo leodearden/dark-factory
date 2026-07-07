@@ -9740,7 +9740,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 
         await harness._maybe_escalate_stale_task_count_snapshot('know_live', 'run-current', run)
 
-        harness._escalate.assert_not_called()
+        assert harness._escalate.call_count == 0
         harness.journal.get_recent_runs.assert_not_awaited()
 
     @pytest.mark.asyncio
