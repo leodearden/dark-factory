@@ -41,6 +41,7 @@ from typing import Any, Literal, NamedTuple, TypedDict
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
 from orchestrator.lane_lifecycle import (
+    LANE_STATE_DIRNAME,
     POOL_ROOT_SENTINEL,  # noqa: F401  re-export shim (test_pool_storage_guard.py)
     LaneLifecycle,
     LaneState,
@@ -212,6 +213,8 @@ PROTECTED_PREFIXES: dict[str, str] = {
     '_substrate-gate-': 'harness-substrate-gate',
     PERSISTENT_MERGE_WORKTREE_NAME: 'persistent-merge-verify',
     PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: 'persistent-offline-deep',
+    LANE_STATE_DIRNAME: 'warm-lane-lifecycle',
+    TASK_META_DIRNAME: 'task-artifacts',
 }
 
 
