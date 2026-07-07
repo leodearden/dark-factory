@@ -301,14 +301,33 @@ def refresh_record(
     *,
     status: Status | None = None,
 ) -> SessionRecord:
-    """Read-modify-write used by the T6 hook seam; bumps the mtime heartbeat.
+    """Upsert used by the T6 hook seam; bumps the mtime heartbeat (PRD G5).
 
-    Strict as of this task (raises if no record exists, like update_status).
-    T6's hand-launched-capture path additionally needs upsert-on-absent
-    semantics for a session with no prior spawn-claude.sh write; that
-    extension lands in step-16 alongside the ``refresh`` CLI subcommand.
+    Updates the existing record for *slug* in place when one exists (a
+    read-modify-write, like update_status). When none exists -- the T6
+    hand-launched-capture path, where a session was started with no prior
+    spawn-claude.sh write -- creates a new, well-formed record under the
+    SAME key: schema_version/session_slug/start_ts/status are populated;
+    every other field is left at its documented ``SessionRecord`` default.
+    This is the write<->refresh boundary contract every downstream
+    Attention Rail task (T4/T5/T6/T7) relies on resolving to one identical
+    ``<root>/sessions/<slug>/record.json`` path.
+
+    A *corrupt* existing body is NOT treated as absent -- it continues to
+    raise ``CorruptSessionRecord`` rather than silently overwriting data the
+    reaper's own 'corrupt' rule already accounts for.
     """
-    record = read_record(slug, root=root)
+    try:
+        record = read_record(slug, root=root)
+    except FileNotFoundError:
+        # No prior write for this slug: synthesize a fresh record. LAUNCHING
+        # is the sensible default identity for "a record just came into
+        # being" when the caller upserts without an explicit status.
+        record = SessionRecord(
+            session_slug=slug,
+            status=status if status is not None else Status.LAUNCHING,
+            start_ts=datetime.now(UTC).isoformat(),
+        )
     if status is not None:
         record.status = status
     write_record(record, root=root)
