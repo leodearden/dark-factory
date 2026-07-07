@@ -2174,6 +2174,7 @@ class TestShouldWithholdBatchPromotionAcceptsScope:
         pytest.param(
             {'stage2_suppress': True, 'task_id': '7'}, True, id='stage2_suppress_guard',
         ),
+<<<<<<< Updated upstream
         pytest.param(
             {'stage2_suppress': False, 'task_id': '7'},
             False,
@@ -2184,10 +2185,17 @@ class TestShouldWithholdBatchPromotionAcceptsScope:
             False,
             id='dead_trigger_source_removed',
         ),
+=======
+>>>>>>> Stashed changes
         pytest.param(
             {'source': 'targeted_reconciliation', 'task_id': '361', 'transition': 'done'},
             False,
             id='plain_prior_echo',
+        ),
+        pytest.param(
+            {'stage2_suppress': False, 'task_id': '7'},
+            False,
+            id='falsy_stage2_suppress_no_other_marker',
         ),
         pytest.param(
             {'source': 'stage1_flag_marker', 'task_id': '7', 'flag_type': 'x'},
@@ -2211,9 +2219,13 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     `stage2_suppress` key") — replacing an earlier revision's `source`
     allowlist (`_AUTHORITATIVE_SOURCES = {'stage2_task_knowledge_sync'}`) that
     a task 1984 review pass found was never actually stamped by any writer in
+<<<<<<< Updated upstream
     the codebase (dead-trigger fix): `dead_trigger_source_removed` below locks
     in that a bare `source='stage2_task_knowledge_sync'` is no longer
     authoritative on its own.
+=======
+    the codebase (dead-trigger fix).
+>>>>>>> Stashed changes
 
     Neither check treats "any other source" as authoritative — real
     task_id-tagged writers like flag_dedup.py's `stage1_flag_marker` and
@@ -2522,6 +2534,54 @@ async def test_on_task_done_suppresses_stale_description_when_authoritative_memo
 
 @pytest.mark.asyncio
 async def test_on_task_done_suppresses_when_stage2_suppress_guard_exists(
+<<<<<<< Updated upstream
+=======
+    reconciler, mock_memory_service,
+):
+    """End-to-end regression guard for the REAL production trigger.
+
+    Unlike the `supersedes`-shaped fixture above, this mocks
+    get_memories_by_metadata to return a memory shaped exactly as Stage 2's
+    documented write-side contract produces it — `metadata={'stage2_suppress':
+    True, 'task_id': str(task_id)}`, no `supersedes` key (prompts/stage2.py
+    "Completion-Note Suppression Pre-Check (stage2_suppress guard)": "the only
+    writer of the `stage2_suppress` key"). A task 1984 review pass found the
+    prior `_AUTHORITATIVE_SOURCES` allowlist had no real writer backing it —
+    this test locks in that the classifier now fires on the shape Stage 2
+    actually produces, not just a synthetic `supersedes` fixture."""
+    mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+        {'id': 'a1b2c3', 'metadata': {'task_id': '361', 'stage2_suppress': True}},
+    ])
+
+    result = await reconciler.reconcile_task(
+        task_id='361', transition='done', project_id='test-project', project_root='/tmp/test',
+        task_before={
+            'id': '361',
+            'title': 'Autopilot task',
+            'status': 'in-progress',
+            'description': 'STALE re-scoped description text',
+            'details': 'stale details',
+        },
+    )
+
+    calls = mock_memory_service.add_memory.call_args_list
+    assert len(calls) >= 1
+    first_call = calls[0]
+    content = first_call.kwargs.get('content')
+    assert content == "Task 'Autopilot task' completed.", (
+        f'Expected title-only completion fact, got: {content!r}'
+    )
+    assert 'STALE re-scoped description text' not in content
+
+    metadata = first_call.kwargs.get('metadata') or {}
+    assert metadata.get('echo_suppressed_stale_description') is True
+
+    assert any(a['type'] == 'knowledge_captured_fast' for a in result.get('actions', []))
+
+
+@pytest.mark.asyncio
+async def test_on_task_done_fails_open_when_metadata_query_raises(
+>>>>>>> Stashed changes
     reconciler, mock_memory_service,
 ):
     """End-to-end regression guard for the REAL production trigger.
