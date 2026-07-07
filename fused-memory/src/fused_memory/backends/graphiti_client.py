@@ -940,11 +940,23 @@ class GraphitiBackend:
         Three Cypher phases:
         (1) Count and delete inter-node edges between the two nodes (they become
             meaningless self-loops after merge).
-        (2) Count then redirect outgoing edges: deprecated→target becomes
-            surviving→target (all properties copied individually to preserve
-            vecf32 embedding type).
-        (3) Count then redirect incoming edges: source→deprecated becomes
-            source→surviving.
+        (2) Enumerate outgoing edges (deprecated→target) by stable internal
+            element ID(old) — not old.uuid, which may already be duplicated by
+            a prior buggy merge — then redirect one edge per query:
+            deprecated→target becomes surviving→target, minting a FRESH uuid4
+            for the new edge and recording the original as
+            new.superseded_edge_uuid for audit (all other properties copied
+            individually to preserve vecf32 embedding type).
+        (3) Symmetrically, enumerate incoming edges (source→deprecated) by
+            ID(old) and redirect one edge per query: source→deprecated becomes
+            source→surviving, likewise minting a fresh uuid4 and recording
+            new.superseded_edge_uuid.
+
+        Redirecting per-edge and keying on the internal ID(old) — rather than
+        issuing a single bulk query keyed on old.uuid — preserves the
+        graph-wide "uuid is unique per RELATES_TO edge" invariant: keying on
+        old.uuid would silently coalesce any pre-existing dup-uuid edges
+        instead of redirecting each one individually (task 2207 W6-δ).
 
         Args:
             deprecated_uuid: UUID of the entity node to be deleted.
@@ -952,7 +964,9 @@ class GraphitiBackend:
 
         Returns:
             Dict with keys: outgoing_redirected, incoming_redirected,
-            inter_node_deleted.
+            inter_node_deleted. The redirected counts are derived from the
+            number of edges actually enumerated (and thus redirected) in each
+            direction.
         """
         graph = self._graph_for(group_id)
 
@@ -1072,9 +1086,11 @@ class GraphitiBackend:
            redirect_node_edges.
         3. Delete the deprecated node via delete_entity_node.
         4. Collapse any parallel duplicate edges left on the surviving node via
-           dedup_valid_edges_for_node (task 2118 — redirect_node_edges copies
-           uuids onto redirected edges without checking for an equivalent edge
-           the survivor already has).
+           dedup_valid_edges_for_node (task 2118 — redirect_node_edges mints a
+           fresh uuid per redirected edge, but the survivor may already hold
+           an equivalent (neighbor, fact, valid_at) edge, so this
+           uuid-agnostic pass is still required to collapse those parallel
+           duplicates).
         5. Rebuild the surviving node's summary via refresh_entity_summary.
 
         Args:
