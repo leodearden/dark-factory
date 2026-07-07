@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
-import hashlib
 import json
 import logging
 import os
@@ -37,6 +36,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
+from shared.task_metadata import RetryLedger
 
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
@@ -353,42 +353,17 @@ class WorkflowOutcome(enum.Enum):
 # surface on attempt 1 for any genuine in-test hang.
 _OPAQUE_TIMEOUT_CAUSE_RE = re.compile(r'^Command timed out after \d+(\.\d+)?s:')
 
-# Regexes used by ``_normalize_cause_hint`` — compiled once at module level.
-# Order of application: ANSI first (so coloured file:line refs are cleaned
-# before the file:line pattern matches them), then file:line, then whitespace.
-_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
-_FILE_LINE_RE = re.compile(
-    r'\b[\w./\\-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cpp|c|h|sh|md|yaml|yml|json|toml)'
-    r':\d+(:\d+)?\b'
-)
-_WHITESPACE_RE = re.compile(r'\s+')
-
-
 def _normalize_cause_hint(hint: str | None) -> str:
-    """Normalise a VerifyResult cause_hint for equality comparison.
+    """Thin delegator to :meth:`RetryLedger.normalize_cause_hint`.
 
-    Strips ANSI colour escape sequences, removes file:line (and file:line:col)
-    numeric tails, collapses contiguous whitespace to a single space,
-    lowercases, and strips leading/trailing whitespace.
-
-    Returns an empty string for empty or None input — never raises.
-
-    Used by the verify-loop signature-repetition guard to detect consecutive
-    identical failures even when line numbers shift between retries.
+    Kept as a module-level function (rather than inlining the call at each
+    site) because ``orchestrator.verify`` and several tests
+    (``test_workflow_signature_loop_guard.py``, ``test_merge_queue_auto_heal.py``)
+    import this name directly from ``orchestrator.workflow``. The ledger is
+    the single signature-keying authority (shared/src/shared/task_metadata.py);
+    this wrapper preserves every existing importer's behaviour byte-for-byte.
     """
-    if not hint:
-        return ''
-    # 1. Strip ANSI colour codes (e.g. \x1b[31m...\x1b[0m) first so that
-    #    coloured file:line references like \x1b[31mfoo.py:42\x1b[0m become
-    #    plain foo.py:42 before the file:line pattern runs.
-    result = _ANSI_ESCAPE_RE.sub('', hint)
-    # 2. Strip file:line and file:line:col numeric tails
-    #    (e.g. "tests/test_x.py:42" or "foo.py:42:7").
-    result = _FILE_LINE_RE.sub('', result)
-    # 3. Collapse contiguous whitespace (spaces, tabs, newlines) to one space.
-    result = _WHITESPACE_RE.sub(' ', result)
-    # 4. Lowercase and strip.
-    return result.lower().strip()
+    return RetryLedger.normalize_cause_hint(hint)
 
 
 def _compute_merge_outcome_signature(
@@ -396,7 +371,7 @@ def _compute_merge_outcome_signature(
     cause_hint: str | None,
     fallback_reason: str = '',
 ) -> str:
-    """Compute a 16-hex-char sha-independent outcome signature from explicit fields.
+    """Thin delegator to :meth:`RetryLedger.compute_merge_outcome_signature`.
 
     Keys on (category, normalised cause_hint) when either field is set; falls
     back to sha256(normalised_reason) when both are empty — same logic as
@@ -412,14 +387,11 @@ def _compute_merge_outcome_signature(
 
     _merge_outcome_signature() delegates here so the hash algorithm stays in
     one place; that method's behaviour and the #1688 thrash tests are unchanged.
+    Kept as a module-level function (rather than inlining the call at each
+    site) because ``test_merge_queue_auto_heal.py`` imports this name directly
+    from ``orchestrator.workflow``.
     """
-    cat = category or ''
-    hint = cause_hint or ''
-    if cat or hint:
-        basis = (cat + '\x1f' + _normalize_cause_hint(hint)).encode('utf-8')
-    else:
-        basis = _normalize_cause_hint(fallback_reason or '').encode('utf-8')
-    return hashlib.sha256(basis).hexdigest()[:16]
+    return RetryLedger.compute_merge_outcome_signature(category, cause_hint, fallback_reason)
 
 
 def compute_preexisting_main_break_fingerprint(
