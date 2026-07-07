@@ -2,7 +2,8 @@
 
 Mirrors the style of ``test_workflow_no_plan_cycle.py``: builds a minimal
 ``TaskWorkflow`` with mocks and drives ``_check_infra_resume_thrash``
-directly to assert state transitions.
+directly to assert state transitions. Counters live inside the typed
+``metadata.retry_ledger`` blob (:class:`shared.task_metadata.RetryLedger`).
 
 The counter is keyed by iteration-log entry count (canonical "agent ran
 real work" signal).  Steward fix-commits will reset the counter via
@@ -154,8 +155,10 @@ async def test_counter_increments_on_consecutive_infra_resumes_no_iter_growth():
     """Same iteration-log size + infra_issue category → counter increments."""
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 1,
-            'last_infra_resume_iteration_count': 5,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 1,
+                'last_infra_resume_iteration_count': 5,
+            },
         },
         iteration_log=[{'iteration': i} for i in range(5)],  # still 5
         resolved_l0s=[_esc(category='infra_issue')],
@@ -166,8 +169,9 @@ async def test_counter_increments_on_consecutive_infra_resumes_no_iter_growth():
     # Below threshold → fall through (None).
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_infra_resume_failures'] == 2
-    assert md['last_infra_resume_iteration_count'] == 5
+    ledger = md['retry_ledger']
+    assert ledger['consecutive_infra_resume_failures'] == 2
+    assert ledger['last_infra_resume_iteration_count'] == 5
     f.mark_blocked.assert_not_awaited()
 
 
@@ -176,8 +180,10 @@ async def test_counter_resets_to_one_when_iteration_log_grows():
     """Steward fix-commit advanced the iteration log → counter resets."""
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 2,
-            'last_infra_resume_iteration_count': 5,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 2,
+                'last_infra_resume_iteration_count': 5,
+            },
         },
         iteration_log=[{'iteration': i} for i in range(8)],  # grew 5 → 8
         resolved_l0s=[_esc(category='infra_issue')],
@@ -187,10 +193,11 @@ async def test_counter_resets_to_one_when_iteration_log_grows():
 
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_infra_resume_failures'] == 1, (
+    ledger = md['retry_ledger']
+    assert ledger['consecutive_infra_resume_failures'] == 1, (
         f'Counter must reset to 1 on iteration-log growth: {md}'
     )
-    assert md['last_infra_resume_iteration_count'] == 8
+    assert ledger['last_infra_resume_iteration_count'] == 8
 
 
 @pytest.mark.asyncio
@@ -198,8 +205,10 @@ async def test_counter_resets_to_zero_on_non_infra_category():
     """task_failure / design_concern / etc. → reset to zero."""
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 2,
-            'last_infra_resume_iteration_count': 5,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 2,
+                'last_infra_resume_iteration_count': 5,
+            },
         },
         iteration_log=[{'iteration': i} for i in range(5)],  # unchanged
         resolved_l0s=[_esc(category='task_failure')],
@@ -209,8 +218,9 @@ async def test_counter_resets_to_zero_on_non_infra_category():
 
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_infra_resume_failures'] == 0
-    assert md['last_infra_resume_iteration_count'] == 5
+    ledger = md['retry_ledger']
+    assert ledger['consecutive_infra_resume_failures'] == 0
+    assert ledger['last_infra_resume_iteration_count'] == 5
 
 
 @pytest.mark.asyncio
@@ -218,8 +228,10 @@ async def test_counter_promotes_to_l1_at_threshold():
     """Counter reaches max_consecutive_infra_resumes → escalate_to_human=True."""
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 2,  # one below default 3
-            'last_infra_resume_iteration_count': 5,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 2,  # one below default 3
+                'last_infra_resume_iteration_count': 5,
+            },
         },
         iteration_log=[{'iteration': i} for i in range(5)],  # unchanged
         resolved_l0s=[_esc(category='infra_issue')],
@@ -239,8 +251,10 @@ async def test_threshold_is_configurable_below_default():
     """Lowering max_consecutive_infra_resumes promotes earlier."""
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 1,  # one below threshold=2
-            'last_infra_resume_iteration_count': 0,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 1,  # one below threshold=2
+                'last_infra_resume_iteration_count': 0,
+            },
         },
         iteration_log=[],
         resolved_l0s=[_esc(category='infra_issue')],
@@ -259,8 +273,10 @@ async def test_no_queue_skips_classification_and_resets_counter():
     """Eval mode (no escalation queue) cannot classify the L0 → reset."""
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 2,
-            'last_infra_resume_iteration_count': 5,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 2,
+                'last_infra_resume_iteration_count': 5,
+            },
         },
         iteration_log=[{'iteration': i} for i in range(5)],
         no_queue=True,
@@ -270,16 +286,24 @@ async def test_no_queue_skips_classification_and_resets_counter():
 
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_infra_resume_failures'] == 0
+    assert md['retry_ledger']['consecutive_infra_resume_failures'] == 0
 
 
 @pytest.mark.asyncio
-async def test_metadata_persistence_failure_is_non_fatal():
-    """If scheduler.update_task raises, we still route correctly."""
+async def test_persistence_failure_escalates_to_human():
+    """If scheduler.update_task raises, the counter can't be trusted to have
+    landed — escalate to a human immediately rather than logging and
+    proceeding (a lost increment would let the infra-resume loop under-fire).
+
+    This is true even below threshold: persist failure always escalates,
+    regardless of the counter values themselves.
+    """
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 0,
-            'last_infra_resume_iteration_count': 0,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 0,
+                'last_infra_resume_iteration_count': 0,
+            },
         },
         iteration_log=[{'iteration': 1}],
         resolved_l0s=[_esc(category='infra_issue')],
@@ -288,18 +312,26 @@ async def test_metadata_persistence_failure_is_non_fatal():
 
     outcome = await f.wf._check_infra_resume_thrash()
 
-    # Below threshold → None despite the persistence failure.
-    assert outcome is None
-    f.mark_blocked.assert_not_awaited()
+    assert outcome == WorkflowOutcome.BLOCKED
+    f.mark_blocked.assert_awaited_once()
+    _, kwargs = f.mark_blocked.await_args
+    assert kwargs.get('escalate_to_human') is True
 
 
 @pytest.mark.asyncio
 async def test_corrupt_counter_metadata_treated_as_zero():
-    """Non-int counter (e.g. legacy task) must not crash the helper."""
+    """Non-int counter (e.g. legacy task) must not crash the helper.
+
+    RetryLedger validation fails on the whole blob (not just the bad field),
+    so the ledger resets to all-zeros rather than raising — same outcome as
+    the old per-field ``int()`` parsing, reached via whole-ledger reset.
+    """
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 'three',  # corrupt
-            'last_infra_resume_iteration_count': 5,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 'three',  # corrupt
+                'last_infra_resume_iteration_count': 5,
+            },
         },
         iteration_log=[{'iteration': i} for i in range(5)],
         resolved_l0s=[_esc(category='infra_issue')],
@@ -309,7 +341,7 @@ async def test_corrupt_counter_metadata_treated_as_zero():
 
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_infra_resume_failures'] == 1
+    assert md['retry_ledger']['consecutive_infra_resume_failures'] == 1
 
 
 @pytest.mark.asyncio
@@ -319,8 +351,10 @@ async def test_picks_most_recent_resolved_l0_by_resolved_at():
     newer = _esc(category='infra_issue', resolved_at='2026-04-27T12:00:00Z')
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 2,  # threshold=3 default
-            'last_infra_resume_iteration_count': 5,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 2,  # threshold=3 default
+                'last_infra_resume_iteration_count': 5,
+            },
         },
         iteration_log=[{'iteration': i} for i in range(5)],
         resolved_l0s=[older, newer],  # in any order
@@ -349,11 +383,12 @@ async def test_metadata_round_trips_via_scheduler_update():
     await f.wf._check_infra_resume_thrash()
 
     md = _persisted_metadata(f.update_task)
+    ledger = md['retry_ledger']
     # Both keys must be present and machine-readable on the next call.
-    assert isinstance(md['consecutive_infra_resume_failures'], int)
-    assert isinstance(md['last_infra_resume_iteration_count'], int)
-    assert md['consecutive_infra_resume_failures'] == 1
-    assert md['last_infra_resume_iteration_count'] == 3
+    assert isinstance(ledger['consecutive_infra_resume_failures'], int)
+    assert isinstance(ledger['last_infra_resume_iteration_count'], int)
+    assert ledger['consecutive_infra_resume_failures'] == 1
+    assert ledger['last_infra_resume_iteration_count'] == 3
 
 
 @pytest.mark.asyncio
@@ -366,12 +401,16 @@ async def test_persists_memory_hints_from_fresh_backend_metadata():
     incremented counter AND memory_hints from the fresh backend read.
     """
     in_memory_md = {
-        'consecutive_infra_resume_failures': 1,
-        'last_infra_resume_iteration_count': 5,
+        'retry_ledger': {
+            'consecutive_infra_resume_failures': 1,
+            'last_infra_resume_iteration_count': 5,
+        },
     }
     backend_md = {
-        'consecutive_infra_resume_failures': 1,
-        'last_infra_resume_iteration_count': 5,
+        'retry_ledger': {
+            'consecutive_infra_resume_failures': 1,
+            'last_infra_resume_iteration_count': 5,
+        },
         'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
     }
     f = _make(
@@ -386,7 +425,7 @@ async def test_persists_memory_hints_from_fresh_backend_metadata():
     # Below threshold (2 < 3) → fall through.
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_infra_resume_failures'] == 2, (
+    assert md['retry_ledger']['consecutive_infra_resume_failures'] == 2, (
         f'Counter must have incremented to 2; got {md}'
     )
     assert md.get('memory_hints') == {'entities': ['E1'], 'queries': ['q1']}, (
@@ -405,8 +444,10 @@ async def test_get_task_failure_falls_back_to_in_memory_metadata_and_warns(caplo
 
     f = _make(
         metadata={
-            'consecutive_infra_resume_failures': 0,
-            'last_infra_resume_iteration_count': 0,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 0,
+                'last_infra_resume_iteration_count': 0,
+            },
             'memory_hints': {'entities': ['E1']},
         },
         get_task_raises=True,
@@ -422,7 +463,7 @@ async def test_get_task_failure_falls_back_to_in_memory_metadata_and_warns(caplo
     # update_task must still be called once — persistence happens on the fallback path.
     f.update_task.assert_awaited_once()
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_infra_resume_failures'] == 1, (
+    assert md['retry_ledger']['consecutive_infra_resume_failures'] == 1, (
         f'Counter must advance on fallback path; got {md}'
     )
     # In-memory memory_hints survive because we fell back to the in-memory copy.
