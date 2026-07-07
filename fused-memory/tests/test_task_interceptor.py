@@ -7022,6 +7022,226 @@ class TestExtractMetadataFilesWarns:
         assert not warns, f"valid files list must not emit WARNINGs; got {warns!r}"
 
 
+# ── task 2166 step-5: _parse_metadata / _extract_metadata_dict discard WARN ──
+#
+# Both helpers delegate their malformed-input policy to
+# shared.task_metadata.parse_metadata(direction='read') and must emit a
+# task_metadata.schema_warning WARNING on a genuine whole-metadata discard
+# (unparseable JSON / non-object) while staying silent for legitimate
+# curator-internal extras (spawned_from, spawn_context, files_to_modify) and
+# valid JSON-string metadata — those aren't discards, so no census line.
+
+
+class TestParseMetadataAndExtractMetadataDictWarnOnDiscard:
+    def test_parse_metadata_unparseable_string_warns_and_returns_empty_dict(self, caplog):
+        """RED: _parse_metadata currently coerces 'garbage{{{' to {} silently."""
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._parse_metadata({'metadata': 'garbage{{{'})
+        assert result == {}
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('task_metadata.schema_warning' in r.message for r in warns), (
+            f'expected a task_metadata.schema_warning WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_extract_metadata_dict_unparseable_string_warns_and_returns_none(self, caplog):
+        """RED: _extract_metadata_dict currently coerces 'garbage{{{' to None silently."""
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._extract_metadata_dict('garbage{{{')
+        assert result is None
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('task_metadata.schema_warning' in r.message for r in warns), (
+            f'expected a task_metadata.schema_warning WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_parse_metadata_curator_extras_no_warning(self, caplog):
+        """Curator-internal extras are legitimate, not a discard — zero warnings."""
+        meta = {
+            'files': ['a.py'], 'files_to_modify': ['b.py'],
+            'spawned_from': '42', 'spawn_context': 'auto',
+        }
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._parse_metadata({'metadata': meta})
+        assert result == meta
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'curator extras must not emit a WARNING; got {[r.message for r in warns]!r}'
+        )
+
+    def test_extract_metadata_dict_curator_extras_no_warning(self, caplog):
+        """Curator-internal extras are legitimate, not a discard — zero warnings."""
+        meta = {
+            'files': ['a.py'], 'files_to_modify': ['b.py'],
+            'spawned_from': '42', 'spawn_context': 'auto',
+        }
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._extract_metadata_dict(meta)
+        assert result == meta
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'curator extras must not emit a WARNING; got {[r.message for r in warns]!r}'
+        )
+
+    def test_parse_metadata_valid_json_string_no_warning(self, caplog):
+        """A well-formed JSON-string metadata parses to the equal raw dict, no warning."""
+        meta = {'files': ['a.py'], 'spawned_from': '42'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._parse_metadata({'metadata': json.dumps(meta)})
+        assert result == meta
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'valid JSON-string metadata must not emit a WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_extract_metadata_dict_valid_json_string_no_warning(self, caplog):
+        """A well-formed JSON-string metadata parses to the equal raw dict, no warning."""
+        meta = {'files': ['a.py'], 'spawned_from': '42'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._extract_metadata_dict(json.dumps(meta))
+        assert result == meta
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'valid JSON-string metadata must not emit a WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_parse_metadata_empty_string_no_warning(self, caplog):
+        """Amendment: an empty-string metadata is benign-absent, not a discard.
+
+        Mirrors the pre-collapse ``isinstance(raw, str) and raw`` guard —
+        '' must not emit a task_metadata.schema_warning census line.
+        """
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._parse_metadata({'metadata': ''})
+        assert result == {}
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
+        )
+
+    def test_extract_metadata_dict_empty_string_no_warning(self, caplog):
+        """Amendment: an empty-string metadata is benign-absent, not a discard."""
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = TaskInterceptor._extract_metadata_dict('')
+        assert result is None
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
+        )
+
+
+# ── task 2166 step-7: _merged_audit_metadata discard WARN ──
+#
+# _merged_audit_metadata's inline before['metadata'] str-parse must delegate
+# to shared.task_metadata.parse_metadata(direction='read') the same way
+# _parse_metadata/_extract_metadata_dict do (step-5/6): warn loudly on a
+# genuine whole-metadata discard (unparseable JSON / non-object) while
+# staying silent for valid dict/JSON-string metadata, and preserve the
+# audit-wins merge semantics unchanged.
+
+
+class TestMergedAuditMetadataWarnsOnDiscard:
+    def test_unparseable_string_warns_and_merges_onto_empty_dict(self, caplog):
+        """RED: current inline parse coerces 'garbage{{{' to {} silently."""
+        from fused_memory.middleware.task_interceptor import _merged_audit_metadata
+
+        audit_fields = {'reopen_reason': 'retry'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = _merged_audit_metadata({'metadata': 'garbage{{{'}, audit_fields)
+        assert result == audit_fields
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('task_metadata.schema_warning' in r.message for r in warns), (
+            f'expected a task_metadata.schema_warning WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_valid_dict_metadata_merges_audit_wins_no_warning(self, caplog):
+        """Audit fields win on collision; a valid dict is not a discard."""
+        from fused_memory.middleware.task_interceptor import _merged_audit_metadata
+
+        existing = {'files': ['a.py'], 'reopen_reason': 'stale'}
+        audit_fields = {'reopen_reason': 'fresh'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = _merged_audit_metadata({'metadata': existing}, audit_fields)
+        assert result == {'files': ['a.py'], 'reopen_reason': 'fresh'}
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'valid dict metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
+        )
+
+    def test_valid_json_string_metadata_merges_audit_wins_no_warning(self, caplog):
+        """Audit fields win on collision; a valid JSON string is not a discard."""
+        from fused_memory.middleware.task_interceptor import _merged_audit_metadata
+
+        existing = {'files': ['a.py'], 'reopen_reason': 'stale'}
+        audit_fields = {'reopen_reason': 'fresh'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = _merged_audit_metadata({'metadata': json.dumps(existing)}, audit_fields)
+        assert result == {'files': ['a.py'], 'reopen_reason': 'fresh'}
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'valid JSON-string metadata must not emit a WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_empty_string_metadata_no_warning(self, caplog):
+        """Amendment: an empty-string metadata is benign-absent, not a discard.
+
+        Mirrors the pre-collapse ``isinstance(raw, str) and raw`` guard — a
+        legacy row storing '' must merge audit_fields onto {} silently,
+        exactly like the None case, instead of emitting a spurious
+        task_metadata.schema_warning census line.
+        """
+        from fused_memory.middleware.task_interceptor import _merged_audit_metadata
+
+        audit_fields = {'reopen_reason': 'retry'}
+        with caplog.at_level(logging.WARNING, logger=_TI_LOGGER):
+            result = _merged_audit_metadata({'metadata': ''}, audit_fields)
+        assert result == audit_fields
+        warns = [
+            r for r in caplog.records
+            if r.name == _TI_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'empty-string metadata must not emit a WARNING; got {[r.message for r in warns]!r}'
+        )
+
+
 # ── task-1810 step-15/16: _check_escalation_idempotency tuple sentinel ──
 
 

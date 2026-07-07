@@ -10,7 +10,7 @@ import uuid as uuid_mod
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 
 try:
     from shared.cli_invoke import AllAccountsCappedException  # type: ignore[import]
@@ -31,6 +31,7 @@ except ImportError:
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
+from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -84,6 +85,72 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
+# value was discarded — parse_metadata could not resolve any dict at all.
+# Only these are loud from the read-path parsers below; 'unknown_key' /
+# 'invalid_field' / 'invalid_submodel' etc. are expected on legitimate
+# curator-internal metadata (files_to_modify, spawned_from, spawn_context)
+# and belong to the write boundary (W3-β's _emit_schema_warning census),
+# not these read-path helpers — emitting them here would flood the
+# `task_metadata.schema_warning` census that θ2's enforce-flip gate greps
+# for zero lines against schema-clean metadata.
+_METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
+
+
+def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
+    """Best-effort parse of *metadata* into a raw dict.
+
+    Returns ``(None, warnings)`` when *metadata* is non-None but cannot be
+    resolved to a JSON object at all — *warnings* then carries
+    ``shared.task_metadata.parse_metadata``'s diagnosis
+    (``direction='read'``). Returns ``(None, [])`` for ``None`` and for an
+    empty string (both benign-absent — mirrors the pre-collapse
+    ``isinstance(raw, str) and raw`` guard so a blank string is never a
+    discard), and ``(dict, [])`` for anything already resolvable to a dict.
+
+    The returned dict — when not ``None`` — is always independently
+    re-derived from *metadata*, never ``parse_metadata(...).model_dump()``,
+    so unknown/curator-internal keys round-trip byte-for-value (I1) instead
+    of gaining ``TaskMetadata``'s typed-field defaults.
+
+    A string is parsed with a local ``json.loads`` first; ``parse_metadata``
+    is only invoked on the failure path to obtain its diagnosis. The two
+    discard codes this function surfaces (``unparseable_json`` /
+    ``not_an_object``) are fully determined by that same
+    loads-then-isinstance check, so a string that already parses to a dict
+    never pays for ``parse_metadata``'s ``apply_migrations`` /
+    submodel-validation / ``TaskMetadata`` construction — none of that
+    output is used here.
+    """
+    if metadata is None:
+        return None, []
+    if isinstance(metadata, dict):
+        return metadata, []
+    if isinstance(metadata, str):
+        if not metadata:
+            return None, []
+        try:
+            parsed = json.loads(metadata)
+        except ValueError:
+            _, warnings = parse_metadata(metadata, direction='read')
+            return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
+        if isinstance(parsed, dict):
+            return parsed, []
+        _, warnings = parse_metadata(metadata, direction='read')
+        return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
+    return None, []
+
+
+def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
+    """Emit the ``task_metadata.schema_warning`` census line for a whole-metadata discard."""
+    reason = '; '.join(w.message for w in warnings) or 'unrecognised shape'
+    logger.warning(
+        'task_metadata.schema_warning source=%s error=%s (type=%s); metadata discarded',
+        source,
+        reason,
+        type(metadata).__name__,
+    )
 
 
 def _journal_param_clip(value: Any, *, limit: int = 200) -> Any:
@@ -1016,13 +1083,19 @@ class TaskInterceptor:
 
         Single source of truth for the get / json.loads / isinstance-dict
         dance shared by :meth:`_extract_meta_files` and :meth:`_build_candidate`.
+
+        Delegates the malformed-string-policy to
+        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
+        and emits a ``task_metadata.schema_warning`` WARNING when a
+        non-empty string is a genuine whole-metadata discard (unparseable
+        JSON / non-object) — I4: this replaces a silent ``{}`` coercion.
         """
         meta = kwargs.get('metadata') or {}
         if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except Exception:
-                meta = {}
+            parsed, warnings = _parse_metadata_value(meta)
+            if warnings:
+                _warn_metadata_discard('TaskInterceptor._parse_metadata', meta, warnings)
+            meta = parsed if parsed is not None else {}
         if not isinstance(meta, dict):
             meta = {}
         return meta
@@ -1459,18 +1532,18 @@ class TaskInterceptor:
 
     @staticmethod
     def _extract_metadata_dict(metadata) -> dict | None:
-        """Best-effort parse of ``metadata`` into a dict, or None."""
-        if metadata is None:
-            return None
-        if isinstance(metadata, dict):
-            return metadata
-        if isinstance(metadata, str):
-            try:
-                parsed = json.loads(metadata)
-            except (json.JSONDecodeError, ValueError):
-                return None
-            return parsed if isinstance(parsed, dict) else None
-        return None
+        """Best-effort parse of ``metadata`` into a dict, or None.
+
+        Delegates the malformed-string policy to
+        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
+        and emits a ``task_metadata.schema_warning`` WARNING when a non-None
+        *metadata* cannot be resolved to a dict — I4: this replaces a silent
+        ``None`` coercion.
+        """
+        parsed, warnings = _parse_metadata_value(metadata)
+        if warnings:
+            _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
+        return parsed
 
     @staticmethod
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
@@ -3578,11 +3651,16 @@ def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> d
     }
 
 
-_VALID_PROVENANCE_KINDS = (
-    'merged',
-    'found_on_main',
-    'deterministic-deploy',
-    'deterministic-deploy-scheduled',
+# Single source of truth for done_provenance.kind membership (I2) — derived
+# once from shared.task_metadata.DoneProvenance rather than re-derived on
+# every _validate_done_provenance call (the retired _VALID_PROVENANCE_KINDS
+# was a module-level constant too; this keeps that shape while sourcing the
+# values from the shared model so a 5th kind auto-propagates here and into
+# the human-readable message below without a second edit).
+_DONE_PROVENANCE_KINDS = get_args(DoneProvenance.model_fields['kind'].annotation)
+_DONE_PROVENANCE_KINDS_TEXT = (
+    ', '.join(f'"{k}"' for k in _DONE_PROVENANCE_KINDS[:-1])
+    + f', or "{_DONE_PROVENANCE_KINDS[-1]}"'
 )
 
 
@@ -3702,12 +3780,10 @@ async def _validate_done_provenance(
             'self-restart that was scheduled but not yet verified (no '
             'commit required).',
         ), None
-    if kind not in _VALID_PROVENANCE_KINDS:
+    if kind not in _DONE_PROVENANCE_KINDS:
         return _done_provenance_error(
             task_id,
-            f'done_provenance.kind must be "merged", "found_on_main", '
-            f'"deterministic-deploy", or "deterministic-deploy-scheduled" '
-            f'(got {kind!r})',
+            f'done_provenance.kind must be {_DONE_PROVENANCE_KINDS_TEXT} (got {kind!r})',
         ), None
 
     if kind == 'merged' and commit_input is None:
@@ -3887,18 +3963,19 @@ def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
 
     Audit fields win on collision (a fresh ``reopen_reason`` should never be
     shadowed by a stale one from an earlier reopen).
+
+    Delegates the malformed-string policy to
+    :func:`shared.task_metadata.parse_metadata` (``direction='read'``) via
+    :func:`_parse_metadata_value` and emits a ``task_metadata.schema_warning``
+    WARNING when a non-None ``before['metadata']`` cannot be resolved to a
+    dict — I4: this replaces a silent discard (the merge still proceeds onto
+    ``{}`` so behaviour is otherwise unchanged).
     """
-    existing: dict = {}
     raw = before.get('metadata') if isinstance(before, dict) else None
-    if isinstance(raw, dict):
-        existing = dict(raw)
-    elif isinstance(raw, str) and raw:
-        try:
-            loaded = json.loads(raw)
-        except (ValueError, TypeError):
-            loaded = None
-        if isinstance(loaded, dict):
-            existing = loaded
+    parsed, warnings = _parse_metadata_value(raw)
+    if warnings:
+        _warn_metadata_discard('_merged_audit_metadata', raw, warnings)
+    existing: dict = parsed if isinstance(parsed, dict) else {}
     return {**existing, **audit_fields}
 
 

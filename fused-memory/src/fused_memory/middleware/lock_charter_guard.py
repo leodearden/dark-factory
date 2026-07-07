@@ -54,7 +54,19 @@ tests:
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+from shared.task_metadata import parse_metadata
+
+logger = logging.getLogger(__name__)
+
+# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
+# value was discarded — parse_metadata could not produce any dict at all.
+# Only these are loud here; 'unknown_key'/'invalid_field'/'invalid_submodel'
+# etc. are expected on legitimate curator-internal metadata and belong to
+# the write boundary (W3-β), not this read-path guard.
+_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 
 # ---------------------------------------------------------------------------
 # Canonical extension allowlist — kept in sync with shared.locking.CODE_EXTENSIONS.
@@ -169,6 +181,14 @@ def extract_files(metadata: str | dict[str, Any] | None) -> list[str]:
     - If the resolved dict has no ``files`` key → []
     - If ``files`` is not a list → []
     - Return only the string entries of the list.
+
+    The ``str`` branch delegates its malformed-input policy to
+    :func:`shared.task_metadata.parse_metadata` (``direction='read'``) and
+    emits a ``task_metadata.schema_warning`` WARNING when *metadata* cannot
+    be resolved to a JSON object at all (unparseable JSON / non-object) — I4:
+    this replaces a silent ``[]`` coercion. The dict-path extraction below is
+    untouched, so mixed-type-list filtering and non-list-``files`` behaviour
+    are unchanged.
     """
     if metadata is None:
         return []
@@ -176,12 +196,26 @@ def extract_files(metadata: str | dict[str, Any] | None) -> list[str]:
     parsed: dict[str, Any] | None = None
     if isinstance(metadata, dict):
         parsed = metadata
+    elif isinstance(metadata, str) and not metadata:
+        # Empty string is benign-absent, not a discard — mirrors the
+        # pre-collapse `isinstance(raw, str) and raw` guard.
+        return []
     elif isinstance(metadata, str):
-        try:
-            loaded = json.loads(metadata)
-        except (ValueError, TypeError):
+        _, warnings = parse_metadata(metadata, direction='read')
+        discard = [w for w in warnings if w.code in _DISCARD_CODES]
+        if discard:
+            reason = '; '.join(w.message for w in discard) or 'unrecognised shape'
+            logger.warning(
+                'task_metadata.schema_warning source=lock_charter_guard.extract_files '
+                'error=%s (type=%s); metadata discarded',
+                reason,
+                type(metadata).__name__,
+            )
             return []
-        parsed = loaded if isinstance(loaded, dict) else None
+        # parse_metadata already confirmed this parses to a JSON object —
+        # reparse independently for the raw dict (see docstring above: never
+        # model_dump()).
+        parsed = json.loads(metadata)
 
     if parsed is None:
         return []

@@ -8,11 +8,14 @@ Step 5 (RED → step-6 GREEN): inject_task_kind normalization.
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 from fused_memory.middleware.deterministic_task_guard import (
     deterministic_task_error,
 )
+
+_DTG_LOGGER = 'fused_memory.middleware.deterministic_task_guard'
 
 # ---------------------------------------------------------------------------
 # Step-1: invariant matrix tests (no filesystem)
@@ -384,3 +387,76 @@ class TestInjectTaskKind:
         inject_task_kind = self._import_inject()
         result = inject_task_kind({}, 'deterministic')
         assert result['task_kind'] == 'deterministic'
+
+    def test_unparseable_string_warns_schema_warning_census_token(self, caplog):
+        """Unparseable metadata string emits a task_metadata.schema_warning WARNING.
+
+        I4: the whole-metadata discard must be observable, mirroring
+        TaskInterceptor._inject_routing_override's discard WARNING. The
+        return value is unchanged — {'task_kind': ...} remains the only
+        sensible fallback for an unparseable string.
+        """
+        inject_task_kind = self._import_inject()
+        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+            result = inject_task_kind('not valid json!!!', 'normal')
+        assert result == {'task_kind': 'normal'}
+        warns = [
+            r for r in caplog.records
+            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('task_metadata.schema_warning' in r.message for r in warns), (
+            f'expected a task_metadata.schema_warning WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_non_dict_json_value_warns_schema_warning_census_token(self, caplog):
+        """A syntactically valid JSON value that isn't an object (a bare list)
+        is also a whole-metadata discard and must warn identically."""
+        inject_task_kind = self._import_inject()
+        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+            result = inject_task_kind('[1,2,3]', 'normal')
+        assert result == {'task_kind': 'normal'}
+        warns = [
+            r for r in caplog.records
+            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('task_metadata.schema_warning' in r.message for r in warns), (
+            f'expected a task_metadata.schema_warning WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_valid_dict_metadata_emits_no_warning(self, caplog):
+        """A well-formed dict is not a discard: no schema_warning WARNING, and
+        curator-internal extras (spawned_from) survive alongside task_kind."""
+        inject_task_kind = self._import_inject()
+        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+            result = inject_task_kind({'foo': 'bar', 'spawned_from': 'x'}, 'deterministic')
+        assert result == {'foo': 'bar', 'spawned_from': 'x', 'task_kind': 'deterministic'}
+        warns = [
+            r for r in caplog.records
+            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'valid dict metadata must not emit a WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
+
+    def test_empty_string_metadata_no_warning(self, caplog):
+        """Amendment: an empty-string metadata is benign-absent, not a discard.
+
+        Mirrors the pre-collapse ``isinstance(raw, str) and raw`` guard —
+        '' must fall back to a fresh dict exactly like None, without
+        emitting a task_metadata.schema_warning census line.
+        """
+        inject_task_kind = self._import_inject()
+        with caplog.at_level(logging.WARNING, logger=_DTG_LOGGER):
+            result = inject_task_kind('', 'normal')
+        assert result == {'task_kind': 'normal'}
+        warns = [
+            r for r in caplog.records
+            if r.name == _DTG_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert not warns, (
+            f'empty-string metadata must not emit a WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
