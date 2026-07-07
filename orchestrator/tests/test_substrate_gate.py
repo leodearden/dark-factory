@@ -484,6 +484,7 @@ def _make_harness(tmp_path: Path):
     h.git_ops.resolve_branch_sha = AsyncMock(return_value='deadbeef' * 5)  # 40-char SHA
     h.git_ops.worktree_base = tmp_path / '.worktrees'
     h.git_ops.project_root = tmp_path
+    h.git_ops.prune_worktrees = AsyncMock(return_value=None)
 
     # No escalation queue by default — tests that need one attach it explicitly
     h._escalation_queue = None
@@ -1286,4 +1287,70 @@ class TestSubstrateGateForeignBandGuard:
             'expected the gate to succeed — the pre-existing stale worktree '
             'at the owned gate_path must still be cleaned up by the '
             'pre-clean sweep'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSubstrateGatePruneChokepoint — gitops-chokepoints β (task 2190).
+#
+# The substrate-gate pre-clean's prune half must route through the guarded
+# GitOps.prune_worktrees(context=...) chokepoint (added by α, task 2185)
+# rather than issuing a raw ('git', 'worktree', 'prune') subprocess argv.
+# ---------------------------------------------------------------------------
+
+
+class TestSubstrateGatePruneChokepoint:
+    """gitops-chokepoints β: the substrate-gate pre-clean's prune half routes
+    through ``GitOps.prune_worktrees(context='substrate-gate-cleanup')``
+    instead of a raw ``git worktree prune`` argv (mocked ``git_ops``)."""
+
+    @pytest.mark.asyncio
+    async def test_preclean_calls_prune_worktrees_with_context(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """The pre-clean loop calls the guarded chokepoint with the
+        'substrate-gate-cleanup' context, not a raw prune subprocess."""
+        h = _make_harness(tmp_path)
+        assignment = _make_assignment()
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+        with patch('asyncio.create_subprocess_exec', new=AsyncMock(
+            return_value=_fake_proc(0)
+        )):
+            result = await h._run_substrate_gate(assignment)
+
+        assert result is True
+        h.git_ops.prune_worktrees.assert_awaited_once_with(
+            context='substrate-gate-cleanup',
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_raw_prune_argv_in_subprocess_calls(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """No subprocess call in the gate path issues a raw
+        ('git', 'worktree', 'prune') argv — prune only happens via the
+        chokepoint delegate, asserted above."""
+        h = _make_harness(tmp_path)
+        assignment = _make_assignment()
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+        exec_mock = AsyncMock(return_value=_fake_proc(0))
+        with patch('asyncio.create_subprocess_exec', exec_mock):
+            result = await h._run_substrate_gate(assignment)
+
+        assert result is True
+        prune_argv_calls = [
+            c for c in exec_mock.call_args_list
+            if tuple(c.args) == ('git', 'worktree', 'prune')
+        ]
+        assert not prune_argv_calls, (
+            f'expected no raw ("git", "worktree", "prune") subprocess call; '
+            f'found {prune_argv_calls!r}'
         )
