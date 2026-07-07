@@ -8770,18 +8770,40 @@ Output JSON matching the schema. Every task must appear in the output.
 
         action = self._resolve_escalation_action(escalation)
 
-        if action == 'close_only':
-            # Operator closed the escalation without a re-pend — leave the task
-            # in its current state (dismissed means "abandon; stay blocked").
+        # Table B (ω3, task 2196): target_status and workflow routing are
+        # sourced from escalation.action_effects.effect_for — the SAME
+        # authority escalation.server.resolve_issue already consumes
+        # (server.py:671). This replaces the harness's former independent
+        # _ACTION_TARGETS copy and action-string routing, closing the Table B
+        # drift (PRD task-status-authority C6, finding 10.0).
+        from escalation.action_effects import (  # noqa: PLC0415
+            WORKFLOW_NONE,
+            WORKFLOW_RESUME,
+            effect_for,
+        )
+
+        effect = effect_for(action, escalation.level, escalation.category)
+        if effect is None:
+            # action outside the five actions ACTION_EFFECTS recognises.
+            logger.warning(
+                'escalation %s: unrecognised action %r for task %s — ignored',
+                escalation.id, action, escalation.task_id,
+            )
+            return
+
+        if effect.workflow_disposition == WORKFLOW_NONE:
+            # close_only: operator closed the escalation without a re-pend —
+            # leave the task in its current state (dismissed means "abandon;
+            # stay blocked").
             logger.info(
                 'escalation %s resolved with close_only — no status change '
                 'for task %s', escalation.id, escalation.task_id,
             )
             return
 
-        if action == 'resume':
-            # Re-pend the blocked task.  Still gated level==1 here (step-2);
-            # D7: level>=1 gate — covers L1 members and born-at-L2 orphans alike.
+        if effect.workflow_disposition == WORKFLOW_RESUME:
+            # Re-pend the blocked task.  D7: level>=1 gate — covers L1 members
+            # and born-at-L2 orphans alike.
             # Cascade member: resolved_by startswith 'l2-cascade:' (the cascade
             # fired _resolve_callback for the L2 first, then each member with
             # 'l2-cascade:<id>').  Direct/orphan: NOT l2-cascade AND task_id
@@ -8818,23 +8840,18 @@ Output JSON matching the schema. Every task must appear in the output.
         # restart / park / abandon → teardown + status write.
         # park → 'blocked' (version-a): quiescence rests on the open L2 escalation
         # suppressing Fix #1b stranded_blocked re-filing, not on the 'deferred' status.
-        _ACTION_TARGETS = {'restart': 'pending', 'park': 'blocked', 'abandon': 'cancelled'}
-        target = _ACTION_TARGETS.get(action)
-        if target is not None:
-            self._schedule_coro_threadsafe(
-                self._action_teardown_and_set_status(
-                    escalation.task_id, target, action,
-                ),
-                label=(
-                    f'action-teardown task {escalation.task_id} '
-                    f'action={action} target={target}'
-                ),
-            )
-        else:
-            logger.warning(
-                'escalation %s: unrecognised action %r for task %s — ignored',
-                escalation.id, action, escalation.task_id,
-            )
+        # effect.target_status is Table B's target for `action`; every entry
+        # reaching this point (disposition not NONE/RESUME) carries a str target.
+        assert effect.target_status is not None
+        self._schedule_coro_threadsafe(
+            self._action_teardown_and_set_status(
+                escalation.task_id, effect.target_status, action,
+            ),
+            label=(
+                f'action-teardown task {escalation.task_id} '
+                f'action={action} target={effect.target_status}'
+            ),
+        )
 
     async def _action_teardown_and_set_status(
         self,
