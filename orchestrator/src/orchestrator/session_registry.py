@@ -19,6 +19,7 @@ record shape (PRD §6 G5).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -212,3 +213,94 @@ def transcript_path_for_cwd(cwd: str) -> str:
     """
     encoded = cwd.replace('/', '-').replace('.', '-')
     return f'~/.claude/projects/{encoded}'
+
+
+# ---------------------------------------------------------------------------
+# Single-writer atomic write / read / update
+# ---------------------------------------------------------------------------
+
+
+class CorruptSessionRecord(Exception):
+    """Raised by read_record when a record.json exists but fails to parse."""
+
+
+def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
+    """Atomically write *record* (tmp file in the same dir, then os.replace).
+
+    Mirrors ``LaneStore._write`` (lane_lifecycle.py:279-298): the tmp file is
+    created in the target's own parent dir so the replace stays within one
+    filesystem, and is cleaned up on any failure. Every successful write
+    bumps record.json's mtime, which reap_stale_records() reads as this
+    record's heartbeat.
+    """
+    path = record_path_for_slug(record.session_slug, root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(
+        suffix='.tmp', prefix=path.stem, dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(record.to_json())
+        os.replace(tmp_path_str, str(path))
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path_str)
+        raise
+
+
+def read_record(slug: str, root: Path | str | None = None) -> SessionRecord:
+    """Read the record for *slug*.
+
+    Raises ``FileNotFoundError`` if no record.json exists at this key, or
+    ``CorruptSessionRecord`` if one exists but fails to parse -- so callers
+    can tell "no record yet" apart from "record present but unreadable".
+    """
+    path = record_path_for_slug(slug, root=root)
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    try:
+        return SessionRecord.from_json(path.read_text())
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise CorruptSessionRecord(f'unparseable session record at {path}') from exc
+
+
+def update_status(
+    slug: str,
+    root: Path | str | None = None,
+    *,
+    status: Status,
+    exit_code: int | None = None,
+) -> SessionRecord:
+    """Strict read-modify-write of *status* (and optionally *exit_code*).
+
+    Raises if no record exists for *slug* -- used by the ``exit`` CLI
+    subcommand (spawn-claude.sh's ``finish()``), where a missing record
+    signals a genuine bug: the ``launching`` write should already have
+    created it moments earlier.
+    """
+    record = read_record(slug, root=root)
+    record.status = status
+    if exit_code is not None:
+        record.exit_code = exit_code
+    write_record(record, root=root)
+    return record
+
+
+def refresh_record(
+    slug: str,
+    root: Path | str | None = None,
+    *,
+    status: Status | None = None,
+) -> SessionRecord:
+    """Read-modify-write used by the T6 hook seam; bumps the mtime heartbeat.
+
+    Strict as of this task (raises if no record exists, like update_status).
+    T6's hand-launched-capture path additionally needs upsert-on-absent
+    semantics for a session with no prior spawn-claude.sh write; that
+    extension lands in step-16 alongside the ``refresh`` CLI subcommand.
+    """
+    record = read_record(slug, root=root)
+    if status is not None:
+        record.status = status
+    write_record(record, root=root)
+    return record
