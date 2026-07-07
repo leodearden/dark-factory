@@ -893,7 +893,13 @@ class TaskWorkflow:
         # hit) or 'fallback' (_has_prior_implementation heuristic).  Stays None
         # unless an already-merged guard actually finalised a recovery-DONE
         # (PRD workflow-state-machine α, Contract §8 MP-2: no recovery-DONE
-        # without a provenance basis).
+        # without a provenance basis).  Intentionally in-process-only: there is
+        # no production reader today.  Its persisted counterpart is the `note`/
+        # `done_provenance` scheduler.mark_done records in _finalise_recovery_done
+        # (that's what a human or another process would inspect); this attribute
+        # exists so tests can assert the MP-2 invariant directly against live
+        # workflow state instead of re-deriving it from mock call args — see
+        # TestNoPhantomDoneProperty in test_workflow_merge_provenance.py.
         self._merge_recovery_basis: str | None = None
         self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
