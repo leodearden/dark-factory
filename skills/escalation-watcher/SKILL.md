@@ -378,6 +378,28 @@ Neither the per-task steward nor the auto-watcher has seen this record. Read `su
 - **`triage_suggestions` / `fix_review_issues`** — Routing hints confirming what the category tells you. No new information.
 - **Free-form text** (e.g., "Restore Value::Frame from previous commits") — Valuable diagnostic context about what the escalating agent *thought* would help. Read it as a starting point for investigation, not as instructions — the agent was stuck, so its diagnosis may be incomplete.
 
+**Additive-context convention for spawned `/unblock` prompts.** Several categories below spawn an
+interactive `/unblock` session with a prompt of the form `/unblock <task_id> (esc <escalation_id>,
+<category>, <severity>: <summary>)`. Only the leading `/unblock <task_id>` token is load-bearing:
+`/unblock`'s own Step 0 (Locate the task) extracts `<task_id>` from it, and Step 1 (Gather context)
+re-derives all context — escalation, task status, git state — fresh from `TASK_ID`
+(`skills/unblock/SKILL.md`). The trailing `(esc ...)` context is purely additive, there only to
+orient the human reading the terminal before `/unblock` runs, so it stays non-load-bearing even if
+a section's summary below drifts out of date.
+
+Two mechanical caveats when building this prompt string:
+- **Which number is the task id.** The parenthetical introduces a second number (`<escalation_id>`);
+  Step 0 must take only the number immediately following `/unblock` as `<task_id>` — `<escalation_id>`
+  always sits behind the `esc ` token inside the parenthetical, never in the leading position, so the
+  leading number is unambiguous.
+- **Escape or truncate `<summary>` before interpolating.** Escalation summaries are free text and may
+  contain single quotes, parens, or newlines. Collapse `<summary>` to a single line, and either
+  shell-escape inner single quotes as `'\''` per `/spawn`'s Arguments section (`skills/spawn/SKILL.md`)
+  or truncate it to a short slug — otherwise an unescaped quote in the summary breaks the
+  single-quoted `<prompt>` argument passed to `spawn-claude.sh`, and the spawn fails or truncates.
+
+Each call site below notes this briefly rather than repeating the full explanation.
+
 ### `review_suggestions` (info)
 
 > **This handler is unreachable at L2.** Review suggestions reach live workflows as curator tickets
@@ -392,7 +414,7 @@ Blocking issues found during code review — the review cycle exhausted without 
 
 This is distinct from `review_suggestions` (info-level, non-blocking). Review issues are real problems that prevented the task from merging.
 
-**Spawn an interactive `/unblock` session** via the `/spawn` skill: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — `/unblock` resolves it when the human finishes. The human needs to see the specific blocking issues and decide how to fix them.
+**Spawn an interactive `/unblock` session** via the `/spawn` skill: invoke `/spawn` with `prompt="/unblock <task_id> (esc <escalation_id>, review_issues, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` (e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention), `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — `/unblock` resolves it when the human finishes. The human needs to see the specific blocking issues and decide how to fix them. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
 If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
@@ -400,7 +422,7 @@ If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B
 
 Merge conflicts, verification failures, build breaks. The task agent is stopped and waiting.
 
-**Spawn an interactive `/unblock` session** so the human can investigate and resolve it: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked.
+**Spawn an interactive `/unblock` session** so the human can investigate and resolve it: invoke `/spawn` with `prompt="/unblock <task_id> (esc <escalation_id>, task_failure, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` (e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention), `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
 If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
@@ -419,7 +441,7 @@ Two flavours:
 - For `wip_conflict`: recovery branch named in the detail preserves the user's WIP; they may need to cherry-pick or reapply before resolving.
 - For `unmerged_state`: run `git status` in `project_root`; UU/AA/DD files need `git mergetool`, manual edit, or `git reset` depending on intent.
 
-**Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished.
+**Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, <wip_conflict|unmerged_state>, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished. The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
 **Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss. (Historical context: pre-fix, this was a common symptom of the category-match un-halt bug.)
 
@@ -453,7 +475,7 @@ Agent found it depends on work that isn't done yet.
      resolved_by="escalation-watcher"
    )
    ```
-3. **If no matching task exists**: spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`).
+3. **If no matching task exists**: spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, dependency_discovered, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`). The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
 ### `design_concern` (info or blocking)
 
@@ -515,7 +537,7 @@ Technical debt or cleanup discovered during development.
   ```
 
   Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
-- **Blocking** (rare): spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`).
+- **Blocking** (rare): spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, cleanup_needed, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`). The trailing `(esc ...)` context is additive only (see the additive-context convention note above).
 
 ### `infra_issue` (blocking)
 
