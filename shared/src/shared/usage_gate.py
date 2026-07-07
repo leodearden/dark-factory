@@ -309,6 +309,27 @@ class UsageGate:
     Tracks cap status per account and returns the first available account's
     token from ``before_invoke()``. Only blocks when *all* accounts are
     capped.  Works with 1 or N accounts.
+
+    Phase precedence — CAPPED takes precedence over AUTH_FAILED: an account
+    already CAPPED that then also hits an auth failure (e.g. a concurrent
+    caller's 403 on a token that gets revoked while the account is capped)
+    stays CAPPED rather than demoting to AUTH_FAILED — see
+    ``_handle_auth_failure`` and ``_LEGAL_TRANSITIONS`` (CAPPED's only legal
+    outbound edge is PROBING; CAPPED -> AUTH_FAILED is not legal). This is a
+    deliberate choice, not a defect, but it does mean the two blocked
+    reasons are not independently observable while an account is CAPPED.
+
+    Recovery for a genuinely revoked token while CAPPED: if ``resets_at`` is
+    known, ``_refresh_capped_accounts``/``before_invoke`` will move the
+    account CAPPED -> PROBING -> PROBE_IN_FLIGHT once ``resets_at`` passes
+    and hand it a real invocation, which will correctly reclassify it as
+    AUTH_FAILED on a genuine 401/403 (the account is no longer CAPPED at
+    that point, so the edge is legal). If ``resets_at`` is unknown (unset),
+    ``_account_resume_probe_loop`` has no such deadline and will keep
+    re-probing indefinitely at the ``max_probe_interval_secs`` backoff
+    ceiling — recovery then requires an operator token refresh + SIGHUP
+    (``_on_sighup_async`` force-resets every account to AVAILABLE). See
+    PRD §7.3 (task W4-γ) for the full transition table.
     """
 
     def __init__(self, config: UsageCapConfig, *, cost_store: CostStore | None = None):
@@ -753,6 +774,11 @@ class UsageGate:
         ``before_invoke`` until an explicit re-probe succeeds — usually
         after the operator updates the token in ``.env`` and sends SIGHUP,
         or after ``auth_reprobe_secs`` elapses.
+
+        No-ops (returns True without transitioning) when the account is
+        already CAPPED — CAPPED takes precedence over AUTH_FAILED by design;
+        see the "Phase precedence" note in :class:`UsageGate`'s docstring
+        for the full recovery-semantics writeup and its known gap.
         """
         acct = self._resolve_account(oauth_token)
         if acct is None:
