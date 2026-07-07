@@ -22,6 +22,7 @@ from _orch_helpers import pydantic_spec
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.scheduler import SetTaskStatusRejected
 from orchestrator.workflow import (
     TaskWorkflow,
     WorkflowOutcome,
@@ -187,3 +188,78 @@ class TestResolveAlreadyMerged:
         decision = f.wf._resolve_already_merged(wt_head='wthead123')
 
         assert decision == _RecoveryDecision(done=False, basis=None, sha=None)
+
+
+# ---------------------------------------------------------------------------
+# Tests: TaskWorkflow._finalise_recovery_done
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinaliseRecoveryDone:
+    """Unit tests for TaskWorkflow._finalise_recovery_done() (PRD α, MP-2 chokepoint).
+
+    The sole writer of ``self._merge_recovery_basis`` — every already-merged
+    guard's only route to a recovery-DONE goes through this method.
+    """
+
+    async def test_journal_basis_sets_marker_and_marks_done(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+        outcome = await f.wf._finalise_recovery_done(
+            basis='journal', sha='advancedsha123', kind='merged',
+            note='landed-outbox journal hit (pre-PLAN recovery)',
+        )
+
+        assert outcome == WorkflowOutcome.DONE
+        assert f.wf._merge_recovery_basis == 'journal'
+        assert f.wf.state == WorkflowState.DONE
+        f.mark_done.assert_awaited_once_with(
+            f.wf.task_id, kind='merged', sha='advancedsha123',
+            note='landed-outbox journal hit (pre-PLAN recovery)',
+        )
+        f.set_task_status.assert_awaited_once()
+        args, kwargs = f.set_task_status.await_args
+        assert args[0] == f.wf.task_id
+        assert args[1] == 'done'
+        assert kwargs['done_provenance']['kind'] == 'merged'
+        assert kwargs['done_provenance']['commit'] == 'advancedsha123'
+
+    async def test_fallback_basis_sets_marker_and_marks_done(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+        outcome = await f.wf._finalise_recovery_done(
+            basis='fallback', sha='mainsha123', kind='found_on_main',
+            note='branch already on main at workflow start (pre-PLAN recovery)',
+        )
+
+        assert outcome == WorkflowOutcome.DONE
+        assert f.wf._merge_recovery_basis == 'fallback'
+        assert f.wf.state == WorkflowState.DONE
+        f.mark_done.assert_awaited_once_with(
+            f.wf.task_id, kind='found_on_main', sha='mainsha123',
+            note='branch already on main at workflow start (pre-PLAN recovery)',
+        )
+
+    async def test_mark_done_rejection_routes_to_mark_blocked_not_phantom_done(
+        self, tmp_path: Path,
+    ):
+        """A rejected mark_done must route to _mark_blocked, not report DONE."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        rejection = SetTaskStatusRejected(
+            task_id=f.wf.task_id, error_code='conflict', raw='row already terminal',
+        )
+        f.wf.scheduler.mark_done = AsyncMock(side_effect=rejection)
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+        outcome = await f.wf._finalise_recovery_done(
+            basis='fallback', sha='mainsha123', kind='found_on_main',
+            note='fallback note',
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        mark_blocked.assert_awaited_once()
+        assert mark_blocked.await_args is not None
+        _args, kwargs = mark_blocked.await_args
+        assert kwargs.get('escalate_to_human') is True
