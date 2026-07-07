@@ -405,7 +405,18 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
     unchanged alongside an error dict — the caller returns the error
     immediately, so the unchanged value is never actually used, but this
     keeps the tuple shape total (always a str, never None) for callers.
+
+    Non-str input (e.g. ``None``, which ``get_queue_stats`` uses for global
+    scope prior to its own ``is not None`` guard) is passed through
+    unchanged rather than handed to ``canonicalize_project_id`` — whose
+    ``raw.lower()`` would raise a bare ``AttributeError`` on a non-str value.
+    This preserves ``validate_project_id``'s pre-S3 graceful handling of
+    falsy/non-str values (it short-circuits on ``not value`` before ever
+    calling ``.strip()``), so this adapter stays a total drop-in for the same
+    inputs ``validate_project_id`` already tolerated.
     """
+    if not isinstance(project_id, str):
+        return project_id, None
     try:
         return canonicalize_project_id(project_id), None
     except PathShapedProjectIdError as e:
@@ -2017,6 +2028,13 @@ def create_mcp_server(
                 than reported here, since it caps the rows it fetches. Pass
                 a ``limit`` at least as large as this tool's ``dead`` count
                 to ``get_dead_letters`` for a matching comparison.
+
+                Note: unlike this tool, ``get_dead_letters`` / ``replay_dead_letters``
+                / ``delete_dead_letters`` do NOT canonicalize project_id — dead-letter
+                tools are intentionally out of scope for the MCP-boundary
+                canonicalization sweep (PRD CGL seam S3 / task 2268). Pass the
+                canonical (underscore) spelling to those tools for a comparison
+                that actually matches this one.
         """
         if project_id is not None:
             project_id, err = _canonicalize_project_id_arg(project_id)
@@ -2110,6 +2128,12 @@ def create_mcp_server(
         This resets them so workers can try again (e.g. after fixing the
         underlying issue).
 
+        Note: project_id is NOT canonicalized here (no hyphen/underscore
+        normalization) — dead-letter tools are intentionally out of scope
+        for the MCP-boundary canonicalization sweep (PRD CGL seam S3 / task
+        2268), unlike ``get_queue_stats``. Pass the canonical (underscore)
+        spelling.
+
         Args:
             project_id: Scope to a specific project (optional — all if omitted)
         """
@@ -2135,6 +2159,12 @@ def create_mcp_server(
         Returns a merged list of dead-letter records from all sources,
         newest-first, with a ``source`` discriminator so operators can triage
         in one place.
+
+        Note: project_id is NOT canonicalized here (no hyphen/underscore
+        normalization) — dead-letter tools are intentionally out of scope
+        for the MCP-boundary canonicalization sweep (PRD CGL seam S3 / task
+        2268), unlike ``get_queue_stats``. Pass the canonical (underscore)
+        spelling.
 
         Args:
             project_id: Filter to a specific project (optional — all if omitted)
@@ -2249,6 +2279,12 @@ def create_mcp_server(
             ``remaining`` excludes ineligible ids already classified in prior
             chunks, so re-calling with ``ids=remaining`` is safe and
             non-redundant.  Re-call after the underlying issue is resolved.
+
+        Note: project_id is NOT canonicalized here (no hyphen/underscore
+        normalization) — dead-letter tools are intentionally out of scope
+        for the MCP-boundary canonicalization sweep (PRD CGL seam S3 / task
+        2268), unlike ``get_queue_stats``. Pass the canonical (underscore)
+        spelling — it must match the ``group_id`` stored on the row exactly.
 
         Args:
             project_id: Project scope (required — prevents accidental cross-project deletes).
