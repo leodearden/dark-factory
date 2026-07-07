@@ -1064,3 +1064,35 @@ class TestActionEffectsTableCoupling:
         await asyncio.gather(*list(harness._background_tasks))
 
         harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_resume_flip_target_sourced_from_table(self, harness: Harness):
+        """_cascade_unblock_member's normal blocked→pending flip must also be
+        sourced from Table B — closing the third divergent copy of the
+        resume→pending mapping (the first two, _ACTION_TARGETS and the
+        dispatch action-string routing, were closed in step-2).
+        """
+        orig = ACTION_EFFECTS[('resume', ANY, ANY)]
+        task_id = 'task-table-resume-flip'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action=None,
+            status='resolved',
+            resolved_by='escalation-watcher-auto',
+            level=1,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': task_id, 'metadata': {}},  # no infra_hold
+        )
+        harness._escalation_events.pop(task_id, None)  # ensure orphan (no active workflow)
+
+        with patch.dict(
+            ACTION_EFFECTS,
+            {('resume', ANY, ANY): TaskEffect('__RESUME_SENTINEL__', orig.workflow_disposition)},
+        ):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, '__RESUME_SENTINEL__',
+        )
