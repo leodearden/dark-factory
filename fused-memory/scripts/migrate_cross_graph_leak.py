@@ -113,6 +113,12 @@ UNRESOLVED: str = 'UNRESOLVED'
 
 DEFAULT_PAGE_SIZE: int = 1000
 
+# Hard safety cap on the number of SKIP/LIMIT pages census_foreign_nodes will
+# fetch for a single graph, purely to bound worst-case pagination against a
+# pathological/huge foreign population -- normal use never approaches it.
+# Tests exercise the cap-hit WARNING path by monkeypatching this down.
+MAX_CENSUS_PAGES: int = 1000
+
 
 # ---------------------------------------------------------------------------
 # Pure core
@@ -191,3 +197,62 @@ def build_manifest(
         'summary': summary,
         'unresolved_uuids': unresolved_uuids,
     }
+
+
+# ---------------------------------------------------------------------------
+# Graphiti: read-only census
+# ---------------------------------------------------------------------------
+
+async def census_foreign_nodes(
+    graphiti: Any,
+    graph_key: str,
+    *,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> list[dict]:
+    """Read-only, paged enumeration of every node foreign to *graph_key*.
+
+    "Foreign" means ``n.group_id <> graph_key`` -- the node lives in this
+    FalkorDB graph but its own ``group_id`` property names a different graph.
+    Paginates via SKIP/LIMIT (never ``collect()``, which truncates) until a
+    short page confirms the true end; counts are therefore always freshly
+    recomputed, never a baked-in/cached figure.
+
+    A hard ``MAX_CENSUS_PAGES`` safety cap bounds worst-case pagination
+    against a pathological/huge foreign population. If that cap is reached
+    while the last page fetched was still full (so there may be more), a
+    WARNING is logged -- the caller must not treat the returned list as
+    guaranteed-complete in that case (no silent caps).
+    """
+    graph = graphiti._graph_for(graph_key)
+    rows: list[dict] = []
+    skip = 0
+    for _page_num in range(MAX_CENSUS_PAGES):
+        result = await graph.ro_query(
+            'MATCH (n) WHERE n.group_id <> $graph_key '
+            'RETURN n.uuid, n.name, n.group_id, labels(n) '
+            'SKIP $skip LIMIT $limit',
+            {'graph_key': graph_key, 'skip': skip, 'limit': page_size},
+        )
+        page = result.result_set or []
+        rows.extend(
+            {
+                'uuid': row[0],
+                'name': row[1],
+                'group_id': row[2],
+                'labels': row[3],
+                'source_graph': graph_key,
+            }
+            for row in page
+        )
+        if len(page) < page_size:
+            return rows
+        skip += page_size
+
+    logger.warning(
+        "census_foreign_nodes: graph '%s' hit the %d-page cap (page_size=%d) "
+        'while the last page was still full -- enumeration may be '
+        'incomplete. Re-run with a larger --page-size to ensure the full '
+        'foreign population is covered.',
+        graph_key, MAX_CENSUS_PAGES, page_size,
+    )
+    return rows
