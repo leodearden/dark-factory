@@ -66,6 +66,7 @@ from orchestrator.git_ops import (
     _run,
     is_wip_safety_commit,
 )
+from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server
 from orchestrator.scheduler import (
     SetTaskStatusRejected,
@@ -804,6 +805,30 @@ class _PriorImplStatus(NamedTuple):
     """SHA read from metadata.json, or None if the file is absent."""
 
 
+@dataclass(frozen=True)
+class _RecoveryDecision:
+    """Result of :meth:`TaskWorkflow._resolve_already_merged`.
+
+    The journal-first outcome consumed by every already-merged guard
+    (:meth:`TaskWorkflow._recover_if_already_merged`,
+    :meth:`TaskWorkflow._recover_before_execute`,
+    :meth:`TaskWorkflow._recover_before_merge`) and passed straight through to
+    :meth:`TaskWorkflow._finalise_recovery_done` (PRD workflow-state-machine
+    α, Contract §8 MP-1/MP-2).
+    """
+
+    done: bool
+    """True iff the task should be finalised DONE via recovery."""
+
+    basis: str | None
+    """``'journal'`` (MergeProvenance hit) or ``'fallback'`` (legacy
+    ``_has_prior_implementation`` heuristic).  ``None`` iff ``done`` is False."""
+
+    sha: str | None
+    """Done-provenance commit SHA — ``row.advanced_sha`` for a journal hit,
+    the git main SHA for a fallback hit, ``None`` iff ``done`` is False."""
+
+
 class TaskWorkflow:
     """Per-task state machine."""
 
@@ -888,6 +913,12 @@ class TaskWorkflow:
         # of the architect's plan.files (which the merge may have squashed).
         self._base_commit: str | None = None
         self._merge_sha: str | None = None  # merge commit SHA set by _submit_to_merge_queue on success
+        # Set exclusively by _finalise_recovery_done — 'journal' (MergeProvenance
+        # hit) or 'fallback' (_has_prior_implementation heuristic).  Stays None
+        # unless an already-merged guard actually finalised a recovery-DONE
+        # (PRD workflow-state-machine α, Contract §8 MP-2: no recovery-DONE
+        # without a provenance basis).
+        self._merge_recovery_basis: str | None = None
         self._last_completed_role: str | None = None  # role of the last successfully-completed invocation
         self._last_verify_result: VerifyResult | None = None  # most recent failing VerifyResult from _verify_debugfix_loop
         # Set by _verify_debugfix_loop when a failure is classified as inherited
