@@ -42,6 +42,31 @@ def test_minutes_since_returns_zero_on_missing_or_bad():
     assert _minutes_since('not-a-date') == 0
 
 
+def test_minutes_since_uses_provided_now():
+    """_minutes_since(iso, now=fixed) derives its result from the passed now, not the clock."""
+    fixed = datetime(2026, 4, 11, 12, 30, 0, tzinfo=UTC)
+    ts = fixed - timedelta(minutes=37, seconds=10)
+    expected = int((fixed - ts).total_seconds() // 60)
+    assert _minutes_since(ts.isoformat(), now=fixed) == expected
+
+
+def test_minutes_since_no_now_resolves_via_clock():
+    """Without now, _minutes_since still resolves via resolve_now (the live clock).
+
+    Brackets the real clock read with before/after captures rather than
+    patching a module-level ``datetime`` symbol, mirroring
+    ``Test_Cutoff.test_cutoff_no_now_uses_current_time`` in test_costs_data.py.
+    """
+    ts = datetime.now(UTC) - timedelta(minutes=10)
+    before = datetime.now(UTC)
+    result = _minutes_since(ts.isoformat())
+    after = datetime.now(UTC)
+
+    lower = int((before - ts).total_seconds() // 60)
+    upper = int((after - ts).total_seconds() // 60)
+    assert lower <= result <= upper
+
+
 # ---------------------------------------------------------------------------
 # collect_active_tasks against in-memory MCP-shaped fixture
 # ---------------------------------------------------------------------------
@@ -187,6 +212,67 @@ async def test_collect_active_tasks_pulls_metadata_and_loops(two_project_config,
     assert 13 <= t19['started'] <= 15
     # meta_files is the module lock source used by the scheduler pipeline.
     assert 'src/agents/consolidation.py' in t19['meta_files']
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_started_uses_provided_now(tmp_path, monkeypatch, dummy_client):
+    """collect_active_tasks(now=fixed) computes every row's `started` against that one instant."""
+    fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+    created_at = (fixed - timedelta(minutes=42)).isoformat()
+    root, shaped = _make_project(
+        tmp_path,
+        project_dir='fixedclock',
+        tasks=[{'id': 1, 'title': 'a', 'status': 'in-progress', 'dependencies': []}],
+        worktrees=[(1, {'task_id': '1', 'title': 'a', 'created_at': created_at}, [], 0, [])],
+    )
+
+    async def _fake(client, config, project_root):
+        return list(shaped)
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg, now=fixed)
+    assert len(active) == 1
+    assert active[0]['started'] == 42
+
+
+@pytest.mark.asyncio
+async def test_collect_tasks_with_counts_started_uses_provided_now_across_projects(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """collect_tasks_with_counts(now=fixed) shares ONE now across every project's rows.
+
+    Two projects, each with a task started at a different known offset from the
+    same fixed instant — proves `now` is resolved once at the aggregation
+    boundary and threaded down, not re-read per project.
+    """
+    fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+    df_created = (fixed - timedelta(minutes=10)).isoformat()
+    reify_created = (fixed - timedelta(minutes=25)).isoformat()
+    df_root, df_tasks = _make_project(
+        tmp_path,
+        project_dir='df',
+        tasks=[{'id': 1, 'title': 'a', 'status': 'in-progress', 'dependencies': []}],
+        worktrees=[(1, {'task_id': '1', 'title': 'a', 'created_at': df_created}, [], 0, [])],
+    )
+    reify_root, reify_tasks = _make_project(
+        tmp_path,
+        project_dir='reify',
+        tasks=[{'id': 2, 'title': 'b', 'status': 'pending', 'dependencies': []}],
+        worktrees=[(2, {'task_id': '2', 'title': 'b', 'created_at': reify_created}, [], 0, [])],
+    )
+    by_root = {df_root.resolve(): df_tasks, reify_root.resolve(): reify_tasks}
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(by_root.get(project_root.resolve(), []))
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    cfg = DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
+
+    active, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
+    started_by_id = {t['id']: t['started'] for t in active}
+    assert started_by_id == {'df/T-1': 10, 'reify/T-2': 25}
 
 
 @pytest.mark.asyncio
