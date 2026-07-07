@@ -102,13 +102,37 @@ def _find_merge_queue_private_patches(source: str, forbidden: set[str]) -> list[
 # ALLOWLIST -- the current reach-back patch residual: (relative_test_path,
 # leaf_name) pairs.  This IS the scope-zeta..lambda worklist -- each pair
 # clears only once its consumer's back-import is deleted so the site can
-# repoint to the defining satellite module.  Pre-1 (task 2157) classified
-# every one of these as reach-back-locked: the exercised consumer resolves
-# the name via a function-local `from orchestrator.merge_queue import X`
-# somewhere in src/ (a satellite, or workflow.py), or merge_queue.py's own
-# body references it directly -- so patching the satellite copy would not
-# intercept the call and would turn the test RED.  No pair was safe to
-# repoint opportunistically (see step-3/step-4).
+# repoint to the defining satellite module.
+#
+# Pre-1 / steps 3-4 (task 2157) classified all 16 forbidden names actually
+# patched via orchestrator.merge_queue in the suite (spanning the 36 pairs
+# below) as reach-back-locked: for each, some exercised consumer resolves the
+# name via a function-local `from orchestrator.merge_queue import X`
+# elsewhere in src/ (a satellite module, or workflow.py), or via a bare
+# reference in merge_queue.py's own body -- so patching the satellite copy
+# directly would not intercept the call and would turn the test RED. Zero
+# pairs were safe to repoint opportunistically. Lock site per name:
+#
+#   _acquire_warm_verify_worktree        merge_queue.py:8761  (_run_inflight_verify, own body)
+#   _check_plan_files_touched_in_branch  workflow.py:5466     (_submit_to_merge_queue)
+#   _check_plan_targets_in_tree          merge_queue.py:2644  (classify_and_merge, own body)
+#   _check_post_merge_equivalence        merge_gates.py:366   (_run_equivalence_gate)
+#   _check_post_merge_pyright            merge_gates.py:444   (_run_pyright_gate)
+#   _commit_is_linear                    merge_gates.py:538   (_finalize_advanced_merge)
+#   _finalize_advanced_merge             merge_queue.py:3313  (_do_train_merge, own body)
+#   _map_advance_failure                 merge_queue.py:3286  (_do_train_merge, own body)
+#   _maybe_run_drift_check               merge_queue.py:9156  (_finalize_inflight, own body)
+#   _maybe_schedule_shadow_compare        merge_queue.py:9150  (_finalize_inflight, own body)
+#   _rebase_delta_touched_overlap         merge_gates.py:1358  (_reverify_rebased_tree)
+#   _resolve_second_parent                merge_gates.py:538   (_finalize_advanced_merge)
+#   _reverify_rebased_tree                merge_queue.py:9195  (_finalize_inflight, own body)
+#   _run_cold_shadow_verify               merge_shadow.py:852  (_run_shadow_compare)
+#   _run_drift_check                      merge_drift.py:254   (_maybe_run_drift_check)
+#   _run_shadow_compare                   merge_shadow.py:1012 (_maybe_schedule_shadow_compare)
+#
+# A name drops off this table -- and its ALLOWLIST pairs become genuine
+# repoint candidates -- once a later scope deletes the back-import that
+# locks it.
 ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_atomic_train_merge.py', '_check_post_merge_equivalence'),
     ('test_merge_drift.py', '_run_drift_check'),
