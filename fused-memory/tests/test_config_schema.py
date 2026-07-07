@@ -940,5 +940,5 @@ class TestTaskMetadataConfig:
 
     def test_override_loads_enforce_true(self):
         """A config dict override for task_metadata is validated into the model."""
-        cfg = FusedMemoryConfig(task_metadata={'enforce': True})
+        cfg = FusedMemoryConfig(task_metadata={'enforce': True})  # type: ignore[arg-type]
         assert cfg.task_metadata.enforce is True
