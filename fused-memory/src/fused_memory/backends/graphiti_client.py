@@ -1347,6 +1347,40 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    async def _resolve_or_create_entity(self, name: str, *, group_id: str) -> str | None:
+        """Exact-name write-time-identity chokepoint: resolve, or collapse duplicates.
+
+        MUST be called only while the caller holds ``_identity_lock_for(group_id)``
+        — this method performs no locking of its own. Idempotent: calling it
+        repeatedly for the same (name, group_id) converges and stays converged.
+
+        Behaviour by match count (via get_nodes_by_exact_name, group_id-scoped):
+        - 0 matches: returns None. Documented no-op — node minting stays
+          graphiti_core's job; this primitive only resolves/collapses existing
+          nodes, it never creates one.
+        - 1 match: returns that node's uuid directly (pure resolve, no writes).
+        - >=2 matches: collapses duplicates via find_duplicate_entity_nodes +
+          merge_entities (see step-6).
+
+        Args:
+            name: Exact name of the Entity to resolve.
+            group_id: Project graph to target.
+
+        Returns:
+            The UUID of the single canonical Entity node with this name in
+            group_id's graph, or None if none existed.
+
+        Post-condition on return (non-None): exactly one Entity node with
+        this name remains in group_id's graph.
+        """
+        nodes = await self.get_nodes_by_exact_name(name, group_id=group_id)
+        if not nodes:
+            return None
+        if len(nodes) == 1:
+            return nodes[0]['uuid']
+        # >=2 branch (collapse via find_duplicate_entity_nodes + merge_entities)
+        # added in step-6.
+
     @staticmethod
     def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
         """Build a normalised edge dict, coercing NULL fact/name to empty string.
