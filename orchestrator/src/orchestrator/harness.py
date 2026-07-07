@@ -9263,12 +9263,21 @@ Output JSON matching the schema. Every task must appear in the output.
         if not await self._check_reblock_guard(escalation, task_id):
             return
 
-        # Only 'blocked' reaches here — attempt the flip
+        # Only 'blocked' reaches here — attempt the flip.
+        # Table B (ω3, task 2196): source the target from the same authority
+        # _on_escalation_resolved / escalation.server.resolve_issue use, so
+        # resume→pending cannot drift into a third independent copy.
+        from escalation.action_effects import effect_for  # noqa: PLC0415
+
+        _resume_effect = effect_for('resume', escalation.level, escalation.category)
+        _resume_target = (
+            _resume_effect.target_status if _resume_effect is not None else 'pending'
+        )  # 'pending' today; defensive fallback only, 'resume' is always in the table
         try:
-            await self.scheduler.set_task_status(task_id, 'pending')
+            await self.scheduler.set_task_status(task_id, _resume_target)
             logger.info(
-                'cascade-unblock: task %s flipped blocked→pending (via %s)',
-                task_id, escalation.resolved_by,
+                'cascade-unblock: task %s flipped blocked→%s (via %s)',
+                task_id, _resume_target, escalation.resolved_by,
             )
         except SetTaskStatusRejected as e:
             # Defensive TOCTOU guard: task may have transitioned to a terminal
