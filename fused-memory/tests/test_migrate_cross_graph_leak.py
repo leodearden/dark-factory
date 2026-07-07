@@ -639,6 +639,48 @@ class TestClassifyNode:
         assert record['episode_count'] == 0
         graphiti._graph_for.assert_called_once_with('reify')
 
+    @pytest.mark.asyncio
+    async def test_target_equals_source_is_rekey_not_merge(self):
+        """A variant-spelling leak whose alias resolves to its OWN source
+        graph (e.g. a node physically living in the 'know_live' graph,
+        tagged group_id='know-live') classifies REKEY, not MERGE.
+
+        Probing the resolved target here would find the node ITSELF
+        (present=True), so a naive impl reaches MERGE and apply would then
+        call merge_foreign_duplicate(wrong=='know_live', home=='know_live')
+        -- DETACH DELETEing the node's ONLY copy. The fixed impl recognizes
+        target_graph == source_graph and skips the presence probe entirely:
+        the single graph's ro_query is awaited exactly twice (only the two
+        count reads), never a third time for a presence probe. A callable
+        side_effect keyed on Cypher shape makes this assertion meaningful
+        under BOTH the current (3 awaits, MERGE) and fixed (2 awaits, REKEY)
+        implementations.
+        """
+        def _side_effect(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return _result([[3]])
+            if 'MENTIONS' in cypher:
+                return _result([[1]])
+            # Presence-probe shape -- would (wrongly) report "present" if a
+            # naive impl issues it against the node's own home graph.
+            return _result([['u0']])
+
+        graph = _make_graph_mock(ro_side_effect=_side_effect)
+        graphs = {'know_live': graph}
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        node = _foreign_node('u0', 'know-live', name='Alice', source_graph='know_live')
+        populated = {'reify', 'dark_factory', 'know_live'}
+
+        record = await _mod.classify_node(graphiti, node, populated, alias_map=_mod.ALIAS_MAP)
+
+        assert record['disposition'] == _mod.REKEY
+        assert record['target_graph'] == 'know_live'
+        assert record['source_graph'] == 'know_live'
+        assert record['edge_count'] == 3
+        assert record['episode_count'] == 1
+        assert graph.ro_query.await_count == 2
+
 
 # ===========================================================================
 # Tests: run() dry-run (step-13/14)
