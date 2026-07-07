@@ -2745,6 +2745,10 @@ async def reconcile_landed_row(
       record and the CAS advance, so the task never actually landed. Do NOT
       mark done; prune the row so the task re-dispatches through normal
       channels (no phantom done).
+    * ``'already_done_pruned'`` (RC-3) — ``advanced_sha`` IS an ancestor of
+      ``main_sha`` and the task's status is ALREADY ``'done'``: prune only,
+      no second done-write. Checked before the RC-2 branch below so a
+      done task can never be re-marked.
     * ``'marked_done'`` (RC-2) — ``advanced_sha`` IS an ancestor of
       ``main_sha`` and the task's status is not yet ``'done'``: the process
       crashed between the CAS advance and the done-write. Drive the task
@@ -2757,7 +2761,10 @@ async def reconcile_landed_row(
         return 'pruned_not_landed'
 
     status = await scheduler.get_status(row.task_id)
-    if status is not None and status != 'done':
+    if status == 'done':
+        outbox.consume(row.task_id)
+        return 'already_done_pruned'
+    if status is not None:
         await scheduler.mark_done(row.task_id, kind='merged', sha=row.advanced_sha)
         outbox.consume(row.task_id)
         return 'marked_done'
