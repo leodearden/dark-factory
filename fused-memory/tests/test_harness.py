@@ -172,7 +172,8 @@ async def test_run_full_cycle_restores_events_on_failure(
         event_buffer=event_buffer,
         config=config,
     )
-    harness._make_stages = lambda: harness.stages
+    harness.stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(harness.stages, scope)
     # task 1143: pre-populate _known_projects so pre-flight does not raise before the stage
     harness._known_projects['test-project'] = '/tmp/test-project'
 
@@ -243,7 +244,8 @@ async def test_full_cycle_uses_registry_for_project_root(
         event_buffer=event_buffer,
         config=config,
     )
-    harness._make_stages = lambda: harness.stages
+    harness.stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(harness.stages, scope)
     # task 1143: pre-populate _known_projects so pre-flight does not raise.
     # Events carry _project_root='/home/leo/src/dark-factory' which matches
     # the registry value for dark_factory, so the assertion below still holds
@@ -322,7 +324,8 @@ def _make_harness_927(journal, event_buffer, mock_memory_service, project_root: 
         event_buffer=event_buffer,
         config=_make_config_927(project_root),
     )
-    harness._make_stages = lambda: harness.stages
+    harness.stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(harness.stages, scope)
     return harness
 
 
@@ -534,14 +537,19 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
         event_buffer=event_buffer,
         config=config,
     )
-    # Patch _make_stages so tests that mock harness.stages[N].run still work
-    harness._make_stages = lambda: harness.stages
     # task 1143: inject known projects so run_full_cycle pre-flight does not raise
-    # for the project_ids used across the existing test suite.
+    # for the project_ids used across the existing test suite.  Set BEFORE building
+    # stages below so the pinned instances' known_projects= (baked in once at
+    # construction, task 2146 β) reflects this map, not __init__'s default.
     harness._known_projects = {
         'dark_factory': '/home/leo/src/dark-factory',
         'test-project': '/tmp/test-project',
     }
+    # Build stages once and pin them so tests that mock harness.stages[N].run still
+    # work; the shim re-scopes (rather than rebuilds) on every _make_stages(scope)
+    # call so mocked .run methods stick across a full cycle + remediation pass.
+    harness.stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(harness.stages, scope)
     return harness
 
 
@@ -688,7 +696,7 @@ async def test_remediation_payload_assembly():
     from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
     stage = MemoryConsolidator.__new__(MemoryConsolidator)
-    stage.project_id = 'test-project'
+    stage.scope = _scope('test-project', '/tmp/test-project')
     stage.remediation_findings = _make_s3_findings()[:2]  # actionable only
     stage.prior_s3_findings = None
 
@@ -712,8 +720,8 @@ async def test_normal_payload_includes_prior_s3_findings(mock_memory_service):
         None,
         AsyncMock(),
         AsyncMock(),
+        scope=_scope('test-project', '/tmp/test-project'),
     )
-    stage.project_id = 'test-project'
     stage.episode_limit = 500
     stage.memory_limit = 1000
     stage.prior_s3_findings = [_make_s3_findings()[0]]
@@ -1153,7 +1161,7 @@ async def test_make_stages_returns_clean_instances(journal, event_buffer, mock_m
         config=config,
     )
 
-    stages = harness._make_stages()
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
     stage1 = stages[0]
     stage2 = stages[1]
     assert isinstance(stage1, MemoryConsolidator)
@@ -1760,8 +1768,8 @@ async def test_remediation_propagates_tier_limits_to_consolidator(
     from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    stages = harness._make_stages()
-    harness._make_stages = lambda: stages
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
     captured: dict = {}
 
@@ -1789,7 +1797,7 @@ async def test_remediation_propagates_tier_limits_to_consolidator(
         'parent-run-id',
         findings,
         tier,
-        project_root='/tmp/test-project',
+        scope=_scope('test-project', '/tmp/test-project'),
     )
 
     assert captured.get('episode_limit') == 125, (
@@ -1811,8 +1819,8 @@ async def test_remediation_sets_project_id_and_root_on_all_stages(
     from fused_memory.reconciliation.harness import TierConfig
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    stages = harness._make_stages()
-    harness._make_stages = lambda: stages
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
     # task 1143: inject registry entry so _known_project_root_for('my-project') succeeds.
     harness._known_projects['my-project'] = '/srv/my-project'
 
@@ -1837,7 +1845,7 @@ async def test_remediation_sets_project_id_and_root_on_all_stages(
         'parent-run-id',
         findings,
         tier,
-        project_root='/srv/my-project',
+        scope=_scope('my-project', '/srv/my-project'),
     )
 
     for name, attrs in stage_attrs.items():
@@ -1860,8 +1868,8 @@ async def test_remediation_sets_remediation_mode_on_task_knowledge_sync(
     from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    stages = harness._make_stages()
-    harness._make_stages = lambda: stages
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
     captured: dict = {}
 
@@ -1883,7 +1891,7 @@ async def test_remediation_sets_remediation_mode_on_task_knowledge_sync(
         'parent-run-id',
         findings,
         tier,
-        project_root='/tmp/test-project',
+        scope=_scope('test-project', '/tmp/test-project'),
     )
 
     assert captured.get('remediation_mode') is True
@@ -1899,8 +1907,8 @@ async def test_remediation_forwards_tier_model_to_stage_run(
     from fused_memory.reconciliation.harness import TierConfig
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    stages = harness._make_stages()
-    harness._make_stages = lambda: stages
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
     models_seen: dict[str, dict] = {}
 
@@ -1918,7 +1926,7 @@ async def test_remediation_forwards_tier_model_to_stage_run(
         'parent-run-id',
         findings,
         tier,
-        project_root='/tmp/test-project',
+        scope=_scope('test-project', '/tmp/test-project'),
     )
 
     for name, call_args in models_seen.items():
@@ -2759,8 +2767,8 @@ class TestHarnessFilteredTaskTreeWiring:
         from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        stages = harness._make_stages()
-        harness._make_stages = lambda: stages
+        stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+        harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
         expected_tree = self._make_tree()
         harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
@@ -2785,7 +2793,7 @@ class TestHarnessFilteredTaskTreeWiring:
             'parent-run-id',
             findings,
             tier,
-            project_root='/tmp/test-project',
+            scope=_scope('test-project', '/tmp/test-project'),
         )
 
         assert captured.get('filtered_task_tree') is expected_tree, (
@@ -2808,8 +2816,8 @@ class TestHarnessFilteredTaskTreeWiring:
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        stages = harness._make_stages()
-        harness._make_stages = lambda: stages
+        stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+        harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
         expected_tree = self._make_tree()
         harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
@@ -2834,7 +2842,7 @@ class TestHarnessFilteredTaskTreeWiring:
             'parent-run-id',
             findings,
             tier,
-            project_root='/tmp/test-project',
+            scope=_scope('test-project', '/tmp/test-project'),
         )
 
         assert captured.get('filtered_task_tree') is expected_tree, (
@@ -2911,8 +2919,8 @@ class TestHarnessFilteredTaskTreeWiring:
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        stages = harness._make_stages()
-        harness._make_stages = lambda: stages
+        stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+        harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
         expected_tree = self._make_tree()
         harness._fetch_filtered_task_tree = AsyncMock(return_value=expected_tree)
@@ -2945,7 +2953,7 @@ class TestHarnessFilteredTaskTreeWiring:
                 'parent-run-id',
                 findings,
                 tier,
-                project_root='/tmp/test-project',
+                scope=_scope('test-project', '/tmp/test-project'),
             )
         finally:
             ReconciliationHarness._configure_task_sync = staticmethod(real_helper)  # type: ignore[method-assign]
@@ -2973,8 +2981,8 @@ class TestHarnessFilteredTaskTreeWiring:
         from fused_memory.reconciliation.harness import TierConfig
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        stages = harness._make_stages()
-        harness._make_stages = lambda: stages
+        stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+        harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
         # Pre-fetched tree passed by caller — fetch should NOT be called
         prefetched_tree = self._make_tree()
@@ -2999,7 +3007,7 @@ class TestHarnessFilteredTaskTreeWiring:
             'parent-run-id',
             findings,
             tier,
-            project_root='/tmp/test-project',
+            scope=_scope('test-project', '/tmp/test-project'),
             filtered_task_tree=prefetched_tree,
         )
 
@@ -3049,8 +3057,8 @@ class TestHarnessFilteredTaskTreeWiring:
         from fused_memory.reconciliation.harness import TierConfig
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        stages = harness._make_stages()
-        harness._make_stages = lambda: stages
+        stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+        harness._make_stages = lambda scope, **k: _rescope(stages, scope)
         # task 1143: inject registry entry so _known_project_root_for('test-project') succeeds.
         harness._known_projects['test-project'] = '/my/project'
 
@@ -3064,14 +3072,14 @@ class TestHarnessFilteredTaskTreeWiring:
         findings = [_make_s3_findings()[0]]
         tier = TierConfig(model='sonnet', episode_limit=100, memory_limit=200)
         # No filtered_task_tree kwarg — method must fall back to _fetch_filtered_task_tree.
-        # project_root='/my/project' is threaded explicitly (injected above as the registry value,
+        # scope='/my/project' is threaded explicitly (injected above as the registry value,
         # but now passed directly as the threaded kwarg rather than re-resolved at call time).
         await harness._run_remediation_pass(
             'test-project',
             'parent-run-id',
             findings,
             tier,
-            project_root='/my/project',
+            scope=_scope('test-project', '/my/project'),
         )
 
         # _fetch_filtered_task_tree must be called with the threaded project_root value.
@@ -5513,7 +5521,11 @@ def _make_harness_with_known_projects(
 ):
     """Build a harness and monkeypatch _known_projects for task-1143 tests."""
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._known_projects = dict(known_projects)
+    # Mutate in place (not reassign) so the stages _make_test_harness already
+    # pinned — which hold known_projects= by reference (task 2146 β: baked in
+    # once at construction, no longer re-injected per cycle) — see the update too.
+    harness._known_projects.clear()
+    harness._known_projects.update(known_projects)
     return harness
 
 
@@ -7200,7 +7212,7 @@ async def test_maybe_remediate_partial_suppression_remediates_only_uncovered(
 
     async def spy_remediate(
         project_id, parent_run_id, findings_arg, tier,
-        *, project_root, filtered_task_tree=None,
+        *, scope, filtered_task_tree=None,
     ):
         remediation_calls.append(list(findings_arg))
 
@@ -7266,7 +7278,7 @@ async def test_maybe_remediate_fail_open_when_queue_raises(
 
     async def spy_remediate(
         project_id, parent_run_id, findings_arg, tier,
-        *, project_root, filtered_task_tree=None,
+        *, scope, filtered_task_tree=None,
     ):
         remediation_calls.append(list(findings_arg))
 
@@ -7463,8 +7475,8 @@ async def test_maybe_remediate_mixed_batch_excludes_placeholder_keeps_reference_
     from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    stages = harness._make_stages()
-    harness._make_stages = lambda: stages
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
 
     stage1 = stages[0]
     assert isinstance(stage1, MemoryConsolidator)
@@ -8206,7 +8218,8 @@ async def test_run_full_cycle_injects_filtered_task_tree_into_integrity_check(
         event_buffer=event_buffer,
         config=config,
     )
-    harness._make_stages = lambda: harness.stages
+    harness.stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(harness.stages, scope)
     harness._known_projects['dark_factory'] = '/home/leo/src/dark-factory'
 
     # Give the harness a known tree to inject

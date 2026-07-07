@@ -428,31 +428,6 @@ class ReconciliationHarness:
         if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
             self.usage_gate = UsageGate(self.config.usage_cap)
 
-        # Build stages — thread recon_report_port and recon_report_state so BaseStage.run
-        # can call start_report / get_assembled_report directly (PRD γ, task 1546).
-        stage1 = MemoryConsolidator(
-            StageId.memory_consolidator, memory_service, taskmaster, journal, self.config,
-            usage_gate=self.usage_gate,
-            recon_report_port=self._recon_report_port,
-            recon_report_state=self._recon_report_state,
-        )
-
-        stage2 = TaskKnowledgeSync(
-            StageId.task_knowledge_sync, memory_service, taskmaster, journal, self.config,
-            usage_gate=self.usage_gate,
-            recon_report_port=self._recon_report_port,
-            recon_report_state=self._recon_report_state,
-        )
-
-        stage3 = IntegrityCheck(
-            StageId.integrity_check, memory_service, taskmaster, journal, self.config,
-            usage_gate=self.usage_gate,
-            recon_report_port=self._recon_report_port,
-            recon_report_state=self._recon_report_state,
-        )
-
-        self.stages = [stage1, stage2, stage3]
-
         # Judge — receives a callback that clears _halt_escalated so a
         # subsequent halt in the same process re-fires the escalation.
         self.judge = (
@@ -1387,11 +1362,11 @@ class ReconciliationHarness:
         logger.info(f'Reconciliation escalation server starting on {host}:{port}')
         await _sleep(0.5)
 
-        # Store escalation URL and queue for _make_stages() and set on existing stages
+        # Store escalation URL and queue; _make_stages propagates them to each
+        # cycle's fresh stages via _propagate_escalation_queue (task 2146 β —
+        # there is no long-lived self.stages list to push into here anymore).
         escalation_url = f'http://{host}:{port}/mcp'
         self._escalation_url = escalation_url
-        # Both _escalation_url and _escalation_queue are set above, so helper will propagate.
-        self._propagate_escalation_queue(self.stages)
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
