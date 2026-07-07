@@ -2745,10 +2745,22 @@ async def reconcile_landed_row(
       record and the CAS advance, so the task never actually landed. Do NOT
       mark done; prune the row so the task re-dispatches through normal
       channels (no phantom done).
+    * ``'marked_done'`` (RC-2) — ``advanced_sha`` IS an ancestor of
+      ``main_sha`` and the task's status is not yet ``'done'``: the process
+      crashed between the CAS advance and the done-write. Drive the task
+      done via the existing ``merged`` done-write path, THEN consume the
+      row — that ordering means a crash between the two re-drives cleanly
+      on the next startup (the row survives to retry).
     """
     if not await git_ops.is_ancestor(row.advanced_sha, main_sha):
         outbox.consume(row.task_id)
         return 'pruned_not_landed'
+
+    status = await scheduler.get_status(row.task_id)
+    if status is not None and status != 'done':
+        await scheduler.mark_done(row.task_id, kind='merged', sha=row.advanced_sha)
+        outbox.consume(row.task_id)
+        return 'marked_done'
 
 
 async def reconcile_landed_outbox(
