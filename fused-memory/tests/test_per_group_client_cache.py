@@ -194,3 +194,29 @@ class TestAddEpisodeConcurrencyIsolation:
         )
 
         assert observed == {'epA': 'A', 'epB': 'B'}
+
+
+# ---------------------------------------------------------------------------
+# step-7/8: GraphitiBackend.build_communities passes the per-group driver
+# ---------------------------------------------------------------------------
+
+
+class TestBuildCommunitiesPassesDriver:
+    """build_communities must pass driver=self._driver_for(group_ids[0]) —
+    upstream Graphiti.build_communities DOES accept driver= (unlike
+    add_episode), so the latent driver-omission sibling bug is fixed by
+    passing the per-group driver directly rather than routing through
+    _client_for."""
+
+    @pytest.mark.asyncio
+    async def test_build_communities_passes_per_group_driver(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        backend.client.build_communities = AsyncMock()
+
+        da = backend._driver_for('A')
+        await backend.build_communities(group_ids=['A'])
+
+        backend.client.build_communities.assert_awaited_once()
+        _, kwargs = backend.client.build_communities.await_args
+        assert kwargs.get('group_ids') == ['A']
+        assert kwargs.get('driver') is da
