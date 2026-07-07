@@ -15,6 +15,7 @@ import os
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest  # pyright: ignore[reportMissingImports]
 
@@ -440,7 +441,7 @@ def test_reap_continues_sweep_when_one_directory_fails_to_remove(
     poison_dir = sr.record_path_for_slug(poison.session_slug, root=tmp_path).parent
     real_rmtree = sr.shutil.rmtree
 
-    def _flaky_rmtree(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
+    def _flaky_rmtree(path: str | os.PathLike[str], *args: Any, **kwargs: Any) -> None:
         if Path(path) == poison_dir:
             raise OSError('simulated ENOTEMPTY race')
         real_rmtree(path, *args, **kwargs)
