@@ -59,9 +59,12 @@ nothing, apply dispatches to the right ε primitive, post-verify catches a
 count mismatch). LIVE byte-fidelity (zero foreign nodes remaining, byte-exact
 vector transport, against a REAL FalkorDB) is explicitly η's live
 throwaway-graph rehearsal, not this task -- see ε's module docstring and PRD
-decision 5. Foreign Episodic nodes are classified and listed here too, but
-ε's ``move_entity_across_graphs`` is :Entity-scoped (it only reattaches, does
-not relocate, Episodic nodes) -- their live relocation is also η's concern.
+decision 5. Foreign non-``:Entity`` nodes (Episodic, Community, ...) are
+classified ``EPISODIC_SKIP`` -- listed in the manifest for visibility but
+NEVER dispatched to an ``:Entity``-scoped primitive (ε's
+``move_entity_across_graphs`` / ``merge_foreign_duplicate`` and this script's
+own ``rekey_node_in_place`` all require an ``:Entity`` match) -- their live
+relocation remains η's concern.
 
 Usage
 -----
@@ -115,6 +118,15 @@ UNRESOLVED: str = 'UNRESOLVED'
 # it's already in). This is an in-place re-key, never a cross-graph MOVE/
 # MERGE -- see classify_node and rekey_node_in_place.
 REKEY: str = 'REKEY'
+# A foreign node whose labels do NOT positively confirm :Entity (Episodic,
+# Community, or no labels at all). The epsilon primitives
+# (move_entity_across_graphs / merge_foreign_duplicate) and this script's own
+# rekey_node_in_place all MATCH (n:Entity {uuid}) -- dispatching a non-Entity
+# node to one would either raise NodeNotFoundError (aborting the whole apply)
+# or silently no-op (surfacing only as a post-verify count mismatch). Such a
+# node is listed in the manifest for visibility but never actioned here; see
+# classify_node.
+EPISODIC_SKIP: str = 'EPISODIC_SKIP'
 
 DEFAULT_PAGE_SIZE: int = 1000
 
@@ -309,6 +321,12 @@ async def classify_node(
     Orchestrates the pure helpers above over a single foreign-node row:
     resolve_target_graph decides where the node belongs.
 
+    - Labels do NOT positively confirm :Entity (Episodic, Community, or no
+      labels at all): EPISODIC_SKIP, no presence probe. The :Entity-scoped
+      epsilon primitives and rekey_node_in_place can never act on such a
+      node -- dispatching/probing it is a trap (see the EPISODIC_SKIP
+      constant). target_graph is still recorded informationally (where the
+      node would belong, for eta's live relocation).
     - Unresolved (target is None): UNRESOLVED, no presence probe (no target
       to probe).
     - Resolved target EQUALS the node's own source_graph: REKEY, no presence
@@ -327,7 +345,10 @@ async def classify_node(
     REKEY will carry before approving --apply.
     """
     target_graph = resolve_target_graph(node['group_id'], populated_graphs, alias_map)
-    if target_graph is None:
+    labels = node.get('labels') or []
+    if 'Entity' not in labels:
+        disposition = EPISODIC_SKIP
+    elif target_graph is None:
         disposition = UNRESOLVED
     elif target_graph == node['source_graph']:
         disposition = REKEY
