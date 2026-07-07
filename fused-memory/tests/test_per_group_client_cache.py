@@ -220,3 +220,29 @@ class TestBuildCommunitiesPassesDriver:
         _, kwargs = backend.client.build_communities.await_args
         assert kwargs.get('group_ids') == ['A']
         assert kwargs.get('driver') is da
+
+
+# ---------------------------------------------------------------------------
+# step-9/10: GraphitiBackend.close() accounts for per-group clients
+# ---------------------------------------------------------------------------
+
+
+class TestCloseAccountsForGroupClients:
+    """close() must drop per-group client references without double-closing
+    the single shared FalkorDB connection — each per-group client's driver
+    aliases an entry already closed via the _cloned_drivers loop."""
+
+    @pytest.mark.asyncio
+    async def test_close_clears_group_clients_without_double_close(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        backend._driver = MagicMock()
+        backend._driver.close = AsyncMock()
+        cloned = MagicMock()
+        cloned.close = AsyncMock()
+        backend._cloned_drivers = {'A': cloned}
+        backend._group_clients = {'A': MagicMock()}
+
+        await backend.close()
+
+        assert backend._group_clients == {}
+        cloned.close.assert_awaited_once()
