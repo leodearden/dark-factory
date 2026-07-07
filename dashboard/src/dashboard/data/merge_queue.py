@@ -18,7 +18,6 @@ import asyncio
 import json
 import logging
 import math
-import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
@@ -28,6 +27,7 @@ import httpx
 from dashboard.config import DashboardConfig
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
+from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.stats_utils import percentile
 from dashboard.data.tasks import fetch_tasks
@@ -868,7 +868,9 @@ def enrich_merges_with_titles(
 # lookups.  Cache is in-process; multi-worker deployments will each pay
 # their own MCP roundtrip on first lookup.
 _TASK_TITLES_TTL_SECONDS = 10.0
-_task_titles_cache: dict[str, tuple[float, dict[str, str]]] = {}
+_task_titles_cache: TTLCache[dict[str, str] | None] = TTLCache(
+    ttl_seconds=lambda: _TASK_TITLES_TTL_SECONDS
+)
 
 
 def _task_titles_cache_clear() -> None:
@@ -888,18 +890,20 @@ async def load_task_titles(
     for ``_TASK_TITLES_TTL_SECONDS`` (~10 s) so that the dashboard's per-poll
     enrichment doesn't hammer the MCP server.  An MCP failure returns ``{}``
     so the merge-queue tab still renders (titles fall back to empty strings).
+    Concurrent cold callers for the same project_root collapse onto one
+    in-flight fetch_tasks call (TTLCache single-flight).
     """
-    now = time.monotonic()
-    cached = _task_titles_cache.get(project_root)
-    if cached is not None and (now - cached[0]) < _TASK_TITLES_TTL_SECONDS:
-        return dict(cached[1])
 
-    fetched = await fetch_tasks(client, config, project_root)
-    if not isinstance(fetched, list):
-        return {}
-    titles = {str(t['id']): t['title'] for t in fetched if t.get('title')}
-    _task_titles_cache[project_root] = (now, titles)
-    return dict(titles)
+    async def _refresh() -> dict[str, str] | None:
+        fetched = await fetch_tasks(client, config, project_root)
+        if not isinstance(fetched, list):
+            return None
+        return {str(t['id']): t['title'] for t in fetched if t.get('title')}
+
+    result = await _task_titles_cache.get_or_refresh(
+        project_root, _refresh, cache_ok=lambda v: v is not None,
+    )
+    return dict(result) if isinstance(result, dict) else {}
 
 
 async def build_per_project_merge_queue(
