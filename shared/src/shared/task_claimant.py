@@ -60,10 +60,12 @@ def is_stranded(task: Mapping, now: datetime, ttl: timedelta) -> bool:
     if status != TaskStatus.IN_PROGRESS.value:
         return False
 
+    # A first-class TaskStatus.INFRA_HOLD status can never reach this line —
+    # the in-progress gate above already returned False for it. Only the
+    # legacy metadata.infra_hold overload (pre-omega4 migration window, see
+    # module docstring) is checked here.
     metadata = task.get('metadata')
-    if status == TaskStatus.INFRA_HOLD.value or (
-        isinstance(metadata, Mapping) and metadata.get('infra_hold')
-    ):
+    if isinstance(metadata, Mapping) and metadata.get('infra_hold'):
         return False
 
     if now.tzinfo is None:
