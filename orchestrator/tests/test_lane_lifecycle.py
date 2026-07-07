@@ -373,3 +373,82 @@ class TestAcquireRouteTable:
             'REUSE', 'REUSE_REPAIR', 'CREATE_ONCE_FRESH', 'CREATE_ONCE_REATTACH',
             'DISK_BACKSTOP_REUSE', 'RESET_IN_PLACE_REATTACH', 'RECYCLE',
         }
+
+
+# ---------------------------------------------------------------------------
+# note_assigned — idempotent bring-to-ASSIGNED (W11 delta): the reader-side /
+# cache-mirror analog of GitOps._note_assigned_via_route, used by
+# WarmLanePool.restore_assignment/note_assignment to keep the durable record
+# coherent with the in-memory cache (PRD dec.3, I1).
+# ---------------------------------------------------------------------------
+
+
+class TestNoteAssigned:
+    def test_released_lane_transitions_to_assigned(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _released_lane(tmp_path, lifecycle)  # branch='task/foo', RELEASED
+
+        record = lifecycle.note_assigned(lane, task_id='42', branch='task/42')
+
+        assert record.state == LaneState.ASSIGNED
+        assert record.task_id == '42'
+        assert record.branch == 'task/42'
+        assert lifecycle.read(lane) == record
+
+    def test_registered_lane_transitions_to_assigned(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/42')
+
+        record = lifecycle.note_assigned(lane, task_id='42', branch='task/42')
+
+        assert record.state == LaneState.ASSIGNED
+        assert record.task_id == '42'
+        assert record.branch == 'task/42'
+        assert lifecycle.read(lane) == record
+
+    def test_absent_record_seeds_up_to_assigned(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        assert lifecycle.read(lane) is None
+
+        record = lifecycle.note_assigned(lane, task_id='42', branch='task/42')
+
+        assert record.state == LaneState.ASSIGNED
+        assert record.task_id == '42'
+        assert record.branch == 'task/42'
+        assert lifecycle.read(lane) == record
+
+    def test_already_assigned_same_task_is_idempotent_noop(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/42')
+        lifecycle.transition(lane, LaneState.ASSIGNED, task_id='42', title='demo')
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        record = lifecycle.note_assigned(lane, task_id='42', branch='task/42')
+
+        assert record.state == LaneState.ASSIGNED
+        assert record.task_id == '42'
+        # No I/O at all on the idempotent path — byte-identical on disk.
+        assert record_path.read_bytes() == before_bytes
+
+    def test_already_assigned_different_task_raises_and_leaves_record_unchanged(
+        self, tmp_path: Path,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/42')
+        lifecycle.transition(lane, LaneState.ASSIGNED, task_id='42', title='demo')
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        with pytest.raises(IllegalLaneTransition):
+            lifecycle.note_assigned(lane, task_id='99', branch='task/99')
+
+        # Never silent-steal: the record is untouched on conflict.
+        assert record_path.read_bytes() == before_bytes
