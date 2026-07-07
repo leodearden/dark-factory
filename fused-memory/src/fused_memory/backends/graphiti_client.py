@@ -1010,33 +1010,44 @@ class GraphitiBackend:
                 },
             )
 
-        # Phase 3: Redirect incoming edges (source → deprecated)
-        count_in = await graph.query(
-            'MATCH ()-[e:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
-            'RETURN count(e) AS cnt',
+        # Phase 3: Redirect incoming edges (source → deprecated). Enumerate
+        # the redirect set by stable internal element ID(old) — NOT old.uuid,
+        # which may already be duplicated by a prior buggy merge — then
+        # redirect one edge per query, minting a fresh uuid4 per edge and
+        # recording the original uuid as new.superseded_edge_uuid for audit.
+        in_enum = await graph.query(
+            'MATCH (source)-[old:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
+            'RETURN ID(old) AS eid',
             {'dep_uuid': deprecated_uuid},
         )
-        incoming_redirected = (
-            int(count_in.result_set[0][0]) if count_in.result_set else 0
-        )
-        await graph.query(
-            'MATCH (source)-[old:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
-            'WITH old, source '
-            'MATCH (sur:Entity {uuid: $sur_uuid}) '
-            'CREATE (source)-[new:RELATES_TO]->(sur) '
-            'SET new.uuid = old.uuid, '
-            '    new.name = old.name, '
-            '    new.fact = old.fact, '
-            '    new.fact_embedding = old.fact_embedding, '
-            '    new.valid_at = old.valid_at, '
-            '    new.invalid_at = old.invalid_at, '
-            '    new.created_at = old.created_at, '
-            '    new.group_id = old.group_id, '
-            '    new.episodes = old.episodes, '
-            '    new.target_node_uuid = $sur_uuid '
-            'DELETE old',
-            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
-        )
+        in_eids = [row[0] for row in (in_enum.result_set or [])]
+        incoming_redirected = len(in_eids)
+        for eid in in_eids:
+            new_uuid = str(uuid.uuid4())
+            await graph.query(
+                'MATCH (source)-[old:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
+                'WHERE ID(old) = $eid '
+                'MATCH (sur:Entity {uuid: $sur_uuid}) '
+                'CREATE (source)-[new:RELATES_TO]->(sur) '
+                'SET new.uuid = $new_uuid, '
+                '    new.superseded_edge_uuid = old.uuid, '
+                '    new.name = old.name, '
+                '    new.fact = old.fact, '
+                '    new.fact_embedding = old.fact_embedding, '
+                '    new.valid_at = old.valid_at, '
+                '    new.invalid_at = old.invalid_at, '
+                '    new.created_at = old.created_at, '
+                '    new.group_id = old.group_id, '
+                '    new.episodes = old.episodes, '
+                '    new.target_node_uuid = $sur_uuid '
+                'DELETE old',
+                {
+                    'dep_uuid': deprecated_uuid,
+                    'sur_uuid': surviving_uuid,
+                    'eid': eid,
+                    'new_uuid': new_uuid,
+                },
+            )
 
         logger.info(
             'redirect_node_edges: dep=%s sur=%s inter_deleted=%d out=%d in=%d',
