@@ -16,6 +16,7 @@ from fastmcp.server.dependencies import get_http_headers
 
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
+from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
@@ -592,11 +593,14 @@ def create_server(
             }
 
         # Connection-capability gate (escalation-connection-capability-guard-prd.md,
-        # task alpha). get_http_headers() returns {} outside an ASGI request context
+        # task alpha; identity-derived ceiling extension per
+        # plans/task-status-authority-prd.md contract C8 / decision D7).
+        # get_http_headers() returns {} outside an ASGI request context
         # (in-process tool.fn() calls, stdio transport), so this gate is a no-op for
         # those callers — default-open is preserved byte-for-byte.
         headers = get_http_headers()
         levels_raw = headers.get(_LEVELS_HEADER)
+        parsed: set[int] | None = None
         if levels_raw is not None:
             try:
                 parsed = _parse_levels(levels_raw)
@@ -608,10 +612,28 @@ def create_server(
                     ),
                     'code': 'bad_capability_header',
                 }
+        identity = headers.get(_IDENTITY_HEADER)
+
+        # D7 effective ceiling: an identity mapped in ROLE_LEVEL_ALLOWLIST is
+        # AUTHORITATIVE — a present X-Escalation-Levels header may only
+        # NARROW within that role ceiling (set intersection), never widen
+        # past it, and dropping the header entirely still leaves the bare
+        # role ceiling in force. An identity absent from
+        # ROLE_LEVEL_ALLOWLIST (or no identity at all) falls back to the
+        # pre-existing 2041 header-opt-in behaviour: `parsed` if a header
+        # was sent, else None — unrestricted (the esc-2087-2 human-channel
+        # guarantee; header-less callers are never default-denied).
+        role_ceiling = ROLE_LEVEL_ALLOWLIST.get(identity) if identity is not None else None
+        if role_ceiling is not None:
+            effective = (role_ceiling & parsed) if parsed is not None else role_ceiling
+        else:
+            effective = parsed
+
+        if effective is not None:
             target = queue.get(escalation_id)
             if target is None:
                 return {'error': f'Escalation {escalation_id} not found'}
-            if target.level not in parsed:
+            if target.level not in effective:
                 return {
                     'error': (
                         f'connection not permitted to change level-{target.level} '
@@ -619,7 +641,6 @@ def create_server(
                     ),
                     'code': 'level_forbidden',
                 }
-        identity = headers.get(_IDENTITY_HEADER)
         if identity is not None:
             # Server-attributed identity overrides the tool arg for both the
             # park stamp (below) and the resolve call further down — a caller
