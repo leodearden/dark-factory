@@ -592,3 +592,47 @@ class TestMergeCollection:
         )
 
         assert result == {'points_upserted': 1, 'source_deleted': False}
+
+
+# ===========================================================================
+# Tests: delete_junk_key
+# ===========================================================================
+
+class TestDeleteJunkKey:
+    """Tests for async delete_junk_key(graphiti, key, node_count)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_graph_for_with_exact_key(self):
+        """graphiti._graph_for is called with the exact key argument."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.delete_junk_key(graphiti, 'my-project', 0)
+
+        graphiti._graph_for.assert_called_once_with('my-project')
+
+    @pytest.mark.asyncio
+    async def test_zero_count_deletes_and_returns_delete_disposition(self):
+        """node_count==0 -> GRAPH.DELETE via graph.delete(), disposition DELETE."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        disposition = await _mod.delete_junk_key(graphiti, 'my-project', 0)
+
+        graph.delete.assert_called_once()
+        assert disposition == 'DELETE'
+
+    @pytest.mark.asyncio
+    async def test_nonzero_count_does_not_delete_and_returns_unresolved(self):
+        """node_count>0 -> .delete() is NEVER called, disposition UNRESOLVED
+        (deletion blocked -- no data loss)."""
+        graphiti = MagicMock()
+        graph = _make_graph_mock([])
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        disposition = await _mod.delete_junk_key(graphiti, 'my-project', 5)
+
+        graph.delete.assert_not_called()
+        assert disposition == 'UNRESOLVED'
