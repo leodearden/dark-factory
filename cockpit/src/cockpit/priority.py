@@ -8,8 +8,16 @@ from a global or a clock read.
 
 from __future__ import annotations
 
+import importlib.resources
+import logging
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -108,3 +116,75 @@ def score(item: ScoringItem, weights: Priorities, now: datetime) -> float:
     raw = max(0.0, raw)
     urgency = raw / (1.0 + raw)
     return STATE_TIER.get(item.state, 0.0) + urgency
+
+
+def _default_priorities_path() -> Path:
+    """Where an operator's editable priorities.yaml lives (outside the repo)."""
+    return Path.home() / '.claude' / 'fleet' / 'priorities.yaml'
+
+
+def _load_bundled_defaults() -> dict[str, Any]:
+    """Load the package-bundled priorities.default.yaml."""
+    defaults_path = importlib.resources.files('cockpit').joinpath('priorities.default.yaml')
+    with importlib.resources.as_file(defaults_path) as p, open(p) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _priorities_from_dict(data: dict[str, Any]) -> Priorities:
+    """Build a Priorities from a parsed YAML dict, defaulting missing sections/fields."""
+    fallback = Priorities.default()
+    defaults_section = data.get('defaults') or {}
+    age_curve_section = data.get('age_curve') or {}
+    manual_boost_section = data.get('manual_boost') or {}
+    return Priorities(
+        severity_weights=data.get('severity_weights', fallback.severity_weights),
+        category_weights=data.get('category_weights', fallback.category_weights),
+        project_weights=data.get('project_weights', fallback.project_weights),
+        defaults=Defaults(
+            severity=defaults_section.get('severity', fallback.defaults.severity),
+            category=defaults_section.get('category', fallback.defaults.category),
+            project=defaults_section.get('project', fallback.defaults.project),
+        ),
+        age_curve=AgeCurve(
+            max_bonus=age_curve_section.get('max_bonus', fallback.age_curve.max_bonus),
+            saturation_seconds=age_curve_section.get(
+                'saturation_seconds', fallback.age_curve.saturation_seconds
+            ),
+        ),
+        manual_boost=ManualBoostConfig(
+            weight=manual_boost_section.get('weight', fallback.manual_boost.weight),
+            min=manual_boost_section.get('min', fallback.manual_boost.min),
+            max=manual_boost_section.get('max', fallback.manual_boost.max),
+        ),
+    )
+
+
+def load_priorities(path: Path | None = None) -> Priorities:
+    """Load Priorities from *path* (default ``~/.claude/fleet/priorities.yaml``).
+
+    Fail-soft, per the cockpit's hard constraint (a view must never be a
+    dependency): a missing user file silently falls back to the
+    package-bundled defaults; a malformed user file falls back to the same
+    defaults with a logged WARNING. This function never raises.
+    """
+    target = path if path is not None else _default_priorities_path()
+
+    if target.exists():
+        try:
+            with open(target) as f:
+                data = yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning('load_priorities: failed to parse %s: %s — using defaults', target, exc)
+            return Priorities.default()
+
+        if not isinstance(data, dict):
+            logger.warning(
+                'load_priorities: expected a YAML mapping in %s, got %s — using defaults',
+                target,
+                type(data).__name__,
+            )
+            return Priorities.default()
+
+        return _priorities_from_dict(data)
+
+    return _priorities_from_dict(_load_bundled_defaults())

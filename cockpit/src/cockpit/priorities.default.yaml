@@ -1,0 +1,35 @@
+# Bundled default priority-scoring weights for the Fleet Cockpit (PRD C3).
+#
+# These values mirror cockpit.priority.Priorities.default() exactly — the
+# hardcoded classmethod is the source of truth for library callers who never
+# touch YAML, and this file is what ships to disk (see ensure_priorities_file)
+# for operators who want to hand-edit ~/.claude/fleet/priorities.yaml via the
+# C9b weight editor. Keep the two in sync.
+
+severity_weights:
+  critical: 5.0
+  high: 3.0
+  medium: 1.5
+  low: 0.5
+
+category_weights:
+  security: 2.0
+  bug: 1.0
+  feature: 0.5
+  chore: 0.2
+
+project_weights: {}
+
+defaults:
+  severity: 1.0
+  category: 0.5
+  project: 0.0
+
+age_curve:
+  max_bonus: 2.0
+  saturation_seconds: 604800  # 7 days
+
+manual_boost:
+  weight: 1.0
+  min: -5
+  max: 5
