@@ -337,12 +337,18 @@ def _warn_malformed_metadata_once(
 def _emit_schema_warning(task_id: int, warning: SchemaWarning) -> None:
     """Emit the write-boundary census line for one :class:`SchemaWarning`.
 
-    One WARNING line per warning, emitted only in warn-mode
-    (``task_metadata.enforce=False``). The literal token
-    ``task_metadata.schema_warning`` is what the enforce-gate census greps
-    for in the fused-memory journal (PRD §1/§5) — it is deliberately
-    distinct from the ``_warn_malformed_metadata_once`` read-path token
-    (``'malformed metadata'``) so the two censuses never conflate.
+    One WARNING line per warning ``parse_metadata`` returns — this is not
+    scoped to warn-mode. In warn-mode every violation surfaces this way
+    (``parse_metadata`` never raises there). In enforce-mode, only non-fatal
+    warnings that ``parse_metadata`` returns *without* raising still reach
+    here (e.g. ``unknown_key`` on an otherwise-valid blob); violations that
+    raise (invalid fields, invariant breaches, unparseable JSON) never do,
+    because the caller's ``_txn`` rolls back before this is called. The
+    literal token ``task_metadata.schema_warning`` is what the enforce-gate
+    census greps for in the fused-memory journal (PRD §1/§5) — it is
+    deliberately distinct from the ``_warn_malformed_metadata_once``
+    read-path token (``'malformed metadata'``) so the two censuses never
+    conflate.
     """
     logger.warning(
         'task_metadata.schema_warning task_id=%s field=%s error=%s',
@@ -359,9 +365,27 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
     metadata_raw = row['metadata']
     metadata: Any = None
     if metadata_raw:
-        _, warnings = parse_metadata(metadata_raw, direction='read')
-        if any(w.code in {'unparseable_json', 'not_an_object'} for w in warnings):
-            # Malformed legacy row: discard and surface {} so downstream
+        # Detects the same two malformed cases parse_metadata(direction='read')
+        # would flag via its 'unparseable_json'/'not_an_object' SchemaWarning
+        # codes (shared/src/shared/task_metadata.py) — both are raised by that
+        # function's own json.loads/isinstance(dict) guard, before
+        # apply_migrations or any TaskMetadata construction runs. Checking
+        # directly here — one json.loads, one isinstance — skips building
+        # (and discarding) a full pydantic model per row on the get_tasks hot
+        # path, and avoids parsing metadata_raw a second time for the happy
+        # case.
+        try:
+            parsed_raw = json.loads(metadata_raw)
+        except ValueError:
+            parsed_raw = None
+        if isinstance(parsed_raw, dict):
+            # Raw shape preserved — never parse_metadata(...).model_dump():
+            # unknown keys, absent schema_version, etc. round-trip
+            # byte-for-value (I1) rather than gaining typed-field defaults.
+            metadata = parsed_raw
+        else:
+            # Malformed legacy row (unparseable JSON, or valid JSON that
+            # isn't an object): discard and surface {} so downstream
             # `(task.get('metadata') or {}).get(...)` callers never see a str
             # or a non-dict. WARN once per (project_root, tag, id) per process
             # so a corrupted-row batch doesn't fan out to one log line per row
@@ -371,11 +395,6 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
                 resolution='coerced to {}',
             )
             metadata = {}
-        else:
-            # Raw shape preserved — never parse_metadata(...).model_dump():
-            # unknown keys, absent schema_version, etc. round-trip
-            # byte-for-value (I1) rather than gaining typed-field defaults.
-            metadata = json.loads(metadata_raw)
 
     row_keys = row.keys()
     return {
@@ -919,6 +938,13 @@ class SqliteTaskBackend:
         unchanged. In enforce-mode, a malformed blob's raise
         (``ValidationError`` / ``ValueError`` / ``TypeError``) propagates
         uncaught — the caller's ``_txn`` rolls back.
+
+        ``project_root``/``tag`` are accepted but not yet read by this method
+        — the census line only carries ``task_id``/field/error. They mirror
+        ``_warn_malformed_metadata_once``'s ``(project_root, tag, task_id)``
+        triple so a future write-side census enrichment (e.g. scoping/dedup
+        by project) can use them without changing either call site's
+        signature.
         """
         _, warnings = parse_metadata(
             metadata, direction='write', enforce=self._task_metadata_enforce,
