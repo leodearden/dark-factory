@@ -17,14 +17,19 @@ is present in, and stable across, all three events for one session.
 
 from __future__ import annotations
 
+import argparse
 import json
+import logging
 import os
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from orchestrator import session_registry
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Hook stdin JSON parsing (tolerant -- every field optional)
@@ -223,3 +228,52 @@ def run_stop(
 ) -> str:
     """Stop hook handler: status -> IDLE, return its OSC retitle."""
     return _run_status_refresh_and_retitle(hook_input, env, root, session_registry.Status.IDLE)
+
+
+# ---------------------------------------------------------------------------
+# CLI + fail-soft (PRD: a hook fault must never block a session or turn)
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog='session_hooks')
+    sub = parser.add_subparsers(dest='verb', required=True)
+    sub.add_parser('session-start', help='SessionStart hook: capture/refresh the record (status=running)')
+    sub.add_parser('notification', help='Notification hook: status=awaiting-input, print the OSC retitle')
+    sub.add_parser('stop', help='Stop hook: status=idle, print the OSC retitle')
+    sub.add_parser('install', help='merge the hooks trio into ~/.claude/settings.json')
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    ALWAYS returns 0: a fault in any subcommand's core logic is logged
+    loudly (stderr, via the standard logging machinery) and swallowed here
+    rather than raised, so a hook fault can never block a Claude Code
+    session or turn (mirrors session_registry.main's fail-soft contract).
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.verb in ('session-start', 'notification', 'stop'):
+            hook_input = parse_hook_input(sys.stdin.read())
+            env = os.environ
+            if args.verb == 'session-start':
+                run_session_start(hook_input, env)
+            elif args.verb == 'notification':
+                print(run_notification(hook_input, env))
+            else:
+                print(run_stop(hook_input, env))
+        elif args.verb == 'install':
+            pass  # wired in task 2288 step-12
+    except Exception:
+        logger.error('session_hooks %s failed', args.verb, exc_info=True)
+        return 0
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
