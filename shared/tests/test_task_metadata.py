@@ -595,3 +595,37 @@ class TestParseMetadataFailurePolicy:
         )
         assert len(warnings) == 1
         assert model.task_kind == 'deterministic'
+
+    # Valid JSON that decodes to something other than an object, plus one
+    # direct non-dict/non-str Python input exercising the `else: parsed =
+    # blob` branch directly (bypassing json.loads entirely).
+    _NON_OBJECT_BLOBS = [
+        pytest.param('"null"', id='json_string_literal_null'),
+        pytest.param('null', id='json_null'),
+        pytest.param('42', id='json_int'),
+        pytest.param('[1,2]', id='json_list'),
+        pytest.param('"str"', id='json_string'),
+        pytest.param([1, 2], id='direct_non_str_non_dict_input'),
+    ]
+
+    @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
+    def test_non_object_blob_read_warns_never_raises(self, blob):
+        model, warnings = parse_metadata(blob, direction='read')  # type: ignore[arg-type]
+        assert model == TaskMetadata()
+        assert len(warnings) == 1
+        assert warnings[0].code == 'not_an_object'
+        assert warnings[0].field == task_metadata_module._WHOLE_METADATA_FIELD
+
+    @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
+    def test_non_object_blob_write_warn_mode_accepts(self, blob):
+        model, warnings = parse_metadata(  # type: ignore[arg-type]
+            blob, direction='write', enforce=False
+        )
+        assert model == TaskMetadata()
+        assert len(warnings) == 1
+        assert warnings[0].code == 'not_an_object'
+
+    @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
+    def test_non_object_blob_write_enforce_raises(self, blob):
+        with pytest.raises((TypeError, ValueError)):
+            parse_metadata(blob, direction='write', enforce=True)  # type: ignore[arg-type]
