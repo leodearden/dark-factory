@@ -2832,3 +2832,82 @@ async def test_update_task_enforce_mode_rejects_invariant_violation(tmp_path, pr
         )
     finally:
         await backend.close()
+
+
+# ── read-path tolerance + collapse (task 2162, step-9/10) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_row_to_task_coerces_valid_non_object_json_to_empty_dict(backend, project_root):
+    """A valid-JSON-but-non-object metadata blob (e.g. '[1,2,3]') reads as {}.
+
+    Net new behavior (task 2162): previously a bare JSON array round-tripped
+    verbatim through the hand-rolled json.loads/try-except (no exception is
+    raised by json.loads for a well-formed array), so it surfaced as a raw
+    list. The shared read policy's 'not_an_object' code now flags this as
+    malformed, coercing it — more correct for downstream dict-consumers
+    (``(task.get('metadata') or {}).get(...)``-style callers). Verified via
+    both get_task and get_tasks.
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    conn = await backend._get_connection(project_root)
+    await conn.execute('UPDATE tasks SET metadata = ? WHERE id = 1', ('[1,2,3]',))
+    await conn.commit()
+
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == {}
+
+    listing = await backend.get_tasks(project_root=project_root)
+    assert listing['tasks'][0]['metadata'] == {}
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_coerces_corrupt_json_to_empty_dict_with_one_warning(
+    backend, project_root, caplog,
+):
+    """A corrupt (unparseable) metadata blob reads as {} via get_tasks, warning once.
+
+    Regression safety net for the parse_metadata collapse: an unparseable
+    blob must never raise out of get_tasks, must coerce to {}, and must still
+    emit exactly one deduped 'malformed metadata' WARNING (the pre-existing
+    _warn_malformed_metadata_once contract, reused unchanged on the collapsed
+    read path).
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    conn = await backend._get_connection(project_root)
+    await conn.execute('UPDATE tasks SET metadata = ? WHERE id = 1', ('{not json',))
+    await conn.commit()
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        listing = await backend.get_tasks(project_root=project_root)
+
+    assert listing['tasks'][0]['metadata'] == {}
+    malformed_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'malformed metadata' in r.message
+    ]
+    assert len(malformed_msgs) == 1, (
+        f'Expected exactly one malformed-metadata WARNING; got '
+        f'{len(malformed_msgs)}: {malformed_msgs}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_row_to_task_preserves_unknown_key_without_typed_defaults(backend, project_root):
+    """A valid object with an unrecognised key round-trips exactly, untouched.
+
+    No schema_version stamp or typed-field defaults (task_kind,
+    always_escalates, before_done=None, external_deps=[], files=[]) are
+    injected into the read — the read path surfaces the raw json.loads dict,
+    never a parse_metadata(...).model_dump().
+    """
+    await backend.add_task(project_root=project_root, title='t')
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id = 1',
+        ('{"prd": "x", "unknown_key": 1}',),
+    )
+    await conn.commit()
+
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == {'prd': 'x', 'unknown_key': 1}
