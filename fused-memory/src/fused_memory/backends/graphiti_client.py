@@ -441,7 +441,7 @@ class GraphitiBackend:
         temporal_context: str | None = None,
     ) -> Any:
         """Add an episode to Graphiti and return the result."""
-        client = self._require_client()
+        client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
