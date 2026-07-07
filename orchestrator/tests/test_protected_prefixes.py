@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
@@ -480,7 +481,11 @@ class TestReapInteractiveForeignBandRefusal:
         # backdated stamp so it is TTL-idle at `now`.
         info = await git_ops.create_interactive_worktree('someslug')
         now = datetime.now(UTC)
-        stamp_path = info.path / '.task' / 'interactive.json'
+        # W11 gamma: the stamp lives at the new .task-meta sibling location.
+        stamp_path = (
+            TaskArtifacts.meta_root_for(info.path.parent, info.path.name)
+            / 'interactive.json'
+        )
         stamp = json.loads(stamp_path.read_text())
         stamp['created_at'] = (
             now - timedelta(seconds=config.interactive_worktree_ttl + 3600)

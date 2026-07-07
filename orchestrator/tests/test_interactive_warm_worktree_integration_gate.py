@@ -109,8 +109,14 @@ async def _add_seed_script(repo: Path, *, exit_code: int = 0) -> None:
 
 
 def _backdate_stamp(path: Path, created_at: datetime) -> None:
-    """Rewrite the ``.task/interactive.json`` stamp's ``created_at`` field."""
-    stamp_path = path / '.task' / 'interactive.json'
+    """Rewrite the interactive.json stamp's ``created_at`` field at its new
+    .task-meta location (W11 gamma .task -> .task-meta relocation; the stamp
+    is a SIBLING of the worktree under ``<worktree_base>/.task-meta/<name>``)."""
+    from orchestrator.artifacts import TaskArtifacts
+
+    stamp_path = (
+        TaskArtifacts.meta_root_for(path.parent, path.name) / 'interactive.json'
+    )
     stamp = json.loads(stamp_path.read_text())
     stamp['created_at'] = created_at.isoformat()
     stamp_path.write_text(json.dumps(stamp))

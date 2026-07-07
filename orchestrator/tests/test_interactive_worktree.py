@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator import config as orchestrator_config
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
     GitOps,
@@ -29,6 +30,16 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.warm_lane_pool import LaneState
+
+
+def _stamp_path(worktree: Path) -> Path:
+    """Resolve the interactive.json stamp at its new .task-meta location
+    (W11 gamma .task -> .task-meta relocation; the stamp is a SIBLING of the
+    worktree under ``<worktree_base>/.task-meta/<name>``, not inside it)."""
+    return (
+        TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        / 'interactive.json'
+    )
 
 # ---------------------------------------------------------------------------
 # Repo fixture + seed-stub helper (mirrors test_warm_lane_integration_gate.py)
@@ -230,7 +241,9 @@ class TestInteractiveWorktreeStamp:
 
         info = await git_ops.create_interactive_worktree('stamp-slug')
 
-        stamp_path = info.path / '.task' / 'interactive.json'
+        # W11 gamma: the stamp is written new-path-only to .task-meta, a
+        # SIBLING of the worktree — never under the legacy <wt>/.task/ path.
+        stamp_path = _stamp_path(info.path)
         assert stamp_path.exists(), f'expected stamp to exist at {stamp_path}'
 
         stamp = json.loads(stamp_path.read_text())
@@ -240,23 +253,25 @@ class TestInteractiveWorktreeStamp:
         # Machine-parseable ISO8601 — raises ValueError on failure.
         datetime.fromisoformat(stamp['created_at'])
 
-        # Not git-tracked: ls-files --error-unmatch must fail (non-zero rc),
-        # and `git status --porcelain` must not list it (gitignored via
-        # .task/.gitignore, written by _ensure_task_gitignore).
-        rc_ls, _, _ = await _run(
-            ['git', 'ls-files', '--error-unmatch', '.task/interactive.json'],
-            cwd=info.path,
+        # No legacy in-worktree stamp is written any more.
+        legacy_path = info.path / '.task' / 'interactive.json'
+        assert not legacy_path.exists(), (
+            f'expected NO interactive.json under the legacy path {legacy_path}'
         )
-        assert rc_ls != 0, (
-            'expected .task/interactive.json to NOT be git-tracked '
-            '(git ls-files --error-unmatch unexpectedly succeeded)'
+
+        # Living outside the worktree, the stamp can never be git-tracked or
+        # dirty the worktree — assert it sits outside info.path and that
+        # `git status` in the worktree is clean of it.
+        assert info.path not in stamp_path.parents, (
+            f'expected stamp {stamp_path} to live OUTSIDE the worktree '
+            f'{info.path} (it is a .task-meta sibling)'
         )
         rc_status, status_out, _ = await _run(
             ['git', 'status', '--porcelain'], cwd=info.path,
         )
         assert rc_status == 0 and 'interactive.json' not in status_out, (
-            f'expected .task/interactive.json to be absent from git status '
-            f'(gitignored); got status: {status_out!r}'
+            f'expected interactive.json to be absent from git status '
+            f'(lives outside the worktree); got status: {status_out!r}'
         )
 
 
@@ -291,7 +306,7 @@ class TestCreateInteractiveWorktreeFailSoftWarmth:
             f'expected {info.path} to be a registered git worktree even though '
             f'cold; worktree list: {wt_list!r}'
         )
-        assert (info.path / '.task' / 'interactive.json').exists(), (
+        assert _stamp_path(info.path).exists(), (
             'expected the stamp to be present even though the worktree is cold '
             '(worktree is usable)'
         )

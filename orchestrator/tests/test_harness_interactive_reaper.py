@@ -74,10 +74,16 @@ async def _commit_file(repo: Path, name: str, content: str, message: str) -> str
 
 
 def _backdate_stamp(path: Path, created_at: datetime) -> None:
-    """Rewrite the ``.task/interactive.json`` stamp's ``created_at`` field."""
+    """Rewrite the interactive.json stamp's ``created_at`` field at its new
+    .task-meta location (W11 gamma .task -> .task-meta relocation; the stamp
+    is a SIBLING of the worktree under ``<worktree_base>/.task-meta/<name>``)."""
     import json
 
-    stamp_path = path / '.task' / 'interactive.json'
+    from orchestrator.artifacts import TaskArtifacts
+
+    stamp_path = (
+        TaskArtifacts.meta_root_for(path.parent, path.name) / 'interactive.json'
+    )
     stamp = json.loads(stamp_path.read_text())
     stamp['created_at'] = created_at.isoformat()
     stamp_path.write_text(json.dumps(stamp))

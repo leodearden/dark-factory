@@ -24,8 +24,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, ReapedInteractiveWorktree, _run
+
+
+def _stamp_path(worktree: Path) -> Path:
+    """Resolve the interactive.json stamp at its new .task-meta location
+    (W11 gamma .task -> .task-meta relocation; the stamp is a SIBLING of the
+    worktree under ``<worktree_base>/.task-meta/<name>``, not inside it)."""
+    return (
+        TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        / 'interactive.json'
+    )
 
 # ---------------------------------------------------------------------------
 # Repo fixture + helpers (mirrors test_interactive_worktree.py)
@@ -61,11 +72,13 @@ async def _commit_file(repo: Path, name: str, content: str, message: str) -> str
 
 
 def _read_stamp(path: Path) -> dict:
-    return json.loads((path / '.task' / 'interactive.json').read_text())
+    return json.loads(_stamp_path(path).read_text())
 
 
 def _write_stamp(path: Path, stamp: dict) -> None:
-    (path / '.task' / 'interactive.json').write_text(json.dumps(stamp))
+    stamp_path = _stamp_path(path)
+    stamp_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp_path.write_text(json.dumps(stamp))
 
 
 def _backdate_stamp(path: Path, created_at: datetime) -> None:
@@ -439,10 +452,10 @@ class TestReapInteractiveWorktreesFailSoftStamp:
         git_ops = GitOps(config, iw_git_repo)
 
         info_g = await git_ops.create_interactive_worktree('no-stamp-g')
-        (info_g.path / '.task' / 'interactive.json').unlink()
+        _stamp_path(info_g.path).unlink()
 
         info_h = await git_ops.create_interactive_worktree('corrupt-h')
-        (info_h.path / '.task' / 'interactive.json').write_text('{not valid json')
+        _stamp_path(info_h.path).write_text('{not valid json')
         await _commit_file(info_h.path, 'work.txt', 'work\n', 'wip on h')
 
         now = datetime.now(UTC)
