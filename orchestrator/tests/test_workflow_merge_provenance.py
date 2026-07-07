@@ -363,3 +363,124 @@ class TestRecoverIfAlreadyMerged:
         assert outcome is None
         assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Tests: TaskWorkflow._recover_before_execute (Guard 2, extracted pre-EXECUTE)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoverBeforeExecute:
+    """Unit tests for the extracted pre-EXECUTE ghost-loop guard (PRD α).
+
+    Mirrors ``TestRecoverIfAlreadyMerged`` but for the guard that runs after
+    PLAN and before the execute/verify/review loop.  External (eval-mode)
+    worktrees never ghost-recover — they always run the execute loop, checked
+    before the journal or any git probe.
+    """
+
+    async def test_external_worktree_never_recovers(self, tmp_path: Path):
+        """worktree_external short-circuits to None before the journal or
+        git layer are ever consulted — even when a journal hit exists."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf._worktree_external = True
+        _bind_landed_row(tmp_path, task_id=f.wf.task_id, advanced_sha='advancedsha123')
+        f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError(
+                '_check_branch_on_main must not be called for an external worktree',
+            ),
+        )
+
+        outcome = await f.wf._recover_before_execute()
+
+        assert outcome is None
+        assert f.wf._merge_recovery_basis is None
+        f.mark_done.assert_not_awaited()
+
+    async def test_journal_hit_returns_done_without_consulting_git_or_fallback(
+        self, tmp_path: Path,
+    ):
+        """A journal hit is authoritative — short-circuits before the
+        git-layer probe and the legacy heuristic are ever consulted [row 1]."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        _bind_landed_row(tmp_path, task_id=f.wf.task_id, advanced_sha='advancedsha123')
+        f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError(
+                '_check_branch_on_main must not be called on a journal hit',
+            ),
+        )
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError(
+                '_has_prior_implementation must not be called on a journal hit',
+            ),
+        )
+
+        outcome = await f.wf._recover_before_execute()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert f.wf._merge_recovery_basis == 'journal'
+        f.mark_done.assert_awaited_once_with(
+            f.wf.task_id, kind='merged', sha='advancedsha123',
+            note='landed-outbox journal hit (pre-EXECUTE recovery)',
+        )
+
+    async def test_journal_miss_on_main_with_prior_work_falls_back_to_found_on_main(
+        self, tmp_path: Path,
+    ):
+        """Journal miss + on-main + prior implementation work (iteration-log
+        fallback, no wt_head) → fallback DONE."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+            return_value=('wthead123', 'mainsha123'),
+        )
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            return_value=_PriorImplStatus(has_work=True, entries=[], base_commit=None),
+        )
+
+        outcome = await f.wf._recover_before_execute()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert f.wf._merge_recovery_basis == 'fallback'
+        f.mark_done.assert_awaited_once_with(
+            f.wf.task_id, kind='found_on_main', sha='mainsha123',
+            note='branch already on main at workflow start (pre-EXECUTE recovery)',
+        )
+        # WT_HEAD INTENTIONALLY OMITTED for this guard (see
+        # _has_prior_implementation docstring) — called with no arguments.
+        f.wf._has_prior_implementation.assert_called_once_with()
+
+    async def test_journal_miss_on_main_with_no_prior_work_returns_none(
+        self, tmp_path: Path,
+    ):
+        """Journal miss + on-main + no prior work → no recovery, proceed
+        normally (stale branch point, not a real ghost loop)."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+            return_value=('wthead123', 'mainsha123'),
+        )
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
+        )
+
+        outcome = await f.wf._recover_before_execute()
+
+        assert outcome is None
+        assert f.wf._merge_recovery_basis is None
+        f.mark_done.assert_not_awaited()
+
+    async def test_journal_miss_not_on_main_returns_none(self, tmp_path: Path):
+        """Journal miss + branch not on main → no recovery, no fallback probe."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf._check_branch_on_main = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError(
+                '_has_prior_implementation must not be called when not on main',
+            ),
+        )
+
+        outcome = await f.wf._recover_before_execute()
+
+        assert outcome is None
+        assert f.wf._merge_recovery_basis is None
+        f.mark_done.assert_not_awaited()
