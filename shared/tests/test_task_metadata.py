@@ -260,6 +260,122 @@ class TestRetryLedger:
         dumped = rl.model_dump()
         assert dumped['x_new_counter'] == 3
 
+    # -- RetryLedger.normalize_cause_hint (staticmethod) --
+    # Ported from test_workflow_signature_loop_guard.py::TestNormalizeCauseHint
+    # so the ledger becomes the single signature-keying authority (see
+    # design_decisions: "_normalize_cause_hint ... become @staticmethod on
+    # shared RetryLedger").
+
+    def test_normalize_cause_hint_strips_file_line_suffix(self):
+        h1 = 'FAILED tests/test_x.py:42 — AssertionError'
+        h2 = 'FAILED tests/test_x.py:99 — AssertionError'
+        assert RetryLedger.normalize_cause_hint(h1) == RetryLedger.normalize_cause_hint(h2)
+
+    def test_normalize_cause_hint_strips_file_line_col_suffix(self):
+        h1 = 'foo.py:42:7 some error'
+        h2 = 'foo.py:99:3 some error'
+        assert RetryLedger.normalize_cause_hint(h1) == RetryLedger.normalize_cause_hint(h2)
+
+    def test_normalize_cause_hint_strips_ansi_escapes(self):
+        raw = '\x1b[31mFAILED\x1b[0m'
+        assert RetryLedger.normalize_cause_hint(raw) == 'failed'
+
+    def test_normalize_cause_hint_collapses_whitespace(self):
+        raw = 'some\t  error\n  detail'
+        assert RetryLedger.normalize_cause_hint(raw) == 'some error detail'
+
+    def test_normalize_cause_hint_lowercases_and_trims(self):
+        raw = '  ASSERTION ERROR  '
+        result = RetryLedger.normalize_cause_hint(raw)
+        assert result == result.lower()
+        assert result == result.strip()
+        assert result == 'assertion error'
+
+    def test_normalize_cause_hint_empty_string_returns_empty_string(self):
+        assert RetryLedger.normalize_cause_hint('') == ''
+
+    def test_normalize_cause_hint_none_returns_empty_string(self):
+        assert RetryLedger.normalize_cause_hint(None) == ''
+
+    # -- RetryLedger.compute_merge_outcome_signature (staticmethod) --
+    # Mirrors the behaviour pinned by
+    # test_workflow_merge_thrash.py::test_merge_outcome_signature_* so the
+    # module-level _compute_merge_outcome_signature delegator (workflow.py)
+    # stays byte-identical once it delegates here.
+
+    def test_compute_merge_outcome_signature_stable_despite_varied_line_and_reason(self):
+        sig_a = RetryLedger.compute_merge_outcome_signature(
+            'gui_tsc', 'StatusBar.tsx:42 error TS2322: Type X not assignable'
+        )
+        sig_b = RetryLedger.compute_merge_outcome_signature(
+            'gui_tsc', 'StatusBar.tsx:58 error TS2322: Type X not assignable'
+        )
+        assert sig_a == sig_b, (
+            f'Same fingerprint (category, normalised cause_hint) must yield equal signature; '
+            f'got {sig_a!r} vs {sig_b!r}'
+        )
+        assert len(sig_a) == 16 and all(c in '0123456789abcdef' for c in sig_a), (
+            f'Signature must be 16 hex chars, got {sig_a!r}'
+        )
+
+    def test_compute_merge_outcome_signature_different_category_differs(self):
+        sig_a = RetryLedger.compute_merge_outcome_signature(
+            'gui_tsc', 'StatusBar.tsx:42 error TS2322: Type X not assignable'
+        )
+        sig_b = RetryLedger.compute_merge_outcome_signature(
+            'test_failure', 'StatusBar.tsx:42 error TS2322: Type X not assignable'
+        )
+        assert sig_a != sig_b, 'Different category must yield a different signature'
+
+    def test_compute_merge_outcome_signature_different_hint_differs(self):
+        sig_a = RetryLedger.compute_merge_outcome_signature(
+            'gui_tsc', 'StatusBar.tsx:42 error TS2322: Type X not assignable'
+        )
+        sig_b = RetryLedger.compute_merge_outcome_signature(
+            'gui_tsc', 'OtherComponent.tsx:10 error TS9999: something else'
+        )
+        assert sig_a != sig_b, 'Different cause_hint must yield a different signature'
+
+    def test_compute_merge_outcome_signature_falls_back_to_reason_hash(self):
+        sig = RetryLedger.compute_merge_outcome_signature(
+            '', '', fallback_reason='Post-merge verification failed: TESTS FAILED\n\nextra output'
+        )
+        assert len(sig) == 16 and all(c in '0123456789abcdef' for c in sig), (
+            f'Fallback signature must be 16 hex chars, got {sig!r}'
+        )
+
+    def test_compute_merge_outcome_signature_fallback_normalises_reason(self):
+        sig_a = RetryLedger.compute_merge_outcome_signature(
+            '', '', fallback_reason='Post-merge verification failed: TESTS FAILED\n\nextra output'
+        )
+        sig_b = RetryLedger.compute_merge_outcome_signature(
+            '',
+            '',
+            fallback_reason='post-merge verification failed:  tests  failed\n\nextra  output',
+        )
+        assert sig_a == sig_b, (
+            'Fallback signatures must match for reasons that differ only by case/whitespace'
+        )
+
+    def test_compute_merge_outcome_signature_fallback_different_reason_differs(self):
+        sig_a = RetryLedger.compute_merge_outcome_signature(
+            '', '', fallback_reason='Post-merge verification failed: TESTS FAILED\n\nextra output'
+        )
+        sig_b = RetryLedger.compute_merge_outcome_signature(
+            '', '', fallback_reason='git merge failed: conflict in foo.py'
+        )
+        assert sig_a != sig_b
+
+    def test_compute_merge_outcome_signature_category_or_hint_alone_takes_structured_path(self):
+        """Either field alone (not just both) is enough to skip the fallback path."""
+        sig_category_only = RetryLedger.compute_merge_outcome_signature(
+            'gui_tsc', '', fallback_reason='some fallback reason'
+        )
+        sig_fallback = RetryLedger.compute_merge_outcome_signature(
+            '', '', fallback_reason='some fallback reason'
+        )
+        assert sig_category_only != sig_fallback
+
 
 class TestTaskMetadataFields:
     def test_empty_defaults(self):
