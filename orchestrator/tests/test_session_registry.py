@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -128,3 +129,67 @@ def test_session_record_json_round_trip_with_null_fields() -> None:
         result_file=None, transcript_path=None,
     )
     assert sr.SessionRecord.from_json(r.to_json()) == r
+
+
+# ---------------------------------------------------------------------------
+# Step-3: identity, paths, transcript encoding
+# ---------------------------------------------------------------------------
+
+
+def test_build_session_slug_joins_role_project_task_pid() -> None:
+    assert sr.build_session_slug('unblock', 'df', '2085', 4242) == 'unblock-df-2085-4242'
+
+
+@pytest.mark.parametrize('task_id', [None, ''])
+def test_build_session_slug_omits_task_segment_when_absent(task_id: str | None) -> None:
+    assert sr.build_session_slug('unblock', 'df', task_id, 4242) == 'unblock-df-4242'
+
+
+def test_build_session_slug_sanitizes_special_chars() -> None:
+    slug = sr.build_session_slug('un block', 'df/prod', '20#85', 4242)
+    assert slug == 'un-block-df-prod-20-85-4242'
+    assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
+
+
+def test_fleet_root_defaults_to_dot_claude_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('CLAUDE_FLEET_ROOT', raising=False)
+    monkeypatch.setenv('HOME', '/home/fakeuser')
+    assert sr.fleet_root() == Path('/home/fakeuser/.claude/fleet')
+
+
+def test_fleet_root_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    assert sr.fleet_root() == tmp_path
+
+
+def test_fleet_root_explicit_root_overrides_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', '/should/not/be/used')
+    other = tmp_path / 'other'
+    assert sr.fleet_root(root=other) == other
+
+
+def test_record_path_for_slug(tmp_path: Path) -> None:
+    path = sr.record_path_for_slug('unblock-df-2085-4242', root=tmp_path)
+    assert path == tmp_path / 'sessions' / 'unblock-df-2085-4242' / 'record.json'
+
+
+def test_transcript_path_for_cwd_encodes_slash() -> None:
+    assert (
+        sr.transcript_path_for_cwd('/home/leo/src/dark-factory')
+        == '~/.claude/projects/-home-leo-src-dark-factory'
+    )
+
+
+def test_transcript_path_for_cwd_encodes_dot() -> None:
+    # Regression fixture confirmed against a real ~/.claude/projects/ dir
+    # (plans/session-attention-rail-prd.md §3): '.' -> '-' too, so a cwd
+    # component starting with '.' yields a doubled '--' (one dash from the
+    # preceding '/', one from the '.').
+    assert (
+        sr.transcript_path_for_cwd('/home/leo/.openclaw-workspace')
+        == '~/.claude/projects/-home-leo--openclaw-workspace'
+    )
