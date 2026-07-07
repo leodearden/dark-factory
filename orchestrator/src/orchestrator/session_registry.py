@@ -27,6 +27,7 @@ import re
 import shutil
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
