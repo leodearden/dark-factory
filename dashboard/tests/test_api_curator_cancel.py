@@ -415,3 +415,34 @@ def test_two_url_all_unreachable_invalidates_each_session_in_order(two_url_clien
         call('http://localhost:9000'),
         call('http://localhost:9001'),
     ]
+
+
+# ---------------------------------------------------------------------------
+# task-2218 step-7: guard the not_found short-circuit ahead of the pending
+# first_success conversion — an authoritative not_found from url[0] must NOT
+# fan out to url[1].
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_handler_not_found_does_not_fan_out(two_url_client):
+    """not_found from url[0] is authoritative → 404 verbatim; url[1] untouched.
+
+    Regression guard ahead of routing cancel_ticket's loop onto
+    ``mcp_fanout.first_success``: first_success stops at the first ``_call``
+    that does not raise, so a not_found JSONResponse must short-circuit the
+    fan-out exactly like the original for-loop's early
+    ``return JSONResponse(result, 404)`` — mcp_tool_call must be invoked
+    exactly once (never falling through to url[1]).
+    """
+    mcp_result = {'error': 'not_found', 'ticket_id': 'tkt_missing'}
+
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = two_url_client.post(
+            '/api/v2/dashboard/curator/cancel',
+            json={'ticket_id': 'tkt_missing'},
+        )
+
+    assert resp.status_code == 404
+    assert resp.json() == mcp_result
+    assert mock_mcp.call_count == 1
+    assert mock_mcp.call_args.args[1] == 'http://localhost:9000'
