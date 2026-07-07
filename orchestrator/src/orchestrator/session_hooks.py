@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from orchestrator import session_registry
@@ -134,3 +136,51 @@ def hook_display_title(
     if identity.task_id:
         return f'{identity.role}:{identity.project}#{identity.task_id}'
     return f'{identity.role}:{identity.project}'
+
+
+# ---------------------------------------------------------------------------
+# SessionStart handler: hand-launched-capture + refresh
+# ---------------------------------------------------------------------------
+
+
+def run_session_start(
+    hook_input: Mapping[str, Any],
+    env: Mapping[str, str],
+    root: Path | str | None = None,
+) -> session_registry.SessionRecord:
+    """SessionStart hook handler: capture or refresh this session's record.
+
+    When no record exists yet at this session's slug, this IS the session's
+    first sight (PRD hand-launched-capture signal -- true for every hand-
+    launched session, and also for a spawned one if this hook somehow runs
+    before a future spawn-claude.sh write), so a RICH record is written:
+    role/project/task_id/escalation_id/title/cwd/transcript_path all
+    populated from the resolved identity, status=RUNNING. When a record
+    already exists under this slug, it is refreshed to RUNNING in place via
+    ``refresh_record`` -- every other already-populated field survives
+    untouched, and the write bumps the record's mtime heartbeat.
+    """
+    identity = resolve_hook_identity(hook_input, env)
+    slug = hook_session_slug(hook_input, env)
+    try:
+        session_registry.read_record(slug, root=root)
+    except FileNotFoundError:
+        cwd = str(hook_input.get('cwd') or os.getcwd())
+        launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
+        launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else os.getppid()
+        record = session_registry.SessionRecord(
+            session_slug=slug,
+            status=session_registry.Status.RUNNING,
+            title=hook_display_title(identity, env, record=None),
+            role=identity.role,
+            project=identity.project,
+            task_id=identity.task_id,
+            escalation_id=identity.escalation_id,
+            cwd=cwd,
+            launcher_pid=launcher_pid,
+            start_ts=datetime.now(UTC).isoformat(),
+            transcript_path=session_registry.transcript_path_for_cwd(cwd),
+        )
+        session_registry.write_record(record, root=root)
+        return record
+    return session_registry.refresh_record(slug, root=root, status=session_registry.Status.RUNNING)
