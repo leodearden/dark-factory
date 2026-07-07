@@ -153,3 +153,62 @@ class SessionRecord:
     @classmethod
     def from_json(cls, raw: str) -> SessionRecord:
         return cls.from_dict(json.loads(raw))
+
+
+# ---------------------------------------------------------------------------
+# Identity, paths, transcript encoding
+# ---------------------------------------------------------------------------
+
+_SLUG_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._-]')
+
+
+def build_session_slug(
+    role: str, project: str, task_id: str | None, launcher_pid: int,
+) -> str:
+    """Build the record-identity/directory key ``<role>-<project>[-<taskid>]-<pid>``.
+
+    The pid guarantees per-record uniqueness across concurrent spawns that
+    share role+project+task (PRD §4 decision 2); single-ownership is a
+    separate concern (T7 leases), not encoded in the key. Any character
+    outside ``[A-Za-z0-9._-]`` in any segment (or the joined whole) is
+    sanitized to ``'-'`` so the slug is always filesystem-safe.
+    """
+    segments = [role, project]
+    if task_id:
+        segments.append(task_id)
+    segments.append(str(launcher_pid))
+    raw = '-'.join(segments)
+    return _SLUG_SANITIZE_RE.sub('-', raw)
+
+
+def fleet_root(root: Path | str | None = None) -> Path:
+    """Resolve the fleet root: explicit *root* > $CLAUDE_FLEET_ROOT > ~/.claude/fleet.
+
+    Every registry function takes this same *root* parameter (or derives it
+    via this function) so tests never touch the real ``~/.claude`` tree.
+    """
+    if root is not None:
+        return Path(root)
+    env_root = os.environ.get('CLAUDE_FLEET_ROOT')
+    if env_root:
+        return Path(env_root)
+    return Path.home() / '.claude' / 'fleet'
+
+
+def sessions_dir(root: Path | str | None = None) -> Path:
+    return fleet_root(root) / 'sessions'
+
+
+def record_path_for_slug(slug: str, root: Path | str | None = None) -> Path:
+    return sessions_dir(root) / slug / 'record.json'
+
+
+def transcript_path_for_cwd(cwd: str) -> str:
+    """Best-effort mirror of Claude Code's own ``~/.claude/projects/<enc>`` encoding.
+
+    Both ``/`` and ``.`` map to ``-`` (confirmed against a real
+    ``~/.claude/projects/`` directory; PRD §3). This is read-only enrichment
+    metadata — never used as a lookup key by this module.
+    """
+    encoded = cwd.replace('/', '-').replace('.', '-')
+    return f'~/.claude/projects/{encoded}'
