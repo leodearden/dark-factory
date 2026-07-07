@@ -188,3 +188,48 @@ class TestBuildConsolidationReport:
         r2 = _mod.build_consolidation_report(graph_items, collection_items, junk_items, dry_run=True)
 
         assert r1 == r2
+
+
+# ===========================================================================
+# Tests: rewrite_point_payload_user_id / canonical_user_id_for
+# ===========================================================================
+
+class TestRewritePointPayloadUserId:
+    """Tests for the pure function rewrite_point_payload_user_id(payload, canonical_user_id)."""
+
+    def test_sets_user_id_to_canonical(self):
+        """Returned payload carries the canonical user_id."""
+        payload = {'user_id': 'dark-factory', 'data': 'hello'}
+
+        result = _mod.rewrite_point_payload_user_id(payload, 'dark_factory')
+
+        assert result['user_id'] == 'dark_factory'
+
+    def test_preserves_other_keys_unchanged(self):
+        """Every other payload key is preserved unchanged."""
+        payload = {'user_id': 'reify', 'data': 'hello', 'metadata': {'a': 1}, 'created_at': 'x'}
+
+        result = _mod.rewrite_point_payload_user_id(payload, 'reify')
+
+        assert result['data'] == 'hello'
+        assert result['metadata'] == {'a': 1}
+        assert result['created_at'] == 'x'
+
+    def test_does_not_mutate_input(self):
+        """The input payload dict is not mutated in place."""
+        payload = {'user_id': 'autopilot_video_autopilot_video', 'data': 'hello'}
+        original = dict(payload)
+
+        _mod.rewrite_point_payload_user_id(payload, 'autopilot_video')
+
+        assert payload == original
+
+
+class TestCanonicalUserIdFor:
+    """Tests for the pure function canonical_user_id_for(target_collection)."""
+
+    def test_derives_project_id_from_fused_target(self):
+        """The canonical user_id is the target collection with the fused_ prefix stripped."""
+        assert _mod.canonical_user_id_for('fused_dark_factory') == 'dark_factory'
+        assert _mod.canonical_user_id_for('fused_reify') == 'reify'
+        assert _mod.canonical_user_id_for('fused_autopilot_video') == 'autopilot_video'
