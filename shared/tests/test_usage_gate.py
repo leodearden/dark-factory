@@ -1852,10 +1852,29 @@ class TestProbeSlotViaTransition:
         with patch.object(gate, '_transition', wraps=gate._transition) as mock_transition:
             gate.release_probe_slot(acct.token)
 
-        mock_transition.assert_called_once_with(acct, AccountPhase.AVAILABLE)
+        mock_transition.assert_called_once_with(
+            acct, AccountPhase.AVAILABLE, clear_near_cap=False,
+        )
         assert acct.phase == AccountPhase.AVAILABLE
         assert acct.probe_count == 0
         assert gate._open.is_set() is True
+
+    async def test_release_probe_slot_does_not_clear_near_cap(self):
+        """release_probe_slot fires on an exception path unrelated to cap
+        status — unlike confirm_account_ok, it must leave a stale near_cap
+        warning untouched (mirrors the out-of-scope
+        test_usage_gate_exhaustive.TestReleaseProbeSlot.
+        test_does_not_touch_near_cap_flag contract, which _transition's
+        default blanket near_cap clear would otherwise break)."""
+        gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.PROBE_IN_FLIGHT
+        acct.near_cap = True
+
+        gate.release_probe_slot(acct.token)
+
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.near_cap is True
 
     async def test_release_probe_slot_noop_when_token_none(self):
         gate = make_gate(['a'], wait_for_reset=False, cost_store=None)
