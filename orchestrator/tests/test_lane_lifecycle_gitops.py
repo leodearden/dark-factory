@@ -523,6 +523,173 @@ class TestAcquireRouteClassification:
 
 
 # ---------------------------------------------------------------------------
+# Sibling .task-meta contamination on lane recycle (W11 ε1): a DIFFERENT-task
+# acquisition via RECYCLE or RESET_IN_PLACE_REATTACH must clear the lane's
+# sibling .task-meta/<name> dir, since it lives OUTSIDE the worktree and
+# survives `checkout -f -B` / `git clean` / `checkout -f` unscathed — without
+# this the incoming task would inherit the PRIOR occupant's plan.json /
+# metadata.json (reviewer_comprehensive robustness/data-integrity blocker at
+# workflow.py:1736). Same-task disk-backstop reuse must NOT be cleared
+# (over-fire guard).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcquireClearsForeignTaskMeta:
+    """DIFFERENT-task RECYCLE / RESET_IN_PLACE_REATTACH acquisitions must
+    clear the lane's sibling .task-meta/<name>; SAME-task disk-backstop reuse
+    must preserve it."""
+
+    async def test_recycle_clears_foreign_task_meta(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """RECYCLE (a registered FREE lane, no orphan-with-commits branch for
+        the new task) must clear the PRIOR occupant's .task-meta/<name>."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('OLD', start_ref)
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            json.dumps({'task_id': 'OLD', 'base_commit': 'deadbeefdeadbeef'})
+        )
+        (meta_root / 'plan.json').write_text(json.dumps({'task_id': 'OLD', 'steps': []}))
+
+        assert git_ops.warm_lane_pool is not None
+        # Bare pool release: FREE + registered, no git/file cleanup — mirrors
+        # test_recycle's setup so 'NEW' lands on the same RECYCLE route.
+        await git_ops.warm_lane_pool.release(lane)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('NEW', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert result.path == lane
+        _assert_route_logged(caplog, AcquireRoute.RECYCLE)
+
+        arts = TaskArtifacts(
+            result.path,
+            TaskArtifacts.meta_root_for(git_ops.worktree_base, result.path.name),
+        )
+        assert arts.read_base_commit() is None, (
+            "expected 'NEW' to observe no base_commit — 'OLD' .task-meta leaked"
+        )
+        assert arts.read_plan() == {}, (
+            "expected 'NEW' to observe no plan — 'OLD' .task-meta leaked"
+        )
+        assert not meta_root.exists(), (
+            f'expected {meta_root} to be cleared on RECYCLE, but it still exists'
+        )
+
+    async def test_reset_in_place_reattach_clears_foreign_task_meta(
+        self, git_repo: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """RESET_IN_PLACE_REATTACH (an already-registered lane whose orphan
+        task/<id> branch carries a commit beyond main) must clear the PRIOR
+        occupant's .task-meta/<name> — mirrors test_reset_in_place_reattach's
+        setup with a foreign .task-meta seeded onto the reused seed lane."""
+        await _add_warm_lane_scripts(git_repo)
+        start_ref = await _get_head(git_repo)
+
+        tmp_wt = tmp_path / 'orphan_f'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/F', str(tmp_wt), start_ref],
+            cwd=git_repo,
+        )
+        (tmp_wt / 'wip.txt').write_text('wip\n')
+        await _run(['git', 'add', '-A'], cwd=tmp_wt)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=tmp_wt)
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_repo)
+
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        seed = await git_ops.acquire_warm_lane('seed', start_ref)
+        assert isinstance(seed, WorktreeInfo), f'Expected WorktreeInfo; got {seed!r}'
+        lane = seed.path
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane)
+
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            json.dumps({'task_id': 'OTHER', 'base_commit': 'feedfacefeedface'})
+        )
+        (meta_root / 'plan.json').write_text(json.dumps({'task_id': 'OTHER', 'steps': []}))
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('F', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected WorktreeInfo (reattach); got {result!r}'
+        )
+        assert result.path == lane
+        _assert_route_logged(caplog, AcquireRoute.RESET_IN_PLACE_REATTACH)
+
+        arts = TaskArtifacts(
+            result.path,
+            TaskArtifacts.meta_root_for(git_ops.worktree_base, result.path.name),
+        )
+        assert arts.read_base_commit() is None, (
+            "expected 'F' to observe no base_commit — 'OTHER' .task-meta leaked"
+        )
+        assert arts.read_plan() == {}, (
+            "expected 'F' to observe no plan — 'OTHER' .task-meta leaked"
+        )
+        assert not meta_root.exists(), (
+            f'expected {meta_root} to be cleared on RESET_IN_PLACE_REATTACH, '
+            f'but it still exists'
+        )
+
+    async def test_same_task_reacquire_preserves_task_meta(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Over-fire guard: re-acquiring the SAME task via the disk-backstop
+        reuse route must NOT clear .task-meta/<name> — only the two
+        DIFFERENT-task routes above do."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('OLD', start_ref)
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            json.dumps({'task_id': 'OLD', 'base_commit': 'cafecafecafe'})
+        )
+        (meta_root / 'plan.json').write_text(json.dumps({'task_id': 'OLD', 'steps': []}))
+
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('OLD', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert result.path == lane
+        _assert_route_logged(caplog, AcquireRoute.DISK_BACKSTOP_REUSE)
+
+        arts = TaskArtifacts(
+            result.path,
+            TaskArtifacts.meta_root_for(git_ops.worktree_base, result.path.name),
+        )
+        assert arts.read_base_commit() == 'cafecafecafe', (
+            'expected the seeded base_commit to survive same-task reuse; got '
+            f'{arts.read_base_commit()!r}'
+        )
+        assert arts.read_plan().get('task_id') == 'OLD', (
+            'expected the seeded plan to survive same-task reuse; got '
+            f'{arts.read_plan()!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # release_warm_lane -> durable RELEASED record
 # ---------------------------------------------------------------------------
 
