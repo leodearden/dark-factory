@@ -9601,18 +9601,34 @@ def _snapshot_stage_reports(stat: int | None) -> dict:
     return {'task_knowledge_sync': {'stats': {'task_count_snapshot_written': stat}}}
 
 
-def _make_current_run(run_id: str, stat: int | None):
-    from types import SimpleNamespace
-    return SimpleNamespace(id=run_id, stage_reports=_snapshot_stage_reports(stat))
-
-
-def _make_prior_run(run_id: str, run_type: str, status: str, stat: int | None, *, offset_seconds: int):
-    from types import SimpleNamespace
-    return SimpleNamespace(
+def _make_current_run(run_id: str, stat: int | None) -> ReconciliationRun:
+    """Build a real ReconciliationRun (not a SimpleNamespace stand-in) so it
+    type-checks against _maybe_escalate_stale_task_count_snapshot's ``run:
+    ReconciliationRun`` parameter — mirrors the ``_make_fake_rfc`` convention
+    used elsewhere in this file.
+    """
+    return ReconciliationRun(
         id=run_id,
-        run_type=run_type,
-        status=status,
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='test',
+        started_at=datetime.now(UTC),
+        stage_reports=_snapshot_stage_reports(stat),
+    )
+
+
+def _make_prior_run(
+    run_id: str, run_type: str, status: str, stat: int | None, *, offset_seconds: int
+) -> ReconciliationRun:
+    """Build a real ReconciliationRun for prior-run journal fixtures (see
+    _make_current_run for why this isn't a SimpleNamespace)."""
+    return ReconciliationRun(
+        id=run_id,
+        project_id='test-project',
+        run_type=RunType(run_type),
+        trigger_reason='test',
         started_at=datetime.now(UTC) - timedelta(seconds=offset_seconds),
+        status=RunStatus(status),
         stage_reports=_snapshot_stage_reports(stat),
     )
 
