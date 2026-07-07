@@ -118,7 +118,7 @@ Read `references/phase2-architecture.md` for the detailed step-by-step process.
 1. Run the project audit (if available) — if the project ships an `/audit` slash command (e.g. Reify's `reify-audit` detector suite), invoke it as the first Phase 2 step with `--pattern P1,P2,P5 --since <window-start>`. Fold its findings into the Phase 2 report under "F-infra automated findings"
 2. Stub and placeholder audit — find TODOs, NotImplementedError, pass bodies, etc. Cross-reference against task tree, briefing known gaps, and memory
 3. Critical path tracing — follow each critical path from the briefing through actual code, checking wiring at every module boundary
-4. Deep read of high-risk modules — read server startup, config loading, pipeline stages, Dockerfiles, and shared utilities line by line. This is where you find behavioral bugs that structural scanning misses: wrong variables passed, hardcoded assumptions, missing initialization, port/path drift
+4. Deep read of high-risk modules — read server startup, config loading, pipeline stages, Dockerfiles, and shared utilities line by line. This is where you find behavioral bugs that structural scanning misses: wrong variables passed, hardcoded assumptions, missing initialization, port/path drift. Prioritise module selection with the latest `/hotspot-survey` report when one exists (reference Step 1.5)
 5. Cross-module consistency — API naming, data flow across boundaries, config coherence, import health
 6. Dead code and orphan detection
 7. Test coverage analysis (qualitative — are critical paths tested end-to-end?)

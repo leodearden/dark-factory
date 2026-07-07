@@ -34,6 +34,16 @@ Carry these into the Phase 2 JSON report under `f_infra_findings` (schema in Ste
 
 `/audit`'s detectors (especially P2 consumer-stub and P1 producer-orphan) overlap with Step 2's stub audit but operate at task-graph scope instead of grep scope. Running `/audit` first means Step 2 can downweight findings that the automated detector already classified, and concentrate on the patterns no detector covers (TODOs without owners, abstract-class stubs in unusual places, etc).
 
+## Step 1.5: Load the latest bug-hotspot survey (if present)
+
+Some projects have run `/hotspot-survey` — a longitudinal multi-agent survey of where bugs have historically clustered and why. Its report is empirical prioritisation data this phase otherwise lacks.
+
+1. **Detect.** Look for the newest `bug-hotspot-survey-*.md` under the project's plans/notes convention (dark-factory: `plans/`; reify: `docs/notes/`). If none exists, skip — and if the repo is mature with substantial fix history, mention `/hotspot-survey` in the Phase 2 report as a suggested follow-up. Do NOT launch the survey from here: it is an hour-scale, ~25-30-agent run and always a deliberate user decision.
+
+2. **Staleness check.** The report's method header pins an as-of main SHA/date. Count commits since (`git log --oneline <sha>.. | wc -l`). The *ranking* (which subsystems are bug-dense) ages slowly and stays useful; individual file:line anchors age fast — re-verify any anchor before acting on it.
+
+3. **Use it for prioritisation, not findings.** Feed the ranked-hotspots table into Step 4's high-risk module selection, and use the churn-exonerations section to avoid over-weighting healthy-churn modules. Do not re-report the survey's findings as Phase 2 findings — most already flowed into a remediation program (check the sibling `bug-hotspot-remediation-program-*.md` and its task ids); re-flagging them creates duplicate tasks at Phase 3.
+
 ## Step 2: Stub and placeholder audit
 
 ### Mechanical scan (delegate to Sonnet agent)
@@ -128,6 +138,7 @@ High-risk modules are those where a bug has outsized impact or where complexity 
 - **Pipeline stages and orchestration** — multi-step processes where data flows through stages. Each handoff is a potential type or semantic mismatch.
 - **Infrastructure files** — Dockerfiles, docker-compose, CI configs. These often drift from the code they deploy (wrong ports, stale paths, missing dependencies).
 - **Shared utilities** — code used by multiple subsystems. A bug here multiplies.
+- **Historically bug-dense modules** — if Step 1.5 loaded a hotspot survey, its ranked hotspots belong on this list: empirical fix-commit density beats the static typology above. Skip modules the survey's churn-exonerations section cleared.
 
 ### What to look for
 
