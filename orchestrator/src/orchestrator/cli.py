@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 from collections.abc import Callable
@@ -16,10 +17,16 @@ from dotenv import load_dotenv
 
 from orchestrator.config import ConfigRequiredError, load_config
 from orchestrator.verify_cancel import (
+    acquire_merge_verify_flock,
     cancel_request,
+    merge_verify_lock_path,
     pgid_file,
+    read_lock_holder_pgid,
+    release_merge_verify_flock,
+    remove_lock_holder_pgid,
     remove_pgid_file,
     start_own_process_group,
+    write_lock_holder_pgid,
     write_pgid_file,
 )
 
@@ -33,6 +40,13 @@ DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 # long orchestration runs are never affected. After this deadline a diagnostic
 # dump is written to stderr and os._exit(137) fires.
 SHUTDOWN_WATCHDOG_TIMEOUT_SECS = 30
+
+# Bounded wait (task 2306 α) for acquiring the laptop persistent-worktree
+# merge-verify fcntl.flock (verify_cancel.acquire_merge_verify_flock) when
+# git.persistent_merge_worktree is on. On timeout, verify-merge emits a
+# distinguished contention VerifyResult instead of ever falling back to an
+# ephemeral worktree. Monkeypatchable so tests run the bounded wait fast.
+MERGE_VERIFY_FLOCK_WAIT_SECS = 10.0
 
 
 class WatchdogHandle(NamedTuple):
