@@ -304,6 +304,19 @@ async def test_set_task_claimant_none_clears_both_columns(backend, project_root)
     assert one['heartbeat_at'] is None
 
 
+@pytest.mark.asyncio
+async def test_set_task_claimant_no_kwargs_is_a_noop(backend, project_root):
+    """No claimant_run_id/heartbeat_at supplied -> early-return, no write, no error."""
+    await backend.add_task(project_root=project_root, title='x')
+
+    result = await backend.set_task_claimant('1', project_root=project_root)
+
+    assert 'No claimant changes supplied' in result['message']
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] is None
+    assert one['heartbeat_at'] is None
+
+
 # ── set_task_status claimant extension (task 2182 step-5/6) ────────
 
 
@@ -428,6 +441,36 @@ async def test_set_task_status_claimant_fails_safe_when_columns_absent(tmp_path,
 
     assert 'in-progress' in result['message']
     assert one['status'] == 'in-progress'
+    assert one['claimant_run_id'] is None
+    assert one['heartbeat_at'] is None
+
+    warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warning_msgs, 'Expected a WARNING when claimant columns are absent'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_fails_safe_when_columns_absent(tmp_path, caplog):
+    """set_task_claimant on a not-yet-migrated connection must not error either."""
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v2_stamped_db_without_claimant_columns(db_path)
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+            result = await b.set_task_claimant(
+                '1', project_root=project_root,
+                claimant_run_id='run-x', heartbeat_at='2026-07-07T00:00:00+00:00',
+            )
+        one = await b.get_task('1', project_root=project_root)
+    finally:
+        await b.close()
+
+    assert 'Claimant columns unavailable' in result['message']
+    # status untouched, and no claimant leaked onto the wire dict either.
+    assert one['status'] == 'pending'
     assert one['claimant_run_id'] is None
     assert one['heartbeat_at'] is None
 
