@@ -396,6 +396,73 @@ class TestAcquireReleaseMergeVerifyFlock:
 
 
 # ---------------------------------------------------------------------------
+# Task 2306 step-7: LOCK_HOLDER_PGID_KEY + write/read/remove_lock_holder_pgid —
+# fixed-key holder-pgid rendezvous.  A waiter cannot know the holder's
+# per-dispatch --request-id, so this uses a request-id-independent fixed key
+# built directly on pgid_file/write_pgid_file/remove_pgid_file.
+# ---------------------------------------------------------------------------
+
+
+class TestLockHolderPgidRendezvous:
+    """write/read/remove_lock_holder_pgid built on the existing pgid-file helpers."""
+
+    def test_key_is_stable_nonempty_string(self):
+        from orchestrator.verify_cancel import LOCK_HOLDER_PGID_KEY
+
+        assert isinstance(LOCK_HOLDER_PGID_KEY, str)
+        assert LOCK_HOLDER_PGID_KEY != ''
+
+    def test_write_lands_at_fixed_key_pgid_file(self, tmp_path: Path):
+        from orchestrator.verify_cancel import (
+            LOCK_HOLDER_PGID_KEY,
+            pgid_file,
+            write_lock_holder_pgid,
+        )
+
+        write_lock_holder_pgid(tmp_path, 5150)
+        expected_path = pgid_file(tmp_path, LOCK_HOLDER_PGID_KEY)
+        assert expected_path.exists()
+        assert expected_path.read_text().strip() == '5150'
+
+    def test_read_returns_written_value(self, tmp_path: Path):
+        from orchestrator.verify_cancel import read_lock_holder_pgid, write_lock_holder_pgid
+
+        write_lock_holder_pgid(tmp_path, 5150)
+        assert read_lock_holder_pgid(tmp_path) == 5150
+
+    def test_remove_deletes_file_and_read_returns_none(self, tmp_path: Path):
+        from orchestrator.verify_cancel import (
+            LOCK_HOLDER_PGID_KEY,
+            pgid_file,
+            read_lock_holder_pgid,
+            remove_lock_holder_pgid,
+            write_lock_holder_pgid,
+        )
+
+        write_lock_holder_pgid(tmp_path, 5150)
+        remove_lock_holder_pgid(tmp_path)
+        assert not pgid_file(tmp_path, LOCK_HOLDER_PGID_KEY).exists()
+        assert read_lock_holder_pgid(tmp_path) is None
+
+    def test_read_returns_none_when_absent(self, tmp_path: Path):
+        from orchestrator.verify_cancel import read_lock_holder_pgid
+
+        assert read_lock_holder_pgid(tmp_path) is None
+
+    def test_read_returns_none_when_corrupt(self, tmp_path: Path):
+        from orchestrator.verify_cancel import (
+            LOCK_HOLDER_PGID_KEY,
+            pgid_file,
+            read_lock_holder_pgid,
+        )
+
+        path = pgid_file(tmp_path, LOCK_HOLDER_PGID_KEY)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('not-an-int')
+        assert read_lock_holder_pgid(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
 # Step-13 (part 1): real-process capstone — setsid + start_new_session escapes
 # ---------------------------------------------------------------------------
 
