@@ -98,6 +98,14 @@ class TestGetQueueStatsConsistencyWithDeadLetters:
 
     @pytest.mark.asyncio
     async def test_scoped_dead_counts_agree_with_get_dead_letters(self, tmp_path):
+        # group_ids are already underscore-canonical (proj_a/proj_b/proj_c), matching
+        # what real writers actually enqueue: memory_service.add_episode/add_memory
+        # always key the durable queue by scope.graphiti_group_id, which Scope's
+        # field_validator (task 2267 / seam S2) canonicalizes at construction. A
+        # hyphenated literal here would be synthetic data no production write path
+        # can produce, and would falsely fail once get_queue_stats canonicalizes its
+        # query project_id (task 2268 / seam S3) while the out-of-scope
+        # get_dead_letters tool does not.
         execute = AsyncMock(side_effect=RuntimeError('fail'))
         q = DurableWriteQueue(
             data_dir=tmp_path / 'queue',
@@ -112,12 +120,12 @@ class TestGetQueueStatsConsistencyWithDeadLetters:
         try:
             for i in range(2):
                 await q.enqueue(
-                    group_id='proj-a', operation='add_episode',
-                    payload={'content': f'a{i}', 'group_id': 'proj-a', 'name': f'a{i}'},
+                    group_id='proj_a', operation='add_episode',
+                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
                 )
             await q.enqueue(
-                group_id='proj-b', operation='add_episode',
-                payload={'content': 'b0', 'group_id': 'proj-b', 'name': 'b0'},
+                group_id='proj_b', operation='add_episode',
+                payload={'content': 'b0', 'group_id': 'proj_b', 'name': 'b0'},
             )
             await _poll_until_dead(q, expected_dead=3)
 
@@ -126,13 +134,13 @@ class TestGetQueueStatsConsistencyWithDeadLetters:
             server = create_mcp_server(svc)
 
             stats_a = await server._tool_manager.call_tool(
-                'get_queue_stats', {'project_id': 'proj-a'},
+                'get_queue_stats', {'project_id': 'proj_a'},
             )
             stats_b = await server._tool_manager.call_tool(
-                'get_queue_stats', {'project_id': 'proj-b'},
+                'get_queue_stats', {'project_id': 'proj_b'},
             )
             stats_c = await server._tool_manager.call_tool(
-                'get_queue_stats', {'project_id': 'proj-c'},
+                'get_queue_stats', {'project_id': 'proj_c'},
             )
             stats_global = await server._tool_manager.call_tool('get_queue_stats', {})
 
@@ -142,13 +150,13 @@ class TestGetQueueStatsConsistencyWithDeadLetters:
             assert stats_global['counts'].get('dead', 0) == 3
 
             dead_letters_a = await server._tool_manager.call_tool(
-                'get_dead_letters', {'project_id': 'proj-a'},
+                'get_dead_letters', {'project_id': 'proj_a'},
             )
             dead_letters_b = await server._tool_manager.call_tool(
-                'get_dead_letters', {'project_id': 'proj-b'},
+                'get_dead_letters', {'project_id': 'proj_b'},
             )
             dead_letters_c = await server._tool_manager.call_tool(
-                'get_dead_letters', {'project_id': 'proj-c'},
+                'get_dead_letters', {'project_id': 'proj_c'},
             )
 
             assert stats_a['counts'].get('dead', 0) == dead_letters_a['counts']['durable_queue']

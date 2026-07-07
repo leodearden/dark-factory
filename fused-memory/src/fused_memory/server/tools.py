@@ -44,6 +44,9 @@ from fused_memory.reconciliation.task_filter import (
 )
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
+    PathShapedProjectIdError,
+    _to_underscore_canonical,
+    canonicalize_project_id,
     validate_int_ids,
     validate_known_project_id,
     validate_project_id,
@@ -385,6 +388,41 @@ def _summarise_ticket_row(row: dict) -> dict:
     }
 
 
+def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] | None]:
+    """Boundary adapter: canonicalize a raw MCP-tool project_id argument.
+
+    Wraps :func:`canonicalize_project_id` (task 2267 / seam S1), converting its
+    raise into the tools' error-dict contract so every memory-tool prologue can
+    use the same two-line idiom as the existing ``if err := validate_project_id(...)``
+    checks:
+
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+
+    On success returns ``(canonical_project_id, None)``. On a path-shaped
+    project_id (e.g. '-home-leo-src-x') returns the ORIGINAL project_id
+    unchanged alongside an error dict — the caller returns the error
+    immediately, so the unchanged value is never actually used, but this
+    keeps the tuple shape total (always a str, never None) for callers.
+
+    Non-str input (e.g. ``None``, which ``get_queue_stats`` uses for global
+    scope prior to its own ``is not None`` guard) is passed through
+    unchanged rather than handed to ``canonicalize_project_id`` — whose
+    ``raw.lower()`` would raise a bare ``AttributeError`` on a non-str value.
+    This preserves ``validate_project_id``'s pre-S3 graceful handling of
+    falsy/non-str values (it short-circuits on ``not value`` before ever
+    calling ``.strip()``), so this adapter stays a total drop-in for the same
+    inputs ``validate_project_id`` already tolerated.
+    """
+    if not isinstance(project_id, str):
+        return project_id, None
+    try:
+        return canonicalize_project_id(project_id), None
+    except PathShapedProjectIdError as e:
+        return project_id, {'error': str(e), 'error_type': type(e).__name__}
+
+
 def _extract_causation(metadata: dict | None, agent_id: str | None) -> tuple[str, str, dict | None]:
     """Extract or generate causation_id, determine source, clean metadata.
 
@@ -675,6 +713,9 @@ def create_mcp_server(
                 the *kind* of episode; reference_time sets the *timestamp*.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
@@ -767,6 +808,9 @@ def create_mcp_server(
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
@@ -869,6 +913,9 @@ def create_mcp_server(
             include_planned: Include planning-episode edges (default: False)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if limit <= 0:
@@ -958,6 +1005,9 @@ def create_mcp_server(
             project_id: Project scope (required)
             filters: Exact metadata key-value pairs to match (e.g. {'kind': 'cycle_summary', 'run_id': '...'})
         """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
@@ -1024,6 +1074,9 @@ def create_mcp_server(
             {'memories': [...], 'project_id': ..., 'filters': ..., 'limit': ...} on success,
             or {'error': ..., 'error_type': ...} on failure.
         """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
@@ -1077,6 +1130,9 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if edge_limit <= 0:
@@ -1141,6 +1197,9 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
@@ -1209,6 +1268,9 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if last_n <= 0:
@@ -1277,6 +1339,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
@@ -1328,6 +1393,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
@@ -1396,6 +1464,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if err := _known_project_gate(project_id):
@@ -1486,6 +1557,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if not entity_uuid and not entity_name:
@@ -1547,6 +1621,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if summary is None:
@@ -1612,6 +1689,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if not new_name:
@@ -1671,6 +1751,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if not deprecated_uuid or not deprecated_uuid.strip():
@@ -1737,6 +1820,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if not entity_uuid or not entity_uuid.strip():
@@ -1803,6 +1889,9 @@ def create_mcp_server(
                 UUIDs, bypassing staleness detection (optional)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
@@ -1907,6 +1996,9 @@ def create_mcp_server(
             source_store: Source store to replay from (currently only "mem0")
             limit: Max memories to replay (None = all)
         """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
@@ -1936,7 +2028,18 @@ def create_mcp_server(
                 than reported here, since it caps the rows it fetches. Pass
                 a ``limit`` at least as large as this tool's ``dead`` count
                 to ``get_dead_letters`` for a matching comparison.
+
+                Note: unlike this tool, ``get_dead_letters`` / ``replay_dead_letters``
+                / ``delete_dead_letters`` do NOT canonicalize project_id — dead-letter
+                tools are intentionally out of scope for the MCP-boundary
+                canonicalization sweep (PRD CGL seam S3 / task 2268). Pass the
+                canonical (underscore) spelling to those tools for a comparison
+                that actually matches this one.
         """
+        if project_id is not None:
+            project_id, err = _canonicalize_project_id_arg(project_id)
+            if err:
+                return err
         try:
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
@@ -2025,6 +2128,12 @@ def create_mcp_server(
         This resets them so workers can try again (e.g. after fixing the
         underlying issue).
 
+        Note: project_id is NOT canonicalized here (no hyphen/underscore
+        normalization) — dead-letter tools are intentionally out of scope
+        for the MCP-boundary canonicalization sweep (PRD CGL seam S3 / task
+        2268), unlike ``get_queue_stats``. Pass the canonical (underscore)
+        spelling.
+
         Args:
             project_id: Scope to a specific project (optional — all if omitted)
         """
@@ -2050,6 +2159,12 @@ def create_mcp_server(
         Returns a merged list of dead-letter records from all sources,
         newest-first, with a ``source`` discriminator so operators can triage
         in one place.
+
+        Note: project_id is NOT canonicalized here (no hyphen/underscore
+        normalization) — dead-letter tools are intentionally out of scope
+        for the MCP-boundary canonicalization sweep (PRD CGL seam S3 / task
+        2268), unlike ``get_queue_stats``. Pass the canonical (underscore)
+        spelling.
 
         Args:
             project_id: Filter to a specific project (optional — all if omitted)
@@ -2164,6 +2279,12 @@ def create_mcp_server(
             ``remaining`` excludes ineligible ids already classified in prior
             chunks, so re-calling with ``ids=remaining`` is safe and
             non-redundant.  Re-call after the underlying issue is resolved.
+
+        Note: project_id is NOT canonicalized here (no hyphen/underscore
+        normalization) — dead-letter tools are intentionally out of scope
+        for the MCP-boundary canonicalization sweep (PRD CGL seam S3 / task
+        2268), unlike ``get_queue_stats``. Pass the canonical (underscore)
+        spelling — it must match the ``group_id`` stored on the row exactly.
 
         Args:
             project_id: Project scope (required — prevents accidental cross-project deletes).
@@ -2539,11 +2660,15 @@ def create_mcp_server(
             if not sep or not project_id or not task_id or not task_id.isdigit():
                 result[dep] = 'malformed'
                 continue
-            # Normalise project_id: lowercase + hyphen→underscore, mirroring
-            # models/scope.py:resolve_project_id so 'dark-factory' == 'dark_factory'.
-            # Registry lookup uses the normalised form; result is keyed by the
-            # original verbatim dep string.
-            norm_project_id = project_id.lower().replace('-', '_')
+            # Normalise project_id via the shared raise-free primitive (task 2267
+            # / seam S1) so 'dark-factory' == 'dark_factory', mirroring
+            # models/scope.py:resolve_project_id. Deliberately NOT the raising
+            # canonicalize_project_id: this tool's contract is sentinel-only
+            # (never raise on a semantic problem), and a path-shaped project_id
+            # must fall through to the 'unknown_project' sentinel below rather
+            # than raise PathShapedProjectIdError. Registry lookup uses the
+            # normalised form; result is keyed by the original verbatim dep string.
+            norm_project_id = _to_underscore_canonical(project_id)
             # Look up project_root in registry
             if norm_project_id not in _kp:
                 result[dep] = 'unknown_project'
