@@ -9254,6 +9254,13 @@ class TestOrchestratorStatusSetsMatchShared:
     members) have not yet been audited to receive. That audit + enablement is
     owned by task omega4 (PRD C7/D3). This test locks the exclusion so an
     accidental future switch to the raw shared.ACTIVE re-export fails CI.
+
+    The TERMINAL_STATUSES/WORKFLOW_PRESERVE_STATUSES equality checks below
+    are near-tautological (each compares an orchestrator constant to the very
+    shared object it is assigned from in task_status.py) — they can only fail
+    if that assignment line itself is edited, so treat them as lightweight
+    wiring regression pins. The real contract lives in the explicit-membership
+    assertions: the 6-member expected set and the infra-hold exclusion lock.
     """
 
     def test_status_sets_are_shared_reexports(self):
@@ -9300,6 +9307,82 @@ class TestOrchestratorStatusSetsMatchShared:
             f"  shared/task_statuses.py (canonical): {sorted(WORKFLOW_PRESERVE)}\n"
             "orchestrator.task_status.WORKFLOW_PRESERVE_STATUSES must re-export "
             "shared.task_statuses.WORKFLOW_PRESERVE."
+        )
+
+
+class TestSharedStatusesMatchFusedMemoryMirror:
+    """Guard: shared.task_statuses stays in sync with fused-memory's own copies.
+
+    fused-memory (fused_memory/reconciliation/task_filter.py,
+    fused_memory/middleware/task_interceptor.py) is the runtime authority for
+    what get_tasks returns, but it has NOT yet been rewired onto
+    shared.task_statuses — that rewire is owned by a sibling task (rho1a; see
+    shared/task_statuses.py:17-18). Until it lands, fused-memory keeps its
+    own independent literals, and cross-package import from here into
+    fused-memory is intentionally avoided per design — fused-memory is not a
+    declared dependency of the orchestrator package, and fused-memory's own
+    task_interceptor.py says as much of the reverse direction: "the server
+    and orchestrator are independent modules, and the set is effectively
+    ossified; duplication is cheaper than cross-package coupling."
+
+    This replaces the old (pre-task-2191) orchestrator-local guard
+    TestActiveTaskStatusesMatchesFusedMemory, which compared orchestrator's
+    now-removed local ACTIVE_TASK_STATUSES literal against a hardcoded
+    fused-memory mirror. Same technique, re-homed to the new authority
+    (shared.task_statuses) now that orchestrator's constants are re-exports
+    of it. As before, this requires a human to update the mirror below AND
+    the fused-memory source together when the server's status vocabulary
+    changes — that manual-sync requirement is the accepted, pre-existing
+    trade-off for not importing across the package boundary. Once rho1a
+    rewires fused-memory onto shared.task_statuses, replace this with a live
+    equality import (see shared/tests/test_task_statuses.py::
+    TestCrossPackageDriftGuardPlaceholder, currently skipped pending that).
+    """
+
+    # Mirror of fused_memory/reconciliation/task_filter.py ACTIVE_TASK_STATUSES.
+    # fused-memory has no 'infra-hold' member yet, so this lines up with
+    # shared.ACTIVE minus infra-hold, not the raw 7-member shared.ACTIVE.
+    _FM_ACTIVE_TASK_STATUSES: frozenset[str] = frozenset(
+        {
+            'pending',
+            'in-progress',
+            'blocked',
+            'deferred',
+            'review',
+            'merge-deferred',
+        }
+    )
+
+    # Mirror of fused_memory/middleware/task_interceptor.py TERMINAL_STATUSES.
+    _FM_TERMINAL_STATUSES: frozenset[str] = frozenset({'done', 'cancelled'})
+
+    def test_shared_active_minus_infra_hold_matches_fused_memory(self):
+        """shared.ACTIVE minus infra-hold == fused-memory's ACTIVE_TASK_STATUSES mirror."""
+        from shared.task_statuses import ACTIVE, TaskStatus
+
+        live = ACTIVE - {TaskStatus.INFRA_HOLD}
+        assert live == self._FM_ACTIVE_TASK_STATUSES, (
+            "shared.task_statuses.ACTIVE (minus infra-hold) has drifted from "
+            "fused-memory's ACTIVE_TASK_STATUSES!\n"
+            f"  shared minus infra-hold: {sorted(live)}\n"
+            "  fused_memory/reconciliation/task_filter.py (mirrored here): "
+            f"{sorted(self._FM_ACTIVE_TASK_STATUSES)}\n"
+            "Update BOTH this mirror and fused_memory/reconciliation/task_filter.py "
+            "(or shared/task_statuses.py, whichever changed) so they match again."
+        )
+
+    def test_shared_terminal_matches_fused_memory(self):
+        """shared.TERMINAL == fused-memory's TERMINAL_STATUSES mirror."""
+        from shared.task_statuses import TERMINAL
+
+        assert TERMINAL == self._FM_TERMINAL_STATUSES, (
+            "shared.task_statuses.TERMINAL has drifted from fused-memory's "
+            "TERMINAL_STATUSES!\n"
+            f"  shared (canonical): {sorted(TERMINAL)}\n"
+            "  fused_memory/middleware/task_interceptor.py (mirrored here): "
+            f"{sorted(self._FM_TERMINAL_STATUSES)}\n"
+            "Update BOTH this mirror and fused_memory/middleware/task_interceptor.py "
+            "(or shared/task_statuses.py, whichever changed) so they match again."
         )
 
 
