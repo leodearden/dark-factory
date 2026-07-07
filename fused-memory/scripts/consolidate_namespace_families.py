@@ -195,3 +195,38 @@ async def count_graph_nodes(graphiti: Any, key: str) -> int:
     graph = graphiti._graph_for(key)
     result = await graph.ro_query('MATCH (n) RETURN count(n)')
     return int(result.result_set[0][0])
+
+
+# ---------------------------------------------------------------------------
+# Graph family merge (mutating)
+# ---------------------------------------------------------------------------
+
+async def merge_graph_family(
+    graphiti: Any,
+    sibling: str,
+    canonical: str,
+    node_rows: list[dict],
+) -> dict:
+    """Move every *node_rows* entry from *sibling* into *canonical*.
+
+    Calls ``move_entity_across_graphs(graphiti, uuid, sibling, canonical,
+    rewrite_group_id=canonical)`` once per row -- the Phase-2 identity
+    rewrite (PRD decision 6) -- and tallies the returned MoveResults.
+    """
+    summary = {
+        'nodes_moved': 0,
+        'edges_moved': 0,
+        'edges_skipped': 0,
+        'mentions_moved': 0,
+        'mentions_skipped': 0,
+    }
+    for row in node_rows:
+        result = await move_entity_across_graphs(
+            graphiti, row['uuid'], sibling, canonical, rewrite_group_id=canonical,
+        )
+        summary['nodes_moved'] += 1
+        summary['edges_moved'] += result.edges_moved
+        summary['edges_skipped'] += result.edges_skipped
+        summary['mentions_moved'] += result.mentions_moved
+        summary['mentions_skipped'] += result.mentions_skipped
+    return summary
