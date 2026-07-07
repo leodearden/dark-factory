@@ -255,8 +255,7 @@ class TargetedReconciler:
     async def _should_withhold_batch_promotion(
         self,
         ep_uuid: str,
-        project_id: str,
-        project_root: str,
+        scope: ProjectScope,
         statuses_cache: dict,
     ) -> bool:
         """Return True when ep_uuid is a batch-plan episode with a still-active sibling.
@@ -290,7 +289,7 @@ class TargetedReconciler:
         know the statuses.)
         """
         try:
-            content = await self.memory.get_episode_content(ep_uuid, project_id)
+            content = await self.memory.get_episode_content(ep_uuid, scope.project_id)
         except Exception as e:
             logger.warning(f'get_episode_content failed for planned episode {ep_uuid}: {e}')
             content = None
@@ -304,7 +303,7 @@ class TargetedReconciler:
 
         if 'statuses' not in statuses_cache:
             try:
-                raw = await self.taskmaster.get_statuses(project_root=project_root)
+                raw = await self.taskmaster.get_statuses(project_root=scope.project_root)
                 if isinstance(raw, dict):
                     statuses_cache['statuses'] = raw
                 else:
@@ -528,7 +527,7 @@ class TargetedReconciler:
                 # is already cached once per block via statuses_cache.
                 for ep_uuid in ep_uuids:
                     if await self._should_withhold_batch_promotion(
-                        ep_uuid, scope.project_id, scope.project_root, statuses_cache
+                        ep_uuid, scope, statuses_cache
                     ):
                         withheld_count += 1
                         continue
