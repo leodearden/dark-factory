@@ -61,7 +61,10 @@ import logging
 import sys
 from typing import Any
 
-from fused_memory.maintenance.cross_graph_move import MoveResult, move_entity_across_graphs
+from fused_memory.maintenance.cross_graph_move import (  # noqa: F401
+    MoveResult,
+    move_entity_across_graphs,
+)
 
 logger = logging.getLogger('consolidate_namespace_families')
 
