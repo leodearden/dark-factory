@@ -10,7 +10,7 @@ import uuid as uuid_mod
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 
 try:
     from shared.cli_invoke import AllAccountsCappedException  # type: ignore[import]
@@ -31,6 +31,7 @@ except ImportError:
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
+from shared.task_metadata import DoneProvenance
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -3578,14 +3579,6 @@ def _done_gate_error(task_id: str, declared: list[str], missing: list[str]) -> d
     }
 
 
-_VALID_PROVENANCE_KINDS = (
-    'merged',
-    'found_on_main',
-    'deterministic-deploy',
-    'deterministic-deploy-scheduled',
-)
-
-
 async def _validate_done_provenance(
     task_id: str,
     raw: object,
@@ -3702,7 +3695,7 @@ async def _validate_done_provenance(
             'self-restart that was scheduled but not yet verified (no '
             'commit required).',
         ), None
-    if kind not in _VALID_PROVENANCE_KINDS:
+    if kind not in get_args(DoneProvenance.model_fields['kind'].annotation):
         return _done_provenance_error(
             task_id,
             f'done_provenance.kind must be "merged", "found_on_main", '
