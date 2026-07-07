@@ -30,6 +30,7 @@ from shared.task_statuses import TaskStatus
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
+    StatusWriteAuthorityError,
     TaskmasterError,
 )
 from fused_memory.backends.task_backend_types import (
@@ -1496,12 +1497,7 @@ class SqliteTaskBackend:
         # and the task SELECT, so a write-authority rejection takes
         # precedence over any existence or connection error.
         if status is not None:
-            raise TaskmasterError(
-                'TASKMASTER_TOOL_ERROR',
-                'update_task is metadata-only and cannot write status. '
-                'Use set_task_status(status=…) instead — it enforces the '
-                'terminal-exit, phantom-done, and done-provenance gates.',
-            )
+            raise StatusWriteAuthorityError(task_id, status)
         if metadata is not None:
             try:
                 parsed_metadata = json.loads(metadata)
