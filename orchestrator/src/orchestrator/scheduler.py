@@ -1925,11 +1925,7 @@ class Scheduler:
         """
         # Reset when the cause changes so emitted events always reflect a
         # single consecutive-run cause, not a mixed accumulation.
-        if self._external_hold_cause.get(task_id) != cause:
-            self._external_hold_streak[task_id] = 0
-        self._external_hold_cause[task_id] = cause
-        streak = self._external_hold_streak.get(task_id, 0) + 1
-        self._external_hold_streak[task_id] = streak
+        streak = self._streak_hold.touch(task_id, cause=cause)
         if streak >= threshold and streak % threshold == 0:
             logger.warning(
                 'Task %s: external-dep gate has held dispatch for %d consecutive '
@@ -2008,12 +2004,11 @@ class Scheduler:
                 )
                 if not external_deps:
                     continue
-                count = self._external_resolver_degraded_counts.get(task_id, 0) + 1
-                self._external_resolver_degraded_counts[task_id] = count
+                count = self._streak_resolver_degraded.bump(task_id)
                 if count >= threshold:
                     # Pop so the next crossing (if it persists) fires again —
                     # mirrors the sentinel re-fire pattern.
-                    self._external_resolver_degraded_counts.pop(task_id, None)
+                    self._streak_resolver_degraded.clear(task_id)
                     if self._on_external_dep_block is not None:
                         summary = (
                             f'EXTERNAL_DEP_RESOLVER_DEGRADED: task {task_id} — '
@@ -2038,8 +2033,7 @@ class Scheduler:
                         # Clear the hold streak so no spurious gate_held event fires
                         # for a task being terminally blocked (mirrors blocked_this_tick
                         # suppression in the non-degraded branch).
-                        self._external_hold_streak.pop(task_id, None)
-                        self._external_hold_cause.pop(task_id, None)
+                        self._streak_hold.clear(task_id)
                         continue
                     else:
                         logger.warning(
@@ -2067,7 +2061,7 @@ class Scheduler:
             # consecutive-tick streak so only CONSECUTIVE degraded ticks count
             # toward escalation.  A transient blip that self-heals never
             # escalates (task 1855 — prefer-loud backstop).
-            self._external_resolver_degraded_counts.pop(task_id, None)
+            self._streak_resolver_degraded.clear(task_id)
             # Track whether any dep left this task held in a live (non-done,
             # non-sentinel) status this tick — used to drive hold-streak
             # visibility after the dep loop.
@@ -2081,11 +2075,11 @@ class Scheduler:
 
                 if status == 'done':
                     # Satisfied — reset any accumulated sentinel counter.
-                    self._external_unresolved_counts.pop((task_id, dep), None)
+                    self._streak_external_unresolved.clear((task_id, dep))
 
                 elif status == 'cancelled':
                     # Strict immediate escalation — no counter increment.
-                    self._external_unresolved_counts.pop((task_id, dep), None)
+                    self._streak_external_unresolved.clear((task_id, dep))
                     summary = (
                         f'EXTERNAL_DEP_CANCELLED: task {task_id} blocked — '
                         f'external dep {dep!r} is cancelled'
@@ -2113,13 +2107,10 @@ class Scheduler:
 
                 elif status in self._EXTERNAL_SENTINEL_STATUSES:
                     # Unknown/malformed — grace-then-escalate counter.
-                    count = (
-                        self._external_unresolved_counts.get((task_id, dep), 0) + 1
-                    )
-                    self._external_unresolved_counts[(task_id, dep)] = count
+                    count = self._streak_external_unresolved.bump((task_id, dep))
                     if count >= threshold:
                         # Pop so the next crossing (if it persists) fires again.
-                        self._external_unresolved_counts.pop((task_id, dep), None)
+                        self._streak_external_unresolved.clear((task_id, dep))
                         summary = (
                             f'EXTERNAL_DEP_UNRESOLVED: task {task_id} — '
                             f'dep {dep!r} unresolvable for {count} ticks '
@@ -2167,7 +2158,7 @@ class Scheduler:
                     # wait silently and reset the sentinel counter so transient
                     # blips don't accumulate.  Mark this task as held by a live
                     # dep so we can emit a visibility event if this persists.
-                    self._external_unresolved_counts.pop((task_id, dep), None)
+                    self._streak_external_unresolved.clear((task_id, dep))
                     held_live = True
 
             # After the dep loop: drive the hold-streak for live-status holds.
