@@ -228,3 +228,143 @@ class TestUngatedMutatorCanonicalization:
             f'Expected offending value {_PATH_SHAPED!r} named in error, got: {result!r}'
         )
         mock_service.refresh_entity_summary.assert_not_called()
+
+
+def _resolve_mock_attr(mock_service, dotted_path: str):
+    """Resolve a dotted attribute path (e.g. 'durable_queue.get_stats') off mock_service."""
+    obj = mock_service
+    for part in dotted_path.split('.'):
+        obj = getattr(obj, part)
+    return obj
+
+
+# (tool_name, extra kwargs supplying the tool's mandatory no-default args other
+# than project_id, dotted mock_service attr path the tool ultimately calls).
+# Covers all 19 in-scope memory tools: the 5 gated writes, 7 reads (including
+# get_queue_stats), and 7 ungated mutators.
+_ALL_MEMORY_TOOL_SWEEP_CASES = [
+    # Gated writes
+    ('add_episode', {'content': 'x'}, 'add_episode'),
+    ('add_memory', {'content': 'x'}, 'add_memory'),
+    ('delete_memory', {'memory_id': 'm1', 'store': 'mem0'}, 'delete_memory'),
+    ('delete_episode', {'episode_id': 'e1'}, 'delete_episode'),
+    ('update_edge', {'edge_uuid': 'e1'}, 'update_edge'),
+    # Reads
+    ('search', {'query': 'q'}, 'search'),
+    ('count_memories_by_metadata', {'filters': {}}, 'count_memories_by_metadata'),
+    ('get_memories_by_metadata', {'filters': {}}, 'get_memories_by_metadata'),
+    ('get_entity', {'name': 'e'}, 'get_entity'),
+    ('get_entity_by_uuid', {'entity_uuid': 'u1'}, 'get_entity_by_uuid'),
+    ('get_episodes', {}, 'get_episodes'),
+    ('get_queue_stats', {}, 'durable_queue.get_stats'),
+    # Ungated mutators
+    ('refresh_entity_summary', {'entity_name': 'Foo'}, 'refresh_entity_summary'),
+    ('set_entity_summary', {'entity_name': 'Foo', 'summary': 's'}, 'set_entity_summary'),
+    ('rename_entity', {'entity_name': 'Foo', 'new_name': 'Bar'}, 'rename_entity'),
+    ('merge_entities', {'deprecated_uuid': 'd1', 'surviving_uuid': 's2'}, 'merge_entities'),
+    ('delete_entity', {'entity_uuid': 'u1'}, 'delete_entity'),
+    ('rebuild_entity_summaries', {}, 'rebuild_entity_summaries'),
+    ('replay_to_graphiti', {}, 'replay_from_store'),
+]
+
+assert len(_ALL_MEMORY_TOOL_SWEEP_CASES) == 19, (
+    'Sweep must cover exactly the 19 in-scope memory tools (PRD seam S3) — '
+    'update this table if the in-scope tool count ever changes.'
+)
+
+
+class TestCompletenessSweepAllMemoryTools:
+    """Behavioral sweep: EVERY memory tool rejects a path-shaped project_id
+    before its downstream service/durable_queue method is ever called.
+
+    Guards the tools not individually B1/B2-tested above, and any tool added
+    in the future — canonicalization is the first project_id operation in
+    every prologue, ahead of any tool-specific required-arg check, so a
+    path-shaped project_id must short-circuit uniformly across all 19.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'tool_name, extra_kwargs, service_attr_path',
+        _ALL_MEMORY_TOOL_SWEEP_CASES,
+        ids=[case[0] for case in _ALL_MEMORY_TOOL_SWEEP_CASES],
+    )
+    async def test_path_shaped_project_id_rejected_before_service_call(
+        self, tool_name, extra_kwargs, service_attr_path
+    ):
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
+
+        result = await server._tool_manager.call_tool(
+            tool_name,
+            {**extra_kwargs, 'project_id': _PATH_SHAPED},
+        )
+
+        assert result.get('error_type') == 'PathShapedProjectIdError', (
+            f'{tool_name}: expected PathShapedProjectIdError, got: {result!r}'
+        )
+        assert _PATH_SHAPED in result.get('error', ''), (
+            f'{tool_name}: expected offending value {_PATH_SHAPED!r} named in error, got: {result!r}'
+        )
+        mock_attr = _resolve_mock_attr(mock_service, service_attr_path)
+        mock_attr.assert_not_called()
+
+
+class TestGetExternalStatusesCharacterization:
+    """get_external_statuses (step-8 refactor target): characterizes its
+    CURRENT project_id normalization behavior so replacing the inline
+    ``project_id.lower().replace('-', '_')`` with the shared, raise-free
+    ``_to_underscore_canonical`` primitive (task 2267/S1) is a verified
+    no-op refactor rather than a behavior change (see plan design decisions —
+    get_external_statuses must keep its sentinel-only contract and must
+    never raise PathShapedProjectIdError).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _passthrough_main_checkout(self, monkeypatch):
+        """Stub resolve_main_checkout so a synthetic known_projects root
+        doesn't need to be a real git working tree (mirrors the load-bearing
+        fixture in tests/test_get_external_statuses.py).
+        """
+        monkeypatch.setattr(
+            'fused_memory.server.tools.resolve_main_checkout',
+            lambda p: str(p),
+        )
+
+    @pytest.mark.asyncio
+    async def test_hyphen_dep_resolves_against_canonical_registry_key(self):
+        """'dark-factory:5' resolves against registry key 'dark_factory' — NOT 'unknown_project'."""
+        mock_task_interceptor = AsyncMock()
+        mock_task_interceptor.get_statuses = AsyncMock(return_value={'5': 'in-progress'})
+        server = create_mcp_server(
+            AsyncMock(),
+            task_interceptor=mock_task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+        result = await server._tool_manager.call_tool(
+            'get_external_statuses', {'deps': ['dark-factory:5']}
+        )
+
+        assert result == {'dark-factory:5': 'in-progress'}, (
+            "Expected the hyphen dep to resolve via the canonical registry key "
+            f"(not 'unknown_project'); got: {result!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_path_shaped_dep_returns_sentinel_without_raising(self):
+        """A path-shaped dep project_id returns a sentinel — no raise, no backend call."""
+        mock_task_interceptor = AsyncMock()
+        server = create_mcp_server(
+            AsyncMock(),
+            task_interceptor=mock_task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
+        dep = f'{_PATH_SHAPED}:5'
+
+        result = await server._tool_manager.call_tool('get_external_statuses', {'deps': [dep]})
+
+        assert result.get(dep) in {'unknown_project', 'malformed'}, (
+            f'Expected a sentinel value (no raise) for a path-shaped dep; got: {result!r}'
+        )
+        mock_task_interceptor.get_statuses.assert_not_called()
