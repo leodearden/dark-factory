@@ -788,3 +788,99 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
     assert record.status == session_registry.Status.FAILED_TO_START, (
         f"expected registry status failed-to-start, got {record.status}"
     )
+
+
+def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
+    """A fresh transcript file must suppress the failed-to-start flag.
+
+    Proves the transcript detector is load-bearing. Uses a DETACHING launcher
+    (custom-term, routing through resolve_detached's launch_rc==0 branch --
+    the incident path) whose fake claude writes a transcript file under
+    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps 2s (longer
+    than the shrunk 1s started-grace) before exiting and letting $inner write
+    the sentinel. <enc> mirrors session_registry.transcript_path_for_cwd's
+    encoding: cwd with every '/' and '.' replaced by '-'.
+
+    RED today: step-2's watchdog only knows the exit sentinel, so with grace=1s
+    it flags failed-to-start at ~1s -- well before the ~2s sentinel -> rc 144,
+    not 0. GREEN after step-4 wires the transcript probe.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+
+    enc = str(tmp_path).replace("/", "-").replace(".", "-")
+
+    # Fake claude: write the transcript file immediately (mirroring a real
+    # Claude Code session creating ~/.claude/projects/<enc>/*.jsonl the moment
+    # it starts), then outlast the shrunk started-grace before exiting -- so
+    # only the transcript probe (not the sentinel) can suppress the flag.
+    claude = bin_dir / "claude"
+    claude.write_text(
+        "#!/usr/bin/env bash\n"
+        f'mkdir -p "$CLAUDE_PROJECTS_DIR/{enc}"\n'
+        f'touch "$CLAUDE_PROJECTS_DIR/{enc}/session.jsonl"\n'
+        "sleep 2\n"
+        "exit 0\n"
+    )
+    claude.chmod(0o755)
+
+    pidfile = tmp_path / "leader.pid"
+    _write_detaching_terminal(bin_dir, "custom-term", pidfile)
+
+    env = _base_env(bin_dir, "custom-term")
+    env["SPAWN_STARTED_GRACE_SECS"] = "1"
+
+    result = _run_spawn(env, tmp_path, timeout=20)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 0, (
+        f"Expected exit 0 (transcript evidence must suppress the flag), "
+        f"got {result.returncode}\nstderr: {stderr}"
+    )
+    assert result.returncode != 144, (
+        f"transcript evidence must suppress EXIT_FAILED_TO_START, got 144\n"
+        f"stderr: {stderr}"
+    )
+    assert "failed-to-start" not in stderr.lower(), (
+        f"transcript evidence must suppress the loud failed-to-start line, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.EXITED, (
+        f"expected registry status exited, got {record.status}"
+    )
+
+
+def test_normal_spawn_exit0_not_flagged(tmp_path: pathlib.Path) -> None:
+    """A normal, fast-exiting spawn must never be flagged failed-to-start.
+
+    Regression guard (task's "a normal spawn is NOT flagged" requirement):
+    locks that the started-watchdog's sentinel short-circuit means an
+    ordinary fast session is never flagged, even while the started-grace
+    watchdog is running concurrently in the background. Already green after
+    step-2 (the sentinel check alone satisfies it) -- this pins the contract
+    before step-4 adds more evidence probes.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 0, (
+        f"Expected exit 0 (normal spawn), got {result.returncode}\nstderr: {stderr}"
+    )
+    assert "failed-to-start" not in stderr.lower(), (
+        f"a normal spawn must never be flagged failed-to-start, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.EXITED, (
+        f"expected registry status exited, got {record.status}"
+    )
