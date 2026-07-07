@@ -4771,6 +4771,10 @@ Output JSON matching the schema. Every task must appear in the output.
                 await _cleanup_proc.communicate()
             except Exception:
                 pass  # best-effort; path may simply not exist
+        # No local try/except needed: prune_worktrees never raises (it wraps its
+        # own `git worktree prune` subprocess in try/except internally — see
+        # GitOps._prune_registrations). This cleanup's best-effort contract
+        # depends on that invariant; preserve it if that method is refactored.
         await self.git_ops.prune_worktrees(context='substrate-gate-cleanup')
 
         # Build ephemeral detached worktree — mirrors evals/snapshots.py pattern.
