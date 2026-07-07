@@ -2709,3 +2709,126 @@ async def test_update_task_invalid_metadata_mode_always_raises(
             metadata_mode='bogus',
         )
     assert exc2.value.code == 'TASKMASTER_TOOL_ERROR'
+
+
+# ── write-boundary validation (task 2162, update_task post-merge I3) ──
+
+
+@pytest.mark.asyncio
+async def test_update_task_warn_mode_emits_schema_warning_and_proceeds(
+    backend, project_root, caplog,
+):
+    """Warn-mode update_task: a post-merge I3 violation still lands.
+
+    Seeding a normal task with ``{"foo": "bar"}`` and then updating with
+    ``{"task_kind": "deterministic"}`` (default additive merge — no
+    ``append``/``metadata_mode`` passed) produces the post-merge blob
+    ``{"foo": "bar", "task_kind": "deterministic"}``, which violates
+    TaskMetadata's cross-field invariant (I3: a deterministic task requires
+    ``before_done`` or ``always_escalates``). update_task validates the
+    POST-MERGE blob, so this is caught on update, not only on submit.
+
+    The default backend is warn-mode (``task_metadata_enforce=False``), so
+    the whole-metadata invariant violation emits exactly one census line
+    carrying the ``<metadata>`` sentinel field, and the write proceeds: the
+    merged metadata — including the pre-existing ``foo`` sibling, which is
+    itself unrecognised by TaskMetadata's schema and so contributes its own
+    independent ``unknown_key`` census line — is stored raw/unchanged.
+    """
+    dto = await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'foo': 'bar'}),
+    )
+    tid = dto['id']
+    # The seed add_task above emits its own census line for the "foo" unknown
+    # key (unrelated to what this test verifies) — caplog.records accumulates
+    # for the whole test regardless of the at_level() scope below, so drop it
+    # to keep the assertions focused on the update_task call under test.
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        result = await backend.update_task(
+            tid, project_root=project_root,
+            metadata=json.dumps({'task_kind': 'deterministic'}),
+        )
+    assert result['updated'] is True
+
+    census_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'task_metadata.schema_warning' in r.message
+    ]
+    whole_metadata_msgs = [m for m in census_msgs if '<metadata>' in m]
+    assert len(whole_metadata_msgs) == 1, (
+        f'Expected exactly one whole-metadata task_metadata.schema_warning line; got '
+        f'{len(whole_metadata_msgs)}: {whole_metadata_msgs} (all census lines: {census_msgs})'
+    )
+    combined = whole_metadata_msgs[0]
+    assert f'task_id={tid}' in combined, (
+        f'Expected labeled task_id={tid!r} token in census line; got: {combined!r}'
+    )
+    assert 'before_done' in combined, (
+        f'Expected the invariant error text in census line; got: {combined!r}'
+    )
+
+    # The write proceeded: the merged metadata (including the "foo" sibling)
+    # is stored raw/unchanged — no repair, no schema_version stamp.
+    task = await backend.get_task(tid, project_root=project_root)
+    assert task['metadata'] == {'foo': 'bar', 'task_kind': 'deterministic'}
+
+
+@pytest.mark.asyncio
+async def test_update_task_valid_metadata_emits_no_schema_warning(
+    backend, project_root, caplog,
+):
+    """A schema-clean update_task merge emits zero task_metadata.schema_warning lines."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'files': ['a.py']}),
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'files': ['b.py']}),
+        )
+
+    census_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'task_metadata.schema_warning' in r.message
+    ]
+    assert census_msgs == [], (
+        f'Expected no task_metadata.schema_warning lines for a valid merge; got: {census_msgs}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_enforce_mode_rejects_invariant_violation(tmp_path, project_root):
+    """Enforce-mode update_task: a post-merge I3 violation raises and rolls back.
+
+    ``task_metadata_enforce=True`` flips the write-boundary failure policy
+    from warn-and-proceed to raise: the merged blob's invariant violation is
+    rejected with ``pydantic.ValidationError`` and the stored metadata is
+    left byte-for-byte unchanged — the update's txn rolled back.
+    """
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        seed_metadata = json.dumps({'foo': 'bar'})
+        dto = await backend.add_task(
+            project_root=project_root, title='t', metadata=seed_metadata,
+        )
+        tid = dto['id']
+
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                tid, project_root=project_root,
+                metadata=json.dumps({'task_kind': 'deterministic'}),
+            )
+
+        task = await backend.get_task(tid, project_root=project_root)
+        assert task['metadata'] == {'foo': 'bar'}, (
+            f'Expected the rolled-back txn to leave metadata unchanged; got: {task["metadata"]}'
+        )
+    finally:
+        await backend.close()
