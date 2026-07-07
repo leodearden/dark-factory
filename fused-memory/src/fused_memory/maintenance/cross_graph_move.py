@@ -128,11 +128,21 @@ async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str
     unexpected source row immediately, rather than silently proceeding
     without it (which would produce a differently-shaped, harder-to-
     diagnose gap later -- e.g. a moved node that can no longer be found by
-    semantic search).
+    semantic search). A reply with zero rows (e.g. a transient race where
+    the source row was deleted between an earlier existence check and this
+    read, or an unexpected reply shape) raises the same kind of descriptive
+    ``ValueError`` rather than a bare ``IndexError``.
     """
     reply = await falkor_client.execute_command('GRAPH.RO_QUERY', group_id, cypher, '--compact')
-    row = reply[1][0]
-    cell = row[0]
+    rows = reply[1]
+    if not rows:
+        raise ValueError(
+            f'_read_compact_vector: expected exactly one row for '
+            f'group_id={group_id!r} (cypher={cypher!r}), got zero rows -- '
+            'the source row may have been deleted between an existence '
+            'check and this read, or the reply shape is unexpected.'
+        )
+    cell = rows[0][0]
     scalar_type, value = int(cell[0]), cell[1]
     if scalar_type != _VALUE_VECTORF32:
         raise ValueError(

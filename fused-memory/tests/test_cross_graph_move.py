@@ -236,6 +236,30 @@ class TestReadCompactVectorTransport:
                 client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
             )
 
+    @pytest.mark.asyncio
+    async def test_empty_rows_raises_naming_group_id_and_cypher(self):
+        """amend (reviewer_comprehensive robustness): zero rows raises a
+        descriptive ValueError, not a bare IndexError.
+
+        A transient race (the source row deleted between an earlier
+        existence check and this read) or an unexpected reply shape must
+        surface as a hard, diagnosable failure naming group_id/cypher --
+        consistent with the non-VECTORF32 path just above -- rather than an
+        undiagnosable IndexError from indexing an empty rows list.
+        """
+        cypher = 'RETURN n.name_embedding'
+        reply = ['header', [], 'stats']  # zero rows
+        client = self._client_returning(reply)
+
+        with pytest.raises(ValueError) as excinfo:
+            await cross_graph_move._read_compact_vector(
+                client, group_id=SOURCE_GRAPH_FIXTURE, cypher=cypher,
+            )
+
+        msg = str(excinfo.value)
+        assert SOURCE_GRAPH_FIXTURE in msg
+        assert cypher in msg
+
 
 # ---------------------------------------------------------------------------
 # move_entity_across_graphs (S5) fixtures + shared test helper
