@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import TypeGuard
 
 _THIS_FILE = Path(__file__).name
 
@@ -31,13 +32,13 @@ _EXPECTED_ARGV = ('git', 'worktree', 'prune')
 _CHOKEPOINT_FUNCTION = '_prune_registrations'
 
 
-def _is_prune_argv_literal(node: ast.AST) -> bool:
+def _is_prune_argv_literal(node: ast.AST) -> TypeGuard[ast.List | ast.Tuple]:
     """True if *node* is a List/Tuple literal of exactly the prune argv."""
     if not isinstance(node, (ast.List, ast.Tuple)):
         return False
     if len(node.elts) != len(_EXPECTED_ARGV):
         return False
-    for elt, expected in zip(node.elts, _EXPECTED_ARGV):
+    for elt, expected in zip(node.elts, _EXPECTED_ARGV, strict=True):
         if not isinstance(elt, ast.Constant) or elt.value != expected:
             return False
     return True
