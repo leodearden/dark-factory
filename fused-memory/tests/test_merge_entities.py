@@ -21,7 +21,11 @@ from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params, ma
 from falkordb import FalkorDB as _SyncFalkorDB
 from falkordb.asyncio import FalkorDB
 
-from fused_memory.backends.graphiti_client import GraphitiBackend, NodeNotFoundError, _MultiTenantFalkorDriver
+from fused_memory.backends.graphiti_client import (
+    GraphitiBackend,
+    NodeNotFoundError,
+    _MultiTenantFalkorDriver,
+)
 
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.redirect_node_edges
