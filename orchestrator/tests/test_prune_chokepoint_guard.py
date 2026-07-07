@@ -11,14 +11,19 @@ reintroducing the hazard the PRD guards against (pool-storage guard races,
 missing escalation debounce, etc.).
 
 This test uses AST parsing (NOT text grep) to scan every *.py under
-orchestrator/src (recursively via rglob, excluding this file), and only
-flags an actual List or Tuple literal whose elements are exactly the string
-Constants ``'git'``, ``'worktree'``, ``'prune'`` in order. Comments,
-docstrings, and log-format strings that merely mention the phrase (e.g.
-verify.py's DD5 notes, git_ops.py's own docstrings) are never matched,
-avoiding false positives. Mirrors the AST-walk / rglob / offender file:line
-list / skip-self pattern used by
-orchestrator/tests/test_event_loop_antipattern_guard.py.
+orchestrator/src (recursively via rglob, excluding this file), and flags
+any List or Tuple literal whose first element is the string Constant
+``'git'`` and whose remaining elements contain ``'worktree'`` followed
+later by ``'prune'`` as an in-order subsequence — catching not just the
+exact 3-element literal but also trailing-flag (e.g. ``--verbose``) and
+``-C <path>``-prefixed variants that a strict equality check would miss.
+Comments, docstrings, and log-format strings that merely mention the
+phrase (e.g. verify.py's DD5 notes, git_ops.py's own docstrings) are never
+matched, avoiding false positives. A literal only counts as "inside the
+chokepoint" when it falls within a ``_prune_registrations`` method defined
+directly on the ``GitOps`` class (not merely any same-named function).
+Mirrors the AST-walk / rglob / offender file:line list / skip-self pattern
+used by orchestrator/tests/test_event_loop_antipattern_guard.py.
 """
 from __future__ import annotations
 
@@ -30,18 +35,37 @@ _THIS_FILE = Path(__file__).name
 
 _EXPECTED_ARGV = ('git', 'worktree', 'prune')
 _CHOKEPOINT_FUNCTION = '_prune_registrations'
+_CHOKEPOINT_CLASS = 'GitOps'
+
+
+def _str_constant(elt: ast.expr) -> str | None:
+    """The string value of *elt* if it's a string ``Constant``, else None."""
+    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+        return elt.value
+    return None
 
 
 def _is_prune_argv_literal(node: ast.AST) -> TypeGuard[ast.List | ast.Tuple]:
-    """True if *node* is a List/Tuple literal of exactly the prune argv."""
+    """True if *node* is a List/Tuple literal invoking ``git worktree prune``.
+
+    Matches not just the exact ``['git', 'worktree', 'prune']`` literal but
+    any literal whose first element is the string constant ``'git'`` and
+    whose remaining elements contain ``'worktree'`` followed later by
+    ``'prune'`` as an in-order (not necessarily contiguous) subsequence.
+    This also catches variants a strict 3-element equality check would
+    miss: extra trailing flags (``['git', 'worktree', 'prune',
+    '--verbose']``) and ``-C <path>``-prefixed forms (``['git', '-C', path,
+    'worktree', 'prune']``, where ``path`` may be a non-constant
+    expression). Argv assembled dynamically (e.g. via ``shlex.split`` or
+    list concatenation) is intentionally out of scope — this is a static,
+    best-effort AST check, not a full data-flow analysis.
+    """
     if not isinstance(node, (ast.List, ast.Tuple)):
         return False
-    if len(node.elts) != len(_EXPECTED_ARGV):
+    if not node.elts or _str_constant(node.elts[0]) != _EXPECTED_ARGV[0]:
         return False
-    for elt, expected in zip(node.elts, _EXPECTED_ARGV, strict=True):
-        if not isinstance(elt, ast.Constant) or elt.value != expected:
-            return False
-    return True
+    remaining = (_str_constant(elt) for elt in node.elts[1:])
+    return all(token in remaining for token in _EXPECTED_ARGV[1:])
 
 
 def _find_prune_argv_literals(source: str) -> list[tuple[int, bool]]:
