@@ -28,16 +28,28 @@ dict) when any of these invariants is violated:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
+
+from shared.task_metadata import parse_metadata
 
 __all__ = [
     'deterministic_task_error',
     'inject_task_kind',
 ]
 
+logger = logging.getLogger(__name__)
+
 _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
+
+# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
+# value was discarded — parse_metadata could not produce any dict at all.
+# Only these are loud here; 'unknown_key'/'invalid_field'/'invalid_submodel'
+# etc. are expected on legitimate curator-internal metadata (before_done,
+# always_escalates) and belong to the write boundary (W3-β), not here.
+_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 
 
 # ---------------------------------------------------------------------------
@@ -45,19 +57,39 @@ _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
 # ---------------------------------------------------------------------------
 
 
+def _parse_metadata_with_discard(metadata: Any) -> tuple[dict, bool]:
+    """Parse *metadata* to a raw dict, delegating malformed-input policy to
+    :func:`shared.task_metadata.parse_metadata`.
+
+    Returns ``(parsed, discarded)``: ``discarded`` is True when *metadata* is
+    non-None but could not be treated as a JSON object at all (parse_metadata's
+    ``unparseable_json`` / ``not_an_object`` SchemaWarning codes) — the same
+    "whole metadata replaced by a fresh dict" event
+    ``TaskInterceptor._inject_routing_override`` already warns on.
+
+    ``parsed`` is always the RAW dict — never ``parse_metadata(...).model_dump()``
+    — so unknown keys (e.g. curator-internal ``spawned_from``) round-trip
+    byte-for-value (I1) instead of gaining ``TaskMetadata``'s typed-field
+    defaults. Only the parse/validate *policy* (what counts as malformed) is
+    delegated to shared; the returned value is independently re-derived from
+    the input so its shape is untouched.
+    """
+    if metadata is None:
+        return {}, False
+    if isinstance(metadata, dict):
+        return metadata, False
+    _, warnings = parse_metadata(metadata, direction='read')
+    if any(w.code in _DISCARD_CODES for w in warnings):
+        return {}, True
+    # metadata is a JSON string parse_metadata accepted as an object — reparse
+    # independently for the raw dict (see docstring: never model_dump()).
+    return json.loads(metadata), False
+
+
 def _parse_metadata(metadata: Any) -> dict:
     """Return *metadata* as a dict (best-effort; unknown shapes → empty dict)."""
-    if metadata is None:
-        return {}
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        try:
-            parsed = json.loads(metadata)
-        except (json.JSONDecodeError, ValueError):
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
+    parsed, _ = _parse_metadata_with_discard(metadata)
+    return parsed
 
 
 def _validation_error(message: str, *, hint: str | None = None) -> dict[str, Any]:
@@ -233,6 +265,14 @@ def inject_task_kind(
         task_kind: The validated kind string to persist ('normal' or
             'deterministic').
     """
-    meta = dict(_parse_metadata(metadata))  # shallow copy — don't mutate caller's dict
+    parsed, discarded = _parse_metadata_with_discard(metadata)
+    if discarded:
+        logger.warning(
+            'task_metadata.schema_warning: non-dict metadata discarded '
+            '(type=%s); using fresh dict. Original value: %r',
+            type(metadata).__name__,
+            metadata,
+        )
+    meta = dict(parsed)  # shallow copy — don't mutate caller's dict
     meta['task_kind'] = task_kind
     return meta
