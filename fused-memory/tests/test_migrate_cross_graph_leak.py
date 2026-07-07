@@ -210,3 +210,99 @@ class TestDispositionFor:
         assert _mod.disposition_for(None, False) is _mod.UNRESOLVED
         assert _mod.disposition_for('g', True) is _mod.MERGE
         assert _mod.disposition_for('g', False) is _mod.MOVE
+
+
+def _classified_node(
+    uuid: str,
+    *,
+    name: str = 'N',
+    source_graph: str = 'reify',
+    target_graph: str | None = 'dark_factory',
+    disposition: str = _mod.MOVE,
+    edge_count: int = 0,
+    episode_count: int = 0,
+) -> dict:
+    """Build a classified-node record dict, shaped as build_manifest expects."""
+    return {
+        'uuid': uuid,
+        'name': name,
+        'source_graph': source_graph,
+        'target_graph': target_graph,
+        'disposition': disposition,
+        'edge_count': edge_count,
+        'episode_count': episode_count,
+    }
+
+
+# ===========================================================================
+# Tests: build_manifest (step-5/6)
+# ===========================================================================
+
+class TestBuildManifest:
+    """build_manifest(classified_nodes, census_counts, *, dry_run, alias_map=ALIAS_MAP)."""
+
+    def test_manifest_shape_and_tallies(self):
+        """Manifest carries dry_run, alias_map, nodes verbatim, census counts,
+        summary tallies, and unresolved_uuids."""
+        nodes = [
+            _classified_node('u-move', disposition=_mod.MOVE),
+            _classified_node('u-merge', disposition=_mod.MERGE),
+            _classified_node('u-unresolved', target_graph=None, disposition=_mod.UNRESOLVED),
+        ]
+        census = {'reify': 3, 'dark_factory': 10, 'know_live': 5}
+
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+
+        assert manifest['dry_run'] is True
+        assert manifest['alias_map'] == _mod.ALIAS_MAP
+        assert manifest['nodes'] == nodes
+        assert manifest['census'] == census
+        assert manifest['summary'] == {'MOVE': 1, 'MERGE': 1, 'UNRESOLVED': 1, 'total': 3}
+        assert manifest['unresolved_uuids'] == ['u-unresolved']
+
+    def test_dry_run_false_is_preserved(self):
+        """dry_run is passed through verbatim, not hardcoded."""
+        manifest = _mod.build_manifest([], {}, dry_run=False)
+        assert manifest['dry_run'] is False
+
+    def test_alias_map_override_is_echoed(self):
+        """A caller-supplied alias_map (not the module default) is echoed
+        verbatim -- the manifest documents what mapping was ACTUALLY used."""
+        custom_map = {'foo': 'bar'}
+        manifest = _mod.build_manifest([], {}, dry_run=True, alias_map=custom_map)
+        assert manifest['alias_map'] == custom_map
+
+    def test_empty_inputs_produce_zeroed_summary(self):
+        """Empty classified_nodes/census_counts -> zeroed summary, empty
+        nodes/unresolved lists."""
+        manifest = _mod.build_manifest([], {}, dry_run=True)
+
+        assert manifest['nodes'] == []
+        assert manifest['census'] == {}
+        assert manifest['summary'] == {'MOVE': 0, 'MERGE': 0, 'UNRESOLVED': 0, 'total': 0}
+        assert manifest['unresolved_uuids'] == []
+
+    def test_unresolved_uuids_only_includes_unresolved_dispositions(self):
+        """unresolved_uuids lists ONLY UNRESOLVED nodes' uuids, in order --
+        MOVE/MERGE nodes are excluded even though they're still in 'nodes'."""
+        nodes = [
+            _classified_node('u1', disposition=_mod.MOVE),
+            _classified_node('u2', target_graph=None, disposition=_mod.UNRESOLVED),
+            _classified_node('u3', disposition=_mod.MERGE),
+            _classified_node('u4', target_graph=None, disposition=_mod.UNRESOLVED),
+        ]
+
+        manifest = _mod.build_manifest(nodes, {}, dry_run=True)
+
+        assert manifest['unresolved_uuids'] == ['u2', 'u4']
+
+    def test_no_io_referentially_stable(self):
+        """build_manifest performs no I/O and holds no hidden mutable state:
+        calling it twice with identical inputs yields equal dicts."""
+        nodes = [_classified_node('u1', disposition=_mod.MOVE)]
+        census = {'reify': 1}
+
+        r1 = _mod.build_manifest(nodes, census, dry_run=True)
+        r2 = _mod.build_manifest(nodes, census, dry_run=True)
+
+        assert r1 == r2
