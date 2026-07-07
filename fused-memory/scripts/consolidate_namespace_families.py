@@ -106,3 +106,23 @@ JUNK_KEYS: tuple[str, ...] = (
     'default',
     '1098',
 )
+
+
+# ---------------------------------------------------------------------------
+# Pure core
+# ---------------------------------------------------------------------------
+
+def build_consolidation_report(
+    graph_family_items: list[dict],
+    collection_items: list[dict],
+    junk_key_items: list[dict],
+    *,
+    dry_run: bool,
+) -> dict:
+    """Assemble the manifest dict from already-computed per-item lists. No I/O."""
+    return {
+        'dry_run': dry_run,
+        'graph_family_merges': list(graph_family_items),
+        'collection_merges': list(collection_items),
+        'junk_key_deletions': list(junk_key_items),
+    }
