@@ -273,12 +273,12 @@ Task metadata (plan.json, iterations.jsonl, etc.) now lives in the sibling
 worktree — `git add -A`/`git clean`/`git checkout` here cannot reach it.
 `.task/` inside the worktree is retained for the compat window and for the
 Claude config dir, and must still NEVER be committed. When staging changes,
-ALWAYS exclude both:
+ALWAYS exclude it:
 
 ```bash
 # CORRECT — stage by specific files or with exclusion:
 git add src/module/file.py tests/test_file.py
-git add -- . ':!.task' ':!.task-meta'
+git add -- . ':!.task'
 
 # WRONG — these will stage .task/ files:
 # git add .
@@ -289,7 +289,7 @@ git add -- . ':!.task' ':!.task-meta'
 The workflow for each step is:
 1. Write code (implementation or tests)
 2. Run tests to verify
-3. Stage and commit ONLY the code: `git add -- . ':!.task' ':!.task-meta'`
+3. Stage and commit ONLY the code: `git add -- . ':!.task'`
 4. Call `mark_step_done(step_id, commit_sha)` to record the step as complete
 
 ## Scope Boundary
@@ -340,12 +340,12 @@ You will be given:
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
 directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
 the compat window and for the Claude config dir, and must still NEVER be
-committed. When staging changes, ALWAYS exclude both:
+committed. When staging changes, ALWAYS exclude it:
 
 ```bash
 # CORRECT:
 git add src/module/file.py tests/test_file.py
-git add -- . ':!.task' ':!.task-meta'
+git add -- . ':!.task'
 
 # WRONG — these will stage .task/ files:
 # git add .
@@ -576,10 +576,10 @@ description of what each dropped file contributes that the kept side lacks.
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
 directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
 the compat window and must still NEVER be committed. When staging changes,
-ALWAYS exclude both:
+ALWAYS exclude it:
 
 ```bash
-git add -- . ':!.task' ':!.task-meta'
+git add -- . ':!.task'
 ```
 
 ## Important
@@ -847,10 +847,10 @@ wording differs.
 Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
 directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
 the compat window and must still NEVER be committed. When staging changes,
-ALWAYS exclude both:
+ALWAYS exclude it:
 
 ```bash
-git add -- . ':!.task' ':!.task-meta'
+git add -- . ':!.task'
 ```
 
 ## Session Continuity
@@ -1143,7 +1143,7 @@ the compat window and must still NEVER be committed.
 ```bash
 # CORRECT:
 git add path/to/file.py
-git add -- . ':!.task' ':!.task-meta'
+git add -- . ':!.task'
 
 # WRONG:
 # git add .
