@@ -10,9 +10,16 @@ Background
 verbatim as the FalkorDB graph name, with no canonicalization -- so a node
 whose ``group_id`` names a spelling variant, alias, or otherwise-wrong graph
 key ends up "foreign" to the graph it actually lives in (``n.group_id <>
-$graph_key``). This script census-enumerates every such foreign node across
-every populated graph, classifies each one's correct disposition, and (with
-human review of the emitted manifest) re-homes it via the CGL-ε primitives.
+$graph_key`` -- or ``group_id`` missing/``NULL`` entirely, which Cypher's
+three-valued logic would otherwise silently exclude from a naive ``<>``
+predicate: ``NULL <> $graph_key`` evaluates to ``NULL``, not ``TRUE``). This
+script census-enumerates every such foreign node across every populated
+graph, classifies each one's correct disposition, and (with human review of
+the emitted manifest) re-homes it via the CGL-ε primitives. A ``NULL``/
+missing ``group_id`` has no meaningful value to resolve against
+``populated_graphs``/``ALIAS_MAP``, so it always classifies ``UNRESOLVED``
+(see ``resolve_target_graph``) -- it is listed for visibility, never
+silently dropped, but blocks ``--apply`` for that node only.
 
 ζ is a pure CONSUMER of ε (task 2271, ``fused_memory.maintenance.cross_graph_move``,
 merged to main): ``move_entity_across_graphs`` (S5) and
@@ -47,9 +54,21 @@ Contract
     call into an ε primitive (``move_entity_across_graphs`` /
     ``merge_foreign_duplicate``), both of which are CREATE-before-DELETE
     (crash-safe) and idempotent on re-run.
+  * A MOVE/MERGE that completes but silently drops topology (an ε primitive's
+    ``MoveResult.edges_skipped``/``mentions_skipped``, or a
+    ``MergeResult.home_edge_count_after`` that does not reconcile with
+    ``home_edge_count_before + edges_recreated`` -- both cases the other
+    endpoint being absent from the target/home graph) is surfaced as a
+    blocked ``apply_results`` entry with a descriptive ``error``, not a clean
+    exit -- see ``_move_result_entry``/``_merge_result_entry``.
   * UNRESOLVED nodes (no populated-home and no ``ALIAS_MAP`` entry) are never
     silently dropped or routed to a new/unpopulated graph -- they block
     ``--apply`` for that node only and force a non-zero exit.
+  * A manifest node record missing a required field (``uuid``/
+    ``disposition``/``source_graph``/``target_graph`` -- e.g. from hand
+    editing) blocks that node only, with a descriptive error, rather than
+    raising a bare ``KeyError`` that would abort the rest of the batch after
+    earlier nodes were already mutated.
 
 Scope note
 ----------
@@ -142,7 +161,7 @@ MAX_CENSUS_PAGES: int = 1000
 # ---------------------------------------------------------------------------
 
 def resolve_target_graph(
-    group_id: str,
+    group_id: str | None,
     populated_graphs: set[str] | list[str] | frozenset[str],
     alias_map: dict[str, str],
 ) -> str | None:
@@ -157,6 +176,11 @@ def resolve_target_graph(
       3. Neither -> None (UNRESOLVED). Never falls back to a generic
          normalization (e.g. blind hyphen->underscore rewrite) and never
          invents/targets a new, unpopulated graph.
+
+    *group_id* may be None (a node with a missing/``NULL`` ``group_id``
+    property -- see ``census_foreign_nodes``): None is never a member of
+    *populated_graphs* or a key in *alias_map*, so it always falls through
+    to case 3 (UNRESOLVED), same as any other unmapped orphan.
     """
     if group_id in populated_graphs:
         return group_id
@@ -229,10 +253,15 @@ async def census_foreign_nodes(
     """Read-only, paged enumeration of every node foreign to *graph_key*.
 
     "Foreign" means ``n.group_id <> graph_key`` -- the node lives in this
-    FalkorDB graph but its own ``group_id`` property names a different graph.
-    Paginates via SKIP/LIMIT (never ``collect()``, which truncates) until a
-    short page confirms the true end; counts are therefore always freshly
-    recomputed, never a baked-in/cached figure.
+    FalkorDB graph but its own ``group_id`` property names a different graph
+    -- OR ``n.group_id IS NULL`` (missing entirely). The ``IS NULL`` half is
+    required, not defensive belt-and-suspenders: Cypher's ``<>`` uses
+    three-valued logic, so ``NULL <> $graph_key`` evaluates to ``NULL`` (not
+    ``TRUE``) and a plain ``WHERE n.group_id <> $graph_key`` would silently
+    exclude every ``NULL``-``group_id`` node from the census entirely, with
+    no error and no log line. Paginates via SKIP/LIMIT (never ``collect()``,
+    which truncates) until a short page confirms the true end; counts are
+    therefore always freshly recomputed, never a baked-in/cached figure.
 
     A hard ``MAX_CENSUS_PAGES`` safety cap bounds worst-case pagination
     against a pathological/huge foreign population. If that cap is reached
@@ -245,7 +274,7 @@ async def census_foreign_nodes(
     skip = 0
     for _page_num in range(MAX_CENSUS_PAGES):
         result = await graph.ro_query(
-            'MATCH (n) WHERE n.group_id <> $graph_key '
+            'MATCH (n) WHERE n.group_id IS NULL OR n.group_id <> $graph_key '
             'RETURN n.uuid, n.name, n.group_id, labels(n) '
             'SKIP $skip LIMIT $limit',
             {'graph_key': graph_key, 'skip': skip, 'limit': page_size},
@@ -423,6 +452,90 @@ def load_reviewed_manifest(path: str | Path) -> dict:
     return json.loads(Path(path).read_text())
 
 
+# Required keys on every manifest node record dispatched by run()'s apply
+# loop. A classify_node-produced record always carries all four (plus
+# name/edge_count/episode_count, not needed for dispatch) -- this constant
+# exists for a hand-edited/malformed manifest file, see
+# missing_required_node_keys.
+_REQUIRED_NODE_KEYS: tuple[str, ...] = ('uuid', 'disposition', 'source_graph', 'target_graph')
+
+
+def missing_required_node_keys(node: dict) -> list[str]:
+    """Return which of _REQUIRED_NODE_KEYS are absent from *node*.
+
+    A manifest file is just JSON -- nothing enforces that a hand-edited copy
+    still carries every key a classify_node record does. run()'s apply loop
+    calls this FIRST, before indexing ``node['uuid']``/``node['disposition']``/
+    etc., so a malformed record blocks that node only (a descriptive error),
+    rather than a bare ``KeyError`` escaping mid-batch and aborting every
+    node after it -- including ones already mutated by an earlier iteration.
+    """
+    return [key for key in _REQUIRED_NODE_KEYS if key not in node]
+
+
+def _move_result_entry(uuid: str, disposition: str, result: Any, target_graph: str) -> dict:
+    """Build a MOVE apply_results entry from move_entity_across_graphs' MoveResult.
+
+    MoveResult.edges_skipped/mentions_skipped count a RELATES_TO edge or
+    Episodic MENTIONS link whose OTHER endpoint was absent from
+    *target_graph* -- FalkorDB's CREATE silently matched nothing, so the
+    edge/mention was never recreated, even though the source node is still
+    unconditionally DETACH DELETEd (move_entity_across_graphs never rolls
+    that back). Discarding the returned MoveResult (as run() used to) hides
+    this from the manifest entirely -- a lossy move still reported
+    ``applied`` and a clean post-verify exit, since post-verify only checks
+    the foreign-node COUNT, not its topology. Folding the counts in here
+    (and blocking the node when either is non-zero) surfaces the loss to the
+    operator instead.
+    """
+    edges_skipped = result.edges_skipped
+    mentions_skipped = result.mentions_skipped
+    lossy = bool(edges_skipped or mentions_skipped)
+    entry = {
+        'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': lossy,
+        'edges_moved': result.edges_moved, 'edges_skipped': edges_skipped,
+        'mentions_moved': result.mentions_moved, 'mentions_skipped': mentions_skipped,
+    }
+    if lossy:
+        entry['error'] = (
+            f'{edges_skipped} RELATES_TO edge(s) and {mentions_skipped} MENTIONS '
+            f'link(s) were silently skipped moving {uuid} into {target_graph!r} '
+            "(the edge/mention's other endpoint is not yet present there) -- "
+            'topology loss, needs manual review'
+        )
+    return entry
+
+
+def _merge_result_entry(uuid: str, disposition: str, result: Any, home_graph: str) -> dict:
+    """Build a MERGE apply_results entry from merge_foreign_duplicate's MergeResult.
+
+    MergeResult.home_edge_count_after is a genuine RE-READ of the home
+    copy's RELATES_TO edge count after the recreate loop -- comparing it
+    against ``home_edge_count_before + edges_recreated`` is a real
+    no-edge-lost check (an edge recreate whose CREATE silently matched no
+    endpoint in the home graph would leave the actual count short of that
+    sum). Discarding the returned MergeResult (as run() used to) hides this
+    from the manifest entirely. Folding the counts in here (and blocking the
+    node on a mismatch) surfaces the loss to the operator instead.
+    """
+    expected_after = result.home_edge_count_before + result.edges_recreated
+    lossy = result.home_edge_count_after != expected_after
+    entry = {
+        'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': lossy,
+        'edges_recreated': result.edges_recreated,
+        'home_edge_count_before': result.home_edge_count_before,
+        'home_edge_count_after': result.home_edge_count_after,
+    }
+    if lossy:
+        entry['error'] = (
+            f'home graph {home_graph!r} RELATES_TO edge count after merging '
+            f'{uuid} ({result.home_edge_count_after}) does not match '
+            f'home_edge_count_before + edges_recreated ({expected_after}) -- an '
+            'edge recreate may have silently matched nothing, needs manual review'
+        )
+    return entry
+
+
 async def run(args: Any, memory_service: Any) -> dict:
     """Census -> classify -> manifest (dry-run), or apply a reviewed manifest.
 
@@ -471,6 +584,26 @@ async def run(args: Any, memory_service: Any) -> dict:
 
     apply_results: list[dict] = []
     for node in manifest['nodes']:
+        missing_keys = missing_required_node_keys(node)
+        if missing_keys:
+            # A hand-edited/malformed manifest record missing a required
+            # field blocks THIS node only -- indexing node['uuid'] etc.
+            # below unguarded would raise a bare KeyError that escapes run()
+            # entirely, aborting every node after it (including ones
+            # already mutated by an earlier iteration). See
+            # missing_required_node_keys.
+            apply_results.append({
+                'uuid': node.get('uuid', '<missing-uuid>'),
+                'disposition': node.get('disposition', '<missing-disposition>'),
+                'applied': False,
+                'blocked': True,
+                'error': (
+                    'malformed manifest node record: missing required '
+                    f'key(s) {missing_keys!r} -- refusing to dispatch'
+                ),
+            })
+            continue
+
         uuid = node['uuid']
         disposition = node['disposition']
 
@@ -507,7 +640,7 @@ async def run(args: Any, memory_service: Any) -> dict:
             # failure is recorded against THIS node only and the loop moves
             # on to the next one.
             try:
-                await move_entity_across_graphs(
+                move_result = await move_entity_across_graphs(
                     graphiti, uuid, node['source_graph'], node['target_graph'],
                     rewrite_group_id=node['target_graph'],
                 )
@@ -518,11 +651,11 @@ async def run(args: Any, memory_service: Any) -> dict:
                 })
             else:
                 apply_results.append(
-                    {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
+                    _move_result_entry(uuid, disposition, move_result, node['target_graph']),
                 )
         elif disposition == MERGE:
             try:
-                await merge_foreign_duplicate(
+                merge_result = await merge_foreign_duplicate(
                     graphiti, uuid,
                     wrong_graph=node['source_graph'], home_graph=node['target_graph'],
                 )
@@ -533,7 +666,7 @@ async def run(args: Any, memory_service: Any) -> dict:
                 })
             else:
                 apply_results.append(
-                    {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
+                    _merge_result_entry(uuid, disposition, merge_result, node['target_graph']),
                 )
         elif disposition == REKEY:
             try:
@@ -584,12 +717,16 @@ async def run(args: Any, memory_service: Any) -> dict:
         foreign = await census_foreign_nodes(graphiti, graph_key, page_size=args.page_size)
         after_counts[graph_key] = len(foreign)
 
+    # .get() (not node['disposition']/node['source_graph']) so a malformed
+    # manifest node record already blocked above by the missing-keys guard
+    # does not ALSO raise a KeyError here -- this loop re-walks the same
+    # manifest['nodes'] independently of the apply loop above.
     expected_residual: dict[str, int] = dict.fromkeys(populated, 0)
     for node in manifest['nodes']:
-        if node['disposition'] in (UNRESOLVED, EPISODIC_SKIP):
-            expected_residual[node['source_graph']] = (
-                expected_residual.get(node['source_graph'], 0) + 1
-            )
+        if node.get('disposition') in (UNRESOLVED, EPISODIC_SKIP):
+            source_graph = node.get('source_graph')
+            if source_graph is not None:
+                expected_residual[source_graph] = expected_residual.get(source_graph, 0) + 1
 
     matched = after_counts == expected_residual
     has_unresolved = bool(manifest.get('unresolved_uuids'))

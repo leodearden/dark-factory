@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params
+from fused_memory.maintenance.cross_graph_move import MergeResult, MoveResult
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'migrate_cross_graph_leak.py'
 
@@ -922,8 +923,12 @@ class TestRunApplyDispatch:
         manifest_path = tmp_path / 'manifest.json'
         manifest_path.write_text(json.dumps(manifest))
 
-        move_mock = AsyncMock()
-        merge_mock = AsyncMock()
+        move_mock = AsyncMock(return_value=MoveResult(
+            uuid='u-move', source_graph='reify', target_graph='dark_factory',
+        ))
+        merge_mock = AsyncMock(return_value=MergeResult(
+            uuid='u-merge', wrong_graph='reify', home_graph='know_live',
+        ))
         monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
         monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
 
@@ -965,7 +970,9 @@ class TestRunApplyDispatch:
         manifest_path = tmp_path / 'manifest.json'
         manifest_path.write_text(json.dumps(manifest))
 
-        move_mock = AsyncMock()
+        move_mock = AsyncMock(return_value=MoveResult(
+            uuid='u-move', source_graph='reify', target_graph='know_live',
+        ))
         monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
         monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
 
@@ -1044,8 +1051,20 @@ class TestRunApplyEpisodicSkip:
         )
         manifest_path = self._write_manifest(tmp_path, [ep_node], {'reify': 1, 'dark_factory': 0})
 
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', AsyncMock())
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+        # return_value is a real, zero-loss MoveResult/MergeResult (not a
+        # bare AsyncMock()) -- run() now reads edges_skipped/mentions_skipped/
+        # home_edge_count_after off the result (see _move_result_entry/
+        # _merge_result_entry), and an unconfigured MagicMock's truthy
+        # attributes and non-identical `+` result would otherwise be
+        # misread as a lossy outcome, spuriously flipping 'blocked' to True.
+        monkeypatch.setattr(
+            _mod, 'move_entity_across_graphs',
+            AsyncMock(return_value=MoveResult(uuid='u', source_graph='s', target_graph='t')),
+        )
+        monkeypatch.setattr(
+            _mod, 'merge_foreign_duplicate',
+            AsyncMock(return_value=MergeResult(uuid='u', wrong_graph='s', home_graph='t')),
+        )
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(
@@ -1249,8 +1268,20 @@ class TestRunPostVerify:
         )
         manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
 
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', AsyncMock())
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+        # return_value is a real, zero-loss MoveResult/MergeResult (not a
+        # bare AsyncMock()) -- run() now reads edges_skipped/mentions_skipped/
+        # home_edge_count_after off the result (see _move_result_entry/
+        # _merge_result_entry), and an unconfigured MagicMock's truthy
+        # attributes and non-identical `+` result would otherwise be
+        # misread as a lossy outcome, spuriously flipping 'blocked' to True.
+        monkeypatch.setattr(
+            _mod, 'move_entity_across_graphs',
+            AsyncMock(return_value=MoveResult(uuid='u', source_graph='s', target_graph='t')),
+        )
+        monkeypatch.setattr(
+            _mod, 'merge_foreign_duplicate',
+            AsyncMock(return_value=MergeResult(uuid='u', wrong_graph='s', home_graph='t')),
+        )
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[]]),
@@ -1279,8 +1310,20 @@ class TestRunPostVerify:
         )
         manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
 
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', AsyncMock())
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+        # return_value is a real, zero-loss MoveResult/MergeResult (not a
+        # bare AsyncMock()) -- run() now reads edges_skipped/mentions_skipped/
+        # home_edge_count_after off the result (see _move_result_entry/
+        # _merge_result_entry), and an unconfigured MagicMock's truthy
+        # attributes and non-identical `+` result would otherwise be
+        # misread as a lossy outcome, spuriously flipping 'blocked' to True.
+        monkeypatch.setattr(
+            _mod, 'move_entity_across_graphs',
+            AsyncMock(return_value=MoveResult(uuid='u', source_graph='s', target_graph='t')),
+        )
+        monkeypatch.setattr(
+            _mod, 'merge_foreign_duplicate',
+            AsyncMock(return_value=MergeResult(uuid='u', wrong_graph='s', home_graph='t')),
+        )
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(ro_pages=[[_foreign_row('u-move', 'dark_factory')]]),
@@ -1309,8 +1352,20 @@ class TestRunPostVerify:
             tmp_path, [unresolved_node], {'reify': 1, 'dark_factory': 0},
         )
 
-        monkeypatch.setattr(_mod, 'move_entity_across_graphs', AsyncMock())
-        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+        # return_value is a real, zero-loss MoveResult/MergeResult (not a
+        # bare AsyncMock()) -- run() now reads edges_skipped/mentions_skipped/
+        # home_edge_count_after off the result (see _move_result_entry/
+        # _merge_result_entry), and an unconfigured MagicMock's truthy
+        # attributes and non-identical `+` result would otherwise be
+        # misread as a lossy outcome, spuriously flipping 'blocked' to True.
+        monkeypatch.setattr(
+            _mod, 'move_entity_across_graphs',
+            AsyncMock(return_value=MoveResult(uuid='u', source_graph='s', target_graph='t')),
+        )
+        monkeypatch.setattr(
+            _mod, 'merge_foreign_duplicate',
+            AsyncMock(return_value=MergeResult(uuid='u', wrong_graph='s', home_graph='t')),
+        )
 
         memory_service = _make_memory_service({
             'reify': _make_graph_mock(
