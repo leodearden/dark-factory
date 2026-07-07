@@ -7537,6 +7537,42 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return _RecoveryDecision(done=True, basis='fallback', sha=None)
         return _RecoveryDecision(done=False, basis=None, sha=None)
 
+    async def _finalise_recovery_done(
+        self, *, basis: str, sha: str, kind: str, note: str,
+    ) -> WorkflowOutcome:
+        """Shared DONE-finalisation for all already-merged guards (PRD α, MP-2).
+
+        The sole writer of :attr:`_merge_recovery_basis`.  Every already-merged
+        guard's only route to a recovery-DONE goes through this method, so a
+        recovery-DONE always carries an explicit provenance ``basis`` — either
+        ``'journal'`` (:meth:`_resolve_already_merged` found a
+        :class:`~orchestrator.landed_outbox.LandedRow`) or ``'fallback'`` (the
+        legacy :meth:`_has_prior_implementation` heuristic). Extracted and
+        generalized from the pre-PLAN guard's original DONE tail.
+
+        Returns ``WorkflowOutcome.DONE`` on success. If the persistence layer
+        rejects the write, routes to ``_mark_blocked(escalate_to_human=True)``
+        (returning its BLOCKED/ESCALATED outcome) instead of reporting a
+        phantom DONE.
+        """
+        self._merge_recovery_basis = basis
+        self._enter_phase(WorkflowState.DONE)
+        await self._reconcile_metadata_files_for_done()
+        try:
+            await self.scheduler.mark_done(
+                self.task_id, kind=kind, sha=sha, note=note,
+            )
+        except SetTaskStatusRejected as exc:
+            logger.error(
+                'Task %s: recovery-DONE mark_done rejected (basis=%s) — %s: %s',
+                self.task_id, basis, exc.error_code, exc.raw,
+            )
+            return await self._mark_blocked(
+                f'Recovery-DONE rejected: {exc.error_code} — {exc.raw}',
+                escalate_to_human=True,
+            )
+        return WorkflowOutcome.DONE
+
     async def _recover_if_already_merged(self) -> WorkflowOutcome | None:
         """Check if the task's branch is already on main and transition to DONE.
 
