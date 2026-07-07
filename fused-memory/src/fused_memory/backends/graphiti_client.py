@@ -958,15 +958,31 @@ class GraphitiBackend:
         old.uuid would silently coalesce any pre-existing dup-uuid edges
         instead of redirecting each one individually (task 2207 W6-δ).
 
+        This trades a single bulk statement per direction for one query per
+        edge (N+1 round-trips) — the deliberate cost of the ID(old) keying
+        above. Entity merges are rare and touch modest-degree nodes in
+        practice, so this is acceptable; if a hub node with hundreds of
+        edges ever makes this hot, batch via UNWIND over a
+        [{eid, new_uuid}, ...] parameter list while still keying each
+        redirect on ID(old) (task 2207 W6-δ Open-Q2, deferred).
+
+        Neither this method nor merge_entities() as a whole runs inside a
+        transaction, so a crash or query error partway through Phase 2/3
+        leaves some edges already redirected onto the survivor and others
+        still on the deprecated node. Retrying redirect_node_edges from the
+        top after such a failure is safe: each phase re-enumerates edges
+        live off the deprecated node, so already-redirected edges (now
+        anchored on the survivor) are simply not seen again.
+
         Args:
             deprecated_uuid: UUID of the entity node to be deleted.
             surviving_uuid: UUID of the entity node that will absorb the edges.
 
         Returns:
             Dict with keys: outgoing_redirected, incoming_redirected,
-            inter_node_deleted. The redirected counts are derived from the
-            number of edges actually enumerated (and thus redirected) in each
-            direction.
+            inter_node_deleted. The redirected counts are incremented only
+            after each per-edge query completes successfully, so they
+            reflect edges actually redirected rather than merely enumerated.
         """
         graph = self._graph_for(group_id)
 
@@ -996,7 +1012,7 @@ class GraphitiBackend:
             {'dep_uuid': deprecated_uuid},
         )
         out_eids = [row[0] for row in (out_enum.result_set or [])]
-        outgoing_redirected = len(out_eids)
+        outgoing_redirected = 0
         for eid in out_eids:
             new_uuid = str(uuid.uuid4())
             await graph.query(
@@ -1023,6 +1039,7 @@ class GraphitiBackend:
                     'new_uuid': new_uuid,
                 },
             )
+            outgoing_redirected += 1
 
         # Phase 3: Redirect incoming edges (source → deprecated). Enumerate
         # the redirect set by stable internal element ID(old) — NOT old.uuid,
@@ -1035,7 +1052,7 @@ class GraphitiBackend:
             {'dep_uuid': deprecated_uuid},
         )
         in_eids = [row[0] for row in (in_enum.result_set or [])]
-        incoming_redirected = len(in_eids)
+        incoming_redirected = 0
         for eid in in_eids:
             new_uuid = str(uuid.uuid4())
             await graph.query(
@@ -1062,6 +1079,7 @@ class GraphitiBackend:
                     'new_uuid': new_uuid,
                 },
             )
+            incoming_redirected += 1
 
         logger.info(
             'redirect_node_edges: dep=%s sur=%s inter_deleted=%d out=%d in=%d',
