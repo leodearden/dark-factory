@@ -138,7 +138,9 @@ def _parse_window(query_params: Mapping[str, str], default: int = 30) -> int:
 # ---------------------------------------------------------------------------
 
 _TASK_CARDS_TTL_SECONDS = 10.0
-_task_cards_cache: dict[str, tuple[float, list[dict]]] = {}
+_task_cards_cache: TTLCache[list[dict] | dict] = TTLCache(
+    ttl_seconds=lambda: _TASK_CARDS_TTL_SECONDS
+)
 
 
 def _task_cards_cache_clear() -> None:
@@ -157,21 +159,20 @@ async def _load_task_cards(
     to avoid hammering the MCP server on every dashboard poll.  An offline
     marker or MCP failure returns ``[]`` WITHOUT writing to the cache, so a
     transient blip doesn't pin empty results for the full TTL window.
+    Concurrent cold callers for the same project_root collapse onto one
+    in-flight fetch_tasks call (TTLCache single-flight).
 
     Test hook: call ``_task_cards_cache_clear()`` to reset cache state between
     test cases.
     """
-    now = time.monotonic()
-    cached = _task_cards_cache.get(project_root)
-    if cached is not None and (now - cached[0]) < _TASK_CARDS_TTL_SECONDS:
-        return list(cached[1])
 
-    fetched = await fetch_tasks(client, config, project_root)
-    if not isinstance(fetched, list):
-        # Offline or MCP failure — degrade gracefully, do NOT cache.
-        return []
-    _task_cards_cache[project_root] = (now, fetched)
-    return list(fetched)
+    async def _refresh() -> list[dict] | dict:
+        return await fetch_tasks(client, config, project_root)
+
+    result = await _task_cards_cache.get_or_refresh(
+        project_root, _refresh, cache_ok=lambda v: isinstance(v, list),
+    )
+    return list(result) if isinstance(result, list) else []
 
 
 # ---------------------------------------------------------------------------
