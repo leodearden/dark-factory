@@ -274,6 +274,98 @@ def test_skip_event_sparkline_returns_empty_when_no_history():
 
 
 # ---------------------------------------------------------------------------
+# task 2281: now-threading for pure helpers (_park_age_seconds / _compose_rows /
+# _skip_event_sparkline)
+# ---------------------------------------------------------------------------
+
+
+def test_park_age_seconds_uses_provided_now():
+    """_park_age_seconds(installed_at, now=fixed) computes elapsed seconds against fixed."""
+    from dashboard.data.scheduler import _park_age_seconds
+
+    fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+    installed_at = (fixed - timedelta(seconds=90)).isoformat()
+
+    assert _park_age_seconds(installed_at, now=fixed) == 90
+
+
+def test_park_age_seconds_future_install_clamps_to_zero_with_fixed_now():
+    """An installed_at AFTER the passed now clamps to 0 rather than going negative."""
+    from dashboard.data.scheduler import _park_age_seconds
+
+    fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+    installed_at = (fixed + timedelta(seconds=30)).isoformat()
+
+    assert _park_age_seconds(installed_at, now=fixed) == 0
+
+
+def test_park_age_seconds_no_now_brackets_real_clock():
+    """Without now, _park_age_seconds still derives elapsed seconds from the current UTC clock.
+
+    Brackets the real clock read with before/after captures (rather than patching
+    a module-level ``datetime`` symbol) because the no-now branch resolves through
+    ``resolve_now`` in ``dashboard.data.utils``.
+    """
+    from dashboard.data.scheduler import _park_age_seconds
+
+    installed_at_dt = datetime.now(UTC) - timedelta(seconds=45)
+    before = datetime.now(UTC)
+    age = _park_age_seconds(installed_at_dt.isoformat())
+    after = datetime.now(UTC)
+
+    lower = int((before - installed_at_dt).total_seconds())
+    upper = int((after - installed_at_dt).total_seconds()) + 1
+    assert lower <= age <= upper
+
+
+def test_compose_rows_park_age_uses_provided_now():
+    """_compose_rows(..., now=fixed) computes a parked task's age_seconds against fixed."""
+    from dashboard.data.scheduler import _compose_rows
+
+    fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+    installed_at = (fixed - timedelta(seconds=200)).isoformat()
+
+    active_tasks = [{
+        'id': 'proj/T-1',
+        'task_id': '1',
+        'title': 'Task One',
+        'priority': 'high',
+        'status': 'in-progress',
+        'started': 10,
+        'meta_files': ['src/a.py'],
+    }]
+    snapshot = _scheduler_snapshot(
+        parks={'1': {'modules': ['src/a.py'], 'installed_at': installed_at}},
+    )
+
+    rows = _compose_rows(active_tasks, snapshot, now=fixed)
+
+    assert rows[0]['age_seconds'] == 200
+
+
+def test_skip_event_sparkline_until_override_sets_deterministic_window_end():
+    """_skip_event_sparkline(since=since, until=fixed) derives bin count/labels from since→fixed.
+
+    Exercises the resolve_now(until) reroute path: an explicit until must yield
+    the same fixed window regardless of the real wall clock.
+    """
+    from dashboard.data.scheduler import _skip_event_sparkline
+
+    since = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    until = since + timedelta(minutes=37)  # not an exact multiple of bin_seconds
+
+    result = _skip_event_sparkline(
+        [{'event_type': 'task_skipped', 'task_id': 'T1', 'timestamp': since.isoformat()}],
+        since=since, until=until, bin_seconds=300,
+    )
+
+    # window_seconds = 37*60 = 2220; n_bins = ceil(2220/300) = 8
+    assert len(result['labels']) == 8
+    assert result['labels'][0] == since.isoformat()
+    assert result['values'][0] == 1
+
+
+# ---------------------------------------------------------------------------
 # step-7: collect_scheduler_state happy path
 # ---------------------------------------------------------------------------
 
