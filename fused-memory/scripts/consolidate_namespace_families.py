@@ -112,6 +112,29 @@ JUNK_KEYS: tuple[str, ...] = (
 # Pure core
 # ---------------------------------------------------------------------------
 
+def rewrite_point_payload_user_id(payload: dict, canonical_user_id: str) -> dict:
+    """Return a COPY of *payload* with 'user_id' set to *canonical_user_id*.
+
+    Every other payload key is preserved unchanged; the input dict is never
+    mutated (the caller may still need the original for logging/comparison).
+    """
+    rewritten = dict(payload)
+    rewritten['user_id'] = canonical_user_id
+    return rewritten
+
+
+def canonical_user_id_for(target_collection: str) -> str:
+    """Derive the canonical project id (Mem0 user_id) from a fused_<project>
+    target collection name, by stripping the collection prefix.
+
+    Mirrors ``Scope.mem0_user_id`` == ``project_id`` and
+    ``Scope.mem0_collection_name`` == ``f'{prefix}_{project_id}'`` (models/
+    scope.py); every COLLECTION_MERGES target is already in that
+    fused_<project> shape.
+    """
+    return target_collection.removeprefix('fused_')
+
+
 def build_consolidation_report(
     graph_family_items: list[dict],
     collection_items: list[dict],
