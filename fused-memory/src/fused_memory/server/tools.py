@@ -1546,6 +1546,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if not entity_uuid and not entity_name:
@@ -1607,6 +1610,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if summary is None:
@@ -1672,6 +1678,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if not new_name:
@@ -1731,6 +1740,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if not deprecated_uuid or not deprecated_uuid.strip():
@@ -1797,6 +1809,9 @@ def create_mcp_server(
             metadata: Optional key-value pairs (may contain _causation_id for recon)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if not entity_uuid or not entity_uuid.strip():
@@ -1863,6 +1878,9 @@ def create_mcp_server(
                 UUIDs, bypassing staleness detection (optional)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
@@ -1967,6 +1985,9 @@ def create_mcp_server(
             source_store: Source store to replay from (currently only "mem0")
             limit: Max memories to replay (None = all)
         """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
