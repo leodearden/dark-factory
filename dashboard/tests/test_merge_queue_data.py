@@ -2379,9 +2379,9 @@ class TestActiveQueuedMerges:
         """
         from dashboard.data.merge_queue import _ACTIVE_ONLY
 
-        assert _ACTIVE_ONLY == frozenset({
+        assert frozenset({
             'cas_retry', 'gate_retry', 'post_merge_generation_chained', 'plan_files_narrowed',
-        })
+        }) == _ACTIVE_ONLY
 
 
 # ---------------------------------------------------------------------------
