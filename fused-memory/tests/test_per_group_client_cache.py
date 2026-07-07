@@ -21,13 +21,13 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-import fused_memory.backends.graphiti_client as graphiti_client_module
-from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.llm_client import LLMClient
+
+import fused_memory.backends.graphiti_client as graphiti_client_module
+from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 
 # ---------------------------------------------------------------------------
 # step-1/2: GraphitiBackend.initialize() hoists shared sub-clients
@@ -217,6 +217,7 @@ class TestBuildCommunitiesPassesDriver:
         await backend.build_communities(group_ids=['A'])
 
         backend.client.build_communities.assert_awaited_once()
+        assert backend.client.build_communities.await_args is not None
         _, kwargs = backend.client.build_communities.await_args
         assert kwargs.get('group_ids') == ['A']
         assert kwargs.get('driver') is da
