@@ -259,6 +259,40 @@ class TestVerifyResultCodec:
 
 
 # ---------------------------------------------------------------------------
+# Task 2306 step-1: VerifyResult.contention — machine-readable flock-contention
+# payload (JSON-native dict, not a nested dataclass) that round-trips losslessly.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyResultContention:
+    """VerifyResult carries an optional `contention` dict that survives the wire codec."""
+
+    def test_contention_round_trips_via_json_codec(self):
+        vr = VerifyResult(
+            passed=False,
+            test_output="",
+            lint_output="",
+            type_output="",
+            summary="flock contention",
+            category="flock_contention",
+            contention={"host": "leo-laptop", "holder_pgid": 4242, "waiter_pgid": 4343},
+        )
+        restored = result_from_json(result_to_json(vr))
+        assert restored.contention == {"host": "leo-laptop", "holder_pgid": 4242, "waiter_pgid": 4343}
+        assert restored.category == "flock_contention"
+
+    def test_default_contention_is_none(self):
+        vr = VerifyResult(
+            passed=True,
+            test_output="",
+            lint_output="",
+            type_output="",
+            summary="all good",
+        )
+        assert vr.contention is None
+
+
+# ---------------------------------------------------------------------------
 # Golden round-trip test — wire codec (spec_to_json / result_to_json)
 # ---------------------------------------------------------------------------
 
