@@ -208,11 +208,16 @@ async def count_graph_nodes(graphiti: Any, key: str) -> int:
     """Read-only total node count (every label) for the *key* FalkorDB graph.
 
     Used as the guard for ``delete_junk_key``: GRAPH.DELETE is only safe
-    when this is exactly 0.
+    when this is exactly 0. Defensively treats a missing/empty
+    ``result_set`` (e.g. a transient backend hiccup, or a RO query against a
+    graph key absent from ``GRAPH.LIST`` -- read-only queries do not
+    auto-create) as a count of 0 rather than raising, mirroring
+    ``enumerate_graph_entity_nodes``'s ``result.result_set or []`` guard.
     """
     graph = graphiti._graph_for(key)
     result = await graph.ro_query('MATCH (n) RETURN count(n)')
-    return int(result.result_set[0][0])
+    rows = result.result_set or []
+    return int(rows[0][0]) if rows else 0
 
 
 # ---------------------------------------------------------------------------
@@ -365,9 +370,12 @@ async def run(
 
     Dry-run (``args.apply`` falsy) performs ZERO mutations: every section's
     ``disposition`` is a PREVIEW of what ``--apply`` would do, computed from
-    read-only enumeration/count/scroll alone -- ``merge_graph_family``,
-    ``merge_collection``, and the mutating half of ``delete_junk_key`` are
-    only invoked when ``args.apply`` is true.
+    read-only enumeration/count/scroll alone -- ``merge_graph_family`` and
+    ``merge_collection`` are only invoked when ``args.apply`` is true AND the
+    corresponding read was not capped (an UNRESOLVED item is never mutated,
+    not even partially); the mutating half of ``delete_junk_key`` is only
+    invoked when ``args.apply`` is true (guarded internally on
+    ``node_count == 0``).
 
     A capped enumeration/scroll (row or point count hits *limit*) is
     reported ``UNRESOLVED`` rather than ``MERGE`` for that item, mirroring
@@ -406,7 +414,12 @@ async def run(
             'point_count': len(points),
             'disposition': 'UNRESOLVED' if capped else 'MERGE',
         }
-        if args.apply:
+        # Guarded exactly like the graph-family branch above: a capped
+        # (possibly-incomplete) scroll must not mutate the target at all,
+        # not even a partial upsert -- an UNRESOLVED item must mean nothing
+        # was written, matching the "reported UNRESOLVED rather than acted
+        # on" contract (module docstring).
+        if args.apply and not capped:
             item.update(
                 await merge_collection(
                     qdrant_client, source, target, canonical_user_id, points, capped=capped,
@@ -417,7 +430,26 @@ async def run(
     # --- 3. Guarded junk-key deletion (JUNK_KEYS + emptied siblings) --------
     junk_key_items: list[dict] = []
     for key in (*JUNK_KEYS, *GRAPH_FAMILY_ALIASES.keys()):
-        node_count = await count_graph_nodes(graphiti, key)
+        try:
+            node_count = await count_graph_nodes(graphiti, key)
+        except Exception as e:
+            # A raising count must never abort the whole consolidation run --
+            # earlier keys/sections in this same --apply pass may already
+            # hold committed mutations. Report this key UNRESOLVED and move
+            # on, exactly like the delete_junk_key guard does for a raising
+            # .delete().
+            logger.warning(
+                "consolidate_namespace_families: failed to count nodes for "
+                "graph key '%s': %s -- reporting UNRESOLVED rather than "
+                "aborting the run.",
+                key, e,
+            )
+            junk_key_items.append({
+                'key': key,
+                'node_count': None,
+                'disposition': 'UNRESOLVED',
+            })
+            continue
         if args.apply:
             disposition = await delete_junk_key(graphiti, key, node_count)
         else:
