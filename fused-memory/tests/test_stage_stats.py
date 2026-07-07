@@ -8,6 +8,7 @@ via the same op→stat mapping the LLM-counter verifier used to own.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -50,6 +51,17 @@ async def _log_write(
         result_summary=result_summary,
         success=success,
     )
+
+
+def _expected(**overrides: int) -> dict[str, int]:
+    """Every canonical counter key at 0, with the given keys overridden.
+
+    Mirrors derive_stage_stats' own 0-default seeding so tests assert exact
+    per-key counts rather than just the keys a scenario happens to touch.
+    """
+    expected = dict.fromkeys(_COMPUTED_STAT_KEYS, 0)
+    expected.update(overrides)
+    return expected
 
 
 @pytest.mark.asyncio
@@ -111,6 +123,133 @@ async def test_derive_stage_stats_excludes_other_stage_agent_id(journal):
     observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
 
     assert observed['memories_added'] == 0
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_dedup_add_memory_counts_toward_neither_key(journal):
+    """A silently-deduped add_memory (empty memory_ids, no stores) is a no-op —
+    it must not inflate memories_added nor graphiti_writes_queued."""
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': []},
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_graphiti_only_enqueue_counts_queued_not_added(journal):
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_graphiti_only_enqueue_stores_written_alias(journal):
+    """The 'stores_written' key is accepted as an alias for 'stores'."""
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores_written': ['graphiti']},
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_update_edge_counts_only_when_verified_true(journal):
+    """Two update_edge ops, same stage: one verified, one not. Only the
+    verified op counts."""
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='update_edge',
+        result_summary={'verified': True, 'status': 'updated'},
+    )
+    await _log_write(
+        journal, causation_id=run_id, operation='update_edge',
+        result_summary={'verified': False, 'status': 'updated'},
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(edges_updated=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_update_edge_missing_verified_key_excluded(journal):
+    """A legacy update_edge op with no 'verified' key must not count — missing
+    means 'not verified', not 'trust the legacy entry'."""
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='update_edge',
+        result_summary={'status': 'updated'},
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_update_edge_truthy_non_true_verified_excluded(journal):
+    """Truthy-but-not-True values like the string 'true' must not count — the
+    strict `is True` identity check rejects loosely-typed values."""
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='update_edge',
+        result_summary={'verified': 'true', 'status': 'updated'},
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_excludes_failed_ops(journal):
+    """A generic-counter op (delete_memory) with success=0 must not count."""
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='delete_memory',
+        result_summary={'status': 'deleted'}, success=False,
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_parses_json_string_result_summary(journal):
+    """result_summary logged as a JSON string (rather than a dict) is parsed."""
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary=json.dumps({'memory_ids': ['m1'], 'stores': ['mem0']}),
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(memories_added=1)
 
 
 @pytest.mark.asyncio
