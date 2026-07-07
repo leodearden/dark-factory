@@ -372,6 +372,7 @@ class UsageGate:
         resets_at: datetime | None = None,
         reason: str = '',
         force: bool = False,
+        clear_near_cap: bool = True,
     ) -> None:
         """Sole writer of ``AccountState.phase`` (PRD §7.3, task W4-γ).
 
@@ -392,6 +393,12 @@ class UsageGate:
         ``resumed``/``auth_resumed`` cost events are NOT fired here — they
         stay in the async callers that carry a probe-count label.
 
+        ``clear_near_cap`` defaults to True (the phase write always implies
+        a fresh near-cap read for every caller except one): ``release_probe_slot``
+        passes ``clear_near_cap=False`` because it fires on an *exception*
+        path unrelated to cap status, and must leave a stale ``near_cap``
+        warning exactly as ``confirm_account_ok``/``detect_cap_hit`` left it.
+
         Raises :class:`IllegalTransitionError` — without mutating any state
         — if ``new_phase`` is not a legal edge from ``acct.phase`` per
         ``_LEGAL_TRANSITIONS``, unless ``force=True`` (reserved for
@@ -409,7 +416,8 @@ class UsageGate:
 
         old_phase = acct.phase
         acct.phase = new_phase
-        acct.near_cap = False
+        if clear_near_cap:
+            acct.near_cap = False
 
         # --- Recovery bookkeeping for the edge just taken -----------------
         if (
@@ -503,9 +511,9 @@ class UsageGate:
                     if acct.probing:
                         # First task claims the probe slot — others block
                         # until confirm_account_ok() or _handle_cap_detected().
-                        acct.probing = False
-                        acct.probe_in_flight = True
-                        self._open.clear()
+                        # _transition owns: the phase write, probe_count
+                        # reset, and the centralized _open recompute.
+                        self._transition(acct, AccountPhase.PROBE_IN_FLIGHT)
                         logger.info(
                             f'Account {acct.name}: probe slot claimed — '
                             f'single task testing',
@@ -535,7 +543,17 @@ class UsageGate:
             if refreshed:
                 continue  # re-check accounts with updated flags
 
-            # Still all capped after fresh check — wait on global gate
+            # Still all capped after fresh check — wait on global gate.
+            # NOTE: this clear() is NOT redundant with _transition's centralized
+            # recompute, despite _transition being the sole writer of every
+            # PRODUCTION phase change. Out-of-scope sibling test suites (and any
+            # other caller of the retained legacy capped/probing/probe_in_flight/
+            # auth_failed shims — see AccountState) mutate `phase` directly
+            # through those property setters, bypassing _transition and its
+            # _open recompute entirely. This clear() is derived independently:
+            # the for-loop above just confirmed every account is non-AVAILABLE
+            # and non-PROBING, so clearing here is always correct regardless of
+            # how _open drifted.
             logger.info('All accounts capped — waiting for any to reopen')
             self._open.clear()
             await self._open.wait()
@@ -1364,11 +1382,11 @@ class UsageGate:
         # A successful invocation clears any stale near_cap flag; it will be
         # re-set on the next near-cap warning if still applicable.
         acct.near_cap = False
-        if acct.probe_in_flight:
-            acct.probe_in_flight = False
-            acct.probe_count = 0
+        if acct.phase == AccountPhase.PROBE_IN_FLIGHT:
             logger.info(f'Account {acct.name}: probe confirmed OK — opening to all tasks')
-            self._open.set()
+            # _transition owns: the phase write, probe_count reset, and the
+            # centralized _open recompute.
+            self._transition(acct, AccountPhase.AVAILABLE)
 
     def release_probe_slot(self, oauth_token: str | None) -> None:
         """Release a probe slot claimed by before_invoke() when invoke raises an exception.
@@ -1395,14 +1413,16 @@ class UsageGate:
         acct = self._find_account_by_token(oauth_token)
         if acct is None:
             return
-        if acct.probe_in_flight:
-            acct.probe_in_flight = False
-            acct.probe_count = 0
+        if acct.phase == AccountPhase.PROBE_IN_FLIGHT:
             logger.info(
                 f'Account {acct.name}: probe slot released after exception — '
                 f'opening to all tasks',
             )
-            self._open.set()
+            # _transition owns: the phase write, probe_count reset, and the
+            # centralized _open recompute. clear_near_cap=False preserves
+            # this method's documented "does NOT touch near_cap" contract —
+            # this is an exception path, orthogonal to cap status.
+            self._transition(acct, AccountPhase.AVAILABLE, clear_near_cap=False)
 
     @property
     def project_id(self) -> str | None:
