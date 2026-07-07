@@ -682,8 +682,9 @@ class GraphitiBackend:
     async def build_communities(self, group_ids: list[str] | None = None) -> None:
         """Build community summaries."""
         client = self._require_client()
+        driver = self._driver_for(group_ids[0]) if group_ids else None
         await asyncio.wait_for(
-            client.build_communities(group_ids=group_ids),
+            client.build_communities(group_ids=group_ids, driver=driver),
             timeout=self._write_timeout,
         )
 
