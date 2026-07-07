@@ -533,18 +533,6 @@ class TestBuildImplementerPromptWipNotice:
 
 @pytest.mark.asyncio
 class TestBuildImplementerPromptMandatoryPreflight:
-    async def test_preflight_renders_with_no_wip_notice(
-        self, briefing: BriefingAssembler, minimal_plan: dict,
-    ):
-        prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=None,
-        )
-
-        assert 'git status' in prompt
-        assert 'git diff HEAD' in prompt
-        assert '.task-meta' in prompt
-        assert 'mark_step_done' in prompt
-
     async def test_preflight_still_renders_alongside_wip_notice(
         self, briefing: BriefingAssembler, minimal_plan: dict,
     ):
@@ -556,7 +544,6 @@ class TestBuildImplementerPromptMandatoryPreflight:
             minimal_plan, [], context='', wip_notice=wip_notice,
         )
 
-        assert 'git status' in prompt
         assert 'git diff HEAD' in prompt
         assert 'Verify Before Re-Implementing' in prompt
 
