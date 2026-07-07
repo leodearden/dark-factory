@@ -79,3 +79,53 @@ def _make_point(
     point.payload = payload if payload is not None else {}
     point.vector = vector if vector is not None else [0.1, 0.2, 0.3]
     return point
+
+
+# ===========================================================================
+# Tests: reviewable-config constants
+# ===========================================================================
+
+class TestGraphFamilyAliases:
+    """Tests for the module constant GRAPH_FAMILY_ALIASES."""
+
+    def test_maps_siblings_to_underscore_canonical(self):
+        """Hyphenated/no-separator siblings map to the underscore-canonical key."""
+        assert _mod.GRAPH_FAMILY_ALIASES['know-live'] == 'know_live'
+        assert _mod.GRAPH_FAMILY_ALIASES['knowlive'] == 'know_live'
+        assert _mod.GRAPH_FAMILY_ALIASES['pump-web-ui'] == 'pump_web_ui'
+
+    def test_excludes_solar_family(self):
+        """PRD Open Q1 default is keep-separate: no solar-family key/value
+        appears anywhere in the alias map (neither as a sibling key nor as a
+        canonical target)."""
+        solar_names = {'my_solar_challenge', 'solar_challenge_platform'}
+        assert not (solar_names & set(_mod.GRAPH_FAMILY_ALIASES.keys()))
+        assert not (solar_names & set(_mod.GRAPH_FAMILY_ALIASES.values()))
+
+
+class TestCollectionMerges:
+    """Tests for the module constant COLLECTION_MERGES."""
+
+    def test_maps_legacy_sources_to_fused_project_targets(self):
+        """Representative legacy/divergent sources map to their fused_<project> target."""
+        assert _mod.COLLECTION_MERGES['fused_dark-factory'] == 'fused_dark_factory'
+        assert _mod.COLLECTION_MERGES['reify_reify'] == 'fused_reify'
+        assert _mod.COLLECTION_MERGES['autopilot_video_autopilot_video'] == 'fused_autopilot_video'
+
+    def test_does_not_auto_merge_ambiguous_collections(self):
+        """PRD Open Q2 defers reify_ (empty project id) and fused_fused_memory
+        to ι human review -- neither is a key in COLLECTION_MERGES."""
+        assert 'reify_' not in _mod.COLLECTION_MERGES
+        assert 'fused_fused_memory' not in _mod.COLLECTION_MERGES
+
+
+class TestJunkKeys:
+    """Tests for the module constant JUNK_KEYS."""
+
+    def test_includes_the_six_explicit_keys(self):
+        """JUNK_KEYS includes every explicitly-named junk graph key."""
+        expected = {
+            'dark-factory', '-home-leo-src-dark-factory',
+            'my-project', 'test-project', 'default', '1098',
+        }
+        assert expected <= set(_mod.JUNK_KEYS)
