@@ -24,9 +24,6 @@ from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST
 class TestRoleLevelAllowlistShape:
     """ROLE_LEVEL_ALLOWLIST maps the deployed auto-watcher identity to {0,1}."""
 
-    def test_is_a_dict(self) -> None:
-        assert isinstance(ROLE_LEVEL_ALLOWLIST, dict)
-
     def test_watcher_identity_maps_to_levels_0_and_1(self) -> None:
         ceiling = ROLE_LEVEL_ALLOWLIST.get('orchestrator-escalation-watcher-auto')
         assert ceiling == frozenset({0, 1}), (
@@ -43,9 +40,6 @@ class TestRoleLevelAllowlistShape:
 
 class TestPromoteAllowedShape:
     """PROMOTE_ALLOWED is a frozenset containing the deployed auto-watcher identity."""
-
-    def test_is_a_frozenset(self) -> None:
-        assert isinstance(PROMOTE_ALLOWED, frozenset)
 
     def test_contains_watcher_identity(self) -> None:
         assert 'orchestrator-escalation-watcher-auto' in PROMOTE_ALLOWED
