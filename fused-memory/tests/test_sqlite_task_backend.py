@@ -221,6 +221,24 @@ async def test_get_task_not_found_raises(backend, project_root):
     assert 'No tasks found' in exc.value.message
 
 
+@pytest.mark.asyncio
+async def test_get_task_surfaces_claimant_columns_default_none(backend, project_root):
+    """A freshly added task exposes claimant_run_id/heartbeat_at, both None."""
+    await backend.add_task(project_root=project_root, title='one')
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] is None
+    assert one['heartbeat_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_surfaces_claimant_columns_default_none(backend, project_root):
+    """get_tasks (plural) also exposes claimant_run_id/heartbeat_at, both None."""
+    await backend.add_task(project_root=project_root, title='one')
+    listing = await backend.get_tasks(project_root=project_root)
+    assert listing['tasks'][0]['claimant_run_id'] is None
+    assert listing['tasks'][0]['heartbeat_at'] is None
+
+
 # ── set_task_status ────────────────────────────────────────────────
 
 
@@ -242,6 +260,48 @@ async def test_set_task_status_returns_per_id_payload(backend, project_root):
 async def test_set_task_status_unknown_id_raises(backend, project_root):
     with pytest.raises(TaskmasterError):
         await backend.set_task_status('99', 'done', project_root=project_root)
+
+
+# ── set_task_claimant ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_persists_without_changing_status(backend, project_root):
+    """set_task_claimant stamps both columns and leaves status untouched."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status('1', 'in-progress', project_root=project_root)
+
+    await backend.set_task_claimant(
+        '1', project_root=project_root,
+        claimant_run_id='run-abc',
+        heartbeat_at='2026-07-07T00:00:00+00:00',
+    )
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] == 'run-abc'
+    assert one['heartbeat_at'] == '2026-07-07T00:00:00+00:00'
+    assert one['status'] == 'in-progress'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_none_clears_both_columns(backend, project_root):
+    """A follow-up set_task_claimant(..., None, None) clears both to NULL."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_claimant(
+        '1', project_root=project_root,
+        claimant_run_id='run-abc',
+        heartbeat_at='2026-07-07T00:00:00+00:00',
+    )
+
+    await backend.set_task_claimant(
+        '1', project_root=project_root,
+        claimant_run_id=None,
+        heartbeat_at=None,
+    )
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['claimant_run_id'] is None
+    assert one['heartbeat_at'] is None
 
 
 # ── update_task ─────────────────────────────────────────────────────
