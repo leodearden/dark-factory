@@ -484,3 +484,96 @@ class TestRecoverBeforeExecute:
         assert outcome is None
         assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Tests: TaskWorkflow._recover_before_merge (Guard 3, extracted merge-phase)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRecoverBeforeMerge:
+    """Unit tests for the extracted merge-phase ghost-loop guard (PRD α).
+
+    Mirrors ``TestRecoverBeforeExecute`` but for the guard that runs inside
+    ``_run_merge_phase`` immediately after computing ``branch_head``/``main_sha``
+    (which the caller passes in explicitly — this helper does no git I/O of
+    its own beyond the ``is_ancestor`` ghost-loop check).
+    """
+
+    async def test_journal_hit_returns_done_without_consulting_git_or_fallback(
+        self, tmp_path: Path,
+    ):
+        """A journal hit is authoritative — short-circuits before is_ancestor
+        and the legacy heuristic are ever consulted [row 1]."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        _bind_landed_row(tmp_path, task_id=f.wf.task_id, advanced_sha='advancedsha123')
+        f.is_ancestor.side_effect = AssertionError(
+            'is_ancestor must not be called on a journal hit',
+        )
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError(
+                '_has_prior_implementation must not be called on a journal hit',
+            ),
+        )
+
+        outcome = await f.wf._recover_before_merge('branchhead123', 'mainsha123')
+
+        assert outcome == WorkflowOutcome.DONE
+        assert f.wf._merge_recovery_basis == 'journal'
+        f.mark_done.assert_awaited_once_with(
+            f.wf.task_id, kind='merged', sha='advancedsha123',
+            note='landed-outbox journal hit (pre-MERGE recovery)',
+        )
+
+    async def test_journal_miss_ancestor_with_prior_work_falls_back_to_found_on_main(
+        self, tmp_path: Path,
+    ):
+        """Journal miss + branch is ancestor of main + prior implementation
+        work → fallback DONE (provenance sha is main_sha, not branch_head)."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=True)
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            return_value=_PriorImplStatus(has_work=True, entries=[], base_commit=None),
+        )
+
+        outcome = await f.wf._recover_before_merge('branchhead123', 'mainsha123')
+
+        assert outcome == WorkflowOutcome.DONE
+        assert f.wf._merge_recovery_basis == 'fallback'
+        f.mark_done.assert_awaited_once_with(
+            f.wf.task_id, kind='found_on_main', sha='mainsha123',
+            note='branch already on main at merge phase (pre-MERGE recovery)',
+        )
+        f.is_ancestor.assert_awaited_once_with('branchhead123', 'mainsha123')
+
+    async def test_journal_miss_ancestor_with_no_prior_work_returns_none(
+        self, tmp_path: Path,
+    ):
+        """Journal miss + ancestor (spurious merge signal) + no prior work →
+        None, proceed with the real merge (task 2911-style guard)."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=True)
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            return_value=_PriorImplStatus(has_work=False, entries=[], base_commit=None),
+        )
+
+        outcome = await f.wf._recover_before_merge('branchhead123', 'mainsha123')
+
+        assert outcome is None
+        assert f.wf._merge_recovery_basis is None
+        f.mark_done.assert_not_awaited()
+
+    async def test_journal_miss_not_ancestor_returns_none(self, tmp_path: Path):
+        """Journal miss + branch NOT an ancestor of main → None, fallback
+        heuristic never consulted (a real merge is still needed)."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=False)
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            side_effect=AssertionError(
+                '_has_prior_implementation must not be called when not an ancestor',
+            ),
+        )
+
+        outcome = await f.wf._recover_before_merge('branchhead123', 'mainsha123')
+
+        assert outcome is None
+        assert f.wf._merge_recovery_basis is None
+        f.mark_done.assert_not_awaited()
