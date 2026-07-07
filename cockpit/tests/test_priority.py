@@ -9,14 +9,14 @@ every later implementation step.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from hypothesis import given, strategies as st
-
+from hypothesis import given
+from hypothesis import strategies as st
 
 _STATES = ['open', 'answered', 'dropped']
 
-_TIMESTAMPS = st.datetimes(timezones=st.just(timezone.utc))
+_TIMESTAMPS = st.datetimes(timezones=st.just(UTC))
 _SHORT_TEXT = st.text(max_size=20)
 _BOOSTS = st.integers(min_value=-10_000, max_value=10_000)
 
@@ -29,11 +29,11 @@ class TestScorePureFloat:
             severity='high',
             category='bug',
             project='dark_factory',
-            filed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            filed_at=datetime(2026, 7, 1, tzinfo=UTC),
             manual_boost=0,
             state='open',
         )
-        now = datetime(2026, 7, 7, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 7, tzinfo=UTC)
 
         result = score(item, Priorities.default(), now)
 
