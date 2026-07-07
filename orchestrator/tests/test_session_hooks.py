@@ -10,6 +10,9 @@ skills/spawn/hooks/*.sh entrypoints end-to-end.
 
 from __future__ import annotations
 
+import io
+import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -261,3 +264,125 @@ def test_run_notification_prefers_persisted_record_title(tmp_path: Path) -> None
     osc = sh.run_notification(hook_input, env, root=tmp_path)
 
     assert osc == '\033]0;⏸ AWAITING unblock:df#2085 routing-mechanism\007'
+
+
+# ---------------------------------------------------------------------------
+# Step-9: main(argv) CLI dispatch + fail-soft
+# ---------------------------------------------------------------------------
+
+
+def _stdin_json(monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]) -> None:
+    monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(payload)))
+
+
+def test_main_session_start_creates_running_record_and_returns_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    hook_input = {'session_id': 'sess-main-1', 'cwd': '/home/leo/src/dark-factory'}
+    _stdin_json(monkeypatch, hook_input)
+
+    rc = sh.main(['session-start'])
+
+    assert rc == 0
+    slug = sh.hook_session_slug(hook_input, env={})
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_main_notification_writes_osc_to_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    hook_input = {'session_id': 'sess-main-2', 'cwd': '/home/leo/src/dark-factory'}
+    _stdin_json(monkeypatch, hook_input)
+
+    rc = sh.main(['notification'])
+
+    assert rc == 0
+    expected = sh.osc_retitle_sequence(sr.Status.AWAITING_INPUT, 'session:dark-factory')
+    assert capsys.readouterr().out.strip() == expected
+    slug = sh.hook_session_slug(hook_input, env={})
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+
+
+def test_main_stop_writes_osc_to_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    hook_input = {'session_id': 'sess-main-3', 'cwd': '/home/leo/src/dark-factory'}
+    _stdin_json(monkeypatch, hook_input)
+
+    rc = sh.main(['stop'])
+
+    assert rc == 0
+    expected = sh.osc_retitle_sequence(sr.Status.IDLE, 'session:dark-factory')
+    assert capsys.readouterr().out.strip() == expected
+    slug = sh.hook_session_slug(hook_input, env={})
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+
+
+def test_main_session_start_fail_soft_on_empty_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setattr('sys.stdin', io.StringIO(''))
+
+    assert sh.main(['session-start']) == 0
+
+
+def test_main_session_start_fail_soft_on_malformed_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setattr('sys.stdin', io.StringIO('not-json{{{'))
+
+    assert sh.main(['session-start']) == 0
+
+
+def test_main_fail_soft_when_registry_write_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _stdin_json(monkeypatch, {'session_id': 'sess-main-4', 'cwd': '/home/leo/src/dark-factory'})
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(sr, 'write_record', _boom)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sh.main(['session-start'])
+
+    assert rc == 0
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_main_session_start_notification_stop_share_one_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Identity stability: the SAME session_id across all three events must
+    # resolve to exactly ONE record directory, ending at status='idle'.
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    hook_input = {'session_id': 'sess-main-5', 'cwd': '/home/leo/src/dark-factory'}
+
+    _stdin_json(monkeypatch, hook_input)
+    assert sh.main(['session-start']) == 0
+    _stdin_json(monkeypatch, hook_input)
+    assert sh.main(['notification']) == 0
+    _stdin_json(monkeypatch, hook_input)
+    assert sh.main(['stop']) == 0
+
+    session_dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    assert len(session_dirs) == 1
+    slug = sh.hook_session_slug(hook_input, env={})
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
