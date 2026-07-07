@@ -7478,7 +7478,21 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         rejects the write, routes to ``_mark_blocked(escalate_to_human=True)``
         (returning its BLOCKED/ESCALATED outcome) instead of reporting a
         phantom DONE.
+
+        Structural MP-2 guard: raises ``AssertionError`` if *basis* is not
+        ``'journal'``/``'fallback'`` or *sha* is falsy — BEFORE any status
+        mutation (no marker write, no phase transition, no scheduler call).
+        This is the executable form of "no recovery-DONE without a
+        provenance basis": a future guard that calls this chokepoint without
+        a valid basis fails loudly instead of silently producing a
+        phantom-done.
         """
+        if basis not in ('journal', 'fallback') or not sha:
+            raise AssertionError(
+                f'_finalise_recovery_done requires a valid provenance basis '
+                f"(basis='journal'|'fallback' and a truthy sha) — got "
+                f'basis={basis!r}, sha={sha!r} (task {self.task_id})'
+            )
         self._merge_recovery_basis = basis
         self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done()
