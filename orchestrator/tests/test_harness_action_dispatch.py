@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from escalation.action_effects import ACTION_EFFECTS, ANY, WORKFLOW_NONE, TaskEffect
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -972,3 +973,94 @@ class TestTeardownStampClear:
         assert task_id not in harness._action_teardown_tasks, (
             '_action_teardown_tasks must not contain task_id after abandon completes'
         )
+
+
+# ---------------------------------------------------------------------------
+# ω3 (task 2196) — dispatch must be SOURCED from the shared Table B
+# (escalation.action_effects.ACTION_EFFECTS / effect_for), the same authority
+# escalation.server.resolve_issue already consumes (server.py:671), instead
+# of the harness's own independent _ACTION_TARGETS copy + action-string
+# routing. These tests patch the table itself (rather than asserting today's
+# values, which would be green either way) so they can only pass once the
+# harness genuinely reads its target/routing through effect_for().
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestActionEffectsTableCoupling:
+    """ω3: dispatch must read its target_status/routing from Table B."""
+
+    @pytest.mark.parametrize('action', ['restart', 'park', 'abandon'])
+    async def test_teardown_target_status_sourced_from_table(
+        self, harness: Harness, action: str,
+    ):
+        """Patching a teardown action's table target_status must change what
+        the harness writes — proving the write is sourced from the table, not
+        from a hardcoded local copy (_ACTION_TARGETS).
+        """
+        orig = ACTION_EFFECTS[(action, ANY, ANY)]
+        task_id = f'task-table-{action}'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action=action,
+            # park stays 'pending' (version-a: kept open at L2); abandon → dismissed; restart → resolved
+            status='pending' if action == 'park' else ('dismissed' if action == 'abandon' else 'resolved'),
+            resolved_by='interactive',
+            level=1,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        with patch.dict(
+            ACTION_EFFECTS,
+            {(action, ANY, ANY): TaskEffect('__SENTINEL_TARGET__', orig.workflow_disposition)},
+        ):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            task_id, '__SENTINEL_TARGET__',
+        )
+
+    async def test_routing_follows_workflow_disposition(self, harness: Harness):
+        """Routing must follow the table's workflow_disposition, not the action
+        string — patching resume's disposition to WORKFLOW_NONE must suppress
+        the flip even though the resolved action string is still 'resume'.
+        """
+        task_id = 'task-table-resume-none'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action=None,
+            status='resolved',
+            resolved_by='escalation-watcher-auto',
+            level=1,
+        )
+        # Not in _escalation_events → orphan (no active workflow)
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        with patch.dict(
+            ACTION_EFFECTS, {('resume', ANY, ANY): TaskEffect('pending', WORKFLOW_NONE)},
+        ):
+            harness._on_escalation_resolved(esc)
+            await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+
+    async def test_unrecognised_action_effect_none_no_write(self, harness: Harness):
+        """effect_for returns None for an action outside the five recognised
+        actions → warning, no status write. Parity guard: green both before
+        and after the refactor (documents the None path stays behaviour-safe).
+        """
+        task_id = 'task-table-bogus'
+        esc = _make_esc(
+            task_id=task_id,
+            resolution_action='bogus',
+            status='resolved',
+            resolved_by='interactive',
+            level=1,
+        )
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
