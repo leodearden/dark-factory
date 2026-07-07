@@ -19,13 +19,14 @@ from pathlib import Path
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig
+from orchestrator.config import TASK_META_DIRNAME, GitConfig
 from orchestrator.git_ops import (
+    PROTECTED_PREFIXES,
     GitOps,
     WorktreeInfo,
     _run,
 )
-from orchestrator.lane_lifecycle import LaneState
+from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME, LaneState
 
 # ---------------------------------------------------------------------------
 # Repo fixture (mirrors test_warm_lane_abort_teardown.py)
@@ -368,4 +369,47 @@ class TestReapInteractiveWorktreesStampRelocation:
         record = next(r for r in reaped if r.path.resolve() == info.path.resolve())
         assert record.reason == 'ttl_idle', (
             f"expected reason == 'ttl_idle', got {record.reason!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PROTECTED_PREFIXES registration: .lane-state / .task-meta bands (W11 gamma)
+# ---------------------------------------------------------------------------
+
+
+class TestLaneStateAndTaskMetaProtectedBands:
+    """.lane-state and .task-meta must be registered as PROTECTED bands
+    (PRD resolved design decision 1: defense-in-depth) so a destructive
+    worktree_base cleanup sweep can never remove either durable-record store
+    as an unrecognized foreign band."""
+
+    @pytest.mark.parametrize('dirname', [LANE_STATE_DIRNAME, TASK_META_DIRNAME])
+    def test_dirname_is_a_protected_prefixes_key_with_non_empty_owner(
+        self, dirname: str,
+    ) -> None:
+        assert dirname in PROTECTED_PREFIXES, (
+            f'expected {dirname!r} to be a key in PROTECTED_PREFIXES; '
+            f'got keys={list(PROTECTED_PREFIXES)!r}'
+        )
+        owner = PROTECTED_PREFIXES[dirname]
+        assert isinstance(owner, str) and owner, (
+            f'expected a non-empty owner tag for {dirname!r}; got {owner!r}'
+        )
+
+    @pytest.mark.parametrize('dirname', [LANE_STATE_DIRNAME, TASK_META_DIRNAME])
+    def test_refuse_foreign_band_protects_worktree_base_child(
+        self, tmp_path: Path, dirname: str,
+    ) -> None:
+        project_root = tmp_path / 'project'
+        project_root.mkdir()
+        git_ops = GitOps(_warm_config(), project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        path = git_ops.worktree_base / dirname
+        path.mkdir()
+
+        result = git_ops._refuse_foreign_band(path, frozenset(), 'test-context')
+
+        assert result is True, (
+            f'expected {dirname!r} to be treated as a protected band (refused, '
+            f'True) when owned=frozenset(); got {result!r}'
         )
