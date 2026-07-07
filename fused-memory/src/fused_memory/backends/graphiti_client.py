@@ -266,6 +266,13 @@ class GraphitiBackend:
         The llm_client/embedder/cross_encoder sub-clients are shared (hoisted
         in ``initialize()``) across every per-group client and the base
         ``self.client``.
+
+        ``_group_clients`` is unbounded and never evicted, mirroring
+        ``_cloned_drivers``/``_identity_locks`` above — safe because
+        *group_id* is always a project_id, so cardinality is bounded by the
+        (small, fixed) number of projects, not by request volume. If
+        *group_id* ever becomes an ephemeral/per-session value, this cache
+        would need a size bound or LRU eviction.
         """
         cached = self._group_clients.get(group_id)
         if cached is not None:
@@ -402,7 +409,23 @@ class GraphitiBackend:
 
         self._llm_client = llm_client
         self._embedder = embedder_client
-        self._cross_encoder = OpenAIRerankerClient()
+
+        # --- Cross-encoder (reranker) ---
+        # Shared across the base client and every per-group client (see
+        # _client_for). Mirror the llm_client/embedder_client guard so a
+        # configured api_key/base_url (e.g. a proxy endpoint) is honored
+        # instead of silently falling back to env-based defaults — the
+        # reranker always talks to the OpenAI API regardless of
+        # cfg.llm.provider, so it keys off cfg.llm.providers.openai directly.
+        reranker_config: GraphitiLLMConfig | None = None
+        if cfg.llm.providers.openai:
+            reranker_api_key = cfg.llm.providers.openai.api_key
+            if reranker_api_key:
+                reranker_config = GraphitiLLMConfig(
+                    api_key=reranker_api_key,
+                    base_url=cfg.llm.providers.openai.api_url,
+                )
+        self._cross_encoder = OpenAIRerankerClient(config=reranker_config)
 
         self.client = Graphiti(
             graph_driver=self._driver,
