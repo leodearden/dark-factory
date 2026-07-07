@@ -159,3 +159,133 @@ class TestPermitLedgerRelease:
         _assert_identity()
         assert ledger.slot_available == depth
         assert ledger.live == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED / step-8 GREEN: permit storage slot on RealMergeItem / DecidedItem
+# / InflightEntry
+# ---------------------------------------------------------------------------
+
+
+class TestPermitStorageSlot:
+    """RealMergeItem, DecidedItem, and InflightEntry each accept an optional
+    ``permit`` keyword (a :class:`SpecPermit` or ``None``) (task 2159 step-7).
+
+    RED until step-8 GREEN adds ``permit: SpecPermit | None = None`` as the
+    trailing field of all three dataclasses. eta populates/reads this slot;
+    zeta only establishes the storage contract, exercised here via minimal,
+    git-free construction (mirrors test_merge_types_invariants.py's
+    _real_kwargs/_decided_kwargs convention).
+    """
+
+    def test_real_merge_item_carries_a_permit(self) -> None:
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_types import RealMergeItem, SpecPermit
+
+        p = SpecPermit()
+        item = RealMergeItem(
+            request=MagicMock(),
+            merge_result=MergeResult(success=True, merge_commit='deadbeef'),
+            merge_wt=Path('/fake/merge-wt'),
+            base_sha='aabbccdd',
+            speculative=False,
+            permit=p,
+        )
+
+        assert item.permit is p
+
+    def test_real_merge_item_permit_defaults_to_none(self) -> None:
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_types import RealMergeItem
+
+        item = RealMergeItem(
+            request=MagicMock(),
+            merge_result=MergeResult(success=True, merge_commit='deadbeef'),
+            merge_wt=Path('/fake/merge-wt'),
+            base_sha='aabbccdd',
+            speculative=False,
+        )
+
+        assert item.permit is None
+
+    def test_decided_item_carries_a_permit(self) -> None:
+        from unittest.mock import MagicMock
+
+        from orchestrator.merge_types import DecidedItem, MergeOutcome, SpecPermit
+
+        p = SpecPermit()
+        item = DecidedItem(
+            request=MagicMock(),
+            base_sha='aabbccdd',
+            speculative=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test'),
+            permit=p,
+        )
+
+        assert item.permit is p
+
+    def test_decided_item_permit_defaults_to_none(self) -> None:
+        from unittest.mock import MagicMock
+
+        from orchestrator.merge_types import DecidedItem, MergeOutcome
+
+        item = DecidedItem(
+            request=MagicMock(),
+            base_sha='aabbccdd',
+            speculative=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test'),
+        )
+
+        assert item.permit is None
+
+    def test_inflight_entry_carries_a_permit(self) -> None:
+        from unittest.mock import MagicMock
+
+        from orchestrator.merge_types import DecidedItem, InflightEntry, MergeOutcome, SpecPermit
+
+        p = SpecPermit()
+        decided_item = DecidedItem(
+            request=MagicMock(),
+            base_sha='aabbccdd',
+            speculative=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test'),
+        )
+        entry = InflightEntry(
+            item=decided_item,
+            lease=None,
+            verify_task=None,
+            merge_wt=None,
+            was_speculative=False,
+            phase='passthrough',
+            permit=p,
+        )
+
+        assert entry.permit is p
+
+    def test_inflight_entry_permit_defaults_to_none(self) -> None:
+        from unittest.mock import MagicMock
+
+        from orchestrator.merge_types import DecidedItem, InflightEntry, MergeOutcome
+
+        decided_item = DecidedItem(
+            request=MagicMock(),
+            base_sha='aabbccdd',
+            speculative=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test'),
+        )
+        entry = InflightEntry(
+            item=decided_item,
+            lease=None,
+            verify_task=None,
+            merge_wt=None,
+            was_speculative=False,
+            phase='passthrough',
+        )
+
+        assert entry.permit is None
