@@ -40,6 +40,17 @@ was inconclusive (unknown run window or a transient query failure) — see
 :func:`extract_snapshot_written`.
 """
 
+TASK_COUNT_SNAPSHOT_MISS_THRESHOLD: int = 2
+"""Number of consecutive full-cycle misses before the harness escalates."""
+
+ESCALATION_CATEGORY: str = 'recon_stale_task_count_snapshot'
+"""Escalation category for a sustained task_count_snapshot cadence gap.
+
+Registered in ``harness.py``'s ``_RECON_DEDUP_CONFIG.infra_dedupe_categories``
+and the 'info'-severity category tuple in ``_escalate`` — this is low-urgency
+process/tooling hardening, not an operator-blocking issue.
+"""
+
 
 def extract_snapshot_written(stage_report: object) -> bool | None:
     """Read the freshness stat off a Stage-2 report.
@@ -82,3 +93,52 @@ def compute_snapshot_miss_streak(recent_flags: list[bool | None]) -> int:
         else:
             break
     return streak
+
+
+def evaluate_snapshot_cadence(
+    current_written: bool | None,
+    prior_flags: list[bool | None],
+    *,
+    blocked: bool,
+    threshold: int = TASK_COUNT_SNAPSHOT_MISS_THRESHOLD,
+) -> dict:
+    """Decide whether the current cycle's miss should escalate.
+
+    Fail-safe / fail-open rules, checked before the streak is ever computed:
+
+    - *blocked* (project is in ``SNAPSHOT_WRITE_BLOCKED_PROJECTS``): the
+      absence of a snapshot is correct-by-design there, so never escalate.
+    - *current_written* is not ``False`` (i.e. ``True`` — a fresh snapshot
+      was confirmed this cycle — or ``None`` — the check was inconclusive):
+      never escalate. Only a CONFIRMED current miss can trigger escalation.
+
+    Otherwise the streak is ``compute_snapshot_miss_streak(prior_flags) + 1``
+    (the "+1" is the current confirmed miss), and ``escalate`` is
+    ``streak >= threshold``.
+
+    Returns:
+        ``{'streak': int, 'escalate': bool}``.
+    """
+    if blocked or current_written is not False:
+        return {'streak': 0, 'escalate': False}
+    streak = compute_snapshot_miss_streak(prior_flags) + 1
+    return {'streak': streak, 'escalate': streak >= threshold}
+
+
+def build_stale_snapshot_finding(project_id: str) -> dict:
+    """Build the stable per-project finding dict for a stale-snapshot escalation.
+
+    Shape mirrors ``harness._DEAD_OWNER_STORM_FINDING``: only ``category``,
+    ``affected_ids``, and ``description`` are set, and none of them vary
+    across calls for the same *project_id* — this stable identity is what lets
+    ``_escalate``'s content-fingerprint dedup fold every repeat cycle's call
+    into a single pending escalation instead of filing one per cycle.
+    """
+    return {
+        'category': ESCALATION_CATEGORY,
+        'affected_ids': [f'{TASK_COUNT_SNAPSHOT_KIND}:{project_id}'],
+        'description': (
+            f'task_count_snapshot has not been written for project {project_id!r} '
+            'within the run window for multiple consecutive full reconciliation cycles'
+        ),
+    }
