@@ -664,15 +664,31 @@ def create_mcp_server(
 
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
     # Derived from the authoritative sets so this validator stays in lockstep
-    # automatically when a new status is added to either partition:
-    #   ACTIVE_TASK_STATUSES  — non-terminal in-flight statuses
-    #                           (fused_memory.reconciliation.task_filter)
-    #   TERMINAL_STATUSES     — terminal statuses requiring reopen_reason to exit
-    #                           (fused_memory.middleware.task_interceptor)
+    # automatically when a new status is added to either partition. Both names
+    # are re-exported from shared.task_statuses (PRD task-status-authority
+    # C1/C2, finding 6.4) — the single source of truth:
+    #   ACTIVE_TASK_STATUSES  — shared.ACTIVE: non-terminal in-flight statuses
+    #                           (re-exported by fused_memory.reconciliation.task_filter)
+    #   TERMINAL_STATUSES     — shared.TERMINAL: terminal statuses requiring
+    #                           reopen_reason to exit (re-exported by
+    #                           fused_memory.middleware.task_interceptor)
     # Do NOT hardcode this as a literal; use the union so a future status added
-    # to ACTIVE_TASK_STATUSES is automatically accepted here without a separate
-    # edit to this file.
-    _VALID_TASK_STATUSES: frozenset[str] = ACTIVE_TASK_STATUSES | TERMINAL_STATUSES
+    # to shared.task_statuses.TaskStatus is automatically accepted here without
+    # a separate edit to this file.
+    #
+    # Cross-package ordering note (task 2171 / rho1a): this union now includes
+    # 'infra-hold', so add_task/set_task_status accept it from ANY caller as
+    # of this change — not just a future orchestrator writer. orchestrator/
+    # src/orchestrator/task_status.py's own ACTIVE_TASK_STATUSES is a separate
+    # 6-member literal (out of this task's fused-memory-only scope) and has
+    # NOT been migrated to shared.task_statuses.ACTIVE yet, so it still does
+    # not recognize 'infra-hold'. Until that orchestrator-side migration
+    # lands (tracked as follow-up omega2/omega3 work), a task externally set
+    # to 'infra-hold' is classified active here but would not be recognized
+    # as such by the orchestrator scheduler. No current writer emits
+    # 'infra-hold', so this is inert today; do not treat its acceptance here
+    # as evidence the orchestrator side is also ready.
+    _VALID_TASK_STATUSES = ACTIVE_TASK_STATUSES | TERMINAL_STATUSES
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
 
@@ -2815,7 +2831,8 @@ def create_mcp_server(
         if status not in _VALID_TASK_STATUSES:
             return {
                 'error': (
-                    f'Invalid status {status!r}. Must be one of {sorted(_VALID_TASK_STATUSES)}.'
+                    f'Invalid status {status!r}. Must be one of '
+                    f'{sorted(s.value for s in _VALID_TASK_STATUSES)}.'
                 ),
                 'error_type': 'ValidationError',
             }

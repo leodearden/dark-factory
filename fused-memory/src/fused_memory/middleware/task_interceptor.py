@@ -31,6 +31,7 @@ except ImportError:
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware.dark_factory_path_guard import (
@@ -115,17 +116,16 @@ def _resolve_backend_label(taskmaster: Any) -> str:
 
 
 # Terminal statuses the server refuses to exit without a reopen_reason.
-# Duplicated from orchestrator.task_status.TERMINAL_STATUSES — the server
-# and orchestrator are independent modules, and the set is effectively
-# ossified; duplication is cheaper than cross-package coupling.
+# Re-exported from shared.task_statuses (PRD task-status-authority C1/C2) —
+# the single source of truth, imported above as TERMINAL_STATUSES.
 #
-# 'merge-deferred' is deliberately NOT in this set per PRD
-# orchestrator-atomic-train-merge §9.2 (task 1519): it is a non-terminal
-# holding state for atomic-train members awaiting the group merge.
-# Transitions out of merge-deferred to done/in-progress/blocked are routine
-# and must not require a reopen_reason. The regression guard
-# test_merge_deferred_is_non_terminal locks this contract.
-TERMINAL_STATUSES: frozenset[str] = frozenset({'done', 'cancelled'})
+# 'merge-deferred' is deliberately NOT in this set — a property of
+# shared.TERMINAL, not this module. It is a non-terminal holding state for
+# atomic-train members awaiting the group merge (PRD
+# orchestrator-atomic-train-merge §9.2, task 1519); transitions out of
+# merge-deferred to done/in-progress/blocked are routine and must not
+# require a reopen_reason. The regression guard test_merge_deferred_is_non_terminal
+# locks this contract.
 
 # Sentinel distinguishing "leave the claimant column untouched" (default) from
 # "clear it to NULL" (explicit None) on the claimant_run_id/heartbeat_at
