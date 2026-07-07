@@ -2789,6 +2789,47 @@ async def reconcile_landed_row(
     return 'marked_done'
 
 
+async def reconcile_landed_task(
+    task_id: str,
+    *,
+    git_ops: Any,
+    scheduler: Any,
+    outbox: LandedOutbox,
+) -> bool:
+    """Single-task landed-outbox consult for the scheduler dispatch gate (task 2156, W1 δ / SD-1).
+
+    Guards the git ancestry round-trip behind a cheap in-memory outbox hit:
+    landed rows exist only for the brief window between a merge advancing
+    main and the task being marked done, so the overwhelmingly common case
+    (no row) returns ``False`` with zero git I/O and zero scheduler calls —
+    keeping the per-candidate cost of the scheduler's dispatch-gate consult
+    to one dict lookup on the hot path.
+
+    When a row IS present, resolves ``main_sha`` and delegates to the shared
+    :func:`reconcile_landed_row` (task 2155, W1 γ) — the SAME RC-1/RC-2/RC-3
+    routine the startup reconciler uses, so the scheduler consult and the
+    startup reconciler converge through one done-write path and can never
+    diverge.
+
+    Returns ``True`` ⟺ ``row.advanced_sha`` is an ancestor of ``main`` ⟺ the
+    task must NOT be dispatched — the disposition (drive to done via
+    ``'marked_done'``, preserve via ``'already_done_pruned'``, or fail-safe
+    wait via ``'skipped'``) has already happened inline via
+    ``reconcile_landed_row``. Returns ``False`` when there is no row, or
+    when the row's disposition is ``'pruned_not_landed'`` — the task never
+    actually landed (crash before the CAS advance), so it stays normally
+    dispatchable and its stale row has already been pruned.
+    """
+    row = outbox.lookup(task_id)
+    if row is None:
+        return False
+    main_sha = await git_ops.get_main_sha()
+    disposition = await reconcile_landed_row(
+        row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
+    )
+    return disposition != 'pruned_not_landed'
+
+
 async def reconcile_landed_outbox(
     outbox: LandedOutbox,
     git_ops: Any,
