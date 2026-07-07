@@ -17,6 +17,8 @@ import shared.task_metadata as task_metadata_module
 from shared.deploy_state import DeployPhase, DeployState, VerifyBaseline
 from shared.task_metadata import parse_metadata
 
+from orchestrator.deploy_state import _LEGAL, is_legal_transition
+
 
 class TestDeployPhase:
     def test_is_str_enum(self) -> None:
@@ -80,3 +82,40 @@ class TestSharedRegistryRegistration:
         assert len(warnings) == 1
         assert warnings[0].field == 'deploy_state'
         assert warnings[0].code == 'invalid_submodel'
+
+
+class TestLegalTransitionTable:
+    """_LEGAL + is_legal_transition (orchestrator-domain state machine).
+
+    Pins only unambiguous edges (PRD §5.2 chart: scheduled→ran→
+    {verified|failed|escalated}→done) — see design decision on why the
+    exact set of middle transition edges is left to ζ coordination.
+    """
+
+    def test_legal_forward_edges_are_true(self) -> None:
+        assert _LEGAL[(DeployPhase.SCHEDULED, DeployPhase.RAN)] is True
+        assert _LEGAL[(DeployPhase.RAN, DeployPhase.VERIFIED)] is True
+        assert _LEGAL[(DeployPhase.RAN, DeployPhase.FAILED)] is True
+        assert _LEGAL[(DeployPhase.RAN, DeployPhase.ESCALATED)] is True
+        assert _LEGAL[(DeployPhase.VERIFIED, DeployPhase.DONE)] is True
+        assert _LEGAL[(DeployPhase.ESCALATED, DeployPhase.DONE)] is True
+
+    def test_illegal_edges_are_false(self) -> None:
+        # PRD D2: cannot write done directly from scheduled.
+        assert is_legal_transition(DeployPhase.SCHEDULED, DeployPhase.DONE) is False
+        # done is terminal.
+        assert is_legal_transition(DeployPhase.DONE, DeployPhase.SCHEDULED) is False
+        # no backward transition.
+        assert is_legal_transition(DeployPhase.VERIFIED, DeployPhase.SCHEDULED) is False
+        # no self-loop.
+        assert is_legal_transition(DeployPhase.RAN, DeployPhase.RAN) is False
+
+    def test_legal_table_shape_and_default_false_fallback(self) -> None:
+        assert isinstance(_LEGAL, dict)
+        for (old, new), legal in _LEGAL.items():
+            assert isinstance(old, DeployPhase)
+            assert isinstance(new, DeployPhase)
+            assert isinstance(legal, bool)
+        # A pair absent from the table falls back to False rather than KeyError.
+        assert (DeployPhase.SCHEDULED, DeployPhase.DONE) not in _LEGAL
+        assert is_legal_transition(DeployPhase.SCHEDULED, DeployPhase.DONE) is False
