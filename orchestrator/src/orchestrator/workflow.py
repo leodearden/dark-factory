@@ -3467,9 +3467,10 @@ class TaskWorkflow:
         non-terminal (pending / in-progress).  If the most recent resolved
         L0 was an ``infra_issue`` and the iteration log has not grown since
         the previous resume, increment ``consecutive_infra_resume_failures``
-        in the task metadata.  At ``max_consecutive_infra_resumes``, route
-        to ``_mark_blocked(escalate_to_human=True)`` instead of dispatching
-        the implementer again.
+        inside the typed ``metadata.retry_ledger`` blob (see
+        :func:`_evaluate_infra_resume`).  At ``max_consecutive_infra_resumes``,
+        route to ``_mark_blocked(escalate_to_human=True)`` instead of
+        dispatching the implementer again.
 
         Returns:
             ``WorkflowOutcome.BLOCKED`` when the threshold is hit; ``None``
@@ -3482,7 +3483,9 @@ class TaskWorkflow:
 
         Mirrors :meth:`_handle_no_plan_failure` style — same per-task
         concurrency assumption as the existing
-        ``consecutive_no_plan_failures`` writer; no new hazard.
+        ``consecutive_no_plan_failures`` writer; no new hazard.  Persist
+        failure escalates to a human immediately rather than logging and
+        proceeding, for the same reason as the no-plan guard.
         """
         assert self.artifacts is not None
 
@@ -3522,50 +3525,41 @@ class TaskWorkflow:
         current_iter_count = len(iter_entries)
 
         try:
-            counter = int(
-                metadata.get('consecutive_infra_resume_failures') or 0
-            )
-        except (TypeError, ValueError):
-            counter = 0
+            ledger = RetryLedger(**(metadata.get('retry_ledger') or {}))
+        except ValidationError:
+            ledger = RetryLedger()
 
-        if recent_category == 'infra_issue':
-            try:
-                last_iter_count = int(
-                    metadata.get('last_infra_resume_iteration_count') or 0
-                )
-            except (TypeError, ValueError):
-                last_iter_count = 0
-            if current_iter_count > last_iter_count:
-                # Steward fix-commits will reset the counter via
-                # iteration-log growth.  This is intentional: a steward
-                # action is forward progress.
-                counter = 1
-            else:
-                counter += 1
-        else:
-            # Non-infra category (or no resolved L0 we could classify) —
-            # the thrash signal does not apply; reset.
-            counter = 0
+        verdict = _evaluate_infra_resume(
+            ledger, current_iter_count, recent_category,
+            self.config.max_consecutive_infra_resumes,
+        )
 
         # Read-modify-write: see _merge_fresh_metadata for the merge policy.
         new_metadata = await self._merge_fresh_metadata(
             metadata, log_context='infra-resume thrash counter',
         )
-        # Counters intentionally sourced from in-memory metadata; backend overlay is only for non-counter keys (e.g. memory_hints).
-        new_metadata['consecutive_infra_resume_failures'] = counter
-        new_metadata['last_infra_resume_iteration_count'] = current_iter_count
+        # In-memory ledger intentionally wins over any backend retry_ledger;
+        # the backend overlay above is only for non-counter keys (e.g. memory_hints).
+        new_metadata['retry_ledger'] = verdict.ledger.model_dump()
         self.task['metadata'] = new_metadata
         try:
             await self.scheduler.update_task(
                 self.task_id, metadata=new_metadata,
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
             logger.warning(
-                'Task %s: failed to persist infra-resume thrash counter: %s',
+                'Task %s: failed to persist infra-resume thrash counter; '
+                'escalating to human (counter cannot be trusted): %s',
                 self.task_id, exc,
             )
+            return await self._mark_blocked(
+                f'Failed to persist infra-resume thrash counter: {exc}',
+                detail=f'category={recent_category!r}',
+                escalate_to_human=True,
+            )
 
-        if counter >= self.config.max_consecutive_infra_resumes:
+        if verdict.escalate:
+            counter = verdict.ledger.consecutive_infra_resume_failures
             logger.warning(
                 'Task %s: consecutive_infra_resume_failures=%d at threshold '
                 '%d — infra-issue thrash confirmed; escalating to human',
@@ -3578,7 +3572,7 @@ class TaskWorkflow:
                     f'category={recent_category!r}, '
                     f'iteration_log_entries={current_iter_count}, '
                     f'last_iteration_log_entries='
-                    f'{metadata.get("last_infra_resume_iteration_count", 0)}'
+                    f'{ledger.last_infra_resume_iteration_count}'
                 ),
                 escalate_to_human=True,
             )
