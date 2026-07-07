@@ -353,6 +353,40 @@ async def classify_node(
 
 
 # ---------------------------------------------------------------------------
+# Graphiti: in-place mutation (REKEY only)
+# ---------------------------------------------------------------------------
+
+async def rekey_node_in_place(graph: Any, uuid: str, new_group_id: str) -> None:
+    """In-place group_id re-key for a REKEY-dispositioned node.
+
+    Unlike MOVE (``move_entity_across_graphs``) and MERGE
+    (``merge_foreign_duplicate``), a REKEY node already physically lives in
+    its home graph -- only its ``group_id`` property is a variant spelling.
+    This rewrites ``group_id`` via ``SET``, uniformly across the node and
+    its incident RELATES_TO edges and Episodic MENTIONS links (mirroring
+    ``move_entity_across_graphs``' uniform ``new_group_id`` treatment across
+    a moved subgraph) -- and ONLY via ``SET``. It never issues ``CREATE`` or
+    ``DETACH DELETE``, so there is no crash window in which the node's only
+    copy could be lost (the data-loss trap this whole REKEY path exists to
+    avoid -- see the REKEY constant and classify_node).
+    """
+    await graph.query(
+        'MATCH (n:Entity {uuid: $uuid}) SET n.group_id = $gid',
+        {'uuid': uuid, 'gid': new_group_id},
+    )
+    await graph.query(
+        'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
+        'SET e.group_id = $gid',
+        {'uuid': uuid, 'gid': new_group_id},
+    )
+    await graph.query(
+        'MATCH (ep:Episodic)-[e:MENTIONS]->(n:Entity {uuid: $uuid}) '
+        'SET e.group_id = $gid',
+        {'uuid': uuid, 'gid': new_group_id},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -418,6 +452,25 @@ async def run(args: Any, memory_service: Any) -> dict:
     for node in manifest['nodes']:
         uuid = node['uuid']
         disposition = node['disposition']
+
+        if disposition in (MOVE, MERGE) and node['source_graph'] == node['target_graph']:
+            # Defensive guard: a correctly-classified in-place re-key is
+            # REKEY, never MOVE/MERGE (see classify_node) -- a MOVE/MERGE
+            # reaching here with source_graph == target_graph can only come
+            # from a malformed/hand-edited manifest. Dispatching it would
+            # make move_entity_across_graphs / merge_foreign_duplicate
+            # DETACH DELETE the node's only copy (wrong==home). Refuse it:
+            # block this node only, never call the primitive.
+            apply_results.append({
+                'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True,
+                'error': (
+                    f'refusing {disposition} with source_graph == target_graph '
+                    f"({node['source_graph']!r}) -- malformed manifest; this "
+                    'node should have classified REKEY'
+                ),
+            })
+            continue
+
         if disposition == MOVE:
             await move_entity_across_graphs(
                 graphiti, uuid, node['source_graph'], node['target_graph'],
@@ -429,6 +482,13 @@ async def run(args: Any, memory_service: Any) -> dict:
             await merge_foreign_duplicate(
                 graphiti, uuid,
                 wrong_graph=node['source_graph'], home_graph=node['target_graph'],
+            )
+            apply_results.append(
+                {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
+            )
+        elif disposition == REKEY:
+            await rekey_node_in_place(
+                graphiti._graph_for(node['source_graph']), uuid, node['target_graph'],
             )
             apply_results.append(
                 {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
@@ -463,6 +523,7 @@ async def run(args: Any, memory_service: Any) -> dict:
 
     matched = after_counts == expected_residual
     has_unresolved = bool(manifest.get('unresolved_uuids'))
+    has_blocked = any(r['blocked'] for r in apply_results)
 
     report = dict(manifest)
     report['dry_run'] = False
@@ -472,7 +533,7 @@ async def run(args: Any, memory_service: Any) -> dict:
         'expected': expected_residual,
         'actual': after_counts,
     }
-    report['exit_code'] = 0 if (matched and not has_unresolved) else 1
+    report['exit_code'] = 0 if (matched and not has_unresolved and not has_blocked) else 1
     return report
 
 
