@@ -142,3 +142,51 @@ class TestCategoryProjectWeights:
         explicit = _make_item(project='mapped-project')
 
         assert score(absent, weights, _NOW) == score(explicit, explicit_weights, _NOW)
+
+
+class TestMonotonicBoost:
+    @given(
+        severity=_SHORT_TEXT,
+        category=_SHORT_TEXT,
+        project=_SHORT_TEXT,
+        filed_at=_TIMESTAMPS,
+        state=st.sampled_from(_STATES),
+        boosts=st.tuples(_BOOSTS, _BOOSTS).map(sorted),
+    )
+    def test_score_nondecreasing_in_boost(
+        self, severity, category, project, filed_at, state, boosts
+    ):
+        """Section 6.3 invariant 1: score is monotonic non-decreasing in manual_boost."""
+        from cockpit.priority import Priorities, score
+
+        b1, b2 = boosts
+        weights = Priorities.default()
+        common = dict(
+            severity=severity, category=category, project=project, filed_at=filed_at, state=state
+        )
+        item_low = _make_item(manual_boost=b1, **common)
+        item_high = _make_item(manual_boost=b2, **common)
+
+        assert score(item_high, weights, _NOW) >= score(item_low, weights, _NOW)
+
+    def test_explicit_examples_span_clamp_regions(self):
+        """Below-min and above-max both flatten (clamp); in-range is strictly increasing.
+
+        RED: manual_boost is not yet summed into raw, so score is constant
+        regardless of boost — the strict in-range inequalities below fail.
+        """
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+
+        def s(boost):
+            return score(_make_item(manual_boost=boost), weights, _NOW)
+
+        # Below the clamp floor (min=-5): both clamp to the same value.
+        assert s(-100) == s(-50)
+        # Above the clamp ceiling (max=5): both clamp to the same value.
+        assert s(50) == s(100)
+        # In-range (unclamped) increments are strictly increasing.
+        assert s(-5) < s(-2) < s(0) < s(3) < s(5)
+        # Monotonic non-decreasing across the full span, clamp regions included.
+        assert s(-100) <= s(-50) <= s(-5) <= s(-2) <= s(0) <= s(3) <= s(5) <= s(50) <= s(100)
