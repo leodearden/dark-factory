@@ -23,6 +23,7 @@ from shared.usage_gate import (
     CODEX_CAP_PATTERNS,
     GEMINI_CAP_PATTERNS,
     NEAR_CAP_PREFIXES,
+    AccountPhase,
     SessionBudgetExhausted,
     UsageGate,
     _extract_cap_message,
@@ -2273,3 +2274,36 @@ class TestAuthReprobeDemoteOnCapMessage:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
+
+
+# =========================================================================
+# TestAccountGeneration — monotonic per-account counter (PRD §7.4, task W4-δ)
+#
+# `generation` is bumped exactly once inside `_transition` (γ's sole
+# phase-writer) on every successful edge, so an `AccountLease` captured
+# before a mid-flight re-transition can be detected as stale by comparing
+# its `generation` snapshot against the account's current value.
+# =========================================================================
+
+
+class TestAccountGeneration:
+    """AccountState.generation: monotonic counter bumped by every legal
+    ``_transition`` edge."""
+
+    def test_fresh_account_generation_is_zero(self):
+        gate = make_gate(['a'])
+        assert gate._accounts[0].generation == 0
+
+    def test_transition_bumps_generation_monotonically(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        g0 = acct.generation
+
+        gate._transition(
+            acct, AccountPhase.CAPPED,
+            resets_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        assert acct.generation == g0 + 1
+
+        gate._transition(acct, AccountPhase.PROBING)
+        assert acct.generation == g0 + 2
