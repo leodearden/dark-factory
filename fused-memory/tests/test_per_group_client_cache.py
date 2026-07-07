@@ -17,12 +17,14 @@ equals group_id and the upstream mutation branch is never taken.
 """
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import fused_memory.backends.graphiti_client as graphiti_client_module
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
+from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.llm_client import LLMClient
@@ -118,3 +120,77 @@ class TestClientFor:
         assert client_g2.embedder is backend._embedder
         assert client_g2.cross_encoder is backend._cross_encoder
         assert client_g1.cross_encoder is client_g2.cross_encoder
+
+
+# ---------------------------------------------------------------------------
+# step-5/6: GraphitiBackend.add_episode routes through _client_for
+# ---------------------------------------------------------------------------
+
+
+class TestAddEpisodeRoutesThroughClientFor:
+    """add_episode must write via the per-group client (_client_for), never
+    via the shared self.client — routing writes off the shared client is
+    the entire point of the fix."""
+
+    @pytest.mark.asyncio
+    async def test_add_episode_uses_per_group_client_not_shared_client(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        sentinel = object()
+        per_group = MagicMock()
+        per_group.add_episode = AsyncMock(return_value=sentinel)
+        backend._client_for = MagicMock(return_value=per_group)
+        backend.client.add_episode = AsyncMock()
+
+        result = await backend.add_episode(name='e', content='c', group_id='A')
+
+        backend._client_for.assert_called_once_with('A')
+        per_group.add_episode.assert_awaited_once()
+        backend.client.add_episode.assert_not_awaited()
+        assert result is sentinel
+
+
+# ---------------------------------------------------------------------------
+# step-5/6: add_episode concurrency isolation (headline regression test)
+# ---------------------------------------------------------------------------
+
+
+class TestAddEpisodeConcurrencyIsolation:
+    """Reproduces the ACTIVE data-integrity bug this task fixes: on a SHARED
+    Graphiti client, concurrent cross-group add_episode calls race on
+    self.driver / self.clients.driver (graphiti_core 0.28.2, graphiti.py:
+    887-890) and misroute writes into the wrong FalkorDB graph. Once
+    add_episode routes through per-group clients (_client_for), each has its
+    own pre-pinned driver and the race is structurally unreachable."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cross_group_writes_do_not_bleed(self, mock_config, monkeypatch):
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(falkor_db=MagicMock(), database='__base__')
+        backend._llm_client = MagicMock(spec=LLMClient)
+        backend._embedder = MagicMock(spec=EmbedderClient)
+        backend._cross_encoder = MagicMock(spec=CrossEncoderClient)
+        backend.client = Graphiti(
+            graph_driver=backend._driver,
+            llm_client=backend._llm_client,
+            embedder=backend._embedder,
+            cross_encoder=backend._cross_encoder,
+        )
+
+        observed: dict[str, str] = {}
+
+        async def fake_add_episode(self, *, name, group_id, **kwargs):
+            # Mirrors graphiti_core 0.28.2 graphiti.py:887-890 verbatim.
+            if group_id != self.driver._database:
+                self.driver = self.driver.clone(database=group_id)
+                self.clients.driver = self.driver
+            await asyncio.sleep(0)  # yield so concurrent calls interleave
+            observed[name] = self.clients.driver._database
+
+        monkeypatch.setattr(Graphiti, 'add_episode', fake_add_episode)
+
+        await asyncio.gather(
+            backend.add_episode(name='epA', content='x', group_id='A'),
+            backend.add_episode(name='epB', content='y', group_id='B'),
+        )
+
+        assert observed == {'epA': 'A', 'epB': 'B'}
