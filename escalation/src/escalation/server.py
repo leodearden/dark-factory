@@ -16,6 +16,7 @@ from fastmcp.server.dependencies import get_http_headers
 
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
+from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
@@ -592,11 +593,14 @@ def create_server(
             }
 
         # Connection-capability gate (escalation-connection-capability-guard-prd.md,
-        # task alpha). get_http_headers() returns {} outside an ASGI request context
+        # task alpha; identity-derived ceiling extension per
+        # plans/task-status-authority-prd.md contract C8 / decision D7).
+        # get_http_headers() returns {} outside an ASGI request context
         # (in-process tool.fn() calls, stdio transport), so this gate is a no-op for
         # those callers — default-open is preserved byte-for-byte.
         headers = get_http_headers()
         levels_raw = headers.get(_LEVELS_HEADER)
+        parsed: set[int] | None = None
         if levels_raw is not None:
             try:
                 parsed = _parse_levels(levels_raw)
@@ -608,18 +612,40 @@ def create_server(
                     ),
                     'code': 'bad_capability_header',
                 }
-            target = queue.get(escalation_id)
-            if target is None:
-                return {'error': f'Escalation {escalation_id} not found'}
-            if target.level not in parsed:
-                return {
-                    'error': (
-                        f'connection not permitted to change level-{target.level} '
-                        'escalations'
-                    ),
-                    'code': 'level_forbidden',
-                }
         identity = headers.get(_IDENTITY_HEADER)
+
+        # Single record lookup reused by the capability gate below, the Table B
+        # gate further down, and the pre-stamp write after it. queue.get() reads
+        # from disk, so identity-mapped callers previously paid for two reads
+        # per resolve (once for the ceiling check, again for Table B); one
+        # fetch is now shared by both gates (efficiency note, PRD C8/D7 review).
+        rec = queue.get(escalation_id)
+        if rec is None:
+            return {'error': f'Escalation {escalation_id} not found'}
+
+        # D7 effective ceiling: an identity mapped in ROLE_LEVEL_ALLOWLIST is
+        # AUTHORITATIVE — a present X-Escalation-Levels header may only
+        # NARROW within that role ceiling (set intersection), never widen
+        # past it, and dropping the header entirely still leaves the bare
+        # role ceiling in force. An identity absent from
+        # ROLE_LEVEL_ALLOWLIST (or no identity at all) falls back to the
+        # pre-existing 2041 header-opt-in behaviour: `parsed` if a header
+        # was sent, else None — unrestricted (the esc-2087-2 human-channel
+        # guarantee; header-less callers are never default-denied).
+        role_ceiling = ROLE_LEVEL_ALLOWLIST.get(identity) if identity is not None else None
+        if role_ceiling is not None:
+            effective = (role_ceiling & parsed) if parsed is not None else role_ceiling
+        else:
+            effective = parsed
+
+        if effective is not None and rec.level not in effective:
+            return {
+                'error': (
+                    f'connection not permitted to change level-{rec.level} '
+                    'escalations'
+                ),
+                'code': 'level_forbidden',
+            }
         if identity is not None:
             # Server-attributed identity overrides the tool arg for both the
             # park stamp (below) and the resolve call further down — a caller
@@ -638,10 +664,10 @@ def create_server(
         # capability header AND an illegal action) sees 'bad_capability_header'
         # / 'level_forbidden', not 'illegal_transition'. Neither gate mutates
         # the record, so this is an error-reporting precedence only — see the
-        # "Gate precedence" note in the resolve_issue docstring.
-        rec = queue.get(escalation_id)
-        if rec is None:
-            return {'error': f'Escalation {escalation_id} not found'}
+        # "Gate precedence" note in the resolve_issue docstring. `rec` was
+        # already fetched above (shared with the capability gate); nothing
+        # mutates the record between that fetch and here, so it is reused
+        # rather than re-read from disk.
         effect = effect_for(action, rec.level, rec.category)
         if effect is None:
             return {
@@ -669,10 +695,11 @@ def create_server(
         # Pre-stamp resolution_action on the pending record so resolve()'s
         # read-modify-write carries it into the archived JSON (C1 persistence).
         # Guard: only rewrite pending records — archived records must not be resurrected.
-        # Reuses `rec` fetched above for the Table B gate instead of re-reading
-        # from disk: queue.get() is a pure read and nothing mutates the record
-        # between that fetch and here (the park branch above already returned),
-        # so `rec` is still current and a second queue.get() would be redundant.
+        # Reuses `rec` fetched at the top of the gate sequence above (shared by
+        # the capability and Table B gates) instead of re-reading from disk:
+        # queue.get() is a pure read and nothing mutates the record between
+        # that fetch and here (the park branch above already returned), so
+        # `rec` is still current and a further queue.get() would be redundant.
         if rec.status == 'pending':
             rec.resolution_action = action
             queue._rewrite(escalation_id, rec)
@@ -770,6 +797,12 @@ def create_server(
         ``_chokepoint_or_submit`` are intentionally bypassed — L2 is set
         explicitly by this tool.
 
+        **Identity gate** (PRD task-status-authority C8/D7): the create side
+        is gated by ``escalation.authority.PROMOTE_ALLOWED`` — a connection
+        asserting an ``X-Escalation-Identity`` not in that set is denied
+        (``{'error': ..., 'code': 'level_forbidden'}``, no L2 minted); a
+        header-less connection (no identity asserted) is always allowed.
+
         Parameters
         ----------
         task_id:
@@ -812,6 +845,17 @@ def create_server(
 
             {'error': '<reason>'}
         """
+        # Identity gate (PRD task-status-authority C8/D7 row C4) — checked
+        # FIRST, before any validation or queue mutation, so a disallowed
+        # caller mints nothing. Header-less (identity is None) stays
+        # allowed, unchanged.
+        identity = get_http_headers().get(_IDENTITY_HEADER)
+        if identity is not None and identity not in PROMOTE_ALLOWED:
+            return {
+                'error': f'identity {identity!r} is not permitted to mint L2 escalations',
+                'code': 'level_forbidden',
+            }
+
         # Validate required non-empty fields
         if not member_ids:
             return {'error': 'member_ids must be a non-empty list'}

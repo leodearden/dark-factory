@@ -612,3 +612,253 @@ class TestWatcherConstantLockstep:
             f'Expected the header identity to win over the spoofed tool arg, got: '
             f'{reread_b.resolved_by!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestIdentityDerivedCeiling: X-Escalation-Identity derives a role-based level
+# ceiling server-side (PRD task-status-authority C8/D7) — closes the
+# general-case default-open hole left by 2041's header-opt-in guard. A
+# present X-Escalation-Levels header may only NARROW within the role
+# ceiling, never widen it; an identity absent from
+# escalation.authority.ROLE_LEVEL_ALLOWLIST keeps the 2041 header-opt-in
+# fallback.
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityDerivedCeiling:
+    """A mapped identity is capped at its role ceiling even with no levels
+    header (PRD row C2); a header cannot widen past that ceiling (PRD row
+    C3) but can narrow it further. An unmapped identity is unaffected —
+    it keeps the pre-existing 2041 header-opt-in behaviour.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mapped_identity_denied_l2_close_only_no_levels_header(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """PRD C2 — identity alone caps at {0,1}; no levels header sent."""
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='task-ceiling-c2')
+
+        result = await _resolve_over_http(
+            base_url, identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id, resolution='x', action='close_only',
+        )
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result}"
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending, got: {reread.status}'
+        assert (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'Denied record must remain in the queue root (not archived)'
+        )
+        assert reread.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread.resolution_action}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mapped_identity_levels_header_cannot_widen_past_ceiling(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """PRD C3 — levels='0,1,2' cannot widen the {0,1} role ceiling."""
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='task-ceiling-c3-widen')
+
+        result = await _resolve_over_http(
+            base_url, levels='0,1,2', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id, resolution='x', action='close_only',
+        )
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result}"
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending, got: {reread.status}'
+        assert reread.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread.resolution_action}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mapped_identity_levels_header_narrows_ceiling(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """levels='0' narrows the {0,1} ceiling to {0}, excluding an L1 record."""
+        base_url, queue = http_server
+        esc = _seed(queue, level=1, task_id='task-ceiling-narrow')
+
+        result = await _resolve_over_http(
+            base_url, levels='0', identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id, resolution='x', action='close_only',
+        )
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result}"
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending, got: {reread.status}'
+        assert reread.resolution_action is None, (
+            f'Expected no resolution_action stamp, got: {reread.resolution_action}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_mapped_identity_within_ceiling_succeeds_and_stamps(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """Identity alone (no levels header) allows an L1 resolve; stamps resolved_by."""
+        base_url, queue = http_server
+        esc = _seed(queue, level=1, task_id='task-ceiling-positive')
+
+        result = await _resolve_over_http(
+            base_url, identity='orchestrator-escalation-watcher-auto',
+            escalation_id=esc.id, resolution='fixed', action='resume',
+            resolved_by='spoofed',
+        )
+        assert 'code' not in result and 'error' not in result, (
+            f'Expected a clean success (level 1 is within the {{0,1}} ceiling), got: {result}'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'resolved', f'Expected resolved, got: {reread.status}'
+        assert reread.resolved_by == 'orchestrator-escalation-watcher-auto', (
+            f'Expected the identity to stamp resolved_by, got: {reread.resolved_by!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unmapped_identity_header_less_stays_open(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """An identity absent from ROLE_LEVEL_ALLOWLIST + no levels header
+        preserves the 2041 fallback: unmapped+header-less stays open."""
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='task-ceiling-unmapped-open')
+
+        result = await _resolve_over_http(
+            base_url, identity='some-other-agent',
+            escalation_id=esc.id, resolution='ok', action='close_only',
+        )
+        assert 'code' not in result and 'error' not in result, (
+            f'Expected a clean success (unmapped identity, no levels header), got: {result}'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status in {'resolved', 'dismissed'}, (
+            f'Expected archived status, got: {reread.status}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unmapped_identity_with_levels_header_still_gated(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """An unmapped identity + a levels header still applies the 2041 gate."""
+        base_url, queue = http_server
+        esc = _seed(queue, level=2, task_id='task-ceiling-unmapped-gated')
+
+        result = await _resolve_over_http(
+            base_url, levels='0,1', identity='some-other-agent',
+            escalation_id=esc.id, resolution='x', action='close_only',
+        )
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result}"
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending, got: {reread.status}'
+
+    @pytest.mark.asyncio
+    async def test_real_watcher_identity_still_capped_without_levels_header(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """Proves the deployed watcher is still capped if it drops its levels header."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+        esc = _seed(queue, level=2, task_id='task-ceiling-real-watcher-no-levels')
+
+        result = await _resolve_over_http(
+            base_url, identity=identity,
+            escalation_id=esc.id, resolution='x', action='close_only',
+        )
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result}"
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'Expected pending, got: {reread.status}'
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteL2Gate: PROMOTE_ALLOWED gates the create-side of promote_to_l2
+# on identity (PRD task-status-authority C8/D7 row C4) — an identity not in
+# PROMOTE_ALLOWED may not mint a new L2 cluster.
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteL2Gate:
+    """An identity absent from PROMOTE_ALLOWED is denied promote_to_l2 (no L2
+    minted); header-less callers and the deployed auto-watcher are unaffected.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disallowed_identity_denied_no_l2_minted(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """PRD C4 — identity not in PROMOTE_ALLOWED => level_forbidden, no L2 minted."""
+        base_url, queue = http_server
+        m1 = _seed(queue, level=1, task_id='task-promote-gate-denied-m1')
+        root_cause = 'rc-promote-gate-denied'
+
+        result = await _promote_over_http(
+            base_url, identity='some-other-agent',
+            task_id='task-promote-gate-denied', agent_role='some-other-agent',
+            member_ids=[m1.id], root_cause=root_cause, evidence='e',
+            options=['A', 'B'], summary='cluster',
+        )
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result}"
+        )
+        assert queue.find_pending_l2_by_root_cause(root_cause) is None, (
+            'Expected no L2 minted for a disallowed identity'
+        )
+
+    @pytest.mark.asyncio
+    async def test_header_less_allowed(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """Header-less (no identity) callers remain allowed — unchanged."""
+        base_url, queue = http_server
+        m1 = _seed(queue, level=1, task_id='task-promote-gate-headerless-m1')
+        root_cause = 'rc-promote-gate-headerless'
+
+        result = await _promote_over_http(
+            base_url,
+            task_id='task-promote-gate-headerless', agent_role='escalation-watcher-auto',
+            member_ids=[m1.id], root_cause=root_cause, evidence='e',
+            options=['A', 'B'], summary='cluster',
+        )
+        assert result.get('status') in {'created', 'updated'}, (
+            f"Expected status in {{'created','updated'}}, got: {result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_watcher_identity_still_allowed(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """No-op regression guard: the deployed watcher can still mint L2."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+        m1 = _seed(queue, level=1, task_id='task-promote-gate-realwatcher-m1')
+        root_cause = 'rc-promote-gate-realwatcher'
+
+        result = await _promote_over_http(
+            base_url, identity=identity,
+            task_id='task-promote-gate-realwatcher', agent_role='escalation-watcher-auto',
+            member_ids=[m1.id], root_cause=root_cause, evidence='e',
+            options=['A', 'B'], summary='cluster',
+        )
+        assert result.get('status') == 'created', (
+            f"Expected status='created', got: {result}"
+        )
