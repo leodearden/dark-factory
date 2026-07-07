@@ -6,6 +6,7 @@ Step 3 (RED → step-4 GREEN): list-gate helpers
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from fused_memory.middleware.lock_charter_guard import (
     is_file_path,
     lock_charter_error,
 )
+
+_LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
 
 # ---------------------------------------------------------------------------
 # Drift guard — two tiers:
@@ -231,6 +234,20 @@ class TestExtractFiles:
 
     def test_unparseable_json_returns_empty(self):
         assert extract_files('not valid json {{{') == []
+
+    def test_unparseable_json_warns_and_returns_empty(self, caplog):
+        """RED (task 2166 step-9): the str/json branch currently discards silently."""
+        with caplog.at_level(logging.WARNING, logger=_LCG_LOGGER):
+            result = extract_files('not valid json {{{')
+        assert result == []
+        warns = [
+            r for r in caplog.records
+            if r.name == _LCG_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert any('task_metadata.schema_warning' in r.message for r in warns), (
+            f'expected a task_metadata.schema_warning WARNING; got '
+            f'{[r.message for r in warns]!r}'
+        )
 
     def test_json_non_dict_returns_empty(self):
         # JSON string that parses to a list, not a dict
