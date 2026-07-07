@@ -183,3 +183,48 @@ class TestReadCanonicalization:
         await server._tool_manager.call_tool('get_queue_stats', {'project_id': 'dark-factory'})
 
         mock_service.durable_queue.get_stats.assert_called_once_with(group_id='dark_factory')
+
+
+class TestUngatedMutatorCanonicalization:
+    """Ungated graph mutators: refresh_entity_summary (also set_entity_summary,
+    rename_entity, merge_entities, delete_entity, rebuild_entity_summaries,
+    replay_to_graphiti — covered by the step-7 completeness sweep).
+    """
+
+    @pytest.mark.asyncio
+    async def test_refresh_entity_summary_accepts_hyphen_spelling(self):
+        """B1: refresh_entity_summary(project_id='dark-factory') is ACCEPTED and normalized."""
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
+
+        await server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'project_id': 'dark-factory', 'entity_name': 'Foo'},
+        )
+
+        mock_service.refresh_entity_summary.assert_called_once()
+        assert mock_service.refresh_entity_summary.call_args[1]['project_id'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_refresh_entity_summary_rejects_path_shaped_project_id(self):
+        """B2: refresh_entity_summary(project_id='-home-leo-src-x') is rejected loudly.
+
+        Proves canonicalization precedes both validate_project_id and the tool's
+        own entity_uuid/entity_name required-arg check — the rejection must fire
+        even though neither entity_uuid nor entity_name is provided.
+        """
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
+
+        result = await server._tool_manager.call_tool(
+            'refresh_entity_summary',
+            {'project_id': _PATH_SHAPED, 'entity_name': 'Foo'},
+        )
+
+        assert result.get('error_type') == 'PathShapedProjectIdError', (
+            f'Expected PathShapedProjectIdError, got: {result!r}'
+        )
+        assert _PATH_SHAPED in result.get('error', ''), (
+            f'Expected offending value {_PATH_SHAPED!r} named in error, got: {result!r}'
+        )
+        mock_service.refresh_entity_summary.assert_not_called()
