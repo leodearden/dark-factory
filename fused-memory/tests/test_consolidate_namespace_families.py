@@ -191,6 +191,75 @@ class TestBuildConsolidationReport:
 
 
 # ===========================================================================
+# Tests: has_unresolved
+# ===========================================================================
+
+class TestHasUnresolved:
+    """Tests for the pure function has_unresolved(report) -> bool."""
+
+    def test_all_clean_empty_sections_returns_false(self):
+        """An all-clean report with empty sections returns False."""
+        report = _mod.build_consolidation_report([], [], [], dry_run=True)
+
+        assert _mod.has_unresolved(report) is False
+
+    def test_all_clean_merge_and_delete_dispositions_returns_false(self):
+        """Sections containing only MERGE/DELETE dispositions (no
+        UNRESOLVED) return False."""
+        graph_items = [{'sibling': 'know-live', 'canonical': 'know_live', 'disposition': 'MERGE'}]
+        collection_items = [{'source': 'reify_reify', 'target': 'fused_reify', 'disposition': 'MERGE'}]
+        junk_items = [{'key': 'my-project', 'node_count': 0, 'disposition': 'DELETE'}]
+        report = _mod.build_consolidation_report(
+            graph_items, collection_items, junk_items, dry_run=True,
+        )
+
+        assert _mod.has_unresolved(report) is False
+
+    def test_unresolved_in_graph_family_merges_returns_true(self):
+        """A single UNRESOLVED disposition in graph_family_merges returns True."""
+        graph_items = [{'sibling': 'know-live', 'canonical': 'know_live', 'disposition': 'UNRESOLVED'}]
+        report = _mod.build_consolidation_report(graph_items, [], [], dry_run=True)
+
+        assert _mod.has_unresolved(report) is True
+
+    def test_unresolved_in_collection_merges_returns_true(self):
+        """A single UNRESOLVED disposition in collection_merges returns True."""
+        collection_items = [
+            {'source': 'fused_dark-factory', 'target': 'fused_dark_factory', 'disposition': 'UNRESOLVED'},
+        ]
+        report = _mod.build_consolidation_report([], collection_items, [], dry_run=True)
+
+        assert _mod.has_unresolved(report) is True
+
+    def test_unresolved_in_junk_key_deletions_returns_true(self):
+        """A single UNRESOLVED disposition in junk_key_deletions returns True."""
+        junk_items = [{'key': 'my-project', 'node_count': 3, 'disposition': 'UNRESOLVED'}]
+        report = _mod.build_consolidation_report([], [], junk_items, dry_run=True)
+
+        assert _mod.has_unresolved(report) is True
+
+    def test_mixed_report_with_one_unresolved_returns_true(self):
+        """A mixed report (several MERGE/DELETE items plus one UNRESOLVED
+        anywhere) returns True."""
+        graph_items = [
+            {'sibling': 'know-live', 'canonical': 'know_live', 'disposition': 'MERGE'},
+            {'sibling': 'pump-web-ui', 'canonical': 'pump_web_ui', 'disposition': 'MERGE'},
+        ]
+        collection_items = [
+            {'source': 'reify_reify', 'target': 'fused_reify', 'disposition': 'MERGE'},
+        ]
+        junk_items = [
+            {'key': 'default', 'node_count': 0, 'disposition': 'DELETE'},
+            {'key': 'my-project', 'node_count': 3, 'disposition': 'UNRESOLVED'},
+        ]
+        report = _mod.build_consolidation_report(
+            graph_items, collection_items, junk_items, dry_run=False,
+        )
+
+        assert _mod.has_unresolved(report) is True
+
+
+# ===========================================================================
 # Tests: rewrite_point_payload_user_id / canonical_user_id_for
 # ===========================================================================
 
