@@ -18,8 +18,10 @@ import pytest
 from escalation.queue import EscalationQueue
 
 from orchestrator.lane_lifecycle import (
+    ACQUIRE_ROUTE_TRANSITIONS,
     ESCALATION_SENTINEL_ROLE,
     LEGAL_TRANSITIONS,
+    AcquireRoute,
     IllegalLaneTransition,
     LaneLifecycle,
     LaneState,
@@ -346,3 +348,40 @@ class TestPoolStorageSentinel:
 
         assert worktree_base.exists()
         assert lifecycle.pool_storage_present() is True
+
+
+# ---------------------------------------------------------------------------
+# AcquireRoute vocabulary + ACQUIRE_ROUTE_TRANSITIONS table (W11 eta): the
+# named route table git_ops.py's _acquire_warm_lane_impl threads through its
+# 7 branches — see test_lane_lifecycle_gitops.py for the GitOps-side writer
+# and route-classification tests.
+# ---------------------------------------------------------------------------
+
+
+class TestAcquireRouteTable:
+    def test_acquire_route_has_exactly_seven_members(self):
+        assert {member.name for member in AcquireRoute} == {
+            'REUSE', 'REUSE_REPAIR', 'CREATE_ONCE_FRESH', 'CREATE_ONCE_REATTACH',
+            'DISK_BACKSTOP_REUSE', 'RESET_IN_PLACE_REATTACH', 'RECYCLE',
+        }
+
+    def test_table_has_an_entry_for_every_route_no_missing_or_extra(self):
+        assert set(ACQUIRE_ROUTE_TRANSITIONS) == set(AcquireRoute)
+
+    def test_every_edge_is_a_from_to_tuple(self):
+        for route, edge in ACQUIRE_ROUTE_TRANSITIONS.items():
+            assert isinstance(edge, tuple) and len(edge) == 2, (
+                f'{route}: expected a (from, to) tuple, got {edge!r}'
+            )
+
+    def test_every_edge_is_a_legal_transition(self):
+        for route, edge in ACQUIRE_ROUTE_TRANSITIONS.items():
+            assert edge in LEGAL_TRANSITIONS, (
+                f'{route}: edge {edge!r} is not a member of LEGAL_TRANSITIONS'
+            )
+
+    def test_every_edge_targets_assigned(self):
+        for route, edge in ACQUIRE_ROUTE_TRANSITIONS.items():
+            assert edge[1] is LaneState.ASSIGNED, (
+                f'{route}: expected edge to target LaneState.ASSIGNED, got {edge[1]!r}'
+            )
