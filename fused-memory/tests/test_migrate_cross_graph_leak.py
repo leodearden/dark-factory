@@ -637,3 +637,83 @@ class TestClassifyNode:
         assert record['edge_count'] == 0
         assert record['episode_count'] == 0
         graphiti._graph_for.assert_called_once_with('reify')
+
+
+# ===========================================================================
+# Tests: run() dry-run (step-13/14)
+# ===========================================================================
+
+class TestRunDryRun:
+    """Tests for async run(args, memory_service) -- dry-run branch (args.apply=False)."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run_enumerates_censuses_classifies_and_builds_manifest(self, monkeypatch):
+        """list_graphs() is enumerated; census_foreign_nodes runs per populated
+        graph; each foreign node found is classified; the result is a
+        build_manifest-shaped dict with dry_run=True, per-graph census
+        counts, and the classified node records.
+
+        'dark_factory' plays two roles here (census subject AND the
+        resolved target of reify's foreign node) and populated_graphs is a
+        set with unordered iteration, so its mock uses a role-aware
+        callable side_effect (dispatching on the Cypher shape) rather than
+        a fixed-order list -- this keeps the test correct regardless of
+        which graph run() happens to enumerate first.
+        """
+        move_mock = AsyncMock(side_effect=AssertionError('must not be called during dry-run'))
+        merge_mock = AsyncMock(side_effect=AssertionError('must not be called during dry-run'))
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+
+        reify_row = _foreign_row('u0', 'dark_factory', name='Alice')
+        reify_graph = _make_graph_mock(ro_side_effect=[
+            _result([reify_row]),  # census: one foreign node
+            _result([[3]]),        # count_node_edges_episodes: RELATES_TO
+            _result([[1]]),        # count_node_edges_episodes: MENTIONS
+        ])
+
+        def _dark_factory_side_effect(cypher, params=None):
+            if 'group_id <>' in cypher:
+                return _result([])  # census: no foreign nodes of its own
+            return _result([])  # presence probe: absent (-> MOVE)
+
+        dark_factory_graph = _make_graph_mock(ro_side_effect=_dark_factory_side_effect)
+
+        memory_service = _make_memory_service({
+            'reify': reify_graph, 'dark_factory': dark_factory_graph,
+        })
+        args = _args(apply=False, page_size=1000)
+
+        manifest = await _mod.run(args, memory_service)
+
+        memory_service.graphiti.list_graphs.assert_awaited_once()
+        assert manifest['dry_run'] is True
+        assert manifest['census'] == {'reify': 1, 'dark_factory': 0}
+        assert len(manifest['nodes']) == 1
+        assert manifest['nodes'][0]['uuid'] == 'u0'
+        assert manifest['nodes'][0]['disposition'] == _mod.MOVE
+        assert manifest['nodes'][0]['target_graph'] == 'dark_factory'
+        assert manifest['exit_code'] == 0
+
+        # Nothing mutated: no .query on either graph, and neither epsilon
+        # primitive was invoked.
+        reify_graph.query.assert_not_called()
+        dark_factory_graph.query.assert_not_called()
+        move_mock.assert_not_awaited()
+        merge_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_with_no_foreign_nodes_returns_empty_manifest(self):
+        """No foreign nodes anywhere -> an empty-but-well-shaped manifest."""
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=False)
+
+        manifest = await _mod.run(args, memory_service)
+
+        assert manifest['nodes'] == []
+        assert manifest['census'] == {'reify': 0, 'dark_factory': 0}
+        assert manifest['summary'] == {'MOVE': 0, 'MERGE': 0, 'UNRESOLVED': 0, 'total': 0}
+        assert manifest['exit_code'] == 0
