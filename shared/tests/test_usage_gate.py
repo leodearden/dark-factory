@@ -1646,9 +1646,9 @@ class TestUncapViaTransition:
         acct.probe_count = 0
         acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
 
-        async def racing_probe(a):
+        async def racing_probe(acct):
             # Simulate _refresh_capped_accounts uncapping this account mid-await.
-            a.phase = AccountPhase.PROBING
+            acct.phase = AccountPhase.PROBING
             return True
 
         gate._run_probe = racing_probe
