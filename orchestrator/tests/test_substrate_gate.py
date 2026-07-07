@@ -1309,22 +1309,41 @@ class TestSubstrateGatePruneChokepoint:
         self, tmp_path: Path, monkeypatch,
     ):
         """The pre-clean loop calls the guarded chokepoint with the
-        'substrate-gate-cleanup' context, not a raw prune subprocess."""
+        'substrate-gate-cleanup' context, not a raw prune subprocess — and
+        does so only after the path-scoped remove has run."""
         h = _make_harness(tmp_path)
+        # h.git_ops is a bare MagicMock, so the default
+        # `refuse_foreign_band(...)` return is a truthy MagicMock and
+        # `not truthy` is False — force it False so the guarded path-scoped
+        # `git worktree remove` branch is actually exercised by this test,
+        # not silently skipped.
+        h.git_ops.refuse_foreign_band = MagicMock(return_value=False)
         assignment = _make_assignment()
+
+        exec_mock = AsyncMock(return_value=_fake_proc(0))
+        # Record how many subprocess calls had happened by the time the prune
+        # chokepoint fires, so we can confirm remove-then-prune ordering
+        # (not just that both happened somewhere during the gate run).
+        exec_calls_before_prune: list[int] = []
+        h.git_ops.prune_worktrees.side_effect = (  # type: ignore[attr-defined]
+            lambda **kw: exec_calls_before_prune.append(len(exec_mock.call_args_list))
+        )
 
         monkeypatch.setattr(
             'orchestrator.substrate_gate.run_substrate_recheck',
             lambda **kw: _pass_verdict(),
         )
-        with patch('asyncio.create_subprocess_exec', new=AsyncMock(
-            return_value=_fake_proc(0)
-        )):
+        with patch('asyncio.create_subprocess_exec', new=exec_mock):
             result = await h._run_substrate_gate(assignment)
 
         assert result is True
         h.git_ops.prune_worktrees.assert_awaited_once_with(  # type: ignore[attr-defined]
             context='substrate-gate-cleanup',
+        )
+        assert exec_calls_before_prune == [1], (
+            f'expected exactly one subprocess call (the path-scoped `git '
+            f'worktree remove`) to precede the prune chokepoint call; '
+            f'got {exec_calls_before_prune!r}'
         )
 
     @pytest.mark.asyncio
@@ -1335,6 +1354,10 @@ class TestSubstrateGatePruneChokepoint:
         ('git', 'worktree', 'prune') argv — prune only happens via the
         chokepoint delegate, asserted above."""
         h = _make_harness(tmp_path)
+        # Force the guard False (see test_preclean_calls_prune_worktrees_with_
+        # context above) so the path-scoped remove branch actually runs here
+        # too, and this test's "no raw prune argv" sweep covers that call.
+        h.git_ops.refuse_foreign_band = MagicMock(return_value=False)
         assignment = _make_assignment()
 
         monkeypatch.setattr(
