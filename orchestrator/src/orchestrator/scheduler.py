@@ -3389,12 +3389,33 @@ class Scheduler:
         one-source-of-truth property).  Returns the empty set immediately
         without awaiting anything when no hook is installed (default None),
         so bare-Scheduler unit tests are unaffected.
+
+        This is a TOTAL function: it never raises.  The hook performs
+        unguarded git I/O (``get_main_sha``/``is_ancestor``) and scheduler
+        writes (``get_status``/``mark_done``) via ``reconcile_landed_task``,
+        any of which can transiently fail.  Each candidate's consult is
+        wrapped individually, so one candidate's failure fails OPEN for that
+        candidate alone (treated as not-gated) and can neither abort the
+        tick nor stop the remaining candidates from being consulted
+        (PROPERTY 1).
         """
         if self._landed_outbox_gate is None:
             return set()
         gated: set[str] = set()
         for tid in candidate_ids:
-            if await self._landed_outbox_gate(tid):
+            try:
+                gated_now = await self._landed_outbox_gate(tid)
+            except Exception:
+                logger.warning(
+                    'Landed-outbox dispatch gate raised for task_id=%s — '
+                    'failing open (task treated as not-gated, dispatch '
+                    'continues) so a git/MCP hiccup can NEVER abort the '
+                    'tick (PROPERTY 1)',
+                    tid,
+                    exc_info=True,
+                )
+                continue
+            if gated_now:
                 gated.add(tid)
         return gated
 
@@ -3878,6 +3899,9 @@ class Scheduler:
         # done inline by the injected hook — dropping it from `candidates`
         # here stops the ghost-loop re-dispatch without touching starvation
         # bookkeeping for a task that is effectively already finished.
+        # _consult_landed_outbox is a TOTAL function (fails open per-candidate
+        # on hook error, PROPERTY 1) — no outer try/except is needed here,
+        # mirroring the _apply_starvation_watchdog wrapper immediately below.
         gated_ids = await self._consult_landed_outbox(
             [str(t.get('id', '')) for t in candidates]
         )
