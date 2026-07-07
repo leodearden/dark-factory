@@ -174,3 +174,90 @@ class TestReconcileLandedOutboxRC3AlreadyDone:
         assert reopened.lookup('Z') is None, 'RC-3 row must be pruned'
         assert report['already_done_pruned'] == 1
         assert report['marked_done'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-7 — scan robustness: empty outbox, error isolation, status-unknown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileLandedOutboxRobustness:
+    """Empty-outbox no-op, per-row error isolation, and the None-status fail-safe."""
+
+    async def test_empty_outbox_returns_all_zero_report_and_makes_no_scheduler_calls(
+        self, tmp_path: Path,
+    ) -> None:
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler()
+
+        report = await reconcile_landed_outbox(outbox, git_ops_recon, scheduler)
+
+        assert report == {
+            'pruned_not_landed': 0,
+            'marked_done': 0,
+            'already_done_pruned': 0,
+            'skipped': 0,
+            'errors': 0,
+        }
+        scheduler.get_status.assert_not_called()
+        scheduler.mark_done.assert_not_called()
+
+    async def test_one_bad_row_does_not_abort_the_scan(self, tmp_path: Path) -> None:
+        """A single row raising during reconcile must not sink the other rows.
+
+        Mirrors recover_pending_merges' fail-open per-record loop: row 'A' is
+        already-done (prune only), row 'BAD' raises inside is_ancestor, row
+        'C' is a genuine RC-2 (drives a done-write) — both good rows must
+        still reach their correct disposition, and the bad row is tallied
+        under 'errors' rather than aborting the whole scan.
+        """
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(task_id='A', branch_tip_sha='tip', advanced_sha='ADV-A', landed_at=1.0))
+        outbox.record(LandedRow(task_id='BAD', branch_tip_sha='tip', advanced_sha='ADV-BAD', landed_at=2.0))
+        outbox.record(LandedRow(task_id='C', branch_tip_sha='tip', advanced_sha='ADV-C', landed_at=3.0))
+
+        def _is_ancestor_side_effect(advanced_sha: str, main_sha: str) -> bool:
+            if advanced_sha == 'ADV-BAD':
+                raise RuntimeError('boom')
+            return True
+
+        def _get_status_side_effect(task_id: str) -> str | None:
+            return {'A': 'done', 'C': 'in-progress'}.get(task_id)
+
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN')
+        git_ops_recon.is_ancestor = AsyncMock(side_effect=_is_ancestor_side_effect)
+        scheduler = _fake_scheduler()
+        scheduler.get_status = AsyncMock(side_effect=_get_status_side_effect)
+
+        report = await reconcile_landed_outbox(outbox, git_ops_recon, scheduler)
+
+        assert outbox.lookup('A') is None, 'row A (already-done) must be pruned'
+        assert outbox.lookup('C') is None, 'row C (RC-2) must be pruned after its done-write'
+        scheduler.mark_done.assert_called_once_with('C', kind='merged', sha='ADV-C')
+        assert report['already_done_pruned'] == 1
+        assert report['marked_done'] == 1
+        assert report['errors'] == 1
+
+    async def test_status_unknown_row_is_left_unconsumed(self, tmp_path: Path) -> None:
+        """A transient get_status() failure (None) must fail-safe: no phantom-done,
+
+        no premature prune — the row survives for the next startup to retry.
+        """
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0))
+
+        reopened = LandedOutbox(path)
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result=None)
+
+        report = await reconcile_landed_outbox(reopened, git_ops_recon, scheduler)
+
+        scheduler.mark_done.assert_not_called()
+        assert reopened.lookup('Z') is not None, (
+            'status-unknown row must be LEFT unconsumed for the next startup to retry'
+        )
+        assert report['skipped'] == 1
