@@ -550,11 +550,12 @@ class TestCountNodeEdgesEpisodes:
 
 def _foreign_node(
     uuid: str, group_id: str, *, name: str = 'N', source_graph: str = 'reify',
+    labels: list[str] | None = None,
 ) -> dict:
     """Build a normalized census-row dict, as returned by census_foreign_nodes."""
     return {
         'uuid': uuid, 'name': name, 'group_id': group_id,
-        'labels': ['Entity'], 'source_graph': source_graph,
+        'labels': labels if labels is not None else ['Entity'], 'source_graph': source_graph,
     }
 
 
@@ -680,6 +681,55 @@ class TestClassifyNode:
         assert record['edge_count'] == 3
         assert record['episode_count'] == 1
         assert graph.ro_query.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_episodic_node_is_episodic_skip_no_presence_probe(self):
+        """A foreign Episodic node (labels=['Episodic']) is never actioned by
+        the :Entity-scoped epsilon primitives (move_entity_across_graphs /
+        merge_foreign_duplicate) or rekey_node_in_place -- classify_node
+        routes it to EPISODIC_SKIP instead of MOVE/MERGE/REKEY, with NO
+        presence probe issued against the target graph (only 'reify', the
+        source graph, is wired into this test's graphs map -- a probe
+        against 'dark_factory' would KeyError). target_graph still carries
+        the informational resolve_target_graph result (where the node WOULD
+        belong, for eta's live relocation); edge_count/episode_count are
+        still read from the source graph."""
+        source_graph = _make_graph_mock(ro_side_effect=[_result([[3]]), _result([[1]])])
+        graphs = {'reify': source_graph}
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        node = _foreign_node(
+            'u0', 'dark_factory', name='Ep1', source_graph='reify', labels=['Episodic'],
+        )
+        populated = {'reify', 'dark_factory'}
+
+        record = await _mod.classify_node(graphiti, node, populated, alias_map=_mod.ALIAS_MAP)
+
+        assert record['disposition'] == _mod.EPISODIC_SKIP
+        assert record['target_graph'] == 'dark_factory'
+        assert record['edge_count'] == 3
+        assert record['episode_count'] == 1
+        graphiti._graph_for.assert_called_once_with('reify')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('labels', [['Community'], []])
+    async def test_non_entity_labels_are_episodic_skip(self, labels):
+        """Any foreign node whose labels do not positively confirm :Entity
+        (a Community node, or a row with no labels at all) is ALSO routed to
+        EPISODIC_SKIP -- only a positively-confirmed :Entity node is ever
+        actioned (fail-safe: 'Entity' not in labels, not 'Episodic' in
+        labels)."""
+        source_graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
+        graphs = {'reify': source_graph}
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        node = _foreign_node('u0', 'dark_factory', source_graph='reify', labels=labels)
+        populated = {'reify', 'dark_factory'}
+
+        record = await _mod.classify_node(graphiti, node, populated, alias_map=_mod.ALIAS_MAP)
+
+        assert record['disposition'] == _mod.EPISODIC_SKIP
+        graphiti._graph_for.assert_called_once_with('reify')
 
 
 # ===========================================================================
