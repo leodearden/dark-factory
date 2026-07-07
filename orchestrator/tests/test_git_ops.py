@@ -427,6 +427,93 @@ class TestWorktreeLifecycle:
         rc, _, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
         assert rc == 0, 'leftover branch must still exist'
 
+    # ── Fix: cold-path γ reattach — resume a reaped-but-retained WIP branch ──
+    # The stranded-in-progress reconciler's stale-lock path removes a
+    # worktree's directory via cleanup_worktree but RETAINS the task branch
+    # when it carries commits beyond main.  On re-dispatch, the cold path
+    # used to treat that leftover branch identically to any other leftover
+    # and raise via _cleanup_leftover_branch — wedging the task BLOCKED
+    # forever.  The γ reattach guard re-attaches the worktree to the
+    # surviving branch (no -b) and resumes, mirroring acquire_warm_lane's
+    # create-once γ reattach site.
+
+    async def test_create_worktree_reattaches_reaped_but_retained_wip_branch(
+        self, git_ops: GitOps,
+    ):
+        """A leftover branch carrying a commit beyond main, whose worktree dir
+        is gone (the reaped-but-retained shape), must be RE-ATTACHED and
+        RESUMED — not destroyed via the old raise-on-leftover-branch path."""
+        full_branch = 'task/lo-commit'
+        # Build the branch with a real commit beyond main via a throwaway
+        # worktree, then remove the worktree so the branch is a dangling ref
+        # (worktree_base/'lo-commit' never existed — the reaped-but-retained
+        # shape: dir gone, branch survives).
+        tmp_wt = git_ops.project_root.parent / 'tmp-lo-commit'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        (tmp_wt / 'orphan_work.py').write_text('value = 42\n')
+        await _run(['git', 'add', '-A'], cwd=tmp_wt)
+        await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root)
+
+        info = await git_ops.create_worktree('lo-commit')
+
+        # Re-attached and resumed — no raise, and the WIP is intact.
+        assert info.path.exists()
+        assert (info.path / 'README.md').exists(), 'must carry main content'
+        assert (info.path / 'orphan_work.py').exists(), 'WIP must be resumed, not destroyed'
+        assert (info.path / 'orphan_work.py').read_text() == 'value = 42\n'
+
+        # The branch must still carry commits beyond main — resumed, not
+        # reset (exact SHA is not asserted: rebase_onto_main +
+        # rebind_branch_to_head may re-parent the commit).
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..{full_branch}'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) > 0, 'branch must still carry commits beyond main'
+
+    async def test_create_worktree_reattach_refuses_when_branch_checked_out_elsewhere(
+        self, git_ops: GitOps,
+    ):
+        """When the γ reattach guard fires but the branch is still checked out
+        in another LIVE worktree, `git worktree add` (no -b) fails — the
+        helper must raise rather than fall through to any destructive
+        cleanup.  The branch, its commit, and the holding worktree's content
+        all survive intact."""
+        full_branch = 'task/lo-live'
+        holding = git_ops.project_root.parent / 'holding-lo-live'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '-b', full_branch, str(holding), 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        (holding / 'live_work.py').write_text('value = 7\n')
+        await _run(['git', 'add', '-A'], cwd=holding)
+        await _run(['git', 'commit', '-m', 'live WIP commit'], cwd=holding)
+        _, commit_sha, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
+        commit_sha = commit_sha.strip()
+        # `holding` is left checked out — worktree_base/'lo-live' (create_worktree's
+        # target) is a distinct, nonexistent path.
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree('lo-live')
+
+        assert 'refus' in str(excinfo.value).lower()
+
+        # The branch and its commit must be preserved (NOT deleted).
+        rc, sha_after, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
+        assert rc == 0, 'leftover branch must still exist'
+        assert sha_after.strip() == commit_sha, 'commit must be preserved'
+
+        # The holding worktree's committed file must survive.
+        assert (holding / 'live_work.py').exists()
+        assert (holding / 'live_work.py').read_text() == 'value = 7\n'
+
     # ── Fix: worktree-wipe race — canonical-path match + liveness gate ────
     # esc-4146-268: reify's `.worktrees` became a symlink → a 17 TB mount on
     # 2026-05-28.  Worktrees whose admin entry was recorded under the symlink
