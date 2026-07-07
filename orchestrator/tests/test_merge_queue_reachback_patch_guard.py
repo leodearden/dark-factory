@@ -37,11 +37,121 @@ _SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'
 _MERGE_QUEUE_PATH = _SRC_DIR / 'merge_queue.py'
 _MERGE_QUEUE_PATCH_PREFIX = 'orchestrator.merge_queue.'
 
+_SATELLITE_MODULES = {
+    'orchestrator.merge_gates',
+    'orchestrator.merge_drift',
+    'orchestrator.merge_shadow',
+    'orchestrator.merge_liveness',
+}
+
+
+def _forbidden_reachback_names() -> set[str]:
+    """The merge_queue-private reach-back patch surface: `_`-prefixed names
+    merge_queue.py re-exports from the four satellite modules via its shim
+    import blocks.
+
+    Derived by AST-parsing merge_queue.py itself rather than a hardcoded
+    list, so the forbidden set self-narrows as later PRD scopes delete names
+    from the shim.
+    """
+    source = _MERGE_QUEUE_PATH.read_text(encoding='utf-8')
+    tree = ast.parse(source, filename=str(_MERGE_QUEUE_PATH))
+    forbidden: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in _SATELLITE_MODULES:
+            forbidden.update(alias.name for alias in node.names if alias.name.startswith('_'))
+    return forbidden
+
+
+def _find_merge_queue_private_patches(source: str, forbidden: set[str]) -> list[tuple[int, str]]:
+    """Return ``(lineno, leaf)`` for each ``patch(...)`` / ``<attr>.patch(...)`` /
+    ``<attr>.setattr(...)`` call in *source* whose first positional argument is
+    a string constant ``orchestrator.merge_queue.<leaf>`` with *leaf* in
+    *forbidden*.
+
+    AST-based (returns ``[]`` on a ``SyntaxError``) so comments, docstrings,
+    and the ``ALLOWLIST`` literal below are never mistaken for a real patch
+    call site.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        is_patch_or_setattr = (
+            (isinstance(func, ast.Attribute) and func.attr in ('patch', 'setattr'))
+            or (isinstance(func, ast.Name) and func.id == 'patch')
+        )
+        if not is_patch_or_setattr:
+            continue
+        first_arg = node.args[0]
+        if not (isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str)):
+            continue
+        if not first_arg.value.startswith(_MERGE_QUEUE_PATCH_PREFIX):
+            continue
+        leaf = first_arg.value[len(_MERGE_QUEUE_PATCH_PREFIX):]
+        if leaf in forbidden:
+            hits.append((node.lineno, leaf))
+    return hits
+
+
+# ALLOWLIST -- the current reach-back patch residual: (relative_test_path,
+# leaf_name) pairs.  This IS the scope-zeta..lambda worklist -- each pair
+# clears only once its consumer's back-import is deleted so the site can
+# repoint to the defining satellite module.  Pre-1 (task 2157) classified
+# every one of these as reach-back-locked: the exercised consumer resolves
+# the name via a function-local `from orchestrator.merge_queue import X`
+# somewhere in src/ (a satellite, or workflow.py), or merge_queue.py's own
+# body references it directly -- so patching the satellite copy would not
+# intercept the call and would turn the test RED.  No pair was safe to
+# repoint opportunistically (see step-3/step-4).
+ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
+    ('test_atomic_train_merge.py', '_check_post_merge_equivalence'),
+    ('test_merge_drift.py', '_run_drift_check'),
+    ('test_merge_gates.py', '_check_post_merge_equivalence'),
+    ('test_merge_gates.py', '_check_post_merge_pyright'),
+    ('test_merge_gates.py', '_rebase_delta_touched_overlap'),
+    ('test_merge_guard_pipeline.py', '_check_plan_targets_in_tree'),
+    ('test_merge_queue.py', '_check_plan_targets_in_tree'),
+    ('test_merge_queue.py', '_check_post_merge_equivalence'),
+    ('test_merge_queue.py', '_check_post_merge_pyright'),
+    ('test_merge_queue.py', '_commit_is_linear'),
+    ('test_merge_queue.py', '_finalize_advanced_merge'),
+    ('test_merge_queue.py', '_rebase_delta_touched_overlap'),
+    ('test_merge_queue.py', '_resolve_second_parent'),
+    ('test_merge_queue.py', '_reverify_rebased_tree'),
+    ('test_merge_queue_concurrent_verify.py', '_maybe_schedule_shadow_compare'),
+    ('test_merge_queue_equivalence.py', '_check_post_merge_pyright'),
+    ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_equivalence'),
+    ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_pyright'),
+    ('test_merge_queue_invariant_integration_gate.py', '_reverify_rebased_tree'),
+    ('test_merge_queue_multihost_wiring.py', '_maybe_run_drift_check'),
+    ('test_merge_queue_multihost_wiring.py', '_maybe_schedule_shadow_compare'),
+    ('test_merge_queue_multihost_wiring.py', '_run_drift_check'),
+    ('test_merge_queue_train_attribution.py', '_finalize_advanced_merge'),
+    ('test_merge_queue_warm_cold_shadow.py', '_maybe_schedule_shadow_compare'),
+    ('test_merge_queue_warm_cold_shadow.py', '_run_cold_shadow_verify'),
+    ('test_merge_queue_warm_cold_shadow.py', '_run_shadow_compare'),
+    ('test_merge_shadow.py', '_run_cold_shadow_verify'),
+    ('test_merge_shadow.py', '_run_shadow_compare'),
+    ('test_merge_speculation.py', '_acquire_warm_verify_worktree'),
+    ('test_merge_speculation.py', '_finalize_advanced_merge'),
+    ('test_merge_speculation.py', '_map_advance_failure'),
+    ('test_merge_speculation.py', '_maybe_run_drift_check'),
+    ('test_merge_speculation.py', '_maybe_schedule_shadow_compare'),
+    ('test_merge_speculation.py', '_reverify_rebased_tree'),
+    ('test_merge_speculation.py', '_run_cold_shadow_verify'),
+    ('test_workflow.py', '_check_plan_files_touched_in_branch'),
+})
+
 
 # ---------------------------------------------------------------------------
 # _find_merge_queue_private_patches(source, forbidden) -- inline-fixture unit
-# tests.  The helper and ALLOWLIST do not exist yet (added in step-2), so
-# every test below fails with NameError until then.
+# tests.
 # ---------------------------------------------------------------------------
 
 
