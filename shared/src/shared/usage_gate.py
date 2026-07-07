@@ -387,11 +387,14 @@ class UsageGate:
         background tasks, firing the ``cap_hit``/``auth_failed`` cost
         events (entering CAPPED/AUTH_FAILED), stamping gate-level
         ``_pause_started_at``/``_paused_reason`` when the edge closes the
-        gate for every account, and recovery bookkeeping when leaving a
-        blocked phase (probe_count reset, pause-time consumption into
-        ``_total_pause_secs``, ``auth_failed_at`` clearing). The
-        ``resumed``/``auth_resumed`` cost events are NOT fired here — they
-        stay in the async callers that carry a probe-count label.
+        gate for every account — and, symmetrically, consuming the elapsed
+        gate-level pause into ``_total_pause_secs`` and clearing
+        ``_pause_started_at`` when an edge reopens the gate — plus recovery
+        bookkeeping when leaving a blocked phase (probe_count reset,
+        per-account pause-time consumption into ``_total_pause_secs``,
+        ``auth_failed_at`` clearing). The ``resumed``/``auth_resumed`` cost
+        events are NOT fired here — they stay in the async callers that
+        carry a probe-count label.
 
         ``clear_near_cap`` defaults to True (the phase write always implies
         a fresh near-cap read for every caller except one): ``release_probe_slot``
@@ -458,6 +461,18 @@ class UsageGate:
             for a in self._accounts
         ):
             self._open.set()
+            # Symmetric counterpart to the closing branch below: consume the
+            # gate-level pause into _total_pause_secs and clear
+            # _pause_started_at on reopen, mirroring the per-account
+            # bookkeeping above. Without this, total_pause_secs (which adds
+            # "now - _pause_started_at" whenever the latter is truthy) would
+            # keep growing forever after the very first full-gate pause, even
+            # while the gate sits open and accounts serve traffic.
+            if self._pause_started_at is not None:
+                self._total_pause_secs += (
+                    datetime.now(UTC) - self._pause_started_at
+                ).total_seconds()
+                self._pause_started_at = None
         else:
             self._open.clear()
             if self._pause_started_at is None:

@@ -1321,6 +1321,33 @@ class TestTransitionSideEffectsLifecycle:
         assert acct.pause_started_at is None
         assert 119 <= gate._total_pause_secs <= 121
 
+    async def test_gate_pause_stops_advancing_once_every_account_reopens(self):
+        """Amendment (reviewer_comprehensive): total_pause_secs must stop
+        growing once an edge reopens the gate. _pause_started_at (the
+        gate-level pause clock, distinct from the per-account
+        pause_started_at covered above) must be consumed into
+        _total_pause_secs and cleared symmetrically to the closing branch —
+        otherwise total_pause_secs keeps growing forever after the very
+        first full-gate pause, even while the gate sits open and accounts
+        serve traffic."""
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+        # Set phase directly (bypassing _transition) and backdate ONLY the
+        # gate-level pause clock, so the per-account pause_started_at block
+        # (acct.pause_started_at stays None) contributes nothing — isolating
+        # the gate-level consumption this amendment adds.
+        acct.phase = AccountPhase.CAPPED
+        gate._pause_started_at = datetime.now(UTC) - timedelta(seconds=120)
+
+        gate._transition(acct, AccountPhase.PROBING)
+
+        assert gate._pause_started_at is None
+        assert 119 <= gate._total_pause_secs <= 121
+
+        # total_pause_secs must not keep advancing now that the gate is open.
+        frozen = gate.total_pause_secs
+        assert gate.total_pause_secs == frozen == gate._total_pause_secs
+
     async def test_transition_from_auth_failed_to_available_clears_auth_failed_at(self):
         gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
         acct = gate._accounts[0]
