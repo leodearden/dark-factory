@@ -2940,6 +2940,8 @@ def create_mcp_server(
         planning_mode: bool = False,
         routing_override_reason: str = '',
         task_kind: str = 'normal',
+        agent_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Phase-1 of two-phase task creation: persist a ticket and return its id immediately.
 
@@ -3005,7 +3007,13 @@ def create_mcp_server(
                 creation time (B10): (1) enum; (2) deterministic without
                 before_done AND always_escalates is ill-formed no-op; (3)
                 before_done is only valid on deterministic tasks.
+            agent_id: Which agent is writing (optional, auto-derived from MCP
+                context). Resolved here for uniform caller-identity attribution
+                across the task write path (task 2175/rho1b); submit_task is a
+                create with no status transition, so it is not forwarded to
+                the interceptor.
         """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -3345,6 +3353,8 @@ def create_mcp_server(
         priority: str | None = None,
         status: str | None = None,
         dependencies: list[str] | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update an existing task.
 
@@ -3387,7 +3397,13 @@ def create_mcp_server(
             priority: New priority (e.g. "high"/"medium"/"low")
             status: New status (e.g. "pending"/"in-progress"/"done")
             dependencies: Replacement list of dependency task ids (top-level only)
+            agent_id: Which agent is writing (optional, auto-derived from MCP
+                context). Resolved here for uniform caller-identity attribution
+                across the task write path (task 2175/rho1b); MCP update_task
+                rejects status= writes, so there is no transition to forward
+                it to on the interceptor.
         """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
             return err
         _normalized = _normalize_project_root(project_root)
