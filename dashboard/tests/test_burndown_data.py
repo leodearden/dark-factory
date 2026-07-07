@@ -2136,7 +2136,7 @@ class TestBurndownNowThreading:
         base = datetime(2026, 3, 1, tzinfo=UTC)
         mock = AsyncMock(return_value=_EMPTY_SERIES)
         with patch('dashboard.data.burndown.get_burndown_series', new=mock):
-            await aggregate_burndown_series([object(), object()], 'proj', days=7, now=base)
+            await aggregate_burndown_series([None, None], 'proj', days=7, now=base)
 
         assert mock.await_count == 2
         nows = [call.kwargs.get('now') for call in mock.await_args_list]
@@ -2150,14 +2150,13 @@ class TestBurndownNowThreading:
         across both per-DB calls (no per-DB clock skew)."""
         mock = AsyncMock(return_value=_EMPTY_SERIES)
         with patch('dashboard.data.burndown.get_burndown_series', new=mock):
-            await aggregate_burndown_series([object(), object()], 'proj', days=7)
+            await aggregate_burndown_series([None, None], 'proj', days=7)
 
         assert mock.await_count == 2
         nows = [call.kwargs.get('now') for call in mock.await_args_list]
-        assert all(n is not None for n in nows), f'expected non-None now, got {nows!r}'
-        assert all(n.tzinfo is not None for n in nows), (
-            f'expected tz-aware now, got {nows!r}'
-        )
+        for n in nows:
+            assert n is not None, f'expected non-None now, got {nows!r}'
+            assert n.tzinfo is not None, f'expected tz-aware now, got {nows!r}'
         assert nows[0] == nows[1], (
             f"expected both per-DB calls to share one resolved now, got {nows!r}"
         )
