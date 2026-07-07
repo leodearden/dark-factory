@@ -159,6 +159,25 @@ In `dashboard/src/dashboard/data/merge_queue.py`:
   only in `utils.py`'s `resolve_now` definition or on lines carrying an
   explicit `# clock-exempt:` justification tag. This is the CI check the brief
   asks for, expressed as a pytest (runs in the same merge verify).
+- **Grandfathered pre-existing debt** (added 2026-07-07, /unblock 2192 —
+  option C). The full-tree scan is retained on purpose — it protects *all* data
+  modules against the next latent-in-siblings clock read; narrowing it would
+  recreate exactly the 692→726 blind spot. But 24 pre-existing bare
+  `datetime.now(` CODE reads live in 7 modules this PRD never converts
+  (metrics.py, scheduler.py, reconciliation.py, write_journal.py,
+  active_tasks.py, redux_api.py, cap_history.py) — and **none is a cross-DB
+  fan-out aggregator** (so none is the task-692 skew shape; they are writers /
+  single-DB cutoffs / age reads / fallbacks). δ tags each with a **distinct**
+  debt marker `# clock-exempt: deferred-consolidation (task 2281)` — still
+  inside the guard's `# clock-exempt:` allow-list, but semantically separate
+  from a correctness exemption (`# clock-exempt: single-capture writer`): it
+  asserts *tracked debt, not safety*, and names the owning task. Task **2281**
+  owns the real conversion (deps 2192, 2218 — runs after ε2 settles the fan-out
+  structure) and is done when
+  `grep -rn 'deferred-consolidation' dashboard/src/dashboard/data/` is empty
+  with the guard still green. This keeps the acceptance criterion greenable in
+  δ's scope without dragging repo-wide consolidation (explicitly deferred by
+  γ's `resolve_now` docstring) into δ.
 
 ### 4. MCP fan-out + TTL cache helper
 
@@ -220,6 +239,16 @@ to find the dashboard reader).
 8. **`resolve_now` lives in `dashboard/data/utils.py`**, not
    `shared.timestamps` — it is dashboard-request-scoping, not a cross-process
    contract; no second consumer exists.
+9. **Full-tree guard + grandfathered debt** (2026-07-07, /unblock 2192): the
+   grep-guard keeps its full `data/*.py` scan (retro-narrowing it would gut its
+   latent-in-siblings purpose). Pre-existing bare reads in the 7 non-converted
+   modules are grandfathered with a distinct `# clock-exempt:
+   deferred-consolidation (task 2281)` marker (tracked debt ≠ correctness
+   exemption); task 2281 owns the real conversion after ε2. Rejected: (A)
+   narrowing the scan (recreates the blind spot the guard exists to close),
+   (B) expanding δ to convert all 7 now (scope creep + δ↔ε2 tangle in
+   scheduler/metrics; contradicts γ's documented repo-wide-consolidation
+   deferral).
 
 ## Pre-conditions
 
@@ -282,12 +311,16 @@ Labels α…ζ; deps in parentheses. Signals are the G2 user-observable signals.
   Files: `dashboard/src/dashboard/data/burndown.py`,
   `dashboard/src/dashboard/data/merge_queue.py`,
   `dashboard/src/dashboard/app.py`, `dashboard/tests/test_burndown_data.py`,
-  `dashboard/tests/test_clock_discipline.py` (new).
+  `dashboard/tests/test_clock_discipline.py` (new), plus a mechanical
+  comment-only tag pass over the 7 grandfathered modules (metrics.py,
+  scheduler.py, reconciliation.py, write_journal.py, active_tasks.py,
+  redux_api.py, cap_history.py — see §3 "Grandfathered pre-existing debt";
+  behavior-preserving, tags only).
   Signal: `aggregate_burndown_series` over two DBs with injected `now` uses one
   shared cutoff; the guard test FAILS if a bare `datetime.now(` is introduced
   anywhere in `dashboard/src/dashboard/data/*.py` outside `resolve_now` /
   `# clock-exempt:`-tagged lines (verified by the test's own negative fixture),
-  and PASSES on the converted tree.
+  and PASSES on the converted-and-grandfather-tagged tree.
   Consumer: burndown dashboard panel; the guard protects all data modules.
 
 - **ε1 — Extract mcp_fanout helper (first_success + TTLCache); convert memory.py + tasks.py** (medium)
