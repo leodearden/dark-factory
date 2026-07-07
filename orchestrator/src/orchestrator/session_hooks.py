@@ -184,3 +184,42 @@ def run_session_start(
         session_registry.write_record(record, root=root)
         return record
     return session_registry.refresh_record(slug, root=root, status=session_registry.Status.RUNNING)
+
+
+# ---------------------------------------------------------------------------
+# Notification / Stop handlers: refresh status, return the OSC retitle
+# ---------------------------------------------------------------------------
+
+
+def _run_status_refresh_and_retitle(
+    hook_input: Mapping[str, Any],
+    env: Mapping[str, str],
+    root: Path | str | None,
+    status: session_registry.Status,
+) -> str:
+    """Shared refresh-then-retitle body for run_notification/run_stop."""
+    identity = resolve_hook_identity(hook_input, env)
+    slug = hook_session_slug(hook_input, env)
+    record = session_registry.refresh_record(slug, root=root, status=status)
+    title = hook_display_title(identity, env, record)
+    return osc_retitle_sequence(status, title)
+
+
+def run_notification(
+    hook_input: Mapping[str, Any],
+    env: Mapping[str, str],
+    root: Path | str | None = None,
+) -> str:
+    """Notification hook handler: status -> AWAITING_INPUT, return its OSC retitle."""
+    return _run_status_refresh_and_retitle(
+        hook_input, env, root, session_registry.Status.AWAITING_INPUT
+    )
+
+
+def run_stop(
+    hook_input: Mapping[str, Any],
+    env: Mapping[str, str],
+    root: Path | str | None = None,
+) -> str:
+    """Stop hook handler: status -> IDLE, return its OSC retitle."""
+    return _run_status_refresh_and_retitle(hook_input, env, root, session_registry.Status.IDLE)
