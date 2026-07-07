@@ -395,9 +395,8 @@ class TargetedReconciler:
             # enumerates Mem0/Qdrant only — it does not query Graphiti. A
             # superseding/resolution memory routed to Graphiti (e.g. written to
             # decisions_and_rationale, entities_and_relations, or temporal_facts)
-            # is invisible to this pre-check. The primary real-world trigger —
-            # Stage 2's stage2_suppress completion-note guard (see
-            # _STAGE2_SUPPRESS_KEY above) — writes observations_and_summaries
+            # is invisible to this pre-check. The primary intended trigger
+            # (Stage-2 knowledge-sync echoes) writes observations_and_summaries
             # to Mem0, so this is acceptable today, but a Graphiti-resident
             # resolution will not suppress a stale description here.
             try:
