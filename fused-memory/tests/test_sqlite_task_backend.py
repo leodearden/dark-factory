@@ -212,6 +212,74 @@ async def test_add_task_without_title_or_prompt_raises(backend, project_root):
     assert 'prompt' in exc.value.message
 
 
+# ── write-boundary validation (task 2162, warn-mode census) ──────────
+
+
+@pytest.mark.asyncio
+async def test_add_task_warn_mode_emits_schema_warning_and_proceeds(
+    backend, project_root, caplog,
+):
+    """Warn-mode add_task: an invariant-violating metadata write still lands.
+
+    ``{"task_kind": "deterministic"}`` violates TaskMetadata's cross-field
+    invariant (I3) — a deterministic task requires ``before_done`` or
+    ``always_escalates``. The default backend is warn-mode
+    (``task_metadata_enforce=False``), so exactly one
+    ``task_metadata.schema_warning`` census line is emitted (carrying the new
+    task's id, the offending field, and the error), and the write proceeds:
+    the task is created and its metadata is stored raw/unchanged.
+    """
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({'task_kind': 'deterministic'}),
+        )
+
+    census_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'task_metadata.schema_warning' in r.message
+    ]
+    assert len(census_msgs) == 1, (
+        f'Expected exactly one task_metadata.schema_warning census line; got '
+        f'{len(census_msgs)}: {census_msgs}'
+    )
+    combined = census_msgs[0]
+    assert f'task_id={dto["id"]}' in combined, (
+        f'Expected labeled task_id={dto["id"]!r} token in census line; got: {combined!r}'
+    )
+    assert '<metadata>' in combined, (
+        f'Expected the whole-metadata sentinel field in census line; got: {combined!r}'
+    )
+    assert 'before_done' in combined, (
+        f'Expected the invariant error text in census line; got: {combined!r}'
+    )
+
+    # The write proceeded: the task exists and its metadata is preserved raw
+    # (original bytes — no repair, no schema_version stamp).
+    task = await backend.get_task(dto['id'], project_root=project_root)
+    assert task['metadata'] == {'task_kind': 'deterministic'}
+
+
+@pytest.mark.asyncio
+async def test_add_task_valid_metadata_emits_no_schema_warning(
+    backend, project_root, caplog,
+):
+    """A schema-clean metadata write emits zero task_metadata.schema_warning lines."""
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({'files': ['a.py']}),
+        )
+
+    census_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'task_metadata.schema_warning' in r.message
+    ]
+    assert census_msgs == [], (
+        f'Expected no task_metadata.schema_warning lines for valid metadata; got: {census_msgs}'
+    )
+
+
 @pytest.mark.asyncio
 async def test_get_task_not_found_raises(backend, project_root):
     await backend.add_task(project_root=project_root, title='one')
