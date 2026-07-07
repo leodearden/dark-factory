@@ -155,10 +155,15 @@ def test_merge_request_carries_first_enqueued_at_field():
 
 @pytest.mark.asyncio
 async def test_first_submission_stamps_and_persists():
-    """First call stamps time.time() into metadata, persists, and returns the value.
+    """First call stamps time.time(), persists under retry_ledger, returns a float.
 
-    RED: _stamp_first_merge_enqueue does not exist yet.
-    GREEN after step-4 adds the minimal implementation.
+    α typed ``RetryLedger.merge_first_enqueued_at`` as ``str | None`` (the
+    runtime value is a float epoch); the persisted/in-memory ledger carries
+    ``str(epoch)`` while the method's return value stays a float
+    (``float(str(x)) == x`` round-trip).
+
+    RED: _stamp_first_merge_enqueue still writes the legacy top-level float key.
+    GREEN after step-12 migrates it onto metadata['retry_ledger'].
     """
     f = _make(metadata={}, get_task_metadata={})
 
@@ -167,10 +172,11 @@ async def test_first_submission_stamps_and_persists():
         result = await f.wf._stamp_first_merge_enqueue()
 
     assert result == 1000.0
-    assert f.wf.task['metadata']['merge_first_enqueued_at'] == 1000.0
+    assert isinstance(result, float)
+    assert f.wf.task['metadata']['retry_ledger']['merge_first_enqueued_at'] == str(1000.0)
 
     persisted = _persisted_metadata(f.update_task)
-    assert persisted['merge_first_enqueued_at'] == 1000.0
+    assert persisted['retry_ledger']['merge_first_enqueued_at'] == str(1000.0)
     f.update_task.assert_awaited_once()
 
 
@@ -181,22 +187,27 @@ async def test_first_submission_stamps_and_persists():
 
 @pytest.mark.asyncio
 async def test_write_once_resubmit_preserves_original():
-    """In-memory value already set → return original, no re-stamp, no persist.
+    """In-memory retry_ledger value already set → return original, no re-stamp, no persist.
 
     Models a task re-dispatch after block/resolve where scheduler has reloaded
-    metadata from backend so the in-memory dict already carries the original value.
+    metadata from backend so the in-memory dict already carries the original
+    value (as ``str(epoch)``, the typed ledger's on-disk shape).
 
-    RED: minimal step-4 helper unconditionally re-stamps and persists.
-    GREEN after step-6 adds the fast-path guard.
+    RED: current implementation reads the legacy top-level key, not the ledger.
+    GREEN after step-12 adds the retry_ledger fast-path guard.
     """
-    f = _make(metadata={'merge_first_enqueued_at': 111.0}, get_task_metadata={})
+    f = _make(
+        metadata={'retry_ledger': {'merge_first_enqueued_at': str(111.0)}},
+        get_task_metadata={},
+    )
 
     with patch('orchestrator.workflow.time') as mock_time:
         mock_time.time.return_value = 999.0
         result = await f.wf._stamp_first_merge_enqueue()
 
     assert result == 111.0
-    assert f.wf.task['metadata']['merge_first_enqueued_at'] == 111.0
+    assert isinstance(result, float)
+    assert f.wf.task['metadata']['retry_ledger']['merge_first_enqueued_at'] == str(111.0)
     f.update_task.assert_not_awaited()
 
 
@@ -207,23 +218,63 @@ async def test_write_once_resubmit_preserves_original():
 
 @pytest.mark.asyncio
 async def test_backend_value_adopted_not_restamped():
-    """Backend has merge_first_enqueued_at; stale in-memory copy does not.
+    """Backend has merge_first_enqueued_at under retry_ledger; stale in-memory copy does not.
 
     Slow path: in-memory metadata is empty but the backend already persisted a
-    value.  _merge_fresh_metadata should surface it and the helper should adopt
-    it without re-stamping or re-persisting.
+    value (as ``str(epoch)``).  _merge_fresh_metadata should surface it and the
+    helper should adopt it (returning a float) without re-stamping or re-persisting.
 
-    RED: step-6 helper, on empty in-memory metadata, ignores backend and stamps.
-    GREEN after step-8 inserts the _merge_fresh_metadata backend-read.
+    RED: current implementation checks the legacy top-level backend key, not
+    the nested ledger.
+    GREEN after step-12 checks fresh.get('retry_ledger').
     """
-    f = _make(metadata={}, get_task_metadata={'merge_first_enqueued_at': 555.0})
+    f = _make(
+        metadata={},
+        get_task_metadata={'retry_ledger': {'merge_first_enqueued_at': str(555.0)}},
+    )
 
     with patch('orchestrator.workflow.time') as mock_time:
         mock_time.time.return_value = 999.0
         result = await f.wf._stamp_first_merge_enqueue()
 
     assert result == 555.0
-    assert f.wf.task['metadata']['merge_first_enqueued_at'] == 555.0
+    assert isinstance(result, float)
+    assert f.wf.task['metadata']['retry_ledger']['merge_first_enqueued_at'] == str(555.0)
+    f.update_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Legacy top-level fallback — in-flight task stamped by pre-migration code
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_legacy_top_level_first_enqueued_at_adopted():
+    """A legacy top-level float (no retry_ledger at all) is adopted, not re-stamped.
+
+    Models an in-flight task whose ``merge_first_enqueued_at`` was stamped by
+    pre-migration code at the old top-level metadata key, with no
+    ``retry_ledger`` blob present yet.  The fast-path legacy fallback must
+    return the original epoch as a float, restore it under
+    ``retry_ledger`` in memory (so subsequent calls take the ledger
+    fast-path), and must not re-stamp or persist — the value is already
+    durable on the backend under the old key.
+
+    RED: current implementation has no retry_ledger concept at all — it reads
+    this exact top-level key directly, so this test alone would not
+    distinguish old from new behaviour; it starts failing once step-12's
+    ledger-first fast-path is added without a legacy fallback (which would
+    otherwise ignore the top-level key and re-stamp).
+    """
+    f = _make(metadata={'merge_first_enqueued_at': 222.0}, get_task_metadata={})
+
+    with patch('orchestrator.workflow.time') as mock_time:
+        mock_time.time.return_value = 999.0
+        result = await f.wf._stamp_first_merge_enqueue()
+
+    assert result == 222.0
+    assert isinstance(result, float)
+    assert f.wf.task['metadata']['retry_ledger']['merge_first_enqueued_at'] == str(222.0)
     f.update_task.assert_not_awaited()
 
 
@@ -236,8 +287,14 @@ async def test_backend_value_adopted_not_restamped():
 async def test_persistence_failure_is_non_fatal():
     """update_task raising RuntimeError must not propagate; in-memory stamp applied.
 
-    RED: step-8 helper lets the RuntimeError propagate.
-    GREEN after step-10 wraps update_task in a logged try/except.
+    Unlike the three anti-thrash guards (which now escalate to a human on
+    persist failure), the first-enqueue stamp keeps the old best-effort
+    behaviour: losing the epoch only perturbs merge-queue aging order
+    (self-correcting), it is not a money-burning loop guard. No escalation.
+
+    RED: current implementation persists the legacy top-level key.
+    GREEN after step-12 persists metadata['retry_ledger'] and keeps the same
+    non-fatal try/except (no _mark_blocked call).
     """
     f = _make(
         metadata={},
@@ -251,7 +308,8 @@ async def test_persistence_failure_is_non_fatal():
         result = await f.wf._stamp_first_merge_enqueue()
 
     assert result == 1000.0
-    assert f.wf.task['metadata']['merge_first_enqueued_at'] == 1000.0
+    assert f.wf.task['metadata']['retry_ledger']['merge_first_enqueued_at'] == str(1000.0)
+    f.mark_blocked.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -266,15 +324,15 @@ async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
 ):
     """_submit_to_merge_queue passes merge_first_enqueued_at=111.0 to MergeRequest.
 
-    Metadata pre-seeded with merge_first_enqueued_at=111.0 (write-once fast-path),
-    so update_task should NOT be awaited (no re-stamp).
+    Metadata pre-seeded with retry_ledger.merge_first_enqueued_at=str(111.0)
+    (write-once fast-path), so update_task should NOT be awaited (no re-stamp).
 
     RED: _submit_to_merge_queue constructs MergeRequest without the new field.
     GREEN after step-12 calls _stamp_first_merge_enqueue and threads the result in.
     """
     f = _make(
-        metadata={'merge_first_enqueued_at': 111.0},
-        get_task_metadata={'merge_first_enqueued_at': 111.0},
+        metadata={'retry_ledger': {'merge_first_enqueued_at': str(111.0)}},
+        get_task_metadata={'retry_ledger': {'merge_first_enqueued_at': str(111.0)}},
     )
     wf = f.wf
     wf.worktree = tmp_path / 'wt'

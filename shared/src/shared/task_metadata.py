@@ -14,7 +14,9 @@ strict ``__all__`` union assertion untouched).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Callable
 from typing import Literal
 
@@ -127,6 +129,20 @@ class ExternalDep(BaseModel):
         return f'{self.project_id}:{self.task_id}'
 
 
+# Regexes used by RetryLedger.normalize_cause_hint — compiled once at module
+# level. Order of application: ANSI first (so coloured file:line refs are
+# cleaned before the file:line pattern matches them), then file:line, then
+# whitespace. Ported verbatim from the orchestrator (formerly
+# orchestrator.workflow._ANSI_ESCAPE_RE et al.) so this model is the single
+# signature-keying authority (PRD §5 / task 2172).
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
+_FILE_LINE_RE = re.compile(
+    r'\b[\w./\\-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cpp|c|h|sh|md|yaml|yml|json|toml)'
+    r':\d+(:\d+)?\b'
+)
+_WHITESPACE_RE = re.compile(r'\s+')
+
+
 class RetryLedger(BaseModel):
     """``metadata.retry_ledger`` — anti-thrash counters (PRD §5).
 
@@ -144,6 +160,58 @@ class RetryLedger(BaseModel):
     consecutive_merge_thrash: int = 0
     last_merge_outcome_signature: str | None = None
     merge_first_enqueued_at: str | None = None
+
+    @staticmethod
+    def normalize_cause_hint(hint: str | None) -> str:
+        """Normalise a VerifyResult cause_hint for equality comparison.
+
+        Strips ANSI colour escape sequences, removes file:line (and
+        file:line:col) numeric tails, collapses contiguous whitespace to a
+        single space, lowercases, and strips leading/trailing whitespace.
+
+        Returns an empty string for empty or None input — never raises.
+
+        Used by the verify-loop and merge-outcome anti-thrash guards to
+        detect consecutive identical failures even when line numbers shift
+        between retries. This is the single signature-keying authority;
+        ``orchestrator.workflow._normalize_cause_hint`` is a thin delegator
+        kept for backward-compatible imports.
+        """
+        if not hint:
+            return ''
+        # 1. Strip ANSI colour codes (e.g. \x1b[31m...\x1b[0m) first so that
+        #    coloured file:line references like \x1b[31mfoo.py:42\x1b[0m
+        #    become plain foo.py:42 before the file:line pattern runs.
+        result = _ANSI_ESCAPE_RE.sub('', hint)
+        # 2. Strip file:line and file:line:col numeric tails
+        #    (e.g. "tests/test_x.py:42" or "foo.py:42:7").
+        result = _FILE_LINE_RE.sub('', result)
+        # 3. Collapse contiguous whitespace (spaces, tabs, newlines) to one space.
+        result = _WHITESPACE_RE.sub(' ', result)
+        # 4. Lowercase and strip.
+        return result.lower().strip()
+
+    @staticmethod
+    def compute_merge_outcome_signature(
+        category: str | None,
+        cause_hint: str | None,
+        fallback_reason: str = '',
+    ) -> str:
+        """Compute a 16-hex-char sha-independent outcome signature from explicit fields.
+
+        Keys on (category, normalised cause_hint) when either field is set;
+        falls back to sha256(normalised_reason) when both are empty — same
+        logic as ``TaskWorkflow._merge_outcome_signature()``, which delegates
+        here (via ``orchestrator.workflow._compute_merge_outcome_signature``)
+        so the hash algorithm stays in one place.
+        """
+        cat = category or ''
+        hint = cause_hint or ''
+        if cat or hint:
+            basis = (cat + '\x1f' + RetryLedger.normalize_cause_hint(hint)).encode('utf-8')
+        else:
+            basis = RetryLedger.normalize_cause_hint(fallback_reason or '').encode('utf-8')
+        return hashlib.sha256(basis).hexdigest()[:16]
 
 
 class TaskMetadata(BaseModel):

@@ -4,8 +4,10 @@ thrash counters.
 PRD § 9.8 — train members have their own loop-guard (γ₂/task 1523) for
 verify-phase thrash and the train-merge worker owns the merge phase.  The
 existing consecutive_infra_resume_failures and consecutive_merge_thrash
-counters add no value for train members and risk false-trips on legitimate
-merge-deferred → merge-deferred re-stamps.
+counters (carried inside the typed ``metadata.retry_ledger`` blob — see
+:class:`shared.task_metadata.RetryLedger`) add no value for train members
+and risk false-trips on legitimate merge-deferred → merge-deferred
+re-stamps.
 
 Guard shape: `if isinstance(metadata.get('train'), dict): return None`
 inserted immediately after `metadata = self.task.get('metadata') or {}`
@@ -164,8 +166,10 @@ async def test_infra_resume_thrash_fires_for_non_train():
     f = _make(
         metadata={
             # No 'train' key — non-train task
-            'consecutive_infra_resume_failures': 2,
-            'last_infra_resume_iteration_count': 5,
+            'retry_ledger': {
+                'consecutive_infra_resume_failures': 2,
+                'last_infra_resume_iteration_count': 5,
+            },
         },
         resolved_l0s=[_esc(category='infra_issue')],
         iteration_log=[{'iteration': i} for i in range(5)],  # unchanged → counter increments
@@ -211,8 +215,10 @@ async def test_merge_outcome_thrash_fires_for_non_train():
     f = _make(
         metadata={
             # No 'train' key — non-train task
-            'consecutive_merge_thrash': 2,
-            'last_merge_outcome_signature': 'sig-xyz',
+            'retry_ledger': {
+                'consecutive_merge_thrash': 2,
+                'last_merge_outcome_signature': 'sig-xyz',
+            },
         },
         max_consecutive_merge_thrash=3,
     )

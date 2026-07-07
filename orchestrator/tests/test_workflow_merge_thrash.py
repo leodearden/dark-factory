@@ -2,7 +2,8 @@
 
 Mirrors :mod:`test_workflow_infra_thrash`: builds a minimal
 :class:`TaskWorkflow` with mocks and drives ``_check_merge_outcome_thrash``
-directly to assert state transitions.
+directly to assert state transitions. The counter lives inside the typed
+``metadata.retry_ledger`` blob (:class:`shared.task_metadata.RetryLedger`).
 
 Signature (a sha256-short fingerprint of the blocked-reason text) keys the
 counter.  Same signature on consecutive REQUEUED outcomes → counter
@@ -118,8 +119,10 @@ async def test_signature_match_at_threshold_promotes_to_l1():
     """Two consecutive identical signatures (default threshold=2) → escalate_to_human=True."""
     f = _make(
         metadata={
-            'consecutive_merge_thrash': 1,
-            'last_merge_outcome_signature': 'sig-abc',
+            'retry_ledger': {
+                'consecutive_merge_thrash': 1,
+                'last_merge_outcome_signature': 'sig-abc',
+            },
         },
         max_consecutive_merge_thrash=2,
     )
@@ -141,8 +144,10 @@ async def test_signature_mismatch_resets_counter():
     """Different verdict on second attempt → counter resets to 1."""
     f = _make(
         metadata={
-            'consecutive_merge_thrash': 1,
-            'last_merge_outcome_signature': 'sig-abc',
+            'retry_ledger': {
+                'consecutive_merge_thrash': 1,
+                'last_merge_outcome_signature': 'sig-abc',
+            },
         },
     )
 
@@ -152,10 +157,11 @@ async def test_signature_mismatch_resets_counter():
 
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_merge_thrash'] == 1, (
+    ledger = md['retry_ledger']
+    assert ledger['consecutive_merge_thrash'] == 1, (
         f'Counter must reset to 1 on signature mismatch, got {md}'
     )
-    assert md['last_merge_outcome_signature'] == 'sig-xyz'
+    assert ledger['last_merge_outcome_signature'] == 'sig-xyz'
     f.mark_blocked.assert_not_awaited()
 
 
@@ -170,8 +176,9 @@ async def test_first_signature_below_threshold_falls_through():
 
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_merge_thrash'] == 1
-    assert md['last_merge_outcome_signature'] == 'sig-1'
+    ledger = md['retry_ledger']
+    assert ledger['consecutive_merge_thrash'] == 1
+    assert ledger['last_merge_outcome_signature'] == 'sig-1'
 
 
 @pytest.mark.asyncio
@@ -179,8 +186,10 @@ async def test_threshold_is_configurable():
     """max_consecutive_merge_thrash=3 → promotion happens one cycle later."""
     f = _make(
         metadata={
-            'consecutive_merge_thrash': 1,
-            'last_merge_outcome_signature': 'sig-abc',
+            'retry_ledger': {
+                'consecutive_merge_thrash': 1,
+                'last_merge_outcome_signature': 'sig-abc',
+            },
         },
         max_consecutive_merge_thrash=3,
     )
@@ -191,17 +200,23 @@ async def test_threshold_is_configurable():
     )
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_merge_thrash'] == 2
+    assert md['retry_ledger']['consecutive_merge_thrash'] == 2
     f.mark_blocked.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_corrupt_counter_metadata_treated_as_zero():
-    """Non-int counter (legacy task) must not crash the helper."""
+    """Non-int counter (legacy task) must not crash the helper.
+
+    RetryLedger validation fails on the whole blob (not just the bad field),
+    so the ledger resets to all-zeros rather than raising.
+    """
     f = _make(
         metadata={
-            'consecutive_merge_thrash': 'two',  # corrupt
-            'last_merge_outcome_signature': 'sig-abc',
+            'retry_ledger': {
+                'consecutive_merge_thrash': 'two',  # corrupt
+                'last_merge_outcome_signature': 'sig-abc',
+            },
         },
     )
 
@@ -212,27 +227,93 @@ async def test_corrupt_counter_metadata_treated_as_zero():
     # corrupt counter → 0; matching signature → 1; below threshold → None
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_merge_thrash'] == 1
+    assert md['retry_ledger']['consecutive_merge_thrash'] == 1
 
 
 @pytest.mark.asyncio
-async def test_metadata_persistence_failure_is_non_fatal():
-    """If scheduler.update_task raises, the routing decision still holds."""
-    f = _make(
-        metadata={
-            'consecutive_merge_thrash': 1,
-            'last_merge_outcome_signature': 'sig-abc',
-        },
-        update_task_raises=True,
-    )
+async def test_non_dict_retry_ledger_treated_as_fresh_ledger():
+    """A non-dict ``retry_ledger`` blob must not crash via ``TypeError``.
+
+    ``RetryLedger(**raw)`` raises ``TypeError`` (not ``ValidationError``) if
+    ``raw`` isn't a mapping — must reset to a fresh all-zero ledger instead
+    of propagating the exception.
+    """
+    f = _make(metadata={'retry_ledger': 'garbage'})
 
     outcome = await f.wf._check_merge_outcome_thrash(
         prev_signature='sig-abc', current_signature='sig-abc',
     )
 
-    # Threshold hit → BLOCKED despite persistence failure
+    # Fresh ledger has no prev signature → resets to 1 regardless of the
+    # caller-supplied prev_signature; below threshold (default 2) → None.
+    assert outcome is None
+    md = _persisted_metadata(f.update_task)
+    assert md['retry_ledger']['consecutive_merge_thrash'] == 1
+    assert md['retry_ledger']['last_merge_outcome_signature'] == 'sig-abc'
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_escalates_to_human():
+    """If scheduler.update_task raises, the counter can't be trusted to have
+    landed — escalate to a human immediately rather than logging and
+    proceeding (a lost increment would let the merge-thrash loop under-fire).
+
+    This is true even below threshold: persist failure always escalates,
+    regardless of the counter values themselves.
+    """
+    f = _make(
+        metadata={'retry_ledger': {'consecutive_merge_thrash': 0}},
+        update_task_raises=True,
+        max_consecutive_merge_thrash=3,
+    )
+
+    outcome = await f.wf._check_merge_outcome_thrash(
+        prev_signature=None, current_signature='sig-abc',
+    )
+
     assert outcome == WorkflowOutcome.BLOCKED
     f.mark_blocked.assert_awaited_once()
+    _, kwargs = f.mark_blocked.await_args
+    assert kwargs.get('escalate_to_human') is True
+
+
+@pytest.mark.asyncio
+async def test_caller_reads_prev_signature_from_retry_ledger():
+    """Pin the write location the merge-loop caller now reads.
+
+    ``_run_merge_phase`` reads ``prev_signature`` from
+    ``metadata['retry_ledger']['last_merge_outcome_signature']`` (not the old
+    top-level key). The guard must persist to exactly that nested path so a
+    caller re-reading it on the next iteration observes the value it just
+    wrote.
+    """
+    f = _make(
+        metadata={'retry_ledger': {'consecutive_merge_thrash': 1}},
+        max_consecutive_merge_thrash=2,
+    )
+
+    await f.wf._check_merge_outcome_thrash(
+        prev_signature=None, current_signature='sig-abc',
+    )
+    persisted = _persisted_metadata(f.update_task)
+    assert 'last_merge_outcome_signature' not in persisted, (
+        f'Signature must not be persisted at the legacy top-level key; got {persisted}'
+    )
+    assert persisted['retry_ledger']['last_merge_outcome_signature'] == 'sig-abc'
+
+    # Simulate the caller re-reading metadata['retry_ledger'][...] on the
+    # next iteration and feeding it back in as prev_signature.
+    f.wf.task['metadata'] = persisted
+    caller_read_prev_signature = (
+        (f.wf.task.get('metadata') or {}).get('retry_ledger') or {}
+    ).get('last_merge_outcome_signature')
+    assert caller_read_prev_signature == 'sig-abc'
+
+    outcome = await f.wf._check_merge_outcome_thrash(
+        prev_signature=caller_read_prev_signature, current_signature='sig-abc',
+    )
+
+    assert outcome == WorkflowOutcome.BLOCKED
 
 
 @pytest.mark.asyncio
@@ -437,7 +518,7 @@ async def test_stable_signature_reaches_threshold_and_escalates():
     escalate_to_human=True.
     """
     f = _make(
-        metadata={'consecutive_merge_thrash': 1},
+        metadata={'retry_ledger': {'consecutive_merge_thrash': 1}},
         max_consecutive_merge_thrash=2,
     )
     wf = f.wf
@@ -448,8 +529,9 @@ async def test_stable_signature_reaches_threshold_and_escalates():
     wf._last_merge_block_reason = 'Post-merge verification failed: tests failed\n\nfirst attempt'
     first_sig = wf._merge_outcome_signature()  # type: ignore[attr-defined]
 
-    # Persist the first sig as prev_signature (simulates the prior iteration)
-    wf.task['metadata']['last_merge_outcome_signature'] = first_sig
+    # Persist the first sig as prev_signature (simulates the prior iteration),
+    # nested under retry_ledger — the shape the caller now reads/writes.
+    wf.task['metadata']['retry_ledger']['last_merge_outcome_signature'] = first_sig
 
     # Simulate second failure — same fingerprint but prose differs (line num shifts)
     wf._last_merge_failure_cause_hint = 'StatusBar.tsx:58 error TS2322'  # type: ignore[attr-defined]
@@ -474,7 +556,7 @@ async def test_stable_signature_reaches_threshold_and_escalates():
 async def test_genuinely_different_fingerprint_resets_counter_to_1():
     """task-1688 step-5: different fingerprint resets counter to 1, no escalation."""
     f = _make(
-        metadata={'consecutive_merge_thrash': 1},
+        metadata={'retry_ledger': {'consecutive_merge_thrash': 1}},
         max_consecutive_merge_thrash=2,
     )
     wf = f.wf
@@ -498,7 +580,7 @@ async def test_genuinely_different_fingerprint_resets_counter_to_1():
 
     assert outcome is None
     md = _persisted_metadata(f.update_task)
-    assert md['consecutive_merge_thrash'] == 1, (
+    assert md['retry_ledger']['consecutive_merge_thrash'] == 1, (
         f'Counter must reset to 1 on different fingerprint, got {md}'
     )
     f.mark_blocked.assert_not_awaited()
@@ -519,13 +601,13 @@ async def test_thrash_threshold_passes_stable_root_cause_to_mark_blocked():
     """
     # Instance A
     fa = _make(
-        metadata={'consecutive_merge_thrash': 1},
+        metadata={'retry_ledger': {'consecutive_merge_thrash': 1}},
         max_consecutive_merge_thrash=2,
     )
     fa.wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
     fa.wf._last_merge_failure_cause_hint = 'StatusBar.tsx:42 error TS2322: Type X not assignable'  # type: ignore[attr-defined]
     sig_a = fa.wf._merge_outcome_signature()  # type: ignore[attr-defined]
-    fa.wf.task['metadata']['last_merge_outcome_signature'] = sig_a
+    fa.wf.task['metadata']['retry_ledger']['last_merge_outcome_signature'] = sig_a
     outcome_a = await fa.wf._check_merge_outcome_thrash(
         prev_signature=sig_a, current_signature=sig_a,
     )
@@ -538,13 +620,13 @@ async def test_thrash_threshold_passes_stable_root_cause_to_mark_blocked():
 
     # Instance B — same fingerprint (line number differs only)
     fb = _make(
-        metadata={'consecutive_merge_thrash': 1},
+        metadata={'retry_ledger': {'consecutive_merge_thrash': 1}},
         max_consecutive_merge_thrash=2,
     )
     fb.wf._last_merge_failure_category = 'gui_tsc'  # type: ignore[attr-defined]
     fb.wf._last_merge_failure_cause_hint = 'StatusBar.tsx:58 error TS2322: Type X not assignable'  # type: ignore[attr-defined]
     sig_b = fb.wf._merge_outcome_signature()  # type: ignore[attr-defined]
-    fb.wf.task['metadata']['last_merge_outcome_signature'] = sig_b
+    fb.wf.task['metadata']['retry_ledger']['last_merge_outcome_signature'] = sig_b
     outcome_b = await fb.wf._check_merge_outcome_thrash(
         prev_signature=sig_b, current_signature=sig_b,
     )

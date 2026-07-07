@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
-import hashlib
 import json
 import logging
 import os
@@ -27,6 +26,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 # nothing in it imports orchestrator.
 from escalation.dedupe import submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES
+from pydantic import ValidationError
 from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
@@ -37,6 +37,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
+from shared.task_metadata import RetryLedger
 
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
 from orchestrator.agents.invoke import AgentResult, invoke_agent
@@ -353,42 +354,17 @@ class WorkflowOutcome(enum.Enum):
 # surface on attempt 1 for any genuine in-test hang.
 _OPAQUE_TIMEOUT_CAUSE_RE = re.compile(r'^Command timed out after \d+(\.\d+)?s:')
 
-# Regexes used by ``_normalize_cause_hint`` — compiled once at module level.
-# Order of application: ANSI first (so coloured file:line refs are cleaned
-# before the file:line pattern matches them), then file:line, then whitespace.
-_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
-_FILE_LINE_RE = re.compile(
-    r'\b[\w./\\-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cpp|c|h|sh|md|yaml|yml|json|toml)'
-    r':\d+(:\d+)?\b'
-)
-_WHITESPACE_RE = re.compile(r'\s+')
-
-
 def _normalize_cause_hint(hint: str | None) -> str:
-    """Normalise a VerifyResult cause_hint for equality comparison.
+    """Thin delegator to :meth:`RetryLedger.normalize_cause_hint`.
 
-    Strips ANSI colour escape sequences, removes file:line (and file:line:col)
-    numeric tails, collapses contiguous whitespace to a single space,
-    lowercases, and strips leading/trailing whitespace.
-
-    Returns an empty string for empty or None input — never raises.
-
-    Used by the verify-loop signature-repetition guard to detect consecutive
-    identical failures even when line numbers shift between retries.
+    Kept as a module-level function (rather than inlining the call at each
+    site) because ``orchestrator.verify`` and several tests
+    (``test_workflow_signature_loop_guard.py``, ``test_merge_queue_auto_heal.py``)
+    import this name directly from ``orchestrator.workflow``. The ledger is
+    the single signature-keying authority (shared/src/shared/task_metadata.py);
+    this wrapper preserves every existing importer's behaviour byte-for-byte.
     """
-    if not hint:
-        return ''
-    # 1. Strip ANSI colour codes (e.g. \x1b[31m...\x1b[0m) first so that
-    #    coloured file:line references like \x1b[31mfoo.py:42\x1b[0m become
-    #    plain foo.py:42 before the file:line pattern runs.
-    result = _ANSI_ESCAPE_RE.sub('', hint)
-    # 2. Strip file:line and file:line:col numeric tails
-    #    (e.g. "tests/test_x.py:42" or "foo.py:42:7").
-    result = _FILE_LINE_RE.sub('', result)
-    # 3. Collapse contiguous whitespace (spaces, tabs, newlines) to one space.
-    result = _WHITESPACE_RE.sub(' ', result)
-    # 4. Lowercase and strip.
-    return result.lower().strip()
+    return RetryLedger.normalize_cause_hint(hint)
 
 
 def _compute_merge_outcome_signature(
@@ -396,7 +372,7 @@ def _compute_merge_outcome_signature(
     cause_hint: str | None,
     fallback_reason: str = '',
 ) -> str:
-    """Compute a 16-hex-char sha-independent outcome signature from explicit fields.
+    """Thin delegator to :meth:`RetryLedger.compute_merge_outcome_signature`.
 
     Keys on (category, normalised cause_hint) when either field is set; falls
     back to sha256(normalised_reason) when both are empty — same logic as
@@ -412,14 +388,11 @@ def _compute_merge_outcome_signature(
 
     _merge_outcome_signature() delegates here so the hash algorithm stays in
     one place; that method's behaviour and the #1688 thrash tests are unchanged.
+    Kept as a module-level function (rather than inlining the call at each
+    site) because ``test_merge_queue_auto_heal.py`` imports this name directly
+    from ``orchestrator.workflow``.
     """
-    cat = category or ''
-    hint = cause_hint or ''
-    if cat or hint:
-        basis = (cat + '\x1f' + _normalize_cause_hint(hint)).encode('utf-8')
-    else:
-        basis = _normalize_cause_hint(fallback_reason or '').encode('utf-8')
-    return hashlib.sha256(basis).hexdigest()[:16]
+    return RetryLedger.compute_merge_outcome_signature(category, cause_hint, fallback_reason)
 
 
 def compute_preexisting_main_break_fingerprint(
@@ -613,6 +586,160 @@ def classify_rebase_cohort(
     if distance_commits < threshold:
         return 'continuous'
     return 'post-unblock' if is_first_rebase else 'big-jump'
+
+
+@dataclass(frozen=True)
+class _LedgerVerdict:
+    """Result of a pure anti-thrash evaluator (task 2172 / W3-ε).
+
+    Bundles the updated :class:`~shared.task_metadata.RetryLedger` with the
+    escalate decision so the async guards can persist ``ledger`` and act on
+    ``escalate``/``trigger`` without repeating the counter arithmetic.
+
+    ``trigger`` is a short machine-readable label describing which condition
+    caused ``escalate=True`` (e.g. ``'same-SHA counter'``, ``'total
+    counter'``); it is the empty string when ``escalate`` is False.
+    """
+
+    ledger: RetryLedger
+    escalate: bool
+    trigger: str = ''
+
+
+def _build_retry_ledger(metadata: dict) -> RetryLedger:
+    """Safely reconstruct a :class:`RetryLedger` from ``metadata['retry_ledger']``.
+
+    Tolerates any shape of corruption a hand-edited or legacy metadata blob
+    might carry: a missing/None key, a non-dict value (a stray string, list,
+    or scalar — ``RetryLedger(**raw)`` would otherwise raise ``TypeError``
+    rather than the ``ValidationError`` callers expect), or a dict whose
+    fields fail pydantic validation (e.g. a non-numeric counter). Any of
+    these reset to a fresh all-zero ledger instead of crashing the calling
+    guard — mirrors the old per-field ``int(...)`` parsing's tolerance for a
+    mistyped value, now centralised for all three anti-thrash guards.
+    """
+    raw = metadata.get('retry_ledger')
+    if not isinstance(raw, dict):
+        return RetryLedger()
+    try:
+        return RetryLedger(**raw)
+    except (ValidationError, TypeError):
+        return RetryLedger()
+
+
+def _evaluate_no_plan(ledger: RetryLedger, current_main_sha: str) -> _LedgerVerdict:
+    """Pure decision core for the no-plan-failure anti-thrash guard.
+
+    Mirrors the counter arithmetic formerly inlined in
+    ``TaskWorkflow._handle_no_plan_failure``: the same main SHA increments
+    ``consecutive_no_plan_failures``; a different (or empty) SHA resets it to
+    1. ``total_no_plan_failures`` never resets — it backstops the SHA-keyed
+    counter when main keeps moving and the per-SHA counter never reaches 2
+    (the bug behind 16 successive Opus calls on task 917).
+
+    Escalates when ``consecutive >= 2`` (same-SHA thrash) OR ``total >= 3``
+    (persistent no-plan failures across changing SHAs); when both fire
+    simultaneously the same-SHA trigger takes precedence in the label.
+    """
+    last_sha = ledger.last_no_plan_main_sha or ''
+    counter = ledger.consecutive_no_plan_failures
+    total = ledger.total_no_plan_failures
+
+    if not current_main_sha or last_sha != current_main_sha:
+        counter = 1
+    else:
+        counter += 1
+    total += 1
+
+    escalate = counter >= 2 or total >= 3
+    trigger = ''
+    if escalate:
+        trigger = 'same-SHA counter' if counter >= 2 else 'total counter'
+
+    new_ledger = ledger.model_copy(update={
+        'last_no_plan_main_sha': current_main_sha,
+        'consecutive_no_plan_failures': counter,
+        'total_no_plan_failures': total,
+    })
+    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+
+
+def _evaluate_infra_resume(
+    ledger: RetryLedger,
+    current_iter_count: int,
+    recent_category: str | None,
+    threshold: int,
+) -> _LedgerVerdict:
+    """Pure decision core for the infra-resume-thrash anti-thrash guard.
+
+    Mirrors the counter arithmetic formerly inlined in
+    ``TaskWorkflow._check_infra_resume_thrash``. When the most recently
+    resolved L0 was classified ``'infra_issue'``: no iteration-log growth
+    since the previous resume increments the counter (thrash observed);
+    growth resets it to 1 (a steward fix-commit is forward progress). Any
+    other category — including ``None``, meaning no classifiable resolved
+    L0 — resets the counter to 0, since the thrash signal does not apply.
+    ``last_infra_resume_iteration_count`` is always refreshed to
+    ``current_iter_count`` regardless of category.
+
+    Escalates when the (possibly just-incremented) counter reaches
+    ``threshold``.
+    """
+    counter = ledger.consecutive_infra_resume_failures
+
+    if recent_category == 'infra_issue':
+        last_iter_count = ledger.last_infra_resume_iteration_count
+        if current_iter_count > last_iter_count:
+            counter = 1
+        else:
+            counter += 1
+    else:
+        counter = 0
+
+    escalate = counter >= threshold
+    trigger = 'infra-resume thrash' if escalate else ''
+
+    new_ledger = ledger.model_copy(update={
+        'consecutive_infra_resume_failures': counter,
+        'last_infra_resume_iteration_count': current_iter_count,
+    })
+    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+
+
+def _evaluate_merge_thrash(
+    ledger: RetryLedger,
+    prev_signature: str | None,
+    current_signature: str,
+    threshold: int,
+) -> _LedgerVerdict:
+    """Pure decision core for the merge-outcome-thrash anti-thrash guard.
+
+    Mirrors the counter arithmetic formerly inlined in
+    ``TaskWorkflow._check_merge_outcome_thrash``: a merge-outcome signature
+    matching the previous attempt increments ``consecutive_merge_thrash``; a
+    differing signature (or no previous signature) resets it to 1 — the
+    steward made progress on something different, and we just observed one
+    occurrence of it. ``last_merge_outcome_signature`` is always refreshed to
+    ``current_signature``.
+
+    Escalates when the (possibly just-incremented) counter reaches
+    ``threshold``.
+    """
+    counter = ledger.consecutive_merge_thrash
+
+    if prev_signature is not None and prev_signature == current_signature:
+        counter += 1
+    else:
+        counter = 1
+
+    escalate = counter >= threshold
+    trigger = 'merge-outcome thrash' if escalate else ''
+
+    new_ledger = ledger.model_copy(update={
+        'consecutive_merge_thrash': counter,
+        'last_merge_outcome_signature': current_signature,
+    })
+    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
 
 
 @dataclass
@@ -2319,7 +2446,7 @@ class TaskWorkflow:
                 if self._last_merge_block_reason is not None:
                     current_signature = self._merge_outcome_signature()
                     prev_signature = (
-                        self.task.get('metadata') or {}
+                        (self.task.get('metadata') or {}).get('retry_ledger') or {}
                     ).get('last_merge_outcome_signature')
                     thrash_outcome = await self._check_merge_outcome_thrash(
                         prev_signature, current_signature,
@@ -3285,10 +3412,23 @@ class TaskWorkflow:
         """Block on a no-plan / malformed-plan failure with cycle detection.
 
         Fix C — increments ``consecutive_no_plan_failures`` keyed by
-        ``last_no_plan_main_sha`` in the task's metadata.  When the
-        counter hits ≥ 2 with the same main SHA, the no-plan loop has
-        been observed and we escalate to a human directly (skip the
-        steward) rather than letting the workflow re-pend.
+        ``last_no_plan_main_sha`` inside the typed ``metadata.retry_ledger``
+        blob (see :func:`_evaluate_no_plan`).  When the counter hits ≥ 2
+        with the same main SHA, the no-plan loop has been observed and we
+        escalate to a human directly (skip the steward) rather than
+        letting the workflow re-pend.
+
+        Persist failure escalates to a human immediately rather than
+        logging and proceeding: a silently-lost counter increment would
+        let this money-burning loop under-fire.
+
+        Deploy note: pre-migration tasks carry this counter only at the
+        legacy top-level ``consecutive_no_plan_failures``/``total_no_plan_failures``
+        keys — there is no fallback that lifts them into ``retry_ledger``.
+        The first guard invocation after deploy therefore sees a fresh
+        all-zero ledger and costs at most one extra no-plan cycle before the
+        counter re-accumulates. Self-healing and benign, same precedent as
+        the signature-format migration note on ``_merge_outcome_signature``.
         """
         try:
             current_main_sha = await self.git_ops.get_main_sha()
@@ -3300,56 +3440,43 @@ class TaskWorkflow:
             current_main_sha = ''
 
         metadata = self.task.get('metadata') or {}
-        last_sha = str(metadata.get('last_no_plan_main_sha') or '')
-        try:
-            counter = int(metadata.get('consecutive_no_plan_failures') or 0)
-        except (TypeError, ValueError):
-            counter = 0
-        try:
-            total = int(metadata.get('total_no_plan_failures') or 0)
-        except (TypeError, ValueError):
-            total = 0
+        ledger = _build_retry_ledger(metadata)
 
-        if not current_main_sha or last_sha != current_main_sha:
-            counter = 1
-        else:
-            counter += 1
-
-        # Total counter never resets — backstops the SHA-keyed counter when
-        # main keeps moving and the per-SHA counter never reaches 2 (the
-        # bug behind 16 successive Opus calls on task 917).
-        total += 1
+        verdict = _evaluate_no_plan(ledger, current_main_sha)
 
         # Read-modify-write: see _merge_fresh_metadata for the merge policy.
         new_metadata = await self._merge_fresh_metadata(
             metadata, log_context='no-plan counter',
         )
-        new_metadata['last_no_plan_main_sha'] = current_main_sha
-        # Counters intentionally sourced from in-memory metadata; backend overlay is only for non-counter keys (e.g. memory_hints).
-        new_metadata['consecutive_no_plan_failures'] = counter
-        new_metadata['total_no_plan_failures'] = total
+        # In-memory ledger intentionally wins over any backend retry_ledger;
+        # the backend overlay above is only for non-counter keys (e.g. memory_hints).
+        new_metadata['retry_ledger'] = verdict.ledger.model_dump()
         self.task['metadata'] = new_metadata
         try:
             await self.scheduler.update_task(self.task_id, metadata=new_metadata)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
             logger.warning(
-                'Task %s: failed to persist no-plan cycle counter: %s',
+                'Task %s: failed to persist no-plan cycle counter; '
+                'escalating to human (counter cannot be trusted): %s',
                 self.task_id, exc,
             )
-
-        if counter >= 2 or total >= 3:
-            trigger = (
-                'same-SHA counter' if counter >= 2 else 'total counter'
+            return await self._mark_blocked(
+                f'Failed to persist no-plan cycle counter: {exc}',
+                detail=detail, escalate_to_human=True,
             )
+
+        if verdict.escalate:
+            counter = verdict.ledger.consecutive_no_plan_failures
+            total = verdict.ledger.total_no_plan_failures
             logger.warning(
                 'Task %s: no-plan loop confirmed (%s) — '
                 'consecutive=%d on main SHA %s, total=%d; escalating to human',
-                self.task_id, trigger, counter,
+                self.task_id, verdict.trigger, counter,
                 current_main_sha[:12] or '<unknown>', total,
             )
             full_reason = (
                 f'Repeated no-plan failure (counter={counter}, total={total}) '
-                f'via {trigger}: {reason}'
+                f'via {verdict.trigger}: {reason}'
             )
             return await self._mark_blocked(
                 full_reason, detail=detail, escalate_to_human=True,
@@ -3365,9 +3492,10 @@ class TaskWorkflow:
         non-terminal (pending / in-progress).  If the most recent resolved
         L0 was an ``infra_issue`` and the iteration log has not grown since
         the previous resume, increment ``consecutive_infra_resume_failures``
-        in the task metadata.  At ``max_consecutive_infra_resumes``, route
-        to ``_mark_blocked(escalate_to_human=True)`` instead of dispatching
-        the implementer again.
+        inside the typed ``metadata.retry_ledger`` blob (see
+        :func:`_evaluate_infra_resume`).  At ``max_consecutive_infra_resumes``,
+        route to ``_mark_blocked(escalate_to_human=True)`` instead of
+        dispatching the implementer again.
 
         Returns:
             ``WorkflowOutcome.BLOCKED`` when the threshold is hit; ``None``
@@ -3380,7 +3508,18 @@ class TaskWorkflow:
 
         Mirrors :meth:`_handle_no_plan_failure` style — same per-task
         concurrency assumption as the existing
-        ``consecutive_no_plan_failures`` writer; no new hazard.
+        ``consecutive_no_plan_failures`` writer; no new hazard.  Persist
+        failure escalates to a human immediately rather than logging and
+        proceeding, for the same reason as the no-plan guard.
+
+        Deploy note: pre-migration tasks carry
+        ``consecutive_infra_resume_failures``/``last_infra_resume_iteration_count``
+        only at the legacy top level — there is no fallback that lifts them
+        into ``retry_ledger``. The first guard invocation after deploy
+        therefore sees a fresh all-zero ledger, costing at most one extra
+        infra-resume cycle before the counter re-accumulates. Self-healing
+        and benign, same precedent as :meth:`_handle_no_plan_failure` and
+        the signature-format migration note on ``_merge_outcome_signature``.
         """
         assert self.artifacts is not None
 
@@ -3419,51 +3558,39 @@ class TaskWorkflow:
         iter_entries, _ = self.artifacts.read_iteration_log()
         current_iter_count = len(iter_entries)
 
-        try:
-            counter = int(
-                metadata.get('consecutive_infra_resume_failures') or 0
-            )
-        except (TypeError, ValueError):
-            counter = 0
+        ledger = _build_retry_ledger(metadata)
 
-        if recent_category == 'infra_issue':
-            try:
-                last_iter_count = int(
-                    metadata.get('last_infra_resume_iteration_count') or 0
-                )
-            except (TypeError, ValueError):
-                last_iter_count = 0
-            if current_iter_count > last_iter_count:
-                # Steward fix-commits will reset the counter via
-                # iteration-log growth.  This is intentional: a steward
-                # action is forward progress.
-                counter = 1
-            else:
-                counter += 1
-        else:
-            # Non-infra category (or no resolved L0 we could classify) —
-            # the thrash signal does not apply; reset.
-            counter = 0
+        verdict = _evaluate_infra_resume(
+            ledger, current_iter_count, recent_category,
+            self.config.max_consecutive_infra_resumes,
+        )
 
         # Read-modify-write: see _merge_fresh_metadata for the merge policy.
         new_metadata = await self._merge_fresh_metadata(
             metadata, log_context='infra-resume thrash counter',
         )
-        # Counters intentionally sourced from in-memory metadata; backend overlay is only for non-counter keys (e.g. memory_hints).
-        new_metadata['consecutive_infra_resume_failures'] = counter
-        new_metadata['last_infra_resume_iteration_count'] = current_iter_count
+        # In-memory ledger intentionally wins over any backend retry_ledger;
+        # the backend overlay above is only for non-counter keys (e.g. memory_hints).
+        new_metadata['retry_ledger'] = verdict.ledger.model_dump()
         self.task['metadata'] = new_metadata
         try:
             await self.scheduler.update_task(
                 self.task_id, metadata=new_metadata,
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
             logger.warning(
-                'Task %s: failed to persist infra-resume thrash counter: %s',
+                'Task %s: failed to persist infra-resume thrash counter; '
+                'escalating to human (counter cannot be trusted): %s',
                 self.task_id, exc,
             )
+            return await self._mark_blocked(
+                f'Failed to persist infra-resume thrash counter: {exc}',
+                detail=f'category={recent_category!r}',
+                escalate_to_human=True,
+            )
 
-        if counter >= self.config.max_consecutive_infra_resumes:
+        if verdict.escalate:
+            counter = verdict.ledger.consecutive_infra_resume_failures
             logger.warning(
                 'Task %s: consecutive_infra_resume_failures=%d at threshold '
                 '%d — infra-issue thrash confirmed; escalating to human',
@@ -3476,7 +3603,7 @@ class TaskWorkflow:
                     f'category={recent_category!r}, '
                     f'iteration_log_entries={current_iter_count}, '
                     f'last_iteration_log_entries='
-                    f'{metadata.get("last_infra_resume_iteration_count", 0)}'
+                    f'{ledger.last_infra_resume_iteration_count}'
                 ),
                 escalate_to_human=True,
             )
@@ -3494,8 +3621,9 @@ class TaskWorkflow:
         Called from the merge-phase loop after ``_submit_to_merge_queue``
         returns ``REQUEUED`` (steward resolved an L0 and the loop is about
         to resubmit).  If the merge-outcome signature matches the previous
-        attempt, increment ``consecutive_merge_thrash`` in the task
-        metadata.  At ``max_consecutive_merge_thrash``, route to
+        attempt, increment ``consecutive_merge_thrash`` inside the typed
+        ``metadata.retry_ledger`` blob (see :func:`_evaluate_merge_thrash`).
+        At ``max_consecutive_merge_thrash``, route to
         ``_mark_blocked(escalate_to_human=True)`` instead of resubmitting.
 
         ``current_signature`` is a sha256-short fingerprint of the blocked
@@ -3503,7 +3631,9 @@ class TaskWorkflow:
         failure reports run multi-kilobyte.
 
         Returns ``WorkflowOutcome.BLOCKED`` at threshold; ``None`` to fall
-        through to the resubmit.
+        through to the resubmit.  Persist failure escalates to a human
+        immediately rather than logging and proceeding, for the same reason
+        as the no-plan and infra-resume guards.
         """
         metadata = self.task.get('metadata') or {}
 
@@ -3519,33 +3649,36 @@ class TaskWorkflow:
             )
             return None
 
-        try:
-            counter = int(metadata.get('consecutive_merge_thrash') or 0)
-        except (TypeError, ValueError):
-            counter = 0
+        ledger = _build_retry_ledger(metadata)
 
-        if prev_signature is not None and prev_signature == current_signature:
-            counter += 1
-        else:
-            # Different verdict (or first observation) → steward made
-            # progress on something; reset to 1 because we just saw one.
-            counter = 1
+        verdict = _evaluate_merge_thrash(
+            ledger, prev_signature, current_signature,
+            self.config.max_consecutive_merge_thrash,
+        )
 
+        # No backend overlay here (unlike no-plan/infra-resume) — preserves
+        # the existing plain-dict merge policy for this guard.
         new_metadata = dict(metadata)
-        new_metadata['consecutive_merge_thrash'] = counter
-        new_metadata['last_merge_outcome_signature'] = current_signature
+        new_metadata['retry_ledger'] = verdict.ledger.model_dump()
         self.task['metadata'] = new_metadata
         try:
             await self.scheduler.update_task(
                 self.task_id, metadata=new_metadata,
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
             logger.warning(
-                'Task %s: failed to persist merge-thrash counter: %s',
+                'Task %s: failed to persist merge-thrash counter; '
+                'escalating to human (counter cannot be trusted): %s',
                 self.task_id, exc,
             )
+            return await self._mark_blocked(
+                f'Failed to persist merge-thrash counter: {exc}',
+                detail=f'merge_outcome_signature={current_signature}',
+                escalate_to_human=True,
+            )
 
-        if counter >= self.config.max_consecutive_merge_thrash:
+        if verdict.escalate:
+            counter = verdict.ledger.consecutive_merge_thrash
             logger.warning(
                 'Task %s: consecutive_merge_thrash=%d at threshold %d — '
                 'merge-phase thrash confirmed; escalating to human',
@@ -3554,7 +3687,7 @@ class TaskWorkflow:
             )
             root_cause = (
                 f'merge-outcome-thrash:{self._last_merge_failure_category}:'
-                f'{_normalize_cause_hint(self._last_merge_failure_cause_hint)}'
+                f'{RetryLedger.normalize_cause_hint(self._last_merge_failure_cause_hint)}'
             )
             return await self._mark_blocked(
                 f'Repeated merge-phase thrash (counter={counter})',
@@ -3567,23 +3700,35 @@ class TaskWorkflow:
     async def _stamp_first_merge_enqueue(self) -> float:
         """Stamp the write-once first-submission wall-clock epoch into task metadata.
 
-        Returns the (possibly pre-existing) ``metadata.merge_first_enqueued_at``
-        value as a float, ensuring:
+        Returns the (possibly pre-existing) epoch as a float, ensuring:
 
         * The value is written exactly once — subsequent calls on the same task
           (resubmit, post-restart re-dispatch) return the original value unchanged.
         * The value is persisted to the backend so it survives process restart.
         * Persistence failure is non-fatal (logged, does not block the merge).
 
+        The epoch lives inside the typed ``metadata.retry_ledger`` blob (see
+        :class:`shared.task_metadata.RetryLedger`) as ``str(epoch)`` — α typed
+        ``RetryLedger.merge_first_enqueued_at`` as ``str | None`` even though the
+        runtime value is a float epoch; ``str()``/``float()`` round-trip losslessly.
+
         Algorithm:
-        1. **Fast-path (in-memory)** — if the in-memory metadata already carries a
-           numeric ``merge_first_enqueued_at``, return it immediately (no I/O).
-        2. **Slow-path (backend read)** — call :meth:`_merge_fresh_metadata` to
-           overlay backend-persisted keys; if the backend already carries the value,
-           adopt it into the in-memory copy and return (no persist needed).
-        3. **Stamp** — call ``time.time()``, write into the merged metadata dict,
-           update the in-memory task, and best-effort persist via
-           ``scheduler.update_task`` (wrapped in a logged try/except).
+        1. **Fast-path (in-memory ledger)** — if ``metadata.retry_ledger`` already
+           carries a parseable ``merge_first_enqueued_at``, return it as a float
+           immediately (no I/O).
+        2. **Fast-path (legacy top-level)** — no ledger value, but a numeric
+           top-level ``merge_first_enqueued_at`` exists (a task stamped by
+           pre-migration code): adopt it — restore it under ``retry_ledger`` in
+           memory and return it as a float, no re-stamp and no persist (the
+           value is already durable on the backend under the old key).
+        3. **Slow-path (backend read)** — call :meth:`_merge_fresh_metadata` to
+           overlay backend-persisted keys; if the backend ledger already carries
+           the value, adopt it into the in-memory copy and return (no persist
+           needed).
+        4. **Stamp** — call ``time.time()``, write ``str(epoch)`` into the merged
+           ledger (preserving its other fields), update the in-memory task, and
+           best-effort persist via ``scheduler.update_task`` (wrapped in a logged
+           try/except).
 
         ζ (task 1887) consumes this value at ``_pop_next_pickable`` for aging-
         priority ordering and owns the ``enqueued_at`` fallback for legacy
@@ -3596,27 +3741,50 @@ class TaskWorkflow:
         would need an explicit per-task lock to remain strictly write-once.
         """
         metadata = self.task.get('metadata') or {}
+        ledger = metadata.get('retry_ledger') or {}
 
-        # Fast-path: in-memory value already present (resubmit / post-restart
-        # reload where the scheduler populated the in-memory task from the backend).
-        existing = metadata.get('merge_first_enqueued_at')
-        if isinstance(existing, (int, float)):
-            return float(existing)
+        # Fast-path: in-memory ledger already carries a parseable value.
+        existing = ledger.get('merge_first_enqueued_at')
+        if existing is not None:
+            try:
+                return float(existing)
+            except (TypeError, ValueError):
+                pass  # corrupt — fall through to the legacy/backend/stamp path
+
+        # Fast-path: legacy top-level value from pre-migration code. It is
+        # already durable on the backend under the old key, so just restore
+        # it into the ledger shape in memory — no persist needed.
+        legacy_existing = metadata.get('merge_first_enqueued_at')
+        if isinstance(legacy_existing, (int, float)):
+            adopted_ledger = dict(ledger)
+            adopted_ledger['merge_first_enqueued_at'] = str(legacy_existing)
+            new_metadata = dict(metadata)
+            new_metadata['retry_ledger'] = adopted_ledger
+            self.task['metadata'] = new_metadata
+            return float(legacy_existing)
 
         # Slow-path: consult backend to adopt a persisted value and protect
         # memory_hints on the subsequent write.
         fresh = await self._merge_fresh_metadata(
             metadata, log_context='merge_first_enqueued_at stamp',
         )
-        backend_existing = fresh.get('merge_first_enqueued_at')
-        if isinstance(backend_existing, (int, float)):
-            # Backend already has the value; adopt into in-memory copy, no persist.
-            self.task['metadata'] = fresh
-            return float(backend_existing)
+        fresh_ledger = fresh.get('retry_ledger') or {}
+        backend_existing = fresh_ledger.get('merge_first_enqueued_at')
+        if backend_existing is not None:
+            try:
+                adopted = float(backend_existing)
+            except (TypeError, ValueError):
+                adopted = None
+            if adopted is not None:
+                # Backend already has the value; adopt into in-memory copy, no persist.
+                self.task['metadata'] = fresh
+                return adopted
 
         # Neither in-memory nor backend carries the value — this is the first submit.
         stamped = time.time()
-        fresh['merge_first_enqueued_at'] = stamped
+        new_ledger = dict(fresh_ledger)
+        new_ledger['merge_first_enqueued_at'] = str(stamped)
+        fresh['retry_ledger'] = new_ledger
         self.task['metadata'] = fresh
         try:
             await self.scheduler.update_task(
