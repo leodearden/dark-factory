@@ -1033,39 +1033,39 @@ class MemoryService:
                     reference_time_iso,
                 )
 
-        result = await self._journaled_backend_call(
-            write_op_id=write_op_id,
-            causation_id=causation_id,
-            backend='graphiti',
-            operation='add_episode',
-            payload={'content': payload['content'][:200], 'group_id': payload.get('group_id')},
-            coro=self.graphiti.add_episode(
-                name=payload.get('name', ''),
-                content=payload['content'],
-                source=episode_type,
-                group_id=payload['group_id'],
-                source_description=payload.get('source_description', ''),
-                uuid=payload.get('uuid'),
-                temporal_context=temporal_context,
-                reference_time=reference_time,
-            ),
-        )
-        # Post-write dedup: remove duplicate edges created within this episode
-        await self._dedup_episode_edges(result, group_id=payload['group_id'])
-        # Post-write restore: undo false dependency-edge supersessions
-        await self._restore_superseded_dependency_edges(result, group_id=payload['group_id'])
-        # Post-write restore: undo false sibling-edge supersessions — edges
-        # invalidated by graphiti's per-node-pair heuristic whose node-pair
-        # is not restated by any surviving edge in this same write (must run
-        # after the dependency restore above so already-cleared dependency
-        # edges are simply skipped here, not double-processed)
-        await self._restore_falsely_superseded_sibling_edges(result, group_id=payload['group_id'])
-        # Post-write node dedup: merge exact-name duplicate entity nodes that
-        # graphiti_core ingestion failed to reuse
-        await self._dedup_episode_nodes(result, group_id=payload['group_id'])
-        # Post-write task-node-name canonicalization: rename/merge non-canonical
-        # task-entity node names (e.g. 'task 132') to the canonical 'Task N' form
-        await self._normalize_task_node_names(result, group_id=payload['group_id'])
+        # Write-time identity gate (task 2202 / W6-β): add_episode and the
+        # folded post-write reconcile run as ONE critical section under α's
+        # (task 2198) per-group_id identity lock, so entity identity is a
+        # write-time guarantee rather than a best-effort post-hoc race. This
+        # is what obsoletes the recurring "duplicate Graphiti node -> manual
+        # FalkorDB merge" operator runbook (tasks 2073/2081/2110/2118, the
+        # /unblock Graphiti-dedup protocol). Graphiti-only critical section —
+        # _execute_mem0_write never acquires this lock (B3).
+        async with self.graphiti._identity_lock_for(payload['group_id']):
+            result = await self._journaled_backend_call(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend='graphiti',
+                operation='add_episode',
+                payload={'content': payload['content'][:200], 'group_id': payload.get('group_id')},
+                coro=self.graphiti.add_episode(
+                    name=payload.get('name', ''),
+                    content=payload['content'],
+                    source=episode_type,
+                    group_id=payload['group_id'],
+                    source_description=payload.get('source_description', ''),
+                    uuid=payload.get('uuid'),
+                    temporal_context=temporal_context,
+                    reference_time=reference_time,
+                ),
+            )
+            reconcile_stats = await self._reconcile_episode_identity(
+                result, group_id=payload['group_id'],
+            )
+            logger.debug(
+                'Reconciled episode identity for group_id=%r: %r',
+                payload['group_id'], reconcile_stats,
+            )
 
         # Register planning episodes so they can be filtered from search results
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
