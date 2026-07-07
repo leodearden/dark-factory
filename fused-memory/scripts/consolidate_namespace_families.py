@@ -428,3 +428,63 @@ async def run(
     return build_consolidation_report(
         graph_family_items, collection_items, junk_key_items, dry_run=not args.apply,
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    """Parse CLI args, build a live MemoryService, and run the consolidation."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+    )
+    parser = argparse.ArgumentParser(
+        description=(
+            'Consolidate cross-graph namespace families: merge sibling Graphiti '
+            'graphs (with identity rewrite), merge legacy Qdrant collections '
+            '(with user_id rewrite), and delete guarded junk keys.'
+        ),
+    )
+    parser.add_argument(
+        '--apply', action='store_true', default=False,
+        help='Commit the merges + junk-key deletions (default: dry-run only, report and exit).',
+    )
+    parser.add_argument(
+        '--limit', type=int, default=1000,
+        help='Maximum rows/points to enumerate or scroll per item (default: 1000). '
+             'Increase if the dry-run report logs a scroll/limit-cap WARNING.',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
+    )
+    args = parser.parse_args()
+
+    if args.config:
+        import os  # noqa: PLC0415
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    async def _run_live() -> dict:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        try:
+            await memory.initialize()
+            return await run(args, memory, limit=args.limit)
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+
+    report = asyncio.run(_run_live())
+    print(json.dumps(report, indent=2, default=str))
+    if not args.apply:
+        logger.info('Dry run -- nothing was modified. Use --apply to commit the consolidation.')
+    return 1 if (args.apply and has_unresolved(report)) else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
