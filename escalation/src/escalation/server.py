@@ -614,6 +614,15 @@ def create_server(
                 }
         identity = headers.get(_IDENTITY_HEADER)
 
+        # Single record lookup reused by the capability gate below, the Table B
+        # gate further down, and the pre-stamp write after it. queue.get() reads
+        # from disk, so identity-mapped callers previously paid for two reads
+        # per resolve (once for the ceiling check, again for Table B); one
+        # fetch is now shared by both gates (efficiency note, PRD C8/D7 review).
+        rec = queue.get(escalation_id)
+        if rec is None:
+            return {'error': f'Escalation {escalation_id} not found'}
+
         # D7 effective ceiling: an identity mapped in ROLE_LEVEL_ALLOWLIST is
         # AUTHORITATIVE — a present X-Escalation-Levels header may only
         # NARROW within that role ceiling (set intersection), never widen
@@ -629,18 +638,14 @@ def create_server(
         else:
             effective = parsed
 
-        if effective is not None:
-            target = queue.get(escalation_id)
-            if target is None:
-                return {'error': f'Escalation {escalation_id} not found'}
-            if target.level not in effective:
-                return {
-                    'error': (
-                        f'connection not permitted to change level-{target.level} '
-                        'escalations'
-                    ),
-                    'code': 'level_forbidden',
-                }
+        if effective is not None and rec.level not in effective:
+            return {
+                'error': (
+                    f'connection not permitted to change level-{rec.level} '
+                    'escalations'
+                ),
+                'code': 'level_forbidden',
+            }
         if identity is not None:
             # Server-attributed identity overrides the tool arg for both the
             # park stamp (below) and the resolve call further down — a caller
@@ -659,10 +664,10 @@ def create_server(
         # capability header AND an illegal action) sees 'bad_capability_header'
         # / 'level_forbidden', not 'illegal_transition'. Neither gate mutates
         # the record, so this is an error-reporting precedence only — see the
-        # "Gate precedence" note in the resolve_issue docstring.
-        rec = queue.get(escalation_id)
-        if rec is None:
-            return {'error': f'Escalation {escalation_id} not found'}
+        # "Gate precedence" note in the resolve_issue docstring. `rec` was
+        # already fetched above (shared with the capability gate); nothing
+        # mutates the record between that fetch and here, so it is reused
+        # rather than re-read from disk.
         effect = effect_for(action, rec.level, rec.category)
         if effect is None:
             return {
@@ -690,10 +695,11 @@ def create_server(
         # Pre-stamp resolution_action on the pending record so resolve()'s
         # read-modify-write carries it into the archived JSON (C1 persistence).
         # Guard: only rewrite pending records — archived records must not be resurrected.
-        # Reuses `rec` fetched above for the Table B gate instead of re-reading
-        # from disk: queue.get() is a pure read and nothing mutates the record
-        # between that fetch and here (the park branch above already returned),
-        # so `rec` is still current and a second queue.get() would be redundant.
+        # Reuses `rec` fetched at the top of the gate sequence above (shared by
+        # the capability and Table B gates) instead of re-reading from disk:
+        # queue.get() is a pure read and nothing mutates the record between
+        # that fetch and here (the park branch above already returned), so
+        # `rec` is still current and a further queue.get() would be redundant.
         if rec.status == 'pending':
             rec.resolution_action = action
             queue._rewrite(escalation_id, rec)
