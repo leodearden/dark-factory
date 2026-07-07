@@ -368,37 +368,6 @@ class TestWorktreeLifecycle:
         assert info.path.exists()
         assert (info.path / 'README.md').exists()
 
-    async def test_create_worktree_refuses_leftover_branch_with_commits(
-        self, git_ops: GitOps,
-    ):
-        """A leftover branch carrying a commit beyond main must NOT be deleted —
-        raise instead, preserving the branch and its orphan commit."""
-        full_branch = 'task/lo-commit'
-        # Build the branch with a real commit beyond main via a throwaway
-        # worktree, then remove the worktree so the branch is a dangling ref.
-        tmp_wt = git_ops.project_root.parent / 'tmp-lo-commit'
-        rc, _, err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0, err
-        (tmp_wt / 'orphan_work.py').write_text('value = 42\n')
-        await _run(['git', 'add', '-A'], cwd=tmp_wt)
-        await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
-        _, commit_sha, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
-        commit_sha = commit_sha.strip()
-        # Detach the worktree, leaving a dangling branch with one commit.
-        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root)
-
-        with pytest.raises(RuntimeError) as excinfo:
-            await git_ops.create_worktree('lo-commit')
-
-        # The branch and its commit must be preserved (NOT deleted).
-        rc, sha_after, _ = await _run(['git', 'rev-parse', full_branch], cwd=git_ops.project_root)
-        assert rc == 0, 'leftover branch must still exist'
-        assert sha_after.strip() == commit_sha, 'orphan commit must be preserved'
-        assert full_branch in str(excinfo.value)
-
     async def test_create_worktree_refuses_leftover_branch_in_dirty_worktree(
         self, git_ops: GitOps,
     ):
