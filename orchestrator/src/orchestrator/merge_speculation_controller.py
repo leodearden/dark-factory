@@ -106,11 +106,14 @@ class PermitLedger:
     Wraps an externally-owned ``asyncio.Semaphore`` (injected — never owns or
     creates its own, mirroring :class:`SpeculationController`'s existing
     contract) and mediates acquire/release through a :class:`SpecPermit`
-    token registered in ``live``. Conservation is structural: ``slot_available
-    + len(live) == depth`` holds after every acquire/release call because
-    neither mutates across an ``await`` boundary — on the single asyncio
-    event loop, each pair (semaphore + ``live``) is therefore atomic from
-    every other coroutine's perspective.
+    token registered in ``live``. Conservation is structural FOR CALLS MADE
+    THROUGH THIS LEDGER: immediately after any ``acquire()`` or ``release()``
+    call ON THIS LEDGER, ``slot_available + len(live) == depth`` holds,
+    because neither mutates across an ``await`` boundary — on the single
+    asyncio event loop, each pair (semaphore + ``live``) is therefore atomic
+    from every other coroutine's perspective. This is a per-call, ledger-local
+    invariant, NOT a whole-pipeline one during task zeta — see the next
+    paragraph for the gap and "Known interim cost" below for when it closes.
 
     In task zeta this ledger WRAPS the worker's existing
     ``_speculation_slot`` while the verifier side continues to release that
@@ -119,7 +122,18 @@ class PermitLedger:
     ``live`` is not yet the pipeline's sole source of truth for in-flight
     permits; only the acquire/release paths already routed through this
     ledger (currently just :class:`SpeculationController`'s merger-side
-    lifecycle) are covered by the identity above.
+    lifecycle) are covered by the identity above. Concretely, this identity
+    is actively FALSE pipeline-wide once a permit has transferred and
+    drained: ``SpeculationController.on_transfer``/``on_transfer_terminal``
+    drop the controller's reference without discarding the token from
+    ``live``, and the verifier's subsequent raw release then restores
+    ``slot_available`` — so ``slot_available + len(live) == depth + 1`` (and
+    ``+ N`` after N such outstanding transfers) until task eta lands. Nothing
+    in production reads ``len(live)`` for conservation during zeta
+    (``speculation_accounting_violations`` reads ``slot_available`` /
+    ``held_by_merger`` / ``inflight_speculative``, not ``live``), so this gap
+    has no safety consequence today — it is purely the accepted interim cost
+    described next.
 
     Known interim cost (until task eta): ``SpeculationController.on_transfer``
     / ``on_transfer_terminal`` deliberately drop the controller's own
@@ -137,7 +151,13 @@ class PermitLedger:
     it through. Net effect: ``live`` is a small, slow, real memory growth and
     is NOT GC-safe in isolation before task eta lands — task eta closes this
     by routing the verifier's release through ``ledger.release(item.permit)``,
-    which discards the token from ``live`` at that point.
+    which discards the token from ``live`` at that point. Tracked as a
+    follow-up dependency (not just this paragraph) via escalation
+    ``esc-2159-3``: a bounded/weak registry or periodic prune was considered
+    and rejected as an interim mitigation — before eta populates
+    ``item.permit``, ``live`` is the only strong reference to a transferred
+    token, so a weak registry would collect it prematurely and falsify the
+    very identity this class maintains.
     """
 
     def __init__(self, slot: asyncio.Semaphore, depth: int) -> None:
