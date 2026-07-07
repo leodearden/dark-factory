@@ -902,6 +902,9 @@ def create_mcp_server(
             include_planned: Include planning-episode edges (default: False)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if limit <= 0:
@@ -991,6 +994,9 @@ def create_mcp_server(
             project_id: Project scope (required)
             filters: Exact metadata key-value pairs to match (e.g. {'kind': 'cycle_summary', 'run_id': '...'})
         """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
@@ -1057,6 +1063,9 @@ def create_mcp_server(
             {'memories': [...], 'project_id': ..., 'filters': ..., 'limit': ...} on success,
             or {'error': ..., 'error_type': ...} on failure.
         """
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
@@ -1110,6 +1119,9 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if edge_limit <= 0:
@@ -1174,6 +1186,9 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         try:
@@ -1242,6 +1257,9 @@ def create_mcp_server(
             session_id: Session context (optional, auto-derived from MCP context)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
         if err := validate_project_id(project_id):
             return err
         if last_n <= 0:
@@ -1979,6 +1997,10 @@ def create_mcp_server(
                 a ``limit`` at least as large as this tool's ``dead`` count
                 to ``get_dead_letters`` for a matching comparison.
         """
+        if project_id is not None:
+            project_id, err = _canonicalize_project_id_arg(project_id)
+            if err:
+                return err
         try:
             if memory_service.durable_queue is None:
                 return {'error': 'Queue not initialized', 'error_type': 'ConfigurationError'}
