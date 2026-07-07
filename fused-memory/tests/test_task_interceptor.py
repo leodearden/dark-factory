@@ -6598,6 +6598,91 @@ async def test_predone_hook_per_project_isolation(
 
 
 # ---------------------------------------------------------------------------
+# Task 2175 (rho1b): transition-legality gate — log-mode (Table A, C3/D5/D6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transition_gate_logs_actor_specific_illegal_and_proceeds(
+    interceptor,
+    taskmaster,
+    caplog,
+):
+    """RECONCILIATION may never leave in-progress (Table A's one actor restriction).
+
+    Default `interceptor` fixture carries no config, so enforce_transitions is
+    off (log-mode default False): the gate emits a grep-stable WARNING but the
+    write still proceeds.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'}
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        result = await interceptor.set_task_status(
+            '1', 'pending', '/project', agent_id='recon-stage-7'
+        )
+
+    assert 'error' not in result, result
+    taskmaster.set_task_status.assert_called_once()
+    assert any(
+        'illegal_transition would-reject in-progress->pending actor=reconciliation' in r.message
+        for r in caplog.records
+    ), f'got records: {[(r.levelno, r.message) for r in caplog.records]}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('agent_id', [None, 'claude-task-9'])
+async def test_transition_gate_safe_open_human_actor_no_warning(
+    interceptor,
+    taskmaster,
+    caplog,
+    agent_id,
+):
+    """HUMAN actor (header-less write, or an interactive claude-task-* session) gets
+    the safe-open union: in-progress->pending IS legal for HUMAN, so no
+    would-reject warning fires and the write proceeds.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'in-progress', 'title': 'T'}
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        result = await interceptor.set_task_status(
+            '1', 'pending', '/project', agent_id=agent_id
+        )
+
+    assert 'error' not in result, result
+    taskmaster.set_task_status.assert_called_once()
+    assert not any(
+        'illegal_transition would-reject' in r.message for r in caplog.records
+    ), f'unexpected would-reject warning: {[r.message for r in caplog.records]}'
+
+
+@pytest.mark.asyncio
+async def test_transition_gate_no_false_positive_on_legal_transition(
+    interceptor,
+    taskmaster,
+    caplog,
+):
+    """pending->in-progress (ordinary dispatch) never warns, regardless of actor."""
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'pending', 'title': 'T'}
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        result = await interceptor.set_task_status(
+            '1', 'in-progress', '/project', agent_id='orchestrator-x'
+        )
+
+    assert 'error' not in result, result
+    taskmaster.set_task_status.assert_called_once()
+    assert not any(
+        'illegal_transition would-reject' in r.message for r in caplog.records
+    ), f'unexpected would-reject warning: {[r.message for r in caplog.records]}'
+
+
+# ---------------------------------------------------------------------------
 # Task 1272: orphan-race observability + cancel_ticket logs
 # ---------------------------------------------------------------------------
 
