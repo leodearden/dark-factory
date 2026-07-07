@@ -44,11 +44,10 @@ def _make_stage(
         AsyncMock(),  # taskmaster
         AsyncMock(),  # journal
         config,
+        scope=ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
         recon_report_port=recon_report_port,
         recon_report_state=recon_report_state,
     )
-    stage.project_id = 'test_project'
-    stage.project_root = '/tmp/test'
     return stage
 
 
@@ -67,10 +66,9 @@ def _make_consolidator(recon_report_port: int = 8003) -> MemoryConsolidator:
         AsyncMock(),  # taskmaster
         AsyncMock(),  # journal
         config,
+        scope=ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
         recon_report_port=recon_report_port,
     )
-    stage.project_id = 'test_project'
-    stage.project_root = '/tmp/test'
     stage.episode_limit = 5
     stage.memory_limit = 10
     return stage
