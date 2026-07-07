@@ -30,7 +30,12 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageId,
 )
-from fused_memory.models.scope import build_known_projects_map
+from fused_memory.models.scope import (
+    ProjectId,
+    ProjectRoot,
+    ProjectScope,
+    build_known_projects_map,
+)
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -261,7 +266,7 @@ class UnknownProjectError(ValueError):
         registered via ``taskmaster.project_root`` or ``DASHBOARD_KNOWN_PROJECT_ROOTS``.
     (b) Subclasses ``ValueError`` for backward-compat: any existing or future
         ``except ValueError`` callsite (test code, callers of
-        ``_known_project_root_for``) continues to match.
+        ``_known_project_scope_for``) continues to match.
     (c) Exists as a distinct type so ``_project_loop`` can narrowly catch ONLY
         misconfiguration and let unrelated ``ValueError``s fall through to the
         existing ``except Exception`` retry path:
@@ -511,12 +516,13 @@ class ReconciliationHarness:
 
         Returns ``''`` when no taskmaster config is present.  Callers that need
         the canonical root for a *project_id* should use
-        ``_known_project_root_for(project_id)`` instead (task 1143).
+        ``_known_project_scope_for(project_id)`` instead (task 1143; renamed +
+        scope-returning per task 2146 β).
         """
         return self._project_root
 
-    def _known_project_root_for(self, project_id: str) -> str:
-        """Return the canonical project_root for *project_id* from the registry.
+    def _known_project_scope_for(self, project_id: str) -> ProjectScope:
+        """Return the canonical ProjectScope for *project_id* from the registry.
 
         This is the pre-flight cross-contamination guard introduced by task 1143.
         It looks up ``self._known_projects`` (populated at init from the configured
@@ -536,13 +542,13 @@ class ReconciliationHarness:
                 lowercase, dashes to underscores).
 
         Returns:
-            The absolute project_root path for *project_id*.
+            The ProjectScope (project_id + absolute project_root) for *project_id*.
 
         Raises:
             UnknownProjectError: (a ``ValueError`` subclass) If *project_id* is not in ``self._known_projects``.
         """
         try:
-            return self._known_projects[project_id]
+            return ProjectScope(ProjectId(project_id), ProjectRoot(self._known_projects[project_id]))
         except KeyError:
             known_sorted = sorted(self._known_projects)
             raise UnknownProjectError(
@@ -1783,7 +1789,8 @@ class ReconciliationHarness:
         """
         # task 1143: pre-flight guard — raises before any side effects (no journal row,
         # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
-        project_root = self._known_project_root_for(project_id)
+        scope = self._known_project_scope_for(project_id)
+        project_root = scope.project_root
 
         tier = tier or TierConfig()
         run_id = str(uuid4())
@@ -1815,7 +1822,7 @@ class ReconciliationHarness:
             },
         )
 
-        # project_root is already hard-bound via _known_project_root_for at the top
+        # project_root is already hard-bound via _known_project_scope_for at the top
         # of this function (task 1143); no _resolve_project_root call needed here.
 
         # Load prior S3 findings from last completed run (backstop for normal pass)
@@ -2537,7 +2544,7 @@ class ReconciliationHarness:
         """Run a focused S1→S2→S3 pass to remediate actionable findings.
 
         project_root is threaded from the parent caller: run_full_cycle resolves it
-        once at entry via _known_project_root_for, before any side-effects, and
+        once at entry via _known_project_scope_for, before any side-effects, and
         threads it through _maybe_remediate so remediation always uses the pre-cycle
         snapshot, immune to any mid-cycle registry mutations (task 1163).
 
@@ -2914,13 +2921,13 @@ class BacklogIterator:
         cutoff = datetime.now(UTC)
 
         # task 1143: hard-bind project_root from registry — event payloads are informational only.
-        project_root = self.harness._known_project_root_for(project_id)
+        scope = self.harness._known_project_scope_for(project_id)
 
         assembler = ContextAssembler(
             memory_service=self.harness.memory,
             taskmaster=self.harness.taskmaster,
             config=self.config,
-            project_root=project_root,
+            project_root=scope.project_root,
         )
 
         watermark = await self.journal.get_watermark(project_id)
