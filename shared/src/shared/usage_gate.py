@@ -57,52 +57,9 @@ __all__ = [
 # `from shared.usage_gate import AccountLease` works regardless of __all__
 # membership.
 
-# Patterns that indicate a usage cap has been hit (from Claude Code CLI output)
-CAP_HIT_PREFIXES = [
-    "You've hit your",
-    "You've used",
-    "You're out of extra",
-    "You're now using extra",
-]
-# Secondary confirmation — at least one of these keywords must also appear in
-# the same text for a CAP_HIT or NEAR_CAP prefix match to be accepted
-# (defense-in-depth against ambiguous prefix false positives).
-# NOTE: 'upgrade' was narrowed to multi-word phrases because the bare verb is
-# too common in unrelated CLI messaging (e.g. 'Upgrade to v2 for more features')
-# and would effectively reduce the guard to a near-prefix-only match in those
-# cases.  'upgrade your plan' and 'upgrade your subscription' are natural SaaS
-# cap-message phrases unlikely to appear in non-cap contexts.  The primary
-# defense remains the CAP_HIT_PREFIXES / NEAR_CAP_PREFIXES prefix match.
-#
-# Known verbatim Claude CLI cap-hit messages that motivated this list
-# (update if Claude changes its wording):
-#   "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours."
-#       → 'usage limit', 'resets'
-#   "You've used all available credits. Upgrade your plan for more capacity."
-#       → 'upgrade your plan'
-#   "You're out of extra usage for this billing period. Your plan resets in 2h."
-#       → 'resets'
-#   "You're now using extra compute credits. Your plan resets in 1h."
-#       → 'resets'
-#   "You're close to reaching your usage limit. Your plan resets in 1h."  (near-cap)
-#       → 'usage limit', 'resets'
-# See also: TestCapDetectionPatterns.test_realistic_cap_messages in
-# test_usage_gate_exhaustive.py for the full parametrized fixture set.
-CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade your plan", "upgrade your subscription"]
-
-# Patterns for near-cap warnings (pause proactively)
-NEAR_CAP_PREFIXES = [
-    "You're close to",
-]
-
-# Codex (OpenAI) cap-hit patterns
-CODEX_CAP_PATTERNS = ['usage limit reached', 'rate limit', 'quota exceeded',
-                      'insufficient_quota', 'rate_limit_exceeded']
-
-# Gemini (Google) cap-hit patterns
-GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
-                       'RESOURCE_EXHAUSTED', 'quota_exceeded']
-
+# The cap/near-cap/backend-pattern string tables that used to live here have
+# moved to shared.invocation_outcome (task W4-beta single-source collapse);
+# this module now consumes them indirectly via classify_invocation.
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 
 
@@ -751,6 +708,11 @@ class UsageGate:
         # truncation, Claude changes its message format, or a CLI-error
         # marker happened to co-occur with cap-like text). Kept as a direct
         # prefix scan since classify_invocation has no "breadcrumb-only" outcome.
+        # Local import (rather than a module-top binding): keeps these two
+        # names out of this module's own namespace so single-source-ownership
+        # holds (see TestSingleSourceOwnership in test_invocation_outcome.py).
+        from shared.invocation_outcome import CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES
+
         combined_lower = f'{stderr}\n{result_text}'.lower()
         for prefix in (*CAP_HIT_PREFIXES, *NEAR_CAP_PREFIXES):
             if prefix.lower() in combined_lower:

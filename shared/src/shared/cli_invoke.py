@@ -114,22 +114,10 @@ CAP_HIT_RESUME_PROMPT = (
 # should stay a plain "continue" rather than mentioning usage limits.
 CRASH_RECOVERY_RESUME_PROMPT = 'continue'
 
-# Concrete CLI/usage errors that exit instantly with no output but are NOT usage
-# caps. Matched case-insensitively against stderr/output so the zero-cost cap
-# heuristic doesn't misfire (and loop forever) on a local CLI failure.
-NON_CAP_CLI_ERROR_MARKERS = [
-    'is already in use',        # --session-id collision (reify-3604)
-    'unrecognized arguments',
-    'unknown option',
-    'invalid value',
-    'no such file or directory',
-    'permission denied',
-]
-
-
-def _is_non_cap_cli_error(stderr: str, output: str) -> bool:
-    blob = f'{stderr or ""}\n{output or ""}'.lower()
-    return any(m in blob for m in NON_CAP_CLI_ERROR_MARKERS)
+# The NON_CAP_CLI_ERROR_MARKERS table and its _is_non_cap_cli_error scanner
+# that used to live here have moved to shared.invocation_outcome (task
+# W4-beta single-source collapse); this module now consumes the verdict
+# indirectly via classify_invocation's CliLocalError variant.
 
 
 __all__ = [
