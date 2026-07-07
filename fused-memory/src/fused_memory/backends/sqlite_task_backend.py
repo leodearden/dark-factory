@@ -17,6 +17,7 @@ from typing import Any
 
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.task_metadata import SchemaWarning, apply_migrations, parse_metadata
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.backends.task_backend_types import (
@@ -333,6 +334,28 @@ def _warn_malformed_metadata_once(
         )
 
 
+def _emit_schema_warning(task_id: int, warning: SchemaWarning) -> None:
+    """Emit the write-boundary census line for one :class:`SchemaWarning`.
+
+    One WARNING line per warning ``parse_metadata`` returns — this is not
+    scoped to warn-mode. In warn-mode every violation surfaces this way
+    (``parse_metadata`` never raises there). In enforce-mode, only non-fatal
+    warnings that ``parse_metadata`` returns *without* raising still reach
+    here (e.g. ``unknown_key`` on an otherwise-valid blob); violations that
+    raise (invalid fields, invariant breaches, unparseable JSON) never do,
+    because the caller's ``_txn`` rolls back before this is called. The
+    literal token ``task_metadata.schema_warning`` is what the enforce-gate
+    census greps for in the fused-memory journal (PRD §1/§5) — it is
+    deliberately distinct from the ``_warn_malformed_metadata_once``
+    read-path token (``'malformed metadata'``) so the two censuses never
+    conflate.
+    """
+    logger.warning(
+        'task_metadata.schema_warning task_id=%s field=%s error=%s',
+        task_id, warning.field, warning.message,
+    )
+
+
 def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: str) -> dict[str, Any]:
     """Convert a tasks-table row into the get_tasks/get_task wire dict.
 
@@ -342,13 +365,31 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
     metadata_raw = row['metadata']
     metadata: Any = None
     if metadata_raw:
+        # Detects the same two malformed cases parse_metadata(direction='read')
+        # would flag via its 'unparseable_json'/'not_an_object' SchemaWarning
+        # codes (shared/src/shared/task_metadata.py) — both are raised by that
+        # function's own json.loads/isinstance(dict) guard, before
+        # apply_migrations or any TaskMetadata construction runs. Checking
+        # directly here — one json.loads, one isinstance — skips building
+        # (and discarding) a full pydantic model per row on the get_tasks hot
+        # path, and avoids parsing metadata_raw a second time for the happy
+        # case.
         try:
-            metadata = json.loads(metadata_raw)
-        except (TypeError, ValueError):
-            # Malformed legacy row: discard and surface {} so downstream
-            # `(task.get('metadata') or {}).get(...)` callers never see a str.
-            # WARN once per (project_root, tag, id) per process so a corrupted-row
-            # batch doesn't fan out to one log line per row per get_tasks call.
+            parsed_raw = json.loads(metadata_raw)
+        except ValueError:
+            parsed_raw = None
+        if isinstance(parsed_raw, dict):
+            # Raw shape preserved — never parse_metadata(...).model_dump():
+            # unknown keys, absent schema_version, etc. round-trip
+            # byte-for-value (I1) rather than gaining typed-field defaults.
+            metadata = parsed_raw
+        else:
+            # Malformed legacy row (unparseable JSON, or valid JSON that
+            # isn't an object): discard and surface {} so downstream
+            # `(task.get('metadata') or {}).get(...)` callers never see a str
+            # or a non-dict. WARN once per (project_root, tag, id) per process
+            # so a corrupted-row batch doesn't fan out to one log line per row
+            # per get_tasks call.
             _warn_malformed_metadata_once(
                 project_root, row['tag'], row['id'], metadata_raw,
                 resolution='coerced to {}',
@@ -384,8 +425,19 @@ class SqliteTaskBackend:
     drains all of them.
     """
 
-    def __init__(self, config: TaskmasterConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: TaskmasterConfig | None = None,
+        *,
+        task_metadata_enforce: bool = False,
+    ) -> None:
         self.config = config
+        # RED-TIER / restart-only (task 2162, W3-β): False (default) is
+        # warn-mode — a write-boundary schema violation emits a
+        # task_metadata.schema_warning census line and the write proceeds.
+        # True is enforce-mode — the same violation raises and the write is
+        # rolled back. See config.schema.TaskMetadataConfig.
+        self._task_metadata_enforce = task_metadata_enforce
         self._connections: dict[str, aiosqlite.Connection] = {}
         # Guards the connection map AND each project's first-access bring-up
         # (schema + WAL pragmas). Held briefly during open; released before
@@ -867,6 +919,39 @@ class SqliteTaskBackend:
             'message': f'Updated claimant fields for task {task_id}',
         }
 
+    # ── Write-boundary validation (task 2162, W3-β) ────────────────────
+
+    async def _validate_metadata_on_write(
+        self,
+        metadata: str | None,
+        *,
+        project_root: str,
+        tag: str,
+        task_id: int,
+    ) -> None:
+        """Validate a ``metadata`` JSON blob at the add_task/update_task write boundary.
+
+        Delegates to the shared ``parse_metadata`` (direction='write',
+        ``enforce=self._task_metadata_enforce``). In warn-mode (the default)
+        every returned :class:`SchemaWarning` is logged as one
+        ``task_metadata.schema_warning`` census line and the write proceeds
+        unchanged. In enforce-mode, a malformed blob's raise
+        (``ValidationError`` / ``ValueError`` / ``TypeError``) propagates
+        uncaught — the caller's ``_txn`` rolls back.
+
+        ``project_root``/``tag`` are accepted but not yet read by this method
+        — the census line only carries ``task_id``/field/error. They mirror
+        ``_warn_malformed_metadata_once``'s ``(project_root, tag, task_id)``
+        triple so a future write-side census enrichment (e.g. scoping/dedup
+        by project) can use them without changing either call site's
+        signature.
+        """
+        _, warnings = parse_metadata(
+            metadata, direction='write', enforce=self._task_metadata_enforce,
+        )
+        for warning in warnings:
+            _emit_schema_warning(task_id, warning)
+
     async def add_task(
         self,
         project_root: str,
@@ -922,6 +1007,9 @@ class SqliteTaskBackend:
             _max_row = await cursor.fetchone()
             assert _max_row is not None  # aggregate MAX always returns one row
             next_id = (_max_row[0] or 0) + 1
+            await self._validate_metadata_on_write(
+                metadata, project_root=project_root, tag=tag, task_id=next_id,
+            )
             await conn.execute(
                 """
                     INSERT INTO tasks (tag, id, title, description,
@@ -1056,6 +1144,14 @@ class SqliteTaskBackend:
                     row['metadata'], metadata,
                     mode=resolved_mode,
                     project_root=project_root, tag=tag, task_id=tid,
+                )
+                # Validate the POST-MERGE blob so the deterministic
+                # cross-field invariant (I3) is caught on update, not only
+                # on submit. Warn-mode logs the census line and proceeds;
+                # enforce-mode's raise propagates out of this `async with
+                # self._txn(...)`, rolling back the UPDATE below.
+                await self._validate_metadata_on_write(
+                    new_metadata, project_root=project_root, tag=tag, task_id=tid,
                 )
                 set_columns.append('metadata = ?')
                 set_values.append(new_metadata)
@@ -1493,40 +1589,6 @@ def _merge_values(old: object, new: object) -> object:
     return old
 
 
-def _normalize_legacy_memory_hints_value(value: object) -> object:
-    """Coerce a legacy list-of-dicts ``memory_hints`` value to canonical dict shape.
-
-    The canonical shape is ``{"entities": [...], "queries": [...]}``.
-    The legacy shape is ``[{"entity": <str>, "query": <str>}, ...]``.
-
-    When *value* is a list each element that is a dict is inspected:
-    * ``entity`` is appended to ``entities`` only when it is a non-empty string.
-    * ``query`` is appended to ``queries`` only when it is a non-empty string.
-    * Non-dict items and entries with missing / empty / non-string keys are skipped.
-
-    Any non-list input (dict, scalar, None) is returned unchanged — the function is
-    a no-op for already-canonical values and for any shape it does not recognise.
-    """
-    if not isinstance(value, list):
-        return value
-    entities: list[str] = []
-    queries: list[str] = []
-    seen_entities: set[str] = set()
-    seen_queries: set[str] = set()
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        entity = item.get("entity")
-        if isinstance(entity, str) and entity and entity not in seen_entities:
-            entities.append(entity)
-            seen_entities.add(entity)
-        query = item.get("query")
-        if isinstance(query, str) and query and query not in seen_queries:
-            queries.append(query)
-            seen_queries.add(query)
-    return {"entities": entities, "queries": queries}
-
-
 def _merge_metadata(
     existing_raw: str | None,
     incoming: str,
@@ -1597,8 +1659,8 @@ def _merge_metadata(
     # path — so a write that omits memory_hints does not silently migrate the
     # stored legacy shape.
     if "memory_hints" in old and "memory_hints" in new:
-        old = {**old, "memory_hints": _normalize_legacy_memory_hints_value(old["memory_hints"])}
-        new = {**new, "memory_hints": _normalize_legacy_memory_hints_value(new["memory_hints"])}
+        old = {**old, "memory_hints": apply_migrations({"memory_hints": old["memory_hints"]})["memory_hints"]}
+        new = {**new, "memory_hints": apply_migrations({"memory_hints": new["memory_hints"]})["memory_hints"]}
     try:
         merged = _merge_values(old, new)
     except RecursionError:

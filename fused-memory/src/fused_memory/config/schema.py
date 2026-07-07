@@ -265,6 +265,28 @@ class TaskmasterConfig(BaseModel):
     tool_mode: str = Field(default='all')
 
 
+# --- Task metadata write-boundary validation (task 2162, W3-β) ---
+
+class TaskMetadataConfig(BaseModel):
+    """Governs ``SqliteTaskBackend``'s write-boundary validation of ``metadata``.
+
+    Backed by ``shared.task_metadata.parse_metadata`` (the single cross-process
+    TaskMetadata schema/parser). This is a top-level config section — NOT
+    nested under ``taskmaster`` — because it governs a schema shared with the
+    orchestrator, not only the SQLite task store.
+    """
+
+    enforce: bool = Field(
+        default=False,
+        description=(
+            'RED-TIER / restart-only: warn-mode when False (default) — '
+            'validation violations emit a task_metadata.schema_warning log '
+            'line and the write proceeds; True rejects the write with '
+            'ValidationError. Not hot-reloadable.'
+        ),
+    )
+
+
 # --- Reconciliation ---
 
 class ReconciliationConfig(BaseModel):
@@ -877,6 +899,7 @@ class FusedMemoryConfig(BaseSettings):
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
     taskmaster: TaskmasterConfig | None = Field(default=None)
+    task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
     summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)

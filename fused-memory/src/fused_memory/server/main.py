@@ -485,7 +485,7 @@ async def run_server():
     taskmaster = None
     task_interceptor = None
     if config.taskmaster:
-        taskmaster = await _build_task_backend(config.taskmaster)
+        taskmaster = await _build_task_backend(config.taskmaster, config.task_metadata)
         memory_service.taskmaster = taskmaster
         try:
             # start() opens SQLite connections lazily on first project access;
@@ -1353,16 +1353,20 @@ async def _periodic_rebuild_summaries_loop(memory_service, cfg) -> None:
         await _run_rebuild_summaries_cycle(memory_service, cfg)
 
 
-async def _build_task_backend(taskmaster_config):
+async def _build_task_backend(taskmaster_config, task_metadata_config):
     """Construct the configured task backend.
 
     The backend is :class:`SqliteTaskBackend` — the legacy Taskmaster MCP
     proxy and the dual-compare wrapper were retired after the SQLite
-    cutover (commit ``a3e966861c``).
+    cutover (commit ``a3e966861c``). ``task_metadata_config.enforce`` is
+    RED-TIER / restart-only (task 2162, W3-β) — it is read once here at
+    backend construction time, not re-read on config hot-reload.
     """
     from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 
-    return SqliteTaskBackend(taskmaster_config)
+    return SqliteTaskBackend(
+        taskmaster_config, task_metadata_enforce=task_metadata_config.enforce,
+    )
 
 
 async def _build_ticket_store(data_dir: Path) -> TicketStore:
