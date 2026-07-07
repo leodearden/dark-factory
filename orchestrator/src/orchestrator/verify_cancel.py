@@ -417,3 +417,43 @@ def release_merge_verify_flock(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
     with contextlib.suppress(OSError):
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Holder-pgid rendezvous — fixed key (task 2306 α)
+#
+# A waiter (a verify-merge invocation that lost the bounded wait on the flock)
+# cannot know the holder's per-dispatch --request-id, so the holder's pgid is
+# recorded at a request-id-independent FIXED key rather than under the
+# per-request pgid file.  Built directly on pgid_file/write_pgid_file/
+# remove_pgid_file — same atomic write, same never-git-cleaned directory.
+# ---------------------------------------------------------------------------
+
+#: Fixed rendezvous key (under PGID_DIR_NAME) recording the pgid of whichever
+#: verify-merge invocation currently holds the merge-verify flock.
+LOCK_HOLDER_PGID_KEY: str = '_merge_verify_lock_holder'
+
+
+def write_lock_holder_pgid(worktree_base: Path, pgid: int) -> None:
+    """Record *pgid* as the current merge-verify flock holder."""
+    write_pgid_file(pgid_file(worktree_base, LOCK_HOLDER_PGID_KEY), pgid)
+
+
+def read_lock_holder_pgid(worktree_base: Path) -> int | None:
+    """Return the recorded flock-holder pgid, or ``None`` if absent/corrupt.
+
+    Fail-safe: a missing file (``FileNotFoundError``), unparseable content
+    (``ValueError``), or any other read error (``OSError``) all yield
+    ``None`` rather than raising — mirrors the ``_bump_host_verify_attempt_count``
+    counter-read precedent.
+    """
+    path = pgid_file(worktree_base, LOCK_HOLDER_PGID_KEY)
+    try:
+        return int(path.read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def remove_lock_holder_pgid(worktree_base: Path) -> None:
+    """Remove the recorded flock-holder pgid file; idempotent when absent."""
+    remove_pgid_file(pgid_file(worktree_base, LOCK_HOLDER_PGID_KEY))
