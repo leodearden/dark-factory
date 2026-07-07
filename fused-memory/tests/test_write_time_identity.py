@@ -14,6 +14,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import extract_cypher, extract_params
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 
@@ -180,3 +181,122 @@ class TestResolveOrCreateEntityCollapse:
         second = await backend._resolve_or_create_entity('Foo', group_id='test')
         assert second == 'surv'
         assert backend.merge_entities.await_count == 2  # unchanged — no re-merge
+
+
+# ---------------------------------------------------------------------------
+# step-7/8: group_id-scoping amendment (guards task-2115 cross-graph leak)
+# ---------------------------------------------------------------------------
+
+class TestGroupIdScopingAmendment:
+    """2026-07-06 amendment: get_nodes_by_exact_name and find_duplicate_entity_nodes
+    must filter by the n.group_id PROPERTY, not just the graph key selected via
+    _graph_for. Task-2115's active cross-graph leak (~1 episode/day) plants
+    misrouted foreign nodes (group_id property of ANOTHER project) physically
+    inside a graph key; without this predicate, _resolve_or_create_entity's
+    resolve-or-collapse would destructively auto-merge a foreign clone into the
+    home node (permanent cross-project edge contamination)."""
+
+    @pytest.mark.asyncio
+    async def test_get_nodes_by_exact_name_filters_by_group_id(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """STRUCTURAL: Cypher gains a group_id predicate + param; the existing
+        exact-name MATCH substring is preserved untouched."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.get_nodes_by_exact_name('Foo', group_id='home')
+        cypher = extract_cypher(graph.ro_query.call_args)
+        params = extract_params(graph.ro_query.call_args)
+        assert 'n.group_id = $group_id' in cypher
+        assert 'MATCH (n:Entity {name: $name})' in cypher  # pre-existing substring, unchanged
+        assert params.get('group_id') == 'home'
+
+    @pytest.mark.asyncio
+    async def test_find_duplicate_entity_nodes_filters_by_group_id(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """STRUCTURAL: Cypher gains a group_id predicate + param; the existing
+        exact-name MATCH and invalid_at substrings are preserved untouched."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        await backend.find_duplicate_entity_nodes('Foo', group_id='home')
+        cypher = extract_cypher(graph.ro_query.call_args)
+        params = extract_params(graph.ro_query.call_args)
+        assert 'n.group_id = $group_id' in cypher
+        assert '(n:Entity {name: $name})' in cypher  # pre-existing substring, unchanged
+        assert 'invalid_at IS NULL' in cypher  # pre-existing substring, unchanged
+        assert params.get('group_id') == 'home'
+
+    @pytest.mark.asyncio
+    async def test_foreign_clone_never_folded_into_home_survivor(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """BEHAVIORAL capstone (amendment's REQUIRED test): a foreign clone
+        (group_id='foreign') physically co-located in the home graph key must
+        never be returned by get_nodes_by_exact_name nor passed to
+        merge_entities; only the two home nodes collapse.
+
+        Drives the REAL get_nodes_by_exact_name + find_duplicate_entity_nodes
+        (only merge_entities is mocked) against a group-aware fake ro_query, so
+        the group_id predicate is exercised end-to-end rather than just
+        structurally. The foreign clone is seeded with the highest edge_count
+        and oldest created_at so that, pre-fix, it wins survivor-first
+        ordering — the destructive scenario the amendment guards against.
+
+        RED on current code: both queries omit the group_id param, so the fake
+        returns the foreign clone too -> it is folded/returned.
+        """
+        seeded = [
+            {'uuid': 'home-1', 'name': 'Foo', 'group_id': 'home',
+             'summary': '', 'labels': ['Entity'], 'created_at': 1, 'edge_count': 5},
+            {'uuid': 'home-2', 'name': 'Foo', 'group_id': 'home',
+             'summary': '', 'labels': ['Entity'], 'created_at': 2, 'edge_count': 1},
+            {'uuid': 'foreign-1', 'name': 'Foo', 'group_id': 'foreign',
+             'summary': '', 'labels': ['Entity'], 'created_at': 0, 'edge_count': 99},
+        ]
+
+        async def fake_ro_query(cypher, params):
+            name = params.get('name')
+            matched = [
+                row for row in seeded
+                if row['name'] == name
+                and ('group_id' not in params or row['group_id'] == params['group_id'])
+            ]
+            result = MagicMock()
+            if 'edge_count' in cypher:
+                # find_duplicate_entity_nodes shape — emulate the DB-side
+                # ORDER BY edge_count DESC, created_at ASC, uuid ASC.
+                ordered = sorted(
+                    matched, key=lambda r: (-r['edge_count'], r['created_at'], r['uuid'])
+                )
+                result.result_set = [
+                    [r['uuid'], r['created_at'], r['edge_count']] for r in ordered
+                ]
+            elif 'labels(n)' in cypher:
+                # get_nodes_by_exact_name shape
+                result.result_set = [
+                    [r['uuid'], r['name'], r['summary'], r['labels']] for r in matched
+                ]
+            else:
+                result.result_set = []
+            return result
+
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        graph.ro_query = AsyncMock(side_effect=fake_ro_query)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.merge_entities = AsyncMock()
+
+        result = await backend._resolve_or_create_entity('Foo', group_id='home')
+
+        assert result in ('home-1', 'home-2')
+        for call in backend.merge_entities.await_args_list:
+            args, kwargs = call
+            assert 'foreign-1' not in args
+            assert kwargs.get('group_id') != 'foreign'
+        backend.merge_entities.assert_awaited_once()
+        dep_uuid, sur_uuid = backend.merge_entities.await_args_list[0][0][:2]
+        assert {dep_uuid, sur_uuid} == {'home-1', 'home-2'}
+        assert sur_uuid == result
