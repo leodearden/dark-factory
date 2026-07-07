@@ -282,11 +282,18 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
 async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
     """True iff both ``claimant_run_id`` and ``heartbeat_at`` exist on ``tasks``.
 
-    Feature-detection used by claimant-writing paths (``set_task_claimant``,
-    the claimant kwargs on ``set_task_status``) to fail safe — rather than
-    error — when a connection somehow predates the v1->v2 ALTER (e.g. a
+    Feature-detection backing the claimant-writing paths' (``set_task_claimant``,
+    the claimant kwargs on ``set_task_status``) fail-safe behaviour — rather
+    than error — when a connection somehow predates the v1->v2 ALTER (e.g. a
     routine orchestrator restart racing ahead of the fused-memory deploy
     that ships this migration).
+
+    Called exactly once per project_root, from ``_get_connection`` right
+    after ``_migrate`` runs; the result is cached on
+    ``SqliteTaskBackend._claimant_columns_cache`` and reused by the write
+    paths so a hot claimant-write loop (e.g. heartbeat refresh) doesn't
+    re-run ``PRAGMA table_info`` on every call — schema shape is immutable
+    for the life of a connection, so a single check at open time suffices.
     """
     info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
     col_names = {r[1] for r in info_rows}
@@ -388,6 +395,14 @@ class SqliteTaskBackend:
         # Per-project write serialisation (mirrors the interceptor's
         # ``_write_lock`` pattern). WAL allows concurrent readers natively.
         self._write_locks: dict[str, asyncio.Lock] = {}
+        # Cached result of `_claimant_columns_present` per project_root,
+        # populated once in `_get_connection` right after `_migrate` runs.
+        # Column presence is immutable for the life of a connection (the only
+        # writer of schema shape is `_migrate`, which only runs once per
+        # connection-open), so re-querying `PRAGMA table_info` on every
+        # claimant write (the heartbeat-refresh hot path) is unnecessary.
+        # Absent entries default to False (fail-safe) in the write paths.
+        self._claimant_columns_cache: dict[str, bool] = {}
         self._closed = False
         self._started = False
         # SQLite connections don't restart, so the counter is pinned at 1
@@ -529,6 +544,10 @@ class SqliteTaskBackend:
             await conn.executescript(_SCHEMA_SQL)
             await conn.commit()
             await _migrate(conn)
+            # Cache once per project_root — see the field docstring in
+            # __init__ for why this is safe to compute a single time here
+            # rather than on every claimant write.
+            self._claimant_columns_cache[project_root] = await _claimant_columns_present(conn)
             self._connections[project_root] = conn
             logger.info('SqliteTaskBackend opened %s', db_path)
             return conn
@@ -753,7 +772,7 @@ class SqliteTaskBackend:
             set_columns = ['status = ?', 'updated_at = ?']
             set_values: list[Any] = [status, _now()]
             if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
-                if await _claimant_columns_present(conn):
+                if self._claimant_columns_cache.get(project_root, False):
                     if claimant_run_id is not _UNSET:
                         set_columns.append('claimant_run_id = ?')
                         set_values.append(claimant_run_id)
@@ -828,7 +847,7 @@ class SqliteTaskBackend:
             if not set_columns:
                 return {'id': task_id, 'message': f'No claimant changes supplied for task {task_id}'}
 
-            if not await _claimant_columns_present(conn):
+            if not self._claimant_columns_cache.get(project_root, False):
                 logger.warning(
                     'set_task_claimant: claimant_run_id/heartbeat_at columns absent '
                     '(pre-migration connection) — skipping claimant write for '
