@@ -545,6 +545,74 @@ def _make_test_harness(journal, event_buffer, mock_memory_service):
     return harness
 
 
+@pytest.mark.asyncio
+async def test_harness_construction_has_no_vestigial_stages(
+    journal, event_buffer, mock_memory_service
+):
+    """ReconciliationHarness.__init__ must not pre-build a `stages` list (task 2146 β).
+
+    Every real cycle builds fresh stage instances via `_make_stages(scope)`
+    (run_full_cycle, _run_remediation_pass), so a __init__-time pre-build is
+    vestigial. Constructed directly here — NOT via `_make_test_harness`, which
+    (as a test convenience, per step-8) re-populates `.stages` itself so the
+    ~150 existing `harness.stages[N]` call sites elsewhere in this file keep
+    working unchanged.
+
+    Also proves the escalation URL/queue reach stages only through the
+    per-cycle `_make_stages` path (which self-propagates them, see
+    `_propagate_escalation_queue`) and not through a stale `self.stages`
+    reference inside `_start_escalation_server`.
+    """
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root='/tmp/test',
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+
+    harness = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
+
+    assert not hasattr(harness, 'stages'), (
+        'ReconciliationHarness.__init__ must not pre-build a stages list — every '
+        'cycle builds fresh stages via _make_stages(scope) instead'
+    )
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.EscalationQueue',
+            return_value=MagicMock(),
+        ),
+        patch(
+            'fused_memory.reconciliation.harness.create_escalation_server',
+            return_value=MagicMock(run_http_async=AsyncMock()),
+        ),
+        patch('fused_memory.reconciliation.harness._sleep', AsyncMock()),
+        patch('fused_memory.reconciliation.harness.HAS_ESCALATION', True),
+    ):
+        try:
+            await harness._start_escalation_server()
+        finally:
+            await harness._stop_escalation_server()
+
+    assert harness._escalation_url is not None, (
+        'Expected _start_escalation_server to run to completion and set _escalation_url'
+    )
+    assert not hasattr(harness, 'stages'), (
+        'Starting the escalation server must not resurrect a harness.stages attribute'
+    )
+
+
 def _mock_stage_run(stage, items_flagged=None, before_return=None, capture_call_args=None):
     """Replace stage.run with a mock that returns a StageReport.
 
