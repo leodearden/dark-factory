@@ -2668,28 +2668,20 @@ class GitOps:
         *,
         expected_title: str | None = None,
     ) -> 'WorktreeInfo | WarmLaneUnavailable':
-        """Thin durable-record chokepoint wrapping :meth:`_acquire_warm_lane_impl`.
+        """Bare passthrough to :meth:`_acquire_warm_lane_impl`.
 
         Delegates to :meth:`_acquire_warm_lane_impl` for the full acquire
-        logic (see that method's docstring for the complete contract) and,
-        iff it returns a :class:`WorktreeInfo` (success), records the durable
-        ASSIGNED lifecycle edge via :meth:`_lifecycle_note_assigned` — the
-        SINGLE chokepoint covering all of the impl's internal routes (reuse,
-        create-once, disk-backstop, reset-in-place, and their reattach
-        variants) without restructuring any of them (per-route named edges
-        are task eta's job, PRD Mechanism 3). Fault paths return
-        WarmLaneUnavailable (never WorktreeInfo), so they never write
-        ASSIGNED — consistent with :meth:`_abort_lane_acquisition` teardown.
+        logic (see that method's docstring for the complete contract). The
+        durable ASSIGNED lifecycle edge is recorded INSIDE the impl, at each
+        named route's success return, via :meth:`_note_assigned_via_route`
+        (PRD W11 eta Mechanism 3) — so this wrapper no longer needs a
+        post-hoc chokepoint. Fault paths return WarmLaneUnavailable (never
+        WorktreeInfo), so they never write ASSIGNED — consistent with
+        :meth:`_abort_lane_acquisition` teardown.
         """
-        result = await self._acquire_warm_lane_impl(
+        return await self._acquire_warm_lane_impl(
             branch_name, start_ref, expected_title=expected_title,
         )
-        if isinstance(result, WorktreeInfo):
-            self._lifecycle_note_assigned(
-                result.path, branch_name, expected_title,
-                f'{self.config.branch_prefix}{branch_name}',
-            )
-        return result
 
     async def _acquire_warm_lane_impl(
         self,
@@ -2882,14 +2874,19 @@ class GitOps:
             # nonzero exit, `_repair_orphaned_reuse_lane` already returned
             # True above and this demote never runs at all.
             _orphan_confirmed_unregistered = False
-            if (
-                reused
-                and not await self._is_registered_worktree(lane)
-                and not await self._repair_orphaned_reuse_lane(lane, branch_name)
-            ):
-                self.warm_lane_pool.drop_assignment(branch_name)
-                reused = False
-                _orphan_confirmed_unregistered = True
+            # _repaired_in_place (W11 eta): distinguishes the REUSE_REPAIR
+            # route from plain REUSE below — set only when the lane WAS
+            # unregistered and `_repair_orphaned_reuse_lane` restored its
+            # registration in place (as opposed to already being registered,
+            # which needs no repair and stays plain REUSE).
+            _repaired_in_place = False
+            if reused and not await self._is_registered_worktree(lane):
+                if await self._repair_orphaned_reuse_lane(lane, branch_name):
+                    _repaired_in_place = True
+                else:
+                    self.warm_lane_pool.drop_assignment(branch_name)
+                    reused = False
+                    _orphan_confirmed_unregistered = True
             # else: not reused, already registered, or repair restored the
             # registration in place — proceed (possibly still reused) below.
 
