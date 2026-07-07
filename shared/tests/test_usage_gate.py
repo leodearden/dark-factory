@@ -2071,3 +2071,45 @@ class TestOpenInvariantProperty:
 
         gate._transition(b, AccountPhase.AVAILABLE, force=True)
         assert _open_invariant_holds(gate)
+
+
+# ---------------------------------------------------------------------------
+# step-19: regression for the review-flagged CAPPED->AUTH_FAILED illegal-edge
+# crash (usage_gate.py:744). A concurrent sibling task can cap an account
+# (via _handle_cap_detected) after before_invoke already handed it out
+# AVAILABLE; when the in-flight caller's request then fails with a 403, the
+# unconditional _transition(acct, AUTH_FAILED) call raised
+# IllegalTransitionError because CAPPED->AUTH_FAILED is not a legal edge
+# (_LEGAL_TRANSITIONS[CAPPED] == {PROBING}). _handle_auth_failure must
+# short-circuit to a no-op for an already-CAPPED account instead of crashing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHandleAuthFailureOnCappedAccountIsNoop:
+    """step-19: _handle_auth_failure on an already-CAPPED account is a no-op
+    that does not raise, does not demote the cap, and still returns True."""
+
+    async def test_capped_account_auth_failure_does_not_raise_and_stays_capped(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=make_mock_cost_store())
+        acct = gate._accounts[0]
+        acct.phase = AccountPhase.CAPPED
+        acct.resets_at = datetime.now(UTC) + timedelta(hours=1)
+        stashed_resets_at = acct.resets_at
+
+        with patch.object(gate, '_fire_cost_event') as mock_fire:
+            result = gate._handle_auth_failure('HTTP 403: forbidden', acct.token)
+
+        assert result is True
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.resets_at == stashed_resets_at
+        mock_fire.assert_not_called()
+
+    async def test_available_account_still_transitions_to_auth_failed(self):
+        gate = make_gate(['acct-A'], wait_for_reset=False, cost_store=None)
+        acct = gate._accounts[0]
+
+        result = gate._handle_auth_failure('HTTP 403: forbidden', acct.token)
+
+        assert result is True
+        assert acct.phase == AccountPhase.AUTH_FAILED
