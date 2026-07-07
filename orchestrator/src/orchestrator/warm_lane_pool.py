@@ -10,9 +10,18 @@ PRD ζ, D9: pool size N = max_concurrent_tasks, wired by Harness at startup.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from orchestrator.lane_lifecycle import IllegalLaneTransition
+
+if TYPE_CHECKING:
+    from orchestrator.lane_lifecycle import LaneLifecycle
+
+logger = logging.getLogger(__name__)
 
 
 class LaneState(Enum):
@@ -40,6 +49,7 @@ class WarmLanePool:
         worktree_base: Path,
         size: int,
         name_prefix: str = '_lane-',
+        lane_lifecycle: LaneLifecycle | None = None,
     ) -> None:
         self._base = worktree_base
         self._name_prefix = name_prefix
@@ -52,6 +62,12 @@ class WarmLanePool:
         # branch_name -> lane_path assignment map (for live-requeue + disk backstop)
         self._assignments: dict[str, Path] = {}
         self._lock = asyncio.Lock()
+        # OPTIONAL durable-record mirror (PRD dec.3, I1). None keeps the pool
+        # a pure in-memory cache — every existing unit test above stays
+        # byte-identical. Wired post-construction via set_lane_lifecycle
+        # (GitOps constructs both its LaneLifecycle and this pool, so the
+        # shared instance cannot be injected at __init__ time).
+        self._lane_lifecycle = lane_lifecycle
 
     # ── Public properties ──────────────────────────────────────────────────
 
@@ -59,6 +75,18 @@ class WarmLanePool:
     def size(self) -> int:
         """Number of lanes in the pool (0 → always exhausted)."""
         return len(self._lanes)
+
+    def set_lane_lifecycle(self, lane_lifecycle: LaneLifecycle) -> None:
+        """Wire the shared durable-record writer post-construction.
+
+        After this call, ``restore_assignment``/``note_assignment`` mirror
+        their cache mutation onto the durable ``.lane-state/<lane>.json``
+        record (via ``LaneLifecycle.note_assigned``) so the record and the
+        in-memory cache never drift (PRD dec.3, I1). Not calling this at all
+        leaves the pool a pure in-memory cache, unchanged from before this
+        was added.
+        """
+        self._lane_lifecycle = lane_lifecycle
 
     # ── Mutating operations ────────────────────────────────────────────────
 
@@ -230,8 +258,13 @@ class WarmLanePool:
         in-memory map after a process restart (when *lane* is discovered on
         disk carrying *branch_name*'s plan.json).  Does NOT change lane state —
         the caller must ensure the lane is ASSIGNED before calling.
+
+        When a ``LaneLifecycle`` has been wired via ``set_lane_lifecycle``,
+        also mirrors this assignment onto the durable record (best-effort;
+        see ``_note_assigned_durable``). No-op when unwired.
         """
         self._assignments[branch_name] = lane
+        self._note_assigned_durable(branch_name, lane)
 
     def drop_assignment(self, branch_name: str) -> None:
         """Remove the *branch_name* assignment without changing lane state.
@@ -257,6 +290,10 @@ class WarmLanePool:
         ``note_assignment``/``drop_assignment``).
 
         Unknown *lane* path → no-op (never raises).
+
+        When a ``LaneLifecycle`` has been wired via ``set_lane_lifecycle``,
+        also mirrors this assignment onto the durable record (best-effort;
+        see ``_note_assigned_durable``). No-op when unwired.
         """
         matched = self._match_lane(lane)
         if matched is None:
@@ -264,3 +301,40 @@ class WarmLanePool:
             return
         self._lanes[matched] = LaneState.ASSIGNED
         self._assignments[branch_name] = matched
+        self._note_assigned_durable(branch_name, matched)
+
+    def _note_assigned_durable(self, branch_name: str, lane: Path) -> None:
+        """Best-effort durable-record mirror for ``restore_assignment``/
+        ``note_assignment`` (PRD dec.3, I1: record ↔ cache never drift).
+
+        No-op when no ``LaneLifecycle`` is wired (``self._lane_lifecycle is
+        None``) — the pool then stays a pure in-memory cache, byte-identical
+        to its pre-record-routing behavior.
+
+        *branch_name* is passed as ``task_id`` only — this pool's callers use
+        it interchangeably as a real git branch name (``GitOps``) or a bare
+        task id (``Harness`` crash recovery), so it is never a reliable
+        ``branch`` value. ``branch`` is deliberately omitted (left at
+        ``note_assigned``'s default ``None``) so any real branch already on
+        the durable record is carried forward untouched rather than
+        clobbered with this ambiguous string.
+
+        A conflicting durable record (``IllegalLaneTransition`` — e.g. the
+        lane is durably ``ASSIGNED``/``IN_USE`` for a DIFFERENT task, or
+        ``QUARANTINED``) is logged and swallowed: the caller already decided
+        to pin *branch_name* in the in-memory cache (crash recovery /
+        reconciliation), and a conflicting record must not crash that
+        decision or silently steal the record (mirrors ``note_assigned``'s
+        own never-steal contract).
+        """
+        if self._lane_lifecycle is None:
+            return
+        try:
+            self._lane_lifecycle.note_assigned(lane, task_id=branch_name)
+        except IllegalLaneTransition:
+            logger.warning(
+                'warm_lane_pool: durable record for lane %s conflicts with '
+                'assignment of %r — cache updated, durable record left '
+                'as-is',
+                lane.name, branch_name, exc_info=True,
+            )
