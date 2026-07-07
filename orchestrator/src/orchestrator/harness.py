@@ -2075,6 +2075,44 @@ Output JSON matching the schema. Every task must appear in the output.
                         )
                         recovered += 1
                         continue
+                    else:
+                        # Divergence: the durable record says this lane
+                        # belongs to rec.task_id, but git reality disagrees
+                        # (orphaned admin entry — 2097/2098 — or, once
+                        # step-10 lands, a stale-branch collision — 2062).
+                        # ANY divergence quarantines; never adopt-on-doubt,
+                        # never silently re-pin (PRD dec.4/5, I3). Quarantine
+                        # is two explicit steps rather than
+                        # lane_lifecycle.quarantine(): git_ops captured
+                        # quarantine_worktree at construction time, and tests
+                        # (plus any post-construction rebind) replace the
+                        # LIVE git_ops.quarantine_worktree — calling through
+                        # lane_lifecycle would hit the stale original and
+                        # bypass it.
+                        reason = 'recovery-record-divergence'
+                        logger.warning(
+                            'Recovery: lane %s record ASSIGNED for task %s '
+                            'diverges from git reality (registered=%s, '
+                            'branch_ok=%s) — quarantining, not re-pinning',
+                            entry.name, rec.task_id, is_registered, branch_ok,
+                        )
+                        dest = await self.git_ops.quarantine_worktree(
+                            entry, rec.branch or rec.task_id, reason,
+                        )
+                        self.git_ops._lane_lifecycle.transition(
+                            entry, DurableLaneState.QUARANTINED,
+                        )
+                        if self.event_store:
+                            self.event_store.emit(
+                                EventType.worktree_quarantined,
+                                task_id=rec.task_id,
+                                data={
+                                    'reason': reason,
+                                    'dest': str(dest) if dest else None,
+                                },
+                            )
+                        cleaned += 1
+                        continue
 
             plan_path = entry / '.task' / 'plan.json'
 
