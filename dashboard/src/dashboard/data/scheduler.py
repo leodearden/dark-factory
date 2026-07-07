@@ -52,7 +52,8 @@ from shared.locking import files_to_modules, modules_conflict
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import _all_project_roots, _project_label, collect_active_tasks
-from dashboard.data.memory import invalidate_session, mcp_tool_call
+from dashboard.data.mcp_fanout import first_success
+from dashboard.data.memory import mcp_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -602,15 +603,18 @@ async def collect_scheduler_state(
     async def _one_project(root) -> tuple[str, dict | None, list[dict]]:
         """Fetch snapshot + events for one project root.
 
-        URLs are tried sequentially (first-success wins).  On success the
-        function returns immediately from inside the ``try`` block, so there is
-        no risk of bleed between a partial success on url1 and a failure on url2.
+        Delegates the per-URL failover to ``mcp_fanout.first_success``: URLs
+        are tried sequentially and the first success wins; on a transport
+        error or soft failure the failing URL's cached MCP session is
+        invalidated and the next URL is tried.
 
         Simplicity trade-off: if the snapshot call succeeds on url1 but the
         events call raises, the whole pair is re-issued against url2 rather
-        than retrying only the events leg.  This amplifies load slightly on
-        the surviving URL but keeps the retry logic single-axis; both calls
-        are idempotent and small, so the re-fetch is cheap.
+        than retrying only the events leg — both calls live inside one
+        ``_call(url)`` coroutine, so a failure anywhere in it re-runs both on
+        the next URL.  This amplifies load slightly on the surviving URL but
+        keeps the retry logic single-axis; both calls are idempotent and
+        small, so the re-fetch is cheap.
 
         Returns ``(label, snapshot, events)`` on success — ``snapshot`` may be
         ``{}`` for a project with no scheduler state yet (online but empty),
@@ -622,49 +626,45 @@ async def collect_scheduler_state(
         """
         label = _project_label(root)
 
-        for url in config.fused_memory_urls:
-            try:
-                snapshot = await mcp_tool_call(
-                    client,
-                    url,
-                    'get_scheduler_state',
-                    {'project_root': str(root)},
-                )
-                # Normalise: a buggy/older MCP server returning a list or
-                # None must not propagate as AttributeError on downstream
-                # `.get(...)` calls.  Treat as online-but-empty.
-                if not isinstance(snapshot, dict):
-                    snapshot = {}
-                events_raw = await mcp_tool_call(
-                    client,
-                    url,
-                    'get_scheduler_events',
-                    {
-                        'project_root': str(root),
-                        'since': since.isoformat(),
-                        'event_types': ['task_skipped'],
-                        'limit': _SCHEDULER_EVENTS_LIMIT,
-                    },
-                )
-                if isinstance(events_raw, list):
-                    events: list[dict] = events_raw
-                elif isinstance(events_raw, dict):
-                    # events may be wrapped: {'events': [...]}
-                    events = events_raw.get('events') or []
-                else:
-                    events = []
-                return label, snapshot, events  # first-success wins
-            except (
-                httpx.ConnectError,
-                httpx.TimeoutException,
-                httpx.HTTPStatusError,
-                ValueError,
-            ) as exc:
-                logger.debug('get_scheduler_state failed for %s / %s: %s', label, url, exc)
-                invalidate_session(url)
-                continue
+        async def _call(url: str) -> tuple[dict, list[dict]]:
+            snapshot = await mcp_tool_call(
+                client,
+                url,
+                'get_scheduler_state',
+                {'project_root': str(root)},
+            )
+            # Normalise: a buggy/older MCP server returning a list or
+            # None must not propagate as AttributeError on downstream
+            # `.get(...)` calls.  Treat as online-but-empty.
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            events_raw = await mcp_tool_call(
+                client,
+                url,
+                'get_scheduler_events',
+                {
+                    'project_root': str(root),
+                    'since': since.isoformat(),
+                    'event_types': ['task_skipped'],
+                    'limit': _SCHEDULER_EVENTS_LIMIT,
+                },
+            )
+            if isinstance(events_raw, list):
+                events: list[dict] = events_raw
+            elif isinstance(events_raw, dict):
+                # events may be wrapped: {'events': [...]}
+                events = events_raw.get('events') or []
+            else:
+                events = []
+            return snapshot, events
 
-        return label, None, []  # all URLs failed; None signals offline
+        snapshot, events = await first_success(
+            config.fused_memory_urls,
+            _call,
+            log_label=f'get_scheduler_state[{label}]',
+            offline_result=lambda errs: (None, []),
+        )
+        return label, snapshot, events
 
     # Build a label→root map for O(1) lookup after asyncio.gather.
     # (A linear next(...) search over roots_to_query would be O(n²) in the
