@@ -2137,7 +2137,10 @@ class ReconciliationHarness:
         stable per-project ``build_stale_snapshot_finding`` identity) once the
         streak reaches ``TASK_COUNT_SNAPSHOT_MISS_THRESHOLD``.  Skipped
         entirely for projects where ``is_snapshot_write_blocked`` — a missing
-        snapshot there is correct-by-design, not a gap.
+        snapshot there is correct-by-design, not a gap. That check runs
+        FIRST, before the current-stat read or the ``journal.get_recent_runs``
+        call, so a blocked project incurs no per-cycle journal query or
+        streak recompute (amendment round: reviewer finding, efficiency).
 
         Fails open — never raises — mirroring ``_get_prior_s3_findings`` /
         ``_check_graphiti_queue_health``, so a journal hiccup never aborts a
@@ -2149,6 +2152,8 @@ class ReconciliationHarness:
         if not HAS_ESCALATION:
             return
         try:
+            if is_snapshot_write_blocked(project_id):
+                return
             current = extract_snapshot_written(run.stage_reports.get('task_knowledge_sync'))
             if current is not False:
                 return

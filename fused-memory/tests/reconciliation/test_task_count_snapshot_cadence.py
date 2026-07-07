@@ -22,7 +22,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.reconciliation import (
+    ReconciliationRun,
+    RunType,
+    StageId,
+    StageReport,
+    Watermark,
+)
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _verify_task_count_snapshot_written,
@@ -293,6 +299,100 @@ class TestVerifyTaskCountSnapshotWritten:
 
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_default_scroll_limit_is_1000(self):
+        """Mirrors the sibling GC helpers' (_sweep_stale_flag_markers etc.)
+        default scroll_limit of 1000 (reviewer finding, amendment round)."""
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+
+        await _verify_task_count_snapshot_written(memory_service, 'reify', window_start)
+
+        _, kwargs = memory_service.get_memories_by_metadata.await_args
+        assert kwargs['limit'] == 1000
+
+    @pytest.mark.asyncio
+    async def test_explicit_scroll_limit_is_passed_through(self):
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata.return_value = []
+
+        await _verify_task_count_snapshot_written(
+            memory_service, 'reify', window_start, scroll_limit=250,
+        )
+
+        _, kwargs = memory_service.get_memories_by_metadata.await_args
+        assert kwargs['limit'] == 250
+
+    @pytest.mark.asyncio
+    async def test_unsaturated_page_with_no_match_still_returns_false(self):
+        """A page below scroll_limit is exhaustive -- a real confirmed miss,
+        not an artifact of truncation."""
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        old_record = {
+            'id': 'm-old',
+            'created_at': (window_start - timedelta(hours=1)).isoformat(),
+            'metadata': {'kind': 'task_count_snapshot'},
+        }
+        memory_service.get_memories_by_metadata.return_value = [old_record] * 2
+
+        result = await _verify_task_count_snapshot_written(
+            memory_service, 'reify', window_start, scroll_limit=3,
+        )
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_saturated_page_with_no_match_returns_none_not_false(self):
+        """Reviewer finding (amendment round, robustness): a saturated scroll
+        page can't confirm absence. Qdrant's scroll orders by point id, not
+        created_at, and task_count_snapshot has no GC/pool-cap, so once
+        matches exceed scroll_limit the freshest record can be excluded from
+        the returned page. Must return None (unknown), never a confirmed
+        miss -- else a truncated page eventually fires a false stale-snapshot
+        escalation despite a fresh snapshot existing."""
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        old_record = {
+            'id': 'm-old',
+            'created_at': (window_start - timedelta(hours=1)).isoformat(),
+            'metadata': {'kind': 'task_count_snapshot'},
+        }
+        memory_service.get_memories_by_metadata.return_value = [old_record] * 3
+
+        result = await _verify_task_count_snapshot_written(
+            memory_service, 'reify', window_start, scroll_limit=3,
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_saturated_page_with_match_still_returns_true(self):
+        """A match found even in a saturated/possibly-truncated page is still
+        real evidence of a fresh write -- truncation only compromises a
+        miss, never a hit."""
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        memory_service = AsyncMock()
+        fresh_record = {
+            'id': 'm-fresh',
+            'created_at': (window_start + timedelta(seconds=5)).isoformat(),
+            'metadata': {'kind': 'task_count_snapshot'},
+        }
+        old_record = {
+            'id': 'm-old',
+            'created_at': (window_start - timedelta(hours=1)).isoformat(),
+            'metadata': {'kind': 'task_count_snapshot'},
+        }
+        memory_service.get_memories_by_metadata.return_value = [old_record, fresh_record]
+
+        result = await _verify_task_count_snapshot_written(
+            memory_service, 'reify', window_start, scroll_limit=2,
+        )
+
+        assert result is True
+
 
 # ---------------------------------------------------------------------------
 # TaskKnowledgeSync.run() wiring — report.stats['task_count_snapshot_written']
@@ -371,3 +471,103 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
     async def test_helper_none_omits_stat_key(self, mock_deps):
         report = await self._run_with_snapshot_check(mock_deps, None, 'run-snap-none')
         assert 'task_count_snapshot_written' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_run_window_start_is_forwarded_to_verify_helper(self, mock_deps):
+        """Wiring regression guard (reviewer finding, amendment round).
+
+        Unlike the three tests above, this one does NOT patch
+        _verify_task_count_snapshot_written -- it lets run() forward its
+        real ``getattr(self, '_run_window_start', None)`` into the real
+        helper, so a broken window handoff (e.g. a future edit that always
+        passes None) is caught here. The direct-patch tests above would
+        keep passing unchanged even under such a regression, since they
+        never exercise the forwarding itself.
+
+        journal.get_run is configured to return a real ReconciliationRun
+        with a tz-aware started_at, which assemble_payload's run-window
+        guard reads via ``journal.get_run(...).started_at`` to compute
+        run_window_start and stash it on self._run_window_start before
+        run() forwards it to the freshness helper post-flight.
+        """
+        window_start = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+        mock_deps['journal'].get_run = AsyncMock(return_value=ReconciliationRun(
+            id='run-window-fwd',
+            project_id='dark_factory',
+            run_type=RunType.full,
+            trigger_reason='test',
+            started_at=window_start,
+        ))
+
+        def _get_memories_by_metadata(*, project_id, filters, **kwargs):
+            # Only the task_count_snapshot query gets the canned fresh
+            # record; every other filter shape queried elsewhere in run()
+            # (e.g. the unconditional stage1_flag_marker sweeps) sees an
+            # empty pool, keeping this test isolated to the call path
+            # under test.
+            if filters == {'kind': TASK_COUNT_SNAPSHOT_KIND}:
+                return [{
+                    'id': 'm-fresh',
+                    'created_at': (window_start + timedelta(seconds=5)).isoformat(),
+                    'metadata': {'kind': TASK_COUNT_SNAPSHOT_KIND},
+                }]
+            return []
+
+        get_memories = AsyncMock(side_effect=_get_memories_by_metadata)
+        mock_deps['memory_service'].get_memories_by_metadata = get_memories
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=self._fake_cli_result()),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-window-fwd',
+            )
+
+        assert report.stats['task_count_snapshot_written'] == 1
+        snapshot_calls = [
+            call for call in get_memories.await_args_list
+            if call.kwargs.get('filters') == {'kind': TASK_COUNT_SNAPSHOT_KIND}
+        ]
+        assert len(snapshot_calls) == 1
+        assert snapshot_calls[0].kwargs.get('project_id') == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_window_start_omits_stat_without_querying(self, mock_deps):
+        """Converse of the forwarding test above (reviewer finding, amendment
+        round): when journal.get_run yields no usable started_at (the
+        pre-existing best-effort fallback), self._run_window_start stays
+        None and run() must forward that None through -- the stat key is
+        omitted and the snapshot-kind query never fires. Together with the
+        prior test, this pins the stat's presence/value to the real
+        self._run_window_start handoff rather than to some independent
+        code path.
+        """
+        mock_deps['journal'].get_run = AsyncMock(return_value=None)
+        get_memories = AsyncMock(return_value=[])
+        mock_deps['memory_service'].get_memories_by_metadata = get_memories
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.project_id = 'dark_factory'
+        stage.project_root = '/tmp/test'
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=self._fake_cli_result()),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='dark_factory'),
+                prior_reports=[], run_id='run-window-none',
+            )
+
+        assert 'task_count_snapshot_written' not in report.stats
+        snapshot_calls = [
+            call for call in get_memories.await_args_list
+            if call.kwargs.get('filters') == {'kind': TASK_COUNT_SNAPSHOT_KIND}
+        ]
+        assert snapshot_calls == []

@@ -9722,7 +9722,14 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
     async def test_blocked_project_not_called_despite_long_streak(
         self, journal, event_buffer, mock_memory_service,
     ):
-        """(e) is_snapshot_write_blocked project (know_live) -> NOT called."""
+        """(e) is_snapshot_write_blocked project (know_live) -> NOT called.
+
+        Also asserts the efficiency fix (amendment round, reviewer finding):
+        the blocked check short-circuits BEFORE the journal read, so a
+        blocked project's cycle never issues a get_recent_runs query or
+        rebuilds/sorts a prior-flags list that evaluate_snapshot_cadence
+        would discard anyway.
+        """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         run = _make_current_run('run-current', 0)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
@@ -9734,6 +9741,7 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
         await harness._maybe_escalate_stale_task_count_snapshot('know_live', 'run-current', run)
 
         harness._escalate.assert_not_called()
+        harness.journal.get_recent_runs.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_remediation_run_interleaved_ignored_still_escalates(

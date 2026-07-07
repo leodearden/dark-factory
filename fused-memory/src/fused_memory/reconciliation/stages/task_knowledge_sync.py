@@ -1911,6 +1911,8 @@ async def _verify_task_count_snapshot_written(
     memory_service,
     project_id: str,
     run_window_start: datetime | None,
+    *,
+    scroll_limit: int = 1000,
 ) -> bool | None:
     """Best-effort freshness check: was a task_count_snapshot written this run window?
 
@@ -1925,20 +1927,35 @@ async def _verify_task_count_snapshot_written(
 
     Mirrors :func:`_verify_stage2_summary_written`'s never-raises, best-effort,
     WARNING-on-failure contract, including the crucial distinction between a
-    CONFIRMED miss (``False``) and an inconclusive check (``None``):
+    CONFIRMED miss (``False``) and an inconclusive check (``None``).
+
+    Unlike that helper, this one passes an explicit ``limit`` (mirroring
+    ``_sweep_stale_flag_markers`` et al. — task_count_snapshot has no GC or
+    pool-cap, so its record count grows unbounded over cycles) and treats a
+    saturated page as INCONCLUSIVE rather than a confirmed miss: Qdrant's
+    scroll orders by point id, not ``created_at``, so once matches exceed
+    *scroll_limit* the freshest record can fall outside the returned page —
+    misreading that as a confirmed miss would eventually fire a false
+    stale-snapshot escalation even though a fresh snapshot exists. A ``True``
+    result is unaffected by truncation: finding a match anywhere in a
+    (possibly partial) page is still real evidence of a fresh write.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata``.
         project_id: Project scope for the query.
         run_window_start: Start of the current run window, or ``None`` when
             unknown.
+        scroll_limit: Max records to enumerate in one scroll (default 1000,
+            matching the sibling GC helpers in this module).
 
     Returns:
         ``True`` when a record's ``created_at`` falls within the run window
-        (confirmed fresh). ``False`` when the query succeeded but no record
+        (confirmed fresh). ``False`` when the query succeeded, the page was
+        NOT saturated (fewer than *scroll_limit* records), and no record
         falls within the window (confirmed miss). ``None`` when
-        *run_window_start* is ``None`` (window unknown) or the query itself
-        raised (transient failure) — "unknown", never miscounted as a
+        *run_window_start* is ``None`` (window unknown), the query itself
+        raised (transient failure), or no match was found in a saturated
+        (possibly-truncated) page — "unknown", never miscounted as a
         confirmed miss.
     """
     if run_window_start is None:
@@ -1947,6 +1964,7 @@ async def _verify_task_count_snapshot_written(
         members = await memory_service.get_memories_by_metadata(
             project_id=project_id,
             filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
+            limit=scroll_limit,
         )
     except Exception:
         logger.warning(
@@ -1957,10 +1975,25 @@ async def _verify_task_count_snapshot_written(
             extra={'project_id': project_id},
         )
         return None
-    return any(
+    found = any(
         _marker_is_within_run_window(member.get('created_at'), run_window_start)
         for member in members
     )
+    if found:
+        return True
+    if len(members) >= scroll_limit:
+        logger.warning(
+            'reconciliation._verify_task_count_snapshot_written: enumerated '
+            '%d of scroll_limit=%d task_count_snapshot records with none in '
+            'the current run window — Qdrant scroll is point-id ordered, NOT '
+            'created_at ordered, so a truncated page may exclude the '
+            'freshest record; treating as unknown rather than a confirmed '
+            'miss. Re-run with a higher scroll_limit.',
+            len(members), scroll_limit,
+            extra={'project_id': project_id},
+        )
+        return None
+    return False
 
 
 async def _repair_stage2_summary_stage_metadata(
