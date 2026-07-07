@@ -31,7 +31,7 @@ except ImportError:
     AllAccountsCappedException = _UnavailableAllAccountsCapped  # type: ignore[assignment,misc]
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
-from shared.task_metadata import DoneProvenance
+from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -85,6 +85,58 @@ if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
+
+# SchemaWarning codes (shared.task_metadata) that mean the WHOLE metadata
+# value was discarded — parse_metadata could not resolve any dict at all.
+# Only these are loud from the read-path parsers below; 'unknown_key' /
+# 'invalid_field' / 'invalid_submodel' etc. are expected on legitimate
+# curator-internal metadata (files_to_modify, spawned_from, spawn_context)
+# and belong to the write boundary (W3-β's _emit_schema_warning census),
+# not these read-path helpers — emitting them here would flood the
+# `task_metadata.schema_warning` census that θ2's enforce-flip gate greps
+# for zero lines against schema-clean metadata.
+_METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
+
+
+def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
+    """Best-effort parse of *metadata* into a raw dict.
+
+    Returns ``(None, warnings)`` when *metadata* is non-None but cannot be
+    resolved to a JSON object at all — *warnings* then carries
+    ``shared.task_metadata.parse_metadata``'s diagnosis
+    (``direction='read'``). Returns ``(dict, [])`` for ``None`` (benign
+    absent) and for anything already resolvable to a dict.
+
+    The returned dict — when not ``None`` — is always independently
+    re-derived from *metadata*, never ``parse_metadata(...).model_dump()``,
+    so unknown/curator-internal keys round-trip byte-for-value (I1) instead
+    of gaining ``TaskMetadata``'s typed-field defaults.
+    """
+    if metadata is None:
+        return None, []
+    if isinstance(metadata, dict):
+        return metadata, []
+    if isinstance(metadata, str):
+        _, warnings = parse_metadata(metadata, direction='read')
+        discard = [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
+        if discard:
+            return None, discard
+        # parse_metadata already confirmed this parses to a JSON object —
+        # reparse independently for the raw dict (see docstring: never
+        # model_dump()).
+        return json.loads(metadata), []
+    return None, []
+
+
+def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
+    """Emit the ``task_metadata.schema_warning`` census line for a whole-metadata discard."""
+    reason = '; '.join(w.message for w in warnings) or 'unrecognised shape'
+    logger.warning(
+        'task_metadata.schema_warning source=%s error=%s (type=%s); metadata discarded',
+        source,
+        reason,
+        type(metadata).__name__,
+    )
 
 
 def _journal_param_clip(value: Any, *, limit: int = 200) -> Any:
@@ -1017,13 +1069,19 @@ class TaskInterceptor:
 
         Single source of truth for the get / json.loads / isinstance-dict
         dance shared by :meth:`_extract_meta_files` and :meth:`_build_candidate`.
+
+        Delegates the malformed-string-policy to
+        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
+        and emits a ``task_metadata.schema_warning`` WARNING when a
+        non-empty string is a genuine whole-metadata discard (unparseable
+        JSON / non-object) — I4: this replaces a silent ``{}`` coercion.
         """
         meta = kwargs.get('metadata') or {}
         if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except Exception:
-                meta = {}
+            parsed, warnings = _parse_metadata_value(meta)
+            if warnings:
+                _warn_metadata_discard('TaskInterceptor._parse_metadata', meta, warnings)
+            meta = parsed if parsed is not None else {}
         if not isinstance(meta, dict):
             meta = {}
         return meta
@@ -1460,18 +1518,18 @@ class TaskInterceptor:
 
     @staticmethod
     def _extract_metadata_dict(metadata) -> dict | None:
-        """Best-effort parse of ``metadata`` into a dict, or None."""
-        if metadata is None:
-            return None
-        if isinstance(metadata, dict):
-            return metadata
-        if isinstance(metadata, str):
-            try:
-                parsed = json.loads(metadata)
-            except (json.JSONDecodeError, ValueError):
-                return None
-            return parsed if isinstance(parsed, dict) else None
-        return None
+        """Best-effort parse of ``metadata`` into a dict, or None.
+
+        Delegates the malformed-string policy to
+        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
+        and emits a ``task_metadata.schema_warning`` WARNING when a non-None
+        *metadata* cannot be resolved to a dict — I4: this replaces a silent
+        ``None`` coercion.
+        """
+        parsed, warnings = _parse_metadata_value(metadata)
+        if parsed is None and metadata is not None:
+            _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
+        return parsed
 
     @staticmethod
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
