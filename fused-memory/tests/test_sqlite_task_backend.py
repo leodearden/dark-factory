@@ -304,6 +304,137 @@ async def test_set_task_claimant_none_clears_both_columns(backend, project_root)
     assert one['heartbeat_at'] is None
 
 
+# ── set_task_status claimant extension (task 2182 step-5/6) ────────
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_claimant_kwargs_persist(backend, project_root):
+    """set_task_status(..., claimant_run_id=..., heartbeat_at=...) stamps both columns."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status(
+        '1', 'in-progress', project_root=project_root,
+        claimant_run_id='run-x', heartbeat_at='2026-07-07T00:00:00+00:00',
+    )
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['status'] == 'in-progress'
+    assert one['claimant_run_id'] == 'run-x'
+    assert one['heartbeat_at'] == '2026-07-07T00:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_claimant_none_releases_on_status_change(backend, project_root):
+    """Release: set_task_status(..., 'done', claimant_run_id=None, heartbeat_at=None) clears both."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status(
+        '1', 'in-progress', project_root=project_root,
+        claimant_run_id='run-x', heartbeat_at='2026-07-07T00:00:00+00:00',
+    )
+
+    await backend.set_task_status(
+        '1', 'done', project_root=project_root,
+        claimant_run_id=None, heartbeat_at=None,
+    )
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['status'] == 'done'
+    assert one['claimant_run_id'] is None
+    assert one['heartbeat_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_without_claimant_kwargs_leaves_claimant_intact(backend, project_root):
+    """_UNSET semantics: a plain status change must not wipe a live claimant."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.set_task_status(
+        '1', 'in-progress', project_root=project_root,
+        claimant_run_id='run-x', heartbeat_at='2026-07-07T00:00:00+00:00',
+    )
+
+    await backend.set_task_status('1', 'review', project_root=project_root)
+
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['status'] == 'review'
+    assert one['claimant_run_id'] == 'run-x'
+    assert one['heartbeat_at'] == '2026-07-07T00:00:00+00:00'
+
+
+def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
+    """Create a tasks.db in the v1 shape but stamped ``user_version = 2`` (columns absent).
+
+    Simulates a connection whose claimant columns never got ALTERed in —
+    e.g. a routine orchestrator restart racing ahead of the fused-memory
+    deploy that ships this migration. `_migrate` early-returns because
+    ``user_version >= _SCHEMA_VERSION``, so the columns stay absent,
+    exercising set_task_status's fail-safe (WARNING, no error) path.
+    """
+    import sqlite3
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag           TEXT NOT NULL DEFAULT 'master',
+            id            INTEGER NOT NULL,
+            title         TEXT NOT NULL,
+            description   TEXT,
+            details       TEXT,
+            test_strategy TEXT,
+            status        TEXT NOT NULL,
+            priority      TEXT,
+            metadata      TEXT,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO tasks (tag, id, title, status, updated_at) "
+        "VALUES ('master', 1, 'stranded-shape task', 'pending', '2026-01-01T00:00:00.000Z')",
+    )
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_claimant_fails_safe_when_columns_absent(tmp_path, caplog):
+    """A connection whose columns never got ALTERed must not error on a claimant write."""
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v2_stamped_db_without_claimant_columns(db_path)
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+            result = await b.set_task_status(
+                '1', 'in-progress', project_root=project_root,
+                claimant_run_id='run-x', heartbeat_at='2026-07-07T00:00:00+00:00',
+            )
+        one = await b.get_task('1', project_root=project_root)
+    finally:
+        await b.close()
+
+    assert 'in-progress' in result['message']
+    assert one['status'] == 'in-progress'
+    assert one['claimant_run_id'] is None
+    assert one['heartbeat_at'] is None
+
+    warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warning_msgs, 'Expected a WARNING when claimant columns are absent'
+
+
 # ── update_task ─────────────────────────────────────────────────────
 
 
