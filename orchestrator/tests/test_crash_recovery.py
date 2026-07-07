@@ -1219,3 +1219,115 @@ class TestRecordDrivenRecovery:
 
         assert pool.assignment_for('42') is None
         assert '42' not in harness._recovered_plans
+
+
+# ===========================================================================
+# Task 2257 (W11 delta) step-11 RED: compat (never-silently-re-pin a
+# record-less lane) + .task-meta read relocation.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestRecordDrivenRecoveryCompatAndRelocation:
+    """(a) compat: a record-less lane recovers its plan but is never pinned.
+    (b) .task-meta-only artifacts are read/cleared on the ADOPT path.
+    (c) legacy-only artifacts (<wt>/.task, no .task-meta) still recover.
+    """
+
+    async def test_compat_no_record_lane_recovers_plan_without_pinning(
+        self, harness: Harness,
+    ):
+        """(a) COMPAT: a pool lane with plan.json (task_id='42', 3/5 steps
+        done) but NO .lane-state record -> the plan IS recovered but the
+        lane is NOT pinned (PRD dec.5: never silently re-pin a record-less
+        lane) and NOT quarantined/cleaned up.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane = _setup_lane(base, '_lane-0', plan)  # legacy path, no record
+
+        await harness._recover_crashed_tasks()
+
+        assert '42' in harness._recovered_plans
+        assert pool.assignment_for('42') is None, (
+            'a record-less lane must never be silently pinned'
+        )
+        assert pool.state(lane) == LaneState.FREE
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_compat_planless_lane_released(self, harness: Harness):
+        """(a) COMPAT, planless variant: no plan.json anywhere (new or
+        legacy) and no record -> released back to the pool, never pinned.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane = base / '_lane-0'
+        lane.mkdir(parents=True, exist_ok=True)
+
+        await harness._recover_crashed_tasks()
+
+        harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            lane, '_lane-0',
+        )
+        assert pool.assignment_for('42') is None
+
+    async def test_adopt_reads_and_clears_task_meta_new_path_only(
+        self, harness: Harness,
+    ):
+        """(b) A lane whose ASSIGNED record matches git and whose
+        plan.json/plan.lock live ONLY under
+        TaskArtifacts.meta_root_for(base, name) (new path, not <wt>/.task)
+        is adopted, its plan recovered from the new path, and plan.lock at
+        the new path is cleared.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane = base / '_lane-0'
+        lane.mkdir(parents=True, exist_ok=True)
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        meta_dir = _setup_lane_meta_plan(base, '_lane-0', plan)
+        (meta_dir / 'plan.lock').write_text(
+            json.dumps({'session_id': 'x', 'owner_pid': 1})
+        )
+
+        harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
+        harness.git_ops.lane_branch_checkouts = AsyncMock(
+            return_value={'42': lane},
+        )
+        harness.scheduler.get_status = AsyncMock(return_value=None)
+
+        await harness._recover_crashed_tasks()
+
+        assert pool.assignment_for('42') == lane
+        assert '42' in harness._recovered_plans
+        assert not (meta_dir / 'plan.lock').exists()
+        # legacy .task dir was never created for this lane
+        assert not (lane / '.task').exists()
+
+    async def test_adopt_falls_back_to_legacy_task_dir(self, harness: Harness):
+        """(c) Legacy fallback: a lane with artifacts ONLY under
+        <wt>/.task (no .task-meta at all) still recovers via new-then-old
+        resolution.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane = _setup_lane(base, '_lane-0', plan)  # legacy .task/plan.json only
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
+        harness.git_ops.lane_branch_checkouts = AsyncMock(
+            return_value={'42': lane},
+        )
+        harness.scheduler.get_status = AsyncMock(return_value=None)
+
+        await harness._recover_crashed_tasks()
+
+        assert pool.assignment_for('42') == lane
+        assert '42' in harness._recovered_plans
