@@ -7513,6 +7513,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             base_commit=base_commit,
         )
 
+    def _resolve_already_merged(self, *, wt_head: str | None) -> _RecoveryDecision:
+        """Journal-first already-merged decision (PRD workflow-state-machine α, MP-1).
+
+        Consults :meth:`MergeProvenance.lookup` first: a hit is authoritative
+        and short-circuits before the legacy heuristic is ever consulted (the
+        landed-outbox journal is keyed by ``task_id``, independent of the
+        current worktree's git ancestry — a strictly more robust signal than
+        re-deriving merge state from the worktree on every re-run). A miss
+        falls back to the unchanged :meth:`_has_prior_implementation`
+        heuristic; *wt_head* is forwarded verbatim so callers keep their
+        existing SHA-primary-vs-iteration-log-scan semantics.
+
+        Returns a :class:`_RecoveryDecision` with ``sha=None`` on a fallback
+        hit — callers supply the git main SHA themselves (this method has no
+        access to it).
+        """
+        row: LandedRow | None = MergeProvenance.lookup(self.task_id)
+        if row is not None:
+            return _RecoveryDecision(done=True, basis='journal', sha=row.advanced_sha)
+        status = self._has_prior_implementation(wt_head=wt_head)
+        if status.has_work:
+            return _RecoveryDecision(done=True, basis='fallback', sha=None)
+        return _RecoveryDecision(done=False, basis=None, sha=None)
+
     async def _recover_if_already_merged(self) -> WorkflowOutcome | None:
         """Check if the task's branch is already on main and transition to DONE.
 
