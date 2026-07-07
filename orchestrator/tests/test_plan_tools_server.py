@@ -10,6 +10,7 @@ from orchestrator.mcp.plan_tools import (
     _add_plan_step,
     _add_prerequisite,
     _add_reuse_item,
+    _artifacts_from_args,
     _confirm_plan,
     _create_plan,
     _mark_step_done,
@@ -574,3 +575,58 @@ class TestReportFalsePremise:
         plan = artifacts.read_plan()
         assert plan['task_id'] == 'test-1'
         assert len(plan['steps']) == 1
+
+
+# ---------------------------------------------------------------------------
+# CLI arg parsing → TaskArtifacts (task 2258 step-5, worktree-lane-lifecycle
+# W11-ε1: hands the `.task-meta` base to the agent-side plan-tools server).
+# ---------------------------------------------------------------------------
+
+
+class TestArtifactsFromArgs:
+    """``_artifacts_from_args`` parses ``--worktree``/``--meta-root`` into a
+    ``TaskArtifacts`` — the same construction shape as workflow.py's
+    orchestrator-side ``self.artifacts``, so both sides resolve the
+    IDENTICAL meta_root for a given worktree.
+    """
+
+    def test_meta_root_flag_produces_relocated_root(self, tmp_path):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        mr = tmp_path / 'base' / '.task-meta' / 'wt'
+        mr.mkdir(parents=True)
+
+        artifacts = _artifacts_from_args(
+            ['--worktree', str(wt), '--meta-root', str(mr)]
+        )
+
+        assert artifacts.root == mr
+        assert artifacts.worktree == wt
+
+    def test_omitted_meta_root_falls_back_to_legacy_task_dir(self, tmp_path):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        (wt / '.task').mkdir()
+
+        artifacts = _artifacts_from_args(['--worktree', str(wt)])
+
+        assert artifacts.root == wt / '.task'
+        assert artifacts.worktree == wt
+
+    def test_worktree_attr_survives_sibling_root_relocation(self, tmp_path):
+        """Documents the plan_tools.py:600 bug this task fixes: once ``root``
+        is a sibling ``.task-meta`` dir, ``artifacts.root.parent`` is the
+        `.task-meta` BASE, not the worktree — callers needing the worktree
+        (e.g. resolving main's SHA via git) must use ``artifacts.worktree``.
+        """
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        mr = tmp_path / 'base' / '.task-meta' / 'wt'
+        mr.mkdir(parents=True)
+
+        artifacts = _artifacts_from_args(
+            ['--worktree', str(wt), '--meta-root', str(mr)]
+        )
+
+        assert artifacts.root.parent != wt
+        assert artifacts.worktree == wt
