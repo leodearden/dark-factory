@@ -32,7 +32,7 @@ from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
-from orchestrator.merge_queue import reconcile_landed_outbox
+from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.overrides import OverrideStore
@@ -784,6 +784,12 @@ class Harness:
         # (pending/deferred).  Declared in scheduler.py, installed here alongside the
         # other callback installs — same pattern as _on_park_stop_trip / _on_external_dep_block.
         self.scheduler._suppress_blocked_write = self._action_teardown_tasks.__contains__
+        # Wire the landed-outbox consult-before-dispatch gate (task 2156, W1 δ
+        # — SD-1/B5).  Declared in scheduler.py, installed here alongside the
+        # other callback installs — same declare-in-scheduler / install-in-
+        # harness pattern as _on_park_stop_trip / _on_external_dep_block /
+        # γ's own _reconcile_landed_outbox.
+        self.scheduler._landed_outbox_gate = self._landed_dispatch_gate
         # Wire the reclaim-on-exhaustion safety valve callbacks (task 1933).
         # Declared on git_ops with default None (byte-identical when not wired);
         # installed here when the knob is on — mirrors the _on_park_stop_trip /
@@ -6701,6 +6707,36 @@ Output JSON matching the schema. Every task must appear in the output.
             report.get('already_done_pruned', 0),
             report.get('skipped', 0),
             report.get('errors', 0),
+        )
+
+    async def _landed_dispatch_gate(self, task_id: str) -> bool:
+        """Consult-before-dispatch gate on the landed-outbox (task 2156, W1 δ
+        — PRD merge-queue-reliability §8.2 SD-1, boundary B5).
+
+        Installed as ``self.scheduler._landed_outbox_gate`` so
+        ``Scheduler.acquire_next()`` consults it per candidate before either
+        dispatch loop commits.  Delegates to the module-level
+        :func:`reconcile_landed_task`, which shares the exact
+        reconcile-to-done routine used by the startup reconciler
+        (:func:`reconcile_landed_outbox`) — returning True means
+        ``task_id``'s ``advanced_sha`` is an ancestor of ``main`` (its merge
+        already landed) and it has just been driven to ``done`` inline, so
+        the scheduler must not dispatch it this tick.
+
+        None-guarded and resolved LAZILY at call time — mirrors
+        :meth:`_reconcile_landed_outbox` — because the merge worker (and its
+        bound ``LandedOutbox``) is constructed in ``_start_merge_worker``,
+        AFTER this callback is wired onto the scheduler in ``__init__``.
+        Fails open (returns False, i.e. does not gate dispatch) when the
+        worker is absent (disabled / not yet started).
+        """
+        if self._merge_worker is None or self._merge_worker._landed_outbox is None:
+            return False
+        return await reconcile_landed_task(
+            task_id,
+            git_ops=self.git_ops,
+            scheduler=self.scheduler,
+            outbox=self._merge_worker._landed_outbox,
         )
 
     async def _stop_escalation_server(self) -> None:
