@@ -5,13 +5,14 @@ import contextlib
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 from _fm_helpers import make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
+from shared.task_metadata import DoneProvenance
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
@@ -2736,6 +2737,75 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
     assert persisted['kind'] == 'deterministic-deploy-scheduled'
     assert persisted['note'] == 'resumed after self-restart scheduled (crash before done write)'
     assert persisted['unit'] == 'orchestrator-dark-factory.service'
+
+
+# ── task 2166 step-1: _VALID_PROVENANCE_KINDS retirement (I2) ──────────────
+#
+# The vocabulary of accepted `done_provenance.kind` values must be sourced
+# from a single declaration: `shared.task_metadata.DoneProvenance.kind`. A
+# hardcoded second tuple in this module previously drifted out of lockstep
+# (the 1902->1976/1982 permanently-blocked-deploy chain), which is exactly
+# what I2 forbids.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'kind', get_args(DoneProvenance.model_fields['kind'].annotation),
+)
+async def test_validate_done_provenance_accepts_every_shared_enum_kind(kind, tmp_path):
+    """Every kind DoneProvenance declares valid must pass the vocabulary gate.
+
+    RED: as long as the interceptor's membership check reads from its own
+    hardcoded `_VALID_PROVENANCE_KINDS` tuple, this merely pins current
+    behavior; the point of this test (together with
+    ``test_interceptor_module_has_no_standalone_valid_kinds_tuple`` below) is
+    to force the membership source to become ``DoneProvenance`` itself, so a
+    5th kind added there auto-propagates here with no second edit.
+    """
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    error, _resolved = await _validate_done_provenance(
+        '1', {'kind': kind}, str(tmp_path), require=True,
+    )
+    if kind in ('deterministic-deploy', 'deterministic-deploy-scheduled'):
+        assert error is None, f'expected acceptance for kind={kind!r} but got: {error}'
+    else:
+        # 'merged'/'found_on_main' require commit/note, so *some* rejection
+        # is expected here — but it must never be the unknown-kind rejection.
+        if error is not None:
+            assert 'kind must be' not in error.get('reason', ''), (
+                f'kind={kind!r} is declared valid by DoneProvenance but was '
+                f'rejected as unknown: {error}'
+            )
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_rejects_kind_unknown_to_shared_enum(tmp_path):
+    """A kind absent from DoneProvenance's Literal is still rejected, by name."""
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    error, resolved = await _validate_done_provenance(
+        '1', {'kind': 'cherry_picked'}, str(tmp_path), require=True,
+    )
+    assert error is not None
+    assert resolved is None
+    assert 'cherry_picked' in error['reason']
+
+
+def test_interceptor_module_has_no_standalone_valid_kinds_tuple():
+    """The interceptor module must not declare its own valid-kinds vocabulary.
+
+    RED: `_VALID_PROVENANCE_KINDS` is still defined at module level. GREEN
+    (step-2) deletes it in favour of deriving the membership set from
+    `shared.task_metadata.DoneProvenance` at the call site.
+    """
+    import fused_memory.middleware.task_interceptor as ti_module
+
+    assert not hasattr(ti_module, '_VALID_PROVENANCE_KINDS'), (
+        'task_interceptor should no longer declare a standalone '
+        '_VALID_PROVENANCE_KINDS — the vocabulary must be sourced from '
+        'shared.task_metadata.DoneProvenance (I2).'
+    )
 
 
 @pytest.mark.asyncio
