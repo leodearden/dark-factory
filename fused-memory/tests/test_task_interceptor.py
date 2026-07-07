@@ -6682,6 +6682,33 @@ async def test_transition_gate_no_false_positive_on_legal_transition(
     ), f'unexpected would-reject warning: {[r.message for r in caplog.records]}'
 
 
+@pytest.mark.asyncio
+async def test_transition_gate_authorized_reopen_no_false_warning(
+    interceptor,
+    taskmaster,
+    caplog,
+):
+    """A terminal exit already authorized by the terminal-exit gate (a non-empty
+    reopen_reason) must not ALSO trip a false 'would-reject done->pending'
+    warning from the transition-legality gate — reopen must be threaded into
+    is_legal_transition, not left to default False.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={'id': '1', 'status': 'done', 'title': 'T'}
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        result = await interceptor.set_task_status(
+            '1', 'pending', '/project', reopen_reason='un-defer script', agent_id='orchestrator-x'
+        )
+
+    assert 'error' not in result, result
+    taskmaster.set_task_status.assert_called_once()
+    assert not any(
+        'illegal_transition would-reject' in r.message for r in caplog.records
+    ), f'unexpected would-reject warning on an authorized reopen: {[r.message for r in caplog.records]}'
+
+
 # ---------------------------------------------------------------------------
 # Task 1272: orphan-race observability + cancel_ticket logs
 # ---------------------------------------------------------------------------
