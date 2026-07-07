@@ -31,7 +31,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from orchestrator.git_ops import AdvanceOutcome
-from orchestrator.landed_outbox import LandedOutbox
+from orchestrator.landed_outbox import LandedOutbox, LandedRow
 from orchestrator.merge_queue import _journal_landed_then_advance, reconcile_landed_outbox
 
 # ---------------------------------------------------------------------------
@@ -140,3 +140,37 @@ class TestReconcileLandedOutboxRC2CrashBeforeDoneWrite:
             'RC-2 row must be consumed AFTER the done-write'
         )
         assert report['marked_done'] == 1
+
+
+# ---------------------------------------------------------------------------
+# step-5 — RC-3 / boundary B4: already-done at reconcile time
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReconcileLandedOutboxRC3AlreadyDone:
+    """RC-3: task already 'done' at reconcile time → prune only, no 2nd done-write."""
+
+    async def test_already_done_row_is_pruned_without_second_done_write(
+        self, tmp_path: Path,
+    ) -> None:
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+
+        # The already-done branch is pure reconciler logic — a direct record()
+        # is sufficient (no need to drive the real producer chokepoint here).
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+
+        reopened = LandedOutbox(path)
+
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='done')
+
+        report = await reconcile_landed_outbox(reopened, git_ops_recon, scheduler)
+
+        scheduler.mark_done.assert_not_called()
+        assert reopened.lookup('Z') is None, 'RC-3 row must be pruned'
+        assert report['already_done_pruned'] == 1
+        assert report['marked_done'] == 0
