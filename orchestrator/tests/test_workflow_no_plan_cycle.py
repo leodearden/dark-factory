@@ -337,18 +337,25 @@ async def test_total_counter_increments_on_same_sha_path_too(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_corrupt_total_metadata_treated_as_zero(tmp_path: Path):
-    """A non-int total_no_plan_failures must not crash the helper."""
+    """A non-int total_no_plan_failures must not crash the helper.
+
+    RetryLedger validation fails on the whole blob (not just the bad field),
+    so the ledger resets to all-zeros rather than raising — same outcome as
+    the old per-field ``int()`` parsing, reached via whole-ledger reset.
+    """
     f = _make(
         project_root=tmp_path, main_sha='SHA-A',
         metadata={
-            'last_no_plan_main_sha': 'SHA-A',
-            'consecutive_no_plan_failures': 1,
-            'total_no_plan_failures': 'lots',  # corrupt
+            'retry_ledger': {
+                'last_no_plan_main_sha': 'SHA-A',
+                'consecutive_no_plan_failures': 1,
+                'total_no_plan_failures': 'lots',  # corrupt -> whole ledger resets
+            },
         },
     )
     await f.wf._handle_no_plan_failure('no plan', detail='')
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['total_no_plan_failures'] == 1
+    assert metadata['retry_ledger']['total_no_plan_failures'] == 1
 
 
 @pytest.mark.asyncio
@@ -358,8 +365,10 @@ async def test_corrupt_counter_metadata_treated_as_zero(tmp_path: Path):
         project_root=tmp_path,
         main_sha='SHA-A',
         metadata={
-            'last_no_plan_main_sha': 'SHA-A',
-            'consecutive_no_plan_failures': 'one',  # corrupt
+            'retry_ledger': {
+                'last_no_plan_main_sha': 'SHA-A',
+                'consecutive_no_plan_failures': 'one',  # corrupt -> whole ledger resets
+            },
         },
     )
 
@@ -369,7 +378,7 @@ async def test_corrupt_counter_metadata_treated_as_zero(tmp_path: Path):
     _, kwargs = f.mark_blocked.await_args
     assert kwargs.get('escalate_to_human') is not True
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 1
+    assert metadata['retry_ledger']['consecutive_no_plan_failures'] == 1
 
 
 @pytest.mark.asyncio
@@ -396,7 +405,7 @@ async def test_persists_memory_hints_from_fresh_backend_metadata(tmp_path: Path)
 
     assert outcome == WorkflowOutcome.BLOCKED
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 1, (
+    assert metadata['retry_ledger']['consecutive_no_plan_failures'] == 1, (
         f'Counter must have incremented to 1; got {metadata}'
     )
     assert metadata.get('memory_hints') == {'entities': ['E1'], 'queries': ['q1']}, (
@@ -434,7 +443,7 @@ async def test_get_task_failure_falls_back_to_in_memory_metadata_and_warns(
     # update_task must still be called once — persistence happens on the fallback path.
     f.update_task.assert_awaited_once()
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 1, (
+    assert metadata['retry_ledger']['consecutive_no_plan_failures'] == 1, (
         f'Counter must advance on fallback path; got {metadata}'
     )
     # In-memory memory_hints survive because we fell back to the in-memory copy.
