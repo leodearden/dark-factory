@@ -306,3 +306,136 @@ class TestBuildManifest:
         r2 = _mod.build_manifest(nodes, census, dry_run=True)
 
         assert r1 == r2
+
+
+# ===========================================================================
+# Tests: census_foreign_nodes (step-7/8)
+# ===========================================================================
+
+class TestCensusForeignNodes:
+    """Tests for async census_foreign_nodes(graphiti, graph_key, *, page_size)."""
+
+    @pytest.mark.asyncio
+    async def test_uses_graph_for_and_ro_query_not_query(self):
+        """Resolves the graph via _graph_for(graph_key); reads via ro_query
+        only -- .query is NEVER called (read-only census)."""
+        graph = _make_graph_mock(ro_pages=[[]])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.census_foreign_nodes(graphiti, 'dark_factory', page_size=1000)
+
+        graphiti._graph_for.assert_called_once_with('dark_factory')
+        graph.ro_query.assert_awaited()
+        graph.query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cypher_filters_foreign_nodes_via_skip_limit_not_collect(self):
+        """Cypher shape: WHERE n.group_id <> $graph_key, RETURN
+        uuid/name/group_id/labels(n), SKIP/LIMIT params -- never collect()."""
+        graph = _make_graph_mock(ro_pages=[[]])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        await _mod.census_foreign_nodes(graphiti, 'dark_factory', page_size=500)
+
+        cypher = extract_cypher(graph.ro_query.call_args)
+        params = extract_params(graph.ro_query.call_args)
+        assert 'n.group_id <>' in cypher
+        assert 'SKIP' in cypher
+        assert 'LIMIT' in cypher
+        assert 'collect(' not in cypher
+        assert params.get('graph_key') == 'dark_factory'
+        assert params.get('skip') == 0
+        assert params.get('limit') == 500
+
+    @pytest.mark.asyncio
+    async def test_full_page_then_short_page_advances_skip_and_concatenates(self):
+        """A full first page (len==page_size) triggers a SECOND ro_query with
+        skip advanced by page_size; a short second page ends the loop, and
+        the result is the concatenation of both pages."""
+        page1 = [_foreign_row(f'u{i}', 'dark_factory') for i in range(3)]
+        page2 = [_foreign_row('u-last', 'know_live')]
+        graph = _make_graph_mock(ro_pages=[page1, page2])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=3)
+
+        assert graph.ro_query.await_count == 2
+        second_params = extract_params(graph.ro_query.call_args_list[1])
+        assert second_params.get('skip') == 3
+        assert [r['uuid'] for r in result] == ['u0', 'u1', 'u2', 'u-last']
+
+    @pytest.mark.asyncio
+    async def test_terminates_on_short_page_no_third_query(self):
+        """After a short (non-full) page, no further ro_query is issued."""
+        page1 = [_foreign_row('u0', 'dark_factory')]
+        graph = _make_graph_mock(ro_pages=[page1])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1000)
+
+        assert graph.ro_query.await_count == 1
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_graph_returns_empty_list(self):
+        """A graph with zero foreign nodes returns an empty list, not an error."""
+        graph = _make_graph_mock(ro_pages=[[]])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1000)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_normalizes_rows_to_dicts_with_source_graph(self):
+        """Each row normalizes to {uuid,name,group_id,labels,source_graph}."""
+        row = _foreign_row('u0', 'dark_factory', name='Alice', labels=['Entity'])
+        graph = _make_graph_mock(ro_pages=[[row]])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1000)
+
+        assert result == [{
+            'uuid': 'u0', 'name': 'Alice', 'group_id': 'dark_factory',
+            'labels': ['Entity'], 'source_graph': 'reify',
+        }]
+
+    @pytest.mark.asyncio
+    async def test_full_final_page_at_cap_warns_no_silent_caps(self, caplog, monkeypatch):
+        """When the page cap (MAX_CENSUS_PAGES) is hit and the last page
+        fetched is STILL full, a no-silent-caps WARNING fires -- the census
+        may be incomplete. Monkeypatches the cap down to 1 so a single full
+        page deterministically hits it without mocking a huge page count."""
+        monkeypatch.setattr(_mod, 'MAX_CENSUS_PAGES', 1)
+        page1 = [_foreign_row('u0', 'dark_factory')]
+        graph = _make_graph_mock(ro_pages=[page1])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        with caplog.at_level('WARNING'):
+            result = await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1)
+
+        assert graph.ro_query.await_count == 1
+        assert len(result) == 1
+        assert any(
+            'incomplete' in rec.message.lower() or 'cap' in rec.message.lower()
+            for rec in caplog.records
+        ), f'Expected a no-silent-caps WARNING, got: {[r.message for r in caplog.records]}'
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_short_page_ends_enumeration(self, caplog):
+        """A normal short-page termination does not log a WARNING."""
+        graph = _make_graph_mock(ro_pages=[[_foreign_row('u0', 'dark_factory')]])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+
+        with caplog.at_level('WARNING'):
+            await _mod.census_foreign_nodes(graphiti, 'reify', page_size=1000)
+
+        assert caplog.records == []
