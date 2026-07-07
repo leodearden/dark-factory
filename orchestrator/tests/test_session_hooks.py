@@ -386,3 +386,124 @@ def test_main_session_start_notification_stop_share_one_record(
     assert len(session_dirs) == 1
     slug = sh.hook_session_slug(hook_input, env={})
     assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+
+
+# ---------------------------------------------------------------------------
+# Step-11: merge_hook_settings (MERGE-not-clobber)
+# ---------------------------------------------------------------------------
+
+
+def _real_settings_snapshot() -> dict:
+    """A settings dict reproducing the real ~/.claude/settings.json's shape."""
+    return {
+        'env': {'SOME_VAR': '1'},
+        'permissions': {'allow': ['Bash(git *)']},
+        'hooks': {
+            'PreToolUse': [
+                {
+                    'matcher': 'Bash',
+                    'hooks': [
+                        {
+                            'type': 'command',
+                            'command': '/home/leo/.claude/hooks/skim-rewrite.sh',
+                            'timeout': 5,
+                        }
+                    ],
+                },
+                {
+                    'matcher': 'EnterWorktree',
+                    'hooks': [
+                        {
+                            'type': 'command',
+                            'command': '/home/leo/.claude/hooks/worktree-hookspath-capture.sh',
+                            'timeout': 10,
+                        }
+                    ],
+                },
+            ],
+            'PostToolUse': [
+                {
+                    'matcher': 'ExitWorktree',
+                    'hooks': [
+                        {
+                            'type': 'command',
+                            'command': '/home/leo/.claude/hooks/worktree-hookspath-restore.sh',
+                            'timeout': 10,
+                        }
+                    ],
+                },
+            ],
+        },
+        'statusLine': {'type': 'command', 'command': 'my-status-line.sh'},
+        'enabledPlugins': ['hookify@claude-plugins-official'],
+    }
+
+
+def test_merge_hook_settings_adds_only_the_three_event_keys(tmp_path: Path) -> None:
+    before = _real_settings_snapshot()
+    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
+
+    after = sh.merge_hook_settings(before, script_dir)
+
+    hooks = after['hooks']
+    assert set(hooks) == {'PreToolUse', 'PostToolUse', 'SessionStart', 'Notification', 'Stop'}
+    for event, script_name in (
+        ('SessionStart', 'session-start.sh'),
+        ('Notification', 'notification.sh'),
+        ('Stop', 'stop.sh'),
+    ):
+        entries = hooks[event]
+        assert len(entries) == 1
+        leaf = entries[0]['hooks'][0]
+        assert leaf['type'] == 'command'
+        assert leaf['command'] == str(script_dir / script_name)
+        assert leaf['timeout'] == 10
+
+
+def test_merge_hook_settings_leaves_pretooluse_posttooluse_byte_identical(tmp_path: Path) -> None:
+    before = _real_settings_snapshot()
+    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
+
+    after = sh.merge_hook_settings(before, script_dir)
+
+    assert after['hooks']['PreToolUse'] == before['hooks']['PreToolUse']
+    assert after['hooks']['PostToolUse'] == before['hooks']['PostToolUse']
+
+
+def test_merge_hook_settings_leaves_every_other_top_level_key_byte_identical(tmp_path: Path) -> None:
+    before = _real_settings_snapshot()
+    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
+
+    after = sh.merge_hook_settings(before, script_dir)
+
+    for key in ('env', 'permissions', 'statusLine', 'enabledPlugins'):
+        assert after[key] == before[key]
+
+
+def test_merge_hook_settings_does_not_mutate_input(tmp_path: Path) -> None:
+    before = _real_settings_snapshot()
+    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
+
+    sh.merge_hook_settings(before, script_dir)
+
+    assert before == _real_settings_snapshot()
+
+
+def test_merge_hook_settings_is_idempotent(tmp_path: Path) -> None:
+    before = _real_settings_snapshot()
+    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
+
+    once = sh.merge_hook_settings(before, script_dir)
+    twice = sh.merge_hook_settings(once, script_dir)
+
+    assert once == twice
+
+
+def test_merge_hook_settings_creates_hooks_key_when_absent(tmp_path: Path) -> None:
+    before = {'env': {'SOME_VAR': '1'}}
+    script_dir = tmp_path / 'skills' / 'spawn' / 'hooks'
+
+    after = sh.merge_hook_settings(before, script_dir)
+
+    assert set(after['hooks']) == {'SessionStart', 'Notification', 'Stop'}
+    assert after['env'] == before['env']
