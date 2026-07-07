@@ -2443,3 +2443,31 @@ class TestB5AttributionSkew:
         cost_store.save_invocation.assert_awaited_once()
         _, kwargs = cost_store.save_invocation.call_args
         assert kwargs['account_name'] == 'b'
+
+
+# =========================================================================
+# TestLeaseIsCurrent — gate.lease_is_current(lease) detects a lease gone
+# stale from a mid-flight account re-transition (PRD §7.4, task W4-δ). This
+# is the detectability primitive consumer ε's InvokeSlot.report() Q4
+# log-and-proceed fail-safe hooks into.
+# =========================================================================
+
+
+@pytest.mark.asyncio
+class TestLeaseIsCurrent:
+    async def test_current_lease_then_stale_after_transition(self):
+        gate = make_gate(['a'])
+        async with gate.invoke_slot() as slot:
+            lease = slot.lease
+
+        acct = gate._accounts[0]
+        assert gate.lease_is_current(lease) is True
+        assert lease.generation == acct.generation
+
+        gate._transition(
+            acct, AccountPhase.CAPPED,
+            resets_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+
+        assert gate.lease_is_current(lease) is False
+        assert lease.generation != acct.generation
