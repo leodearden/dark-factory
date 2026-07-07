@@ -116,6 +116,31 @@ async def test_set_task_status_non_trigger(interceptor, taskmaster, reconciler, 
 
 
 @pytest.mark.asyncio
+async def test_set_task_status_forwards_claimant_kwargs(interceptor, taskmaster):
+    """Explicit claimant_run_id/heartbeat_at are forwarded to the backend call (task 2182 step-7)."""
+    await interceptor.set_task_status(
+        '1', 'in-progress', '/project',
+        claimant_run_id='run-x', heartbeat_at='2026-07-07T00:00:00+00:00',
+    )
+    taskmaster.set_task_status.assert_called_once()
+    kwargs = taskmaster.set_task_status.call_args.kwargs
+    assert kwargs.get('claimant_run_id') == 'run-x'
+    assert kwargs.get('heartbeat_at') == '2026-07-07T00:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_without_claimant_kwargs_omits_them_from_backend_call(
+    interceptor, taskmaster,
+):
+    """No claimant args supplied -> backend call carries neither kwarg (byte-identical to today)."""
+    await interceptor.set_task_status('1', 'in-progress', '/project')
+    taskmaster.set_task_status.assert_called_once()
+    kwargs = taskmaster.set_task_status.call_args.kwargs
+    assert 'claimant_run_id' not in kwargs
+    assert 'heartbeat_at' not in kwargs
+
+
+@pytest.mark.asyncio
 async def test_set_task_status_done_triggers_async_reconciliation(
     interceptor, reconciler, event_buffer
 ):

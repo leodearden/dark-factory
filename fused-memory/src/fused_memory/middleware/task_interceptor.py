@@ -125,6 +125,14 @@ def _resolve_backend_label(taskmaster: Any) -> str:
 # test_merge_deferred_is_non_terminal locks this contract.
 TERMINAL_STATUSES: frozenset[str] = frozenset({'done', 'cancelled'})
 
+# Sentinel distinguishing "leave the claimant column untouched" (default) from
+# "clear it to NULL" (explicit None) on the claimant_run_id/heartbeat_at
+# pass-through (task 2182). Mirrors the backend's own _UNSET
+# (fused_memory.backends.sqlite_task_backend) — kept as a separate object
+# rather than imported, since the interceptor only ever forwards these values
+# and never compares them to the backend's sentinel.
+_UNSET = object()
+
 
 def _is_ticket_id(value: object) -> bool:
     """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
@@ -575,6 +583,9 @@ class TaskInterceptor:
         tag: str | None = None,
         done_provenance: dict | None = None,
         reopen_reason: str | None = None,
+        *,
+        claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered.
 
@@ -583,6 +594,12 @@ class TaskInterceptor:
         independently and returns ``{'success': bool, 'results': [...]}``;
         single-id input returns the raw per-id result dict for backwards
         compatibility.
+
+        ``claimant_run_id``/``heartbeat_at`` (task 2182) are forwarded to the
+        backend's ``set_task_status`` only when explicitly supplied — the
+        default ``_UNSET`` keeps the backend call byte-identical to today's,
+        so every existing caller is unaffected. Purely a pass-through: no
+        gate logic, event payload, or reconciliation behavior is added here.
         """
         if err := await self._backlog_gate(project_root):
             return err
@@ -599,6 +616,8 @@ class TaskInterceptor:
                     tag=tag,
                     done_provenance=done_provenance,
                     reopen_reason=reopen_reason,
+                    claimant_run_id=claimant_run_id,
+                    heartbeat_at=heartbeat_at,
                 )
                 results.append({'task_id': tid, 'result': per_result})
             all_ok = all(
@@ -614,6 +633,8 @@ class TaskInterceptor:
             tag=tag,
             done_provenance=done_provenance,
             reopen_reason=reopen_reason,
+            claimant_run_id=claimant_run_id,
+            heartbeat_at=heartbeat_at,
         )
 
     async def _apply_status_transition(
@@ -625,6 +646,8 @@ class TaskInterceptor:
         tag: str | None,
         done_provenance: dict | None,
         reopen_reason: str | None,
+        claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
     ) -> dict:
         """Single-id status transition with all gates + event emission.
 
@@ -805,12 +828,20 @@ class TaskInterceptor:
 
             # 3. Execute status change. Convert the typed DTO to a plain
             # dict so callers can tack on the reconciliation key below.
+            # claimant_kwargs carries claimant_run_id/heartbeat_at only when
+            # explicitly supplied (task 2182) — _UNSET params are omitted so
+            # the default call stays byte-identical to every existing caller.
+            claimant_kwargs: dict[str, Any] = {}
+            if claimant_run_id is not _UNSET:
+                claimant_kwargs['claimant_run_id'] = claimant_run_id
+            if heartbeat_at is not _UNSET:
+                claimant_kwargs['heartbeat_at'] = heartbeat_at
             result: dict[str, Any] = dict(
                 await self._journal_around(
                     'set_task_status',
                     project_root,
                     {'task_id': task_id, 'status': status, 'tag': tag},
-                    tm.set_task_status(task_id, status, project_root, tag),
+                    tm.set_task_status(task_id, status, project_root, tag, **claimant_kwargs),
                 )
             )
 
