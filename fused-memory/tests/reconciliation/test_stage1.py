@@ -42,10 +42,15 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.models.scope import ProjectScope
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+
+def _scope(project_id: str, project_root: str) -> ProjectScope:
+    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
+    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
 def _rescope(stages, scope: ProjectScope) -> list:
@@ -60,8 +65,16 @@ def _rescope(stages, scope: ProjectScope) -> list:
     return stages
 
 
-def _make_consolidator(project_root: str = '') -> MemoryConsolidator:
-    """Build a MemoryConsolidator with mocked deps — mirrors test_stages.py ~L1418."""
+def _make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
+    """Build a MemoryConsolidator with mocked deps — mirrors test_stages.py ~L1418.
+
+    NOTE: callers that pass ``project_root=''`` (the pre-task-2146 "unset root"
+    sentinel) now raise ``InputValidationError`` from ``ProjectScope.__post_init__``
+    at this call site — a required ``scope`` can no longer carry a falsy root.
+    See ``TestStage1PayloadOmitsProjectRootWhenUnset`` / the empty-root case in
+    ``TestStage1PayloadLiveWorkflowSignalsSection`` for the (currently blocked,
+    escalated) fallout.
+    """
     config = ReconciliationConfig()
     memory_mock = AsyncMock()
     memory_mock.get_episodes = AsyncMock(return_value=[])
@@ -75,9 +88,8 @@ def _make_consolidator(project_root: str = '') -> MemoryConsolidator:
         AsyncMock(),  # taskmaster
         AsyncMock(),  # journal
         config,
+        scope=_scope('test_project', project_root),
     )
-    stage.project_id = 'test_project'
-    stage.project_root = project_root
     stage.episode_limit = 5
     stage.memory_limit = 10
     return stage
@@ -553,7 +565,7 @@ class TestReconEscalationDedup:
 
         await harness._maybe_remediate(
             'test_project', 'parent-run-id', parent_run,
-            TierConfig(), project_root='/tmp/x',
+            TierConfig(), scope=_scope('test_project', '/tmp/x'),
         )
 
         files = list(queue_dir.glob('esc-*.json'))
@@ -776,7 +788,7 @@ class TestReconEscalationDedup:
 
         # Use real stage instances (to pass isinstance checks in _run_remediation_pass)
         # with their run() methods patched to return quickly.
-        stages = harness._make_stages()
+        stages = harness._make_stages(_scope('test_project', '/tmp/x'))
         stages[0].run = AM(return_value=StageReport(
             stage=StageId.memory_consolidator, started_at=now, completed_at=now,
         ))
@@ -787,7 +799,7 @@ class TestReconEscalationDedup:
             stage=StageId.integrity_check, started_at=now, completed_at=now,
             items_flagged=[residue_finding],
         ))
-        harness._make_stages = lambda: stages
+        harness._make_stages = lambda scope: stages
 
         # Mock _finding_persistence_count to return the threshold value (4) so
         # the escalation gate fires without needing a real journal history.
@@ -801,7 +813,7 @@ class TestReconEscalationDedup:
                     'description': 'trigger finding', 'actionable': True,
                 }],
                 tier=TierConfig(),
-                project_root='/tmp/x',
+                scope=_scope('test_project', '/tmp/x'),
                 filtered_task_tree=MagicMock(),  # pre-supply to skip _fetch_filtered_task_tree
             )
 
@@ -850,7 +862,6 @@ class TestMemoryConsolidatorRunWiring:
         absence flag remains in items_flagged.
         """
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         # get_task returns a present record — task is real, not absent
         assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
         stage.taskmaster.get_task.return_value = {'id': '3438', 'title': 'real task 3438'}  # type: ignore[union-attr]
@@ -915,7 +926,6 @@ class TestMemoryConsolidatorRunWiring:
         is not set.
         """
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         stage.filtered_task_tree = FilteredTaskTree(max_task_id=1515, total_count=1515)
 
         # Event with task_id exceeding the census max
@@ -985,7 +995,6 @@ class TestMemoryConsolidatorRunWiring:
         This test remains GREEN after step-12 as long as the early-return is preserved.
         """
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         stage.remediation_findings = [{'description': 'fix this'}]  # remediation mode
         # get_task must NOT be called at all for remediation runs
         assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
@@ -1048,7 +1057,6 @@ class TestMemoryConsolidatorRunWiring:
         even though the task is genuinely absent.
         """
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         # Simulate real sqlite backend: RAISES not-found on absence
         assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
         stage.taskmaster.get_task.side_effect = TaskmasterError(  # type: ignore[union-attr]
@@ -1210,7 +1218,6 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
     async def test_task_count_verification_stat_set_when_inconsistent(self):
         """When task_count_verification has consistent=False, report.stats is set and WARNING logged."""
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
 
         verification_record = {
             'available': True,
@@ -1258,7 +1265,6 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
         import logging
 
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         stage.task_count_verification = {
             'available': True,
             'consistent': False,
@@ -1300,7 +1306,6 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
     async def test_task_count_verification_absent_when_none(self):
         """When stage.task_count_verification is None, the key must be absent from report.stats."""
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         # Explicitly leave task_count_verification at the default (None)
 
         base_report = StageReport(
@@ -1348,7 +1353,6 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
     async def test_graphiti_queue_health_stat_set_when_unhealthy(self):
         """When graphiti_queue_health.healthy=False, report.stats is set."""
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
 
         health_record = {
             'dead_count': 2,
@@ -1395,7 +1399,6 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
         import logging
 
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         stage.graphiti_queue_health = {
             'dead_count': 2, 'pending_count': 0, 'retry_count': 0,
             'oldest_pending_age_seconds': None, 'healthy': False,
@@ -1433,7 +1436,6 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
     async def test_graphiti_queue_health_absent_when_none(self):
         """When stage.graphiti_queue_health is None, the key must be absent from report.stats."""
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         # Explicitly leave graphiti_queue_health at the default (None)
 
         base_report = StageReport(
@@ -1484,7 +1486,6 @@ class TestMemoryConsolidatorStatusCorrectionReconciliationWiring:
     async def test_status_correction_reconciliation_stat_set_when_present(self):
         """When stage.status_correction_reconciliation is set, report.stats carries it."""
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
 
         reconciliation_record = {
             'superseded': True, 'diverged': True, 'memory_id': 'x',
@@ -1525,7 +1526,6 @@ class TestMemoryConsolidatorStatusCorrectionReconciliationWiring:
     async def test_status_correction_reconciliation_absent_when_none(self):
         """When stage.status_correction_reconciliation is None, the key is absent."""
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         # Explicitly leave status_correction_reconciliation at the default (None)
 
         base_report = StageReport(
@@ -1682,7 +1682,6 @@ class TestStaleCountSnapshotCorrectionWiring:
         run() and the stat is unset.
         """
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
 
         incident_flag = {
             'task_id': None,
@@ -1969,7 +1968,6 @@ class TestConsolidatorRunFetchDegradedStat:
     async def test_run_surfaces_degraded_episodes_in_stats(self):
         """When episodes fetch fails, report.stats['stage1_fetch_degraded'] == ['episodes']."""
         stage = _make_consolidator(project_root='/tmp/test_run_degraded')
-        stage.project_id = 'test_project'
         stage.memory.get_episodes = AsyncMock(side_effect=RuntimeError('graphiti down'))
 
         # Use real assemble_payload (no BaseStage.run mock) — let MemoryConsolidator.run
@@ -2015,7 +2013,6 @@ class TestConsolidatorRunFetchDegradedStat:
     async def test_run_surfaces_empty_degraded_on_clean_fetch(self):
         """When no fetch fails, report.stats['stage1_fetch_degraded'] == []."""
         stage = _make_consolidator(project_root='/tmp/test_run_clean')
-        stage.project_id = 'test_project'
 
         watermark = Watermark(project_id='test_project')
         # Clean fetch — no exceptions
@@ -2052,7 +2049,6 @@ class TestConsolidatorRunFetchDegradedStat:
         Mirrors test_run_surfaces_degraded_episodes_in_stats but for the assembled-payload path.
         """
         stage = _make_consolidator(project_root='/tmp/test_run_degraded_assembled')
-        stage.project_id = 'test_project'
         stage.assembled_payload = AssembledPayload(events=[], context_items={})
         stage.memory.get_status = AsyncMock(side_effect=RuntimeError('status backend down'))
 
@@ -2329,7 +2325,6 @@ class TestDegenerateTaskNodeSweepWiring:
         """run() awaits the sweep with done+cancelled ids (incl. cancelled 142 & 144)
         and surfaces its scanned/deleted stats under the degenerate_task_nodes_* keys."""
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         stage.filtered_task_tree = FilteredTaskTree(
             done_tasks=[{'id': 148}],
             cancelled_tasks=[{'id': 142}, {'id': 144}],
@@ -2405,7 +2400,6 @@ class TestDegenerateTaskNodeSweepGuards:
     async def test_remediation_pass_never_sweeps(self):
         """remediation_findings set -> run() returns before reaching the sweep block."""
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         stage.remediation_findings = [{'description': 'some finding'}]
         stage.filtered_task_tree = FilteredTaskTree(done_tasks=[{'id': 148}])
 
@@ -2441,7 +2435,6 @@ class TestDegenerateTaskNodeSweepGuards:
     async def test_none_filtered_task_tree_never_sweeps(self):
         """filtered_task_tree left at its None default -> sweep not awaited, no stats set."""
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         assert stage.filtered_task_tree is None
 
         base_report = StageReport(
@@ -2481,7 +2474,6 @@ class TestDegenerateTaskNodeSweepGuards:
         out of stage.run() instead of being swallowed.
         """
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
         stage.filtered_task_tree = FilteredTaskTree(done_tasks=[{'id': 148}])
 
         incident_flag = {

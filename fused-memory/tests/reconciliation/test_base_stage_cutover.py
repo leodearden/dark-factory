@@ -297,7 +297,7 @@ class TestHarnessForwardsReconState:
         journal_mock = AsyncMock()
         event_buffer_mock = MagicMock()
 
-        return ReconciliationHarness(
+        harness = ReconciliationHarness(
             memory_service=memory_mock,
             taskmaster=None,
             journal=journal_mock,
@@ -305,6 +305,14 @@ class TestHarnessForwardsReconState:
             config=config,
             recon_report_state=state,
         )
+        # Task 2146 β: the harness no longer pre-builds a long-lived `self.stages`
+        # list at construction — every cycle builds fresh stages via
+        # `_make_stages(scope)`. Build one here and stash it so this fixture's
+        # callers keep their `harness.stages[N]` access pattern.
+        harness.stages = harness._make_stages(
+            ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test'))
+        )
+        return harness
 
     def test_stages_receive_recon_report_state(self):
         """All three stages get _recon_report_state set to the injected state object."""

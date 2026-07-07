@@ -29,6 +29,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _verify_task_count_snapshot_written,
@@ -43,6 +44,11 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     evaluate_snapshot_cadence,
     extract_snapshot_written,
 )
+
+
+def _scope(project_id: str, project_root: str) -> ProjectScope:
+    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
+    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
 def _stage_report(stats: dict) -> StageReport:
@@ -437,9 +443,11 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
         )
 
     async def _run_with_snapshot_check(self, mock_deps, snapshot_result, run_id):
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('dark_factory', '/tmp/test'),
+            **mock_deps,
+        )
 
         with (
             patch(
@@ -516,9 +524,11 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
         get_memories = AsyncMock(side_effect=_get_memories_by_metadata)
         mock_deps['memory_service'].get_memories_by_metadata = get_memories
 
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('dark_factory', '/tmp/test'),
+            **mock_deps,
+        )
 
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
@@ -552,9 +562,11 @@ class TestRunRecordsTaskCountSnapshotWrittenStat:
         get_memories = AsyncMock(return_value=[])
         mock_deps['memory_service'].get_memories_by_metadata = get_memories
 
-        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage = TaskKnowledgeSync(
+            StageId.task_knowledge_sync,
+            scope=_scope('dark_factory', '/tmp/test'),
+            **mock_deps,
+        )
 
         with patch(
             'fused_memory.reconciliation.stages.base.run_stage_via_cli',
