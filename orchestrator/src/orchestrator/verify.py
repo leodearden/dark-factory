@@ -1718,6 +1718,14 @@ class VerifyResult:
     category: str = ''
     worktree_log_paths: list[str] = field(default_factory=list)
     archive_log_paths: list[str] = field(default_factory=list)
+    # Machine-readable payload for a flock-contention outcome (task 2306 α):
+    # {'host', 'holder_pgid', 'waiter_pgid'}.  Deliberately a plain JSON-native
+    # dict (NOT a nested dataclass) so the generic codec (result_to_dict=asdict /
+    # result_from_dict=VerifyResult(**d)) round-trips it losslessly — a nested
+    # dataclass would come back as a bare dict from asdict but from_dict would
+    # pass it straight into VerifyResult(**d) without reconstructing it.
+    # None for every non-contention result (default / back-compat).
+    contention: dict | None = None
     # Wall-clock verify cost.  For a single-module run: max(test, lint, type)
     # when the three commands ran concurrently (asyncio.gather), or their sum
     # when run serially.  For a multi-module run: max across child
