@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,7 +24,7 @@ from orchestrator import session_registry as sr
 # ---------------------------------------------------------------------------
 
 
-def _make_record(**overrides: object) -> "sr.SessionRecord":
+def _make_record(**overrides: object) -> sr.SessionRecord:
     """Build a fully-populated SessionRecord for round-trip/identity tests.
 
     Every field is given a concrete, distinguishable value so a round-trip
