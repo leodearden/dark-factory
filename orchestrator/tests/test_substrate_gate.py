@@ -278,7 +278,7 @@ class TestRunSubstrateRecheckFailClosed:
         assert verdict.verdict == FLIP, f'Expected FLIP, got {verdict.verdict!r}'
         assert verdict.flipped is True
         # Checker must NOT have been invoked
-        assert checker.calls == []
+        assert checker.calls == []  # type: ignore[attr-defined]
         # A WARNING must have been emitted
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             f'Expected a WARNING; got: {[r.message for r in caplog.records]!r}'
@@ -293,7 +293,7 @@ class TestRunSubstrateRecheckFailClosed:
             verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
         assert verdict.verdict == FLIP, f'Expected FLIP, got {verdict.verdict!r}'
         assert verdict.flipped is True
-        assert checker.calls == []
+        assert checker.calls == []  # type: ignore[attr-defined]
         assert any(r.levelno >= logging.WARNING for r in caplog.records), (
             f'Expected a WARNING; got: {[r.message for r in caplog.records]!r}'
         )
@@ -307,7 +307,7 @@ class TestRunSubstrateRecheckFailClosed:
             verdict = run_substrate_recheck(task=task, worktree='/gate/wt', run_subprocess=checker)
         assert verdict.verdict == SKIP, f'Expected SKIP, got {verdict.verdict!r}'
         assert verdict.flipped is False
-        assert checker.calls == []
+        assert checker.calls == []  # type: ignore[attr-defined]
         # No WARNING for a genuinely-absent probe
         assert not any(r.levelno >= logging.WARNING for r in caplog.records), (
             f'Expected no WARNING for genuinely-absent probe; got: {[r.message for r in caplog.records]!r}'
@@ -385,7 +385,7 @@ class TestRunSubstrateRecheck:
         assert verdict.verdict == SKIP
         assert verdict.flipped is False
         # Checker must NOT have been invoked for a task with no descriptor
-        assert checker.calls == []
+        assert checker.calls == []  # type: ignore[attr-defined]
 
     def test_descriptor_but_no_checker_returns_flip(self):
         """Descriptor present but no resolvable checker → FLIP."""
@@ -403,8 +403,8 @@ class TestRunSubstrateRecheck:
         task = make_probe_task(checker=['run_check'], probe_set='probes/suite.json')
         checker = fake_checker(rc=0)
         run_substrate_recheck(task=task, worktree='/wt/gate', run_subprocess=checker)
-        assert len(checker.calls) == 1
-        called_argv, called_cwd = checker.calls[0]
+        assert len(checker.calls) == 1  # type: ignore[attr-defined]
+        called_argv, called_cwd = checker.calls[0]  # type: ignore[attr-defined]
         assert called_argv == ['run_check', 'probes/suite.json']
         assert called_cwd == '/wt/gate'
 
@@ -1323,7 +1323,7 @@ class TestSubstrateGatePruneChokepoint:
             result = await h._run_substrate_gate(assignment)
 
         assert result is True
-        h.git_ops.prune_worktrees.assert_awaited_once_with(
+        h.git_ops.prune_worktrees.assert_awaited_once_with(  # type: ignore[attr-defined]
             context='substrate-gate-cleanup',
         )
 
