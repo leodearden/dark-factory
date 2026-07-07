@@ -198,6 +198,11 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     # (task 2285) to a tmp dir sibling of bin_dir, so this suite never reads
     # or writes the real ~/.claude/fleet tree.
     env["CLAUDE_FLEET_ROOT"] = str(bin_dir.parent / "fleet")
+    # Isolate the started-watchdog's transcript-appearance probe (task 2286,
+    # Attention Rail T4) to a fresh, empty tmp dir sibling of bin_dir, so the
+    # watchdog never scans (or finds stray evidence in) the real
+    # ~/.claude/projects tree.
+    env["CLAUDE_PROJECTS_DIR"] = str(bin_dir.parent / "projects")
     return env
 
 
@@ -704,4 +709,82 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
     assert not slug_dir.exists()
     assert absent_slug not in reaped_by_slug, (
         "the freshly-upserted record must not be reaped -- its heartbeat is new"
+    )
+
+
+# ===========================================================================
+# task-2286 (Attention Rail T4): failed-to-start detection
+# ===========================================================================
+# The 2026-07-06 incident: a detaching launcher reports success (exit 0) but
+# never actually starts claude -- no sentinel, no transcript, ever.
+# resolve_detached's launch_rc==0 branch then calls the UNBOUNDED
+# await_sentinel and hangs forever. A backgrounded started-watchdog must
+# detect this within a bounded grace (SPAWN_STARTED_GRACE_SECS) and surface a
+# distinct exit code + a loud stderr line + a failed-to-start session-registry
+# record, instead of hanging.
+
+
+def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> None:
+    """A detaching launcher that exits 0 WITHOUT starting claude must be
+    flagged failed-to-start within SPAWN_STARTED_GRACE_SECS, not hang forever.
+
+    This is the exact incident shape: the launcher (routed to the `*)`
+    dispatch branch as "custom-term") exits 0 immediately without ever
+    exec'ing the `bash -c "$inner"` payload -- so no claude process ever
+    runs, no sentinel is ever written, and no transcript ever appears under
+    $CLAUDE_PROJECTS_DIR.
+
+    RED today: resolve_detached's launch_rc==0 (no sentinel) branch calls the
+    unbounded await_sentinel, which loops forever since the sentinel is never
+    written -> proc.wait(timeout=20) raises TimeoutExpired -> pytest.fail.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+
+    # Fake DETACHING terminal that never runs the payload at all: no claude,
+    # no sentinel, no transcript. Adapts the exit-0-without-payload idiom of
+    # test_genuine_launcher_failure_yields_127 (which uses exit 1 for a
+    # genuine launcher crash) to exit 0 -- the incident is a launcher that
+    # reports SUCCESS while silently never starting claude.
+    term = bin_dir / "custom-term"
+    term.write_text("#!/usr/bin/env bash\nexit 0\n")
+    term.chmod(0o755)
+
+    env = _base_env(bin_dir, "custom-term")
+    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+
+    proc = subprocess.Popen(
+        [str(SPAWN_SCRIPT), str(tmp_path), "false", "", "test prompt"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    # Must-not-hang guard, not a latency SLA -- mirrors
+    # test_window_close_yields_129_not_hang's Popen+wait(timeout) pattern.
+    # Pre-impl this hangs forever (unbounded await_sentinel), so a bounded
+    # wait cleanly separates pass/fail from an infinite hang.
+    try:
+        rc = proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        pytest.fail(
+            "spawn-claude.sh hung after a detached launcher exited 0 without "
+            "starting claude (no started-watchdog / unbounded await_sentinel "
+            "not broken)"
+        )
+
+    stderr = proc.stderr.read().decode()  # type: ignore[union-attr]
+    assert rc == 144, (
+        f"Expected exit 144 (EXIT_FAILED_TO_START), got {rc}\nstderr: {stderr}"
+    )
+    assert "failed-to-start" in stderr.lower(), (
+        f"expected a loud failed-to-start line on stderr, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.FAILED_TO_START, (
+        f"expected registry status failed-to-start, got {record.status}"
     )
