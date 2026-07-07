@@ -796,14 +796,23 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     Proves the transcript detector is load-bearing. Uses a DETACHING launcher
     (custom-term, routing through resolve_detached's launch_rc==0 branch --
     the incident path) whose fake claude writes a transcript file under
-    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps 2s (longer
-    than the shrunk 1s started-grace) before exiting and letting $inner write
-    the sentinel. <enc> mirrors session_registry.transcript_path_for_cwd's
+    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps well past
+    the shrunk started-grace before exiting and letting $inner write the
+    sentinel. <enc> mirrors session_registry.transcript_path_for_cwd's
     encoding: cwd with every '/' and '.' replaced by '-'.
 
-    RED today: step-2's watchdog only knows the exit sentinel, so with grace=1s
-    it flags failed-to-start at ~1s -- well before the ~2s sentinel -> rc 144,
-    not 0. GREEN after step-4 wires the transcript probe.
+    Grace/sleep margins are deliberately generous, not tight: the watchdog's
+    deadline is computed from `date +%s` (whole-second resolution), so a
+    nominal N-second grace can grant anywhere from just-over-0 to just-under
+    (N+1) seconds of real time depending on where in the current second the
+    watchdog starts. A grace=1s/sleep=2s pairing is flaky under load for
+    exactly this reason (observed empirically); grace=3s/sleep=8s leaves
+    enough headroom to absorb that +/-1s truncation noise on a busy host.
+
+    RED today: step-2's watchdog only knows the exit sentinel, so with grace
+    shorter than the sentinel delay it flags failed-to-start well before the
+    sentinel appears -> rc 144, not 0. GREEN after step-4 wires the
+    transcript probe.
     """
     bin_dir = _make_bin_dir(tmp_path)
 
@@ -818,7 +827,7 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
         "#!/usr/bin/env bash\n"
         f'mkdir -p "$CLAUDE_PROJECTS_DIR/{enc}"\n'
         f'touch "$CLAUDE_PROJECTS_DIR/{enc}/session.jsonl"\n'
-        "sleep 2\n"
+        "sleep 8\n"
         "exit 0\n"
     )
     claude.chmod(0o755)
@@ -827,7 +836,7 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     _write_detaching_terminal(bin_dir, "custom-term", pidfile)
 
     env = _base_env(bin_dir, "custom-term")
-    env["SPAWN_STARTED_GRACE_SECS"] = "1"
+    env["SPAWN_STARTED_GRACE_SECS"] = "3"
 
     result = _run_spawn(env, tmp_path, timeout=20)
 

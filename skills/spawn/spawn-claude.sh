@@ -169,12 +169,69 @@ finish_failed_to_start() {
   exit "$code"
 }
 
+# Mirror session_registry.transcript_path_for_cwd's encoding byte-for-byte:
+# every '/' then every '.' maps to '-' (empirically re-verified 2026-07-07,
+# e.g. /home/leo/src/dark-factory -> -home-leo-src-dark-factory). Used to
+# locate this spawn's transcript directory under $CLAUDE_PROJECTS_DIR.
+_encode_cwd() {
+  local e="${1//\//-}"
+  printf '%s' "${e//./-}"
+}
+
+# Best-effort: is any process named `claude` a descendant of this script's
+# own PID? Guarded end-to-end -- ps unavailable, or any parsing hiccup,
+# yields "no descendant found" (fail-soft) rather than a fault. Scoped to
+# $$'s ancestor chain so it only matches a foreground-launched claude
+# (detached emulators reparent claude away from this script, so it is
+# correctly empty there) and never a coincidental, unrelated claude process
+# elsewhere on a busy host.
+_claude_descendant_alive() {
+  command -v ps >/dev/null 2>&1 || return 1
+
+  local -A ppid_of=()
+  local -a claude_pids=()
+  local pid ppid comm
+
+  while read -r pid ppid comm; do
+    [ -n "$pid" ] || continue
+    ppid_of["$pid"]="$ppid"
+    [ "$comm" = "claude" ] && claude_pids+=("$pid")
+  done < <(ps -eo pid=,ppid=,comm= 2>/dev/null)
+
+  local cand anc hops
+  for cand in "${claude_pids[@]}"; do
+    anc="${ppid_of[$cand]:-}"
+    hops=0
+    while [ -n "$anc" ] && [ "$hops" -lt 100 ]; do
+      [ "$anc" = "$$" ] && return 0
+      anc="${ppid_of[$anc]:-}"
+      hops=$(( hops + 1 ))
+    done
+  done
+  return 1
+}
+
+# Positive start-evidence: either a transcript file appeared under this
+# spawn's $CLAUDE_PROJECTS_DIR/<encoded-cwd>/ newer than the spawn-time
+# reference marker, or a claude process is running as this script's
+# descendant. The transcript probe is the primary, deterministically-tested
+# signal (the motivating incident is "no transcript ever appeared"); the
+# process probe is a guarded best-effort secondary.
+_started_evidence() {
+  local d="$CLAUDE_PROJECTS_DIR/$(_encode_cwd "$cwd")"
+  if [ -d "$d" ] && [ -n "$(find "$d" -type f -newer "$spawn_ref" -print -quit 2>/dev/null)" ]; then
+    return 0
+  fi
+  _claude_descendant_alive && return 0
+  return 1
+}
+
 # Backgrounded started-verification watchdog (Attention Rail T4). Forked once
 # right before the emulator case dispatch so it is already running whether
 # the launcher turns out to be foreground (blocks until window-close) or
 # detached (returns immediately). Polls up to SPAWN_STARTED_GRACE_SECS for
-# start-evidence; this step only checks the exit sentinel (the transcript
-# and claude-descendant probes are added in step-4).
+# start-evidence: the exit sentinel, a fresh transcript, or a live claude
+# descendant.
 #
 # On grace-expiry with no evidence, flags failed-to-start: best-effort marks
 # the session-registry record, emits a loud caller-visible stderr line, and
@@ -191,6 +248,7 @@ _started_watchdog() {
   end=$(( $(date +%s) + SPAWN_STARTED_GRACE_SECS ))
   while [ "$(date +%s)" -lt "$end" ]; do
     [ -f "$sentinel" ] && return 0
+    _started_evidence && return 0
     sleep 0.25
   done
   # Final check -- avoid flagging on a sentinel that landed right at the
