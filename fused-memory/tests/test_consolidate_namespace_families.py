@@ -909,3 +909,148 @@ class TestRunDryRun:
 
         graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
         assert graph_by_sibling['know-live']['disposition'] == 'UNRESOLVED'
+
+
+# ===========================================================================
+# Tests: run() -- apply path
+# ===========================================================================
+
+class TestRunApply:
+    """Tests for async run(args, memory_service, *, limit) in apply mode
+    (args.apply=True). Reuses the fixtures declared above (shared with
+    TestRunDryRun)."""
+
+    def _scenario(self):
+        """One mergeable sibling (know-live, 1 entity row; its total node
+        count is fixed at 0 to stand in for the post-move state, so it is
+        ALSO DELETE-able as a junk key in the same --apply pass); one
+        collection with points (fused_dark-factory); one non-empty
+        JUNK_KEYS entry (my-project, count 3); one empty JUNK_KEYS entry
+        (test-project, count 0)."""
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            total_count_by_key={'know-live': 0, 'my-project': 3, 'test-project': 0},
+        )
+        qdrant_client = _make_run_qdrant_mock(
+            points_by_collection={
+                'fused_dark-factory': [_make_point('p1', payload={'user_id': 'dark-factory'})],
+            },
+        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+        return memory_service, graphiti, qdrant_client
+
+    def _move_mock(self, monkeypatch) -> AsyncMock:
+        """Patch move_entity_across_graphs so the family-merge branch (which
+        --apply always exercises for a non-capped sibling) never reaches the
+        real ε primitive."""
+        move_mock = AsyncMock(
+            return_value=_mod.MoveResult(
+                uuid='uuid-1', source_graph='know-live', target_graph='know_live',
+                edges_moved=2, edges_skipped=0, mentions_moved=1, mentions_skipped=0,
+            ),
+        )
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        return move_mock
+
+    @pytest.mark.asyncio
+    async def test_apply_moves_each_sibling_entity_with_rewrite_group_id(self, monkeypatch):
+        """move_entity_across_graphs is called once per sibling entity row,
+        with source=sibling, target=canonical, and rewrite_group_id=canonical
+        -- the Phase-2 identity rewrite (PRD decision 6) -- and the know-live
+        graph_family item carries the merge summary (nodes_moved etc.)."""
+        move_mock = self._move_mock(monkeypatch)
+        memory_service, graphiti, _ = self._scenario()
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        move_mock.assert_called_once()
+        call = move_mock.call_args
+        assert call.args == (graphiti, 'uuid-1', 'know-live', 'know_live')
+        assert call.kwargs == {'rewrite_group_id': 'know_live'}
+
+        graph_by_sibling = {item['sibling']: item for item in report['graph_family_merges']}
+        know_live_item = graph_by_sibling['know-live']
+        assert know_live_item['nodes_moved'] == 1
+        assert know_live_item['edges_moved'] == 2
+        assert know_live_item['mentions_moved'] == 1
+
+    @pytest.mark.asyncio
+    async def test_apply_upserts_with_canonical_user_id_and_deletes_source_collection(self, monkeypatch):
+        """qdrant upsert is called with collection_name=target and the
+        point's payload user_id rewritten to canonical; the not-capped
+        source collection is deleted; the collection item carries
+        points_upserted/source_deleted=True."""
+        self._move_mock(monkeypatch)
+        memory_service, _, qdrant_client = self._scenario()
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        upsert_calls = [
+            c for c in qdrant_client.upsert.call_args_list
+            if c.kwargs.get('collection_name') == 'fused_dark_factory'
+        ]
+        assert len(upsert_calls) == 1
+        upserted = upsert_calls[0].kwargs['points']
+        assert len(upserted) == 1
+        assert upserted[0].payload['user_id'] == 'dark_factory'
+
+        qdrant_client.delete_collection.assert_any_call('fused_dark-factory')
+
+        collection_by_source = {item['source']: item for item in report['collection_merges']}
+        dark_factory_item = collection_by_source['fused_dark-factory']
+        assert dark_factory_item['points_upserted'] == 1
+        assert dark_factory_item['source_deleted'] is True
+
+    @pytest.mark.asyncio
+    async def test_apply_deletes_zero_count_junk_key_and_leaves_nonzero_unresolved(self, monkeypatch):
+        """delete_junk_key deletes the zero-count key (test-project,
+        disposition DELETE) but leaves the non-empty one (my-project,
+        disposition UNRESOLVED) untouched -- .delete() is never called on
+        it. The know-live sibling, whose total count is fixed at 0 (the
+        post-move state), is likewise DELETE-able in the same pass."""
+        self._move_mock(monkeypatch)
+        memory_service, graphiti, _ = self._scenario()
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        graphiti._graphs_by_key['test-project'].delete.assert_called_once()
+        graphiti._graphs_by_key['my-project'].delete.assert_not_called()
+
+        junk_by_key = {item['key']: item for item in report['junk_key_deletions']}
+        assert junk_by_key['test-project']['disposition'] == 'DELETE'
+        assert junk_by_key['my-project']['disposition'] == 'UNRESOLVED'
+        assert junk_by_key['know-live']['disposition'] == 'DELETE'
+
+    @pytest.mark.asyncio
+    async def test_apply_report_dry_run_is_false(self, monkeypatch):
+        """report['dry_run'] is False when args.apply is True."""
+        self._move_mock(monkeypatch)
+        memory_service, _, _ = self._scenario()
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        assert report['dry_run'] is False
+
+    @pytest.mark.asyncio
+    async def test_apply_capped_collection_not_deleted_and_stays_unresolved(self, monkeypatch):
+        """A collection whose scroll hits --limit is NOT deleted even with
+        --apply (no data loss on a partial migration) and its disposition
+        stays UNRESOLVED."""
+        self._move_mock(monkeypatch)
+        points = [_make_point(f'p{i}') for i in range(2)]
+        graphiti = _make_run_graphiti_mock()
+        qdrant_client = _make_run_qdrant_mock(
+            points_by_collection={'fused_dark-factory': points},
+        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=2)
+
+        capped_deletes = [
+            c for c in qdrant_client.delete_collection.call_args_list
+            if c.args and c.args[0] == 'fused_dark-factory'
+        ]
+        assert capped_deletes == []
+
+        collection_by_source = {item['source']: item for item in report['collection_merges']}
+        assert collection_by_source['fused_dark-factory']['disposition'] == 'UNRESOLVED'
