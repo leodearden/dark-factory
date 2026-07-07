@@ -116,6 +116,8 @@ import signal
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from shared.task_metadata import DoneProvenance
+
 from orchestrator import systemd_inspect
 from orchestrator.systemd_inspect import inspect_systemd_unit
 from orchestrator.workflow import WorkflowOutcome
@@ -173,6 +175,25 @@ _INSPECT_TIMEOUT_SECS: float = systemd_inspect._INSPECT_TIMEOUT_SECS
 # same task_id (e.g. a starvation-watchdog filing) must never alias as this
 # runner's own dedup/quiescence/resolution-proof signal.
 DETERMINISTIC_AGENT_ROLE: str = 'orchestrator-deterministic'
+
+
+def _build_done_provenance(kind: str, **fields: object) -> dict:
+    """Build a ``done_provenance`` dict via the shared ``DoneProvenance`` model.
+
+    THE single seam every runner ``done_provenance`` construction routes
+    through (task 2167 — W3-δ SEAM B), sharing ONE valid-kinds enum with the
+    fused-memory validator (I2) instead of six independent inline dict
+    literals.  An unknown/typo *kind* raises ``pydantic.ValidationError``
+    here, at build time, on the orchestrator side — structurally preventing
+    the 1902/1976/1982 permanently-blocked self-restart failure mode (a
+    ``kind`` fused-memory silently rejects).
+
+    ``exclude_none=True`` keeps the emitted wire dict byte-compatible with
+    the hand-written literals this replaces (they never carried explicit
+    ``None`` values either); extra fields such as ``transient_unit`` /
+    ``fire_delay_secs`` survive via ``DoneProvenance``'s ``extra='allow'``.
+    """
+    return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)
 
 
 class DeterministicRunner:
@@ -661,12 +682,12 @@ class DeterministicRunner:
                 await self.scheduler.set_task_status(
                     task_id,
                     'done',
-                    done_provenance={
-                        'kind': 'deterministic-deploy',
-                        'pid': pid,
-                        'active_enter_timestamp': active_enter_timestamp,
-                        'unit': target_unit,
-                    },
+                    done_provenance=_build_done_provenance(
+                        'deterministic-deploy',
+                        pid=pid,
+                        active_enter_timestamp=active_enter_timestamp,
+                        unit=target_unit,
+                    ),
                 )
                 return WorkflowOutcome.DONE
             except Exception as exc:
@@ -868,11 +889,11 @@ class DeterministicRunner:
                     await self.scheduler.set_task_status(
                         task_id,
                         'done',
-                        done_provenance={
-                            'kind': 'deterministic-deploy',
-                            'unit': _ata_unit,
-                            'note': 'resumed after gate resolution',
-                        },
+                        done_provenance=_build_done_provenance(
+                            'deterministic-deploy',
+                            unit=_ata_unit,
+                            note='resumed after gate resolution',
+                        ),
                     )
                 else:
                     await self.scheduler.set_task_status(task_id, 'done')
@@ -938,12 +959,12 @@ class DeterministicRunner:
                     await self.scheduler.set_task_status(
                         task_id,
                         'done',
-                        done_provenance={
-                            'kind': 'deterministic-deploy',
-                            'pid': metadata.get('before_done_verified_pid'),
-                            'note': 'resumed after verified deploy (crash before done write)',
-                            'unit': target_unit,
-                        },
+                        done_provenance=_build_done_provenance(
+                            'deterministic-deploy',
+                            pid=metadata.get('before_done_verified_pid'),
+                            note='resumed after verified deploy (crash before done write)',
+                            unit=target_unit,
+                        ),
                     )
                     return WorkflowOutcome.DONE
 
@@ -967,13 +988,13 @@ class DeterministicRunner:
                         await self.scheduler.set_task_status(
                             task_id,
                             'done',
-                            done_provenance={
-                                'kind': 'deterministic-deploy-scheduled',
-                                'unit': target_unit,
-                                'transient_unit': _sched.get('transient_unit', ''),
-                                'fire_delay_secs': _sched.get('fire_delay_secs', 0),
-                                'note': 'resumed after self-restart scheduled (crash before done write)',
-                            },
+                            done_provenance=_build_done_provenance(
+                                'deterministic-deploy-scheduled',
+                                unit=target_unit,
+                                transient_unit=_sched.get('transient_unit', ''),
+                                fire_delay_secs=_sched.get('fire_delay_secs', 0),
+                                note='resumed after self-restart scheduled (crash before done write)',
+                            ),
                         )
                         return WorkflowOutcome.DONE
                     # always_escalates=True (act-then-ask): the milestone gate must NOT
@@ -997,11 +1018,11 @@ class DeterministicRunner:
                     await self.scheduler.set_task_status(
                         task_id,
                         'done',
-                        done_provenance={
-                            'kind': 'deterministic-deploy',
-                            'note': 'resumed after human resolution',
-                            'unit': target_unit,
-                        },
+                        done_provenance=_build_done_provenance(
+                            'deterministic-deploy',
+                            note='resumed after human resolution',
+                            unit=target_unit,
+                        ),
                     )
                     return WorkflowOutcome.DONE
 
@@ -1138,12 +1159,12 @@ class DeterministicRunner:
                         await self.scheduler.set_task_status(
                             task_id,
                             'done',
-                            done_provenance={
-                                'kind': 'deterministic-deploy-scheduled',
-                                'unit': target_unit,
-                                'transient_unit': transient_unit,
-                                'fire_delay_secs': on_active_secs,
-                            },
+                            done_provenance=_build_done_provenance(
+                                'deterministic-deploy-scheduled',
+                                unit=target_unit,
+                                transient_unit=transient_unit,
+                                fire_delay_secs=on_active_secs,
+                            ),
                         )
                         return WorkflowOutcome.DONE
                 except Exception as exc:
