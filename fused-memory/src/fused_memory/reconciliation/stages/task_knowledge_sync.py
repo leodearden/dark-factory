@@ -55,6 +55,9 @@ from fused_memory.reconciliation.summary_pool import (
     enforce_summary_pool_cap,
     pretrim_summary_pool,
 )
+from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    TASK_COUNT_SNAPSHOT_KIND,
+)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_task_dump_contamination,
@@ -1902,6 +1905,62 @@ async def _verify_stage2_summary_written(
             extra={'project_id': project_id, 'run_id': run_id},
         )
     return count
+
+
+async def _verify_task_count_snapshot_written(
+    memory_service,
+    project_id: str,
+    run_window_start: datetime | None,
+) -> bool | None:
+    """Best-effort freshness check: was a task_count_snapshot written this run window?
+
+    Enumerates existing ``kind='task_count_snapshot'`` Mem0 records via
+    ``get_memories_by_metadata`` (deterministic Qdrant scroll, NOT semantic
+    search) and checks whether any record's ``created_at`` falls within the
+    current run window via :func:`_marker_is_within_run_window`.
+
+    The existing snapshot write does not reliably carry ``metadata.run_id``,
+    so this checks the write's *timestamp* against the run window rather than
+    matching on run_id (which would read 0 forever).
+
+    Mirrors :func:`_verify_stage2_summary_written`'s never-raises, best-effort,
+    WARNING-on-failure contract, including the crucial distinction between a
+    CONFIRMED miss (``False``) and an inconclusive check (``None``):
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata``.
+        project_id: Project scope for the query.
+        run_window_start: Start of the current run window, or ``None`` when
+            unknown.
+
+    Returns:
+        ``True`` when a record's ``created_at`` falls within the run window
+        (confirmed fresh). ``False`` when the query succeeded but no record
+        falls within the window (confirmed miss). ``None`` when
+        *run_window_start* is ``None`` (window unknown) or the query itself
+        raised (transient failure) — "unknown", never miscounted as a
+        confirmed miss.
+    """
+    if run_window_start is None:
+        return None
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._verify_task_count_snapshot_written: '
+            'get_memories_by_metadata failed for project_id=%s; absence NOT '
+            'confirmed (transient failure, not treated as a miss)',
+            project_id,
+            extra={'project_id': project_id},
+        )
+        return None
+    return any(
+        _marker_is_within_run_window(member.get('created_at'), run_window_start)
+        for member in members
+    )
 
 
 async def _repair_stage2_summary_stage_metadata(
