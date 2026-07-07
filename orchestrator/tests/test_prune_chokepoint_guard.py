@@ -160,10 +160,16 @@ def test_exactly_one_prune_argv_literal_inside_chokepoint() -> None:
 
     if total != 1 or outside_chokepoint:
         offender_list = '\n  '.join(offenders) if offenders else '(none found)'
-        raise AssertionError(
-            "Expected exactly one ['git', 'worktree', 'prune'] argv literal "
-            f"under orchestrator/src, found {total}, all inside "
-            f"{_CHOKEPOINT_FUNCTION}.\n"
-            f'{remediation}\n'
-            f'\nOffending sites:\n  {offender_list}'
-        )
+        message_lines = [
+            "Expected exactly one ['git', 'worktree', 'prune']-style argv "
+            f'literal under orchestrator/src, found {total}.'
+        ]
+        if outside_chokepoint:
+            outside_list = '\n  '.join(outside_chokepoint)
+            message_lines.append(
+                f'{len(outside_chokepoint)} site(s) are OUTSIDE '
+                f'{_CHOKEPOINT_CLASS}.{_CHOKEPOINT_FUNCTION}:\n  {outside_list}'
+            )
+        message_lines.append(remediation)
+        message_lines.append(f'\nAll offending sites:\n  {offender_list}')
+        raise AssertionError('\n'.join(message_lines))
