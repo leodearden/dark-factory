@@ -27,10 +27,18 @@ from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
-from orchestrator.config import OrchestratorConfig, apply_reload, load_config
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import (
+    TASK_META_DIRNAME,
+    OrchestratorConfig,
+    apply_reload,
+    load_config,
+)
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
+from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
+from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
@@ -1961,8 +1969,25 @@ Output JSON matching the schema. Every task must appear in the output.
         recovered = 0
         cleaned = 0
 
+        # W11 delta: keep the durable LaneLifecycle record and the pool's
+        # in-memory cache from ever drifting (PRD dec.3, I1) — every
+        # restore_assignment/note_assignment call below (both the new
+        # record-driven adopt path and the pre-existing heuristic path)
+        # now mirrors onto the durable record.
+        top_pool = self.git_ops.warm_lane_pool
+        if top_pool is not None:
+            top_pool.set_lane_lifecycle(self.git_ops._lane_lifecycle)
+
         for entry in worktree_base.iterdir():
             if not entry.is_dir():
+                continue
+            if entry.name in (LANE_STATE_DIRNAME, TASK_META_DIRNAME):
+                # Sibling state-store dirs living directly under worktree_base
+                # (W11 alpha/beta/gamma), never a worktree/lane themselves —
+                # must never be scanned as one (the no-plan heuristic below
+                # would otherwise call cleanup_worktree on the durable
+                # .lane-state records / .task-meta artifacts on every
+                # restart, destroying the very state this task reads).
                 continue
             pool = self.git_ops.warm_lane_pool
             spec_pool = self.git_ops.spec_warm_lane_pool
@@ -1977,6 +2002,80 @@ Output JSON matching the schema. Every task must appear in the output.
                 spec_pool is not None and spec_pool.is_lane(entry)
             )
             task_id = entry.name
+
+            # ── Record-driven recovery (W11 delta, PRD mechanism 1) ─────
+            # Consult the durable LaneLifecycle record FIRST, before any of
+            # the plan.json heuristics below: a record in ASSIGNED/IN_USE is
+            # the durable source of truth for "this lane belongs to this
+            # task". Adopt only on an EXACT git-reality match (still a
+            # registered worktree AND — when resolvable — its checked-out
+            # branch matches the record) for a non-terminal task. ANY other
+            # rec.state (including no record at all — the pre-W11 compat
+            # case) falls through unchanged to the existing heuristic path
+            # below. A divergent ASSIGNED/IN_USE record also falls through
+            # for now (harmless: the heuristic path re-derives the same
+            # registration check independently) — quarantine-on-divergence
+            # and the terminal-task release/branch-mismatch cells are added
+            # by later steps of this task.
+            if is_lane and pool is not None:
+                rec = self.git_ops._lane_lifecycle.read(entry)
+                if (
+                    rec is not None
+                    and rec.state in (DurableLaneState.ASSIGNED, DurableLaneState.IN_USE)
+                    and rec.task_id is not None
+                ):
+                    try:
+                        is_registered = await self.git_ops._is_registered_worktree(entry)
+                    except OSError:
+                        # Fail-safe: an unreachable git command must not be
+                        # read as conclusively "orphaned" (mirrors the
+                        # transient-safe default used elsewhere in this
+                        # method).
+                        is_registered = True
+                    registered_branch = None
+                    checkouts = await self.git_ops.lane_branch_checkouts()
+                    if checkouts:
+                        for bare_id, checkout_lane in checkouts.items():
+                            if checkout_lane == entry:
+                                registered_branch = (
+                                    f'{self.git_ops.config.branch_prefix}{bare_id}'
+                                )
+                                break
+                    branch_ok = rec.branch is None or registered_branch == rec.branch
+                    if is_registered and branch_ok:
+                        pool.restore_assignment(rec.task_id, entry)
+                        meta_dir = TaskArtifacts.meta_root_for(worktree_base, entry.name)
+                        rec_plan_path = meta_dir / 'plan.json'
+                        if not rec_plan_path.exists():
+                            rec_plan_path = entry / '.task' / 'plan.json'
+                        if rec_plan_path.exists():
+                            try:
+                                self._recovered_plans[rec.task_id] = json.loads(
+                                    rec_plan_path.read_text()
+                                )
+                            except (json.JSONDecodeError, OSError) as e:
+                                logger.warning(
+                                    'Recovery: lane %s record-adopted for task '
+                                    '%s but plan.json unreadable (%s)',
+                                    entry.name, rec.task_id, e,
+                                )
+                        rec_lock_path = meta_dir / 'plan.lock'
+                        if not rec_lock_path.exists():
+                            rec_lock_path = entry / '.task' / 'plan.lock'
+                        if rec_lock_path.exists():
+                            rec_lock_path.unlink()
+                            logger.info(
+                                'Recovery: cleared stale plan.lock for '
+                                'record-adopted task %s', rec.task_id,
+                            )
+                        logger.info(
+                            'Recovery: lane %s record-adopted for task %s '
+                            '(durable state=%s)',
+                            entry.name, rec.task_id, rec.state.value,
+                        )
+                        recovered += 1
+                        continue
+
             plan_path = entry / '.task' / 'plan.json'
 
             if not plan_path.exists():

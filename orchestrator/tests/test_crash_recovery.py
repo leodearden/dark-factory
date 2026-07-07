@@ -1053,6 +1053,7 @@ class TestRecordDrivenRecovery:
         pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         lane = base / '_lane-0'
+        lane.mkdir(parents=True, exist_ok=True)  # the lane dir itself (no .task/ needed)
         lifecycle = harness.git_ops._lane_lifecycle
         _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
 
