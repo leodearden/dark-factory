@@ -11,13 +11,26 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import textwrap
 import time
+from datetime import UTC, datetime, timedelta
 
 import pytest  # pyright: ignore[reportMissingImports]
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
+
+# Insert this worktree's orchestrator/src onto sys.path (ahead of any
+# editable install pointing at a different checkout) so `import
+# orchestrator.session_registry` resolves to the module spawn-claude.sh
+# itself invokes by absolute path (task 2285) -- letting this file assert
+# in-process against the exact same record/reap contract.
+_ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
+if str(_ORCH_SRC) not in sys.path:
+    sys.path.insert(0, str(_ORCH_SRC))
+
+from orchestrator import session_registry  # noqa: E402
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
 FOREGROUND_NAMES = ["gnome-terminal", "xterm", "kitty"]
@@ -181,6 +194,10 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     env.pop("ESCALATION_TERMINAL_CMD", None)
     # Keep the genuine-launcher-failure grace short so tests don't hang.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
+    # Isolate the session-registry writes spawn-claude.sh now performs
+    # (task 2285) to a tmp dir sibling of bin_dir, so this suite never reads
+    # or writes the real ~/.claude/fleet tree.
+    env["CLAUDE_FLEET_ROOT"] = str(bin_dir.parent / "fleet")
     return env
 
 
@@ -503,3 +520,188 @@ def test_window_close_129_robust_to_delayed_trap_install(
             f"with {DELAY}s trap-install delay), got {rc}\n"
             f"stderr: {proc.stderr.read().decode()}"  # type: ignore[union-attr]
         )
+
+
+# ===========================================================================
+# task-2285 step-11: session-registry record lifecycle
+# ===========================================================================
+# Real spawn-claude.sh run, CLAUDE_FLEET_ROOT isolated to a tmp dir (via
+# _base_env). The registry write must be purely additive: the pre-existing
+# exit-code contract (result.returncode == the fake claude's own code) holds
+# unchanged alongside the new launching -> exited record.json lifecycle.
+
+
+def _find_one_record(fleet_root: pathlib.Path) -> pathlib.Path:
+    """Return the single record.json under *fleet_root*/sessions/, or fail loudly."""
+    records = list((fleet_root / "sessions").glob("*/record.json"))
+    assert len(records) == 1, f"expected exactly one record.json, found {records}"
+    return records[0]
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_spawn_writes_session_record_lifecycle(
+    tmp_path: pathlib.Path, exit_code: int,
+) -> None:
+    """A real spawn writes launching -> exited with the session's own exit code."""
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=exit_code)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == exit_code, (
+        f"registry wiring must be additive to the exit-code contract: "
+        f"expected {exit_code}, got {result.returncode}\n"
+        f"stderr: {result.stderr.decode()}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.EXITED
+    assert record.exit_code == exit_code
+
+
+# ===========================================================================
+# task-2285 step-13: session-registry fail-soft on forced registry failure
+# ===========================================================================
+# CLAUDE_FLEET_ROOT is pointed at a subpath UNDER a pre-created regular file,
+# so any mkdir the registry attempts raises NotADirectoryError deterministically
+# (not reliant on filesystem permission semantics, which vary across CI users/
+# containers). This pins the hard requirement (design decision 3): a registry
+# fault must be loud (caller-visible stderr) but must NEVER change
+# spawn-claude.sh's own exit code, and must leave no record dir behind.
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_spawn_fail_soft_on_unwritable_fleet_root(
+    tmp_path: pathlib.Path, exit_code: int,
+) -> None:
+    """A forced registry-write failure must not affect the exit-code contract."""
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=exit_code)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    # Shadow _base_env's CLAUDE_FLEET_ROOT with one that can never be created:
+    # a path nested UNDER a pre-existing regular file.
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("i am a regular file, not a directory\n")
+    env["CLAUDE_FLEET_ROOT"] = str(blocker / "fleet")
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == exit_code, (
+        f"a registry fault must never change the exit-code contract: "
+        f"expected {exit_code}, got {result.returncode}\n"
+        f"stderr: {result.stderr.decode()}"
+    )
+
+    stderr = result.stderr.decode()
+    assert "session_registry" in stderr and "failed" in stderr, (
+        f"expected a loud registry-fault line on the spawn's stderr, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    assert not fleet_root.exists(), (
+        f"no record dir should have been created under an unwritable fleet root, "
+        f"but {fleet_root} exists"
+    )
+
+
+# ===========================================================================
+# task-2285 step-15: G5 two-way boundary test (write -> refresh -> reap)
+# ===========================================================================
+# The shared session-registry contract (PRD G5): a record written by one
+# process (spawn-claude.sh, a real bash subprocess) must be findable and
+# refreshable under the SAME slug key by a wholly separate write (the future
+# T6 SessionStart hook, simulated here via the `refresh` CLI), and the result
+# must still reap correctly afterward. This is the seam every downstream
+# Attention Rail task (T4/T5/T6/T7) builds on.
+
+# Matches the guaranteed-dead-pid convention established in
+# orchestrator/tests/test_session_registry.py (_DEAD_PID = 2**31 - 1).
+_DEAD_PID = 2**31 - 1
+
+
+def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) -> None:
+    """write (real spawn) -> refresh (simulated hook, same key) -> reap."""
+    # --- Producer: a REAL spawn-claude.sh run writes launching -> exited --
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    slug_dir = record_path.parent
+    written = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert written.status == session_registry.Status.EXITED
+
+    # Backdate the mtime so the refresh's heartbeat bump is unambiguous even
+    # on filesystems with coarse mtime resolution.
+    backdated_ts = record_path.stat().st_mtime - 100
+    os.utime(record_path, (backdated_ts, backdated_ts))
+
+    # --- Consumer: a simulated hook write refreshes under the SAME key ----
+    # The exact CLI invocation the T6 SessionStart hook will make.
+    rc = session_registry.main(
+        ["refresh", "--record", str(slug_dir), "--status", "running"]
+    )
+    assert rc == 0
+
+    refreshed_paths = list((fleet_root / "sessions").glob("*/record.json"))
+    assert refreshed_paths == [record_path], (
+        f"refresh must update the SAME record.json path (same key), "
+        f"found: {refreshed_paths}"
+    )
+    refreshed = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert refreshed.session_slug == written.session_slug
+    assert refreshed.status == session_registry.Status.RUNNING
+    assert record_path.stat().st_mtime > backdated_ts, (
+        "refresh must bump the record's mtime heartbeat"
+    )
+
+    # --- Upsert-on-absent: a hand-launched session with no prior write ----
+    # (the T6 hand-launched-capture path -- no spawn-claude.sh write exists
+    # for this slug at all).
+    absent_slug = "unblock-df-999-424242"
+    assert not session_registry.record_path_for_slug(absent_slug, root=fleet_root).is_file()
+
+    upserted = session_registry.refresh_record(
+        absent_slug, root=fleet_root, status=session_registry.Status.AWAITING_INPUT,
+    )
+    assert upserted.session_slug == absent_slug
+    assert upserted.status == session_registry.Status.AWAITING_INPUT
+    assert upserted.schema_version == session_registry.SCHEMA_VERSION
+    assert upserted.start_ts, "an upserted record must still get a populated start_ts"
+    upserted_path = session_registry.record_path_for_slug(absent_slug, root=fleet_root)
+    assert upserted_path.is_file()
+    assert session_registry.read_record(absent_slug, root=fleet_root) == upserted
+
+    # --- The hook-refreshed record still reaps correctly -------------------
+    # Force a guaranteed-dead launcher_pid (the real spawn's own $$ has
+    # already exited by now, but relying on incidental PID death would be
+    # racy under PID reuse) and age it past the non-terminal heartbeat TTL,
+    # so it reaps via the stale_pid rule now that its status is RUNNING
+    # (non-terminal) after the hook's refresh.
+    dead_record = session_registry.SessionRecord.from_json(record_path.read_text())
+    dead_record.launcher_pid = _DEAD_PID
+    record_path.write_text(dead_record.to_json())
+    now = datetime.now(UTC)
+    stale_ts = (
+        now - session_registry.NON_TERMINAL_HEARTBEAT_TTL - timedelta(hours=1)
+    ).timestamp()
+    os.utime(record_path, (stale_ts, stale_ts))
+
+    reaped = session_registry.reap_stale_records(root=fleet_root, now=now)
+    reaped_by_slug = {r.session_slug: r.reason for r in reaped}
+    assert reaped_by_slug.get(dead_record.session_slug) == "stale_pid"
+    assert not slug_dir.exists()
+    assert absent_slug not in reaped_by_slug, (
+        "the freshly-upserted record must not be reaped -- its heartbeat is new"
+    )
