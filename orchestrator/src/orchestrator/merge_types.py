@@ -820,6 +820,7 @@ class RealMergeItem:
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
     counts_against_cap: bool = False  # True for non-speculative, non-train successful merges (Mechanism 1)
+    permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
 
 
 @dataclass
@@ -843,6 +844,7 @@ class DecidedItem:
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
     already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
     failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
+    permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
 
 
 SpeculativeItem: TypeAlias = RealMergeItem | DecidedItem
@@ -1057,6 +1059,7 @@ class InflightEntry:
     verify_result: VerifyResult | None = None  # None = pass; VerifyResult = fail/skip
     status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
     started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
+    permit: SpecPermit | None = None        # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
 
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).
