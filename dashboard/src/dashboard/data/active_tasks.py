@@ -39,6 +39,7 @@ import httpx
 from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import _scan_worktrees
 from dashboard.data.tasks import fetch_external_statuses, fetch_statuses, fetch_tasks
+from dashboard.data.utils import resolve_now
 
 _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred', 'deferred'}
 
@@ -70,8 +71,13 @@ def _task_uid(project: str, task_id: int) -> str:
     return f'{project}/T-{task_id}'
 
 
-def _minutes_since(iso: str | None) -> int:
-    """Whole minutes between *iso* and now (UTC). 0 on parse failure / future."""
+def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int:
+    """Whole minutes between *iso* and *now* (UTC). 0 on parse failure / future.
+
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
+    pass an explicit value for deterministic results or to share one instant
+    across multiple rows in an aggregation.
+    """
     if not iso:
         return 0
     try:
@@ -80,7 +86,7 @@ def _minutes_since(iso: str | None) -> int:
         return 0
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
-    delta = datetime.now(UTC) - ts  # clock-exempt: deferred-consolidation (task 2281)
+    delta = resolve_now(now) - ts
     minutes = int(delta.total_seconds() // 60)
     return max(minutes, 0)
 
@@ -148,6 +154,7 @@ async def _shape_one_project(
     *,
     max_done_per_project: int = 0,
     max_cancelled_per_project: int = 0,
+    now: datetime | None = None,
 ) -> tuple[list[dict], bool, int]:
     """Build ``(active_tasks, offline, done_count)`` for a single project root.
 
