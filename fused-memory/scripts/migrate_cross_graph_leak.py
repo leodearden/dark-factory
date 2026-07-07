@@ -395,4 +395,36 @@ async def run(args: Any, memory_service: Any) -> dict:
         }
 
     manifest = load_reviewed_manifest(args.manifest)
-    raise NotImplementedError('apply dispatch is implemented in a later step (2272 step-18+)')
+
+    apply_results: list[dict] = []
+    for node in manifest['nodes']:
+        uuid = node['uuid']
+        disposition = node['disposition']
+        if disposition == MOVE:
+            await move_entity_across_graphs(
+                graphiti, uuid, node['source_graph'], node['target_graph'],
+            )
+            apply_results.append(
+                {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
+            )
+        elif disposition == MERGE:
+            await merge_foreign_duplicate(
+                graphiti, uuid,
+                wrong_graph=node['source_graph'], home_graph=node['target_graph'],
+            )
+            apply_results.append(
+                {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
+            )
+        else:
+            # UNRESOLVED: never dispatched to a primitive (PRD decision 4 --
+            # no silent drop, no silent routing to a new/unpopulated graph).
+            # Blocks this node only; the report's non-zero exit_code (added
+            # by the post-verify step) surfaces it to the operator.
+            apply_results.append(
+                {'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True},
+            )
+
+    report = dict(manifest)
+    report['dry_run'] = False
+    report['apply_results'] = apply_results
+    return report
