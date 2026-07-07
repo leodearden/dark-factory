@@ -791,6 +791,12 @@ def create_server(
         ``_chokepoint_or_submit`` are intentionally bypassed — L2 is set
         explicitly by this tool.
 
+        **Identity gate** (PRD task-status-authority C8/D7): the create side
+        is gated by ``escalation.authority.PROMOTE_ALLOWED`` — a connection
+        asserting an ``X-Escalation-Identity`` not in that set is denied
+        (``{'error': ..., 'code': 'level_forbidden'}``, no L2 minted); a
+        header-less connection (no identity asserted) is always allowed.
+
         Parameters
         ----------
         task_id:
@@ -833,6 +839,17 @@ def create_server(
 
             {'error': '<reason>'}
         """
+        # Identity gate (PRD task-status-authority C8/D7 row C4) — checked
+        # FIRST, before any validation or queue mutation, so a disallowed
+        # caller mints nothing. Header-less (identity is None) stays
+        # allowed, unchanged.
+        identity = get_http_headers().get(_IDENTITY_HEADER)
+        if identity is not None and identity not in PROMOTE_ALLOWED:
+            return {
+                'error': f'identity {identity!r} is not permitted to mint L2 escalations',
+                'code': 'level_forbidden',
+            }
+
         # Validate required non-empty fields
         if not member_ids:
             return {'error': 'member_ids must be a non-empty list'}
