@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp import plan_tools
 from orchestrator.mcp.plan_tools import (
     _add_design_decision,
     _add_plan_step,
@@ -630,3 +631,66 @@ class TestArtifactsFromArgs:
 
         assert artifacts.root.parent != wt
         assert artifacts.worktree == wt
+
+
+# ---------------------------------------------------------------------------
+# Tool-level regression guard for plan_tools.py:603 (task 2258 amendment).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReportBlockingDependencyToolResolvesRealWorktree:
+    """Pins the ``report_blocking_dependency`` MCP tool's git-resolution
+    target directly, rather than only asserting on the ``TaskArtifacts``
+    object in isolation (``TestArtifactsFromArgs`` above).
+
+    ``TestReportBlockingDependency`` (the ``_report_blocking_dependency``
+    unit tests) call the private helper with an explicit ``main_sha=``,
+    bypassing the tool wrapper's own ``worktree = artifacts.worktree`` /
+    ``_resolve_main_sha(worktree)`` code path entirely — a regression that
+    reverted plan_tools.py:603 back to ``artifacts.root.parent`` would still
+    pass every one of those tests. This test drives the actual registered
+    MCP tool through ``create_server`` with a relocated (sibling)
+    ``meta_root`` and monkeypatches ``_resolve_main_sha`` to capture the
+    path it is invoked with, pinning that path to ``artifacts.worktree``.
+    """
+
+    async def test_tool_calls_resolve_main_sha_with_worktree_not_root_parent(
+        self, tmp_path, monkeypatch
+    ):
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        mr = tmp_path / 'base' / '.task-meta' / 'wt'
+        mr.mkdir(parents=True)
+
+        artifacts = _artifacts_from_args(
+            ['--worktree', str(wt), '--meta-root', str(mr)]
+        )
+        artifacts.init('test-1', 'Test task', 'A test')
+        # Sanity check this fixture actually reproduces the bug scenario:
+        # once root is a relocated sibling, root.parent is the .task-meta
+        # BASE, not the worktree.
+        assert artifacts.root.parent != artifacts.worktree
+
+        captured: list[object] = []
+
+        def fake_resolve_main_sha(worktree):
+            captured.append(worktree)
+            return 'deadbeefcafef00d'
+
+        monkeypatch.setattr(
+            plan_tools, '_resolve_main_sha', fake_resolve_main_sha
+        )
+
+        server = plan_tools.create_server(artifacts)
+        tool = await server.get_tool('report_blocking_dependency')
+        assert tool is not None
+        # report_blocking_dependency is a sync def — call tool.fn() directly.
+        result = tool.fn(depends_on_task_id='42', reason='missing foo()')
+
+        assert result['status'] == 'ok'
+        assert captured == [artifacts.worktree]
+
+        data = artifacts.read_blocking_dependency()
+        assert data is not None
+        assert data['main_sha_at_report'] == 'deadbeefcafef00d'
