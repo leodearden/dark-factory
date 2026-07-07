@@ -500,10 +500,26 @@ Before writing any new code:
 {wip_section}
 # Session Startup Protocol
 
-1. Read `.task/plan.json` to see the full plan with current status.
-2. Read `.task/iterations.jsonl` to see prior iteration details.
+1. Read `.task/plan.json` to see the full plan with current status. (If
+   absent, check the sibling `.task-meta/<worktree-name>/plan.json` — the
+   worktree-lane-lifecycle W11 relocation moves plan/iteration state
+   outside the worktree for pooled lanes; both locations are the same
+   plan, just different physical paths.)
+2. Read `.task/iterations.jsonl` (or its `.task-meta` counterpart) to see
+   prior iteration details.
 3. Run `git log --oneline -10` to see recent commits.
 4. Identify the next pending step (prerequisites first, then steps).
+5. **Mandatory pre-flight — before writing any code for that step:** run
+   `git status` and `git diff HEAD` on the step's target files. A prior
+   iteration may have already written — or fully implemented — this
+   step's code and then crashed or ran out of context before staging,
+   committing, or calling `mark_step_done`. That work shows up here as an
+   uncommitted diff in the working tree, not as a WIP safety-commit (that
+   narrower case is covered separately above when detected). If the diff
+   already satisfies the step's spec, run its tests; if they pass, commit
+   the existing work and call `mark_step_done(step_id, commit_sha)`
+   instead of re-implementing from scratch. Only write new code if the
+   step is genuinely unsatisfied by what's already on disk.
 
 # Action
 

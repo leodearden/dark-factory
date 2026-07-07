@@ -524,6 +524,44 @@ class TestBuildImplementerPromptWipNotice:
 
 
 # ---------------------------------------------------------------------------
+# task-2279 RED: mandatory git status/diff pre-flight always renders,
+# independent of wip_notice — covers the broader "uncommitted, never
+# committed at all" crash mode that 2051's WIP-safety-commit auto-detect
+# (wip_section above) does not catch.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBuildImplementerPromptMandatoryPreflight:
+    async def test_preflight_renders_with_no_wip_notice(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        prompt = await briefing.build_implementer_prompt(
+            minimal_plan, [], context='', wip_notice=None,
+        )
+
+        assert 'git status' in prompt
+        assert 'git diff HEAD' in prompt
+        assert '.task-meta' in prompt
+        assert 'mark_step_done' in prompt
+
+    async def test_preflight_still_renders_alongside_wip_notice(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        wip_notice = [
+            {'sha': 'abcdef1234567890', 'subject': 'chore: save WIP before requeue rebase'},
+        ]
+
+        prompt = await briefing.build_implementer_prompt(
+            minimal_plan, [], context='', wip_notice=wip_notice,
+        )
+
+        assert 'git status' in prompt
+        assert 'git diff HEAD' in prompt
+        assert 'Verify Before Re-Implementing' in prompt
+
+
+# ---------------------------------------------------------------------------
 # step-9 RED: _execute_iterations forwards the detected wip_notice
 # ---------------------------------------------------------------------------
 #
