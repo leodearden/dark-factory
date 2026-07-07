@@ -807,3 +807,104 @@ class TestRunApplyDispatch:
             'uuid': 'u-unresolved', 'disposition': _mod.UNRESOLVED,
             'applied': False, 'blocked': True,
         }]
+
+
+# ===========================================================================
+# Tests: run() post-verify re-census (step-19/20)
+# ===========================================================================
+
+class TestRunPostVerify:
+    """Tests for run()'s post-apply re-census verification and exit_code."""
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_clean_reconciliation_after_apply_is_exit_zero(self, tmp_path, monkeypatch):
+        """A clean post-apply re-census (the moved node is gone from both
+        graphs, no UNRESOLVED nodes in the manifest) reconciles exactly with
+        the expected (all-zero) residual -> exit_code 0 and a post_verify
+        block marking matched."""
+        move_node = _classified_node(
+            'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
+
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', AsyncMock())
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        memory_service.graphiti.list_graphs.assert_awaited_once()
+        assert report['post_verify'] == {
+            'matched': True,
+            'expected': {'reify': 0, 'dark_factory': 0},
+            'actual': {'reify': 0, 'dark_factory': 0},
+        }
+        assert report['exit_code'] == 0
+
+    @pytest.mark.asyncio
+    async def test_residual_foreign_node_after_apply_is_nonzero_exit(self, tmp_path, monkeypatch):
+        """If the post-apply re-census still finds a foreign node in a graph
+        that should now be clean (e.g. a MOVE that silently failed to remove
+        the source copy), the residual count mismatches the expectation ->
+        non-zero exit_code."""
+        move_node = _classified_node(
+            'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(tmp_path, [move_node], {'reify': 1, 'dark_factory': 0})
+
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', AsyncMock())
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[_foreign_row('u-move', 'dark_factory')]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        assert report['post_verify']['matched'] is False
+        assert report['exit_code'] != 0
+
+    @pytest.mark.asyncio
+    async def test_any_unresolved_node_forces_nonzero_exit_even_if_counts_reconcile(
+        self, tmp_path, monkeypatch,
+    ):
+        """An UNRESOLVED node blocks --apply's success regardless of whether
+        the post-apply re-census otherwise reconciles: the residual foreign
+        node it necessarily leaves behind IS the expected residual (matched
+        can be True), but the manifest containing any UNRESOLVED node still
+        forces a non-zero, blocking exit_code."""
+        unresolved_node = _classified_node(
+            'u-unresolved', source_graph='reify', target_graph=None, disposition=_mod.UNRESOLVED,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [unresolved_node], {'reify': 1, 'dark_factory': 0},
+        )
+
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', AsyncMock())
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(
+                ro_pages=[[_foreign_row('u-unresolved', 'my_solar_challenge_typo')]],
+            ),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        assert report['post_verify']['matched'] is True
+        assert report['exit_code'] != 0
