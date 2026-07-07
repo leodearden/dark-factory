@@ -125,3 +125,53 @@ class TestAcquireWarmLaneWritesAssignedRecord:
         assert record_path.is_file(), (
             f'expected a durable record file to exist at {record_path}'
         )
+
+
+# ---------------------------------------------------------------------------
+# release_warm_lane -> durable RELEASED record
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReleaseWarmLaneWritesReleasedRecord:
+    """release_warm_lane must write a durable RELEASED LaneLifecycle record."""
+
+    async def test_release_after_acquire_writes_released_record(self, git_repo: Path):
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        wt = await git_ops.acquire_warm_lane('321', start_ref, expected_title='Fix X')
+        assert isinstance(wt, WorktreeInfo), f'Expected WorktreeInfo; got {wt!r}'
+
+        await git_ops.release_warm_lane(wt.path, '321')
+
+        record = git_ops._lane_lifecycle.read(wt.path)
+        assert record is not None, 'expected a durable record after release'
+        assert record.state is LaneState.RELEASED, (
+            f'expected RELEASED, got {record.state!r}'
+        )
+        assert record.task_id is None, f'expected task_id cleared, got {record.task_id!r}'
+        assert record.title is None, f'expected title cleared, got {record.title!r}'
+
+    async def test_release_already_released_lane_is_a_noop(self, git_repo: Path):
+        """A second release_warm_lane call on an already-RELEASED lane must
+        not raise. RELEASED -> RELEASED is not a legal edge, so
+        _lifecycle_note_released must no-op rather than attempt it."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        wt = await git_ops.acquire_warm_lane('321', start_ref)
+        assert isinstance(wt, WorktreeInfo), f'Expected WorktreeInfo; got {wt!r}'
+        await git_ops.release_warm_lane(wt.path, '321')
+        before = git_ops._lane_lifecycle.read(wt.path)
+        assert before is not None and before.state is LaneState.RELEASED
+
+        await git_ops.release_warm_lane(wt.path, '321')  # must not raise
+
+        after = git_ops._lane_lifecycle.read(wt.path)
+        assert after is not None
+        assert after.state is LaneState.RELEASED, (
+            f'expected RELEASED to remain a legal no-op state, got {after.state!r}'
+        )
