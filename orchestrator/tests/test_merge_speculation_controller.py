@@ -522,3 +522,125 @@ class TestReleasePathsAndDoubleReleaseTolerance:
         controller.on_shutdown()  # must NOT raise ValueError
 
         assert slot._value == depth + 1  # over depth — plain Semaphore tolerates it
+
+
+# ---------------------------------------------------------------------------
+# task 2159 step-5 RED / step-6 GREEN: PermitLedger-routed construction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpeculationControllerLedgerRouting:
+    """SpeculationController constructed with a PermitLedger, not a raw
+    Semaphore (task 2159 step-5, DD5).
+
+    RED until step-6 GREEN refactors SpeculationController to take
+    ``ledger=`` instead of ``slot=`` and routes acquire/transfer/release
+    through it. Unlike the legacy ``slot=``-constructed tests above (task
+    1993, unchanged by this task), these assert against
+    ``ledger.live``/``ledger.slot_available`` rather than a raw
+    ``asyncio.Semaphore``'s ``_value``.
+    """
+
+    def _make_ledger_and_controller(self, depth: int):
+        from orchestrator.merge_speculation_controller import (
+            PermitLedger,
+            SpeculationController,
+        )
+
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth)
+        controller = SpeculationController(ledger=ledger, depth=depth)
+        return ledger, controller
+
+    async def test_acquire_for_lookahead_registers_a_live_token_and_sets_held(
+        self,
+    ) -> None:
+        depth = 2
+        ledger, controller = self._make_ledger_and_controller(depth)
+
+        await controller.acquire_for_lookahead()
+
+        assert controller.held_by_merger == 1
+        assert len(ledger.live) == 1
+        assert ledger.slot_available == depth - 1
+
+    async def test_on_transfer_clears_held_but_token_remains_live(self) -> None:
+        """The verifier now owns the in-flight permit — on_transfer must NOT
+        release it through the ledger (task eta migrates the verifier's own
+        raw release to ``ledger.release(item.permit)``); the token stays in
+        ``live`` until then.
+        """
+        depth = 2
+        ledger, controller = self._make_ledger_and_controller(depth)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+
+        controller.on_transfer()
+
+        assert controller.held_by_merger == 0
+        assert len(ledger.live) == 1
+        assert ledger.slot_available == depth - 1
+
+    async def test_on_transfer_terminal_clears_held_and_spec_base_token_remains_live(
+        self,
+    ) -> None:
+        depth = 2
+        ledger, controller = self._make_ledger_and_controller(depth)
+        await controller.acquire_for_lookahead()
+        controller.spec_base = 'PRED_SHA'
+
+        controller.on_transfer_terminal()
+
+        assert controller.held_by_merger == 0
+        assert controller.spec_base is None
+        assert len(ledger.live) == 1
+        assert ledger.slot_available == depth - 1
+
+    async def test_on_abort_releases_through_the_ledger(self) -> None:
+        depth = 2
+        ledger, controller = self._make_ledger_and_controller(depth)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+
+        controller.on_abort()
+
+        assert controller.held_by_merger == 0
+        assert ledger.live == frozenset()
+        assert ledger.slot_available == depth
+
+    async def test_on_shutdown_releases_through_the_ledger(self) -> None:
+        depth = 2
+        ledger, controller = self._make_ledger_and_controller(depth)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+
+        controller.on_shutdown()
+
+        assert controller.held_by_merger == 0
+        assert ledger.live == frozenset()
+        assert ledger.slot_available == depth
+
+    async def test_on_dequeue_fallback_releases_through_the_ledger(self) -> None:
+        depth = 1
+        ledger, controller = self._make_ledger_and_controller(depth)
+        await controller.acquire_for_lookahead()
+        # pending_spec_base defaults to None -> ATTACH condition (a) fails ->
+        # FALLBACK releases the held permit.
+        new_req = _make_pending_request('new')
+
+        controller.on_dequeue(new_req)
+
+        assert controller.held_by_merger == 0
+        assert ledger.live == frozenset()
+        assert ledger.slot_available == depth
+
+    async def test_snapshot_slot_available_matches_ledger(self) -> None:
+        depth = 2
+        ledger, controller = self._make_ledger_and_controller(depth)
+
+        await controller.acquire_for_lookahead()
+
+        assert controller.snapshot()['slot_available'] == ledger.slot_available

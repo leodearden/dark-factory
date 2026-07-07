@@ -1054,3 +1054,58 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
 
         violations = worker.snapshot()['resource_audit']['speculation_accounting']
         assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
+
+
+# ---------------------------------------------------------------------------
+# task 2159 step-5 RED / step-6 GREEN: worker's _speculation_ledger wiring
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculationLedgerWiring:
+    """SpeculativeMergeWorker exposes a PermitLedger wrapping
+    ``_speculation_slot``, shared with ``_speculation_controller`` (task 2159
+    step-5, DD5).
+
+    RED until step-6 GREEN adds ``worker._speculation_ledger`` and threads it
+    into the ``SpeculationController`` construction.
+    """
+
+    def test_worker_exposes_a_permit_ledger_wrapping_the_speculation_slot(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import PermitLedger, SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        assert isinstance(worker._speculation_ledger, PermitLedger)
+        assert worker._speculation_ledger.slot_available == worker._speculation_slot._value
+
+    def test_speculation_ledger_is_shared_with_the_controller(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Behavioral proof of sharing (not a private-attribute reach-in):
+        an acquire driven through the controller must be visible on the
+        worker's ``_speculation_ledger`` — only possible if both point at
+        the same ``PermitLedger`` instance.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        asyncio.run(worker._speculation_controller.acquire_for_lookahead())
+
+        assert worker._speculation_ledger.slot_available == 1
+        assert len(worker._speculation_ledger.live) == 1
+
+    def test_speculation_accounting_is_clean_initially_and_after_an_acquire(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        assert worker.speculation_accounting_violations() == []
+
+        asyncio.run(worker._speculation_controller.acquire_for_lookahead())
+
+        assert worker.speculation_accounting_violations() == []
