@@ -41,6 +41,7 @@ from orchestrator.merge_queue import (
     MainHealthAutoHealRegistry,
     MergeOutcome,
     MergeRequest,
+    OutcomeKind,
     WorktreeMissing,
     _acquire_warm_verify_worktree,
     _do_train_merge,
@@ -247,7 +248,7 @@ class MergeWorker(_WipHaltMixin):
                 self.MAX_POST_MERGE_VERIFY_TIMEOUTS,
             )
             _emit_merge_attempt(
-                self._event_store, req.task_id, 'abandoned_verify_timeouts',
+                self._event_store, req.task_id, OutcomeKind.abandoned_verify_timeouts,
                 attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
             )
             return self._abandon_outcome(req.task_id, prior_timeouts)
@@ -361,7 +362,7 @@ class MergeWorker(_WipHaltMixin):
                 f'Task {req.task_id}: CAS retry limit exhausted '
                 f'({self.MAX_CAS_RETRIES} attempts)'
             )
-            _emit_merge_attempt(self._event_store, req.task_id, 'cas_exhausted', attempt=retries, duration_ms=_elapsed_ms(t0))
+            _emit_merge_attempt(self._event_store, req.task_id, OutcomeKind.cas_exhausted, attempt=retries, duration_ms=_elapsed_ms(t0))
             return MergeOutcome(
                 'blocked',
                 reason=(
@@ -374,7 +375,7 @@ class MergeWorker(_WipHaltMixin):
             f'Task {req.task_id}: CAS failed (attempt {retries}/'
             f'{self.MAX_CAS_RETRIES}), re-enqueueing at front'
         )
-        _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=retries, duration_ms=_elapsed_ms(t0))
+        _emit_merge_attempt(self._event_store, req.task_id, OutcomeKind.cas_retry, attempt=retries, duration_ms=_elapsed_ms(t0))
         _emit_merge_queued(
             self._event_store, req, reason='cas_retry',
             queue_depth=self._queue.qsize() + len(self._urgent) + 1,

@@ -128,6 +128,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     MergeOutcome,
     MergeReadyPredicate,
     MergeRequest,
+    OutcomeKind,
     RealMergeItem,
     SoloVerifyResult,
     SpeculativeItem,
@@ -749,7 +750,7 @@ async def _classify_main_health_red(
             verify.category or '', verify.cause_hint, probe_sha,
         ),
     )
-    _emit_merge_attempt(event_store, req.task_id, 'main_health_red')
+    _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
     return outcome
 
 
@@ -1355,7 +1356,7 @@ def _elapsed_ms(start: float | None) -> int | None:
 def _emit_merge_attempt(
     event_store: EventStore | None,
     task_id: str,
-    outcome: str,
+    outcome: OutcomeKind,
     *,
     attempt: int | None = None,
     duration_ms: int | None = None,
@@ -1467,7 +1468,7 @@ async def _classify_branch_presence(
     for candidate in (prefixed, branch):
         if await git_ops.find_merge_marker(candidate) is not None:
             _emit_merge_attempt(
-                event_store, task_id, 'already_merged', duration_ms=_elapsed_ms(t0),
+                event_store, task_id, OutcomeKind.already_merged, duration_ms=_elapsed_ms(t0),
             )
             return MergeOutcome('already_merged')
 
@@ -1508,7 +1509,7 @@ async def _classify_branch_presence(
 
     # ── Genuine misroute ───────────────────────────────────────────────────
     _emit_merge_attempt(
-        event_store, task_id, 'unknown_branch', duration_ms=_elapsed_ms(t0),
+        event_store, task_id, OutcomeKind.unknown_branch, duration_ms=_elapsed_ms(t0),
     )
     return MergeOutcome(
         'unknown_branch',
@@ -2565,7 +2566,7 @@ async def classify_and_merge(
                 req.task_id,
             )
             _emit_merge_attempt(
-                event_store, req.task_id, 'already_merged',
+                event_store, req.task_id, OutcomeKind.already_merged,
                 duration_ms=_elapsed_ms(started_monotonic),
             )
             return Decided(MergeOutcome('already_merged'))
@@ -2593,7 +2594,7 @@ async def classify_and_merge(
         if merge_result.conflicts:
             logger.info('Task %s: merge conflicts detected', req.task_id)
             _emit_merge_attempt(
-                event_store, req.task_id, 'conflict',
+                event_store, req.task_id, OutcomeKind.conflict,
                 duration_ms=_elapsed_ms(started_monotonic),
             )
             if isinstance(worker, SpeculativeMergeWorker):
@@ -2651,7 +2652,7 @@ async def classify_and_merge(
                 req.task_id, drop_result.dropped,
             )
             _emit_merge_attempt(
-                event_store, req.task_id, 'dropped_plan_targets',
+                event_store, req.task_id, OutcomeKind.dropped_plan_targets,
                 duration_ms=_elapsed_ms(started_monotonic),
             )
             reason = (
@@ -2992,7 +2993,7 @@ async def _do_train_merge(
             worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
         )
         _emit_merge_attempt(
-            event_store, req.task_id, 'abandoned_verify_timeouts',
+            event_store, req.task_id, OutcomeKind.abandoned_verify_timeouts,
             attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
             **_train_emit_kwargs,
         )
@@ -3025,7 +3026,7 @@ async def _do_train_merge(
             f'{first_status!r} (expected merge-deferred)'
         )
         logger.info('Train %s: %s', req.train_id, reason)
-        _emit_merge_attempt(event_store, req.task_id, 'train_incomplete', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.train_incomplete, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=reason)
 
     # (b) Rebase tip onto current main so the --no-ff merge is clean.
@@ -3043,7 +3044,7 @@ async def _do_train_merge(
             member_task_ids=req.member_task_ids,
             data={'derail_reason': reason},
         )
-        _emit_merge_attempt(event_store, req.task_id, 'train_rebase_conflict', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.train_rebase_conflict, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=reason)
 
     # (c) Read current main HEAD AFTER rebase (so CAS expected_main is fresh).
@@ -3062,7 +3063,7 @@ async def _do_train_merge(
             member_task_ids=req.member_task_ids,
             data={'derail_reason': reason},
         )
-        _emit_merge_attempt(event_store, req.task_id, 'conflict' if merge_result.conflicts else 'merge_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.conflict if merge_result.conflicts else OutcomeKind.merge_failed, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('blocked', reason=reason)
 
     # Enforce invariants explicitly — plain assert is stripped under python -O,
@@ -3130,7 +3131,7 @@ async def _do_train_merge(
             member_task_ids=req.member_task_ids,
             data={'derail_reason': reason},
         )
-        _emit_merge_attempt(event_store, req.task_id, 'verify_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.verify_failed, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return verify_outcome
 
     # (f) CAS-advance main.
@@ -3190,7 +3191,7 @@ async def _do_train_merge(
 
     if adv != 'advanced':
         logger.info('Train %s: advance_main returned %r', req.train_id, adv)
-        _emit_merge_attempt(event_store, req.task_id, 'advance_failed', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.advance_failed, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         if adv == 'cas_failed':
             # advance_main already retried internally; workflow re-parks the
             # train.  Return a simple blocked rather than routing through
@@ -3308,7 +3309,7 @@ async def _do_train_merge(
             + '; '.join(detail_items)
         )
         logger.warning('Train %s: %s', req.train_id, reason)
-        _emit_merge_attempt(event_store, req.task_id, 'train_partial_flip', duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.train_partial_flip, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         return MergeOutcome('done', merge_sha=advanced_sha, reason=reason)
 
     # _finalize_advanced_merge already emitted merge_attempt 'done'; return its
@@ -7502,7 +7503,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         _emit_merge_attempt(
                             self._event_store, req.task_id,
-                            'abandoned_verify_timeouts',
+                            OutcomeKind.abandoned_verify_timeouts,
                             attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
                         )
                         _abandon = self._abandon_outcome(req.task_id, prior_timeouts)
@@ -9150,7 +9151,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             req.task_id, self.MAX_CAS_RETRIES,
                         )
                         _emit_merge_attempt(
-                            self._event_store, req.task_id, 'cas_exhausted',
+                            self._event_store, req.task_id, OutcomeKind.cas_exhausted,
                             attempt=gate_total,
                             duration_ms=_elapsed_ms(item.started_monotonic),
                         )
@@ -9180,7 +9181,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         gate_total, self.MAX_CAS_RETRIES,
                     )
                     _emit_merge_attempt(
-                        self._event_store, req.task_id, 'gate_retry',
+                        self._event_store, req.task_id, OutcomeKind.gate_retry,
                         attempt=gate_total,
                         duration_ms=_elapsed_ms(item.started_monotonic),
                     )
@@ -9222,7 +9223,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         f'Task {req.task_id}: CAS retry limit exhausted '
                         f'({self.MAX_CAS_RETRIES} attempts)'
                     )
-                    _emit_merge_attempt(self._event_store, req.task_id, 'cas_exhausted', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+                    _emit_merge_attempt(self._event_store, req.task_id, OutcomeKind.cas_exhausted, attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
                     await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
                     if not req.result.done():
                         req.result.set_result(MergeOutcome(
@@ -9242,7 +9243,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     f'Task {req.task_id}: CAS failed (attempt {total}/'
                     f'{self.MAX_CAS_RETRIES}), retrying'
                 )
-                _emit_merge_attempt(self._event_store, req.task_id, 'cas_retry', attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
+                _emit_merge_attempt(self._event_store, req.task_id, OutcomeKind.cas_retry, attempt=total, duration_ms=_elapsed_ms(item.started_monotonic))
 
         finally:
             # Always: release the host lease (unless passthrough / already skipped),

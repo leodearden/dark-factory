@@ -5299,6 +5299,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             AttachAction,
             MergeRequest,
+            OutcomeKind,
             WaiterRecord,
             _check_plan_files_touched_in_branch,
             _emit_merge_attempt,
@@ -5363,7 +5364,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
                     _emit_merge_attempt(
                         self.event_store, self.task_id,
-                        'plan_files_not_touched',
+                        OutcomeKind.plan_files_not_touched,
                     )
                     return await self._mark_blocked(
                         reason,
@@ -5375,7 +5376,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # from human-triage-required (emitted just above).
                     _emit_merge_attempt(
                         self.event_store, self.task_id,
-                        'plan_files_narrowed',
+                        OutcomeKind.plan_files_narrowed,
                     )
 
         # Belt-and-braces rebind (task-1923): re-assert refs/heads/task/<id>
