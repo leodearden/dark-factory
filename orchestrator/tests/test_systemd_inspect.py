@@ -41,18 +41,20 @@ class TestInspectSystemdUnit:
         mock_proc.kill = MagicMock()
         mock_proc.wait = AsyncMock(return_value=None)
 
-        with patch('asyncio.create_subprocess_exec', AsyncMock(return_value=mock_proc)):
-            with caplog.at_level(logging.WARNING, logger='orchestrator.systemd_inspect'):
-                # Hang tripwire: if the fix regresses, fail loudly instead of
-                # stalling the suite.
-                result = await asyncio.wait_for(
-                    inspect_systemd_unit(
-                        'orchestrator-reify.service',
-                        timeout_secs=0.05,
-                        reap_grace_secs=0.05,
-                    ),
-                    timeout=5,
-                )
+        with (
+            patch('asyncio.create_subprocess_exec', AsyncMock(return_value=mock_proc)),
+            caplog.at_level(logging.WARNING, logger='orchestrator.systemd_inspect'),
+        ):
+            # Hang tripwire: if the fix regresses, fail loudly instead of
+            # stalling the suite.
+            result = await asyncio.wait_for(
+                inspect_systemd_unit(
+                    'orchestrator-reify.service',
+                    timeout_secs=0.05,
+                    reap_grace_secs=0.05,
+                ),
+                timeout=5,
+            )
 
         assert result == {
             'MainPID': 0,

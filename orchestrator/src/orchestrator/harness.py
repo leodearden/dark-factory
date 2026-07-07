@@ -48,8 +48,8 @@ from orchestrator.service_restart import (
     schedule_detached_systemd_restart,
 )
 from orchestrator.systemd_inspect import (
-    _deterministic_deploy_health_verdict,
     _INSPECT_TIMEOUT_SECS,
+    _deterministic_deploy_health_verdict,
     inspect_systemd_unit,
 )
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
