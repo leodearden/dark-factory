@@ -38,7 +38,9 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
-from orchestrator.config import GitConfig
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import TASK_META_DIRNAME, GitConfig
+from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
@@ -868,6 +870,16 @@ class GitOps:
         self.config = config
         self.project_root = project_root
         self.worktree_base = (project_root / config.worktree_dir).resolve()
+        # Durable per-lane lifecycle record writer (W11 gamma).  Shared by
+        # acquire_warm_lane/release_warm_lane (durable ASSIGNED/RELEASED
+        # writes below) and the .pool-root sentinel delegators. escalation_
+        # queue=None: GitOps has no escalation queue wired (mirrors the other
+        # unwired-callback attributes in this constructor) — delta/harness can
+        # inject a real one later. quarantine_worktree is wired now (harmless
+        # in gamma; consumed by delta).
+        self._lane_lifecycle = LaneLifecycle(
+            self.worktree_base, quarantine_worktree=self.quarantine_worktree,
+        )
         # Warm-lane pool — None when knob off or size=0 (default-off, trivially
         # revertible, mirrors persistent_merge_worktree).  Size is passed from
         # OrchestratorConfig.max_concurrent_tasks by Harness at startup (D9).
