@@ -3,7 +3,8 @@
 Covers:
 - project_root threading through assemble_payload / _format_assembled_payload
   (TestStage1PayloadThreadsProjectRootLegacy, TestStage1PayloadThreadsProjectRootAssembled)
-- project_root omitted when empty (TestStage1PayloadOmitsProjectRootWhenUnset)
+  (the former "project_root omitted when empty" cases were removed in task 2146:
+  ProjectScope now rejects an empty project_root at construction)
 - STAGE2_SYSTEM_PROMPT uniqueness_token mechanism exists (task 1473): minimal existence
   check via build_stage2_system_prompt to guard against the section being dropped
   (TestStage2PromptMandatesUniquenessToken)
@@ -68,12 +69,11 @@ def _rescope(stages, scope: ProjectScope) -> list:
 def _make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
     """Build a MemoryConsolidator with mocked deps — mirrors test_stages.py ~L1418.
 
-    NOTE: callers that pass ``project_root=''`` (the pre-task-2146 "unset root"
-    sentinel) now raise ``InputValidationError`` from ``ProjectScope.__post_init__``
-    at this call site — a required ``scope`` can no longer carry a falsy root.
-    See ``TestStage1PayloadOmitsProjectRootWhenUnset`` / the empty-root case in
-    ``TestStage1PayloadLiveWorkflowSignalsSection`` for the (currently blocked,
-    escalated) fallout.
+    NOTE: callers must pass a non-empty absolute ``project_root``. Passing
+    ``project_root=''`` (the pre-task-2146 "unset root" sentinel) raises
+    ``InputValidationError`` from ``ProjectScope.__post_init__`` at this call
+    site — a required ``scope`` can no longer carry a falsy root. The former
+    empty-root tests were removed accordingly (task 2146).
     """
     config = ReconciliationConfig()
     memory_mock = AsyncMock()
@@ -160,46 +160,19 @@ class TestStage1PayloadThreadsProjectRootAssembled:
 
 
 # ---------------------------------------------------------------------------
-# project_root omitted when empty (BaseStage default '')
+# project_root omitted when empty — REMOVED (task 2146 / recon-project-scope PRD).
+#
+# The former class TestStage1PayloadOmitsProjectRootWhenUnset pinned a scenario
+# (a stage constructed with project_root='') that ProjectScope (task α, task
+# 2144) now makes unconstructable: __post_init__ calls require_project_root(''),
+# which raises InputValidationError. Task β deleted the BaseStage '' defaults, so
+# no legitimate construction can yield a falsy self.project_root anywhere. The
+# defensive `if not self.project_root:` guard in memory_consolidator's
+# _build_project_root_directive (and the parallel guard in task_knowledge_sync's
+# _render_live_workflow_section) is now dead code; task γ (task 2147) owns any
+# cleanup of those branches. These tests exercised an impossible state and are
+# deleted rather than migrated.
 # ---------------------------------------------------------------------------
-
-
-class TestStage1PayloadOmitsProjectRootWhenUnset:
-    """When project_root is '' (BaseStage default), no project_root line is emitted."""
-
-    @pytest.mark.asyncio
-    async def test_assemble_payload_omits_project_root_when_empty(self):
-        """Legacy assemble_payload does NOT emit project_root line when project_root=''."""
-        stage = _make_consolidator(project_root='')
-        watermark = Watermark(project_id='test_project')
-
-        result = await stage.assemble_payload(
-            events=[], watermark=watermark, prior_reports=[]
-        )
-
-        assert 'Use project_root=' not in result, (
-            'assemble_payload should omit project_root directive when project_root is empty'
-        )
-        assert 'Use project_root=""' not in result
-
-    @pytest.mark.asyncio
-    async def test_format_assembled_payload_omits_project_root_when_empty(self):
-        """Assembled-payload branch does NOT emit project_root line when project_root=''."""
-        stage = _make_consolidator(project_root='')
-        stage.assembled_payload = AssembledPayload(
-            events=[],
-            context_items={},
-        )
-
-        watermark = Watermark(project_id='test_project')
-        result = await stage.assemble_payload(
-            events=[], watermark=watermark, prior_reports=[]
-        )
-
-        assert 'Use project_root=' not in result, (
-            '_format_assembled_payload should omit project_root directive when project_root is empty'
-        )
-        assert 'Use project_root=""' not in result
 
 
 # ---------------------------------------------------------------------------
@@ -2197,36 +2170,11 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
             f"got snippet:\n{payload[-800:]!r}"
         )
 
-    @pytest.mark.asyncio
-    async def test_legacy_path_omits_section_when_project_root_empty(self, monkeypatch):
-        """Section absent when project_root is '' even if an active task would be live."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
-        from fused_memory.services.live_workflow_detector import WorkflowLiveness
-
-        def _fake_detect(task_id, project_root, **kwargs):
-            return WorkflowLiveness(
-                is_live=True,
-                worktree_registered=True,
-                recent_commit=False,
-                orchestrator_live=False,
-                branch=f'task/{task_id}',
-                last_commit_at=None,
-            )
-
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
-
-        stage = _make_consolidator(project_root='')
-        stage.filtered_task_tree = self._make_tree(
-            [{'id': 4321, 'title': 'Live', 'status': 'in-progress'}]
-        )
-        watermark = Watermark(project_id='test_project')
-
-        payload = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
-
-        assert '### Live-Workflow Signals' not in payload, (
-            f"Expected '### Live-Workflow Signals' absent when project_root is empty; "
-            f"got snippet:\n{payload[-800:]!r}"
-        )
+    # NOTE: the former test_legacy_path_omits_section_when_project_root_empty was
+    # removed (task 2146 / recon-project-scope PRD). It constructed a stage with
+    # project_root='' — a state ProjectScope (task α) now rejects at construction,
+    # so the "omit section when project_root empty" branch is unreachable dead
+    # code (task γ owns any cleanup of the guard in _render_live_workflow_section).
 
     @pytest.mark.asyncio
     async def test_legacy_path_omits_section_when_no_filtered_task_tree(self, monkeypatch):
