@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS id_counters (
 
 DEFAULT_TAG = 'master'
 
+# Sentinel distinguishing "leave the claimant column untouched" (default) from
+# "clear it to NULL" (explicit None). Module-level and private — never
+# compared across processes, only used as an in-process default marker.
+_UNSET = object()
+
 
 def _now() -> str:
     """ISO-8601 UTC timestamp matching the Taskmaster ``updatedAt`` format."""
@@ -274,6 +279,20 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
+    """True iff both ``claimant_run_id`` and ``heartbeat_at`` exist on ``tasks``.
+
+    Feature-detection used by claimant-writing paths (``set_task_claimant``,
+    the claimant kwargs on ``set_task_status``) to fail safe — rather than
+    error — when a connection somehow predates the v1->v2 ALTER (e.g. a
+    routine orchestrator restart racing ahead of the fused-memory deploy
+    that ships this migration).
+    """
+    info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
+    col_names = {r[1] for r in info_rows}
+    return 'claimant_run_id' in col_names and 'heartbeat_at' in col_names
+
+
 def _warn_malformed_metadata_once(
     project_root: str,
     tag: str,
@@ -329,6 +348,7 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
             )
             metadata = {}
 
+    row_keys = row.keys()
     return {
         'id': str(row['id']),
         'title': row['title'],
@@ -341,6 +361,10 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         'subtasks': [],
         'updatedAt': row['updated_at'],
         'metadata': metadata if metadata is not None else {},
+        # Guarded access (task 2182): a row from a not-yet-migrated connection
+        # (pre-ALTER window) simply surfaces None for both rather than raising.
+        'claimant_run_id': row['claimant_run_id'] if 'claimant_run_id' in row_keys else None,
+        'heartbeat_at': row['heartbeat_at'] if 'heartbeat_at' in row_keys else None,
     }
 
 
@@ -725,6 +749,71 @@ class SqliteTaskBackend:
                 'oldStatus': old_status,
                 'newStatus': status,
             }],
+        }
+
+    async def set_task_claimant(
+        self,
+        task_id: str,
+        project_root: str,
+        *,
+        claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+        tag: str | None = None,
+    ) -> dict:
+        """Stamp or clear claimant_run_id/heartbeat_at without touching status.
+
+        Dedicated write path for the heartbeat-refresh/clear cycle (task 2182,
+        PRD ``plans/task-status-authority-prd.md`` C4/D4) — kept separate from
+        ``set_task_status``, which owns the status-FSM gates. Each param is
+        independently tri-state: a string stamps the column, explicit
+        ``None`` clears it to NULL, and the default ``_UNSET`` leaves it
+        untouched. Fails safe (WARNING, no write, no error) when the
+        claimant columns are absent from a not-yet-migrated connection.
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        tid = _parse_task_id(task_id)
+        async with self._write_lock(project_root), self._txn(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT id FROM tasks WHERE tag = ? AND id = ?',
+                (tag, tid),
+            )
+            if (await cursor.fetchone()) is None:
+                raise TaskmasterError(
+                    'TASKMASTER_TOOL_ERROR',
+                    f'No tasks found for ID(s): {task_id}',
+                )
+
+            set_columns: list[str] = []
+            set_values: list[Any] = []
+            if claimant_run_id is not _UNSET:
+                set_columns.append('claimant_run_id')
+                set_values.append(claimant_run_id)
+            if heartbeat_at is not _UNSET:
+                set_columns.append('heartbeat_at')
+                set_values.append(heartbeat_at)
+
+            if not set_columns:
+                return {'id': task_id, 'message': f'No claimant changes supplied for task {task_id}'}
+
+            if not await _claimant_columns_present(conn):
+                logger.warning(
+                    'set_task_claimant: claimant_run_id/heartbeat_at columns absent '
+                    '(pre-migration connection) — skipping claimant write for '
+                    'task_id=%s project_root=%s',
+                    task_id, project_root,
+                )
+                return {'id': task_id, 'message': f'Claimant columns unavailable; no write for task {task_id}'}
+
+            set_clause = ', '.join(f'{c} = ?' for c in set_columns)
+            set_values.extend([tag, tid])
+            await conn.execute(
+                f'UPDATE tasks SET {set_clause} WHERE tag = ? AND id = ?',
+                set_values,
+            )
+        return {
+            'id': task_id,
+            'message': f'Updated claimant fields for task {task_id}',
         }
 
     async def add_task(
