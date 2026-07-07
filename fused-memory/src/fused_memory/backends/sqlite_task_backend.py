@@ -933,16 +933,17 @@ class SqliteTaskBackend:
     ) -> None:
         """Validate a ``metadata`` JSON blob at the add_task/update_task write boundary.
 
-        Delegates to the shared ``parse_metadata`` (direction='write').
-        Every returned :class:`SchemaWarning` is logged as one
+        Delegates to the shared ``parse_metadata`` (direction='write',
+        ``enforce=self._task_metadata_enforce``). In warn-mode (the default)
+        every returned :class:`SchemaWarning` is logged as one
         ``task_metadata.schema_warning`` census line and the write proceeds
-        unchanged.
-
-        NOTE: warn-only for now — hardcodes ``enforce=False`` regardless of
-        ``self._task_metadata_enforce``. Honoring the flag (so enforce-mode
-        raises and the caller's ``_txn`` rolls back) is wired in separately.
+        unchanged. In enforce-mode, a malformed blob's raise
+        (``ValidationError`` / ``ValueError`` / ``TypeError``) propagates
+        uncaught — the caller's ``_txn`` rolls back.
         """
-        _, warnings = parse_metadata(metadata, direction='write', enforce=False)
+        _, warnings = parse_metadata(
+            metadata, direction='write', enforce=self._task_metadata_enforce,
+        )
         for warning in warnings:
             _emit_schema_warning(task_id, warning)
 
