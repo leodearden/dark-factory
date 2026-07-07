@@ -359,18 +359,23 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
     metadata_raw = row['metadata']
     metadata: Any = None
     if metadata_raw:
-        try:
-            metadata = json.loads(metadata_raw)
-        except (TypeError, ValueError):
+        _, warnings = parse_metadata(metadata_raw, direction='read')
+        if any(w.code in {'unparseable_json', 'not_an_object'} for w in warnings):
             # Malformed legacy row: discard and surface {} so downstream
-            # `(task.get('metadata') or {}).get(...)` callers never see a str.
-            # WARN once per (project_root, tag, id) per process so a corrupted-row
-            # batch doesn't fan out to one log line per row per get_tasks call.
+            # `(task.get('metadata') or {}).get(...)` callers never see a str
+            # or a non-dict. WARN once per (project_root, tag, id) per process
+            # so a corrupted-row batch doesn't fan out to one log line per row
+            # per get_tasks call.
             _warn_malformed_metadata_once(
                 project_root, row['tag'], row['id'], metadata_raw,
                 resolution='coerced to {}',
             )
             metadata = {}
+        else:
+            # Raw shape preserved — never parse_metadata(...).model_dump():
+            # unknown keys, absent schema_version, etc. round-trip
+            # byte-for-value (I1) rather than gaining typed-field defaults.
+            metadata = json.loads(metadata_raw)
 
     row_keys = row.keys()
     return {
