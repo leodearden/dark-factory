@@ -23,6 +23,7 @@ from fused_memory.config.schema import (
     ReconciliationConfig,
     ServerConfig,
     SummaryRebuildConfig,
+    TaskMetadataConfig,
     YamlSettingsSource,
 )
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
@@ -916,3 +917,28 @@ class TestSummaryRebuildConfigDefaults:
     def test_interval_seconds_must_be_positive(self):
         with pytest.raises(ValidationError, match='interval_seconds'):
             SummaryRebuildConfig(interval_seconds=0)
+
+
+class TestTaskMetadataConfig:
+    """Task 2162 (W3-β): ``task_metadata.enforce`` — RED-TIER, restart-only.
+
+    Warn-mode (default, ``enforce=False``): a write that violates the shared
+    ``TaskMetadata`` schema (``shared.task_metadata.parse_metadata``) emits a
+    ``task_metadata.schema_warning`` log line and the write proceeds. Enforce-
+    mode (``True``): the same write is rejected with ``ValidationError``. Not
+    hot-reloadable — see ``skills/orchestrate/SKILL.md``'s config-hot-reload
+    section and PRD decision #6.
+    """
+
+    def test_defaults_to_warn_mode(self):
+        assert TaskMetadataConfig().enforce is False
+
+    def test_fused_memory_config_attaches_disabled_by_default(self):
+        cfg = FusedMemoryConfig().task_metadata
+        assert isinstance(cfg, TaskMetadataConfig)
+        assert cfg.enforce is False
+
+    def test_override_loads_enforce_true(self):
+        """A config dict override for task_metadata is validated into the model."""
+        cfg = FusedMemoryConfig(task_metadata={'enforce': True})
+        assert cfg.task_metadata.enforce is True
