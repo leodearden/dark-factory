@@ -3625,69 +3625,26 @@ class Scheduler:
                 self._pending_anchor.pop(tid_str, None)
                 self._was_non_pending.add(tid_str)
                 _stale_ids.add(tid_str)
-        # _external_unresolved_counts is keyed by (task_id, dep); sweep
-        # separately to avoid mutating while iterating.  A sub-threshold counter
-        # entry would otherwise leak permanently if the task terminates before
-        # crossing the escalation threshold (e.g. manually cancelled while count=1).
-        if _stale_ids and self._external_unresolved_counts:
-            _stale_ext_keys = [
-                k for k in self._external_unresolved_counts
-                if k[0] in _stale_ids
-            ]
-            for k in _stale_ext_keys:
-                del self._external_unresolved_counts[k]
-        if _stale_ids and self._local_backfill_unresolved_counts:
-            _stale_local_keys = [
-                k for k in self._local_backfill_unresolved_counts
-                if k[0] in _stale_ids
-            ]
-            for k in _stale_local_keys:
-                del self._local_backfill_unresolved_counts[k]
-        # _external_hold_streak, _external_hold_cause, and
-        # _external_resolver_degraded_counts are keyed by task_id (str); GC
-        # alongside _external_unresolved_counts so they stay bounded.
-        if _stale_ids and (
-            self._external_hold_streak
-            or self._external_hold_cause
-            or self._external_resolver_degraded_counts
-        ):
-            for tid in _stale_ids:
-                self._external_hold_streak.pop(tid, None)
-                self._external_hold_cause.pop(tid, None)
-                self._external_resolver_degraded_counts.pop(tid, None)
-
-        # Starvation-watchdog GC (task 1880): for tasks that have gone terminal
-        # or been removed from the task list while a watchdog INFO escalation is
-        # still open, self-resolve the escalation and clear the watchdog state.
-        # Also resolves for tasks that transition to a non-terminal but
-        # non-eligible status (blocked/deferred/review/merge-deferred) — those
-        # leave the candidate pool without going terminal, so the dispatch-site
-        # resolve and the _stale_ids sweep would never fire.  'in-progress'
-        # tasks are already resolved at the dispatch site; 'pending' tasks may
-        # return to candidacy so we keep their escalation.
-        # Uses a SEPARATE guard (not merged with the _external_hold_streak block
-        # above) so it runs even when those external dicts are empty — mirrors
-        # the dedicated _external_unresolved_counts block.  The resolve callback
-        # is wrapped in try/except so a failure never aborts the GC sweep.
-        _starvation_gc_ids: set[str] = set(_stale_ids)
-        for _tid in self._starvation_escalated:
-            if status_map.get(_tid) in _STARVATION_NON_ELIGIBLE:
-                _starvation_gc_ids.add(_tid)
-        if _starvation_gc_ids and (self._starvation_escalated or self._starvation_first_seen):
-            for tid in _starvation_gc_ids:
-                if tid in self._starvation_escalated:
-                    if self._on_starvation_resolve is not None:
-                        try:
-                            await self._on_starvation_resolve(tid)
-                        except Exception:
-                            logger.warning(
-                                'Starvation watchdog GC resolve for tid=%s raised '
-                                '— continuing GC normally',
-                                tid,
-                                exc_info=True,
-                            )
-                    self._starvation_escalated.discard(tid)
-                self._starvation_first_seen.pop(tid, None)
+        # Sweep every registered streak counter (task 2124): external_unresolved
+        # / local_backfill / hold / resolver_degraded are keyed off _stale_ids;
+        # starvation is ALSO keyed off tasks that transition to a non-terminal
+        # but non-eligible status (blocked/deferred/review/merge-deferred) —
+        # those leave the candidate pool without going terminal, so the
+        # dispatch-site resolve and the _stale_ids sweep would never fire.
+        # 'in-progress' tasks are already resolved at the dispatch site;
+        # 'pending' tasks may return to candidacy so we keep their escalation.
+        # StreakRegistry.gc resolves (via the 'starvation' counter's on_gc,
+        # i.e. _starvation_gc_resolve) BEFORE clearing each escalated key in
+        # the sweep set, and wraps the callback in try/except so a resolve
+        # failure never aborts the GC sweep — mirrors the previous inline
+        # resolve-then-clear block exactly.
+        _starvation_non_eligible = {
+            tid for tid in self._starvation_escalated
+            if status_map.get(tid) in _STARVATION_NON_ELIGIBLE
+        }
+        await self._streak_registry.gc(
+            _stale_ids, extra={'starvation': _starvation_non_eligible}
+        )
 
         # Per-tick GC of the requeue-cooldown dict — keeps the dict bounded
         # and lets _eligible_for_dispatch stay side-effect-free.  Runs before
