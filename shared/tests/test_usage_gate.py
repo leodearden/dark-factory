@@ -1355,6 +1355,47 @@ class TestTransitionSideEffectsLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# step-27/28 (reviewer_comprehensive/robustness_dead_safeguard): the B10
+# _shutting_down guard is inert unless production shutdown() arms the flag
+# itself — until now _shutting_down was only ever set True by hand in the
+# TestTransitionSideEffectsLifecycle tests above. A probe/cost-event task
+# completing concurrently with a real shutdown() could still drive a
+# CAPPED/AUTH_FAILED _transition that spawns a new background task past
+# teardown, leaking it past shutdown.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestShutdownArmsB10Guard:
+    """step-27: a real await gate.shutdown() must set _shutting_down=True
+    itself, so a _transition racing teardown cannot start a new resume or
+    reprobe task."""
+
+    async def test_shutdown_arms_guard_and_blocks_new_resume_task_on_capped(self):
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+
+        await gate.shutdown()
+
+        assert gate._shutting_down is True
+        gate._transition(acct, AccountPhase.CAPPED)
+        assert acct.resume_task is None
+
+    async def test_shutdown_arms_guard_and_blocks_new_reprobe_task_on_auth_failed(self):
+        # Separate fresh gate+account from the CAPPED case above: CAPPED ->
+        # AUTH_FAILED is not a legal edge and would raise
+        # IllegalTransitionError instead of exercising the guard.
+        gate = make_gate(['acct-A'], wait_for_reset=True, cost_store=None)
+        acct = gate._accounts[0]
+
+        await gate.shutdown()
+
+        assert gate._shutting_down is True
+        gate._transition(acct, AccountPhase.AUTH_FAILED)
+        assert acct.auth_reprobe_task is None
+
+
+# ---------------------------------------------------------------------------
 # step-5/6: _handle_cap_detected migrated onto _transition (sole writer) —
 # the ~10 inline flag writes + open-recompute + cost-event firing this
 # handler used to own directly are retired in favor of one _transition call.
