@@ -188,3 +188,28 @@ def load_priorities(path: Path | None = None) -> Priorities:
         return _priorities_from_dict(data)
 
     return _priorities_from_dict(_load_bundled_defaults())
+
+
+def ensure_priorities_file(path: Path | None = None) -> None:
+    """Materialize an editable priorities.yaml at *path* if it doesn't exist yet.
+
+    Default target is ``~/.claude/fleet/priorities.yaml``. If the target
+    already exists, this is a no-op — never clobbers operator edits (e.g.
+    from the C9b weight editor). Otherwise the parent dirs are created and
+    the bundled ``priorities.default.yaml`` contents are copied in. Fail-soft
+    on write error (logged, never raised) per the cockpit's hard constraint
+    that a view must never be a dependency.
+    """
+    target = path if path is not None else _default_priorities_path()
+
+    if target.exists():
+        return
+
+    try:
+        defaults_path = importlib.resources.files('cockpit').joinpath('priorities.default.yaml')
+        with importlib.resources.as_file(defaults_path) as p:
+            contents = p.read_text()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(contents)
+    except OSError as exc:
+        logger.warning('ensure_priorities_file: failed to write %s: %s', target, exc)
