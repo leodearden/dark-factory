@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -100,6 +101,23 @@ async def _get_head(repo: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
     assert rc == 0, f'git rev-parse HEAD failed (rc={rc})'
     return out.strip()
+
+
+def _lane_admin_dir(lane: Path) -> Path:
+    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
+    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
+    content = (lane / '.git').read_text().strip()
+    prefix = 'gitdir:'
+    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
+    return Path(content[len(prefix):].strip())
+
+
+def _assert_route_logged(caplog: pytest.LogCaptureFixture, route: AcquireRoute) -> None:
+    """Assert the route= INFO log fired for *route* — anchored on the
+    trailing ' edge=' so a REUSE assertion can't false-positive-match a
+    REUSE_REPAIR log line (REUSE is a prefix of REUSE_REPAIR's value)."""
+    needle = f'route={route.value} edge='
+    assert needle in caplog.text, f'expected {needle!r} in caplog:\n{caplog.text}'
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +314,212 @@ class TestNoteAssignedViaRoute:
             assert record is not None
             assert record.state is ACQUIRE_ROUTE_TRANSITIONS[route][1]
             assert record.state is LaneState.ASSIGNED
+
+
+# ---------------------------------------------------------------------------
+# Route classification: each of the 7 acquire_warm_lane routes must record
+# ASSIGNED via the correctly-named route (W11 eta)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcquireRouteClassification:
+    """Drives acquire_warm_lane down each of the 7 named routes and asserts
+    BOTH the durable record ends ASSIGNED and caplog shows the matching
+    route= INFO log line — the user-observable signal that the restructure
+    (step 6) actually threads AcquireRoute through every branch instead of
+    leaving them on the anonymous _lifecycle_note_assigned chokepoint."""
+
+    async def test_create_once_fresh(self, git_repo: Path, caplog: pytest.LogCaptureFixture):
+        """First acquire of a new task on a fresh pool: non-registered lane,
+        no orphan branch -> plain `git worktree add -b` + seed."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('A', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        record = git_ops._lane_lifecycle.read(result.path)
+        assert record is not None and record.state is LaneState.ASSIGNED
+        _assert_route_logged(caplog, AcquireRoute.CREATE_ONCE_FRESH)
+
+    async def test_reuse(self, git_repo: Path, caplog: pytest.LogCaptureFixture):
+        """A second same-task acquire with no release between: in-memory map
+        hit, lane already registered from the first acquire."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('C', start_ref)
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('C', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert result.path == first.path
+        record = git_ops._lane_lifecycle.read(result.path)
+        assert record is not None and record.state is LaneState.ASSIGNED
+        _assert_route_logged(caplog, AcquireRoute.REUSE)
+
+    async def test_reuse_repair(self, git_repo: Path, caplog: pytest.LogCaptureFixture):
+        """A reused lane whose `.git/worktrees/<name>` admin dir survives but
+        has a corrupted (stale, non-wiped) gitdir back-pointer: repairable
+        per `_repair_orphaned_reuse_lane`'s docstring -> repaired in place,
+        not demoted to create-once reattach."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        info = await git_ops.acquire_warm_lane('R', start_ref)
+        assert isinstance(info, WorktreeInfo), f'Expected WorktreeInfo; got {info!r}'
+        lane = info.path
+        # DO NOT release — 'R' stays mapped, so the next acquire_for('R')
+        # returns reused=True.
+
+        admin_dir = _lane_admin_dir(lane)
+        (admin_dir / 'gitdir').write_text('/tmp/bogus/.git\n')
+        assert not await git_ops._is_registered_worktree(lane), (
+            'lane must appear unregistered once its admin dir gitdir '
+            'pointer is corrupted (setup check)'
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('R', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected WorktreeInfo (repaired in place); got {result!r}'
+        )
+        assert result.path == lane
+        record = git_ops._lane_lifecycle.read(result.path)
+        assert record is not None and record.state is LaneState.ASSIGNED
+        _assert_route_logged(caplog, AcquireRoute.REUSE_REPAIR)
+
+    async def test_create_once_reattach(
+        self, git_repo: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """A non-registered lane whose orphan task/<id> branch already carries
+        a commit beyond main: `git worktree add` (no -b) + seed, then the
+        reuse tail."""
+        await _add_warm_lane_scripts(git_repo)
+        start_ref = await _get_head(git_repo)
+
+        tmp_wt = tmp_path / 'orphan_e'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/E', str(tmp_wt), start_ref],
+            cwd=git_repo,
+        )
+        (tmp_wt / 'wip.txt').write_text('wip\n')
+        await _run(['git', 'add', '-A'], cwd=tmp_wt)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=tmp_wt)
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_repo)
+
+        # FRESH pool — _lane-0 never acquired (create-once site).
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('E', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected WorktreeInfo (reattach); got {result!r}'
+        )
+        record = git_ops._lane_lifecycle.read(result.path)
+        assert record is not None and record.state is LaneState.ASSIGNED
+        _assert_route_logged(caplog, AcquireRoute.CREATE_ONCE_REATTACH)
+
+    async def test_disk_backstop_reuse(self, git_repo: Path, caplog: pytest.LogCaptureFixture):
+        """A registered FREE lane whose .task/plan.json still names THIS
+        task (e.g. after a process restart cleared the in-memory map)."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('D', start_ref)
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+        (lane / '.task').mkdir(exist_ok=True)
+        (lane / '.task' / 'plan.json').write_text('{"task_id": "D"}')
+        assert git_ops.warm_lane_pool is not None
+        # Bare pool release: drops the in-memory assignment (and frees the
+        # pool slot) without touching git or the .task/ scratch on disk —
+        # only the on-disk plan.json scan can now discover the match.
+        await git_ops.warm_lane_pool.release(lane)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('D', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert result.path == lane
+        record = git_ops._lane_lifecycle.read(result.path)
+        assert record is not None and record.state is LaneState.ASSIGNED
+        assert record.task_id == 'D'
+        _assert_route_logged(caplog, AcquireRoute.DISK_BACKSTOP_REUSE)
+
+    async def test_reset_in_place_reattach(
+        self, git_repo: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """An already-registered lane whose orphan task/<id> branch carries a
+        commit beyond main: `git checkout -f` + the reuse tail."""
+        await _add_warm_lane_scripts(git_repo)
+        start_ref = await _get_head(git_repo)
+
+        tmp_wt = tmp_path / 'orphan_f'
+        await _run(
+            ['git', 'worktree', 'add', '-b', 'task/F', str(tmp_wt), start_ref],
+            cwd=git_repo,
+        )
+        (tmp_wt / 'wip.txt').write_text('wip\n')
+        await _run(['git', 'add', '-A'], cwd=tmp_wt)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=tmp_wt)
+        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_repo)
+
+        # Register+free the pool's only lane as a previous 'seed' occupant.
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        seed = await git_ops.acquire_warm_lane('seed', start_ref)
+        assert isinstance(seed, WorktreeInfo), f'Expected WorktreeInfo; got {seed!r}'
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(seed.path)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('F', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'Expected WorktreeInfo (reattach); got {result!r}'
+        )
+        assert result.path == seed.path
+        record = git_ops._lane_lifecycle.read(result.path)
+        assert record is not None and record.state is LaneState.ASSIGNED
+        _assert_route_logged(caplog, AcquireRoute.RESET_IN_PLACE_REATTACH)
+
+    async def test_recycle(self, git_repo: Path, caplog: pytest.LogCaptureFixture):
+        """A registered FREE lane with no matching on-disk plan.json and no
+        orphan-with-commits branch for the new task: fresh reset+reseed via
+        `_reset_and_seed_recycled_lane`."""
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('OLD', start_ref)
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+        assert git_ops.warm_lane_pool is not None
+        # Bare pool release: FREE + registered, no git/file cleanup — 'OLD'
+        # left checked out and no .task/plan.json ever written, so the next
+        # acquire's disk-backstop scan (task_id 'OLD' != 'NEW') and orphan
+        # probe (task/NEW never existed) both miss, landing on recycle.
+        await git_ops.warm_lane_pool.release(lane)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('NEW', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert result.path == lane
+        record = git_ops._lane_lifecycle.read(result.path)
+        assert record is not None and record.state is LaneState.ASSIGNED
+        assert record.task_id == 'NEW'
+        _assert_route_logged(caplog, AcquireRoute.RECYCLE)
 
 
 # ---------------------------------------------------------------------------
