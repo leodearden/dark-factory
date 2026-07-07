@@ -1917,3 +1917,64 @@ class TestProbeSlotViaTransition:
         assert token == acct.token
         assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
         assert gate._open.is_set() is False
+
+
+# ---------------------------------------------------------------------------
+# step-15/16: B8 — _on_sighup_async's per-account hard reset migrated onto a
+# single forced _transition(acct, AVAILABLE, force=True) call, replacing the
+# old 9-field inline reset + standalone self._open.set().
+# ---------------------------------------------------------------------------
+
+
+async def _idle_task() -> asyncio.Task:
+    async def _hang() -> None:
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(60)
+    return asyncio.get_event_loop().create_task(_hang())
+
+
+@pytest.mark.asyncio
+class TestSighupUncapsViaTransition:
+    """step-15: _on_sighup_async drives every account to AVAILABLE through
+    one forced _transition call each (DD-4)."""
+
+    async def test_sighup_forces_every_account_to_available_via_transition(self):
+        gate = make_gate(['a', 'b'], wait_for_reset=False, cost_store=None)
+        a, b = gate._accounts
+        a.phase = AccountPhase.CAPPED
+        a.resets_at = datetime.now(UTC) + timedelta(hours=1)
+        a.pause_started_at = datetime.now(UTC) - timedelta(seconds=30)
+        a.probe_count = 2
+        a.resume_task = await _idle_task()
+
+        b.phase = AccountPhase.AUTH_FAILED
+        b.auth_failed_at = datetime.now(UTC)
+        b.auth_reprobe_task = await _idle_task()
+
+        gate._open.clear()
+        gate._paused_reason = 'some prior reason'
+        gate._reprobe_account = AsyncMock(return_value=None)
+
+        with (
+            patch.object(gate, '_transition', wraps=gate._transition) as mock_transition,
+            patch('shared.usage_gate.load_dotenv'),
+        ):
+            await gate._on_sighup_async()
+
+        assert mock_transition.call_count == 2
+        for call in mock_transition.call_args_list:
+            args, kwargs = call
+            assert args[1] == AccountPhase.AVAILABLE
+            assert kwargs.get('force') is True
+
+        assert a.phase == AccountPhase.AVAILABLE
+        assert b.phase == AccountPhase.AVAILABLE
+        await asyncio.sleep(0)
+        assert a.resume_task.cancelled() or a.resume_task.done()
+        assert b.auth_reprobe_task.cancelled() or b.auth_reprobe_task.done()
+        assert a.resets_at is None
+        assert a.pause_started_at is None
+        assert a.probe_count == 0
+        assert b.auth_failed_at is None
+        assert gate._open.is_set() is True
+        assert gate._paused_reason == ''
