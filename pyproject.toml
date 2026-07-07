@@ -15,6 +15,22 @@ members = [
     "shared",
 ]
 
+[tool.pyright]
+include = ["conftest.py"]
+extraPaths = [
+    "cockpit/src",
+    "dashboard/src",
+    "escalation/src",
+    "fused-memory/src",
+    "orchestrator/src",
+    "sampler/src",
+    "shared/src",
+]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
+
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
 asyncio_mode = "auto"
