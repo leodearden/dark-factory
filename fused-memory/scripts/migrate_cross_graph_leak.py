@@ -256,3 +256,37 @@ async def census_foreign_nodes(
         graph_key, MAX_CENSUS_PAGES, page_size,
     )
     return rows
+
+
+async def node_present_in_graph(graph: Any, uuid: str) -> bool:
+    """Read-only presence probe: True iff a node with *uuid* exists in *graph*.
+
+    Distinguishes MOVE (absent from the resolved target -- displaced-only)
+    from MERGE (already present in the resolved target -- a genuine
+    duplicate) in disposition_for.
+    """
+    result = await graph.ro_query(
+        'MATCH (n {uuid: $uuid}) RETURN n.uuid LIMIT 1',
+        {'uuid': uuid},
+    )
+    return bool(result.result_set)
+
+
+async def count_node_edges_episodes(graph: Any, uuid: str) -> dict:
+    """Read-only {'edges', 'episodes'} counts incident to *uuid* in *graph*.
+
+    Surfaced on each manifest node so a human reviewer can see how much
+    topology a MOVE/MERGE will carry before approving --apply. Both reads
+    are read-only counts -- never .query.
+    """
+    edges_result = await graph.ro_query(
+        'MATCH (n {uuid: $uuid})-[e:RELATES_TO]-(m) RETURN count(DISTINCT e)',
+        {'uuid': uuid},
+    )
+    episodes_result = await graph.ro_query(
+        'MATCH (ep:Episodic)-[e:MENTIONS]->(n {uuid: $uuid}) RETURN count(e)',
+        {'uuid': uuid},
+    )
+    edges = edges_result.result_set[0][0] if edges_result.result_set else 0
+    episodes = episodes_result.result_set[0][0] if episodes_result.result_set else 0
+    return {'edges': edges, 'episodes': episodes}
