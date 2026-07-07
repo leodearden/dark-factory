@@ -179,3 +179,34 @@ class TestResolveTargetGraph:
         target = _mod.resolve_target_graph('some-other-typo', populated, _mod.ALIAS_MAP)
 
         assert target is None
+
+
+# ===========================================================================
+# Tests: disposition_for (step-3/4)
+# ===========================================================================
+
+class TestDispositionFor:
+    """Tests for pure disposition_for(target_graph, present_in_target) -> str."""
+
+    def test_none_target_is_unresolved_regardless_of_presence(self):
+        """target_graph is None -> UNRESOLVED, whether or not present_in_target
+        is (nonsensically) passed as True."""
+        assert _mod.disposition_for(None, False) == _mod.UNRESOLVED
+        assert _mod.disposition_for(None, True) == _mod.UNRESOLVED
+
+    def test_target_set_and_present_in_target_is_merge(self):
+        """A resolved target that already holds this uuid is a duplicate ->
+        MERGE (S6), not a move."""
+        assert _mod.disposition_for('know_live', True) == _mod.MERGE
+
+    def test_target_set_and_absent_from_target_is_move(self):
+        """A resolved target that does not yet hold this uuid is a
+        displaced-only node -> MOVE (S5)."""
+        assert _mod.disposition_for('dark_factory', False) == _mod.MOVE
+
+    def test_returned_values_match_module_constants(self):
+        """Returned strings are exactly the module's MOVE/MERGE/UNRESOLVED
+        constants, not ad-hoc equal-looking literals."""
+        assert _mod.disposition_for(None, False) is _mod.UNRESOLVED
+        assert _mod.disposition_for('g', True) is _mod.MERGE
+        assert _mod.disposition_for('g', False) is _mod.MOVE
