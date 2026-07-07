@@ -153,6 +153,68 @@ class TestRedirectNodeEdges:
 
         assert len(seen_new_uuids) == 2, 'each redirected edge must get a DISTINCT fresh uuid'
 
+    @pytest.mark.asyncio
+    async def test_incoming_redirect_mints_fresh_uuid_and_records_superseded_prop(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """Phase 3 (incoming) enumerates the redirect set by stable internal
+        element ID(old) — NOT old.uuid, which may already be duplicated by a
+        prior buggy merge — then redirects one edge per query, minting a
+        FRESH uuid4 for each and recording the original uuid as
+        new.superseded_edge_uuid for audit (task 2207 W6-δ / S4)."""
+        backend = make_backend(mock_config)
+
+        async def router(cypher, params=None):
+            result = MagicMock()
+            if 'RETURN ID(' in cypher and '-[old:RELATES_TO]->(dep' in cypher:
+                # The incoming element-id enumerate query — seed two edges.
+                result.result_set = [[201], [202]]
+            else:
+                result.result_set = []
+            return result
+
+        graph = make_graph_mock([])
+        graph.query = AsyncMock(side_effect=router)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.redirect_node_edges('dep-uuid', 'sur-uuid', group_id='test')
+
+        incoming_calls = [
+            call for call in graph.query.call_args_list
+            if 'CREATE (source)' in extract_cypher(call) and 'target_node_uuid' in extract_cypher(call)
+        ]
+        assert len(incoming_calls) == 2, (
+            f'expected one per-edge incoming redirect call per enumerated id, got '
+            f'{len(incoming_calls)}: {[extract_cypher(c) for c in incoming_calls]}'
+        )
+
+        seen_new_uuids = set()
+        for call in incoming_calls:
+            cypher = extract_cypher(call)
+            params = extract_params(call)
+
+            new_uuid = params.get('new_uuid')
+            assert new_uuid is not None, f'missing new_uuid param in {params!r}'
+            assert uuid.UUID(new_uuid).version == 4
+            assert new_uuid not in ('dep-uuid', 'sur-uuid')
+            seen_new_uuids.add(new_uuid)
+
+            assert 'new.superseded_edge_uuid = old.uuid' in cypher
+            assert 'ID(old) = $eid' in cypher
+            assert 'new.uuid = old.uuid' not in cypher
+
+            assert 'new.fact_embedding = old.fact_embedding' in cypher
+            assert 'new.name = old.name' in cypher
+            assert 'new.fact = old.fact' in cypher
+            assert 'new.valid_at = old.valid_at' in cypher
+            assert 'new.invalid_at = old.invalid_at' in cypher
+            assert 'new.created_at = old.created_at' in cypher
+            assert 'new.group_id = old.group_id' in cypher
+            assert 'new.episodes = old.episodes' in cypher
+            assert 'new.target_node_uuid = $sur_uuid' in cypher
+
+        assert len(seen_new_uuids) == 2, 'each redirected edge must get a DISTINCT fresh uuid'
+
 
 # ---------------------------------------------------------------------------
 # step-3: GraphitiBackend.delete_entity_node
