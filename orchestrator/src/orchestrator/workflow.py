@@ -7702,6 +7702,56 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         return None
 
+    async def _recover_before_merge(
+        self, branch_head: str, main_sha: str,
+    ) -> WorkflowOutcome | None:
+        """Ghost-loop early exit inside the merge phase (Guard 3, PRD α, MP-1/MP-2).
+
+        Runs at the top of :meth:`_run_merge_phase`, immediately after the
+        caller computes ``branch_head``/``main_sha`` — prevents infinite
+        merge retry when the code was already merged (e.g. by an external
+        actor, or by a prior run of this same workflow).
+
+        Journal-first (MP-1): a :meth:`MergeProvenance.lookup` hit is
+        authoritative and short-circuits before ``is_ancestor`` or the legacy
+        heuristic are ever consulted. A miss falls back to the same
+        stale-branch-point guard as the pre-EXECUTE check: if *branch_head*
+        is an ancestor of main but :meth:`_has_prior_implementation` (called
+        WITHOUT ``wt_head`` — see that method's docstring) finds no
+        implementation entries, this is a spurious merge signal (e.g. an
+        empty branch whose base commit trivially satisfies the ancestor
+        check) and the caller should proceed with the real merge rather than
+        short-circuit.
+
+        Returns ``WorkflowOutcome.DONE`` (via the shared
+        :meth:`_finalise_recovery_done` chokepoint, MP-2) when the branch is
+        already merged AND there is prior implementation work. Returns
+        ``None`` in all other cases (not an ancestor, or a spurious merge
+        signal) so the caller proceeds with the merge-retry loop.
+        """
+        row: LandedRow | None = MergeProvenance.lookup(self.task_id)
+        if row is not None:
+            return await self._finalise_recovery_done(
+                basis='journal', sha=row.advanced_sha, kind='merged',
+                note='landed-outbox journal hit (pre-MERGE recovery)',
+            )
+
+        if not await self.git_ops.is_ancestor(branch_head, main_sha):
+            return None
+
+        if not self._has_prior_implementation().has_work:
+            logger.warning(
+                f'Task {self.task_id}: branch appears merged at '
+                f'merge phase but has no implementation entries '
+                f'— proceeding with merge'
+            )
+            return None
+
+        return await self._finalise_recovery_done(
+            basis='fallback', sha=main_sha, kind='found_on_main',
+            note='branch already on main at merge phase (pre-MERGE recovery)',
+        )
+
     def _escalate_plan_overwrite(self) -> None:
         """Submit a blocking escalation when plan.json ownership doesn't match.
 
