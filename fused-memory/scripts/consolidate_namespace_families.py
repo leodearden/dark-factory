@@ -303,3 +303,30 @@ async def merge_collection(
         source_deleted = True
 
     return {'points_upserted': len(upsert_points), 'source_deleted': source_deleted}
+
+
+# ---------------------------------------------------------------------------
+# Guarded junk-key deletion
+# ---------------------------------------------------------------------------
+
+async def delete_junk_key(graphiti: Any, key: str, node_count: int) -> str:
+    """GRAPH.DELETE the *key* graph (removes it from GRAPH.LIST) -- but ONLY
+    when its live *node_count* is exactly 0.
+
+    Guards against destroying a key that unexpectedly still holds data: a
+    non-zero count returns 'UNRESOLVED' without ever calling ``.delete()``
+    (deletion blocked, no data loss). Best-effort: a raising ``.delete()``
+    is caught and reported as UNRESOLVED rather than propagating.
+    """
+    if node_count > 0:
+        return 'UNRESOLVED'
+    graph = graphiti._graph_for(key)
+    try:
+        await graph.delete()
+    except Exception as e:
+        logger.warning(
+            "consolidate_namespace_families: failed to GRAPH.DELETE junk key '%s': %s",
+            key, e,
+        )
+        return 'UNRESOLVED'
+    return 'DELETE'
