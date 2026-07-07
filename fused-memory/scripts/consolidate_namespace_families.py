@@ -149,3 +149,49 @@ def build_consolidation_report(
         'collection_merges': list(collection_items),
         'junk_key_deletions': list(junk_key_items),
     }
+
+
+# ---------------------------------------------------------------------------
+# Graph inspection (read-only)
+# ---------------------------------------------------------------------------
+
+async def enumerate_graph_entity_nodes(
+    graphiti: Any,
+    key: str,
+    *,
+    limit: int = 1000,
+) -> list[dict]:
+    """Read-only enumeration of every :Entity node in the *key* FalkorDB graph.
+
+    Scoped to :Entity (not every label) -- the family-merge move primitive
+    (``move_entity_across_graphs``) only moves Entity nodes; any Episodic-
+    only residual left behind in *key* is exactly what should make the
+    junk-key guard (``delete_junk_key``) classify it UNRESOLVED rather than
+    silently GRAPH.DELETE-ing it.
+    """
+    graph = graphiti._graph_for(key)
+    result = await graph.ro_query(
+        'MATCH (n:Entity) RETURN n.uuid, n.name LIMIT $limit',
+        {'limit': limit},
+    )
+    rows = result.result_set or []
+    if len(rows) >= limit:
+        logger.warning(
+            "consolidate_namespace_families: enumerated %d Entity node(s) in "
+            "graph '%s', which hit limit=%d -- enumeration may be incomplete. "
+            "Re-run with a higher --limit value to ensure the full graph is "
+            "covered.",
+            len(rows), key, limit,
+        )
+    return [{'uuid': row[0], 'name': row[1]} for row in rows]
+
+
+async def count_graph_nodes(graphiti: Any, key: str) -> int:
+    """Read-only total node count (every label) for the *key* FalkorDB graph.
+
+    Used as the guard for ``delete_junk_key``: GRAPH.DELETE is only safe
+    when this is exactly 0.
+    """
+    graph = graphiti._graph_for(key)
+    result = await graph.ro_query('MATCH (n) RETURN count(n)')
+    return int(result.result_set[0][0])
