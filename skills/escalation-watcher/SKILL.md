@@ -392,7 +392,7 @@ Blocking issues found during code review — the review cycle exhausted without 
 
 This is distinct from `review_suggestions` (info-level, non-blocking). Review issues are real problems that prevented the task from merging.
 
-**Spawn an interactive `/unblock` session** via the `/spawn` skill: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — `/unblock` resolves it when the human finishes. The human needs to see the specific blocking issues and decide how to fix them.
+**Spawn an interactive `/unblock` session** via the `/spawn` skill: invoke `/spawn` with `prompt="/unblock <task_id> (esc <escalation_id>, review_issues, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` (e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention), `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — `/unblock` resolves it when the human finishes. The human needs to see the specific blocking issues and decide how to fix them. The trailing `(esc ...)` context is purely additive for the human reading the terminal — `/unblock` Step 0 extracts `<task_id>` from the leading token and Step 1 re-derives all context from `TASK_ID` (`skills/unblock/SKILL.md:23-60`), so it stays authoritative even if this summary drifts.
 
 If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
@@ -400,7 +400,7 @@ If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B
 
 Merge conflicts, verification failures, build breaks. The task agent is stopped and waiting.
 
-**Spawn an interactive `/unblock` session** so the human can investigate and resolve it: invoke `/spawn` with `prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked.
+**Spawn an interactive `/unblock` session** so the human can investigate and resolve it: invoke `/spawn` with `prompt="/unblock <task_id> (esc <escalation_id>, task_failure, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` (e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention), `cwd=<project_root>`, `skip_permissions=true`. Leave the escalation pending — the `/unblock` skill resolves it when the human finishes. Track the spawned session so you can report its status if asked. The trailing `(esc ...)` context is purely additive — `/unblock` Step 0 extracts `<task_id>` from the leading token and Step 1 re-derives all context from `TASK_ID` (`skills/unblock/SKILL.md:23-60`), so it stays authoritative even if this summary drifts.
 
 If the low-risk auto-unblock gate applies — see [Low-risk auto-unblock gate (B3)](#low-risk-auto-unblock-gate-b3) — try it first.
 
@@ -419,7 +419,7 @@ Two flavours:
 - For `wip_conflict`: recovery branch named in the detail preserves the user's WIP; they may need to cherry-pick or reapply before resolving.
 - For `unmerged_state`: run `git status` in `project_root`; UU/AA/DD files need `git mergetool`, manual edit, or `git reset` depending on intent.
 
-**Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished.
+**Spawn an interactive `/unblock` session** via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, <wip_conflict|unmerged_state>, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`) so the human can see the recovery branch, inspect `project_root`, and resolve the escalation when finished. The trailing `(esc ...)` context is purely additive — `/unblock` Step 0 extracts `<task_id>` from the leading token and Step 1 re-derives all context from `TASK_ID` (`skills/unblock/SKILL.md:23-60`), so it stays authoritative even if this summary drifts.
 
 **Phantom-halt check:** if the orchestrator log shows "Merge queue un-halted: halt owner &lt;esc.id&gt; resolved" but the escalation file still has `status: pending`, that is a bug — report to the human; do **not** silently dismiss. (Historical context: pre-fix, this was a common symptom of the category-match un-halt bug.)
 
@@ -453,7 +453,7 @@ Agent found it depends on work that isn't done yet.
      resolved_by="escalation-watcher"
    )
    ```
-3. **If no matching task exists**: spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`).
+3. **If no matching task exists**: spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, dependency_discovered, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`). The trailing `(esc ...)` context is purely additive — `/unblock` Step 0 extracts `<task_id>` from the leading token and Step 1 re-derives all context from `TASK_ID` (`skills/unblock/SKILL.md:23-60`), so it stays authoritative even if this summary drifts.
 
 ### `design_concern` (info or blocking)
 
@@ -515,7 +515,7 @@ Technical debt or cleanup discovered during development.
   ```
 
   Resolve via `mcp__escalation__resolve_issue` once the ticket resolves.
-- **Blocking** (rare): spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id>"`, `cwd=<project_root>`, `skip_permissions=true`).
+- **Blocking** (rare): spawn an interactive `/unblock` session via `/spawn` (`prompt="/unblock <task_id> (esc <escalation_id>, cleanup_needed, <severity>: <summary>)"`, `terminal_title="unblock:<project>#<task_id> <short-slug>"` — e.g. `unblock:df#2085 routing-mechanism`; abbreviate the project token per the emergent convention — `cwd=<project_root>`, `skip_permissions=true`). The trailing `(esc ...)` context is purely additive — `/unblock` Step 0 extracts `<task_id>` from the leading token and Step 1 re-derives all context from `TASK_ID` (`skills/unblock/SKILL.md:23-60`), so it stays authoritative even if this summary drifts.
 
 ### `infra_issue` (blocking)
 
