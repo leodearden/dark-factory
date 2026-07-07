@@ -437,6 +437,21 @@ class UsageGate:
         ):
             acct.probe_count = 0
 
+        # --- Force hard-reset cleanup (operator-driven, SIGHUP only) ------
+        # force=True is reserved for _on_sighup_async's per-account hard
+        # reset to AVAILABLE — cancel whichever background task was running
+        # (the CAPPED/AUTH_FAILED-entry branches below only ever start the
+        # OPPOSITE task, so neither would otherwise cancel a stale one here)
+        # and clear the fields the two edge-specific bookkeeping blocks
+        # above don't cover for a CAPPED/AVAILABLE-self-loop source.
+        if force:
+            if acct.resume_task is not None and not acct.resume_task.done():
+                acct.resume_task.cancel()
+            if acct.auth_reprobe_task is not None and not acct.auth_reprobe_task.done():
+                acct.auth_reprobe_task.cancel()
+            acct.probe_count = 0
+            acct.resets_at = None
+
         # --- Centralized _open recompute (DD-5) ---------------------------
         if any(
             a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING)
@@ -878,10 +893,8 @@ class UsageGate:
 
         Treats SIGHUP as an operator-driven "refresh everything" signal:
         - reload .env (override existing env vars)
-        - cancel any in-flight resume / auth-reprobe tasks
         - refresh each account's token from its env var if it changed
-        - clear capped / auth_failed / probing state so every account is
-          probe-worthy
+        - force every account to AVAILABLE so it is probe-worthy
         - reopen the global gate
         - fire a probe per account in parallel
 
@@ -890,10 +903,6 @@ class UsageGate:
         """
         load_dotenv(override=True)
         for acct in self._accounts:
-            if acct.resume_task is not None and not acct.resume_task.done():
-                acct.resume_task.cancel()
-            if acct.auth_reprobe_task is not None and not acct.auth_reprobe_task.done():
-                acct.auth_reprobe_task.cancel()
             token_env = self._token_env_for(acct)
             if token_env:
                 fresh = os.environ.get(token_env)
@@ -902,16 +911,13 @@ class UsageGate:
                         f'SIGHUP: account {acct.name} env token changed — refreshing'
                     )
                     acct.token = fresh
-            acct.capped = False
-            acct.resets_at = None
-            acct.pause_started_at = None
-            acct.auth_failed = False
-            acct.auth_failed_at = None
-            acct.near_cap = False
-            acct.probing = False
-            acct.probe_in_flight = False
-            acct.probe_count = 0
-        self._open.set()
+            # _transition owns: the phase write, cancelling any in-flight
+            # resume/auth-reprobe task, probe_count/resets_at reset,
+            # pause-time consumption, auth_failed_at clearing, and the
+            # centralized _open recompute. force=True is required because
+            # CAPPED/AUTH_FAILED -> AVAILABLE is not a legal edge outside
+            # this operator-driven hard reset.
+            self._transition(acct, AccountPhase.AVAILABLE, force=True)
         self._paused_reason = ''
         logger.info(
             f'SIGHUP: reloaded {len(self._accounts)} account(s); firing probes'
