@@ -36,6 +36,7 @@ from shared.cli_invoke import (
     is_zero_output_timeout,
     read_transcript_records,
 )
+from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
 
 
@@ -1949,6 +1950,120 @@ class TestHeuristicCapGating:
         second_cooldown = mock_asyncio.sleep.call_args_list[1][0][0]
         assert first_cooldown == _CAP_HIT_COOLDOWN_SECS
         assert second_cooldown == _CAP_HIT_COOLDOWN_SECS * 2
+
+
+@pytest.mark.asyncio
+class TestInvokeWithCapRetryOutcomeRouting:
+    """Pin invoke_with_cap_retry's auth/wedge/heuristic routing to a single
+    classify_invocation call (task beta consumer-rewire, reify-3604 at the
+    cli layer).
+
+    Each test asserts both (1) the caller-visible routing behaviour is
+    unchanged, and (2) the routing decision is actually driven by
+    ``classify_invocation`` via a ``wraps=`` spy on
+    ``shared.invocation_outcome.classify_invocation``. Assertion (2) is RED
+    today — invoke_with_cap_retry does not call classify_invocation at all
+    yet (auth/wedge/heuristic routing reads AgentResult fields directly, and
+    the cap path delegates to ``slot.detect_cap_hit`` on a *mocked* gate here,
+    which never touches the real classifier) — and turns GREEN once the
+    consumer-rewire lands.
+    """
+
+    async def test_reify_3604_cli_local_error_not_treated_as_cap(self):
+        """A zero-cost, <=1-turn, sub-5s failure whose stderr carries a
+        NON_CAP_CLI_ERROR_MARKER classifies as CliLocalError and must NOT be
+        treated as a cap hit: single invocation, no _handle_cap_detected
+        call, no sleep, failed result returned verbatim.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        result = _make_result(
+            success=False, cost_usd=0, turns=0, duration_ms=300,
+            stderr='Error: is already in use foo bar',
+        )
+        with (
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
+                  return_value=result) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            patch('shared.invocation_outcome.classify_invocation',
+                  wraps=classify_invocation) as spy_classify,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        mock_invoke.assert_awaited_once()
+        gate._handle_cap_detected.assert_not_called()
+        mock_sleep.assert_not_awaited()
+        assert got is result
+        assert got.success is False
+        assert spy_classify.called, (
+            'invoke_with_cap_retry must classify the result via '
+            'classify_invocation so CliLocalError precedence applies'
+        )
+
+    async def test_auth_failure_401_403_routes_via_outcome(self):
+        """A 401/403 result routes to _handle_auth_failure + failover,
+        without sleeping (i.e. not counted as a cap hit).
+        """
+        gate = make_gate_mock(
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            active_account_name='acct-a',
+        )
+        gate._handle_auth_failure = MagicMock(return_value=True)
+        auth_failed = _make_result(
+            success=False, output='Unauthorized', api_error_status=403,
+            cost_usd=0.0,
+        )
+        ok = _make_result(success=True, cost_usd=0.5)
+        with (
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
+                  side_effect=[auth_failed, ok]) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            patch('shared.invocation_outcome.classify_invocation',
+                  wraps=classify_invocation) as spy_classify,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        assert got.success is True
+        assert mock_invoke.await_count == 2
+        gate._handle_auth_failure.assert_called_once()
+        mock_sleep.assert_not_awaited()
+        assert spy_classify.called, (
+            'invoke_with_cap_retry must classify the result via '
+            'classify_invocation so AuthFailed is derived from it'
+        )
+
+    async def test_zero_output_wedge_on_resume_clears_session(self):
+        """A zero-output timed-out result on a caller-initiated resume clears
+        the wedged resume_session_id and retries fresh with the original
+        prompt.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        wedge = AgentResult(
+            success=False, output='', cost_usd=0.0,
+            duration_ms=300_000, turns=0, session_id='wedged-Y',
+            timed_out=True, transcript_turns=0,
+        )
+        ok = _make_result(success=True, cost_usd=0.5)
+        with (
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
+                  side_effect=[wedge, ok]) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+            patch('shared.invocation_outcome.classify_invocation',
+                  wraps=classify_invocation) as spy_classify,
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', prompt='real-prompt', resume_session_id='wedged-Y',
+            )
+
+        assert got.success is True
+        assert mock_invoke.await_count == 2
+        second = mock_invoke.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') is None
+        assert second.kwargs.get('prompt') == 'real-prompt'
+        assert spy_classify.called, (
+            'invoke_with_cap_retry must classify the result via '
+            'classify_invocation so ZeroOutputWedge is derived from it'
+        )
 
 
 # ── _run_subprocess process-group fix ────────────────────────────────────────
