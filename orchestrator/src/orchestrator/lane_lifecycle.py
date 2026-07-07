@@ -82,6 +82,82 @@ LEGAL_TRANSITIONS: frozenset[tuple[LaneState | None, LaneState]] = frozenset(
 )
 
 
+class AcquireRoute(Enum):
+    """Named routes through ``GitOps._acquire_warm_lane_impl`` (PRD W11 eta,
+    mechanism 3). Each member names one of the 7 acquire-time decision
+    branches in ``git_ops.py``; see ``ACQUIRE_ROUTE_TRANSITIONS`` for the
+    canonical durable edge each one takes.
+    """
+
+    #: git_ops.py ~2894-2906 — in-memory map hit, identity OK.
+    REUSE = 'reuse'
+    #: git_ops.py ~2882-2892,2906 — reused lane whose worktree registration
+    #: was restored in place by ``_repair_orphaned_reuse_lane`` (task 2097)
+    #: before reuse.
+    REUSE_REPAIR = 'reuse_repair'
+    #: git_ops.py ~3070-3122 — ``git worktree add -b`` + seed on a
+    #: non-registered lane.
+    CREATE_ONCE_FRESH = 'create_once_fresh'
+    #: git_ops.py ~3020-3068 — orphan ``task/<id>`` branch has commits beyond
+    #: main; ``git worktree add`` (no ``-b``) + seed, then the reuse tail.
+    CREATE_ONCE_REATTACH = 'create_once_reattach'
+    #: git_ops.py ~3132-3161 — already-registered lane whose
+    #: ``.task-meta/plan.json`` matches this task (post-restart backstop).
+    DISK_BACKSTOP_REUSE = 'disk_backstop_reuse'
+    #: git_ops.py ~3163-3213 — already-registered lane whose orphan branch
+    #: has commits beyond main; ``git checkout -f`` + the reuse tail.
+    RESET_IN_PLACE_REATTACH = 'reset_in_place_reattach'
+    #: git_ops.py ~2909-2945 (in-memory reuse identity MISMATCH variant) and
+    #: ~3215-3240 (registered FREE lane) — fresh reset+reseed via
+    #: ``_reset_and_seed_recycled_lane`` or the inline mismatch reset.
+    RECYCLE = 'recycle'
+
+
+# Canonical (from, to) edge for each AcquireRoute — the durable-state
+# contract every acquire_warm_lane route takes en route to ASSIGNED. This is
+# a documented/asserted contract, not a static replacement for the runtime
+# transition: GitOps._note_assigned_via_route still resolves the actual
+# predecessor state at runtime (the pool's 2-value cache does not map 1:1
+# onto this 6-state durable model) and uses this table for the terminal
+# ASSIGNED target + the route name.
+ACQUIRE_ROUTE_TRANSITIONS: dict[AcquireRoute, tuple[LaneState | None, LaneState]] = {
+    AcquireRoute.REUSE: (LaneState.RELEASED, LaneState.ASSIGNED),
+    AcquireRoute.REUSE_REPAIR: (LaneState.RELEASED, LaneState.ASSIGNED),
+    AcquireRoute.CREATE_ONCE_FRESH: (LaneState.REGISTERED, LaneState.ASSIGNED),
+    AcquireRoute.CREATE_ONCE_REATTACH: (LaneState.REGISTERED, LaneState.ASSIGNED),
+    AcquireRoute.DISK_BACKSTOP_REUSE: (LaneState.RELEASED, LaneState.ASSIGNED),
+    AcquireRoute.RESET_IN_PLACE_REATTACH: (LaneState.RELEASED, LaneState.ASSIGNED),
+    AcquireRoute.RECYCLE: (LaneState.RELEASED, LaneState.ASSIGNED),
+}
+
+
+def _validate_acquire_route_transitions() -> None:
+    """Module-import guard: the route table must stay in sync with both
+    ``AcquireRoute`` and ``LEGAL_TRANSITIONS`` as either vocabulary evolves.
+    """
+    keys = set(ACQUIRE_ROUTE_TRANSITIONS)
+    routes = set(AcquireRoute)
+    if keys != routes:
+        raise AssertionError(
+            f'ACQUIRE_ROUTE_TRANSITIONS keys {keys!r} do not match '
+            f'AcquireRoute members {routes!r}'
+        )
+    for route, edge in ACQUIRE_ROUTE_TRANSITIONS.items():
+        if edge not in LEGAL_TRANSITIONS:
+            raise AssertionError(
+                f'ACQUIRE_ROUTE_TRANSITIONS[{route!r}] = {edge!r} is not a '
+                f'member of LEGAL_TRANSITIONS'
+            )
+        if edge[1] is not LaneState.ASSIGNED:
+            raise AssertionError(
+                f'ACQUIRE_ROUTE_TRANSITIONS[{route!r}] must target '
+                f'LaneState.ASSIGNED, got {edge[1]!r}'
+            )
+
+
+_validate_acquire_route_transitions()
+
+
 class IllegalLaneTransition(Exception):
     """Raised when a caller attempts a (from, to) edge not in LEGAL_TRANSITIONS.
 
