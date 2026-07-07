@@ -786,3 +786,79 @@ class TestIdentityDerivedCeiling:
         reread = queue.get(esc.id)
         assert reread is not None
         assert reread.status == 'pending', f'Expected pending, got: {reread.status}'
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteL2Gate: PROMOTE_ALLOWED gates the create-side of promote_to_l2
+# on identity (PRD task-status-authority C8/D7 row C4) — an identity not in
+# PROMOTE_ALLOWED may not mint a new L2 cluster.
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteL2Gate:
+    """An identity absent from PROMOTE_ALLOWED is denied promote_to_l2 (no L2
+    minted); header-less callers and the deployed auto-watcher are unaffected.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disallowed_identity_denied_no_l2_minted(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """PRD C4 — identity not in PROMOTE_ALLOWED => level_forbidden, no L2 minted."""
+        base_url, queue = http_server
+        m1 = _seed(queue, level=1, task_id='task-promote-gate-denied-m1')
+        root_cause = 'rc-promote-gate-denied'
+
+        result = await _promote_over_http(
+            base_url, identity='some-other-agent',
+            task_id='task-promote-gate-denied', agent_role='some-other-agent',
+            member_ids=[m1.id], root_cause=root_cause, evidence='e',
+            options=['A', 'B'], summary='cluster',
+        )
+        assert result.get('code') == 'level_forbidden', (
+            f"Expected code='level_forbidden', got: {result}"
+        )
+        assert queue.find_pending_l2_by_root_cause(root_cause) is None, (
+            'Expected no L2 minted for a disallowed identity'
+        )
+
+    @pytest.mark.asyncio
+    async def test_header_less_allowed(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """Header-less (no identity) callers remain allowed — unchanged."""
+        base_url, queue = http_server
+        m1 = _seed(queue, level=1, task_id='task-promote-gate-headerless-m1')
+        root_cause = 'rc-promote-gate-headerless'
+
+        result = await _promote_over_http(
+            base_url,
+            task_id='task-promote-gate-headerless', agent_role='escalation-watcher-auto',
+            member_ids=[m1.id], root_cause=root_cause, evidence='e',
+            options=['A', 'B'], summary='cluster',
+        )
+        assert result.get('status') in {'created', 'updated'}, (
+            f"Expected status in {{'created','updated'}}, got: {result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_watcher_identity_still_allowed(
+        self, http_server: tuple[str, EscalationQueue],
+    ) -> None:
+        """No-op regression guard: the deployed watcher can still mint L2."""
+        from orchestrator.harness import _WATCHER_ESCALATION_HEADERS
+
+        base_url, queue = http_server
+        identity = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']
+        m1 = _seed(queue, level=1, task_id='task-promote-gate-realwatcher-m1')
+        root_cause = 'rc-promote-gate-realwatcher'
+
+        result = await _promote_over_http(
+            base_url, identity=identity,
+            task_id='task-promote-gate-realwatcher', agent_role='escalation-watcher-auto',
+            member_ids=[m1.id], root_cause=root_cause, evidence='e',
+            options=['A', 'B'], summary='cluster',
+        )
+        assert result.get('status') == 'created', (
+            f"Expected status='created', got: {result}"
+        )
