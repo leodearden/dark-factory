@@ -141,3 +141,62 @@ class TestLandedOutboxGatePinnedParity:
         assert 'Y' in scheduler._dispatched
         awaited_ids = {call.args[0] for call in scheduler._landed_outbox_gate.await_args_list}
         assert awaited_ids == {'Z', 'Y'}, 'the gate must be consulted for every candidate'
+
+
+# ---------------------------------------------------------------------------
+# PROPERTY 1 — a raising gate hook must never propagate out of acquire_next()
+# and must never abort the rest of the tick's consult.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLandedOutboxGateFailsOpen:
+    """A gate hook that raises must fail OPEN, per-candidate, never crash the tick.
+
+    ``Harness.run()``'s dispatch loop wraps ``acquire_next()`` in try/finally
+    with NO except clause, so any exception that escapes here crashes the
+    orchestrator process. The injected hook performs unguarded git I/O
+    (``get_main_sha``/``is_ancestor``) and scheduler writes
+    (``get_status``/``mark_done``) via ``reconcile_landed_task`` — any of
+    which can transiently fail — so a raising hook must be treated as "not
+    gated" for that candidate only, not propagated and not allowed to skip
+    consulting the remaining candidates.
+    """
+
+    async def test_gate_raises_fails_open_and_dispatches(self, caplog) -> None:
+        caplog.set_level('WARNING')
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = _pending_task('Z')
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler._landed_outbox_gate = AsyncMock(side_effect=RuntimeError('git hiccup'))
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None, 'a raising consult must fail open, not withhold dispatch'
+        assert result.task_id == 'Z'
+        assert 'Z' in scheduler._dispatched
+        assert any(record.levelname == 'WARNING' for record in caplog.records), (
+            'a raising gate hook should be logged, not silently swallowed'
+        )
+
+    async def test_gate_raises_for_one_candidate_does_not_abort_others(self) -> None:
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task_z = _pending_task('Z', files=['z/src'])
+        task_y = _pending_task('Y', files=['y/src'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_z, task_y])
+
+        async def _gate_side_effect(task_id: str) -> bool:
+            if task_id == 'Z':
+                raise RuntimeError('git hiccup')
+            return task_id == 'Y'
+
+        scheduler._landed_outbox_gate = AsyncMock(side_effect=_gate_side_effect)
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'Z', 'Z fails open (its consult raised) so it is the only candidate left'
+        assert 'Z' in scheduler._dispatched
+        assert 'Y' not in scheduler._dispatched, 'Y was genuinely gated (its consult returned True)'
+        awaited_ids = {call.args[0] for call in scheduler._landed_outbox_gate.await_args_list}
+        assert awaited_ids == {'Z', 'Y'}, "Z's exception must not abort Y's consult"
