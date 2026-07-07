@@ -109,6 +109,12 @@ ALIAS_MAP: dict[str, str] = {
 MOVE: str = 'MOVE'
 MERGE: str = 'MERGE'
 UNRESOLVED: str = 'UNRESOLVED'
+# A resolved target_graph that equals the node's OWN source_graph: the node
+# already physically lives in its home graph and only its group_id property
+# is a variant spelling (e.g. 'know-live' aliasing to the 'know_live' graph
+# it's already in). This is an in-place re-key, never a cross-graph MOVE/
+# MERGE -- see classify_node and rekey_node_in_place.
+REKEY: str = 'REKEY'
 
 DEFAULT_PAGE_SIZE: int = 1000
 
@@ -301,22 +307,35 @@ async def classify_node(
     """Classify one census row (see census_foreign_nodes) into a manifest record.
 
     Orchestrates the pure helpers above over a single foreign-node row:
-    resolve_target_graph decides where the node belongs; if (and only if) it
-    resolves, a presence probe against the target graph feeds
-    disposition_for's MOVE/MERGE split -- an unresolved node (target is
-    None) skips the probe entirely, since there is no target to probe.
+    resolve_target_graph decides where the node belongs.
+
+    - Unresolved (target is None): UNRESOLVED, no presence probe (no target
+      to probe).
+    - Resolved target EQUALS the node's own source_graph: REKEY, no presence
+      probe. The node already physically lives in its home graph and only
+      its group_id property is a variant spelling -- probing the target here
+      would find the node ITSELF (present=True), misclassifying it as MERGE
+      and sending it through merge_foreign_duplicate(wrong==home), which
+      DETACH DELETEs the node's only copy (see the REKEY constant and
+      rekey_node_in_place). disposition_for is not consulted for this case:
+      the target==source decision is made here, not there.
+    - Resolved target DIFFERS from source_graph: a presence probe against
+      the target feeds disposition_for's MOVE/MERGE split, as before.
+
     edge_count/episode_count are always read from the SOURCE graph (not the
-    target), so a human reviewer can see how much topology a MOVE/MERGE will
-    carry before approving --apply.
+    target), so a human reviewer can see how much topology a MOVE/MERGE/
+    REKEY will carry before approving --apply.
     """
     target_graph = resolve_target_graph(node['group_id'], populated_graphs, alias_map)
-    if target_graph is not None:
+    if target_graph is None:
+        disposition = UNRESOLVED
+    elif target_graph == node['source_graph']:
+        disposition = REKEY
+    else:
         present_in_target = await node_present_in_graph(
             graphiti._graph_for(target_graph), node['uuid'],
         )
-    else:
-        present_in_target = False
-    disposition = disposition_for(target_graph, present_in_target)
+        disposition = disposition_for(target_graph, present_in_target)
 
     counts = await count_node_edges_episodes(
         graphiti._graph_for(node['source_graph']), node['uuid'],
