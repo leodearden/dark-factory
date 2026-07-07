@@ -33,6 +33,7 @@ except ImportError:
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+from shared.task_transitions import derive_actor_class, is_legal_transition
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware.dark_factory_path_guard import (
@@ -655,6 +656,7 @@ class TaskInterceptor:
         *,
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+        agent_id: str | None = None,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered.
 
@@ -669,6 +671,13 @@ class TaskInterceptor:
         default ``_UNSET`` keeps the backend call byte-identical to today's,
         so every existing caller is unaffected. Purely a pass-through: no
         gate logic, event payload, or reconciliation behavior is added here.
+
+        ``agent_id`` (task 2175/rho1b) classifies the caller into an
+        :class:`~shared.task_transitions.ActorClass` for the transition-
+        legality gate in ``_apply_status_transition``. Keyword-optional and
+        forwarded per-id through the CSV loop so a comma-separated call is
+        classified identically to a single-id call; every existing internal
+        caller omits it and is unaffected (``None`` -> HUMAN, safe-open).
         """
         if err := await self._backlog_gate(project_root):
             return err
@@ -687,6 +696,7 @@ class TaskInterceptor:
                     reopen_reason=reopen_reason,
                     claimant_run_id=claimant_run_id,
                     heartbeat_at=heartbeat_at,
+                    agent_id=agent_id,
                 )
                 results.append({'task_id': tid, 'result': per_result})
             all_ok = all(
@@ -704,6 +714,7 @@ class TaskInterceptor:
             reopen_reason=reopen_reason,
             claimant_run_id=claimant_run_id,
             heartbeat_at=heartbeat_at,
+            agent_id=agent_id,
         )
 
     async def _apply_status_transition(
@@ -717,6 +728,7 @@ class TaskInterceptor:
         reopen_reason: str | None,
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+        agent_id: str | None = None,
     ) -> dict:
         """Single-id status transition with all gates + event emission.
 
@@ -894,6 +906,29 @@ class TaskInterceptor:
                 _hook_err = await _run_hook(task_id, project_root)
                 if _hook_err is not None:
                     return _hook_err
+
+            # 2e. Transition-legality gate (Table A, task 2175/rho1b): LOG-MODE.
+            # Classifies the caller into an ActorClass and checks the
+            # (old_status, status, actor) triple against the shared transition
+            # authority (shared.task_transitions). Runs after every other gate
+            # and immediately before the write so old_status/status/actor are
+            # all in scope. An out-of-vocabulary old/new status (ValueError
+            # from TaskStatus coercion) is a vocabulary rejection — rho1a's
+            # job, not this gate's — so it is treated as legal (never brick).
+            # LOG-ONLY at this step: always proceed regardless of verdict; the
+            # enforce-mode reject branch and reopen-threading land separately.
+            actor = derive_actor_class(agent_id)
+            try:
+                _legal_transition = is_legal_transition(old_status, status, actor)
+            except ValueError:
+                _legal_transition = True
+            if not _legal_transition:
+                logger.warning(
+                    'illegal_transition would-reject %s->%s actor=%s',
+                    old_status,
+                    status,
+                    actor,
+                )
 
             # 3. Execute status change. Convert the typed DTO to a plain
             # dict so callers can tack on the reconciliation key below.
