@@ -1298,8 +1298,9 @@ async def api_burndown(request: Request) -> JSONResponse:
 
     try:
         projects = await aggregate_burndown_projects(dbs)
+        now = datetime.now(UTC)
         per_pid = await asyncio.gather(
-            *(aggregate_burndown_series(dbs, pid, days=days) for pid in projects)
+            *(aggregate_burndown_series(dbs, pid, days=days, now=now) for pid in projects)
         )
         series: dict[str, dict] = dict(zip(projects, per_pid, strict=True))
     except Exception:
