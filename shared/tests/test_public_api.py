@@ -93,8 +93,10 @@ class TestModuleLevelAll:
         assert set(usage_gate.__all__) == {
             'UsageGate',
             'AccountState',
+            'AccountPhase',
             'InvokeSlot',
             'SessionBudgetExhausted',
+            'IllegalTransitionError',
         }
 
     def test_config_models_all(self):

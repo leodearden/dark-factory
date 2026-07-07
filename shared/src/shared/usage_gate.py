@@ -42,18 +42,18 @@ __all__ = [
     'UsageGate',
     'InvokeSlot',
     'AccountState',
+    'AccountPhase',
     'SessionBudgetExhausted',
+    'IllegalTransitionError',
 ]
-# NOTE: AccountPhase, IllegalTransitionError, and AccountLease are
-# intentionally NOT listed here even though they are part of this module's
-# public surface (AccountPhase/IllegalTransitionError are imported directly
-# by shared.tests.test_usage_gate; AccountLease by consumers of
+# NOTE: AccountLease is intentionally NOT listed here even though it is part
+# of this module's public surface (consumed by callers of
 # before_invoke()/InvokeSlot.lease). shared/tests/test_public_api.py pins
 # this module's __all__ to an exact set (and shared.__all__ to the union of
-# every submodule's __all__) — both out of this task's edit scope. Adding
-# entries here would fail that pinned assertion. __all__ only governs
-# `from shared.usage_gate import *`; explicit `from shared.usage_gate import
-# AccountPhase` (or `AccountLease`) works regardless of __all__ membership.
+# every submodule's __all__); AccountLease is out of that pinned set's scope.
+# __all__ only governs `from shared.usage_gate import *`; explicit
+# `from shared.usage_gate import AccountLease` works regardless of __all__
+# membership.
 
 # Patterns that indicate a usage cap has been hit (from Claude Code CLI output)
 CAP_HIT_PREFIXES = [
