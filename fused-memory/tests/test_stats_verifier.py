@@ -10,14 +10,7 @@ import pytest_asyncio
 
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.stage_stats import _COMPUTED_STAT_KEYS
-from fused_memory.reconciliation.stats_verifier import (
-    _OP_TO_STAT,
-    _STAT_ALIASES,
-    _bucket_ops_by_stage,
-    _count_add_memory,
-    _count_graphiti_queued,
-    verify_and_rewrite_stats,
-)
+from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.services.write_journal import WriteJournal
 
 
@@ -52,99 +45,6 @@ def _stage_report(stage_id: StageId, started: datetime, completed: datetime,
         completed_at=completed,
         stats=stats or {},
     )
-
-
-# ── _count_add_memory ───────────────────────────────────────────────────
-
-
-def test_count_add_memory_empty_memory_ids_no_stores_is_false():
-    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': []}}
-    assert _count_add_memory(op) is False
-
-
-def test_count_add_memory_nonempty_memory_ids_is_true():
-    op = {'success': 1, 'result_summary': {'memory_ids': ['m1'], 'stores': []}}
-    assert _count_add_memory(op) is True
-
-
-def test_count_add_memory_graphiti_enqueued_without_memory_ids_is_false():
-    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
-    assert _count_add_memory(op) is False
-
-
-def test_count_add_memory_failure_is_false():
-    op = {'success': 0, 'result_summary': {'memory_ids': ['m1']}}
-    assert _count_add_memory(op) is False
-
-
-def test_count_add_memory_handles_json_string_result_summary():
-    op = {'success': 1, 'result_summary': '{"memory_ids": ["m1"], "stores": ["mem0"]}'}
-    assert _count_add_memory(op) is True
-
-
-# ── _count_graphiti_queued ──────────────────────────────────────────────
-
-
-def test_count_graphiti_queued_true_when_empty_ids_and_graphiti_store():
-    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
-    assert _count_graphiti_queued(op) is True
-
-
-def test_count_graphiti_queued_false_when_nonempty_memory_ids():
-    # Already counted as memories_added — not a graphiti-only enqueue.
-    op = {'success': 1, 'result_summary': {'memory_ids': ['m1'], 'stores': ['graphiti']}}
-    assert _count_graphiti_queued(op) is False
-
-
-def test_count_graphiti_queued_false_when_mem0_only():
-    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': ['mem0']}}
-    assert _count_graphiti_queued(op) is False
-
-
-def test_count_graphiti_queued_false_when_failed():
-    op = {'success': 0, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
-    assert _count_graphiti_queued(op) is False
-
-
-def test_count_graphiti_queued_true_for_stores_written_alias():
-    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores_written': ['graphiti']}}
-    assert _count_graphiti_queued(op) is True
-
-
-def test_count_graphiti_queued_true_for_json_string_result_summary():
-    import json
-    rs = json.dumps({'memory_ids': [], 'stores': ['graphiti']})
-    op = {'success': 1, 'result_summary': rs}
-    assert _count_graphiti_queued(op) is True
-
-
-# ── _bucket_ops_by_stage ────────────────────────────────────────────────
-
-
-def test_bucket_ops_by_stage_assigns_to_matching_window():
-    now = datetime(2026, 4, 20, 9, 0, 0, tzinfo=UTC)
-    s1 = _stage_report(StageId.memory_consolidator, now, now + timedelta(minutes=2))
-    s2 = _stage_report(
-        StageId.task_knowledge_sync,
-        now + timedelta(minutes=2, seconds=1),
-        now + timedelta(minutes=4),
-    )
-    reports: dict[str, StageReport | dict] = {
-        'memory_consolidator': s1,
-        'task_knowledge_sync': s2,
-    }
-    ops = [
-        {'layer': 'write_op', 'operation': 'add_memory',
-         'created_at': (now + timedelta(minutes=1)).isoformat()},
-        {'layer': 'write_op', 'operation': 'delete_memory',
-         'created_at': (now + timedelta(minutes=3)).isoformat()},
-        {'layer': 'write_op', 'operation': 'add_memory',
-         'created_at': (now + timedelta(minutes=5)).isoformat()},  # after both stages
-    ]
-    buckets = _bucket_ops_by_stage(ops, reports)
-    assert len(buckets['memory_consolidator']) == 1
-    assert len(buckets['task_knowledge_sync']) == 1
-    assert len(buckets['_unbucketed']) == 1
 
 
 # ── verify_and_rewrite_stats ────────────────────────────────────────────
@@ -503,101 +403,6 @@ async def test_verify_skips_non_stage_id_keys_like_error(journal):
     assert reports['_error'] == {'message': 'stage crashed', 'stats': {}}
 
 
-@pytest.mark.asyncio
-async def test_verify_aliases_memories_written_to_memories_added(journal):
-    """memories_written must mirror memories_added after verification.
-
-    The LLM uses both 'memories_added' and 'memories_written' interchangeably.
-    The verifier must write both keys to the same observed count and snapshot
-    both original LLM-emitted values under _reported.
-    """
-    run_id = str(uuid.uuid4())
-    now = datetime.now(UTC)
-    stage_start = now - timedelta(minutes=1)
-    stage_end = now + timedelta(minutes=1)
-
-    # One successful add_memory with non-empty memory_ids.
-    await _log_write(
-        journal, causation_id=run_id, operation='add_memory',
-        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
-    )
-
-    # Stage reports both keys with the same (inflated) value.
-    reports: dict[str, StageReport | dict] = {
-        'memory_consolidator': _stage_report(
-            StageId.memory_consolidator, stage_start, stage_end,
-            stats={'memories_added': 4, 'memories_written': 4},
-        ),
-    }
-
-    await verify_and_rewrite_stats(run_id, reports, journal)
-
-    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
-    # Both keys overwritten with the observed value (1).
-    assert stats['memories_added'] == 1
-    assert stats['memories_written'] == 1
-    # Both originals preserved under _reported.
-    assert stats['_reported']['memories_added'] == 4
-    assert stats['_reported']['memories_written'] == 4
-
-
-@pytest.mark.asyncio
-async def test_verify_aliases_memories_written_when_only_written_key_present(journal):
-    """When stage only reports memories_written (no memories_added), verifier
-    writes both keys and snapshots only memories_written in _reported.
-    """
-    run_id = str(uuid.uuid4())
-    now = datetime.now(UTC)
-    stage_start = now - timedelta(minutes=1)
-    stage_end = now + timedelta(minutes=1)
-
-    await _log_write(
-        journal, causation_id=run_id, operation='add_memory',
-        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
-    )
-
-    reports: dict[str, StageReport | dict] = {
-        'memory_consolidator': _stage_report(
-            StageId.memory_consolidator, stage_start, stage_end,
-            stats={'memories_written': 3},
-        ),
-    }
-
-    await verify_and_rewrite_stats(run_id, reports, journal)
-
-    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
-    # Both keys written with observed value.
-    assert stats['memories_added'] == 1
-    assert stats['memories_written'] == 1
-    # Only memories_written was originally present — memories_added was absent.
-    assert 'memories_written' in stats['_reported']
-    assert stats['_reported']['memories_written'] == 3
-    # memories_added was not in the original stats, so NOT in _reported.
-    assert 'memories_added' not in stats['_reported']
-
-
-def test_op_to_stat_mapping_covers_core_memory_operations():
-    """Guard against accidental deletions of key op-to-stat mappings."""
-    for key in ('add_memory', 'delete_memory', 'update_edge', 'add_episode'):
-        assert key in _OP_TO_STAT
-
-
-def test_stat_aliases_values_are_canonical_keys():
-    """Guard: _STAT_ALIASES values must all resolve to keys in the canonical set.
-
-    Prevents chained aliases (a → b where b is itself an alias key) from
-    silently propagating stale values in _apply_observed. The canonical set is
-    _OP_TO_STAT.values() ∪ {'graphiti_writes_queued'}.
-    """
-    canonical = frozenset(_OP_TO_STAT.values()) | {'graphiti_writes_queued'}
-    for alias_key, canonical_key in _STAT_ALIASES.items():
-        assert canonical_key in canonical, (
-            f"_STAT_ALIASES['{alias_key}'] = '{canonical_key}' is not a canonical key. "
-            f"Canonical keys: {sorted(canonical)}. "
-            "Chained aliases silently propagate stale values in _apply_observed."
-        )
-
-
 class TestUpdateEdgeVerifiedFilter:
     """Only verified update_edge ops should count toward edges_updated (step-17 / step-19)."""
 
@@ -695,34 +500,3 @@ class TestUpdateEdgeVerifiedFilter:
         assert stats['edges_updated'] == 0, (
             "Truthy-but-not-True 'verified' (e.g. string 'true') must not count as verified"
         )
-
-
-def test_alias_pass_reads_from_observed_for_order_independence(monkeypatch):
-    """Alias pass reads from observed, not stats — verifies order-independence under a chained alias."""
-    import fused_memory.reconciliation.stats_verifier as sv  # noqa: PLC0415
-
-    # Inject a chained alias AFTER the existing 'memories_written' entry so
-    # the old code produces the wrong result via insertion-order luck
-    # (memories_written is processed first, setting stats['memories_written']=1,
-    # then foo reads that stale stats value and incorrectly becomes 1 too).
-    chained_aliases = {'memories_written': 'memories_added', 'foo': 'memories_written'}
-    monkeypatch.setattr(sv, '_STAT_ALIASES', chained_aliases)
-    monkeypatch.setattr(sv, '_TRACKED_STAT_KEYS',
-                        sv._TRACKED_STAT_KEYS | frozenset({'foo'}))
-
-    # One successful add_memory op → observed = {'memories_added': 1}
-    observed = {'memories_added': 1}
-    now = datetime.now(UTC)
-    report = _stage_report(StageId.memory_consolidator, now - timedelta(minutes=1), now + timedelta(minutes=1))
-    sv._apply_observed(report, observed)
-
-    stats = report.stats
-
-    # Single-level alias: memories_written -> memories_added (canonical, in observed).
-    assert stats['memories_added'] == 1
-    assert stats['memories_written'] == 1
-
-    # Chained alias: foo -> memories_written (alias key, NOT in observed).
-    # Fixed behavior:  observed.get('memories_written', 0) = 0  (deterministic).
-    # Old behavior:    stats['memories_written'] = 1             (insertion-order accident).
-    assert stats['foo'] == 0

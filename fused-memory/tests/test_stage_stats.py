@@ -16,12 +16,84 @@ import pytest_asyncio
 
 from fused_memory.reconciliation.stage_stats import (
     _COMPUTED_STAT_KEYS,
+    _OP_TO_STAT,
+    _count_add_memory,
+    _count_graphiti_queued,
     derive_stage_stats,
 )
 from fused_memory.services.write_journal import WriteJournal
 
 _STAGE_AGENT_ID = 'recon-stage-memory_consolidator'
 _OTHER_STAGE_AGENT_ID = 'recon-stage-task_knowledge_sync'
+
+
+# ── _count_add_memory ───────────────────────────────────────────────────
+
+
+def test_count_add_memory_empty_memory_ids_no_stores_is_false():
+    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': []}}
+    assert _count_add_memory(op) is False
+
+
+def test_count_add_memory_nonempty_memory_ids_is_true():
+    op = {'success': 1, 'result_summary': {'memory_ids': ['m1'], 'stores': []}}
+    assert _count_add_memory(op) is True
+
+
+def test_count_add_memory_graphiti_enqueued_without_memory_ids_is_false():
+    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
+    assert _count_add_memory(op) is False
+
+
+def test_count_add_memory_failure_is_false():
+    op = {'success': 0, 'result_summary': {'memory_ids': ['m1']}}
+    assert _count_add_memory(op) is False
+
+
+def test_count_add_memory_handles_json_string_result_summary():
+    op = {'success': 1, 'result_summary': '{"memory_ids": ["m1"], "stores": ["mem0"]}'}
+    assert _count_add_memory(op) is True
+
+
+# ── _count_graphiti_queued ──────────────────────────────────────────────
+
+
+def test_count_graphiti_queued_true_when_empty_ids_and_graphiti_store():
+    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
+    assert _count_graphiti_queued(op) is True
+
+
+def test_count_graphiti_queued_false_when_nonempty_memory_ids():
+    # Already counted as memories_added — not a graphiti-only enqueue.
+    op = {'success': 1, 'result_summary': {'memory_ids': ['m1'], 'stores': ['graphiti']}}
+    assert _count_graphiti_queued(op) is False
+
+
+def test_count_graphiti_queued_false_when_mem0_only():
+    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores': ['mem0']}}
+    assert _count_graphiti_queued(op) is False
+
+
+def test_count_graphiti_queued_false_when_failed():
+    op = {'success': 0, 'result_summary': {'memory_ids': [], 'stores': ['graphiti']}}
+    assert _count_graphiti_queued(op) is False
+
+
+def test_count_graphiti_queued_true_for_stores_written_alias():
+    op = {'success': 1, 'result_summary': {'memory_ids': [], 'stores_written': ['graphiti']}}
+    assert _count_graphiti_queued(op) is True
+
+
+def test_count_graphiti_queued_true_for_json_string_result_summary():
+    rs = json.dumps({'memory_ids': [], 'stores': ['graphiti']})
+    op = {'success': 1, 'result_summary': rs}
+    assert _count_graphiti_queued(op) is True
+
+
+def test_op_to_stat_mapping_covers_core_memory_operations():
+    """Guard against accidental deletions of key op-to-stat mappings."""
+    for key in ('add_memory', 'delete_memory', 'update_edge', 'add_episode'):
+        assert key in _OP_TO_STAT
 
 
 @pytest_asyncio.fixture
