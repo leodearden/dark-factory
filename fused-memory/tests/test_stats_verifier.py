@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -385,6 +386,48 @@ async def test_verify_per_stage_isolation_across_two_stages(journal):
     assert mc_stats['memories_deleted'] == 0
     assert tks_stats['memories_added'] == 0
     assert tks_stats['memories_deleted'] == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_logs_mistagged_stage_writes(journal, caplog):
+    """A write_op stamped with a recon-stage-* agent_id that matches no known
+    StageId (e.g. a typo, or a stage retired since the op was logged) doesn't
+    count toward any stage's counters — but it's now surfaced via an INFO log
+    instead of silently vanishing, so mis-tagging is diagnosable."""
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+
+    # Correctly-tagged op for a real stage.
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        agent_id='recon-stage-memory_consolidator',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+    # Mis-tagged op: looks like a stage write but the stage id is bogus.
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        agent_id='recon-stage-nonexistent_stage',
+        result_summary={'memory_ids': ['m2'], 'stores': ['mem0']},
+    )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator,
+            now - timedelta(minutes=1), now + timedelta(minutes=1),
+        ),
+    }
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.stats_verifier'):
+        await verify_and_rewrite_stats(run_id, reports, journal)
+
+    # The real stage's count is unaffected by the mis-tagged op.
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    assert stats['memories_added'] == 1
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any('matched no known stage' in m and run_id in m for m in messages), (
+        f'expected an INFO diagnostic naming the mis-tagged op count; got {messages}'
+    )
 
 
 @pytest.mark.asyncio
