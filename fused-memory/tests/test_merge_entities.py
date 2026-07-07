@@ -1012,3 +1012,116 @@ async def merge_entities_live_graph():
             await graph.delete()
         with contextlib.suppress(Exception):
             await client.aclose()
+
+
+@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@pytest.mark.timeout(15)
+class TestRedirectNodeEdgesLiveFalkorDB:
+    """Pin the true B4 invariant against a REAL FalkorDB server: after
+    redirect_node_edges, no RELATES_TO uuid is shared by more than one edge,
+    every redirected edge carries a superseded_edge_uuid audit prop equal to
+    the uuid it replaced, no edges are lost, and fact_embedding survives the
+    redirect intact.
+
+    Seeds a PRE-EXISTING dup-uuid pair in each direction -- the discriminating
+    scenario for this fix. A clean distinct-uuid seed would stay graph-wide
+    unique even under the OLD bulk create-then-delete code (net one edge per
+    uuid), so it would not be RED. The dup-uuid seed is what the old
+    `SET new.uuid = old.uuid` code re-mints twice, producing a real
+    count(*) > 1 violation (task 2207 W6-δ / S4).
+    """
+
+    @pytest.mark.asyncio
+    async def test_redirect_repairs_dup_uuids_no_loss_preserves_embeddings(
+        self, mock_config, merge_entities_live_graph,
+    ):
+        graph_name, graph = merge_entities_live_graph
+
+        # Nodes: dep, sur, and distinct neighbors for both directions.
+        await graph.query(
+            "CREATE (:Entity {uuid: 'dep', name: 'Dep'}), "
+            "(:Entity {uuid: 'sur', name: 'Sur'}), "
+            "(:Entity {uuid: 't1', name: 'T1'}), "
+            "(:Entity {uuid: 't2', name: 'T2'}), "
+            "(:Entity {uuid: 't3', name: 'T3'}), "
+            "(:Entity {uuid: 's1', name: 'S1'}), "
+            "(:Entity {uuid: 's2', name: 'S2'}), "
+            "(:Entity {uuid: 's3', name: 'S3'})"
+        )
+
+        async def seed_edge(src, dst, edge_uuid, fact, embedding):
+            await graph.query(
+                'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+                'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b) '
+                'SET e.fact_embedding = vecf32($embedding)',
+                {
+                    'src': src, 'dst': dst, 'edge_uuid': edge_uuid,
+                    'name': 'rel', 'fact': fact, 'embedding': embedding,
+                },
+            )
+
+        # Outgoing from dep: one distinct edge + a pre-existing dup-uuid pair
+        # ('odup') to two DIFFERENT targets -- what a prior buggy merge (the
+        # old SET new.uuid = old.uuid code) leaves behind.
+        await seed_edge('dep', 't1', 'o1', 'dep relates to t1', [1.0, 2.0])
+        await seed_edge('dep', 't2', 'odup', 'dep relates to t2', [3.0, 4.0])
+        await seed_edge('dep', 't3', 'odup', 'dep relates to t3', [5.0, 6.0])
+
+        # Incoming to dep: one distinct edge + a pre-existing dup-uuid pair
+        # ('idup') from two DIFFERENT sources.
+        await seed_edge('s1', 'dep', 'i1', 's1 relates to dep', [7.0, 8.0])
+        await seed_edge('s2', 'dep', 'idup', 's2 relates to dep', [9.0, 10.0])
+        await seed_edge('s3', 'dep', 'idup', 's3 relates to dep', [11.0, 12.0])
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            result = await backend.redirect_node_edges('dep', 'sur', group_id=graph_name)
+
+            # (3) No edges lost: reported counts match what was seeded.
+            assert result['outgoing_redirected'] == 3
+            assert result['incoming_redirected'] == 3
+            assert result['inter_node_deleted'] == 0
+
+            # (1) Graph-wide: no uuid is shared by more than one RELATES_TO
+            # edge. The OLD bulk `SET new.uuid = old.uuid` code fails this --
+            # 'odup'/'idup' would each be re-minted twice (count 2).
+            dup_check = await graph.query(
+                'MATCH ()-[e:RELATES_TO]->() '
+                'WITH e.uuid AS u, count(*) AS c '
+                'WHERE c > 1 '
+                'RETURN count(u)'
+            )
+            assert dup_check.result_set[0][0] == 0
+
+            # (2)+(3) Every edge now incident to sur has a fresh uuid, distinct
+            # from the original uuid it superseded; total incident count is 6
+            # (nothing lost).
+            sur_edges = await graph.query(
+                'MATCH (sur:Entity {uuid: "sur"})-[e:RELATES_TO]-() '
+                'RETURN e.uuid, e.superseded_edge_uuid, e.fact_embedding, e.fact'
+            )
+            rows = sur_edges.result_set
+            assert len(rows) == 6
+
+            original_uuids = {'o1', 'odup', 'i1', 'idup'}
+            seen_new_uuids = set()
+            embeddings_by_fact = {}
+            for new_uuid, superseded, embedding, fact in rows:
+                assert superseded is not None
+                assert superseded in original_uuids
+                assert new_uuid != superseded
+                assert new_uuid not in original_uuids  # genuinely fresh, not reused
+                seen_new_uuids.add(new_uuid)
+                embeddings_by_fact[fact] = embedding
+
+            assert len(seen_new_uuids) == 6  # every redirected edge got a DISTINCT fresh uuid
+
+            # (4) fact_embedding survives the redirect intact -- checked on
+            # both a distinct-origin and a dup-origin edge, each direction.
+            assert list(embeddings_by_fact['dep relates to t1']) == pytest.approx([1.0, 2.0])
+            assert list(embeddings_by_fact['dep relates to t3']) == pytest.approx([5.0, 6.0])
+            assert list(embeddings_by_fact['s1 relates to dep']) == pytest.approx([7.0, 8.0])
+            assert list(embeddings_by_fact['s2 relates to dep']) == pytest.approx([9.0, 10.0])
+        finally:
+            await backend.close()
