@@ -600,23 +600,26 @@ class ReconciliationHarness:
         """True when draining and all project loops have completed."""
         return self._draining and self._no_active_loops()
 
-    def _make_stages(self) -> list:
+    def _make_stages(self, scope: ProjectScope) -> list:
         """Create a fresh set of stage instances for one reconciliation cycle."""
         stage1 = MemoryConsolidator(
             StageId.memory_consolidator, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            scope=scope, known_projects=self._known_projects,
             recon_report_port=self._recon_report_port,
             recon_report_state=self._recon_report_state,
         )
         stage2 = TaskKnowledgeSync(
             StageId.task_knowledge_sync, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            scope=scope, known_projects=self._known_projects,
             recon_report_port=self._recon_report_port,
             recon_report_state=self._recon_report_state,
         )
         stage3 = IntegrityCheck(
             StageId.integrity_check, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            scope=scope, known_projects=self._known_projects,
             recon_report_port=self._recon_report_port,
             recon_report_state=self._recon_report_state,
         )
@@ -1846,14 +1849,11 @@ class ReconciliationHarness:
 
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
-        stages = self._make_stages()
+        stages = self._make_stages(scope)
         try:
             reports = []
             for stage in stages:
                 current_stage_name = stage.stage_id.value
-                stage.project_id = project_id
-                stage.project_root = project_root
-                stage.known_projects = self._known_projects
 
                 # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
                 if isinstance(stage, MemoryConsolidator):
@@ -1917,10 +1917,10 @@ class ReconciliationHarness:
             if self.judge:
                 asyncio.create_task(self._run_judge(run_id))
 
-            # Remediation pass: thread project_root resolved above (task 1163) and pass
+            # Remediation pass: thread scope resolved above (task 1163) and pass
             # pre-fetched tree to avoid a redundant fetch (ref: task 478).
             await self._maybe_remediate(project_id, run_id, run, tier,
-                                        project_root=project_root,
+                                        scope=scope,
                                         filtered_task_tree=filtered_task_tree)
 
             logger.info(
@@ -2367,7 +2367,7 @@ class ReconciliationHarness:
         parent_run: ReconciliationRun,
         tier: TierConfig,
         *,
-        project_root: str,
+        scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
         """Extract Stage 3 findings from the parent run and trigger remediation if needed."""
@@ -2520,7 +2520,7 @@ class ReconciliationHarness:
             )
             await self._run_remediation_pass(
                 project_id, parent_run_id, to_remediate, tier,
-                project_root=project_root,
+                scope=scope,
                 filtered_task_tree=filtered_task_tree,
             )
         except Exception as e:
@@ -2538,12 +2538,12 @@ class ReconciliationHarness:
         findings: list[dict],
         tier: TierConfig,
         *,
-        project_root: str,
+        scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
         """Run a focused S1→S2→S3 pass to remediate actionable findings.
 
-        project_root is threaded from the parent caller: run_full_cycle resolves it
+        scope is threaded from the parent caller: run_full_cycle resolves it
         once at entry via _known_project_scope_for, before any side-effects, and
         threads it through _maybe_remediate so remediation always uses the pre-cycle
         snapshot, immune to any mid-cycle registry mutations (task 1163).
@@ -2553,6 +2553,7 @@ class ReconciliationHarness:
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
         """
+        project_root = scope.project_root
         # Defense-in-depth assert deliberately omitted.  A registry-bound check such
         # as `assert project_root in self._known_projects.values()` would fail during
         # the mid-cycle mutation window that task 1163 was specifically designed to
@@ -2626,7 +2627,7 @@ class ReconciliationHarness:
             task_kind_by_id[tid] = _metadata.get('task_kind') if isinstance(_metadata, dict) else None
 
         current_stage_name: str | None = None
-        stages = self._make_stages()
+        stages = self._make_stages(scope)
         try:
             # Configure stages for remediation mode
             stage1 = stages[0]
@@ -2644,9 +2645,6 @@ class ReconciliationHarness:
             reports = []
             for stage in stages:
                 current_stage_name = stage.stage_id.value
-                stage.project_id = project_id
-                stage.project_root = project_root
-                stage.known_projects = self._known_projects
 
                 report = await stage.run(
                     [], watermark, reports, run_id, model=tier.model,
