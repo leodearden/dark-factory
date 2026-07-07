@@ -70,6 +70,25 @@ class TestSharedRegistryRegistration:
     Importing shared.deploy_state (this file's step-1 import above) is
     itself the registration trigger (§5.2 seam note) — no explicit register
     call is made here.
+
+    NOTE — cross-suite process isolation: this module-level import
+    registers the REAL DeployState into
+    ``shared.task_metadata._SUBMODEL_REGISTRY`` permanently for the life of
+    the interpreter (this file adds no reset fixture — the registration is
+    meant to be process-durable, mirroring how the two live processes
+    boot). That is safe only because the verify harness runs each workspace
+    member's tests as its own `uv run --project <member> pytest` process
+    (CLAUDE.md's ENV GOTCHA), so this process never also collects
+    shared/tests/test_task_metadata.py. A future combined/monorepo pytest
+    run (e.g. a bare `pytest` from the repo root — root pyproject.toml's
+    `[tool.pytest.ini_options]` makes that collection possible) that
+    collected both suites into one process would leak this real
+    registration into shared/tests/test_task_metadata.py's
+    TestSubmodelRegistry, whose stub-registration tests would then raise a
+    conflict ValueError — that fixture's snapshot/restore only guards
+    leaks *within* its own file, not a pre-existing cross-file
+    registration. See shared/src/shared/deploy_state.py's docstring for the
+    same note.
     """
 
     def test_deploy_state_registered_under_its_key(self) -> None:
