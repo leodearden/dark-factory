@@ -4,9 +4,18 @@ Request-scoped code must resolve `now` once (via
 :func:`dashboard.data.utils.resolve_now`) and thread it through, rather than
 letting each function read the live clock independently. This module parses
 each `dashboard/src/dashboard/data/*.py` file with `ast` and flags every
-`datetime.now(...)` Call node that is neither tagged `# clock-exempt:` on its
+`<expr>.now(...)` Call node that is neither tagged `# clock-exempt:` on its
 physical source line nor part of `resolve_now`'s own definition (the
 sanctioned single clock-read site).
+
+The matcher intentionally does not require the receiver to be a bare
+`datetime` name: it flags any `.now(...)` attribute call, so an aliased
+import (``from datetime import datetime as dt`` then ``dt.now(UTC)``, or
+``import datetime as _dt`` then ``_dt.datetime.now()``) can't silently
+evade the guard. This trades a slightly higher false-positive rate (any
+unrelated `.now()`-named method would also be flagged) for closing that
+coverage gap; false positives are handled the same way as everything else
+— an explicit `# clock-exempt:` tag.
 """
 
 from __future__ import annotations
@@ -18,11 +27,13 @@ _EXEMPT_MARKER = '# clock-exempt:'
 
 
 def find_clock_violations(source: str) -> list[tuple[int, str]]:
-    """Return ``(line, text)`` for every bare ``datetime.now(...)`` call in *source*.
+    """Return ``(line, text)`` for every bare ``<expr>.now(...)`` call in *source*.
 
-    A call is exempt if its physical source line contains the substring
-    ``# clock-exempt:``, or if the call lives inside a ``def resolve_now(...):``
-    (the sanctioned single clock-read site).
+    Matches any attribute-call named ``now`` — not just calls on a bare
+    ``datetime`` name — so aliased imports can't evade the guard (see the
+    module docstring). A call is exempt if its physical source line
+    contains the substring ``# clock-exempt:``, or if the call lives inside
+    a ``def resolve_now(...):`` (the sanctioned single clock-read site).
     """
     tree = ast.parse(source)
     lines = source.splitlines()
@@ -41,12 +52,7 @@ def find_clock_violations(source: str) -> list[tuple[int, str]]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if not (
-            isinstance(func, ast.Attribute)
-            and func.attr == 'now'
-            and isinstance(func.value, ast.Name)
-            and func.value.id == 'datetime'
-        ):
+        if not (isinstance(func, ast.Attribute) and func.attr == 'now'):
             continue
         lineno = func.value.lineno
         line_text = lines[lineno - 1] if 0 < lineno <= len(lines) else ''
@@ -107,6 +113,22 @@ def test_multiline_call_tag_on_base_line():
         ')\n'
     )
     assert find_clock_violations(source) == []
+
+
+def test_aliased_datetime_import_fires():
+    """`from datetime import datetime as dt; dt.now(UTC)` can't evade the guard."""
+    source = 'now = dt.now(UTC)  # dt is `datetime` imported under an alias\n'
+    violations = find_clock_violations(source)
+    assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
+    assert violations[0][0] == 1
+
+
+def test_aliased_module_import_fires():
+    """`import datetime as _dt; _dt.datetime.now()` can't evade the guard either."""
+    source = 'now = _dt.datetime.now()\n'
+    violations = find_clock_violations(source)
+    assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
+    assert violations[0][0] == 1
 
 
 # ---------------------------------------------------------------------------

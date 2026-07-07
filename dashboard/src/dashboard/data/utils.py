@@ -89,13 +89,14 @@ def resolve_now(now: datetime | None) -> datetime:
     pattern from :mod:`dashboard.data.merge_queue`.
 
     Note:
-        :mod:`dashboard.data.merge_queue` and :mod:`dashboard.data.metrics`
-        still inline their own equivalent ``now if now is not None else
-        datetime.now(UTC)`` checks, and :mod:`dashboard.data.cap_history`
-        uses a parallel ``_to_utc`` idiom — none of them have been migrated
-        to call this helper yet. Repo-wide consolidation onto a single
-        clock-read site is tracked as follow-up work, not part of this
-        task.
+        :mod:`dashboard.data.metrics` still inlines its own equivalent
+        ``now if now is not None else datetime.now(UTC)`` checks, and
+        :mod:`dashboard.data.cap_history` uses a parallel ``_to_utc`` idiom —
+        neither has been migrated to call this helper yet.
+        :mod:`dashboard.data.merge_queue` *has* been migrated (its
+        ``effective_now`` fallbacks now call this function). Repo-wide
+        consolidation onto a single clock-read site is tracked as follow-up
+        work, not part of this task.
 
     Args:
         now: An explicit reference timestamp, or None to read the current
