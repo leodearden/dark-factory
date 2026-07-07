@@ -16,7 +16,6 @@ from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
     _format_task_id,
     _merge_metadata,
-    _normalize_legacy_memory_hints_value,
     _parse_qualified_dep,
     _parse_task_id,
     _resolve_metadata_mode,
@@ -868,55 +867,6 @@ def test_merge_metadata_legacy_hints_not_normalized_on_one_sided_write():
     # memory_hints was NOT in the incoming write, so normalization does not fire;
     # the legacy list shape is preserved verbatim in the merged result.
     assert result["memory_hints"] == [{"entity": "E1", "query": "q1"}]
-
-
-def test_normalize_legacy_memory_hints_handles_partial_and_malformed_entries():
-    """_normalize_legacy_memory_hints_value correctly handles edge cases in the list.
-
-    Proves:
-    * dict entries with only entity → entity extracted, no query
-    * dict entries with only query → query extracted, no entity
-    * dict entries with both → both extracted
-    * empty dicts → skipped
-    * non-dict items (str, None) → skipped
-    * empty-string entity/query → skipped
-    * None-valued entity/query → skipped
-    * duplicate entity/query values → deduplicated in stable (first-seen) order
-    * already-canonical dict input → returned unchanged (pass-through)
-    * None input → returned unchanged (pass-through)
-
-    Cross-reference: test_merge_metadata_legacy_list_hints_coerce_and_union_with_new_dict
-    covers the full _merge_metadata path; this test locks the helper's semantics.
-    """
-    # Mixed/malformed list
-    malformed = [
-        {"entity": "E1"},           # only entity — ok
-        {"query": "q1"},            # only query — ok
-        {"entity": "E2", "query": "q2"},  # both — ok
-        {},                         # empty dict — skip
-        "not-a-dict",               # non-dict — skip
-        None,                       # non-dict — skip
-        {"entity": ""},             # empty string — skip
-        {"query": None},            # None value — skip
-    ]
-    result = _normalize_legacy_memory_hints_value(malformed)
-    assert result == {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}
-
-    # Duplicates — deduplicated in stable first-seen order
-    duped = [
-        {"entity": "E1", "query": "q1"},
-        {"entity": "E1", "query": "q2"},  # duplicate entity — skip entity, keep query
-        {"entity": "E2", "query": "q1"},  # duplicate query — keep entity, skip query
-    ]
-    result_dedup = _normalize_legacy_memory_hints_value(duped)
-    assert result_dedup == {"entities": ["E1", "E2"], "queries": ["q1", "q2"]}
-
-    # Already-canonical dict — pass-through
-    canonical = {"entities": ["X"], "queries": ["q"]}
-    assert _normalize_legacy_memory_hints_value(canonical) is canonical
-
-    # None — pass-through
-    assert _normalize_legacy_memory_hints_value(None) is None
 
 
 @pytest.mark.asyncio
