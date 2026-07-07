@@ -68,3 +68,27 @@ class TestLoadPriorities:
         assert any('priorities' in msg.lower() for msg in warnings), (
             f'Expected a WARNING mentioning "priorities"; got: {warnings}'
         )
+
+
+class TestEnsurePrioritiesFile:
+    def test_creates_parent_dirs_and_round_trips_to_defaults(self, tmp_path):
+        from cockpit.priority import Priorities, ensure_priorities_file, load_priorities
+
+        target = tmp_path / 'nested' / 'dir' / 'priorities.yaml'
+        assert not target.parent.exists()
+
+        ensure_priorities_file(target)
+
+        assert target.exists()
+        assert load_priorities(target) == Priorities.default()
+
+    def test_existing_file_is_left_untouched(self, tmp_path):
+        from cockpit.priority import ensure_priorities_file
+
+        target = tmp_path / 'priorities.yaml'
+        custom_contents = 'severity_weights:\n  critical: 123.0\n'
+        target.write_text(custom_contents)
+
+        ensure_priorities_file(target)
+
+        assert target.read_text() == custom_contents
