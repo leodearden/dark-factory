@@ -151,6 +151,21 @@ def build_consolidation_report(
     }
 
 
+def has_unresolved(report: dict) -> bool:
+    """True iff any item in any of the three manifest sections carries an
+    'UNRESOLVED' disposition.
+
+    This is the S7 exit-code predicate: ``main()`` returns non-zero on
+    ``--apply`` when this is True. Pure function, no I/O.
+    """
+    sections = (
+        report['graph_family_merges'],
+        report['collection_merges'],
+        report['junk_key_deletions'],
+    )
+    return any(item.get('disposition') == 'UNRESOLVED' for section in sections for item in section)
+
+
 # ---------------------------------------------------------------------------
 # Graph inspection (read-only)
 # ---------------------------------------------------------------------------
