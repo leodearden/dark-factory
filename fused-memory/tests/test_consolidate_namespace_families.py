@@ -129,3 +129,62 @@ class TestJunkKeys:
             'my-project', 'test-project', 'default', '1098',
         }
         assert expected <= set(_mod.JUNK_KEYS)
+
+
+# ===========================================================================
+# Tests: build_consolidation_report
+# ===========================================================================
+
+class TestBuildConsolidationReport:
+    """Tests for the pure function build_consolidation_report(...)."""
+
+    def test_report_shape(self):
+        """Returned dict has exactly the four top-level manifest keys."""
+        report = _mod.build_consolidation_report([], [], [], dry_run=True)
+
+        assert set(report.keys()) == {
+            'dry_run', 'graph_family_merges', 'collection_merges', 'junk_key_deletions',
+        }
+
+    def test_dry_run_passed_through_verbatim(self):
+        """dry_run is passed through verbatim, not hardcoded, in either direction."""
+        report_true = _mod.build_consolidation_report([], [], [], dry_run=True)
+        report_false = _mod.build_consolidation_report([], [], [], dry_run=False)
+
+        assert report_true['dry_run'] is True
+        assert report_false['dry_run'] is False
+
+    def test_sections_are_lists_of_given_items(self):
+        """Each section is exactly the list of per-item dicts given, in order."""
+        graph_items = [{'sibling': 'know-live', 'canonical': 'know_live', 'disposition': 'MERGE'}]
+        collection_items = [{'source': 'reify_reify', 'target': 'fused_reify', 'disposition': 'MERGE'}]
+        junk_items = [{'key': 'my-project', 'node_count': 0, 'disposition': 'DELETE'}]
+
+        report = _mod.build_consolidation_report(
+            graph_items, collection_items, junk_items, dry_run=True,
+        )
+
+        assert report['graph_family_merges'] == graph_items
+        assert report['collection_merges'] == collection_items
+        assert report['junk_key_deletions'] == junk_items
+
+    def test_empty_inputs_produce_empty_lists(self):
+        """Empty inputs for all three sections produce empty lists, with dry_run preserved."""
+        report = _mod.build_consolidation_report([], [], [], dry_run=False)
+
+        assert report['graph_family_merges'] == []
+        assert report['collection_merges'] == []
+        assert report['junk_key_deletions'] == []
+        assert report['dry_run'] is False
+
+    def test_no_io_pure_function(self):
+        """build_consolidation_report performs no I/O -- calling twice with
+        identical inputs is referentially stable in content."""
+        graph_items = [{'sibling': 'knowlive', 'canonical': 'know_live', 'disposition': 'MERGE'}]
+        collection_items = [{'source': 'fused_dark-factory', 'target': 'fused_dark_factory'}]
+        junk_items = [{'key': 'default', 'node_count': 0, 'disposition': 'DELETE'}]
+
+        r1 = _mod.build_consolidation_report(graph_items, collection_items, junk_items, dry_run=True)
+        r2 = _mod.build_consolidation_report(graph_items, collection_items, junk_items, dry_run=True)
+
+        assert r1 == r2
