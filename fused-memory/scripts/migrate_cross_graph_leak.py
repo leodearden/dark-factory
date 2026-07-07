@@ -472,8 +472,14 @@ async def run(args: Any, memory_service: Any) -> dict:
             continue
 
         if disposition == MOVE:
+            # rewrite_group_id re-keys the moved node (and, via epsilon's
+            # uniform new_group_id, its edges/mentions) to the canonical
+            # home-graph name, so it is no longer foreign after the move --
+            # a safe no-op for displaced-only moves where target_graph
+            # already equals the node's group_id.
             await move_entity_across_graphs(
                 graphiti, uuid, node['source_graph'], node['target_graph'],
+                rewrite_group_id=node['target_graph'],
             )
             apply_results.append(
                 {'uuid': uuid, 'disposition': disposition, 'applied': True, 'blocked': False},
