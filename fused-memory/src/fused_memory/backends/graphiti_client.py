@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import logging
 import re
+import uuid
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -970,33 +971,44 @@ class GraphitiBackend:
             {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
         )
 
-        # Phase 2: Redirect outgoing edges (deprecated → target)
-        count_out = await graph.query(
-            'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]->() '
-            'RETURN count(e) AS cnt',
+        # Phase 2: Redirect outgoing edges (deprecated → target). Enumerate
+        # the redirect set by stable internal element ID(old) — NOT old.uuid,
+        # which may already be duplicated by a prior buggy merge — then
+        # redirect one edge per query, minting a fresh uuid4 per edge and
+        # recording the original uuid as new.superseded_edge_uuid for audit.
+        out_enum = await graph.query(
+            'MATCH (dep:Entity {uuid: $dep_uuid})-[old:RELATES_TO]->() '
+            'RETURN ID(old) AS eid',
             {'dep_uuid': deprecated_uuid},
         )
-        outgoing_redirected = (
-            int(count_out.result_set[0][0]) if count_out.result_set else 0
-        )
-        await graph.query(
-            'MATCH (dep:Entity {uuid: $dep_uuid})-[old:RELATES_TO]->(target) '
-            'WITH old, target '
-            'MATCH (sur:Entity {uuid: $sur_uuid}) '
-            'CREATE (sur)-[new:RELATES_TO]->(target) '
-            'SET new.uuid = old.uuid, '
-            '    new.name = old.name, '
-            '    new.fact = old.fact, '
-            '    new.fact_embedding = old.fact_embedding, '
-            '    new.valid_at = old.valid_at, '
-            '    new.invalid_at = old.invalid_at, '
-            '    new.created_at = old.created_at, '
-            '    new.group_id = old.group_id, '
-            '    new.episodes = old.episodes, '
-            '    new.source_node_uuid = $sur_uuid '
-            'DELETE old',
-            {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
-        )
+        out_eids = [row[0] for row in (out_enum.result_set or [])]
+        outgoing_redirected = len(out_eids)
+        for eid in out_eids:
+            new_uuid = str(uuid.uuid4())
+            await graph.query(
+                'MATCH (dep:Entity {uuid: $dep_uuid})-[old:RELATES_TO]->(target) '
+                'WHERE ID(old) = $eid '
+                'MATCH (sur:Entity {uuid: $sur_uuid}) '
+                'CREATE (sur)-[new:RELATES_TO]->(target) '
+                'SET new.uuid = $new_uuid, '
+                '    new.superseded_edge_uuid = old.uuid, '
+                '    new.name = old.name, '
+                '    new.fact = old.fact, '
+                '    new.fact_embedding = old.fact_embedding, '
+                '    new.valid_at = old.valid_at, '
+                '    new.invalid_at = old.invalid_at, '
+                '    new.created_at = old.created_at, '
+                '    new.group_id = old.group_id, '
+                '    new.episodes = old.episodes, '
+                '    new.source_node_uuid = $sur_uuid '
+                'DELETE old',
+                {
+                    'dep_uuid': deprecated_uuid,
+                    'sur_uuid': surviving_uuid,
+                    'eid': eid,
+                    'new_uuid': new_uuid,
+                },
+            )
 
         # Phase 3: Redirect incoming edges (source → deprecated)
         count_in = await graph.query(
