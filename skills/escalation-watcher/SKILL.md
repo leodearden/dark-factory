@@ -385,8 +385,20 @@ interactive `/unblock` session with a prompt of the form `/unblock <task_id> (es
 re-derives all context — escalation, task status, git state — fresh from `TASK_ID`
 (`skills/unblock/SKILL.md`). The trailing `(esc ...)` context is purely additive, there only to
 orient the human reading the terminal before `/unblock` runs, so it stays non-load-bearing even if
-a section's summary below drifts out of date. Each call site below notes this briefly rather than
-repeating the full explanation.
+a section's summary below drifts out of date.
+
+Two mechanical caveats when building this prompt string:
+- **Which number is the task id.** The parenthetical introduces a second number (`<escalation_id>`);
+  Step 0 must take only the number immediately following `/unblock` as `<task_id>` — `<escalation_id>`
+  always sits behind the `esc ` token inside the parenthetical, never in the leading position, so the
+  leading number is unambiguous.
+- **Escape or truncate `<summary>` before interpolating.** Escalation summaries are free text and may
+  contain single quotes, parens, or newlines. Collapse `<summary>` to a single line, and either
+  shell-escape inner single quotes as `'\''` per `/spawn`'s Arguments section (`skills/spawn/SKILL.md`)
+  or truncate it to a short slug — otherwise an unescaped quote in the summary breaks the
+  single-quoted `<prompt>` argument passed to `spawn-claude.sh`, and the spawn fails or truncates.
+
+Each call site below notes this briefly rather than repeating the full explanation.
 
 ### `review_suggestions` (info)
 
