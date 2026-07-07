@@ -20,9 +20,13 @@ import pytest
 
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    ESCALATION_CATEGORY,
     SNAPSHOT_WRITTEN_STAT_KEY,
     TASK_COUNT_SNAPSHOT_KIND,
+    TASK_COUNT_SNAPSHOT_MISS_THRESHOLD,
+    build_stale_snapshot_finding,
     compute_snapshot_miss_streak,
+    evaluate_snapshot_cadence,
     extract_snapshot_written,
 )
 
@@ -51,6 +55,12 @@ class TestConstants:
 
     def test_stat_key_value(self):
         assert SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_written'
+
+    def test_miss_threshold_value(self):
+        assert TASK_COUNT_SNAPSHOT_MISS_THRESHOLD == 2
+
+    def test_escalation_category_value(self):
+        assert ESCALATION_CATEGORY == 'recon_stale_task_count_snapshot'
 
 
 # ---------------------------------------------------------------------------
@@ -123,3 +133,69 @@ class TestComputeSnapshotMissStreak:
     )
     def test_streak(self, recent_flags, expected):
         assert compute_snapshot_miss_streak(recent_flags) == expected
+
+
+# ---------------------------------------------------------------------------
+# evaluate_snapshot_cadence
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateSnapshotCadence:
+    """evaluate_snapshot_cadence(current_written, prior_flags, *, blocked, threshold) -> dict.
+
+    Returns {'streak': int, 'escalate': bool}.
+    """
+
+    def test_current_written_true_never_escalates_regardless_of_priors(self):
+        result = evaluate_snapshot_cadence(True, [False, False, False], blocked=False)
+        assert result['escalate'] is False
+
+    def test_current_written_none_never_escalates(self):
+        """Unknown current cycle -> never escalate (fail-safe)."""
+        result = evaluate_snapshot_cadence(None, [False, False, False], blocked=False)
+        assert result['escalate'] is False
+
+    def test_blocked_project_never_escalates_even_with_long_streak(self):
+        result = evaluate_snapshot_cadence(False, [False] * 5, blocked=True)
+        assert result['escalate'] is False
+
+    def test_current_false_empty_priors_streak_1_below_threshold(self):
+        result = evaluate_snapshot_cadence(False, [], blocked=False)
+        assert result == {'streak': 1, 'escalate': False}
+
+    def test_current_false_one_prior_miss_streak_2_meets_threshold(self):
+        result = evaluate_snapshot_cadence(False, [False], blocked=False)
+        assert result == {'streak': 2, 'escalate': True}
+
+    def test_current_false_prior_write_resets_streak_to_1(self):
+        """A prior successful write resets the streak; current miss alone is 1."""
+        result = evaluate_snapshot_cadence(False, [True], blocked=False)
+        assert result == {'streak': 1, 'escalate': False}
+
+
+# ---------------------------------------------------------------------------
+# build_stale_snapshot_finding
+# ---------------------------------------------------------------------------
+
+
+class TestBuildStaleSnapshotFinding:
+    """build_stale_snapshot_finding(project_id) -> dict.
+
+    Stable identity ({category, affected_ids, description}) so _escalate's
+    content-fingerprint dedup folds repeats into a single pending escalation
+    (mirrors _DEAD_OWNER_STORM_FINDING).
+    """
+
+    def test_category_is_escalation_category(self):
+        finding = build_stale_snapshot_finding('reify')
+        assert finding['category'] == 'recon_stale_task_count_snapshot'
+
+    def test_affected_ids_scoped_to_project(self):
+        finding = build_stale_snapshot_finding('reify')
+        assert finding['affected_ids'] == ['task_count_snapshot:reify']
+
+    def test_description_is_stable_and_non_empty(self):
+        first = build_stale_snapshot_finding('reify')
+        second = build_stale_snapshot_finding('reify')
+        assert first['description']
+        assert first['description'] == second['description']
