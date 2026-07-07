@@ -2624,11 +2624,15 @@ def create_mcp_server(
             if not sep or not project_id or not task_id or not task_id.isdigit():
                 result[dep] = 'malformed'
                 continue
-            # Normalise project_id: lowercase + hyphen→underscore, mirroring
-            # models/scope.py:resolve_project_id so 'dark-factory' == 'dark_factory'.
-            # Registry lookup uses the normalised form; result is keyed by the
-            # original verbatim dep string.
-            norm_project_id = project_id.lower().replace('-', '_')
+            # Normalise project_id via the shared raise-free primitive (task 2267
+            # / seam S1) so 'dark-factory' == 'dark_factory', mirroring
+            # models/scope.py:resolve_project_id. Deliberately NOT the raising
+            # canonicalize_project_id: this tool's contract is sentinel-only
+            # (never raise on a semantic problem), and a path-shaped project_id
+            # must fall through to the 'unknown_project' sentinel below rather
+            # than raise PathShapedProjectIdError. Registry lookup uses the
+            # normalised form; result is keyed by the original verbatim dep string.
+            norm_project_id = _to_underscore_canonical(project_id)
             # Look up project_root in registry
             if norm_project_id not in _kp:
                 result[dep] = 'unknown_project'
