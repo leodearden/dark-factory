@@ -3707,15 +3707,22 @@ class Scheduler:
         # (counter increments, escalation callbacks) exactly once per tick.
         # The _park_gc call site above does NOT receive the cache, preserving park-GC
         # semantics (design decision 4: scope containment).
-        _pending_tasks_with_ext: list[dict] = [
-            t for t in tasks
+        # _task_external_deps(t) runs the full parse_metadata pipeline (JSON parse,
+        # apply_migrations copy, sub-model validation, TaskMetadata construction) —
+        # noticeably heavier than the old dict.get idiom.  Compute it once per
+        # pending task here and reuse the cached list for both the filter and the
+        # union, instead of calling it again per task in a second comprehension.
+        _pending_ext_deps: list[tuple[dict, list[str]]] = [
+            (t, deps)
+            for t in tasks
             if t.get('status') == 'pending'
-            and _task_external_deps(t)
+            and (deps := _task_external_deps(t))
         ]
+        _pending_tasks_with_ext: list[dict] = [t for t, _ in _pending_ext_deps]
         _ext_dep_union: list[str] = list({
             dep
-            for t in _pending_tasks_with_ext
-            for dep in _task_external_deps(t)
+            for _, deps in _pending_ext_deps
+            for dep in deps
         })
         if _ext_dep_union:
             external_cache, external_err = await self.get_external_statuses(_ext_dep_union)
