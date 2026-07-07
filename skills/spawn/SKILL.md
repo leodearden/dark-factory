@@ -74,7 +74,10 @@ The background task's completion is a reliable signal that the spawned session h
 | `126`     | No terminal emulator found — prompt the user for `$CLAUDE_TERMINAL_CMD` and retry. Suggest they export it in their shell profile for future sessions. |
 | `127`     | Launcher failed to start the session (the emulator binary errored before running the payload — no sentinel was ever written). Surface the error to the caller. |
 | `129`     | Terminal window closed while the session was still alive (SIGHUP reached the running session). The session may or may not have completed its work; treat as inconclusive, not as a launcher failure. |
+| `144`     | Claude never started — no new transcript appeared under `~/.claude/projects/<encoded-cwd>/` and no `claude` process was detected within the started-grace window; the background started-watchdog marked the session-registry record `failed-to-start` and emitted a loud caller-visible line on the spawn's stderr. This is the silent-no-transcript hang (2026-07-06 incident), now surfaced within grace instead of hanging. Additive; all existing codes retain their meaning. |
 | `2`       | Bad usage — caller bug, not user-recoverable. |
+
+The transcript path used by the `144` check encodes the session's `cwd` by replacing every `/` and `.` with `-`, matching `session_registry.transcript_path_for_cwd` byte-for-byte — e.g. `/home/leo/src/dark-factory` → `~/.claude/projects/-home-leo-src-dark-factory/`. The started-grace window defaults to ~90s and is tunable via `$SPAWN_STARTED_GRACE_SECS`.
 
 If you want to confirm the spawned session is alive mid-run, `ps -ef | grep claude` works. The background task itself is the canonical liveness signal — don't poll it via `TaskGet` in tight loops; just wait for its completion notification.
 
