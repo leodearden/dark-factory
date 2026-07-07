@@ -17,6 +17,8 @@ from fused_memory.services.memory_service import MemoryService, _serialize_tempo
 @pytest.fixture
 def service(mock_config):
     """MemoryService with mocked backends (no real DB needed)."""
+    from _fm_helpers import install_identity_mocks
+
     svc = MemoryService(mock_config)
     # Mock backends
     svc.graphiti = MagicMock()
@@ -34,6 +36,7 @@ def service(mock_config):
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})

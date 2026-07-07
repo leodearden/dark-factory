@@ -7,6 +7,7 @@ module name so test files can `from _fm_helpers import X` without
 colliding with sibling subprojects' helpers.
 """
 
+import asyncio
 import contextlib
 import functools
 import inspect
@@ -14,7 +15,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pydantic import BaseModel
@@ -151,6 +152,44 @@ class MockAddEpisodeResult:
     def __post_init__(self) -> None:
         if self.edges == [] and self.entity_edges:
             self.edges = list(self.entity_edges)
+
+
+def install_identity_mocks(mock_graphiti: MagicMock) -> None:
+    """Stub GraphitiBackend's write-time-identity primitives (task 2198/α) onto a mock.
+
+    ``MemoryService._execute_graphiti_write`` (task 2202/β) wraps its
+    add_episode + _reconcile_episode_identity critical section in
+    ``async with self.graphiti._identity_lock_for(group_id):``. A bare
+    ``MagicMock()._identity_lock_for(...)`` returns a non-async-context-manager
+    child mock, which breaks that ``async with`` for every test that builds
+    ``svc.graphiti = MagicMock()``. Call this immediately after constructing
+    such a mock (before returning it from a fixture) to install:
+
+      - ``_identity_lock_for``: a real lazy per-group_id ``asyncio.Lock``
+        registry (same group_id -> same Lock instance across calls),
+        mirroring the production contract at graphiti_client.py:255. A
+        sync callable (matching the real sync accessor) so
+        ``async with mock_graphiti._identity_lock_for(gid):`` works.
+      - ``_resolve_or_create_entity``: an ``AsyncMock(return_value=None)`` —
+        the no-op default (0 exact-name matches), since most callers only
+        need the awaited call to not raise. Tests that care about
+        resolve/collapse behavior override this per-test.
+
+    Args:
+        mock_graphiti: The ``MagicMock()`` standing in for ``svc.graphiti``.
+            Mutated in place; nothing is returned.
+    """
+    locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(group_id: str) -> asyncio.Lock:
+        lock = locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[group_id] = lock
+        return lock
+
+    mock_graphiti._identity_lock_for = MagicMock(side_effect=_lock_for)
+    mock_graphiti._resolve_or_create_entity = AsyncMock(return_value=None)
 
 
 async def assert_ro_query_only(
