@@ -186,6 +186,13 @@ async def enumerate_graph_entity_nodes(
     only residual left behind in *key* is exactly what should make the
     junk-key guard (``delete_junk_key``) classify it UNRESOLVED rather than
     silently GRAPH.DELETE-ing it.
+
+    Single-page fetch: this issues exactly ONE ``LIMIT $limit`` query and
+    never follows up with a second page, so a graph with more than *limit*
+    Entity nodes is permanently reported UNRESOLVED at the given --limit.
+    Callers must pass a *limit* larger than the true Entity-node count of
+    every graph they intend to migrate in this run; the full result set is
+    held in memory, so raising *limit* trades completeness for peak memory.
     """
     graph = graphiti._graph_for(key)
     result = await graph.ro_query(
@@ -270,6 +277,14 @@ async def scroll_collection_points(
     ``with_vectors=True`` is essential: omitting it drops embeddings from
     the returned points, which would silently destroy them once re-upserted
     into the target collection (see ``merge_collection``).
+
+    Single-page fetch: this issues exactly ONE ``scroll(..., limit=limit)``
+    call and discards the returned ``next_offset`` rather than paging
+    through it, so a collection with more than *limit* points is
+    permanently reported UNRESOLVED at the given --limit. Callers must pass
+    a *limit* larger than the true point count of every collection they
+    intend to migrate in this run; the full result set (with vectors) is
+    held in memory, so raising *limit* trades completeness for peak memory.
     """
     points, _next_offset = await qdrant_client.scroll(
         collection_name=collection,
@@ -301,11 +316,18 @@ async def merge_collection(
     """Upsert *points* (payload user_id rewritten to canonical) into *target*.
 
     Preserves each point's original id and vector -- only the payload's
-    user_id is rewritten. The *source* collection is deleted ONLY when
-    *capped* is False (the scroll that produced *points* was NOT capped,
-    i.e. fully drained): a capped scroll means the enumeration may be
-    incomplete, so deleting source would risk losing un-migrated data --
-    the caller marks that case UNRESOLVED instead.
+    user_id is rewritten. Qdrant upsert is id-keyed: this ASSUMES every
+    *source* point id is globally unique with respect to *target* (true for
+    Mem0's UUID point ids), so a same-id point already present in *target*
+    would be silently overwritten rather than merged. No pre-upsert
+    existence check is performed -- COLLECTION_MERGES entries must only ever
+    pair collections whose point ids cannot collide.
+
+    The *source* collection is deleted ONLY when *capped* is False (the
+    scroll that produced *points* was NOT capped, i.e. fully drained): a
+    capped scroll means the enumeration may be incomplete, so deleting
+    source would risk losing un-migrated data -- the caller marks that case
+    UNRESOLVED instead.
     """
     from qdrant_client.http import models as qmodels  # noqa: PLC0415
 
@@ -488,8 +510,12 @@ def main() -> int:
     )
     parser.add_argument(
         '--limit', type=int, default=1000,
-        help='Maximum rows/points to enumerate or scroll per item (default: 1000). '
-             'Increase if the dry-run report logs a scroll/limit-cap WARNING.',
+        help='Maximum rows/points fetched in a SINGLE page per item (default: '
+             '1000 -- no further pages are fetched). Must exceed the true '
+             'row/point count of the largest graph/collection being '
+             'migrated, or that item is permanently reported UNRESOLVED. '
+             'Increase if the dry-run report logs a scroll/limit-cap '
+             'WARNING; memory scales with this value.',
     )
     parser.add_argument(
         '--config', default=None,
