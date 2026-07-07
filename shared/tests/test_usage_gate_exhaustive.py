@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ from shared.usage_gate import (
     CODEX_CAP_PATTERNS,
     GEMINI_CAP_PATTERNS,
     NEAR_CAP_PREFIXES,
+    AccountLease,
     AccountPhase,
     SessionBudgetExhausted,
     UsageGate,
@@ -2307,3 +2309,30 @@ class TestAccountGeneration:
 
         gate._transition(acct, AccountPhase.PROBING)
         assert acct.generation == g0 + 2
+
+
+# =========================================================================
+# TestAccountLease — frozen (name, token, generation) snapshot of the
+# account selected by before_invoke() (PRD §7.4, task W4-δ). Not added to
+# usage_gate.__all__ (see the NOTE near that list) — imported explicitly.
+# =========================================================================
+
+
+class TestAccountLease:
+    """AccountLease: frozen, hashable dataclass with name/token/generation."""
+
+    def test_fields(self):
+        lease = AccountLease(name='a', token='fake-token-a', generation=0)
+        assert lease.name == 'a'
+        assert lease.token == 'fake-token-a'
+        assert lease.generation == 0
+
+    def test_frozen(self):
+        lease = AccountLease(name='a', token='fake-token-a', generation=0)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            lease.name = 'b'
+
+    def test_hashable(self):
+        lease = AccountLease(name='a', token='fake-token-a', generation=0)
+        other = AccountLease(name='a', token='fake-token-a', generation=0)
+        assert hash(lease) == hash(other)
