@@ -92,6 +92,11 @@ STATE_TIER: dict[str, float] = {
 
 def score(item: ScoringItem, weights: Priorities, now: datetime) -> float:
     """Score `item` for queue ordering. Pure: `now` is injected, no RNG."""
-    raw = max(0.0, weights.severity_weights.get(item.severity, weights.defaults.severity))
+    raw = (
+        weights.severity_weights.get(item.severity, weights.defaults.severity)
+        + weights.category_weights.get(item.category, weights.defaults.category)
+        + weights.project_weights.get(item.project, weights.defaults.project)
+    )
+    raw = max(0.0, raw)
     urgency = raw / (1.0 + raw)
     return urgency
