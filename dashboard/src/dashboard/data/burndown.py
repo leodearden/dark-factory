@@ -24,6 +24,7 @@ from dashboard.data.orchestrator import (
     find_running_orchestrators,
 )
 from dashboard.data.tasks import fetch_statuses
+from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ async def collect_snapshot(
       regressions.
     """
     try:
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now(UTC).isoformat()  # clock-exempt: single-capture writer
         # config.project_root is already resolved by DashboardConfig.__post_init__
         resolved_root = str(config.project_root)
 
@@ -217,7 +218,7 @@ async def collect_snapshot(
 
 async def downsample(conn: aiosqlite.Connection) -> None:
     """Compact old snapshots: hourly after 7 days, expire after 90 days."""
-    now = datetime.now(UTC)
+    now = datetime.now(UTC)  # clock-exempt: single-capture writer
     cutoff_7d = (now - timedelta(days=7)).isoformat()
     cutoff_90d = (now - timedelta(days=90)).isoformat()
 
@@ -278,6 +279,7 @@ async def aggregate_burndown_series(
     project_id: str,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict:
     """Return merged time-series data for *project_id* across all burndown DBs.
 
@@ -286,6 +288,10 @@ async def aggregate_burndown_series(
     the list overwrite earlier ones for the same timestamp).  The result is
     sorted by timestamp and returned in the same dict-of-lists shape as
     :func:`get_burndown_series`.
+
+    *now* is resolved once (via :func:`dashboard.data.utils.resolve_now`) and
+    threaded identically to every per-DB call so all queries share a single
+    cutoff, closing the per-DB clock-skew race.
 
     Returns the empty-series default ``{labels: [], done: [], ...}`` when no
     rows are found across any DB.
@@ -296,8 +302,9 @@ async def aggregate_burndown_series(
     if not dbs:
         return empty
 
+    now = resolve_now(now)
     per_db: list[dict] = list(await asyncio.gather(
-        *(get_burndown_series(db, project_id, days=days) for db in dbs)
+        *(get_burndown_series(db, project_id, days=days, now=now) for db in dbs)
     ))
 
     # Why last-writer-wins and not sum-of-counts (as used in performance.py /
@@ -489,11 +496,15 @@ async def get_burndown_series(
     project_id: str,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict:
     """Return time-series data for a project's burndown chart.
 
     Returns ``{labels: [...], done: [...], cancelled: [...], blocked: [...],
     deferred: [...], in_progress: [...], pending: [...]}``.
+
+    *now* is the reference timestamp for the window cutoff; when ``None``
+    (the default) it is resolved via :func:`dashboard.data.utils.resolve_now`.
     """
     empty: dict = {
         'labels': [],
@@ -506,7 +517,7 @@ async def get_burndown_series(
     }
     if db is None:
         return empty
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
         async with db.execute(
             'SELECT ts, done, cancelled, blocked, deferred, in_progress, pending '
