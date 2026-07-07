@@ -192,8 +192,15 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     the hand-written literals this replaces (they never carried explicit
     ``None`` values either); extra fields such as ``transient_unit`` /
     ``fire_delay_secs`` survive via ``DoneProvenance``'s ``extra='allow'``.
+
+    ``kind``/``**fields`` are intentionally loosely typed (``str``/``object``):
+    the six call sites forward heterogeneous field subsets, so pyright's
+    dataclass-transform-synthesized ``DoneProvenance.__init__`` (each
+    parameter narrowly typed, e.g. ``kind: Literal[...]``, ``pid: int | None``)
+    cannot be satisfied by a generic pass-through signature. The real
+    validation happens at runtime, in the model itself.
     """
-    return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)
+    return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
 
 
 class DeterministicRunner:
