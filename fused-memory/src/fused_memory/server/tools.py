@@ -2832,6 +2832,8 @@ def create_mcp_server(
         tag: str | None = None,
         done_provenance: dict | None = None,
         reopen_reason: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
         done/blocked/cancelled/deferred transitions. Entering merge-deferred is
@@ -2888,7 +2890,11 @@ def create_mcp_server(
                 'manual re-scope', 'reconciliation: re-implementation required'.
                 Persisted on the task as metadata.reopen_reason for audit.
                 Ignored for non-terminal transitions.
+            agent_id: Which agent is writing (optional, auto-derived from MCP
+                context). Threaded into the transition-legality gate so it can
+                classify an actor (task 2175/rho1b).
         """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
             return err
         _normalized = _normalize_project_root(project_root)
@@ -2911,6 +2917,7 @@ def create_mcp_server(
                 tag=tag,
                 done_provenance=done_provenance,
                 reopen_reason=reopen_reason,
+                agent_id=agent_id,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise

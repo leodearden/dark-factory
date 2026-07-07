@@ -683,6 +683,7 @@ async def test_set_task_status_accepts_merge_deferred(
         tag=None,
         done_provenance=None,
         reopen_reason=None,
+        agent_id=None,
     )
 
 
