@@ -557,6 +557,41 @@ class TestReconcileStrandedInProgress:
         # Task must still be reverted to pending (recovery runs separately)
         harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
 
+    async def test_no_lock_worktree_retained_when_branch_has_wip_commits(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """Worktree dir exists but has no plan.lock and task is NOT in
+        _recovered_plans/_preserved_worktrees, but the leftover branch still
+        carries WIP commits beyond main (the shape left behind when the
+        stale-lock reap retained a non-degenerate branch) → cleanup_worktree
+        is NOT called: the worktree is retained so the next dispatch can
+        resume it via create_worktree's cold-path γ reattach, instead of
+        reaping the dir and forcing _cleanup_leftover_branch to raise later.
+        Task is still reverted to pending.
+
+        Mirrors test_no_lock_worktree_preserved_when_recovered, but the
+        retention signal here is branch WIP (_orphan_has_commits), not
+        _recovered_plans/_preserved_worktrees membership.
+        """
+        tid = 36
+        harness.scheduler.get_statuses.return_value = ({str(tid): 'in-progress'}, None)  # type: ignore[attr-defined]
+        # Create the worktree directory (no .task/plan.lock inside)
+        worktree_path = harness.git_ops.worktree_base / str(tid)
+        worktree_path.mkdir(parents=True)
+        # tid is NOT in _recovered_plans / _preserved_worktrees (defaults empty)
+        # Simulate a re-attached-eligible WIP branch: the leftover branch
+        # still carries commits beyond main.
+        harness.git_ops._orphan_has_commits = AsyncMock(return_value=True)
+
+        await harness._reconcile_stranded_in_progress()
+
+        # cleanup_worktree must NOT have been called — WIP is retained.
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+        # Worktree directory must still exist.
+        assert worktree_path.exists()
+        # Task must still be reverted to pending (next dispatch resumes it).
+        harness.scheduler.set_task_status.assert_called_once_with(str(tid), 'pending')  # type: ignore[attr-defined]
+
     async def test_no_lock_worktree_preserved_when_in_preserved_set(
         self, harness: Harness, tmp_path: Path
     ):
