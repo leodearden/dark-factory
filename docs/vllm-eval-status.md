@@ -1258,17 +1258,7 @@ leosiriusdawn/runpod-vllm:latest / :upgraded      24 GB  (base, pushed, has entr
 
 All 5 new configs now use `:latest` + HF download. The existing-image configs still use OLD baked Hub images on bigger H200 pods.
 
-```python
-<<<<<<< Updated upstream
-VLLM_EVAL_CONFIGS = [
-    _vllm_config('minimax-m25-fp8', 'MiniMaxAI/MiniMax-M2.5'),
-    _vllm_config('qwen3-coder-next-fp8', 'Qwen/Qwen3-Coder-Next'),
-    _vllm_config('reap-139b-nvfp4', 'cerebras/MiniMax-M2.5-REAP-139B-A10B'),
-    _vllm_config('reap-172b-nvfp4', 'cerebras/MiniMax-M2.5-REAP-172B-A10B'),
-    _vllm_config('qwen3-coder-30b-q4', 'Qwen/Qwen3-Coder-30B-A3B-Instruct'),
-    _vllm_config('devstral-small-2505-q6', 'mistralai/Devstral-Small-2505'),
-]
-=======
+```
 # New configs (5 — all use :latest + HF download)
 qwen3-coder-next-fp8-new        :latest  1× RTX PRO 6000  240G  Qwen/Qwen3-Coder-Next-FP8
 reap-139b-nvfp4-new             :latest  1× RTX PRO 6000  200G  lukealonso/MiniMax-M2.5-REAP-139B-A10B-NVFP4
@@ -1284,7 +1274,6 @@ minimax-m25-fp8                 :latest            2× H200  600G  MiniMaxAI/Min
 
 # Workstation tier (unchanged)
 qwen3-coder-30b-q4, devstral-small-2505-q6, qwen25-coder-32b-q4
->>>>>>> Stashed changes
 ```
 
 `devstral-small` remains PARKED — Devstral-Small-2505 emits 3 inconsistent tool-call formats, not a parser config problem.
