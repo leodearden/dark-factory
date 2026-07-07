@@ -219,9 +219,16 @@ def is_legal_transition(
 # outcome_allows_status — the WorkflowOutcome -> TaskStatus consistency map.
 # Keys MIRROR the 8 WorkflowOutcome string values (orchestrator/workflow.py:
 # 337-345) as inline literals, since shared/ must NOT import orchestrator
-# (layering). A future WorkflowOutcome addition that isn't mirrored here
-# fails loudly via the drift guard in test-outcome
-# (test_recognized_outcome_keys_match_mirrored_workflow_outcomes).
+# (layering).
+#
+# test-outcome's test_recognized_outcome_keys_match_mirrored_workflow_outcomes
+# only pins these _OUTCOME_ALLOWED keys against that test's own
+# _WORKFLOW_OUTCOME_VALUES copy — both are hand-maintained mirrors of the real
+# orchestrator.workflow.WorkflowOutcome enum, so that assertion catches
+# module-vs-test drift between the two copies, NOT drift from the actual
+# source of truth (shared/ cannot import orchestrator to check that
+# directly). A genuine cross-layer guard would need to live in
+# orchestrator/tests, asserting against the real WorkflowOutcome enum.
 #
 # Several rows are intentionally loose sets rather than a single dominant
 # status: W9's SM-2 invariant checks outcome_allows_status(report.outcome,

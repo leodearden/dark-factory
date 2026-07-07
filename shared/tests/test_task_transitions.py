@@ -246,6 +246,16 @@ class TestActorRestriction:
         assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, ActorClass.RECONCILIATION) is False
         assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.DONE, ActorClass.RECONCILIATION) is False
 
+    def test_reconciliation_restriction_applies_to_raw_string_actor(self):
+        # ActorClass is a StrEnum, so TRANSITIONS.get(actor, _UNION) must
+        # match a raw string actor against the real ActorClass keys by
+        # value, not only the enum member itself — is_legal_transition's
+        # signature accepts `actor: ActorClass | str` and the module comment
+        # promises this lookup works for a plain string too. Pin it: a raw
+        # 'reconciliation' string is restricted exactly like
+        # ActorClass.RECONCILIATION above (not the safe-open default).
+        assert is_legal_transition(TaskStatus.IN_PROGRESS, TaskStatus.PENDING, 'reconciliation') is False
+
     @pytest.mark.parametrize(
         'actor', [ActorClass.ORCHESTRATOR, ActorClass.HUMAN, ActorClass.ESCALATION, ActorClass.DETERMINISTIC]
     )
@@ -278,9 +288,12 @@ class TestActorRestriction:
 # The 8 WorkflowOutcome string values, verified verbatim against
 # orchestrator/src/orchestrator/workflow.py:337-345 on 2026-07-06. shared/
 # must not import orchestrator (layering, program decision #4), so these are
-# mirrored literals — test_recognized_outcome_keys_match_mirrored_workflow_outcomes
-# below is the drift guard that catches a future WorkflowOutcome addition that
-# isn't mirrored here.
+# mirrored literals. test_recognized_outcome_keys_match_mirrored_workflow_outcomes
+# below only checks this hand-maintained copy against the module's own
+# _OUTCOME_ALLOWED keys (also a hand-maintained mirror) — an internal
+# module-vs-test consistency guard, NOT a guard against drift from the real
+# WorkflowOutcome enum (shared/ cannot import orchestrator to check that
+# directly; a genuine cross-layer guard belongs in orchestrator/tests).
 _WORKFLOW_OUTCOME_VALUES = {
     'done',
     'planned',
@@ -341,6 +354,11 @@ class TestOutcomeAllowsStatus:
         assert outcome_allows_status(stub, 'done') is True
 
     def test_recognized_outcome_keys_match_mirrored_workflow_outcomes(self):
+        # Internal consistency only: pins the module's _OUTCOME_ALLOWED keys
+        # against this test's own _WORKFLOW_OUTCOME_VALUES mirror. Both are
+        # hand-maintained copies of orchestrator.workflow.WorkflowOutcome, so
+        # this catches module-vs-test drift, not drift from the real enum
+        # (shared/ cannot import orchestrator to check that directly).
         assert set(_OUTCOME_ALLOWED.keys()) == _WORKFLOW_OUTCOME_VALUES
 
     def test_unknown_outcome_raises(self):
