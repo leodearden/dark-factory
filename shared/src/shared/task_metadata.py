@@ -346,6 +346,18 @@ def parse_metadata(
     else:
         parsed = blob
 
+    if not isinstance(parsed, dict):
+        if direction == 'write' and enforce:
+            raise TypeError(f'metadata must be a JSON object, got {type(parsed).__name__}')
+        warnings.append(
+            SchemaWarning(
+                field=_WHOLE_METADATA_FIELD,
+                code='not_an_object',
+                message=f'metadata is not a JSON object: got {type(parsed).__name__}',
+            )
+        )
+        return TaskMetadata(), warnings
+
     parsed = apply_migrations(parsed)
 
     for key, submodel in _SUBMODEL_REGISTRY.items():
