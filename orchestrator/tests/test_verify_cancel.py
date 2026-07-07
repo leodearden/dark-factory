@@ -343,7 +343,10 @@ class TestAcquireReleaseMergeVerifyFlock:
     """acquire_merge_verify_flock / release_merge_verify_flock against a real temp file."""
 
     def test_acquire_when_free_returns_fd(self, tmp_path: Path):
-        from orchestrator.verify_cancel import acquire_merge_verify_flock, release_merge_verify_flock
+        from orchestrator.verify_cancel import (
+            acquire_merge_verify_flock,
+            release_merge_verify_flock,
+        )
 
         path = tmp_path / '.merge_verify.lock'
         fd = acquire_merge_verify_flock(path, timeout_secs=1.0)
@@ -352,7 +355,10 @@ class TestAcquireReleaseMergeVerifyFlock:
 
     def test_release_then_reacquire_succeeds(self, tmp_path: Path):
         """release_merge_verify_flock frees the lock so a subsequent acquire succeeds."""
-        from orchestrator.verify_cancel import acquire_merge_verify_flock, release_merge_verify_flock
+        from orchestrator.verify_cancel import (
+            acquire_merge_verify_flock,
+            release_merge_verify_flock,
+        )
 
         path = tmp_path / '.merge_verify.lock'
         fd1 = acquire_merge_verify_flock(path, timeout_secs=1.0)
