@@ -364,8 +364,14 @@ def parse_metadata(
         if key not in parsed:
             continue
         try:
+            # `submodel(**parsed[key])` raises TypeError (not ValidationError)
+            # when the slice's value isn't a mapping at all (e.g. a list or
+            # str) — caught alongside ValidationError so a non-mapping slice
+            # is absorbed by the same warn-or-raise policy as any other
+            # malformed sub-model, never escaping uncaught in read or
+            # write+enforce=False.
             parsed = {**parsed, key: submodel(**parsed[key])}
-        except ValidationError as exc:
+        except (ValidationError, TypeError) as exc:
             if direction == 'write' and enforce:
                 raise
             warnings.append(SchemaWarning(field=key, code='invalid_submodel', message=str(exc)))
@@ -377,12 +383,17 @@ def parse_metadata(
             raise
         # loc[0] is only ever a top-level dict key (hence `str`) for a
         # per-field error on this model; a whole-model error (e.g. the
-        # deterministic invariant) has an empty loc, filtered out by `if loc`.
-        offending = {
-            loc[0]
-            for loc in (err['loc'] for err in exc.errors())
-            if loc and isinstance(loc[0], str)
-        }
+        # deterministic invariant) has an empty loc, filtered out below.
+        # Grouping messages by field also scopes each field's warning to
+        # only its own errors, rather than the full multi-error exception
+        # dump (which would otherwise repeat every offending field's text
+        # in every one of that blob's warnings).
+        errors_by_field: dict[str, list[str]] = {}
+        for err in exc.errors():
+            loc = err['loc']
+            if loc and isinstance(loc[0], str):
+                errors_by_field.setdefault(loc[0], []).append(str(err['msg']))
+        offending = set(errors_by_field)
         if offending:
             remainder = {k: v for k, v in parsed.items() if k not in offending}
             try:
@@ -401,7 +412,13 @@ def parse_metadata(
                     for key in offending:
                         extra[key] = parsed[key]
             for key in offending:
-                warnings.append(SchemaWarning(field=key, code='invalid_field', message=str(exc)))
+                warnings.append(
+                    SchemaWarning(
+                        field=key,
+                        code='invalid_field',
+                        message='; '.join(errors_by_field[key]),
+                    )
+                )
         else:
             # A whole-model error (e.g. the deterministic cross-field
             # invariant) has no single offending key to pop; skip validation
