@@ -32,6 +32,8 @@ from collections.abc import Mapping
 
 from pydantic import BaseModel, ConfigDict
 
+from shared.task_metadata import register_metadata_submodel
+
 __all__ = [
     'DeployPhase',
     'DeployState',
@@ -106,3 +108,13 @@ class DeployState(BaseModel):
         previously-written fields on the next merge.
         """
         return {'deploy_state': self.model_dump(mode='json')}
+
+
+# The one sanctioned shared/ registration call (Open-Q Q2: shared-visible).
+# Importing this module — from either process — registers this SAME
+# DeployState class into shared.task_metadata's per-process
+# _SUBMODEL_REGISTRY, so parse_metadata validates a `deploy_state` slice and
+# never emits an `unknown_key` SchemaWarning for it (W3 θ2 gate, task 2184).
+# Deliberately NOT done at shared.task_metadata import time — see this
+# module's docstring for why (would break dep 2158's TestSubmodelRegistry).
+register_metadata_submodel('deploy_state', DeployState)
