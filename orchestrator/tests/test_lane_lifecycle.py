@@ -316,3 +316,33 @@ class TestQuarantine:
 
         with pytest.raises(RuntimeError):
             await lifecycle.quarantine(lane, branch='task/foo', reason='divergence')
+
+
+# ---------------------------------------------------------------------------
+# .pool-root sentinel fold (W11 gamma) — POOL_ROOT_SENTINEL,
+# pool_storage_present() / mark_pool_storage_present() move here from
+# git_ops.py; GitOps becomes a thin delegator (see test_lane_lifecycle_gitops.py).
+# ---------------------------------------------------------------------------
+
+
+class TestPoolStorageSentinel:
+    def test_present_false_before_marking(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        assert lifecycle.pool_storage_present() is False
+
+    def test_mark_then_present_is_true(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lifecycle.mark_pool_storage_present()
+        sentinel = tmp_path / '.pool-root'
+        assert sentinel.is_file()
+        assert lifecycle.pool_storage_present() is True
+
+    def test_mark_creates_missing_worktree_base(self, tmp_path: Path):
+        worktree_base = tmp_path / 'not-yet-created'
+        lifecycle = _lifecycle(worktree_base)
+        assert not worktree_base.exists()
+
+        lifecycle.mark_pool_storage_present()
+
+        assert worktree_base.exists()
+        assert lifecycle.pool_storage_present() is True

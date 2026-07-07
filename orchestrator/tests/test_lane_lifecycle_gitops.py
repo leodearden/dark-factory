@@ -175,3 +175,29 @@ class TestReleaseWarmLaneWritesReleasedRecord:
         assert after.state is LaneState.RELEASED, (
             f'expected RELEASED to remain a legal no-op state, got {after.state!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# .pool-root sentinel fold: GitOps delegates to LaneLifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestPoolStorageSentinelDelegation:
+    """GitOps.pool_storage_present()/mark_pool_storage_present() must delegate
+    to the shared LaneLifecycle instance (W11 gamma sentinel fold) — the
+    public GitOps API behavior is preserved through the fold."""
+
+    def test_mark_and_present_delegate_to_lane_lifecycle(self, tmp_path: Path):
+        project_root = tmp_path / 'project'
+        project_root.mkdir()
+        git_ops = GitOps(_warm_config(), project_root)
+        assert git_ops.pool_storage_present() is False
+
+        git_ops.mark_pool_storage_present()
+
+        sentinel = git_ops.worktree_base / '.pool-root'
+        assert sentinel.is_file(), f'expected sentinel at {sentinel}'
+        assert git_ops.pool_storage_present() is True
+        # Same record LaneLifecycle owns — delegation, not a parallel/
+        # duplicate implementation.
+        assert git_ops._lane_lifecycle.pool_storage_present() is True
