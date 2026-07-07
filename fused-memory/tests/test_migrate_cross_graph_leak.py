@@ -1160,6 +1160,72 @@ class TestRunApplyRekeyAndGuard:
 
 
 # ===========================================================================
+# Tests: run() apply loop isolates per-node primitive exceptions
+# (step-33/34 review-fix, cycle 2)
+# ===========================================================================
+
+class TestRunApplyExceptionIsolation:
+    """Tests for run()'s apply loop never letting one node's primitive
+    exception abort the whole batch. A hand-edited manifest mislabeling an
+    Episodic node as MOVE (escaping the classify-time EPISODIC_SKIP gate),
+    a ForeignDuplicateSuspectedError, or a transient FalkorDB error must not
+    lose the record of every OTHER node's outcome, and post-verify must
+    still run."""
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_failed_dispatch_does_not_abort_remaining_nodes(self, tmp_path, monkeypatch):
+        """A FIRST node whose primitive dispatch raises is recorded blocked
+        with the error captured -- but the loop continues: the SECOND node
+        is still dispatched, post-verify still runs, and run() returns a
+        report dict rather than propagating the exception. The failure
+        forces a non-zero exit_code."""
+        failing_move = _classified_node(
+            'u-move', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        succeeding_merge = _classified_node(
+            'u-merge', source_graph='know_live', target_graph='pump_web_ui',
+            disposition=_mod.MERGE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [failing_move, succeeding_merge], {'reify': 1, 'know_live': 1},
+        )
+
+        move_mock = AsyncMock(side_effect=RuntimeError('simulated epsilon failure'))
+        merge_mock = AsyncMock()
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'know_live': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        report = await _mod.run(args, memory_service)
+
+        move_result = [r for r in report['apply_results'] if r['uuid'] == 'u-move']
+        assert len(move_result) == 1
+        assert move_result[0]['applied'] is False
+        assert move_result[0]['blocked'] is True
+        assert 'simulated epsilon failure' in move_result[0]['error']
+
+        merge_mock.assert_awaited_once()
+        merge_result = [r for r in report['apply_results'] if r['uuid'] == 'u-merge']
+        assert merge_result == [{
+            'uuid': 'u-merge', 'disposition': _mod.MERGE, 'applied': True, 'blocked': False,
+        }]
+
+        assert 'post_verify' in report
+        assert report['exit_code'] != 0
+
+
+# ===========================================================================
 # Tests: run() post-verify re-census (step-19/20)
 # ===========================================================================
 
