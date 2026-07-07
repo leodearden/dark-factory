@@ -3920,11 +3920,18 @@ class GitOps:
             return False
 
     def _find_lane_by_plan_task_id(self, task_id: str) -> Path | None:
-        """Scan ``worktree_base/_lane-*/.task/plan.json`` for *task_id*.
+        """Scan each pool lane's plan.json (new-then-old) for *task_id*.
 
         On-disk backstop for :meth:`release_lane_for_terminal_task`: used when
         ``pool.assignment_for`` returns None (e.g. post-restart where the
         in-memory assignment map was not rebuilt for a terminal task).
+
+        Reads plan.json new-then-old (W11 gamma ``.task`` -> ``.task-meta``
+        relocation, PRD decision 7 — side-effect-free reads, no migration
+        write-back here): first ``TaskArtifacts.meta_root_for(worktree_base,
+        entry.name) / 'plan.json'`` (the new location, a sibling of the lane
+        dir), falling back to the legacy ``entry / '.task' / 'plan.json'`` so
+        lanes seeded before this relocation still resolve.
 
         Uses a local ``import json as _json`` (mirrors git_ops.py:1816 idiom —
         no module-level ``import json``).  Hoisted once above the loop rather
@@ -3952,9 +3959,11 @@ class GitOps:
             if not pool.is_lane(entry):
                 continue
             try:
-                plan_path = entry / '.task' / 'plan.json'
+                plan_path = TaskArtifacts.meta_root_for(base, entry.name) / 'plan.json'
                 if not plan_path.exists():
-                    continue
+                    plan_path = entry / '.task' / 'plan.json'
+                    if not plan_path.exists():
+                        continue
                 data = _json.loads(plan_path.read_text())
                 if str(data.get('task_id')) == task_id:
                     return entry
