@@ -16,7 +16,7 @@ from _orch_helpers import pydantic_spec
 from escalation import archive
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from shared.usage_gate import InvokeSlot
+from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.steward import (
@@ -43,12 +43,21 @@ def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
     @contextlib.asynccontextmanager
     async def _cm():
         token = await gate.before_invoke()
-        slot = InvokeSlot(gate, token)
+        # gate.before_invoke() is mocked to return a bare token (task W4-δ
+        # changed the real UsageGate.before_invoke to return an AccountLease
+        # instead) — wrap it the same way the real invoke_slot() would have
+        # built it, using the mock's active_account_name for the lease name,
+        # so the real InvokeSlot's lease-derived token/account_name
+        # properties see the same values this helper's callers configured.
+        lease = token if isinstance(token, AccountLease) else AccountLease(
+            name=gate.active_account_name or '', token=token, generation=0,
+        )
+        slot = InvokeSlot(gate, lease)
         try:
             yield slot
         finally:
             if not slot._settled:
-                gate.release_probe_slot(token)
+                gate.release_probe_slot(lease.token if lease is not None else None)
 
     gate.invoke_slot = _cm
     return gate

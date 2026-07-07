@@ -1403,26 +1403,26 @@ class TestBeforeInvokeCore:
 
     async def test_returns_first_available_token(self):
         gate = make_gate(['a', 'b'])
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease.token == 'fake-token-a'
 
     async def test_skips_capped_accounts(self):
         gate = make_gate(['a', 'b'])
         gate._accounts[0].capped = True
-        token = await gate.before_invoke()
-        assert token == 'fake-token-b'
+        lease = await gate.before_invoke()
+        assert lease.token == 'fake-token-b'
 
     async def test_skips_probe_in_flight_accounts(self):
         gate = make_gate(['a', 'b'])
         gate._accounts[0].probe_in_flight = True
-        token = await gate.before_invoke()
-        assert token == 'fake-token-b'
+        lease = await gate.before_invoke()
+        assert lease.token == 'fake-token-b'
 
     async def test_claims_probe_slot(self):
         gate = make_gate(['a'])
         gate._accounts[0].probing = True
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease.token == 'fake-token-a'
         assert gate._accounts[0].probing is False
         assert gate._accounts[0].probe_in_flight is True
         # Gate should be cleared (not set) to block other tasks
@@ -1431,8 +1431,8 @@ class TestBeforeInvokeCore:
     async def test_session_budget_below_limit(self):
         gate = make_gate(['a'], session_budget_usd=10.0)
         gate._cumulative_cost = 5.0
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease.token == 'fake-token-a'
 
     async def test_session_budget_at_exact_limit_raises(self):
         gate = make_gate(['a'], session_budget_usd=10.0)
@@ -1450,15 +1450,15 @@ class TestBeforeInvokeCore:
     async def test_session_budget_not_configured(self):
         gate = make_gate(['a'], session_budget_usd=None)
         gate._cumulative_cost = 999999.0
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease.token == 'fake-token-a'
 
     async def test_session_budget_float_edge(self):
         gate = make_gate(['a'], session_budget_usd=10.0)
         gate._cumulative_cost = 9.999999999
         # 9.999999999 < 10.0, so should not raise
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease.token == 'fake-token-a'
 
     async def test_no_accounts_raises_runtime_error(self):
         gate = make_gate(['a'])
@@ -1484,8 +1484,8 @@ class TestBeforeInvokeCore:
             gate._open.set()
 
         task = asyncio.create_task(open_gate_soon())
-        token = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
-        assert token == 'fake-token-a'
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease.token == 'fake-token-a'
         await task
 
     async def test_failover_event_on_account_change(self):

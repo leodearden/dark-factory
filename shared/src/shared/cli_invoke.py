@@ -779,6 +779,12 @@ async def invoke_with_cap_retry(
     else:
         while True:
             async with usage_gate.invoke_slot() as slot:
+                # slot.account_name is derived from slot.lease — the SAME
+                # account slot.token came from (task W4-δ, PRD §7.4). This
+                # is what makes the attribution below (and the save_invocation
+                # call at the bottom of this function) name the account
+                # actually invoked, not a differently-phased one (finding 3 /
+                # boundary test B5).
                 account_name = slot.account_name
 
                 if config_dir and slot.token:

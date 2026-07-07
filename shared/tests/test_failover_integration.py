@@ -405,13 +405,13 @@ class TestAllCappedThenResume:
         assert gate._accounts[0].probing is True
 
         # before_invoke claims the probe slot
-        token = await gate.before_invoke()
-        assert token == 'fake-token-A'
+        lease = await gate.before_invoke()
+        assert lease.token == 'fake-token-A'
         assert gate._accounts[0].probe_in_flight is True
         assert gate._accounts[0].probing is False
 
         # confirm_account_ok clears probe_in_flight
-        gate.confirm_account_ok(token)
+        gate.confirm_account_ok(lease.token)
         assert gate._accounts[0].probe_in_flight is False
 
 
