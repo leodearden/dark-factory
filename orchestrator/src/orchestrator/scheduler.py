@@ -24,6 +24,7 @@ from shared.locking import (
     strip_directory_locks,
 )
 from shared.mcp_envelope import parse_tool_result, resolver_failed
+from shared.task_metadata import parse_metadata
 
 from orchestrator.config import (
     DEFAULT_TIER,
@@ -968,6 +969,31 @@ def _iter_pending_deps_in(
             dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
             if dep_id in dep_set:
                 yield tid, dep_id
+
+
+def _task_external_deps(task: dict) -> list[str]:
+    """Return *task*'s ``metadata.external_deps`` as canonical wire strings.
+
+    THE single seam every scheduler external_deps read routes through
+    (task 2167 — W3-δ SEAM A).  Delegates to the shared, versioned
+    ``shared.task_metadata.parse_metadata`` parser instead of the old untyped
+    ``(task.get('metadata') or {}).get('external_deps') or []`` idiom, which
+    ``AttributeError``s on JSON-string metadata (str has no ``.get``).
+
+    ``direction='read'`` makes this best-effort — it never raises, even on
+    corrupt/unparseable metadata — so a bad historical metadata row cannot
+    break a scheduler dispatch tick (matches the scheduler's existing
+    fail-safe philosophy).
+
+    The return value stays ``list[str]`` — the canonical "project_id:task_id"
+    wire form fed to ``get_external_statuses`` / the external-status cache —
+    and is intentionally NOT converted to ``list[ExternalDep]`` (PRD Open
+    Question #4): a malformed dep must still reach ``get_external_statuses``
+    so it can resolve to the ``malformed`` sentinel and escalate, which
+    pre-filtering with ``ExternalDep.parse`` would silently prevent.
+    """
+    metadata, _warnings = parse_metadata(task.get('metadata'), direction='read')
+    return metadata.external_deps
 
 
 class Scheduler:
@@ -2030,9 +2056,7 @@ class Scheduler:
             # tolerance window should raise max_external_dep_unresolved_cycles.
             for task in pending_tasks:
                 task_id = str(task.get('id', '?'))
-                external_deps: list = (
-                    (task.get('metadata') or {}).get('external_deps') or []
-                )
+                external_deps: list = _task_external_deps(task)
                 if not external_deps:
                     continue
                 count = self._streak_resolver_degraded.bump(task_id)
@@ -2085,9 +2109,7 @@ class Scheduler:
 
         for task in pending_tasks:
             task_id = str(task.get('id', '?'))
-            external_deps: list = (
-                (task.get('metadata') or {}).get('external_deps') or []
-            )
+            external_deps: list = _task_external_deps(task)
             # Resolver succeeded this tick → reset the resolver-degraded
             # consecutive-tick streak so only CONSECUTIVE degraded ticks count
             # toward escalation.  A transient blip that self-heals never
@@ -2673,9 +2695,7 @@ class Scheduler:
         # External-dep gate (cross-project).  Only active when the cache is
         # supplied (not None) — defaults reproduce byte-identical legacy behaviour.
         if external_status_cache is not None:
-            external_deps: list = (
-                (task.get('metadata') or {}).get('external_deps') or []
-            )
+            external_deps: list = _task_external_deps(task)
             for ext_dep in external_deps:
                 if external_resolver_failed:
                     logger.debug(
@@ -3690,12 +3710,12 @@ class Scheduler:
         _pending_tasks_with_ext: list[dict] = [
             t for t in tasks
             if t.get('status') == 'pending'
-            and (t.get('metadata') or {}).get('external_deps')
+            and _task_external_deps(t)
         ]
         _ext_dep_union: list[str] = list({
             dep
             for t in _pending_tasks_with_ext
-            for dep in ((t.get('metadata') or {}).get('external_deps') or [])
+            for dep in _task_external_deps(t)
         })
         if _ext_dep_union:
             external_cache, external_err = await self.get_external_statuses(_ext_dep_union)
