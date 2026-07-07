@@ -174,13 +174,17 @@ class TestMonotonicBoost:
 
         RED: manual_boost is not yet summed into raw, so score is constant
         regardless of boost — the strict in-range inequalities below fail.
+
+        Uses severity='critical' so raw stays positive even at boost=-5 —
+        otherwise the unrelated `raw = max(0.0, raw)` misconfiguration guard
+        would itself flatten the low end and confound this test.
         """
         from cockpit.priority import Priorities, score
 
         weights = Priorities.default()
 
         def s(boost):
-            return score(_make_item(manual_boost=boost), weights, _NOW)
+            return score(_make_item(severity='critical', manual_boost=boost), weights, _NOW)
 
         # Below the clamp floor (min=-5): both clamp to the same value.
         assert s(-100) == s(-50)
