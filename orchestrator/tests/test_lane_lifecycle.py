@@ -20,6 +20,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.lane_lifecycle import (
     ESCALATION_SENTINEL_ROLE,
     LEGAL_TRANSITIONS,
+    AcquireRoute,
     IllegalLaneTransition,
     LaneLifecycle,
     LaneState,
@@ -346,3 +347,29 @@ class TestPoolStorageSentinel:
 
         assert worktree_base.exists()
         assert lifecycle.pool_storage_present() is True
+
+
+# ---------------------------------------------------------------------------
+# AcquireRoute vocabulary + ACQUIRE_ROUTE_TRANSITIONS table (W11 eta): the
+# named route table git_ops.py's _acquire_warm_lane_impl threads through its
+# 7 branches — see test_lane_lifecycle_gitops.py for the GitOps-side writer
+# and route-classification tests.
+# ---------------------------------------------------------------------------
+
+
+class TestAcquireRouteTable:
+    # NOTE: table/vocabulary shape invariants (every route has an edge, every
+    # edge is a legal (from, to) tuple, every edge targets ASSIGNED) are
+    # enforced by `_validate_acquire_route_transitions()`, which runs at
+    # `orchestrator.lane_lifecycle` import time and raises AssertionError on
+    # collection if violated — see that module for the single source of
+    # truth. Re-asserting them here would be pure duplication (this suite
+    # could never even collect if they failed). What IS worth pinning here is
+    # the literal route-name vocabulary itself, which the import-time
+    # validator does not check (it only checks table/enum concordance,
+    # whatever the names are).
+    def test_acquire_route_has_exactly_seven_members(self):
+        assert {member.name for member in AcquireRoute} == {
+            'REUSE', 'REUSE_REPAIR', 'CREATE_ONCE_FRESH', 'CREATE_ONCE_REATTACH',
+            'DISK_BACKSTOP_REUSE', 'RESET_IN_PLACE_REATTACH', 'RECYCLE',
+        }

@@ -41,8 +41,10 @@ from typing import Any, Literal, NamedTuple, TypedDict
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
 from orchestrator.lane_lifecycle import (
+    ACQUIRE_ROUTE_TRANSITIONS,
     LANE_STATE_DIRNAME,
     POOL_ROOT_SENTINEL,  # noqa: F401  re-export shim (test_pool_storage_guard.py)
+    AcquireRoute,
     LaneLifecycle,
     LaneState,
 )
@@ -2666,28 +2668,20 @@ class GitOps:
         *,
         expected_title: str | None = None,
     ) -> 'WorktreeInfo | WarmLaneUnavailable':
-        """Thin durable-record chokepoint wrapping :meth:`_acquire_warm_lane_impl`.
+        """Bare passthrough to :meth:`_acquire_warm_lane_impl`.
 
         Delegates to :meth:`_acquire_warm_lane_impl` for the full acquire
-        logic (see that method's docstring for the complete contract) and,
-        iff it returns a :class:`WorktreeInfo` (success), records the durable
-        ASSIGNED lifecycle edge via :meth:`_lifecycle_note_assigned` — the
-        SINGLE chokepoint covering all of the impl's internal routes (reuse,
-        create-once, disk-backstop, reset-in-place, and their reattach
-        variants) without restructuring any of them (per-route named edges
-        are task eta's job, PRD Mechanism 3). Fault paths return
-        WarmLaneUnavailable (never WorktreeInfo), so they never write
-        ASSIGNED — consistent with :meth:`_abort_lane_acquisition` teardown.
+        logic (see that method's docstring for the complete contract). The
+        durable ASSIGNED lifecycle edge is recorded INSIDE the impl, at each
+        named route's success return, via :meth:`_note_assigned_via_route`
+        (PRD W11 eta Mechanism 3) — so this wrapper no longer needs a
+        post-hoc chokepoint. Fault paths return WarmLaneUnavailable (never
+        WorktreeInfo), so they never write ASSIGNED — consistent with
+        :meth:`_abort_lane_acquisition` teardown.
         """
-        result = await self._acquire_warm_lane_impl(
+        return await self._acquire_warm_lane_impl(
             branch_name, start_ref, expected_title=expected_title,
         )
-        if isinstance(result, WorktreeInfo):
-            self._lifecycle_note_assigned(
-                result.path, branch_name, expected_title,
-                f'{self.config.branch_prefix}{branch_name}',
-            )
-        return result
 
     async def _acquire_warm_lane_impl(
         self,
@@ -2838,6 +2832,13 @@ class GitOps:
 
         full_branch = f'{self.config.branch_prefix}{branch_name}'
 
+        # Call-LOCAL route classifier (W11 eta, PRD Mechanism 3) — NOT
+        # instance state: acquire_warm_lane runs concurrently for different
+        # tasks/lanes, so shared state would race. Set at each branch's
+        # routing decision below and consumed by _note_assigned_via_route at
+        # every success return (never on a path that faults).
+        route: AcquireRoute | None = None
+
         try:
             # ── Orphaned-lane reuse guard (task 2097) ───────────────────────
             # The reuse path (_reuse_warm_lane -> commit()) and the identity-
@@ -2880,14 +2881,18 @@ class GitOps:
             # nonzero exit, `_repair_orphaned_reuse_lane` already returned
             # True above and this demote never runs at all.
             _orphan_confirmed_unregistered = False
-            if (
-                reused
-                and not await self._is_registered_worktree(lane)
-                and not await self._repair_orphaned_reuse_lane(lane, branch_name)
-            ):
-                self.warm_lane_pool.drop_assignment(branch_name)
-                reused = False
-                _orphan_confirmed_unregistered = True
+            # route=REUSE_REPAIR (W11 eta): distinguishes the repaired-in-
+            # place route from plain REUSE below — set only when the lane
+            # WAS unregistered and `_repair_orphaned_reuse_lane` restored its
+            # registration in place (as opposed to already being registered,
+            # which needs no repair and stays plain REUSE).
+            if reused and not await self._is_registered_worktree(lane):
+                if await self._repair_orphaned_reuse_lane(lane, branch_name):
+                    route = AcquireRoute.REUSE_REPAIR
+                else:
+                    self.warm_lane_pool.drop_assignment(branch_name)
+                    reused = False
+                    _orphan_confirmed_unregistered = True
             # else: not reused, already registered, or repair restored the
             # registration in place — proceed (possibly still reused) below.
 
@@ -2903,7 +2908,13 @@ class GitOps:
                 )
                 if _ident_ok:
                     # .task/plan.json is preserved; WIP is committed + rebased.
-                    return await self._reuse_warm_lane(lane, full_branch)
+                    if route is None:
+                        route = AcquireRoute.REUSE
+                    info = await self._reuse_warm_lane(lane, full_branch)
+                    self._note_assigned_via_route(
+                        info.path, route, branch_name, expected_title, full_branch,
+                    )
+                    return info
                 # Mismatch: stale assignment from a recycled id — drop it and
                 # reset in-place so the new task starts clean.
                 logger.warning(
@@ -2911,6 +2922,7 @@ class GitOps:
                     '%s — expected %r; running fresh reset',
                     lane, expected_title,
                 )
+                route = AcquireRoute.RECYCLE
                 self.warm_lane_pool.drop_assignment(branch_name)
                 await self._reset_warm_lane(lane, full_branch, start_ref)
                 # β: THIN re-seed — rm target/ before seeding so the re-seed is a
@@ -3023,6 +3035,7 @@ class GitOps:
                         'orphan %s has commits; attaching lane %s without -b',
                         full_branch, lane,
                     )
+                    route = AcquireRoute.CREATE_ONCE_REATTACH
                     _co_add_rc, _, _co_err = await _run(
                         ['git', 'worktree', 'add', str(lane), full_branch],
                         cwd=self.project_root,
@@ -3065,7 +3078,11 @@ class GitOps:
                             lane, branch_name, remove_worktree=True,
                         )
                         return _seed_rc_to_unavailable(_co_seed_rc)
-                    return await self._reuse_warm_lane(lane, full_branch)
+                    info = await self._reuse_warm_lane(lane, full_branch)
+                    self._note_assigned_via_route(
+                        info.path, route, branch_name, expected_title, full_branch,
+                    )
+                    return info
 
                 git_add_rc, _, err = await _run(
                     ['git', 'worktree', 'add', '-b', full_branch, str(lane), start_ref],
@@ -3120,6 +3137,7 @@ class GitOps:
                         lane, branch_name, remove_worktree=True,
                     )
                     return _seed_rc_to_unavailable(seed_rc)
+                route = AcquireRoute.CREATE_ONCE_FRESH
             else:
                 # ── Already-registered lane — check on-disk backstop first ─
                 # If the lane still carries THIS task's plan.json (e.g. after a
@@ -3158,7 +3176,12 @@ class GitOps:
                     pass
 
                 if disk_reuse:
-                    return await self._reuse_warm_lane(lane, full_branch)
+                    route = AcquireRoute.DISK_BACKSTOP_REUSE
+                    info = await self._reuse_warm_lane(lane, full_branch)
+                    self._note_assigned_via_route(
+                        info.path, route, branch_name, expected_title, full_branch,
+                    )
+                    return info
 
                 # ── γ reattach guard (reset-in-place site) ───────────────────
                 # If the orphaned task/<id> branch still carries commits beyond
@@ -3177,6 +3200,7 @@ class GitOps:
                         'lane %s has orphan %s with commits; reattaching',
                         lane, full_branch,
                     )
+                    route = AcquireRoute.RESET_IN_PLACE_REATTACH
                     _co_rc, _, _co_err = await _run(
                         ['git', 'checkout', '-f', full_branch], cwd=lane,
                     )
@@ -3210,7 +3234,11 @@ class GitOps:
                     # inherits a foreign plan.json/iterations.jsonl/reviews/
                     # (reify esc-4920-163: _lane-26 4949→4920 contamination).
                     shutil.rmtree(lane / '.task', ignore_errors=True)
-                    return await self._reuse_warm_lane(lane, full_branch)
+                    info = await self._reuse_warm_lane(lane, full_branch)
+                    self._note_assigned_via_route(
+                        info.path, route, branch_name, expected_title, full_branch,
+                    )
+                    return info
 
                 # ── Fresh reset-in-place (new task on a recycled FREE lane) ─
                 # R4: one-shot in-process retry on a transient _reset_warm_lane
@@ -3220,6 +3248,7 @@ class GitOps:
                 )
                 if recycle_result is not None:
                     return recycle_result
+                route = AcquireRoute.RECYCLE
 
             # ── Shared tail: gitignore, scrub, base, debug-port ──────────
             _ensure_task_gitignore(lane)
@@ -3237,6 +3266,9 @@ class GitOps:
                 'acquire_warm_lane: acquired %s on branch %s (base=%s, port=%s)',
                 lane, full_branch, base_commit[:8] if base_commit else '?', port,
             )
+            self._note_assigned_via_route(
+                lane, route, branch_name, expected_title, full_branch,
+            )
             return WorktreeInfo(path=lane, base_commit=base_commit, reify_debug_port=port)
 
         except Exception:
@@ -3246,44 +3278,58 @@ class GitOps:
             await self._abort_lane_acquisition(lane, branch_name, remove_worktree=False)
             return WarmLaneUnavailable.FAULT
 
-    def _lifecycle_note_assigned(
-        self, lane: Path, task_id: str, title: str | None, branch: str,
+    def _note_assigned_via_route(
+        self, lane: Path, route: AcquireRoute, task_id: str, title: str | None, branch: str,
     ) -> None:
-        """Best-effort durable ASSIGNED write for :meth:`acquire_warm_lane`.
+        """Route-named durable ASSIGNED write for :meth:`_acquire_warm_lane_impl`.
 
         Normalizes whatever state the lane's durable record is CURRENTLY in
         onto a legal edge ending at ASSIGNED, rather than calling
         ``transition(lane, ASSIGNED)`` directly — ``LEGAL_TRANSITIONS``
         forbids ``(None, ASSIGNED)`` and ``(ASSIGNED, ASSIGNED)``, and the
         pool's 2-value FREE/ASSIGNED cache does not map 1:1 onto the 6-state
-        durable model (pre-gamma live lanes have no record at all until
-        task kappa's migration adopt):
+        durable model:
 
-        * Same-task reuse (already ASSIGNED to this task_id): no-op —
-          idempotent.
+        * Same-task reuse (already at the route's target state for this
+          task_id): no-op — idempotent.
         * Currently ASSIGNED (to a DIFFERENT task) or IN_USE (steal/recycle):
-          released first, so RELEASED -> ASSIGNED is the edge actually taken.
+          released first, so RELEASED -> target is the edge actually taken.
         * No record yet (``None``): bootstrapped ``SEED -> REGISTERED``
-          before the ASSIGNED write.
-        * SEED (should not normally occur pre-gamma, but handled for
-          completeness): registered before the ASSIGNED write.
-        * REGISTERED or RELEASED: assigned directly (both are legal
+          before the write.
+        * SEED (should not normally occur post-gamma, but handled for
+          completeness): registered before the write.
+        * REGISTERED or RELEASED: written directly (both are legal
           predecessors of ASSIGNED).
+
+        The terminal target is read from ``ACQUIRE_ROUTE_TRANSITIONS[route][1]``
+        — always ``LaneState.ASSIGNED`` by construction (validated at
+        :mod:`orchestrator.lane_lifecycle` import time) — making the route
+        table load-bearing, and an INFO log line records which named route
+        (PRD W11 eta Mechanism 3) the acquire took.
 
         Best-effort / never-raise (mirrors :meth:`mark_pool_storage_present`):
         any exception (including a genuine ``IllegalLaneTransition``, e.g. a
         QUARANTINED lane) is logged and swallowed so a durable-record hiccup
         never regresses ``acquire_warm_lane`` itself.
         """
+        target = None
         try:
+            target = ACQUIRE_ROUTE_TRANSITIONS[route][1]
             rec = self._lane_lifecycle.read(lane)
+            original_state = rec.state if rec is not None else None
             if (
                 rec is not None
-                and rec.state is LaneState.ASSIGNED
+                and rec.state is target
                 and rec.task_id == str(task_id)
             ):
+                logger.info(
+                    'acquire_warm_lane: route=%s edge=%s->%s(noop) lane=%s task=%s',
+                    route.value,
+                    original_state.value if original_state is not None else 'none',
+                    target.value, lane, task_id,
+                )
                 return  # idempotent same-task reuse
-            state = rec.state if rec is not None else None
+            state = original_state
             if state in (LaneState.ASSIGNED, LaneState.IN_USE):
                 self._lane_lifecycle.transition(lane, LaneState.RELEASED)
                 state = LaneState.RELEASED
@@ -3297,13 +3343,19 @@ class GitOps:
                     lane, LaneState.REGISTERED, branch=branch,
                 )
             self._lane_lifecycle.transition(
-                lane, LaneState.ASSIGNED, task_id=str(task_id), title=title, branch=branch,
+                lane, target, task_id=str(task_id), title=title, branch=branch,
+            )
+            logger.info(
+                'acquire_warm_lane: route=%s edge=%s->%s lane=%s task=%s',
+                route.value,
+                original_state.value if original_state is not None else 'none',
+                target.value, lane, task_id,
             )
         except Exception:
             logger.warning(
-                '_lifecycle_note_assigned: failed to record ASSIGNED for lane '
-                '%s (task %s) — durable record may be stale/inconsistent',
-                lane, task_id, exc_info=True,
+                '_note_assigned_via_route: failed to record %s for lane %s '
+                '(task %s, route %s) — durable record may be stale/inconsistent',
+                target, lane, task_id, getattr(route, 'value', route), exc_info=True,
             )
 
     async def _reuse_warm_lane(
@@ -3650,7 +3702,7 @@ class GitOps:
         this never attempts either).
 
         Best-effort / never-raise (mirrors :meth:`mark_pool_storage_present`
-        and :meth:`_lifecycle_note_assigned`): any exception is logged and
+        and :meth:`_note_assigned_via_route`): any exception is logged and
         swallowed so a durable-record hiccup never regresses
         ``release_warm_lane`` itself (contractually never-raise).
         """
