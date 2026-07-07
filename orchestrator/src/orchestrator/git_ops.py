@@ -6141,6 +6141,17 @@ class GitOps:
                     cwd=self.project_root,
                 )
                 if rc_rm == 0:
+                    # The interactive.json stamp now lives in the .task-meta
+                    # sibling dir (S10), OUTSIDE the worktree, so `git
+                    # worktree remove` above no longer cleans it up
+                    # incidentally the way it did when the stamp lived inside
+                    # the worktree. Remove it here, best-effort, so a reaped
+                    # worktree never leaves an orphaned .task-meta/<name> dir
+                    # behind (I2: never an indefinite leak).
+                    shutil.rmtree(
+                        TaskArtifacts.meta_root_for(self.worktree_base, wt_resolved.name),
+                        ignore_errors=True,
+                    )
                     reaped.append(ReapedInteractiveWorktree(
                         path=wt_path, branch=full_branch, slug=slug, reason=reason,
                     ))

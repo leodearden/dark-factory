@@ -372,6 +372,41 @@ class TestReapInteractiveWorktreesStampRelocation:
         )
 
 
+@pytest.mark.asyncio
+class TestReapInteractiveWorktreesCleansTaskMeta:
+    """reap_interactive_worktrees must remove the .task-meta/<name> sibling
+    dir once the worktree itself is reaped (resource-leak amendment): the
+    interactive.json stamp now lives OUTSIDE the worktree (S10), so `git
+    worktree remove` no longer cleans it up incidentally the way it did when
+    the stamp lived at <worktree>/.task/interactive.json."""
+
+    async def test_reap_removes_task_meta_sibling_dir(self, git_repo: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+        info = await git_ops.create_interactive_worktree('meta-leak-check')
+
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, info.path.name)
+        assert meta_root.is_dir(), f'expected the stamp dir to exist at {meta_root}'
+
+        stamp_path = meta_root / 'interactive.json'
+        stamp = json.loads(stamp_path.read_text())
+        now = datetime.now(UTC)
+        stamp['created_at'] = (
+            now - timedelta(seconds=git_ops.config.interactive_worktree_ttl + 3600)
+        ).isoformat()
+        stamp_path.write_text(json.dumps(stamp))
+
+        reaped = await git_ops.reap_interactive_worktrees(now=now)
+
+        reaped_paths = {r.path.resolve() for r in reaped}
+        assert info.path.resolve() in reaped_paths, (
+            f'expected the expired stamp to trigger a ttl_idle reap; got {reaped!r}'
+        )
+        assert not meta_root.exists(), (
+            f'expected {meta_root} to be removed once the worktree was reaped '
+            f'— an orphaned .task-meta/<name> dir is an indefinite leak (I2)'
+        )
+
+
 # ---------------------------------------------------------------------------
 # PROTECTED_PREFIXES registration: .lane-state / .task-meta bands (W11 gamma)
 # ---------------------------------------------------------------------------
