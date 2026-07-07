@@ -3672,23 +3672,35 @@ class TaskWorkflow:
     async def _stamp_first_merge_enqueue(self) -> float:
         """Stamp the write-once first-submission wall-clock epoch into task metadata.
 
-        Returns the (possibly pre-existing) ``metadata.merge_first_enqueued_at``
-        value as a float, ensuring:
+        Returns the (possibly pre-existing) epoch as a float, ensuring:
 
         * The value is written exactly once — subsequent calls on the same task
           (resubmit, post-restart re-dispatch) return the original value unchanged.
         * The value is persisted to the backend so it survives process restart.
         * Persistence failure is non-fatal (logged, does not block the merge).
 
+        The epoch lives inside the typed ``metadata.retry_ledger`` blob (see
+        :class:`shared.task_metadata.RetryLedger`) as ``str(epoch)`` — α typed
+        ``RetryLedger.merge_first_enqueued_at`` as ``str | None`` even though the
+        runtime value is a float epoch; ``str()``/``float()`` round-trip losslessly.
+
         Algorithm:
-        1. **Fast-path (in-memory)** — if the in-memory metadata already carries a
-           numeric ``merge_first_enqueued_at``, return it immediately (no I/O).
-        2. **Slow-path (backend read)** — call :meth:`_merge_fresh_metadata` to
-           overlay backend-persisted keys; if the backend already carries the value,
-           adopt it into the in-memory copy and return (no persist needed).
-        3. **Stamp** — call ``time.time()``, write into the merged metadata dict,
-           update the in-memory task, and best-effort persist via
-           ``scheduler.update_task`` (wrapped in a logged try/except).
+        1. **Fast-path (in-memory ledger)** — if ``metadata.retry_ledger`` already
+           carries a parseable ``merge_first_enqueued_at``, return it as a float
+           immediately (no I/O).
+        2. **Fast-path (legacy top-level)** — no ledger value, but a numeric
+           top-level ``merge_first_enqueued_at`` exists (a task stamped by
+           pre-migration code): adopt it — restore it under ``retry_ledger`` in
+           memory and return it as a float, no re-stamp and no persist (the
+           value is already durable on the backend under the old key).
+        3. **Slow-path (backend read)** — call :meth:`_merge_fresh_metadata` to
+           overlay backend-persisted keys; if the backend ledger already carries
+           the value, adopt it into the in-memory copy and return (no persist
+           needed).
+        4. **Stamp** — call ``time.time()``, write ``str(epoch)`` into the merged
+           ledger (preserving its other fields), update the in-memory task, and
+           best-effort persist via ``scheduler.update_task`` (wrapped in a logged
+           try/except).
 
         ζ (task 1887) consumes this value at ``_pop_next_pickable`` for aging-
         priority ordering and owns the ``enqueued_at`` fallback for legacy
@@ -3701,27 +3713,50 @@ class TaskWorkflow:
         would need an explicit per-task lock to remain strictly write-once.
         """
         metadata = self.task.get('metadata') or {}
+        ledger = metadata.get('retry_ledger') or {}
 
-        # Fast-path: in-memory value already present (resubmit / post-restart
-        # reload where the scheduler populated the in-memory task from the backend).
-        existing = metadata.get('merge_first_enqueued_at')
-        if isinstance(existing, (int, float)):
-            return float(existing)
+        # Fast-path: in-memory ledger already carries a parseable value.
+        existing = ledger.get('merge_first_enqueued_at')
+        if existing is not None:
+            try:
+                return float(existing)
+            except (TypeError, ValueError):
+                pass  # corrupt — fall through to the legacy/backend/stamp path
+
+        # Fast-path: legacy top-level value from pre-migration code. It is
+        # already durable on the backend under the old key, so just restore
+        # it into the ledger shape in memory — no persist needed.
+        legacy_existing = metadata.get('merge_first_enqueued_at')
+        if isinstance(legacy_existing, (int, float)):
+            adopted_ledger = dict(ledger)
+            adopted_ledger['merge_first_enqueued_at'] = str(legacy_existing)
+            new_metadata = dict(metadata)
+            new_metadata['retry_ledger'] = adopted_ledger
+            self.task['metadata'] = new_metadata
+            return float(legacy_existing)
 
         # Slow-path: consult backend to adopt a persisted value and protect
         # memory_hints on the subsequent write.
         fresh = await self._merge_fresh_metadata(
             metadata, log_context='merge_first_enqueued_at stamp',
         )
-        backend_existing = fresh.get('merge_first_enqueued_at')
-        if isinstance(backend_existing, (int, float)):
-            # Backend already has the value; adopt into in-memory copy, no persist.
-            self.task['metadata'] = fresh
-            return float(backend_existing)
+        fresh_ledger = fresh.get('retry_ledger') or {}
+        backend_existing = fresh_ledger.get('merge_first_enqueued_at')
+        if backend_existing is not None:
+            try:
+                adopted = float(backend_existing)
+            except (TypeError, ValueError):
+                adopted = None
+            if adopted is not None:
+                # Backend already has the value; adopt into in-memory copy, no persist.
+                self.task['metadata'] = fresh
+                return adopted
 
         # Neither in-memory nor backend carries the value — this is the first submit.
         stamped = time.time()
-        fresh['merge_first_enqueued_at'] = stamped
+        new_ledger = dict(fresh_ledger)
+        new_ledger['merge_first_enqueued_at'] = str(stamped)
+        fresh['retry_ledger'] = new_ledger
         self.task['metadata'] = fresh
         try:
             await self.scheduler.update_task(
