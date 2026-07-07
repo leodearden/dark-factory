@@ -55,6 +55,10 @@ def _ts_sort_key(entry: dict) -> datetime:
 # (tests/test_outcome_kind.py::TestOutcomeKindFrozenContract) is the drift tripwire. A latest
 # merge_attempt event is TERMINAL (drops off the active panel) UNLESS its outcome is listed
 # here — new/unknown terminal outcomes fail SAFE instead of phantoming for the full TTL.
+# MAINTENANCE: no test or CI check enforces this mirror across the package boundary — if a
+# change to orchestrator's _NON_TERMINAL_OUTCOMES lands, this frozenset must be updated to
+# match by hand (see test_active_only_set_contents in test_merge_queue_data.py for the
+# dashboard-side pin).
 _ACTIVE_ONLY: frozenset[str] = frozenset({
     'cas_retry', 'gate_retry', 'post_merge_generation_chained', 'plan_files_narrowed',
 })
