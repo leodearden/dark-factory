@@ -230,6 +230,7 @@ class GraphitiBackend:
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._indexed_graphs: set[str] = set()
         self._cloned_drivers: dict[str, GraphDriver] = {}
+        self._identity_locks: dict[str, asyncio.Lock] = {}
 
     # --- Per-request driver routing ---
 
@@ -250,6 +251,32 @@ class GraphitiBackend:
         """Return the FalkorGraph object for *group_id* (for direct Cypher)."""
         driver = self._require_driver()
         return driver._get_graph(group_id)
+
+    def _identity_lock_for(self, group_id: str) -> asyncio.Lock:
+        """Return the per-group_id write-time-identity lock, creating it lazily.
+
+        Mirrors the DurableWriteQueue._group_locks idiom (durable_queue.py:136,
+        259-260): one asyncio.Lock per group_id, created on first access and
+        cached thereafter so repeated calls for the same group_id return the
+        exact same Lock instance.
+
+        This registry is SEPARATE from DurableWriteQueue._group_locks, which
+        only guards _claim_next — not _process_item/add_episode — so with
+        workers_per_group > 1 two add_episode calls for the same group can run
+        concurrently and would race on entity-name resolution without their
+        own lock.
+
+        Callers (MemoryService) are expected to hold this lock across an
+        add_episode + reconcile critical section (which includes any call to
+        _resolve_or_create_entity), and must NEVER hold it across a Mem0
+        write. Synchronous accessor — returns the Lock object itself, not a
+        coroutine, so callers write ``async with backend._identity_lock_for(gid):``.
+        """
+        lock = self._identity_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._identity_locks[group_id] = lock
+        return lock
 
     def _require_driver(self) -> FalkorDriver:
         if self._driver is None:
@@ -1250,6 +1277,12 @@ class GraphitiBackend:
         never raises on zero or multiple matches — callers (e.g. MemoryService.get_entity)
         treat an empty result as "fall back to fuzzy search" and pick nodes[0] on a hit.
 
+        Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
+        amendment), not just the graph key selected via _graph_for — task-2115's active
+        cross-graph leak can plant a misrouted foreign node (group_id property of
+        ANOTHER project) physically inside this graph key, and this predicate keeps
+        such a clone from ever surfacing here.
+
         Uses ro_query since no writes are performed.
 
         Args:
@@ -1264,8 +1297,11 @@ class GraphitiBackend:
             RuntimeError: if the backend is not initialized.
         """
         graph = self._graph_for(group_id)
-        cypher = 'MATCH (n:Entity {name: $name}) RETURN n.uuid, n.name, n.summary, labels(n)'
-        result = await graph.ro_query(cypher, {'name': name})
+        cypher = (
+            'MATCH (n:Entity {name: $name}) WHERE n.group_id = $group_id '
+            'RETURN n.uuid, n.name, n.summary, labels(n)'
+        )
+        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
         return [
             {
                 'uuid': row[0],
@@ -1288,6 +1324,12 @@ class GraphitiBackend:
         uuid — so callers can treat matches[0] as the merge survivor and
         matches[1:] as the deprecated duplicates to fold into it.
 
+        Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
+        amendment), not just the graph key selected via _graph_for — task-2115's active
+        cross-graph leak can plant a misrouted foreign node (group_id property of
+        ANOTHER project) physically inside this graph key, and this predicate keeps
+        such a clone from ever being treated as a duplicate to collapse.
+
         Uses ro_query since no writes are performed.
 
         Args:
@@ -1305,12 +1347,13 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH (n:Entity {name: $name}) '
+            'WHERE n.group_id = $group_id '
             'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
             'WITH n, count(DISTINCT e) AS edge_count '
             'RETURN n.uuid, n.created_at, edge_count '
             'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
         )
-        result = await graph.ro_query(cypher, {'name': name})
+        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
         return [
             {
                 'uuid': row[0],
@@ -1319,6 +1362,52 @@ class GraphitiBackend:
             }
             for row in (result.result_set or [])
         ]
+
+    async def _resolve_or_create_entity(self, name: str, *, group_id: str) -> str | None:
+        """Exact-name write-time-identity chokepoint: resolve, or collapse duplicates.
+
+        MUST be called only while the caller holds ``_identity_lock_for(group_id)``
+        — this method performs no locking of its own. Idempotent: calling it
+        repeatedly for the same (name, group_id) converges and stays converged.
+
+        Behaviour by match count (via get_nodes_by_exact_name, group_id-scoped):
+        - 0 matches: returns None. Documented no-op — node minting stays
+          graphiti_core's job; this primitive only resolves/collapses existing
+          nodes, it never creates one.
+        - 1 match: returns that node's uuid directly (pure resolve, no writes).
+        - >=2 matches: collapses duplicates via find_duplicate_entity_nodes
+          (already survivor-first: edge_count DESC, created_at ASC, uuid ASC)
+          and merge_entities, folding every non-canonical duplicate into the
+          survivor. Returns the survivor's uuid.
+
+        Args:
+            name: Exact name of the Entity to resolve.
+            group_id: Project graph to target.
+
+        Returns:
+            The UUID of the single canonical Entity node with this name in
+            group_id's graph, or None if none existed.
+
+        Post-condition on return (non-None): exactly one Entity node with
+        this name remains in group_id's graph.
+        """
+        nodes = await self.get_nodes_by_exact_name(name, group_id=group_id)
+        if not nodes:
+            return None
+        if len(nodes) == 1:
+            return nodes[0]['uuid']
+        dups = await self.find_duplicate_entity_nodes(name, group_id=group_id)
+        if not dups:
+            # Defensive: get_nodes_by_exact_name and find_duplicate_entity_nodes
+            # are separate queries and, under the lock contract, are expected to
+            # filter identically. If they ever diverge (e.g. a future change
+            # narrows find_duplicate_entity_nodes to exclude edgeless nodes),
+            # degrade to a no-op rather than raise IndexError on dups[0].
+            return None
+        survivor = dups[0]
+        for dup in dups[1:]:
+            await self.merge_entities(dup['uuid'], survivor['uuid'], group_id=group_id)
+        return survivor['uuid']
 
     @staticmethod
     def _edge_dict(uuid: str, fact: str | None, name: str | None) -> EdgeDict:
