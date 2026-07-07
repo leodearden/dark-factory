@@ -595,6 +595,75 @@ async def test_set_task_claimant_fails_safe_when_columns_absent(tmp_path, caplog
     assert warning_msgs, 'Expected a WARNING when claimant columns are absent'
 
 
+# ── status vocabulary guard ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_rejects_unknown_status(backend, project_root):
+    """Store floor: set_task_status must reject a status outside the shared vocabulary.
+
+    'in_progress' (underscore) is a plausible typo of the real 'in-progress'
+    (hyphen) status — exactly the silent-stranding failure this guard closes.
+    The write must be blocked: re-reading the task shows the status unchanged.
+    """
+    await backend.add_task(project_root=project_root, title='x')
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.set_task_status('1', 'in_progress', project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'Invalid status' in exc.value.message
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_unknown_status_rejection_precedes_existence_check(
+    backend, project_root,
+):
+    """Vocabulary guard runs BEFORE the task SELECT, so it beats 'No tasks found'."""
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.set_task_status('999', 'in_progress', project_root=project_root)
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'Invalid status' in exc.value.message
+    assert 'No tasks found' not in exc.value.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'status',
+    ['done', 'in-progress', 'review', 'merge-deferred', 'infra-hold'],
+)
+async def test_set_task_status_accepts_valid_statuses(backend, project_root, status):
+    """The guard must not over-reject — every shared-vocabulary status is accepted."""
+    await backend.add_task(project_root=project_root, title='x')
+    result = await backend.set_task_status('1', status, project_root=project_root)
+    assert result['tasks'][0]['newStatus'] == status
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['status'] == status
+
+
+@pytest.mark.asyncio
+async def test_add_task_rejects_unknown_status(backend, project_root):
+    """Store floor: add_task must reject a status outside the shared vocabulary.
+
+    No row is created and the id counter is not consumed — a subsequent
+    valid add_task still gets id '1'.
+    """
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.add_task(project_root=project_root, title='x', status='in_progress')
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'Invalid status' in exc.value.message
+    assert await backend.get_statuses(project_root) == {}
+    dto = await backend.add_task(project_root=project_root, title='y')
+    assert dto['id'] == '1'
+
+
+@pytest.mark.asyncio
+async def test_add_task_accepts_infra_hold(backend, project_root):
+    dto = await backend.add_task(project_root=project_root, title='held', status='infra-hold')
+    task = await backend.get_task(dto['id'], project_root=project_root)
+    assert task['status'] == 'infra-hold'
+
+
 # ── update_task ─────────────────────────────────────────────────────
 
 
