@@ -449,3 +449,146 @@ class TestMergeGraphFamily:
             'nodes_moved': 0, 'edges_moved': 0, 'edges_skipped': 0,
             'mentions_moved': 0, 'mentions_skipped': 0,
         }
+
+
+# ===========================================================================
+# Tests: scroll_collection_points
+# ===========================================================================
+
+class TestScrollCollectionPoints:
+    """Tests for async scroll_collection_points(qdrant_client, collection, *, limit)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_scroll_with_payload_and_vectors(self):
+        """scroll is called with with_payload=True AND with_vectors=True --
+        omitting with_vectors would silently drop embeddings."""
+        client = _make_qdrant_mock([])
+
+        await _mod.scroll_collection_points(client, 'fused_dark-factory', limit=1000)
+
+        client.scroll.assert_called_once_with(
+            collection_name='fused_dark-factory',
+            with_payload=True,
+            with_vectors=True,
+            limit=1000,
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_the_points(self):
+        """Returns the points list from the scroll result."""
+        points = [_make_point('p1'), _make_point('p2')]
+        client = _make_qdrant_mock(points)
+
+        result = await _mod.scroll_collection_points(client, 'reify_reify', limit=1000)
+
+        assert result == points
+
+    @pytest.mark.asyncio
+    async def test_warns_when_point_count_hits_limit(self, caplog):
+        """No-silent-caps: hitting the limit logs a WARNING."""
+        points = [_make_point(f'p{i}') for i in range(3)]
+        client = _make_qdrant_mock(points)
+
+        with caplog.at_level('WARNING'):
+            await _mod.scroll_collection_points(client, 'reify_reify', limit=3)
+
+        assert any('limit' in rec.message.lower() for rec in caplog.records), (
+            f'Expected a limit-related WARNING, got: {[r.message for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_under_limit(self, caplog):
+        """Point count below the limit does not log a WARNING."""
+        points = [_make_point('p1')]
+        client = _make_qdrant_mock(points)
+
+        with caplog.at_level('WARNING'):
+            await _mod.scroll_collection_points(client, 'reify_reify', limit=1000)
+
+        assert caplog.records == []
+
+
+# ===========================================================================
+# Tests: merge_collection
+# ===========================================================================
+
+class TestMergeCollection:
+    """Tests for async merge_collection(qdrant_client, source, target,
+    canonical_user_id, points, *, capped)."""
+
+    @pytest.mark.asyncio
+    async def test_upserts_into_target_with_canonical_user_id(self):
+        """upsert is called with collection_name=target and each point's
+        payload user_id rewritten to canonical -- original id/vector preserved."""
+        points = [
+            _make_point('p1', payload={'user_id': 'dark-factory', 'data': 'a'}, vector=[0.1, 0.2]),
+            _make_point('p2', payload={'user_id': 'dark-factory', 'data': 'b'}, vector=[0.3, 0.4]),
+        ]
+        client = _make_qdrant_mock()
+
+        await _mod.merge_collection(
+            client, 'fused_dark-factory', 'fused_dark_factory', 'dark_factory',
+            points, capped=False,
+        )
+
+        client.upsert.assert_called_once()
+        upsert_kwargs = client.upsert.call_args.kwargs
+        assert upsert_kwargs['collection_name'] == 'fused_dark_factory'
+        upserted = upsert_kwargs['points']
+        assert len(upserted) == 2
+        assert {p.id for p in upserted} == {'p1', 'p2'}
+        for p in upserted:
+            assert p.payload['user_id'] == 'dark_factory'
+        by_id = {p.id: p for p in upserted}
+        assert by_id['p1'].vector == [0.1, 0.2]
+        assert by_id['p1'].payload['data'] == 'a'
+        assert by_id['p2'].vector == [0.3, 0.4]
+
+    @pytest.mark.asyncio
+    async def test_deletes_source_when_not_capped(self):
+        """A fully-drained (not capped) scroll deletes the source collection."""
+        client = _make_qdrant_mock()
+        points = [_make_point('p1')]
+
+        await _mod.merge_collection(
+            client, 'reify_reify', 'fused_reify', 'reify', points, capped=False,
+        )
+
+        client.delete_collection.assert_called_once_with('reify_reify')
+
+    @pytest.mark.asyncio
+    async def test_does_not_delete_source_when_capped(self):
+        """A capped (possibly-incomplete) scroll does NOT delete the source
+        collection -- no data loss on a partial migration."""
+        client = _make_qdrant_mock()
+        points = [_make_point('p1')]
+
+        await _mod.merge_collection(
+            client, 'reify_reify', 'fused_reify', 'reify', points, capped=True,
+        )
+
+        client.delete_collection.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_summary_dict(self):
+        """Returns a summary with points_upserted count and source_deleted flag."""
+        client = _make_qdrant_mock()
+        points = [_make_point('p1'), _make_point('p2')]
+
+        result = await _mod.merge_collection(
+            client, 'reify_reify', 'fused_reify', 'reify', points, capped=False,
+        )
+
+        assert result == {'points_upserted': 2, 'source_deleted': True}
+
+    @pytest.mark.asyncio
+    async def test_capped_summary_reports_source_not_deleted(self):
+        """capped=True summary reports source_deleted=False."""
+        client = _make_qdrant_mock()
+        points = [_make_point('p1')]
+
+        result = await _mod.merge_collection(
+            client, 'reify_reify', 'fused_reify', 'reify', points, capped=True,
+        )
+
+        assert result == {'points_upserted': 1, 'source_deleted': False}
