@@ -910,7 +910,8 @@ class TestRunApplyDispatch:
 
         await _mod.run(args, memory_service)
 
-        _call_args, call_kwargs = move_mock.await_args
+        assert move_mock.await_args is not None
+        call_kwargs = move_mock.await_args.kwargs
         assert call_kwargs.get('rewrite_group_id') == 'know_live'
 
 
