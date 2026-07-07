@@ -208,6 +208,16 @@ async def test_gap_handlers_return_shape_identical_error_on_failure(mcp_server):
     """
     expected = {'error': 'backend down', 'error_type': 'RuntimeError'}
 
+    # submit_task's minimal {'project_root': ...} arg set is expected to clear
+    # every pre-interceptor validation gate (project_root format via the
+    # passthrough_main_checkout fixture, the lock-charter directory guard on
+    # metadata.files, and the deterministic-task-kind invariants) untouched,
+    # since metadata=None and task_kind defaults to 'normal'. That is what
+    # lets this call reach task_interceptor.submit_task and exercise the
+    # decorator's passthrough. If validation ordering later moves a
+    # required-field check ahead of the interceptor call, this assertion
+    # would silently start checking that ValidationError dict instead —
+    # revisit the arg set here if that happens.
     submit_result = await mcp_server._tool_manager.call_tool(
         'submit_task', {'project_root': '/project'},
     )

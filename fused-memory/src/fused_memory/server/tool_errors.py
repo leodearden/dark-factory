@@ -47,6 +47,14 @@ def mcp_tool_errors(
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception as e:
+                # logger.exception (full traceback) uniformly, matching the
+                # convention list_tickets/cancel_ticket's hand-written tails
+                # already used. For submit_task/resolve_ticket specifically,
+                # this is an intentional verbosity increase over their
+                # pre-refactor logger.error(...) (message-only) tails: any
+                # log scraper/alert keyed on the old single-line
+                # 'submit_task error: ...' / 'resolve_ticket error: ...'
+                # format will now also see an attached stack trace.
                 logger.exception(f'{op} error: {e}')
                 return {'error': str(e), 'error_type': type(e).__name__}
 
