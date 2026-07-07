@@ -120,6 +120,24 @@ class PermitLedger:
     permits; only the acquire/release paths already routed through this
     ledger (currently just :class:`SpeculationController`'s merger-side
     lifecycle) are covered by the identity above.
+
+    Known interim cost (until task eta): ``SpeculationController.on_transfer``
+    / ``on_transfer_terminal`` deliberately drop the controller's own
+    reference to a transferred permit WITHOUT calling ``release`` on it — the
+    verifier now owns that token and (in zeta) still releases the underlying
+    semaphore directly, raw, never through this ledger. So a transferred
+    permit is never discarded from ``live`` either: it stays registered for
+    the remainder of the process's zeta-era lifetime, one retained
+    :class:`SpecPermit` object per speculative transfer. This is intentional,
+    not a bug — discarding it at transfer time instead would make a later,
+    eta-migrated verifier's ``ledger.release(item.permit)`` call fail its
+    liveness check, since the very point of storing ``permit`` on
+    ``RealMergeItem``/``DecidedItem``/``InflightEntry`` (also task zeta) is
+    for the verifier to release that SAME still-live token once eta threads
+    it through. Net effect: ``live`` is a small, slow, real memory growth and
+    is NOT GC-safe in isolation before task eta lands — task eta closes this
+    by routing the verifier's release through ``ledger.release(item.permit)``,
+    which discards the token from ``live`` at that point.
     """
 
     def __init__(self, slot: asyncio.Semaphore, depth: int) -> None:
@@ -164,15 +182,25 @@ class PermitLedger:
 
         Checks ``permit.released`` FIRST so a double-release is a silent
         no-op — never an over-release, never an assertion failure. Only past
-        that guard does it assert the token is actually live, catching a
+        that guard does it verify the token is actually live, catching a
         genuinely-unknown token as a programming error.
+
+        This liveness check is enforced with an explicit ``raise`` rather
+        than a bare ``assert`` statement: a plain ``assert`` is stripped
+        under ``python -O`` (``merge_queue.py``'s ``merge_commit is None``
+        invariant guard documents this same hazard), and silently skipping
+        the check would let a genuinely-unknown token fall through to
+        ``self._slot.release()`` below — over-releasing a semaphore permit
+        this ledger never issued. Raises ``AssertionError`` (not a bare
+        assert) so callers/tests keep catching the same exception type.
         """
         if permit.released:
             return
-        assert permit in self._live, (
-            f'PermitLedger.release: permit {permit!r} is not live (a token '
-            'this ledger never issued, or already discarded)'
-        )
+        if permit not in self._live:
+            raise AssertionError(
+                f'PermitLedger.release: permit {permit!r} is not live (a token '
+                'this ledger never issued, or already discarded)'
+            )
         permit.released = True
         self._live.discard(permit)
         self._slot.release()
@@ -345,6 +373,12 @@ class SpeculationController:
         For the seven early-continue sites (no subsequent look-ahead ever
         runs for this permit), use ``on_transfer_terminal`` instead so
         ``spec_base`` does not leak stale between requests.
+
+        The transferred token is NOT discarded from ``self._ledger.live`` —
+        see :class:`PermitLedger`'s docstring ("Known interim cost") for why
+        this is intentional and what the accepted memory-growth cost is
+        until task eta migrates the verifier's release onto this same
+        token.
         """
         self._permit = None
 
@@ -367,6 +401,10 @@ class SpeculationController:
         base SHA across the ``continue``, wrongly reporting ``is_idle()`` as
         False and ``snapshot()['speculation']['spec_base']`` as non-None
         until the next ``on_dequeue`` happens to overwrite or clear it.
+
+        Like ``on_transfer``, the transferred token is NOT discarded from
+        ``self._ledger.live`` — see :class:`PermitLedger`'s docstring
+        ("Known interim cost") for why.
         """
         self._permit = None
         self.spec_base = None
