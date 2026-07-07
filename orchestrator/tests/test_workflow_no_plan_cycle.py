@@ -1,9 +1,13 @@
 """Tests for ``TaskWorkflow._handle_no_plan_failure`` (Fix C).
 
 The helper increments ``consecutive_no_plan_failures`` keyed by
-``last_no_plan_main_sha`` in the task metadata.  When the counter hits
-``>= 2`` with the same main SHA, the workflow short-circuits to
-BLOCKED + L1 instead of letting the steward attempt resolution again.
+``last_no_plan_main_sha``, both carried inside the typed
+``metadata.retry_ledger`` blob (:class:`shared.task_metadata.RetryLedger`).
+When the counter hits ``>= 2`` with the same main SHA, the workflow
+short-circuits to BLOCKED + L1 instead of letting the steward attempt
+resolution again. A ``retry_ledger`` that fails RetryLedger validation
+(corrupt/legacy shape) is treated as a fresh all-zero ledger rather than
+crashing.
 """
 
 from __future__ import annotations
@@ -121,11 +125,12 @@ async def test_first_failure_increments_counter_to_one_and_routes_normally(
     f.mark_blocked.assert_awaited_once()
     _, kwargs = f.mark_blocked.await_args
     assert kwargs.get('escalate_to_human') is not True
-    # Counter persisted to 1 with current main SHA.
+    # Counter persisted to 1 with current main SHA, under retry_ledger.
     f.update_task.assert_awaited_once()
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 1
-    assert metadata['last_no_plan_main_sha'] == 'SHA-A'
+    ledger = metadata['retry_ledger']
+    assert ledger['consecutive_no_plan_failures'] == 1
+    assert ledger['last_no_plan_main_sha'] == 'SHA-A'
 
 
 @pytest.mark.asyncio
@@ -134,8 +139,10 @@ async def test_second_failure_same_main_sha_escalates_to_human(tmp_path: Path):
         project_root=tmp_path,
         main_sha='SHA-A',
         metadata={
-            'last_no_plan_main_sha': 'SHA-A',
-            'consecutive_no_plan_failures': 1,
+            'retry_ledger': {
+                'last_no_plan_main_sha': 'SHA-A',
+                'consecutive_no_plan_failures': 1,
+            },
         },
     )
 
@@ -150,7 +157,7 @@ async def test_second_failure_same_main_sha_escalates_to_human(tmp_path: Path):
     assert kwargs.get('escalate_to_human') is True
     assert 'counter=2' in args[0] or 'Repeated no-plan' in args[0]
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 2
+    assert metadata['retry_ledger']['consecutive_no_plan_failures'] == 2
 
 
 @pytest.mark.asyncio
@@ -161,8 +168,10 @@ async def test_main_sha_changed_resets_counter_to_one(tmp_path: Path):
         project_root=tmp_path,
         main_sha='SHA-NEW',
         metadata={
-            'last_no_plan_main_sha': 'SHA-OLD',
-            'consecutive_no_plan_failures': 5,
+            'retry_ledger': {
+                'last_no_plan_main_sha': 'SHA-OLD',
+                'consecutive_no_plan_failures': 5,
+            },
         },
     )
 
@@ -174,8 +183,9 @@ async def test_main_sha_changed_resets_counter_to_one(tmp_path: Path):
     _, kwargs = f.mark_blocked.await_args
     assert kwargs.get('escalate_to_human') is not True
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 1
-    assert metadata['last_no_plan_main_sha'] == 'SHA-NEW'
+    ledger = metadata['retry_ledger']
+    assert ledger['consecutive_no_plan_failures'] == 1
+    assert ledger['last_no_plan_main_sha'] == 'SHA-NEW'
 
 
 @pytest.mark.asyncio
@@ -185,8 +195,10 @@ async def test_third_consecutive_failure_still_escalates(tmp_path: Path):
         project_root=tmp_path,
         main_sha='SHA-A',
         metadata={
-            'last_no_plan_main_sha': 'SHA-A',
-            'consecutive_no_plan_failures': 2,
+            'retry_ledger': {
+                'last_no_plan_main_sha': 'SHA-A',
+                'consecutive_no_plan_failures': 2,
+            },
         },
     )
 
@@ -197,8 +209,15 @@ async def test_third_consecutive_failure_still_escalates(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_metadata_persistence_failure_is_non_fatal(tmp_path: Path):
-    """If scheduler.update_task raises, we still route to _mark_blocked."""
+async def test_persistence_failure_escalates_to_human(tmp_path: Path):
+    """If scheduler.update_task raises, the counter can't be trusted to have
+    landed — escalate to a human immediately rather than logging and
+    proceeding (a lost increment would let the no-plan loop under-fire).
+
+    This is true even on what would otherwise be a first, non-escalating
+    failure (main_sha='SHA-A' with no prior ledger): persist failure always
+    escalates, regardless of the counter values themselves.
+    """
     f = _make(
         project_root=tmp_path, main_sha='SHA-A',
         update_task_raises=True,
@@ -208,6 +227,8 @@ async def test_metadata_persistence_failure_is_non_fatal(tmp_path: Path):
 
     assert outcome == WorkflowOutcome.BLOCKED
     f.mark_blocked.assert_awaited_once()
+    _, kwargs = f.mark_blocked.await_args
+    assert kwargs.get('escalate_to_human') is True
 
 
 @pytest.mark.asyncio
@@ -216,8 +237,10 @@ async def test_get_main_sha_failure_treats_as_unknown_main(tmp_path: Path):
     f = _make(
         project_root=tmp_path,
         metadata={
-            'last_no_plan_main_sha': 'SHA-A',
-            'consecutive_no_plan_failures': 5,
+            'retry_ledger': {
+                'last_no_plan_main_sha': 'SHA-A',
+                'consecutive_no_plan_failures': 5,
+            },
         },
         get_main_sha_raises=True,
     )
@@ -245,32 +268,36 @@ async def test_total_counter_escalates_at_3(tmp_path: Path):
     _, kwargs = f.mark_blocked.await_args
     assert kwargs.get('escalate_to_human') is not True
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 1
-    assert metadata['total_no_plan_failures'] == 1
+    assert metadata['retry_ledger']['consecutive_no_plan_failures'] == 1
+    assert metadata['retry_ledger']['total_no_plan_failures'] == 1
 
     # Failure 2 on SHA-B (main moved): counter resets to 1, total=2 → still normal.
     f = _make(
         project_root=tmp_path, main_sha='SHA-B',
         metadata={
-            'last_no_plan_main_sha': 'SHA-A',
-            'consecutive_no_plan_failures': 1,
-            'total_no_plan_failures': 1,
+            'retry_ledger': {
+                'last_no_plan_main_sha': 'SHA-A',
+                'consecutive_no_plan_failures': 1,
+                'total_no_plan_failures': 1,
+            },
         },
     )
     await f.wf._handle_no_plan_failure('no plan', detail='')
     _, kwargs = f.mark_blocked.await_args
     assert kwargs.get('escalate_to_human') is not True
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 1
-    assert metadata['total_no_plan_failures'] == 2
+    assert metadata['retry_ledger']['consecutive_no_plan_failures'] == 1
+    assert metadata['retry_ledger']['total_no_plan_failures'] == 2
 
     # Failure 3 on SHA-C: counter resets to 1, total=3 → escalates via total.
     f = _make(
         project_root=tmp_path, main_sha='SHA-C',
         metadata={
-            'last_no_plan_main_sha': 'SHA-B',
-            'consecutive_no_plan_failures': 1,
-            'total_no_plan_failures': 2,
+            'retry_ledger': {
+                'last_no_plan_main_sha': 'SHA-B',
+                'consecutive_no_plan_failures': 1,
+                'total_no_plan_failures': 2,
+            },
         },
     )
     await f.wf._handle_no_plan_failure('no plan', detail='')
@@ -280,8 +307,8 @@ async def test_total_counter_escalates_at_3(tmp_path: Path):
     assert 'total=3' in args[0]
     assert 'total counter' in args[0]
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 1
-    assert metadata['total_no_plan_failures'] == 3
+    assert metadata['retry_ledger']['consecutive_no_plan_failures'] == 1
+    assert metadata['retry_ledger']['total_no_plan_failures'] == 3
 
 
 @pytest.mark.asyncio
@@ -291,9 +318,11 @@ async def test_total_counter_increments_on_same_sha_path_too(tmp_path: Path):
     f = _make(
         project_root=tmp_path, main_sha='SHA-A',
         metadata={
-            'last_no_plan_main_sha': 'SHA-A',
-            'consecutive_no_plan_failures': 1,
-            'total_no_plan_failures': 1,
+            'retry_ledger': {
+                'last_no_plan_main_sha': 'SHA-A',
+                'consecutive_no_plan_failures': 1,
+                'total_no_plan_failures': 1,
+            },
         },
     )
     await f.wf._handle_no_plan_failure('no plan', detail='')
@@ -301,8 +330,8 @@ async def test_total_counter_increments_on_same_sha_path_too(tmp_path: Path):
     # Same-SHA counter trigger fires (counter=2), but total still increments.
     assert kwargs.get('escalate_to_human') is True
     metadata = _persisted_metadata(f.update_task)
-    assert metadata['consecutive_no_plan_failures'] == 2
-    assert metadata['total_no_plan_failures'] == 2
+    assert metadata['retry_ledger']['consecutive_no_plan_failures'] == 2
+    assert metadata['retry_ledger']['total_no_plan_failures'] == 2
     assert 'same-SHA counter' in args[0]
 
 
