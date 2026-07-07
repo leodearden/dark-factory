@@ -1775,7 +1775,7 @@ class TestUncapViaTransition:
         # wait_for_reset=False already makes _start_account_resume_probe a
         # no-op, but neutralize it explicitly so this test's intent (isolating
         # the pause-accounting bug) doesn't depend on that unrelated guard.
-        gate._start_account_resume_probe = lambda a: None
+        gate._start_account_resume_probe = lambda acct: None
 
         gate._handle_cap_detected('cap', datetime.now(UTC), acct.token)
 
