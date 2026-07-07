@@ -915,11 +915,19 @@ class TaskInterceptor:
             # all in scope. An out-of-vocabulary old/new status (ValueError
             # from TaskStatus coercion) is a vocabulary rejection — rho1a's
             # job, not this gate's — so it is treated as legal (never brick).
+            # reopen mirrors the terminal-exit gate above (2a): a terminal->X
+            # write that already cleared that gate (resolved_reopen_reason set)
+            # is treated as a legal reopen by the table, not double-flagged.
             # LOG-ONLY at this step: always proceed regardless of verdict; the
-            # enforce-mode reject branch and reopen-threading land separately.
+            # enforce-mode reject branch lands separately.
             actor = derive_actor_class(agent_id)
             try:
-                _legal_transition = is_legal_transition(old_status, status, actor)
+                _legal_transition = is_legal_transition(
+                    old_status,
+                    status,
+                    actor,
+                    reopen=(resolved_reopen_reason is not None),
+                )
             except ValueError:
                 _legal_transition = True
             if not _legal_transition:
