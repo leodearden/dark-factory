@@ -1354,3 +1354,40 @@ class TestSubstrateGatePruneChokepoint:
             f'expected no raw ("git", "worktree", "prune") subprocess call; '
             f'found {prune_argv_calls!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_stale_gate_worktree_self_heal_still_works(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """Regression (real GitOps): a stale gate worktree left by a prior
+        interrupted run is still cleaned up before 'worktree add', so the
+        gate proceeds normally rather than FLIPping on 'already exists'."""
+        from orchestrator.git_ops import _run
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_gate_repo(repo)
+        h = _make_real_git_harness(repo)
+        assignment = _make_assignment()
+
+        gate_path = h.git_ops.worktree_base / '_substrate-gate-42'
+        h.git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(gate_path), 'main'],
+            cwd=repo,
+        )
+        assert rc == 0, f'failed to plant stale gate worktree fixture: {err}'
+        assert gate_path.exists()
+
+        monkeypatch.setattr(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            lambda **kw: _pass_verdict(),
+        )
+
+        result = await h._run_substrate_gate(assignment)
+
+        assert result is True, (
+            'expected the gate to succeed — the pre-existing stale gate '
+            'worktree must still be cleaned up (remove + chokepoint prune) '
+            'so `git worktree add` does not fail with "already exists"'
+        )
