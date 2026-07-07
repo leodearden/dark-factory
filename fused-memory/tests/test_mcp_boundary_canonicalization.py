@@ -209,16 +209,20 @@ class TestUngatedMutatorCanonicalization:
     async def test_refresh_entity_summary_rejects_path_shaped_project_id(self):
         """B2: refresh_entity_summary(project_id='-home-leo-src-x') is rejected loudly.
 
-        Proves canonicalization precedes both validate_project_id and the tool's
-        own entity_uuid/entity_name required-arg check — the rejection must fire
-        even though neither entity_uuid nor entity_name is provided.
+        Deliberately omits both entity_uuid and entity_name. refresh_entity_summary's
+        own required-arg guard (``if not entity_uuid and not entity_name``) would
+        fire and return a generic (non-PathShapedProjectIdError) error dict if
+        canonicalization ran AFTER it. Asserting PathShapedProjectIdError here
+        therefore proves canonicalization precedes BOTH validate_project_id and
+        that tool-specific required-arg check — not just the former, which a call
+        that also supplied entity_name would leave unproven.
         """
         mock_service = AsyncMock()
         server = create_mcp_server(mock_service, known_projects=_KNOWN_PROJECTS)
 
         result = await server._tool_manager.call_tool(
             'refresh_entity_summary',
-            {'project_id': _PATH_SHAPED, 'entity_name': 'Foo'},
+            {'project_id': _PATH_SHAPED},
         )
 
         assert result.get('error_type') == 'PathShapedProjectIdError', (
