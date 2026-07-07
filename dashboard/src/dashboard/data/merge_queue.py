@@ -48,8 +48,6 @@ def _ts_sort_key(entry: dict) -> datetime:
     except (TypeError, ValueError):
         return datetime.min.replace(tzinfo=UTC)
 
-_CANONICAL_OUTCOMES = ['done', 'conflict', 'blocked', 'already_merged']
-
 # _ACTIVE_ONLY mirrors the non-terminal members of orchestrator merge_types.OutcomeKind
 # (_NON_TERMINAL_OUTCOMES in orchestrator/src/orchestrator/merge_types.py). The dashboard
 # has NO dependency on the orchestrator package, so this is a hand-maintained mirror, not an
@@ -248,9 +246,9 @@ async def outcome_distribution(
 ) -> ChartData:
     """Count merge_attempt events by outcome within the window.
 
-    Returns ChartData with canonical outcomes first (done, conflict, blocked,
-    already_merged), then any unknown outcomes sorted alphabetically.
-    Missing canonical outcomes are omitted (count=0 entries are dropped).
+    Returns ChartData with outcomes ordered by count descending; ties are
+    broken alphabetically. Outcomes with no events in the window are omitted
+    (count=0 entries are dropped).
 
     Args:
         db: aiosqlite connection, or None (returns empty ChartData).
@@ -280,18 +278,10 @@ async def outcome_distribution(
         if not counts:
             return {'labels': [], 'values': []}
 
-        # Canonical outcomes first, then unknowns alphabetically
-        labels: list[str] = []
-        values: list[int | float] = []
-        for outcome in _CANONICAL_OUTCOMES:
-            if outcome in counts:
-                labels.append(outcome)
-                values.append(counts[outcome])
-
-        unknowns = sorted(k for k in counts if k not in _CANONICAL_OUTCOMES)
-        for outcome in unknowns:
-            labels.append(outcome)
-            values.append(counts[outcome])
+        # Count descending; ties broken alphabetically.
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        labels: list[str] = [k for k, _ in ordered]
+        values: list[int | float] = [v for _, v in ordered]
 
         return {'labels': labels, 'values': values}
 
