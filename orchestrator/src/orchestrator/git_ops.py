@@ -3018,6 +3018,27 @@ class GitOps:
                     shutil.rmtree(lane)
                 lane.parent.mkdir(parents=True, exist_ok=True)
 
+                # Clear the sibling .task-meta/<name> before (re)building the
+                # worktree (W11 ε1). This create-once branch is reached only
+                # for an UNREGISTERED lane, whose worktree is always rebuilt
+                # fresh below (self-heal rmtree above, or `git worktree add`
+                # into an absent dir). In the legacy `.task/` world the
+                # metadata lived INSIDE the worktree, so that rebuild always
+                # destroyed the prior occupant's plan.json/already_done.json/
+                # false_premise.json. The relocated .task-meta/<name> lives
+                # OUTSIDE the worktree and survives the rebuild unscathed, so
+                # a DIFFERENT-task acquisition through this branch (orphan
+                # window: registration lost but sibling meta survived, guard
+                # at ~2846) would otherwise hand the incoming task the prior
+                # occupant's metadata — a data-integrity regression relative
+                # to the legacy cleanup (reviewer_comprehensive blocker,
+                # create-once route). Cleared unconditionally so it covers
+                # BOTH the FRESH (`add -b`) and REATTACH (`_reuse_warm_lane`)
+                # sub-routes below AND the lane-dir-already-gone case where
+                # the self-heal rmtree never ran. init()/_reuse_warm_lane
+                # re-provision this task's own metadata afterward.
+                self._clear_foreign_meta_root(lane)
+
                 # ── γ reattach guard (create-once site) ──────────────────────
                 # If the leftover task/<id> branch still carries commits beyond
                 # main, attach the worktree to it (no -b) rather than letting
@@ -3527,9 +3548,11 @@ class GitOps:
         """Remove the sibling ``.task-meta/<name>`` dir for *lane* (W11 ε1).
 
         ``.task-meta/<name>`` lives OUTSIDE the worktree, so none of
-        ``checkout -f -B``, ``git clean``, or ``checkout -f`` touch it — a
-        DIFFERENT-task acquisition (RECYCLE / RESET_IN_PLACE_REATTACH) would
-        otherwise hand the incoming task the PRIOR occupant's
+        ``checkout -f -B``, ``git clean``, ``checkout -f``, or the create-once
+        worktree rebuild (self-heal ``rmtree`` + ``git worktree add``) touch
+        it — a DIFFERENT-task acquisition (RECYCLE / RESET_IN_PLACE_REATTACH /
+        CREATE_ONCE_FRESH / CREATE_ONCE_REATTACH) would otherwise hand the
+        incoming task the PRIOR occupant's
         plan.json/metadata.json/blocking_dependency.json. Mirrors the
         already-landed interactive-reap cleanup (``reap_interactive_worktrees``).
         Best-effort (``ignore_errors=True``); never raises. Must NOT be called
