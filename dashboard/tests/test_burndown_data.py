@@ -8,7 +8,7 @@ import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import pytest
@@ -2083,6 +2083,84 @@ class TestAggregateBurndownSeries:
         assert result['done'][idx1] == 10
         idx3 = result['labels'].index(ts3)
         assert result['done'][idx3] == 30
+
+
+# ---------------------------------------------------------------------------
+# TestBurndownNowThreading (step-1)
+# ---------------------------------------------------------------------------
+
+
+_EMPTY_SERIES: dict = {
+    'labels': [],
+    'done': [],
+    'cancelled': [],
+    'blocked': [],
+    'deferred': [],
+    'in_progress': [],
+    'pending': [],
+}
+
+
+class TestBurndownNowThreading:
+    """get_burndown_series and aggregate_burndown_series must accept an
+    injected `now` and, in the aggregate case, resolve it once and thread
+    the identical value to every per-DB call — closing the per-DB
+    clock-skew race (mirrors costs.py's aggregate_cost_summary pattern).
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_burndown_series_respects_injected_now(self, tmp_path):
+        """now=base anchors the cutoff instead of the live clock."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        base = datetime(2026, 3, 1, tzinfo=UTC)
+        sync_conn = sqlite3.connect(str(db_path))
+        _insert_snapshot(sync_conn, 'proj', (base - timedelta(days=2)).isoformat(), done=1)
+        _insert_snapshot(sync_conn, 'proj', (base - timedelta(days=10)).isoformat(), done=2)
+        sync_conn.commit()
+        sync_conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await get_burndown_series(conn, 'proj', days=7, now=base)
+
+        assert len(result['labels']) == 1, (
+            f"expected only the base-2d row within the 7d window, got {result['labels']!r}"
+        )
+        assert result['done'] == [1]
+
+    @pytest.mark.asyncio
+    async def test_aggregate_burndown_series_threads_shared_now(self):
+        """An injected now= is threaded unchanged to every per-DB call."""
+        base = datetime(2026, 3, 1, tzinfo=UTC)
+        mock = AsyncMock(return_value=_EMPTY_SERIES)
+        with patch('dashboard.data.burndown.get_burndown_series', new=mock):
+            await aggregate_burndown_series([object(), object()], 'proj', days=7, now=base)
+
+        assert mock.await_count == 2
+        nows = [call.kwargs.get('now') for call in mock.await_args_list]
+        assert nows == [base, base], (
+            f"expected both per-DB calls to receive now={base!r}, got {nows!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_aggregate_burndown_series_resolves_now_once_when_none(self):
+        """Without now=, the aggregator resolves once and shares one value
+        across both per-DB calls (no per-DB clock skew)."""
+        mock = AsyncMock(return_value=_EMPTY_SERIES)
+        with patch('dashboard.data.burndown.get_burndown_series', new=mock):
+            await aggregate_burndown_series([object(), object()], 'proj', days=7)
+
+        assert mock.await_count == 2
+        nows = [call.kwargs.get('now') for call in mock.await_args_list]
+        assert all(n is not None for n in nows), f'expected non-None now, got {nows!r}'
+        assert all(n.tzinfo is not None for n in nows), (
+            f'expected tz-aware now, got {nows!r}'
+        )
+        assert nows[0] == nows[1], (
+            f"expected both per-DB calls to share one resolved now, got {nows!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
