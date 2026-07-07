@@ -10,6 +10,7 @@ skills/spawn/hooks/*.sh entrypoints end-to-end.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -150,3 +151,59 @@ def test_hook_display_title_ignores_blank_record_title() -> None:
     identity = sr.SpawnIdentity(role='session', project='dark-factory', task_id=None, escalation_id=None)
     record = _make_hook_record(title='')
     assert sh.hook_display_title(identity, env={}, record=record) == 'session:dark-factory'
+
+
+# ---------------------------------------------------------------------------
+# Step-5: run_session_start (hand-launched-capture + refresh)
+# ---------------------------------------------------------------------------
+
+
+def test_run_session_start_hand_launched_creates_new_running_record(tmp_path: Path) -> None:
+    # Case A: no prior record, no CLAUDE_SPAWN_* -> a NEW record.json appears
+    # at the session_id-keyed slug (the hand-launched-capture signal).
+    hook_input = {'session_id': 'sess-a', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    assert record.role == 'session'
+    assert record.project == 'dark-factory'
+    assert record.cwd == '/home/leo/src/dark-factory'
+    assert record.transcript_path == sr.transcript_path_for_cwd('/home/leo/src/dark-factory')
+
+
+def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path: Path) -> None:
+    # Case B: a record already exists at the slug -> refreshed to 'running'
+    # (status flips, mtime heartbeat bumps) without dropping previously-
+    # populated fields.
+    hook_input = {'session_id': 'sess-b', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    existing = sr.SessionRecord(
+        session_slug=slug,
+        status=sr.Status.LAUNCHING,
+        role='unblock',
+        project='df',
+        task_id='2085',
+        cwd='/home/leo/src/dark-factory',
+        prompt='/unblock 2085',
+    )
+    sr.write_record(existing, root=tmp_path)
+    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    old_ts = record_path.stat().st_mtime - 10
+    os.utime(record_path, (old_ts, old_ts))
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    # Previously-populated fields survive the refresh untouched.
+    assert record.role == 'unblock'
+    assert record.project == 'df'
+    assert record.task_id == '2085'
+    assert record.prompt == '/unblock 2085'
+    # mtime heartbeat bumped by the refresh write.
+    assert record_path.stat().st_mtime > old_ts
