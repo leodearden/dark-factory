@@ -606,6 +606,27 @@ class _LedgerVerdict:
     trigger: str = ''
 
 
+def _build_retry_ledger(metadata: dict) -> RetryLedger:
+    """Safely reconstruct a :class:`RetryLedger` from ``metadata['retry_ledger']``.
+
+    Tolerates any shape of corruption a hand-edited or legacy metadata blob
+    might carry: a missing/None key, a non-dict value (a stray string, list,
+    or scalar — ``RetryLedger(**raw)`` would otherwise raise ``TypeError``
+    rather than the ``ValidationError`` callers expect), or a dict whose
+    fields fail pydantic validation (e.g. a non-numeric counter). Any of
+    these reset to a fresh all-zero ledger instead of crashing the calling
+    guard — mirrors the old per-field ``int(...)`` parsing's tolerance for a
+    mistyped value, now centralised for all three anti-thrash guards.
+    """
+    raw = metadata.get('retry_ledger')
+    if not isinstance(raw, dict):
+        return RetryLedger()
+    try:
+        return RetryLedger(**raw)
+    except (ValidationError, TypeError):
+        return RetryLedger()
+
+
 def _evaluate_no_plan(ledger: RetryLedger, current_main_sha: str) -> _LedgerVerdict:
     """Pure decision core for the no-plan-failure anti-thrash guard.
 
@@ -3400,6 +3421,14 @@ class TaskWorkflow:
         Persist failure escalates to a human immediately rather than
         logging and proceeding: a silently-lost counter increment would
         let this money-burning loop under-fire.
+
+        Deploy note: pre-migration tasks carry this counter only at the
+        legacy top-level ``consecutive_no_plan_failures``/``total_no_plan_failures``
+        keys — there is no fallback that lifts them into ``retry_ledger``.
+        The first guard invocation after deploy therefore sees a fresh
+        all-zero ledger and costs at most one extra no-plan cycle before the
+        counter re-accumulates. Self-healing and benign, same precedent as
+        the signature-format migration note on ``_merge_outcome_signature``.
         """
         try:
             current_main_sha = await self.git_ops.get_main_sha()
@@ -3411,10 +3440,7 @@ class TaskWorkflow:
             current_main_sha = ''
 
         metadata = self.task.get('metadata') or {}
-        try:
-            ledger = RetryLedger(**(metadata.get('retry_ledger') or {}))
-        except ValidationError:
-            ledger = RetryLedger()
+        ledger = _build_retry_ledger(metadata)
 
         verdict = _evaluate_no_plan(ledger, current_main_sha)
 
@@ -3485,6 +3511,15 @@ class TaskWorkflow:
         ``consecutive_no_plan_failures`` writer; no new hazard.  Persist
         failure escalates to a human immediately rather than logging and
         proceeding, for the same reason as the no-plan guard.
+
+        Deploy note: pre-migration tasks carry
+        ``consecutive_infra_resume_failures``/``last_infra_resume_iteration_count``
+        only at the legacy top level — there is no fallback that lifts them
+        into ``retry_ledger``. The first guard invocation after deploy
+        therefore sees a fresh all-zero ledger, costing at most one extra
+        infra-resume cycle before the counter re-accumulates. Self-healing
+        and benign, same precedent as :meth:`_handle_no_plan_failure` and
+        the signature-format migration note on ``_merge_outcome_signature``.
         """
         assert self.artifacts is not None
 
@@ -3523,10 +3558,7 @@ class TaskWorkflow:
         iter_entries, _ = self.artifacts.read_iteration_log()
         current_iter_count = len(iter_entries)
 
-        try:
-            ledger = RetryLedger(**(metadata.get('retry_ledger') or {}))
-        except ValidationError:
-            ledger = RetryLedger()
+        ledger = _build_retry_ledger(metadata)
 
         verdict = _evaluate_infra_resume(
             ledger, current_iter_count, recent_category,
@@ -3617,10 +3649,7 @@ class TaskWorkflow:
             )
             return None
 
-        try:
-            ledger = RetryLedger(**(metadata.get('retry_ledger') or {}))
-        except ValidationError:
-            ledger = RetryLedger()
+        ledger = _build_retry_ledger(metadata)
 
         verdict = _evaluate_merge_thrash(
             ledger, prev_signature, current_signature,
