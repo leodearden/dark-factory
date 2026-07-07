@@ -26,7 +26,12 @@ from orchestrator.git_ops import (
     WorktreeInfo,
     _run,
 )
-from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME, LaneState
+from orchestrator.lane_lifecycle import (
+    ACQUIRE_ROUTE_TRANSITIONS,
+    LANE_STATE_DIRNAME,
+    AcquireRoute,
+    LaneState,
+)
 
 # ---------------------------------------------------------------------------
 # Repo fixture (mirrors test_warm_lane_abort_teardown.py)
@@ -129,6 +134,168 @@ class TestAcquireWarmLaneWritesAssignedRecord:
         assert record_path.is_file(), (
             f'expected a durable record file to exist at {record_path}'
         )
+
+
+# ---------------------------------------------------------------------------
+# _note_assigned_via_route: route-table-driven ASSIGNED writer (W11 eta)
+# ---------------------------------------------------------------------------
+
+
+def _bare_git_ops(tmp_path: Path) -> GitOps:
+    """A GitOps instance over a plain (non-git) directory.
+
+    _note_assigned_via_route only touches self._lane_lifecycle (file-based
+    JSON records) and never shells out to git, so — like
+    TestPoolStorageSentinelDelegation above — these tests don't need a real
+    git repo or the warm-lane scripts/base fixtures.
+    """
+    project_root = tmp_path / 'project'
+    project_root.mkdir()
+    return GitOps(_warm_config(), project_root)
+
+
+class TestNoteAssignedViaRoute:
+    """GitOps._note_assigned_via_route must reproduce _lifecycle_note_assigned's
+    dynamic FROM-state normalization while reading its terminal target from
+    ACQUIRE_ROUTE_TRANSITIONS[route] (making the table load-bearing)."""
+
+    def test_none_origin_bootstraps_to_assigned(self, tmp_path: Path):
+        git_ops = _bare_git_ops(tmp_path)
+        lane = git_ops.worktree_base / '_lane-0'
+
+        git_ops._note_assigned_via_route(
+            lane, AcquireRoute.CREATE_ONCE_FRESH, '321', 'Fix X', 'task/321',
+        )
+
+        record = git_ops._lane_lifecycle.read(lane)
+        assert record is not None
+        assert record.state is LaneState.ASSIGNED
+        assert record.task_id == '321'
+        assert record.title == 'Fix X'
+        assert record.branch == 'task/321'
+
+    def test_registered_transitions_to_assigned(self, tmp_path: Path):
+        git_ops = _bare_git_ops(tmp_path)
+        lane = git_ops.worktree_base / '_lane-0'
+        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
+        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/foo')
+
+        git_ops._note_assigned_via_route(
+            lane, AcquireRoute.CREATE_ONCE_FRESH, '321', 'Fix X', 'task/321',
+        )
+
+        record = git_ops._lane_lifecycle.read(lane)
+        assert record is not None
+        assert record.state is LaneState.ASSIGNED
+        assert record.task_id == '321'
+
+    def test_released_transitions_to_assigned(self, tmp_path: Path):
+        git_ops = _bare_git_ops(tmp_path)
+        lane = git_ops.worktree_base / '_lane-0'
+        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
+        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/foo')
+        git_ops._lane_lifecycle.transition(
+            lane, LaneState.ASSIGNED, task_id='999', title='old',
+        )
+        git_ops._lane_lifecycle.transition(lane, LaneState.IN_USE)
+        git_ops._lane_lifecycle.transition(lane, LaneState.RELEASED)
+
+        git_ops._note_assigned_via_route(
+            lane, AcquireRoute.REUSE, '321', 'Fix X', 'task/321',
+        )
+
+        record = git_ops._lane_lifecycle.read(lane)
+        assert record is not None
+        assert record.state is LaneState.ASSIGNED
+        assert record.task_id == '321'
+        assert record.title == 'Fix X'
+
+    def test_same_task_assigned_is_idempotent_noop(self, tmp_path: Path):
+        git_ops = _bare_git_ops(tmp_path)
+        lane = git_ops.worktree_base / '_lane-0'
+        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
+        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/321')
+        before = git_ops._lane_lifecycle.transition(
+            lane, LaneState.ASSIGNED, task_id='321', title='Fix X', branch='task/321',
+        )
+
+        git_ops._note_assigned_via_route(
+            lane, AcquireRoute.REUSE, '321', 'Fix X', 'task/321',
+        )
+
+        after = git_ops._lane_lifecycle.read(lane)
+        assert after == before, (
+            f'expected an idempotent no-op for same-task reuse; '
+            f'before={before!r} after={after!r}'
+        )
+
+    def test_different_task_releases_first_then_assigns(self, tmp_path: Path):
+        git_ops = _bare_git_ops(tmp_path)
+        lane = git_ops.worktree_base / '_lane-0'
+        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
+        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/999')
+        git_ops._lane_lifecycle.transition(
+            lane, LaneState.ASSIGNED, task_id='999', title='old',
+        )
+
+        git_ops._note_assigned_via_route(
+            lane, AcquireRoute.RECYCLE, '321', 'Fix X', 'task/321',
+        )
+
+        record = git_ops._lane_lifecycle.read(lane)
+        assert record is not None
+        assert record.state is LaneState.ASSIGNED
+        assert record.task_id == '321'
+        assert record.title == 'Fix X'
+
+    def test_in_use_releases_first_then_assigns(self, tmp_path: Path):
+        git_ops = _bare_git_ops(tmp_path)
+        lane = git_ops.worktree_base / '_lane-0'
+        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
+        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/999')
+        git_ops._lane_lifecycle.transition(
+            lane, LaneState.ASSIGNED, task_id='999', title='old',
+        )
+        git_ops._lane_lifecycle.transition(lane, LaneState.IN_USE)
+
+        git_ops._note_assigned_via_route(
+            lane, AcquireRoute.RECYCLE, '321', 'Fix X', 'task/321',
+        )
+
+        record = git_ops._lane_lifecycle.read(lane)
+        assert record is not None
+        assert record.state is LaneState.ASSIGNED
+        assert record.task_id == '321'
+
+    def test_quarantined_lane_never_raises_and_record_unchanged(self, tmp_path: Path):
+        git_ops = _bare_git_ops(tmp_path)
+        lane = git_ops.worktree_base / '_lane-0'
+        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
+        before = git_ops._lane_lifecycle.transition(lane, LaneState.QUARANTINED)
+
+        git_ops._note_assigned_via_route(
+            lane, AcquireRoute.CREATE_ONCE_FRESH, '321', 'Fix X', 'task/321',
+        )  # must not raise
+
+        after = git_ops._lane_lifecycle.read(lane)
+        assert after == before, (
+            f'expected the QUARANTINED record to be left untouched; '
+            f'before={before!r} after={after!r}'
+        )
+
+    def test_write_targets_the_routes_canonical_assigned_edge(self, tmp_path: Path):
+        """No route's canonical target is anything other than ASSIGNED (by
+        construction, per ACQUIRE_ROUTE_TRANSITIONS) — assert the writer
+        actually uses that table lookup (not a hardcoded constant) across
+        every route."""
+        git_ops = _bare_git_ops(tmp_path)
+        for route in AcquireRoute:
+            lane = git_ops.worktree_base / f'_lane-{route.value}'
+            git_ops._note_assigned_via_route(lane, route, '321', 'Fix X', 'task/321')
+            record = git_ops._lane_lifecycle.read(lane)
+            assert record is not None
+            assert record.state is ACQUIRE_ROUTE_TRANSITIONS[route][1]
+            assert record.state is LaneState.ASSIGNED
 
 
 # ---------------------------------------------------------------------------
