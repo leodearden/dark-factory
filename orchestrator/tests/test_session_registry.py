@@ -32,7 +32,12 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
     test can catch a field being dropped/mis-typed; ``overrides`` lets a
     test tweak just the field(s) it cares about.
     """
-    fields: dict[str, object] = {
+    # Declared as a bare `dict` (not `dict[str, object]`) so pyright treats it
+    # as dict[Unknown, Unknown] at the **fields unpack below -- mirrors
+    # test_merge_types_invariants.py's _real_kwargs/_decided_kwargs/_entry_kwargs,
+    # the established idiom in this suite for a kwargs-builder helper whose
+    # result is unpacked into a strictly-typed constructor.
+    fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
         'status': sr.Status.LAUNCHING,
         'title': 'unblock:df#2085 routing-mechanism',
