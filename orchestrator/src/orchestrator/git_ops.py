@@ -2666,6 +2666,36 @@ class GitOps:
         *,
         expected_title: str | None = None,
     ) -> 'WorktreeInfo | WarmLaneUnavailable':
+        """Thin durable-record chokepoint wrapping :meth:`_acquire_warm_lane_impl`.
+
+        Delegates to :meth:`_acquire_warm_lane_impl` for the full acquire
+        logic (see that method's docstring for the complete contract) and,
+        iff it returns a :class:`WorktreeInfo` (success), records the durable
+        ASSIGNED lifecycle edge via :meth:`_lifecycle_note_assigned` — the
+        SINGLE chokepoint covering all of the impl's internal routes (reuse,
+        create-once, disk-backstop, reset-in-place, and their reattach
+        variants) without restructuring any of them (per-route named edges
+        are task eta's job, PRD Mechanism 3). Fault paths return
+        WarmLaneUnavailable (never WorktreeInfo), so they never write
+        ASSIGNED — consistent with :meth:`_abort_lane_acquisition` teardown.
+        """
+        result = await self._acquire_warm_lane_impl(
+            branch_name, start_ref, expected_title=expected_title,
+        )
+        if isinstance(result, WorktreeInfo):
+            self._lifecycle_note_assigned(
+                result.path, branch_name, expected_title,
+                f'{self.config.branch_prefix}{branch_name}',
+            )
+        return result
+
+    async def _acquire_warm_lane_impl(
+        self,
+        branch_name: str,
+        start_ref: str,
+        *,
+        expected_title: str | None = None,
+    ) -> 'WorktreeInfo | WarmLaneUnavailable':
         """Allocate a FREE warm lane, seed/reset it, and return a WorktreeInfo.
 
         **Create-once path** (lane not yet a registered worktree):
@@ -3215,6 +3245,66 @@ class GitOps:
             )
             await self._abort_lane_acquisition(lane, branch_name, remove_worktree=False)
             return WarmLaneUnavailable.FAULT
+
+    def _lifecycle_note_assigned(
+        self, lane: Path, task_id: str, title: str | None, branch: str,
+    ) -> None:
+        """Best-effort durable ASSIGNED write for :meth:`acquire_warm_lane`.
+
+        Normalizes whatever state the lane's durable record is CURRENTLY in
+        onto a legal edge ending at ASSIGNED, rather than calling
+        ``transition(lane, ASSIGNED)`` directly — ``LEGAL_TRANSITIONS``
+        forbids ``(None, ASSIGNED)`` and ``(ASSIGNED, ASSIGNED)``, and the
+        pool's 2-value FREE/ASSIGNED cache does not map 1:1 onto the 6-state
+        durable model (pre-gamma live lanes have no record at all until
+        task kappa's migration adopt):
+
+        * Same-task reuse (already ASSIGNED to this task_id): no-op —
+          idempotent.
+        * Currently ASSIGNED (to a DIFFERENT task) or IN_USE (steal/recycle):
+          released first, so RELEASED -> ASSIGNED is the edge actually taken.
+        * No record yet (``None``): bootstrapped ``SEED -> REGISTERED``
+          before the ASSIGNED write.
+        * SEED (should not normally occur pre-gamma, but handled for
+          completeness): registered before the ASSIGNED write.
+        * REGISTERED or RELEASED: assigned directly (both are legal
+          predecessors of ASSIGNED).
+
+        Best-effort / never-raise (mirrors :meth:`mark_pool_storage_present`):
+        any exception (including a genuine ``IllegalLaneTransition``, e.g. a
+        QUARANTINED lane) is logged and swallowed so a durable-record hiccup
+        never regresses ``acquire_warm_lane`` itself.
+        """
+        try:
+            rec = self._lane_lifecycle.read(lane)
+            if (
+                rec is not None
+                and rec.state is LaneState.ASSIGNED
+                and rec.task_id == str(task_id)
+            ):
+                return  # idempotent same-task reuse
+            state = rec.state if rec is not None else None
+            if state in (LaneState.ASSIGNED, LaneState.IN_USE):
+                self._lane_lifecycle.transition(lane, LaneState.RELEASED)
+                state = LaneState.RELEASED
+            if state is None:
+                self._lane_lifecycle.transition(lane, LaneState.SEED)
+                self._lane_lifecycle.transition(
+                    lane, LaneState.REGISTERED, branch=branch,
+                )
+            elif state is LaneState.SEED:
+                self._lane_lifecycle.transition(
+                    lane, LaneState.REGISTERED, branch=branch,
+                )
+            self._lane_lifecycle.transition(
+                lane, LaneState.ASSIGNED, task_id=str(task_id), title=title, branch=branch,
+            )
+        except Exception:
+            logger.warning(
+                '_lifecycle_note_assigned: failed to record ASSIGNED for lane '
+                '%s (task %s) — durable record may be stale/inconsistent',
+                lane, task_id, exc_info=True,
+            )
 
     async def _reuse_warm_lane(
         self, lane_dir: Path, full_branch: str,
