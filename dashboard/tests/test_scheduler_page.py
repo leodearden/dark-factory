@@ -950,6 +950,94 @@ async def test_get_scheduler_snapshot_single_flight_collapses_concurrent_misses(
 
 
 # ---------------------------------------------------------------------------
+# task-2218 step-5: guard the TTLCache swap — hooks (_scheduler_cache_clear,
+# runtime-monkeypatchable _SCHEDULER_TTL_SECONDS) and single-flight must
+# survive get_scheduler_snapshot's cache moving onto mcp_fanout.TTLCache.
+# ---------------------------------------------------------------------------
+
+
+async def test_get_scheduler_snapshot_ttlcache_preserves_hooks_and_single_flight(
+    dummy_client, dummy_config, monkeypatch
+):
+    """One test exercising all three TTLCache-backed seams together.
+
+    (a) Within TTL: two sequential calls invoke the collector once and return
+        an identical (six_tuple, snapshot_at) pair.
+    (b) After _scheduler_cache_clear() + monkeypatching _SCHEDULER_TTL_SECONDS
+        to 0.0: two calls each invoke the collector (the callable/monkeypatched
+        TTL must still be honored, not a value captured once at construction).
+    (c) After _scheduler_cache_clear() + TTL 9999.0: three concurrent callers
+        on a cold cache (gated by an asyncio.Event) collapse onto exactly one
+        collector invocation and all three receive the same snapshot_at
+        (single-flight is preserved by TTLCache.get_or_refresh).
+
+    Complements (rather than replaces) the pre-existing dedicated cache and
+    single-flight tests above — this test's job is specifically to guard that
+    swapping the hand-rolled double-checked-locking implementation for
+    mcp_fanout.TTLCache doesn't silently drop any of these three seams.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    import dashboard.data.scheduler as sched
+
+    empty_6tuple = ([], [], [], {}, [], [])
+
+    # (a) within TTL
+    sched._scheduler_cache_clear()
+    mock_collector_a = AsyncMock(return_value=empty_6tuple)
+    with patch('dashboard.data.scheduler.collect_scheduler_state', new=mock_collector_a):
+        result1 = await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+        result2 = await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+
+    assert mock_collector_a.call_count == 1
+    assert result1 == result2
+    assert result1[1] is not None
+
+    # (b) TTL=0.0 monkeypatch — still honored after clear
+    sched._scheduler_cache_clear()
+    monkeypatch.setattr(sched, '_SCHEDULER_TTL_SECONDS', 0.0)
+    mock_collector_b = AsyncMock(return_value=empty_6tuple)
+    with patch('dashboard.data.scheduler.collect_scheduler_state', new=mock_collector_b):
+        await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+        await sched.get_scheduler_snapshot(dummy_client, dummy_config)
+
+    assert mock_collector_b.call_count == 2, (
+        'callable/monkeypatched TTL=0.0 must force a re-fetch on every call'
+    )
+
+    # (c) single-flight on a cold cache with TTL restored to a large value
+    sched._scheduler_cache_clear()
+    monkeypatch.setattr(sched, '_SCHEDULER_TTL_SECONDS', 9999.0)
+    counter = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_collector(_client, _config):
+        nonlocal counter
+        counter += 1
+        started.set()
+        await release.wait()
+        return empty_6tuple
+
+    with patch('dashboard.data.scheduler.collect_scheduler_state', side_effect=slow_collector):
+        tasks = [
+            asyncio.create_task(sched.get_scheduler_snapshot(dummy_client, dummy_config))
+            for _ in range(3)
+        ]
+        await started.wait()
+        await asyncio.sleep(0)  # yield so the other two callers queue up
+        release.set()
+        results = await asyncio.gather(*tasks)
+
+    assert counter == 1, f'expected a single underlying collection, got counter={counter}'
+    snapshot_ats = [r[1] for r in results]
+    assert len(set(snapshot_ats)) == 1, (
+        f'all concurrent cold callers must receive the same snapshot_at, got {snapshot_ats}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # task-1569 step-5: endpoint threads snapshot_at through the envelope
 # ---------------------------------------------------------------------------
 
