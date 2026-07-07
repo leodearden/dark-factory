@@ -1,11 +1,14 @@
 """Tests for MCP task-tool behavior (update_task, set_task_status, etc.)."""
 
 import json
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
 
 from fused_memory.server.tools import create_mcp_server
+
+_TOOLS_LOGGER = 'fused_memory.server.tools'
 
 
 @pytest.fixture(autouse=True)
@@ -328,6 +331,95 @@ async def test_update_task_allows_unrelated_metadata(
     )
     assert result == {'success': True}
     task_interceptor.update_task.assert_called_once()
+
+
+# ------------------------------------------------------------------
+# update_task metadata discard WARN (task 2166 step-11)
+#
+# _reject_done_provenance_in_metadata's inline str->dict json.loads branch
+# must delegate its malformed-input policy to
+# shared.task_metadata.parse_metadata(direction='read') and emit a
+# task_metadata.schema_warning WARNING on a genuine whole-metadata discard
+# (unparseable JSON / non-object) instead of silently returning None — I4.
+# The done_provenance rejection/pass-through behavior itself is unchanged.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_unparseable_metadata_warns_and_forwards(
+    mcp_server_with_tasks, task_interceptor, caplog,
+):
+    """RED: the closure's str branch currently discards silently (returns None,
+    not rejected) — it must also warn, and must still forward to the
+    interceptor since an unparseable string can't carry done_provenance."""
+    with caplog.at_level(logging.WARNING, logger=_TOOLS_LOGGER):
+        result = await mcp_server_with_tasks._tool_manager.call_tool(
+            'update_task',
+            {'id': '1', 'project_root': '/project', 'metadata': 'not valid json {{{'},
+        )
+    assert result == {'success': True}
+    task_interceptor.update_task.assert_called_once()
+    warns = [
+        r for r in caplog.records
+        if r.name == _TOOLS_LOGGER and r.levelno >= logging.WARNING
+    ]
+    assert any('task_metadata.schema_warning' in r.message for r in warns), (
+        f'expected a task_metadata.schema_warning WARNING; got '
+        f'{[r.message for r in warns]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_json_string_with_done_provenance_still_rejected(
+    mcp_server_with_tasks, task_interceptor, caplog,
+):
+    """A parseable JSON-string metadata carrying done_provenance is still
+    rejected after the parser collapse, with no spurious discard warning."""
+    with caplog.at_level(logging.WARNING, logger=_TOOLS_LOGGER):
+        result = await mcp_server_with_tasks._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '1', 'project_root': '/project',
+                'metadata': '{"done_provenance": {"kind": "merged", "commit": "abc"}}',
+            },
+        )
+    assert result.get('error_type') == 'ValidationError'
+    assert 'set_task_status' in result['error']
+    task_interceptor.update_task.assert_not_called()
+    warns = [
+        r for r in caplog.records
+        if r.name == _TOOLS_LOGGER and r.levelno >= logging.WARNING
+    ]
+    assert not warns, (
+        f'a parseable metadata string must not emit a discard WARNING; got '
+        f'{[r.message for r in warns]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_json_string_without_done_provenance_not_rejected(
+    mcp_server_with_tasks, task_interceptor, caplog,
+):
+    """A parseable JSON-string metadata without done_provenance is forwarded,
+    with no spurious discard warning."""
+    with caplog.at_level(logging.WARNING, logger=_TOOLS_LOGGER):
+        result = await mcp_server_with_tasks._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '1', 'project_root': '/project',
+                'metadata': '{"priority": "high"}',
+            },
+        )
+    assert result == {'success': True}
+    task_interceptor.update_task.assert_called_once()
+    warns = [
+        r for r in caplog.records
+        if r.name == _TOOLS_LOGGER and r.levelno >= logging.WARNING
+    ]
+    assert not warns, (
+        f'a parseable metadata string must not emit a discard WARNING; got '
+        f'{[r.message for r in warns]!r}'
+    )
 
 
 # ------------------------------------------------------------------
