@@ -319,3 +319,123 @@ class TestDataLayerErrorHandling:
             with patch.object(conn, 'execute', return_value=mock_cursor):
                 result = await get_agent_breakdown(conn)
         assert result == {'labels': [], 'values': []}
+
+
+def _seed_write_ops(db_path, rows):
+    """Create a write_ops SQLite DB at *db_path* seeded with *rows*.
+
+    Each row is ``(op_id, operation, project_id, agent_id, kind, created_at)``,
+    matching the column order used throughout this module's fixtures.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(WRITE_OPS_SCHEMA)
+    for op_id, operation, project_id, agent_id, kind, created_at in rows:
+        conn.execute(
+            'INSERT INTO write_ops (id, operation, project_id, agent_id, kind, created_at)'
+            ' VALUES (?, ?, ?, ?, ?, ?)',
+            (op_id, operation, project_id, agent_id, kind, created_at),
+        )
+    conn.commit()
+    conn.close()
+
+
+class TestNowThreading:
+    """now-threading: each function accepts now=fixed and derives its cutoff from it.
+
+    Mirrors ``Test_Cutoff`` in test_costs_data.py: a fixed-now determinism test
+    per function plus one no-now bracket test, rather than relying on the
+    live clock for every assertion.
+    """
+
+    FIXED_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+
+    @pytest.mark.asyncio
+    async def test_memory_timeseries_uses_provided_now(self, tmp_path):
+        """get_memory_timeseries(now=fixed) buckets rows against fixed, not the live clock.
+
+        One row 1h before FIXED_NOW (well inside the 24h window relative to
+        FIXED_NOW) and one row 25h before FIXED_NOW (outside it). FIXED_NOW is
+        an arbitrary historical instant unrelated to the real current time, so
+        this only passes if the function actually threads `now` through.
+        """
+        from dashboard.data.write_journal import get_memory_timeseries
+
+        db_path = tmp_path / 'timeseries_fixed_now.db'
+        inside = self.FIXED_NOW - timedelta(hours=1)
+        outside = self.FIXED_NOW - timedelta(hours=25)
+        _seed_write_ops(db_path, [
+            ('in-1', 'search', 'dark_factory', 'agent-a', 'read', inside.isoformat()),
+            ('out-1', 'search', 'dark_factory', 'agent-a', 'read', outside.isoformat()),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await get_memory_timeseries(conn, now=self.FIXED_NOW)
+        assert sum(result['reads']) == 1
+
+    @pytest.mark.asyncio
+    async def test_memory_timeseries_no_now_resolves_via_clock(self, tmp_path):
+        """Without now, get_memory_timeseries still buckets against the live clock.
+
+        Same shape as the fixed-now test above, but rows are anchored to the
+        real ``datetime.now(UTC)`` and no ``now`` kwarg is passed — regression
+        coverage for the default (no-now) path once resolve_now is threaded in.
+        """
+        from dashboard.data.write_journal import get_memory_timeseries
+
+        db_path = tmp_path / 'timeseries_live_clock.db'
+        real_now = datetime.now(UTC)
+        inside = real_now - timedelta(hours=1)
+        outside = real_now - timedelta(hours=25)
+        _seed_write_ops(db_path, [
+            ('in-1', 'search', 'dark_factory', 'agent-a', 'read', inside.isoformat()),
+            ('out-1', 'search', 'dark_factory', 'agent-a', 'read', outside.isoformat()),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await get_memory_timeseries(conn)
+        assert sum(result['reads']) == 1
+
+    @pytest.mark.asyncio
+    async def test_operations_breakdown_uses_provided_now_at_minute_boundary(self, tmp_path):
+        """get_operations_breakdown(now=fixed): fixed-24h+1min is counted, fixed-24h-1min is not.
+
+        Unlike get_memory_timeseries, this function's cutoff is a plain
+        ``created_at >= since`` comparison (no hour-bucketing), so a tight
+        1-minute boundary deterministically separates included/excluded rows.
+        """
+        from dashboard.data.write_journal import get_operations_breakdown
+
+        db_path = tmp_path / 'ops_fixed_now_boundary.db'
+        cutoff = self.FIXED_NOW - timedelta(hours=24)
+        just_inside = cutoff + timedelta(minutes=1)
+        just_outside = cutoff - timedelta(minutes=1)
+        _seed_write_ops(db_path, [
+            ('in-1', 'search', 'dark_factory', 'agent-a', 'read', just_inside.isoformat()),
+            ('out-1', 'search', 'dark_factory', 'agent-a', 'read', just_outside.isoformat()),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await get_operations_breakdown(conn, now=self.FIXED_NOW)
+        assert sum(result['values']) == 1
+
+    @pytest.mark.asyncio
+    async def test_agent_breakdown_uses_provided_now_at_minute_boundary(self, tmp_path):
+        """get_agent_breakdown(now=fixed): fixed-24h+1min is counted, fixed-24h-1min is not."""
+        from dashboard.data.write_journal import get_agent_breakdown
+
+        db_path = tmp_path / 'agents_fixed_now_boundary.db'
+        cutoff = self.FIXED_NOW - timedelta(hours=24)
+        just_inside = cutoff + timedelta(minutes=1)
+        just_outside = cutoff - timedelta(minutes=1)
+        _seed_write_ops(db_path, [
+            ('in-1', 'search', 'dark_factory', 'agent-a', 'read', just_inside.isoformat()),
+            ('out-1', 'search', 'dark_factory', 'agent-a', 'read', just_outside.isoformat()),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await get_agent_breakdown(conn, now=self.FIXED_NOW)
+        assert sum(result['values']) == 1
