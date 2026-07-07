@@ -1091,6 +1091,20 @@ class GitOps:
         the callback so a guard site can never be broken by escalation-filing
         failing — mirrors the other declare-on-callee callback dispatchers in
         this class.
+
+        **No dedup/debounce here (review-fix, gitops-chokepoints α)**: this
+        dispatcher fires on EVERY refusal with no rate-limiting of its own.
+        Since :meth:`_prune_registrations` is now the chokepoint for all six
+        callers (``prune_worktrees`` plus five converted sweep sites,
+        including hot paths like ``create_worktree``'s leftover-branch
+        cleanup and ``reap_interactive_worktrees``), a sustained mount-down
+        can drive many calls here per tick.  Collapsing those repeats into a
+        single operator-visible signal is entirely the installed handler's
+        responsibility, not this method's — in production that's
+        ``Harness._file_pool_storage_absent_escalation``, which dedupes via
+        ``has_open_l1`` so only one pool-storage-absent escalation is ever
+        open at a time.  A handler wired without that dedup would see one
+        escalation attempt per refused prune.
         """
         if self._on_pool_storage_absent is None:
             return
@@ -7065,6 +7079,12 @@ class GitOps:
         skipped (there is nothing to prune yet) but the escalation callback
         is suppressed so a legitimate cold start does not file operator
         noise; the sentinel appears for real once the first seed runs.
+
+        **Escalation debounce**: the refusal branch below calls
+        :meth:`_note_pool_storage_absent` unconditionally on every refusal —
+        see that method's docstring for why repeated calls from hot sweep
+        sites (e.g. ``create_worktree``, ``reap_interactive_worktrees``) do
+        not multiply operator-visible escalations.
         """
         if self.pool_in_use() and not self.pool_storage_present():
             if self._pool_storage_bootstrap_ok():
