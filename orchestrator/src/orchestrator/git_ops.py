@@ -41,8 +41,10 @@ from typing import Any, Literal, NamedTuple, TypedDict
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
 from orchestrator.lane_lifecycle import (
+    ACQUIRE_ROUTE_TRANSITIONS,
     LANE_STATE_DIRNAME,
     POOL_ROOT_SENTINEL,  # noqa: F401  re-export shim (test_pool_storage_guard.py)
+    AcquireRoute,
     LaneLifecycle,
     LaneState,
 )
@@ -3304,6 +3306,66 @@ class GitOps:
                 '_lifecycle_note_assigned: failed to record ASSIGNED for lane '
                 '%s (task %s) — durable record may be stale/inconsistent',
                 lane, task_id, exc_info=True,
+            )
+
+    def _note_assigned_via_route(
+        self, lane: Path, route: AcquireRoute, task_id: str, title: str | None, branch: str,
+    ) -> None:
+        """Route-named durable ASSIGNED write for :meth:`_acquire_warm_lane_impl`.
+
+        Same dynamic FROM-state normalization as :meth:`_lifecycle_note_assigned`
+        (see that method's docstring), but the terminal target is read from
+        ``ACQUIRE_ROUTE_TRANSITIONS[route][1]`` — always ``LaneState.ASSIGNED``
+        by construction (validated at :mod:`orchestrator.lane_lifecycle` import
+        time) — making the route table load-bearing, and an INFO log line
+        records which named route (PRD W11 eta Mechanism 3) the acquire took.
+
+        Best-effort / never-raise: any exception (including a genuine
+        ``IllegalLaneTransition``, e.g. a QUARANTINED lane) is logged and
+        swallowed so a durable-record hiccup never regresses
+        ``acquire_warm_lane`` itself.
+        """
+        target = ACQUIRE_ROUTE_TRANSITIONS[route][1]
+        try:
+            rec = self._lane_lifecycle.read(lane)
+            original_state = rec.state if rec is not None else None
+            if (
+                rec is not None
+                and rec.state is target
+                and rec.task_id == str(task_id)
+            ):
+                logger.info(
+                    'acquire_warm_lane: route=%s edge=%s->%s(noop) lane=%s task=%s',
+                    route.value, original_state.value, target.value, lane, task_id,
+                )
+                return  # idempotent same-task reuse
+            state = original_state
+            if state in (LaneState.ASSIGNED, LaneState.IN_USE):
+                self._lane_lifecycle.transition(lane, LaneState.RELEASED)
+                state = LaneState.RELEASED
+            if state is None:
+                self._lane_lifecycle.transition(lane, LaneState.SEED)
+                self._lane_lifecycle.transition(
+                    lane, LaneState.REGISTERED, branch=branch,
+                )
+            elif state is LaneState.SEED:
+                self._lane_lifecycle.transition(
+                    lane, LaneState.REGISTERED, branch=branch,
+                )
+            self._lane_lifecycle.transition(
+                lane, target, task_id=str(task_id), title=title, branch=branch,
+            )
+            logger.info(
+                'acquire_warm_lane: route=%s edge=%s->%s lane=%s task=%s',
+                route.value,
+                original_state.value if original_state is not None else 'none',
+                target.value, lane, task_id,
+            )
+        except Exception:
+            logger.warning(
+                '_note_assigned_via_route: failed to record %s for lane %s '
+                '(task %s, route %s) — durable record may be stale/inconsistent',
+                target, lane, task_id, route.value, exc_info=True,
             )
 
     async def _reuse_warm_lane(
