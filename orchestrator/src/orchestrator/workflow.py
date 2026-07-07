@@ -587,6 +587,139 @@ def classify_rebase_cohort(
     return 'post-unblock' if is_first_rebase else 'big-jump'
 
 
+@dataclass(frozen=True)
+class _LedgerVerdict:
+    """Result of a pure anti-thrash evaluator (task 2172 / W3-ε).
+
+    Bundles the updated :class:`~shared.task_metadata.RetryLedger` with the
+    escalate decision so the async guards can persist ``ledger`` and act on
+    ``escalate``/``trigger`` without repeating the counter arithmetic.
+
+    ``trigger`` is a short machine-readable label describing which condition
+    caused ``escalate=True`` (e.g. ``'same-SHA counter'``, ``'total
+    counter'``); it is the empty string when ``escalate`` is False.
+    """
+
+    ledger: RetryLedger
+    escalate: bool
+    trigger: str = ''
+
+
+def _evaluate_no_plan(ledger: RetryLedger, current_main_sha: str) -> _LedgerVerdict:
+    """Pure decision core for the no-plan-failure anti-thrash guard.
+
+    Mirrors the counter arithmetic formerly inlined in
+    ``TaskWorkflow._handle_no_plan_failure``: the same main SHA increments
+    ``consecutive_no_plan_failures``; a different (or empty) SHA resets it to
+    1. ``total_no_plan_failures`` never resets — it backstops the SHA-keyed
+    counter when main keeps moving and the per-SHA counter never reaches 2
+    (the bug behind 16 successive Opus calls on task 917).
+
+    Escalates when ``consecutive >= 2`` (same-SHA thrash) OR ``total >= 3``
+    (persistent no-plan failures across changing SHAs); when both fire
+    simultaneously the same-SHA trigger takes precedence in the label.
+    """
+    last_sha = ledger.last_no_plan_main_sha or ''
+    counter = ledger.consecutive_no_plan_failures
+    total = ledger.total_no_plan_failures
+
+    if not current_main_sha or last_sha != current_main_sha:
+        counter = 1
+    else:
+        counter += 1
+    total += 1
+
+    escalate = counter >= 2 or total >= 3
+    trigger = ''
+    if escalate:
+        trigger = 'same-SHA counter' if counter >= 2 else 'total counter'
+
+    new_ledger = ledger.model_copy(update={
+        'last_no_plan_main_sha': current_main_sha,
+        'consecutive_no_plan_failures': counter,
+        'total_no_plan_failures': total,
+    })
+    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+
+
+def _evaluate_infra_resume(
+    ledger: RetryLedger,
+    current_iter_count: int,
+    recent_category: str | None,
+    threshold: int,
+) -> _LedgerVerdict:
+    """Pure decision core for the infra-resume-thrash anti-thrash guard.
+
+    Mirrors the counter arithmetic formerly inlined in
+    ``TaskWorkflow._check_infra_resume_thrash``. When the most recently
+    resolved L0 was classified ``'infra_issue'``: no iteration-log growth
+    since the previous resume increments the counter (thrash observed);
+    growth resets it to 1 (a steward fix-commit is forward progress). Any
+    other category — including ``None``, meaning no classifiable resolved
+    L0 — resets the counter to 0, since the thrash signal does not apply.
+    ``last_infra_resume_iteration_count`` is always refreshed to
+    ``current_iter_count`` regardless of category.
+
+    Escalates when the (possibly just-incremented) counter reaches
+    ``threshold``.
+    """
+    counter = ledger.consecutive_infra_resume_failures
+
+    if recent_category == 'infra_issue':
+        last_iter_count = ledger.last_infra_resume_iteration_count
+        if current_iter_count > last_iter_count:
+            counter = 1
+        else:
+            counter += 1
+    else:
+        counter = 0
+
+    escalate = counter >= threshold
+    trigger = 'infra-resume thrash' if escalate else ''
+
+    new_ledger = ledger.model_copy(update={
+        'consecutive_infra_resume_failures': counter,
+        'last_infra_resume_iteration_count': current_iter_count,
+    })
+    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+
+
+def _evaluate_merge_thrash(
+    ledger: RetryLedger,
+    prev_signature: str | None,
+    current_signature: str,
+    threshold: int,
+) -> _LedgerVerdict:
+    """Pure decision core for the merge-outcome-thrash anti-thrash guard.
+
+    Mirrors the counter arithmetic formerly inlined in
+    ``TaskWorkflow._check_merge_outcome_thrash``: a merge-outcome signature
+    matching the previous attempt increments ``consecutive_merge_thrash``; a
+    differing signature (or no previous signature) resets it to 1 — the
+    steward made progress on something different, and we just observed one
+    occurrence of it. ``last_merge_outcome_signature`` is always refreshed to
+    ``current_signature``.
+
+    Escalates when the (possibly just-incremented) counter reaches
+    ``threshold``.
+    """
+    counter = ledger.consecutive_merge_thrash
+
+    if prev_signature is not None and prev_signature == current_signature:
+        counter += 1
+    else:
+        counter = 1
+
+    escalate = counter >= threshold
+    trigger = 'merge-outcome thrash' if escalate else ''
+
+    new_ledger = ledger.model_copy(update={
+        'consecutive_merge_thrash': counter,
+        'last_merge_outcome_signature': current_signature,
+    })
+    return _LedgerVerdict(ledger=new_ledger, escalate=escalate, trigger=trigger)
+
+
 @dataclass
 class WorkflowMetrics:
     total_cost_usd: float = 0.0
