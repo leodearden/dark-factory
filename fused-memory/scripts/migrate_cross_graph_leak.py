@@ -140,3 +140,20 @@ def resolve_target_graph(
     if group_id in alias_map:
         return alias_map[group_id]
     return None
+
+
+def disposition_for(target_graph: str | None, present_in_target: bool) -> str:
+    """Classify a foreign node's migration disposition.
+
+    - *target_graph* is None (resolve_target_graph could not resolve a home)
+      -> UNRESOLVED, regardless of *present_in_target*.
+    - *target_graph* resolved AND already present there -> MERGE (S6): a
+      genuine duplicate uuid also lives in the home graph.
+    - *target_graph* resolved AND absent there -> MOVE (S5): a displaced-only
+      node with no copy at home yet.
+    """
+    if target_graph is None:
+        return UNRESOLVED
+    if present_in_target:
+        return MERGE
+    return MOVE
