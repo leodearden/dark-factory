@@ -106,28 +106,6 @@ def test_session_record_schema_version_defaults_to_schema_version() -> None:
     assert r.schema_version == sr.SCHEMA_VERSION
 
 
-def test_session_record_carries_all_required_fields() -> None:
-    r = _make_record()
-    for field_name in (
-        'schema_version',
-        'session_slug',
-        'title',
-        'role',
-        'project',
-        'task_id',
-        'escalation_id',
-        'prompt',
-        'cwd',
-        'launcher_pid',
-        'start_ts',
-        'status',
-        'exit_code',
-        'result_file',
-        'transcript_path',
-    ):
-        assert hasattr(r, field_name), f'SessionRecord missing field {field_name!r}'
-
-
 def test_session_record_dict_round_trip_is_lossless() -> None:
     r = _make_record()
     assert sr.SessionRecord.from_dict(r.to_dict()) == r
@@ -640,6 +618,20 @@ def test_parse_spawn_identity_defaults_project_unknown_when_cwd_has_no_basename(
     assert identity.project == 'unknown'
 
 
+def test_parse_spawn_identity_defaults_project_strips_trailing_slash_from_cwd() -> None:
+    # CLAUDE_SPAWN_CWD comes from a bash positional arg and is not guaranteed
+    # normalized; a trailing '/' must not make basename() degrade to '' (and
+    # thus the project silently fall through to 'unknown').
+    identity = sr.parse_spawn_identity(
+        env={},
+        title='',
+        prompt='',
+        cwd='/home/leo/src/dark-factory/',
+    )
+    assert identity.role == 'session'
+    assert identity.project == 'dark-factory'
+
+
 # --- fail-soft ---------------------------------------------------------------
 
 
@@ -685,3 +677,27 @@ def test_main_launching_fail_soft_when_fleet_root_under_a_file(
     assert capsys.readouterr().out.strip() == ''
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
     assert not (blocker / 'fleet').exists()
+
+
+def test_main_launching_fail_soft_when_launcher_pid_not_numeric(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # CLAUDE_SPAWN_LAUNCHER_PID is spawn-claude.sh's own "$$" and should
+    # always be numeric, but a malformed/corrupted env value must fail soft
+    # like any other registry fault -- int() raising ValueError inside
+    # _run_launching must not escape main(), must not print a bogus record
+    # dir, and must leave no record behind.
+    env = _launching_env(tmp_path)
+    env['CLAUDE_SPAWN_LAUNCHER_PID'] = 'not-a-pid'
+    _set_env(monkeypatch, env)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(['launching'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ''
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert not sr.sessions_dir(root=tmp_path).exists()

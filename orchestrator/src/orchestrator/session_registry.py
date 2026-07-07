@@ -498,7 +498,9 @@ def parse_spawn_identity(
        ``'<role>:<project>#<task-id> <short-slug>'`` (skills/spawn/SKILL.md).
        The trailing short-slug is always discarded; a project-level title
        (no ``#``) yields ``task_id=None``.
-    3. Defaults: ``role='session'``, ``project=basename(cwd)`` or ``'unknown'``.
+    3. Defaults: ``role='session'``, ``project=basename(cwd.rstrip('/'))`` or
+       ``'unknown'`` (a trailing ``'/'`` is stripped first so it doesn't
+       degrade the basename to empty).
 
     *prompt* takes no part in this resolution; it is accepted so callers have
     one function for the whole spawn-identity cascade.
@@ -519,7 +521,7 @@ def parse_spawn_identity(
     if role is None:
         role = 'session'
     if project is None:
-        project = os.path.basename(cwd) or 'unknown'
+        project = os.path.basename(cwd.rstrip('/')) or 'unknown'
 
     return SpawnIdentity(role=role, project=project, task_id=task_id, escalation_id=escalation_id)
 
