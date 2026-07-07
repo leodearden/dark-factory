@@ -154,6 +154,7 @@ from orchestrator.suffix_graph import (  # noqa: F401  re-export shim
     SuffixConflictGraph,
     SuffixConflictTracker,
 )
+from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.verify import (
     PREEXISTING_BREAK_SKIP_CATEGORIES,
     VerifyResult,
@@ -2746,15 +2747,27 @@ async def reconcile_landed_row(
       mark done; prune the row so the task re-dispatches through normal
       channels (no phantom done).
     * ``'already_done_pruned'`` (RC-3) — ``advanced_sha`` IS an ancestor of
-      ``main_sha`` and the task's status is ALREADY ``'done'``: prune only,
-      no second done-write. Checked before the RC-2 branch below so a
-      done task can never be re-marked.
+      ``main_sha`` and the task's status is already a steward-owned resting
+      state (:data:`~orchestrator.task_status.WORKFLOW_PRESERVE_STATUSES`:
+      ``done``, ``cancelled``, ``deferred``, ``blocked``, or
+      ``merge-deferred``): prune only, no done-write. A landed merge never
+      overrides a status the workflow itself is forbidden from overwriting —
+      e.g. a task the steward cancelled/blocked/deferred AFTER its merge
+      landed but BEFORE the done-write must not be resurrected to ``'done'``
+      by this reconciler, and a still-``'merge-deferred'`` train member's
+      flip-to-done stays owned by the train-merge worker, not this scan.
+      Checked before the RC-2 branch below so neither an already-done task
+      nor any other steward-owned status is ever re-marked.
     * ``'marked_done'`` (RC-2) — ``advanced_sha`` IS an ancestor of
-      ``main_sha`` and the task's status is not yet ``'done'``: the process
-      crashed between the CAS advance and the done-write. Drive the task
-      done via the existing ``merged`` done-write path, THEN consume the
-      row — that ordering means a crash between the two re-drives cleanly
-      on the next startup (the row survives to retry).
+      ``main_sha`` and the task's status is NOT in
+      ``WORKFLOW_PRESERVE_STATUSES``: the process crashed between the CAS
+      advance and the done-write. Drive the task done via the existing
+      ``merged`` done-write path, THEN consume the row — that ordering
+      means a crash between the two re-drives cleanly on the next startup
+      (the row survives to retry): if ``mark_done`` raises, the row is left
+      unconsumed and the exception propagates to :func:`reconcile_landed_outbox`'s
+      per-row ``try/except`` (tallied under ``'errors'``) rather than being
+      silently pruned.
     * ``'skipped'`` — ``scheduler.get_status`` returned ``None`` (a
       transient MCP failure): fail-safe, leave the row unconsumed for the
       next startup to retry rather than guessing done-or-not (no
@@ -2767,7 +2780,7 @@ async def reconcile_landed_row(
     status = await scheduler.get_status(row.task_id)
     if status is None:
         return 'skipped'
-    if status == 'done':
+    if status in WORKFLOW_PRESERVE_STATUSES:
         outbox.consume(row.task_id)
         return 'already_done_pruned'
     await scheduler.mark_done(row.task_id, kind='merged', sha=row.advanced_sha)
@@ -2788,6 +2801,20 @@ async def reconcile_landed_outbox(
     per-row try/except (fail-open, mirroring ``recover_pending_merges``)
     ensures one bad row never aborts the scan — its exception is logged and
     tallied under ``'errors'`` while the remaining rows still get reconciled.
+
+    KNOWN LIMITATION (reviewer_comprehensive amendment #3, task 2155): the
+    happy path (``advance_main`` → ``'advanced'`` → task marked done) never
+    calls ``outbox.consume()`` — those ``Scheduler.mark_done(kind='merged',
+    ...)`` call sites live in ``harness.py``'s ``build_train_callback_factory``
+    (train members) and ``harness.py``'s ``found_on_main`` double-landing
+    guard, plus several mirrored sites in ``workflow.py``, none of which
+    currently hold a ``LandedOutbox`` reference. A long-running orchestrator
+    therefore accumulates one row per successfully-landed task until the
+    next startup prunes them here via RC-3 (``'already_done_pruned'``) —
+    self-cleaning at boot, never a phantom-done risk. Wiring happy-path
+    consume would require changing ``workflow.py``, which is outside this
+    task's locked-module scope; left as a follow-up rather than expanded
+    into this task (see escalation log).
     """
     report = {
         'pruned_not_landed': 0,

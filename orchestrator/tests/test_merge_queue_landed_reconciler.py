@@ -176,6 +176,39 @@ class TestReconcileLandedOutboxRC3AlreadyDone:
         assert report['already_done_pruned'] == 1
         assert report['marked_done'] == 0
 
+    @pytest.mark.parametrize('preserved_status', ['cancelled', 'blocked', 'deferred', 'merge-deferred'])
+    async def test_workflow_preserve_status_row_is_pruned_without_being_resurrected(
+        self, tmp_path: Path, preserved_status: str,
+    ) -> None:
+        """A task the steward moved to a WORKFLOW_PRESERVE_STATUSES resting
+        state (amendment, reviewer_comprehensive #2) after its merge landed
+        but before the done-write must NOT be resurrected to 'done' by this
+        reconciler — the row is pruned exactly like the literal-'done' RC-3
+        case, and 'merge-deferred' stays owned by the train-merge worker.
+
+        Locks in the generalization of RC-3 from ``status == 'done'`` to
+        ``status in WORKFLOW_PRESERVE_STATUSES`` — a landed merge must never
+        override a status the workflow itself is forbidden from overwriting.
+        """
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(
+            task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0,
+        ))
+
+        reopened = LandedOutbox(path)
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result=preserved_status)
+
+        report = await reconcile_landed_outbox(reopened, git_ops_recon, scheduler)
+
+        scheduler.mark_done.assert_not_called()
+        assert reopened.lookup('Z') is None, (
+            f'{preserved_status!r} row must be pruned, not resurrected to done'
+        )
+        assert report['already_done_pruned'] == 1
+        assert report['marked_done'] == 0
+
 
 # ---------------------------------------------------------------------------
 # step-7 — scan robustness: empty outbox, error isolation, status-unknown
@@ -262,6 +295,37 @@ class TestReconcileLandedOutboxRobustness:
             'status-unknown row must be LEFT unconsumed for the next startup to retry'
         )
         assert report['skipped'] == 1
+
+    async def test_mark_done_raising_leaves_row_unconsumed_for_retry(
+        self, tmp_path: Path,
+    ) -> None:
+        """RC-2 ordering contract (amendment, reviewer_comprehensive #1):
+        mark_done runs BEFORE consume(), so a crash — or any exception —
+        between the two must leave the row for the next startup to retry.
+
+        Without this test, a regression that reordered consume() before
+        mark_done(), or that swallowed a mark_done exception instead of
+        letting it propagate to reconcile_landed_outbox's per-row
+        try/except, would still pass every other test in this file.
+        """
+        path = tmp_path / 'landed_outbox.json'
+        outbox = LandedOutbox(path)
+        outbox.record(LandedRow(task_id='Z', branch_tip_sha='tip', advanced_sha='ADV', landed_at=1.0))
+
+        reopened = LandedOutbox(path)
+        git_ops_recon = _reconciler_git_ops(main_sha='MAIN', is_ancestor_result=True)
+        scheduler = _fake_scheduler(get_status_result='in-progress')
+        scheduler.mark_done = AsyncMock(side_effect=RuntimeError('boom'))
+
+        report = await reconcile_landed_outbox(reopened, git_ops_recon, scheduler)
+
+        scheduler.mark_done.assert_called_once_with('Z', kind='merged', sha='ADV')
+        assert reopened.lookup('Z') is not None, (
+            'row must be LEFT unconsumed when mark_done raises — consume() '
+            'must never run before a successful done-write'
+        )
+        assert report['errors'] == 1
+        assert report['marked_done'] == 0
 
 
 # ---------------------------------------------------------------------------
