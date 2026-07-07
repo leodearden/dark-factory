@@ -3938,18 +3938,19 @@ def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
 
     Audit fields win on collision (a fresh ``reopen_reason`` should never be
     shadowed by a stale one from an earlier reopen).
+
+    Delegates the malformed-string policy to
+    :func:`shared.task_metadata.parse_metadata` (``direction='read'``) via
+    :func:`_parse_metadata_value` and emits a ``task_metadata.schema_warning``
+    WARNING when a non-None ``before['metadata']`` cannot be resolved to a
+    dict — I4: this replaces a silent discard (the merge still proceeds onto
+    ``{}`` so behaviour is otherwise unchanged).
     """
-    existing: dict = {}
     raw = before.get('metadata') if isinstance(before, dict) else None
-    if isinstance(raw, dict):
-        existing = dict(raw)
-    elif isinstance(raw, str) and raw:
-        try:
-            loaded = json.loads(raw)
-        except (ValueError, TypeError):
-            loaded = None
-        if isinstance(loaded, dict):
-            existing = loaded
+    parsed, warnings = _parse_metadata_value(raw)
+    if parsed is None and raw is not None:
+        _warn_metadata_discard('_merged_audit_metadata', raw, warnings)
+    existing: dict = parsed if isinstance(parsed, dict) else {}
     return {**existing, **audit_fields}
 
 
