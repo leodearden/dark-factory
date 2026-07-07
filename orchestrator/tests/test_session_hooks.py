@@ -90,3 +90,63 @@ def test_hook_session_slug_uses_cwd_fallback_when_absent(
     hook_input = {'session_id': 'sess-3'}
     slug = sh.hook_session_slug(hook_input, env={})
     assert slug == sr.build_session_slug('session', tmp_path.name, None, 'sess-3')
+
+
+# ---------------------------------------------------------------------------
+# Step-3: pure OSC-retitle + display-title helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_hook_record(**overrides: object) -> sr.SessionRecord:
+    """Minimal SessionRecord for hook_display_title's record-title fallback tests."""
+    fields: dict = {
+        'session_slug': 'session-dark-factory-sess-1',
+        'status': sr.Status.RUNNING,
+        'title': '',
+    }
+    fields.update(overrides)
+    return sr.SessionRecord(**fields)
+
+
+def test_osc_retitle_sequence_running_uses_gear_glyph() -> None:
+    seq = sh.osc_retitle_sequence(sr.Status.RUNNING, 'unblock:df#2085')
+    assert seq == '\033]0;⚙ unblock:df#2085\007'
+
+
+def test_osc_retitle_sequence_awaiting_input_uses_pause_glyph_and_label() -> None:
+    seq = sh.osc_retitle_sequence(sr.Status.AWAITING_INPUT, 'unblock:df#2085')
+    assert seq == '\033]0;⏸ AWAITING unblock:df#2085\007'
+
+
+def test_osc_retitle_sequence_idle_uses_check_glyph() -> None:
+    seq = sh.osc_retitle_sequence(sr.Status.IDLE, 'unblock:df#2085')
+    assert seq == '\033]0;✅ unblock:df#2085\007'
+
+
+def test_hook_display_title_prefers_explicit_env_title() -> None:
+    identity = sr.SpawnIdentity(role='unblock', project='df', task_id='2085', escalation_id=None)
+    env = {'CLAUDE_SPAWN_TITLE': 'unblock:df#2085 routing-mechanism'}
+    record = _make_hook_record(title='stale-title')
+    assert sh.hook_display_title(identity, env, record) == 'unblock:df#2085 routing-mechanism'
+
+
+def test_hook_display_title_falls_back_to_record_title_when_no_env_title() -> None:
+    identity = sr.SpawnIdentity(role='unblock', project='df', task_id='2085', escalation_id=None)
+    record = _make_hook_record(title='unblock:df#2085 routing-mechanism')
+    assert sh.hook_display_title(identity, env={}, record=record) == 'unblock:df#2085 routing-mechanism'
+
+
+def test_hook_display_title_derives_role_project_task_when_no_explicit_title() -> None:
+    identity = sr.SpawnIdentity(role='unblock', project='df', task_id='2085', escalation_id=None)
+    assert sh.hook_display_title(identity, env={}, record=None) == 'unblock:df#2085'
+
+
+def test_hook_display_title_derives_role_project_when_no_task_id() -> None:
+    identity = sr.SpawnIdentity(role='session', project='dark-factory', task_id=None, escalation_id=None)
+    assert sh.hook_display_title(identity, env={}, record=None) == 'session:dark-factory'
+
+
+def test_hook_display_title_ignores_blank_record_title() -> None:
+    identity = sr.SpawnIdentity(role='session', project='dark-factory', task_id=None, escalation_id=None)
+    record = _make_hook_record(title='')
+    assert sh.hook_display_title(identity, env={}, record=record) == 'session:dark-factory'
