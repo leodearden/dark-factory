@@ -93,11 +93,17 @@ STATE_TIER: dict[str, float] = {
 def score(item: ScoringItem, weights: Priorities, now: datetime) -> float:
     """Score `item` for queue ordering. Pure: `now` is injected, no RNG."""
     clamped_boost = max(weights.manual_boost.min, min(item.manual_boost, weights.manual_boost.max))
+    # max(0.0, ...) tolerates clock skew (now earlier than filed_at) by treating it as age 0.
+    age_seconds = max(0.0, (now - item.filed_at).total_seconds())
+    age_term = weights.age_curve.max_bonus * min(
+        1.0, age_seconds / weights.age_curve.saturation_seconds
+    )
     raw = (
         weights.severity_weights.get(item.severity, weights.defaults.severity)
         + weights.category_weights.get(item.category, weights.defaults.category)
         + weights.project_weights.get(item.project, weights.defaults.project)
         + weights.manual_boost.weight * clamped_boost
+        + age_term
     )
     raw = max(0.0, raw)
     urgency = raw / (1.0 + raw)
