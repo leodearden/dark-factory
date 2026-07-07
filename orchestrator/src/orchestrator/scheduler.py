@@ -38,6 +38,7 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
 # task_skipped events for "effectively infinite" skip thresholds (>= this
@@ -1059,28 +1060,55 @@ class Scheduler:
         # _on_park_stop_trip / _on_external_dep_block callback-install pattern:
         # declared here, installed by Harness.__init__.
         self._suppress_blocked_write: Callable[[str], bool] | None = None
+        # --- Consecutive-tick streak counters (task 2124) ---
+        # Backed by StreakCounter/StreakRegistry (orchestrator.streaks).  The
+        # registry owns COUNTING + GC only; fire/escalate/block decisions stay
+        # at the call sites below, which keep reading thresholds fresh from
+        # self.config each tick (hot-reload-safe).  The legacy dict/set
+        # attributes further down are ALIASED to each counter's backing
+        # container (same object, never rebound — see StreakCounter.gc's
+        # docstring) so every existing call site and test that reads/writes
+        # them directly keeps working unchanged.
+        self._streak_external_unresolved = StreakCounter(key_fn=lambda k: k[0])
+        self._streak_local_backfill = StreakCounter(key_fn=lambda k: k[0])
+        self._streak_hold = StreakCounter()
+        self._streak_resolver_degraded = StreakCounter()
+        self._streak_starvation = StreakCounter()
+        self._streak_registry = StreakRegistry()
+        self._streak_registry.register('external_unresolved', self._streak_external_unresolved)
+        self._streak_registry.register('local_backfill', self._streak_local_backfill)
+        self._streak_registry.register('hold', self._streak_hold)
+        self._streak_registry.register('resolver_degraded', self._streak_resolver_degraded)
+        self._streak_registry.register(
+            'starvation', self._streak_starvation, on_gc=self._starvation_gc_resolve
+        )
+
         # Per-(task_id, dep_string) count of consecutive ticks where the dep
         # resolved to a sentinel (unknown_project/unknown_task/malformed).
         # Process-local — a scheduler restart is an acceptable implicit reset,
         # matching _requeue_counts/_skip_count idioms above.
-        self._external_unresolved_counts: dict[tuple[str, str], int] = {}
+        # ALIASED to _streak_external_unresolved.counts (task 2124).
+        self._external_unresolved_counts = self._streak_external_unresolved.counts
         # Per-(task_id, dep_id) count of consecutive ticks where the LOCAL dep
         # backfill get_statuses call degraded (parse failure or empty result).
         # Mirrors _external_unresolved_counts for local deps.  GC'd in the
         # per-tick stale-id sweep alongside _external_unresolved_counts.
-        self._local_backfill_unresolved_counts: dict[tuple[str, str], int] = {}
+        # ALIASED to _streak_local_backfill.counts (task 2124).
+        self._local_backfill_unresolved_counts = self._streak_local_backfill.counts
         # Per-task_id count of consecutive ticks where the external-dep gate
         # held dispatch (either because the resolver was degraded, or because
         # all deps returned live non-done statuses).  Keyed by task_id (str).
         # Process-local — same rationale as _external_unresolved_counts.
         # GC'd alongside _external_unresolved_counts in the per-tick stale-id sweep.
-        self._external_hold_streak: dict[str, int] = {}
+        # ALIASED to _streak_hold.counts (task 2124).
+        self._external_hold_streak = self._streak_hold.counts
         # Tracks the most-recent cause for _external_hold_streak[task_id].
         # Reset alongside the streak.  When the cause changes tick-over-tick
         # (e.g. resolver degraded → dep live) the streak resets to zero so the
         # emitted external_dep_gate_held.cause always reflects the dominant
         # (consecutive-run) reason, not a mixed accumulation.
-        self._external_hold_cause: dict[str, str] = {}
+        # ALIASED to _streak_hold.causes (task 2124).
+        self._external_hold_cause = self._streak_hold.causes
         # Per-task_id count of CONSECUTIVE ticks where the resolver was degraded
         # (external_err is not None).  Keyed by task_id (str) — whole-tick
         # granularity (the resolver fails for every dep on a tick, so per-dep
@@ -1090,17 +1118,20 @@ class Scheduler:
         # silently forever (prefer-loud backstop, task 1855).
         # Process-local; GC'd in the per-tick stale-id sweep alongside
         # _external_hold_streak / _external_hold_cause.
-        self._external_resolver_degraded_counts: dict[str, int] = {}
+        # ALIASED to _streak_resolver_degraded.counts (task 2124).
+        self._external_resolver_degraded_counts = self._streak_resolver_degraded.counts
         # --- Starvation watchdog state (task 1880) ---
         # Wall-clock timestamp (from _time_source) of the first tick a task appeared
         # as a dispatch-eligible candidate.  Cleared when the task leaves the
         # candidate pool for any tick (continuity reset) so idle measures uninterrupted
         # dispatch-eligibility.  GC'd in the per-tick stale-id sweep.
-        self._starvation_first_seen: dict[str, float] = {}
+        # ALIASED to _streak_starvation.first_seen (task 2124).
+        self._starvation_first_seen = self._streak_starvation.first_seen
         # Tasks for which a STARVATION_WATCHDOG INFO escalation is currently open.
         # Prevents re-filing per tick (belt-and-suspenders with the harness-side
         # get_by_task dedup).  Cleared when the task dispatches or is GC'd.
-        self._starvation_escalated: set[str] = set()
+        # ALIASED to _streak_starvation.escalated (task 2124).
+        self._starvation_escalated = self._streak_starvation.escalated
         # Callback installed by the Harness to file an INFO escalation when a
         # starved task crosses both thresholds.  Signature:
         #   (task_id: str, *, summary: str, detail: str) -> None (async)
@@ -2264,6 +2295,18 @@ class Scheduler:
         # Unconditionally clear both dicts so no stale residue survives.
         self._starvation_escalated.discard(task_id)
         self._starvation_first_seen.pop(task_id, None)
+
+    async def _starvation_gc_resolve(self, tid: str) -> None:
+        """``on_gc`` callback for the ``'starvation'`` StreakRegistry entry.
+
+        Bridges the registry's generic GC-sweep resolve hook to the
+        Harness-installed ``_on_starvation_resolve`` callback (task 2124).
+        A no-op when no callback is installed (bare-Scheduler unit tests).
+        ``StreakRegistry.gc`` already wraps this call in try/except, so no
+        additional fail-safety is needed here.
+        """
+        if self._on_starvation_resolve is not None:
+            await self._on_starvation_resolve(tid)
 
     async def _apply_warm_base_hard_down_watchdog(self) -> None:
         """Host-scoped warm-lane CoW base health latch (task 2061).
