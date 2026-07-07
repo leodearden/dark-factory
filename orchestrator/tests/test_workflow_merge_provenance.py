@@ -577,3 +577,139 @@ class TestRecoverBeforeMerge:
         assert outcome is None
         assert f.wf._merge_recovery_basis is None
         f.mark_done.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Tests: MP-2 enforcement (PRD §9 boundary row 4) — no recovery-DONE without
+# an explicit provenance basis
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinaliseRecoveryDoneRefusesUnprovenancedDone:
+    """`_finalise_recovery_done` is the sole chokepoint for a recovery-DONE
+    (PRD α, MP-2). It must refuse to proceed without a valid provenance
+    basis and a truthy sha, raising BEFORE any status mutation — no marker
+    write, no phase transition, no scheduler call.
+    """
+
+    async def test_refuses_none_basis(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+        with pytest.raises((AssertionError, ValueError)):
+            await f.wf._finalise_recovery_done(
+                basis=None, sha='somesha', kind='merged', note='n',  # type: ignore[arg-type]
+            )
+
+        assert f.wf._merge_recovery_basis is None
+        assert f.wf.state == WorkflowState.PLAN
+        f.mark_done.assert_not_awaited()
+
+    async def test_refuses_invalid_basis(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+        with pytest.raises((AssertionError, ValueError)):
+            await f.wf._finalise_recovery_done(
+                basis='hunch', sha='somesha', kind='merged', note='n',
+            )
+
+        assert f.wf._merge_recovery_basis is None
+        assert f.wf.state == WorkflowState.PLAN
+        f.mark_done.assert_not_awaited()
+
+    async def test_refuses_empty_sha(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+        with pytest.raises((AssertionError, ValueError)):
+            await f.wf._finalise_recovery_done(
+                basis='journal', sha='', kind='merged', note='n',
+            )
+
+        assert f.wf._merge_recovery_basis is None
+        assert f.wf.state == WorkflowState.PLAN
+        f.mark_done.assert_not_awaited()
+
+    async def test_refuses_none_sha(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+        with pytest.raises((AssertionError, ValueError)):
+            await f.wf._finalise_recovery_done(
+                basis='fallback', sha=None, kind='found_on_main', note='n',  # type: ignore[arg-type]
+            )
+
+        assert f.wf._merge_recovery_basis is None
+        assert f.wf.state == WorkflowState.PLAN
+        f.mark_done.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestNoPhantomDoneProperty:
+    """Boundary row 4 (PRD §9): across all three already-merged guards, a
+    journal-miss + no-prior-work shape must never produce a recovery-DONE
+    (the task must remain re-dispatchable — ``_merge_recovery_basis`` stays
+    ``None``), and whenever a guard DOES return ``WorkflowOutcome.DONE`` the
+    marker must be a valid provenance basis (``'journal'`` or ``'fallback'``).
+    """
+
+    async def test_journal_miss_no_work_leaves_task_re_dispatchable_all_guards(
+        self, tmp_path: Path,
+    ):
+        no_work = _PriorImplStatus(has_work=False, entries=[], base_commit=None)
+
+        # Guard 1: _recover_if_already_merged — on-main, no prior work.
+        f1 = _make(worktree=tmp_path / 'wt1', project_root=tmp_path / 'proj1')
+        f1.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+            return_value=('wthead123', 'mainsha123'),
+        )
+        f1.wf._has_prior_implementation = MagicMock(return_value=no_work)  # type: ignore[method-assign]
+        outcome1 = await f1.wf._recover_if_already_merged()
+        assert outcome1 is None
+        assert f1.wf._merge_recovery_basis is None
+        f1.mark_done.assert_not_awaited()
+
+        # Guard 2: _recover_before_execute — on-main, no prior work.
+        f2 = _make(worktree=tmp_path / 'wt2', project_root=tmp_path / 'proj2')
+        f2.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+            return_value=('wthead123', 'mainsha123'),
+        )
+        f2.wf._has_prior_implementation = MagicMock(return_value=no_work)  # type: ignore[method-assign]
+        outcome2 = await f2.wf._recover_before_execute()
+        assert outcome2 is None
+        assert f2.wf._merge_recovery_basis is None
+        f2.mark_done.assert_not_awaited()
+
+        # Guard 3: _recover_before_merge — ancestor True (spurious merge
+        # signal), no prior work.
+        f3 = _make(
+            worktree=tmp_path / 'wt3', project_root=tmp_path / 'proj3',
+            branch_on_main=True,
+        )
+        f3.wf._has_prior_implementation = MagicMock(return_value=no_work)  # type: ignore[method-assign]
+        outcome3 = await f3.wf._recover_before_merge('branchhead123', 'mainsha123')
+        assert outcome3 is None
+        assert f3.wf._merge_recovery_basis is None
+        f3.mark_done.assert_not_awaited()
+
+    async def test_journal_hit_done_always_carries_a_valid_basis_all_guards(
+        self, tmp_path: Path,
+    ):
+        # Guard 1
+        f1 = _make(worktree=tmp_path / 'wt1', project_root=tmp_path / 'proj1')
+        _bind_landed_row(tmp_path, task_id=f1.wf.task_id, advanced_sha='sha1')
+        outcome1 = await f1.wf._recover_if_already_merged()
+        assert outcome1 == WorkflowOutcome.DONE
+        assert f1.wf._merge_recovery_basis in ('journal', 'fallback')
+
+        # Guard 2
+        f2 = _make(worktree=tmp_path / 'wt2', project_root=tmp_path / 'proj2')
+        _bind_landed_row(tmp_path, task_id=f2.wf.task_id, advanced_sha='sha2')
+        outcome2 = await f2.wf._recover_before_execute()
+        assert outcome2 == WorkflowOutcome.DONE
+        assert f2.wf._merge_recovery_basis in ('journal', 'fallback')
+
+        # Guard 3
+        f3 = _make(worktree=tmp_path / 'wt3', project_root=tmp_path / 'proj3')
+        _bind_landed_row(tmp_path, task_id=f3.wf.task_id, advanced_sha='sha3')
+        outcome3 = await f3.wf._recover_before_merge('branchhead123', 'mainsha123')
+        assert outcome3 == WorkflowOutcome.DONE
+        assert f3.wf._merge_recovery_basis in ('journal', 'fallback')
