@@ -541,3 +541,99 @@ class TestCountNodeEdgesEpisodes:
         assert first_params.get('uuid') == 'target-uuid'
         assert 'MENTIONS' in second_cypher
         assert second_params.get('uuid') == 'target-uuid'
+
+
+# ===========================================================================
+# Tests: classify_node (step-11/12)
+# ===========================================================================
+
+def _foreign_node(
+    uuid: str, group_id: str, *, name: str = 'N', source_graph: str = 'reify',
+) -> dict:
+    """Build a normalized census-row dict, as returned by census_foreign_nodes."""
+    return {
+        'uuid': uuid, 'name': name, 'group_id': group_id,
+        'labels': ['Entity'], 'source_graph': source_graph,
+    }
+
+
+class TestClassifyNode:
+    """Tests for async classify_node(graphiti, node, populated_graphs, *, alias_map)."""
+
+    @pytest.mark.asyncio
+    async def test_resolved_target_absent_in_target_is_move(self):
+        """A displaced-only node (group_id names a populated graph, absent
+        from there) classifies MOVE. edge_count/episode_count are read from
+        the SOURCE graph, not the target."""
+        target_graph = _make_graph_mock(ro_pages=[[]])  # presence probe: absent
+        source_graph = _make_graph_mock(ro_side_effect=[_result([[3]]), _result([[1]])])
+        graphs = {'dark_factory': target_graph, 'reify': source_graph}
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        node = _foreign_node('u0', 'dark_factory', name='Alice', source_graph='reify')
+        populated = {'reify', 'dark_factory', 'know_live'}
+
+        record = await _mod.classify_node(graphiti, node, populated, alias_map=_mod.ALIAS_MAP)
+
+        assert record == {
+            'uuid': 'u0', 'name': 'Alice', 'source_graph': 'reify',
+            'target_graph': 'dark_factory', 'disposition': _mod.MOVE,
+            'edge_count': 3, 'episode_count': 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_resolved_target_present_in_target_is_merge(self):
+        """A duplicate node (present in the resolved target) classifies
+        MERGE, and the presence probe is issued against _graph_for(target)."""
+        target_graph = _make_graph_mock(ro_pages=[[['u0']]])  # presence probe: present
+        source_graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
+        graphs = {'dark_factory': target_graph, 'reify': source_graph}
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        node = _foreign_node('u0', 'dark_factory', source_graph='reify')
+        populated = {'reify', 'dark_factory'}
+
+        record = await _mod.classify_node(graphiti, node, populated, alias_map=_mod.ALIAS_MAP)
+
+        assert record['disposition'] == _mod.MERGE
+        assert record['target_graph'] == 'dark_factory'
+        graphiti._graph_for.assert_any_call('dark_factory')
+        target_graph.ro_query.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_alias_mapped_orphan_resolves_via_alias_map(self):
+        """An orphan group_id (e.g. 'know-live') with no populated graph of
+        its own resolves via ALIAS_MAP to its canonical target."""
+        target_graph = _make_graph_mock(ro_pages=[[]])
+        source_graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
+        graphs = {'know_live': target_graph, 'reify': source_graph}
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        node = _foreign_node('u0', 'know-live', name='Bob', source_graph='reify')
+        populated = {'reify', 'know_live'}
+
+        record = await _mod.classify_node(graphiti, node, populated, alias_map=_mod.ALIAS_MAP)
+
+        assert record['target_graph'] == 'know_live'
+        assert record['disposition'] == _mod.MOVE
+
+    @pytest.mark.asyncio
+    async def test_unmapped_orphan_is_unresolved_with_no_presence_probe(self):
+        """An orphan with no populated graph and no ALIAS_MAP entry is
+        UNRESOLVED, target_graph=None, and NO presence probe is issued on
+        any target -- _graph_for is called ONLY for the source graph (to
+        read edge/episode counts)."""
+        source_graph = _make_graph_mock(ro_side_effect=[_result([[0]]), _result([[0]])])
+        graphs = {'reify': source_graph}
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(side_effect=lambda name: graphs[name])
+        node = _foreign_node('u0', 'totally-unknown', name='Carl', source_graph='reify')
+        populated = {'reify', 'dark_factory'}
+
+        record = await _mod.classify_node(graphiti, node, populated, alias_map=_mod.ALIAS_MAP)
+
+        assert record['target_graph'] is None
+        assert record['disposition'] == _mod.UNRESOLVED
+        assert record['edge_count'] == 0
+        assert record['episode_count'] == 0
+        graphiti._graph_for.assert_called_once_with('reify')
