@@ -482,6 +482,19 @@ class TestParseMetadataCore:
         assert model.deploy_state.phase == 'rollout'  # type: ignore[attr-defined]
         assert warnings == []
 
+    def test_registered_submodel_round_trips_as_plain_dict_via_model_dump(self):
+        # model.deploy_state is a _DeployStateStub instance (asserted above),
+        # stored in TaskMetadata.__pydantic_extra__ since 'deploy_state' is
+        # not a declared TaskMetadata field. I1 round-trip preservation
+        # requires model_dump() to re-emit it as a plain dict — not leave a
+        # BaseModel instance sitting in the "JSON-serializable blob" output.
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        model, warnings = parse_metadata({'deploy_state': {'phase': 'rollout'}}, direction='write')
+        assert warnings == []
+        dumped = model.model_dump()
+        assert dumped['deploy_state'] == {'phase': 'rollout'}
+        assert not isinstance(dumped['deploy_state'], BaseModel)
+
     def test_unknown_top_level_key_survives_round_trip(self):
         # x_-prefixed is the sanctioned silent namespace regardless of the
         # failure-policy matrix landing later, so this stays stable.
@@ -560,6 +573,58 @@ class TestParseMetadataFailurePolicy:
         with pytest.raises(ValidationError):
             parse_metadata(blob, direction='write', enforce=True)
 
+    def test_invalid_field_warning_message_scoped_to_that_field_only(self):
+        # Two independently-invalid top-level fields in one blob: each
+        # field's warning message must describe only that field's own
+        # failure. Before the fix both warnings shared `message=str(exc)`
+        # — the full multi-error ValidationError dump — so each message
+        # would mention *both* offending fields, making the per-field
+        # `field` slug the only distinguishing signal.
+        blob = {
+            'done_provenance': {'kind': 'bogus'},
+            'retry_ledger': {'consecutive_no_plan_failures': 'not-an-int'},
+        }
+        model, warnings = parse_metadata(blob, direction='read')
+        by_field = {w.field: w.message for w in warnings if w.code == 'invalid_field'}
+        assert set(by_field) == {'done_provenance', 'retry_ledger'}
+        assert by_field['done_provenance'] != by_field['retry_ledger']
+        assert 'retry_ledger' not in by_field['done_provenance']
+        assert 'done_provenance' not in by_field['retry_ledger']
+        assert 'validation error' not in by_field['done_provenance'].lower()
+        assert 'validation error' not in by_field['retry_ledger'].lower()
+        assert model.model_dump()['done_provenance'] == blob['done_provenance']
+        assert model.model_dump()['retry_ledger'] == blob['retry_ledger']
+
+    def test_second_independent_invariant_after_pop_falls_back_to_raw_construct(self):
+        # before_done is missing its required timeout_secs, so it's popped
+        # as the offending field; but the remainder
+        # (task_kind='deterministic', always_escalates=False, before_done
+        # popped) trips the *separate* deterministic cross-field invariant
+        # on its own. Popping the first offending key isn't sufficient to
+        # produce a valid remainder, so parse_metadata must fall back to a
+        # fully raw, unvalidated model instead of raising.
+        blob = {
+            'task_kind': 'deterministic',
+            'always_escalates': False,
+            'before_done': {'script': 'scripts/x.sh'},  # missing required timeout_secs
+        }
+        model, warnings = parse_metadata(blob, direction='read')
+        assert model.task_kind == 'deterministic'
+        assert model.always_escalates is False
+        assert model.before_done == blob['before_done']
+        assert len(warnings) == 1
+        assert warnings[0].field == 'before_done'
+        assert warnings[0].code == 'invalid_field'
+
+    def test_second_independent_invariant_write_enforce_raises(self):
+        blob = {
+            'task_kind': 'deterministic',
+            'always_escalates': False,
+            'before_done': {'script': 'scripts/x.sh'},
+        }
+        with pytest.raises(ValidationError):
+            parse_metadata(blob, direction='write', enforce=True)
+
     def test_invalid_registered_submodel_slice_write_enforce_raises(self):
         register_metadata_submodel('deploy_state', _DeployStateStub)
         with pytest.raises(ValidationError):
@@ -572,6 +637,31 @@ class TestParseMetadataFailurePolicy:
         assert warnings[0].code == 'invalid_submodel'
         assert warnings[0].field == 'deploy_state'
         assert model.model_dump()['deploy_state'] == {}
+
+    # A registered slice whose *value* isn't a mapping at all (list/str/etc.)
+    # can't be splatted as `submodel(**value)` — that raises TypeError, not
+    # ValidationError. parse_metadata must absorb this the same way as any
+    # other malformed sub-model, never raising outside write+enforce=True.
+    def test_registered_submodel_slice_non_mapping_value_read_warns_never_raises(self):
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        model, warnings = parse_metadata({'deploy_state': [1, 2]}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].code == 'invalid_submodel'
+        assert warnings[0].field == 'deploy_state'
+        assert model.model_dump()['deploy_state'] == [1, 2]
+
+    def test_registered_submodel_slice_non_mapping_value_write_warn_mode_accepts(self):
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        model, warnings = parse_metadata({'deploy_state': 'x'}, direction='write', enforce=False)
+        assert len(warnings) == 1
+        assert warnings[0].code == 'invalid_submodel'
+        assert warnings[0].field == 'deploy_state'
+        assert model.model_dump()['deploy_state'] == 'x'
+
+    def test_registered_submodel_slice_non_mapping_value_write_enforce_raises(self):
+        register_metadata_submodel('deploy_state', _DeployStateStub)
+        with pytest.raises((ValidationError, TypeError)):
+            parse_metadata({'deploy_state': [1, 2]}, direction='write', enforce=True)
 
     def test_x_prefixed_unknown_key_silent_zero_warnings(self):
         model, warnings = parse_metadata({'x_experimental': 'v'}, direction='write')
