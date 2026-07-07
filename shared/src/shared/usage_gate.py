@@ -1114,20 +1114,30 @@ class UsageGate:
             ok = await self._run_probe(acct)
 
             if ok:
-                # Captured before _transition resets probe_count — the event
-                # label below reports the probe number that confirmed.
-                confirmed_probe_num = acct.probe_count
-                # _transition owns: the phase write (-> PROBING, gate: let one
-                # real task confirm first), near_cap clear, probe_count reset,
-                # pause-time consumption into _total_pause_secs, and the
-                # centralized _open recompute.
-                self._transition(acct, AccountPhase.PROBING)
-                logger.info(f'Account {acct.name} RESUMED (probe confirmed)')
-                if self._cost_store:
-                    await self._write_cost_event(
-                        acct.name, 'resumed',
-                        json.dumps({'label': f'probe #{confirmed_probe_num} confirmed'}),
-                    )
+                # _refresh_capped_accounts runs from before_invoke OUTSIDE
+                # self._lock and targets the same resets_at event, so it can win
+                # the CAPPED->PROBING race while we awaited _run_probe above.
+                # Only CAPPED->PROBING is a legal edge here, so a raced-away
+                # phase (already PROBING/AVAILABLE/PROBE_IN_FLIGHT) makes the
+                # success block a pure no-op — mirrors the auth-reprobe guard in
+                # _reprobe_account. Without this guard _transition would raise
+                # IllegalTransitionError inside this fire-and-forget task. The
+                # confirmed probe still ends the loop either way (return below).
+                if acct.phase == AccountPhase.CAPPED:
+                    # Captured before _transition resets probe_count — the event
+                    # label below reports the probe number that confirmed.
+                    confirmed_probe_num = acct.probe_count
+                    # _transition owns: the phase write (-> PROBING, gate: let one
+                    # real task confirm first), near_cap clear, probe_count reset,
+                    # pause-time consumption into _total_pause_secs, and the
+                    # centralized _open recompute.
+                    self._transition(acct, AccountPhase.PROBING)
+                    logger.info(f'Account {acct.name} RESUMED (probe confirmed)')
+                    if self._cost_store:
+                        await self._write_cost_event(
+                            acct.name, 'resumed',
+                            json.dumps({'label': f'probe #{confirmed_probe_num} confirmed'}),
+                        )
                 return
             else:
                 logger.info(
