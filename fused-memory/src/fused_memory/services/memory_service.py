@@ -8,6 +8,7 @@ import logging
 import re
 import time
 import uuid as uuid_mod
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -302,6 +303,27 @@ class SearchResults(list):
         super().__init__(iterable)
         self.degraded = degraded
         self.failed_stores: list[str] = failed_stores if failed_stores is not None else []
+
+
+@dataclass
+class ReconcileStats:
+    """Aggregated counts from one ``_reconcile_episode_identity`` run.
+
+    Returned to the caller and logged for observability — NOT wired into the
+    durable write-journal schema (extending that schema is out of scope for
+    task 2202 / W6-β). Each field mirrors the int return of the
+    correspondingly-named post-write sweep. ``errors`` collects the label of
+    any sub-pass that raised (task 2202 step-4's best-effort guard); an
+    all-zeros, empty-errors instance signals a fully-converged, idempotent
+    reconcile.
+    """
+
+    edges_deduped: int = 0
+    dependency_edges_restored: int = 0
+    sibling_edges_restored: int = 0
+    nodes_resolved: int = 0
+    task_names_normalized: int = 0
+    errors: list[str] = field(default_factory=list)
 
 
 class MemoryService:
@@ -903,6 +925,88 @@ class MemoryService:
                 failed,
             )
         return fixed
+
+    async def _reconcile_episode_identity(
+        self, result: Any, *, group_id: str
+    ) -> ReconcileStats:
+        """Fold the five post-write identity/dedup sweeps into one call.
+
+        Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
+        runs immediately after ``add_episode``, inside α's (task 2198)
+        per-group identity lock — making entity identity a write-time
+        guarantee instead of a best-effort post-hoc sweep. This obsoletes the
+        recurring "duplicate Graphiti node -> manual FalkorDB merge" operator
+        runbook (tasks 2073/2081/2110/2118, the /unblock Graphiti-dedup
+        protocol): those incidents arose because the sweeps ran outside any
+        lock and could race with a concurrent same-group write; folding them
+        into one locked reconcile closes that race.
+
+        Runs the five sub-passes in their pre-existing chain order —
+        dependency-restore before sibling-restore, matching the ordering
+        this replaces at the ``_execute_graphiti_write`` call site (a
+        dependency edge must be un-superseded before the sibling-restore
+        pass considers it, so it is correctly skipped there rather than
+        double-processed) — and aggregates each sub-pass's int return into
+        the matching ``ReconcileStats`` field.
+
+        Each sub-pass runs under its own best-effort guard: a generic
+        ``Exception`` is logged and recorded as that sub-pass's label in
+        ``ReconcileStats.errors`` (leaving its count at 0), and the
+        remaining sub-passes still run — a single sub-pass failure must
+        never fail the already-committed episode write.
+        ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` are never
+        swallowed; they propagate immediately and skip any later sub-passes.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                AddEpisodeResults object), forwarded verbatim to every
+                sub-pass.
+            group_id: The project graph this episode was written to.
+
+        Returns:
+            A ReconcileStats aggregating every sub-pass's count (and any
+            per-sub-pass failure labels).
+        """
+        stats = ReconcileStats()
+
+        async def _run_pass(label: str, coro: Any) -> int:
+            try:
+                return await coro
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Best-effort: one sub-pass's transient backend error must
+                # not fail the others, nor the already-committed episode
+                # write. Log, record the label, and continue.
+                logger.exception(
+                    'Sub-pass %s failed during _reconcile_episode_identity; '
+                    'continuing with the remaining sub-passes',
+                    label,
+                )
+                stats.errors.append(label)
+                return 0
+
+        stats.edges_deduped = await _run_pass(
+            '_dedup_episode_edges',
+            self._dedup_episode_edges(result, group_id=group_id),
+        )
+        stats.dependency_edges_restored = await _run_pass(
+            '_restore_superseded_dependency_edges',
+            self._restore_superseded_dependency_edges(result, group_id=group_id),
+        )
+        stats.sibling_edges_restored = await _run_pass(
+            '_restore_falsely_superseded_sibling_edges',
+            self._restore_falsely_superseded_sibling_edges(result, group_id=group_id),
+        )
+        stats.nodes_resolved = await _run_pass(
+            '_dedup_episode_nodes',
+            self._dedup_episode_nodes(result, group_id=group_id),
+        )
+        stats.task_names_normalized = await _run_pass(
+            '_normalize_task_node_names',
+            self._normalize_task_node_names(result, group_id=group_id),
+        )
+        return stats
 
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
