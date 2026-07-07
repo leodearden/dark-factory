@@ -176,6 +176,11 @@ class AccountState:
     near_cap: bool = False
     auth_failed_at: datetime | None = None
     auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
+    # Monotonic counter bumped once per successful `_transition` edge (task
+    # W4-δ, PRD §7.4). Lets a capturer of an `AccountLease` (see below)
+    # detect whether the account has re-transitioned since the lease was
+    # taken — see `UsageGate.lease_is_current`.
+    generation: int = 0
 
     # --- Legacy-compat boolean shim -----------------------------------
     #
@@ -397,7 +402,10 @@ class UsageGate:
     ) -> None:
         """Sole writer of ``AccountState.phase`` (PRD §7.3, task W4-γ).
 
-        Writes the new phase, then recomputes the shared ``_open`` event in
+        Writes the new phase, bumps ``acct.generation`` (task W4-δ, PRD
+        §7.4 — the sole increment site, so an ``AccountLease`` captured
+        before this call can later be checked for staleness via
+        ``lease_is_current``), then recomputes the shared ``_open`` event in
         ONE place from the current phase of every account (DD-5 invariant:
         ``_open.is_set() <=> any(a.phase in {AVAILABLE, PROBING})``) —
         replacing the ~10 scattered ``self._open.set()``/``.clear()`` call
@@ -442,6 +450,11 @@ class UsageGate:
 
         old_phase = acct.phase
         acct.phase = new_phase
+        # Bump the monotonic generation counter on every successful edge
+        # (including force=True SIGHUP resets) — task W4-δ, PRD §7.4. This
+        # is the sole increment site, mirroring _transition's role as the
+        # sole writer of `phase`.
+        acct.generation += 1
         if clear_near_cap:
             acct.near_cap = False
 
