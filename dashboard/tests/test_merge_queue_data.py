@@ -2263,6 +2263,103 @@ class TestActiveQueuedMerges:
         result = await active_queued_merges(None, ttl_minutes=30, now=now)
         assert result == []
 
+    async def test_verify_failed_latest_attempt_excluded(self, tmp_path):
+        """A latest merge_attempt outcome of 'verify_failed' is excluded (terminal).
+
+        'verify_failed' is one of the ~11 terminal outcomes added since the old
+        8-item _TERMINAL_MERGE_OUTCOMES denylist was frozen. Under the new
+        terminal-unless-listed semantics it is excluded because it is not a
+        member of _ACTIVE_ONLY.
+        """
+        from dashboard.data.merge_queue import active_queued_merges
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        t0 = now - timedelta(minutes=10)
+        t1 = now - timedelta(minutes=5)
+
+        db_path = _make_db(tmp_path, 'aq7.db', [
+            dict(event_type='merge_queued', task_id='T7', run_id='run-1',
+                 timestamp=t0, data={'branch': 'task/T7'}),
+            dict(event_type='merge_attempt', task_id='T7', run_id='run-1',
+                 timestamp=t1, data={'branch': 'task/T7', 'outcome': 'verify_failed'}),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await active_queued_merges(conn, ttl_minutes=30, now=now)
+
+        assert result == []
+
+    async def test_unknown_future_outcome_excluded_fail_safe(self, tmp_path):
+        """A made-up, never-seen outcome is excluded — fail safe, not fail stale."""
+        from dashboard.data.merge_queue import active_queued_merges
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        t0 = now - timedelta(minutes=10)
+        t1 = now - timedelta(minutes=5)
+
+        db_path = _make_db(tmp_path, 'aq8.db', [
+            dict(event_type='merge_queued', task_id='T8', run_id='run-1',
+                 timestamp=t0, data={'branch': 'task/T8'}),
+            dict(event_type='merge_attempt', task_id='T8', run_id='run-1',
+                 timestamp=t1, data={'branch': 'task/T8', 'outcome': 'frobnicated'}),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await active_queued_merges(conn, ttl_minutes=30, now=now)
+
+        assert result == []
+
+    @pytest.mark.parametrize('outcome', [
+        'cas_retry', 'gate_retry', 'post_merge_generation_chained', 'plan_files_narrowed',
+    ])
+    async def test_active_only_members_remain_in_flight(self, tmp_path, outcome):
+        """Each _ACTIVE_ONLY member keeps its task listed as in_flight.
+
+        Locks the allowlist behaviour end-to-end; gate_retry and
+        post_merge_generation_chained are the two members newly relevant since
+        dependency 2165 landed OutcomeKind._NON_TERMINAL_OUTCOMES.
+        """
+        from dashboard.data.merge_queue import active_queued_merges
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        t0 = now - timedelta(minutes=10)
+        t1 = now - timedelta(minutes=5)
+
+        db_path = _make_db(tmp_path, f'aq9-{outcome}.db', [
+            dict(event_type='merge_queued', task_id='T9', run_id='run-1',
+                 timestamp=t0, data={'branch': 'task/T9'}),
+            dict(event_type='merge_attempt', task_id='T9', run_id='run-1',
+                 timestamp=t1, data={'branch': 'task/T9', 'outcome': outcome}),
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await active_queued_merges(conn, ttl_minutes=30, now=now)
+
+        assert len(result) == 1
+        assert result[0]['task_id'] == 'T9'
+        assert result[0]['state'] == 'in_flight'
+        assert result[0]['outcome'] == outcome
+
+    async def test_active_only_set_contents(self):
+        """Dashboard-side drift-mirror guard.
+
+        _ACTIVE_ONLY must exactly match the orchestrator's authoritative
+        OutcomeKind._NON_TERMINAL_OUTCOMES (see
+        orchestrator/src/orchestrator/merge_types.py, whose FROZEN CONTRACT
+        docstring names this allowlist as the mirror and
+        tests/test_outcome_kind.py::TestOutcomeKindFrozenContract as the
+        drift tripwire). Dashboard has no import on the orchestrator package,
+        so this is a hand-maintained pin, not a shared-symbol guarantee.
+        """
+        from dashboard.data.merge_queue import _ACTIVE_ONLY
+
+        assert _ACTIVE_ONLY == frozenset({
+            'cas_retry', 'gate_retry', 'post_merge_generation_chained', 'plan_files_narrowed',
+        })
+
 
 # ---------------------------------------------------------------------------
 # TestRecentTrainEvents
