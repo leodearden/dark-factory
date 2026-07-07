@@ -13,6 +13,7 @@ eta's live throwaway-graph rehearsal -- see the script's module docstring.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -717,3 +718,41 @@ class TestRunDryRun:
         assert manifest['census'] == {'reify': 0, 'dark_factory': 0}
         assert manifest['summary'] == {'MOVE': 0, 'MERGE': 0, 'UNRESOLVED': 0, 'total': 0}
         assert manifest['exit_code'] == 0
+
+
+# ===========================================================================
+# Tests: load_reviewed_manifest + --apply-requires-manifest guard (step-15/16)
+# ===========================================================================
+
+class TestLoadReviewedManifest:
+    """Tests for load_reviewed_manifest(path) and run()'s apply-requires-manifest guard."""
+
+    def test_round_trips_a_manifest_file(self, tmp_path):
+        """load_reviewed_manifest(path) parses back exactly what was written."""
+        manifest = _mod.build_manifest(
+            [_classified_node('u1', disposition=_mod.MOVE)], {'reify': 1}, dry_run=True,
+        )
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+
+        loaded = _mod.load_reviewed_manifest(manifest_path)
+
+        assert loaded == manifest
+
+    @pytest.mark.asyncio
+    async def test_apply_without_manifest_refuses_with_no_mutations(self, monkeypatch):
+        """--apply with no --manifest refuses: zero epsilon calls, no census
+        recompute (list_graphs is never even awaited), non-zero exit_code."""
+        move_mock = AsyncMock()
+        merge_mock = AsyncMock()
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', merge_mock)
+        memory_service = _make_memory_service({'reify': _make_graph_mock()})
+        args = _args(apply=True, manifest=None)
+
+        report = await _mod.run(args, memory_service)
+
+        move_mock.assert_not_awaited()
+        merge_mock.assert_not_awaited()
+        memory_service.graphiti.list_graphs.assert_not_awaited()
+        assert report['exit_code'] != 0
