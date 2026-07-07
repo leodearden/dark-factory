@@ -1397,6 +1397,13 @@ class GraphitiBackend:
         if len(nodes) == 1:
             return nodes[0]['uuid']
         dups = await self.find_duplicate_entity_nodes(name, group_id=group_id)
+        if not dups:
+            # Defensive: get_nodes_by_exact_name and find_duplicate_entity_nodes
+            # are separate queries and, under the lock contract, are expected to
+            # filter identically. If they ever diverge (e.g. a future change
+            # narrows find_duplicate_entity_nodes to exclude edgeless nodes),
+            # degrade to a no-op rather than raise IndexError on dups[0].
+            return None
         survivor = dups[0]
         for dup in dups[1:]:
             await self.merge_entities(dup['uuid'], survivor['uuid'], group_id=group_id)

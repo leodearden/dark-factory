@@ -182,6 +182,22 @@ class TestResolveOrCreateEntityCollapse:
         assert second == 'surv'
         assert backend.merge_entities.await_count == 2  # unchanged — no re-merge
 
+    @pytest.mark.asyncio
+    async def test_find_duplicate_entity_nodes_returns_empty_degrades_to_none(
+        self, backend_with_mocks
+    ):
+        """Defensive/coupling guard: get_nodes_by_exact_name and
+        find_duplicate_entity_nodes are separate queries expected to filter
+        identically. If they ever diverge — get_nodes_by_exact_name finds
+        >=2 matches but find_duplicate_entity_nodes returns no rows — degrade
+        to None instead of raising IndexError on dups[0]; merge_entities
+        must never be awaited."""
+        backend = backend_with_mocks
+        backend.find_duplicate_entity_nodes.return_value = []
+        result = await backend._resolve_or_create_entity('Foo', group_id='test')
+        assert result is None
+        backend.merge_entities.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # step-7/8: group_id-scoping amendment (guards task-2115 cross-graph leak)
