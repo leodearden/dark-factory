@@ -895,32 +895,6 @@ class SqliteTaskBackend:
             'message': f'Updated claimant fields for task {task_id}',
         }
 
-    # ── Write-boundary validation (task 2162, W3-β) ─────────────────────
-
-    async def _validate_metadata_on_write(
-        self,
-        metadata: str | None,
-        *,
-        project_root: str,
-        tag: str,
-        task_id: int,
-    ) -> None:
-        """Validate a metadata blob at the add_task/update_task write boundary.
-
-        Delegates to the shared ``parse_metadata`` (direction='write'). In
-        warn-mode (the default) every returned :class:`SchemaWarning` is
-        logged as one ``task_metadata.schema_warning`` census line and the
-        write proceeds unchanged. In enforce-mode a malformed blob's raise
-        (``ValidationError`` / ``ValueError`` / ``TypeError``) propagates
-        uncaught out of this call — the caller's ``async with self._txn(...)``
-        rolls back so the original bytes are preserved.
-        """
-        _, warnings = parse_metadata(
-            metadata, direction='write', enforce=self._task_metadata_enforce,
-        )
-        for warning in warnings:
-            _emit_schema_warning(task_id, warning)
-
     # ── Write-boundary validation (task 2162, W3-β) ────────────────────
 
     async def _validate_metadata_on_write(
