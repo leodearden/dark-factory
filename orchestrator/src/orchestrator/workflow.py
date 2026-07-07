@@ -2426,7 +2426,7 @@ class TaskWorkflow:
                 if self._last_merge_block_reason is not None:
                     current_signature = self._merge_outcome_signature()
                     prev_signature = (
-                        self.task.get('metadata') or {}
+                        (self.task.get('metadata') or {}).get('retry_ledger') or {}
                     ).get('last_merge_outcome_signature')
                     thrash_outcome = await self._check_merge_outcome_thrash(
                         prev_signature, current_signature,
@@ -3590,8 +3590,9 @@ class TaskWorkflow:
         Called from the merge-phase loop after ``_submit_to_merge_queue``
         returns ``REQUEUED`` (steward resolved an L0 and the loop is about
         to resubmit).  If the merge-outcome signature matches the previous
-        attempt, increment ``consecutive_merge_thrash`` in the task
-        metadata.  At ``max_consecutive_merge_thrash``, route to
+        attempt, increment ``consecutive_merge_thrash`` inside the typed
+        ``metadata.retry_ledger`` blob (see :func:`_evaluate_merge_thrash`).
+        At ``max_consecutive_merge_thrash``, route to
         ``_mark_blocked(escalate_to_human=True)`` instead of resubmitting.
 
         ``current_signature`` is a sha256-short fingerprint of the blocked
@@ -3599,7 +3600,9 @@ class TaskWorkflow:
         failure reports run multi-kilobyte.
 
         Returns ``WorkflowOutcome.BLOCKED`` at threshold; ``None`` to fall
-        through to the resubmit.
+        through to the resubmit.  Persist failure escalates to a human
+        immediately rather than logging and proceeding, for the same reason
+        as the no-plan and infra-resume guards.
         """
         metadata = self.task.get('metadata') or {}
 
@@ -3616,32 +3619,38 @@ class TaskWorkflow:
             return None
 
         try:
-            counter = int(metadata.get('consecutive_merge_thrash') or 0)
-        except (TypeError, ValueError):
-            counter = 0
+            ledger = RetryLedger(**(metadata.get('retry_ledger') or {}))
+        except ValidationError:
+            ledger = RetryLedger()
 
-        if prev_signature is not None and prev_signature == current_signature:
-            counter += 1
-        else:
-            # Different verdict (or first observation) → steward made
-            # progress on something; reset to 1 because we just saw one.
-            counter = 1
+        verdict = _evaluate_merge_thrash(
+            ledger, prev_signature, current_signature,
+            self.config.max_consecutive_merge_thrash,
+        )
 
+        # No backend overlay here (unlike no-plan/infra-resume) — preserves
+        # the existing plain-dict merge policy for this guard.
         new_metadata = dict(metadata)
-        new_metadata['consecutive_merge_thrash'] = counter
-        new_metadata['last_merge_outcome_signature'] = current_signature
+        new_metadata['retry_ledger'] = verdict.ledger.model_dump()
         self.task['metadata'] = new_metadata
         try:
             await self.scheduler.update_task(
                 self.task_id, metadata=new_metadata,
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
             logger.warning(
-                'Task %s: failed to persist merge-thrash counter: %s',
+                'Task %s: failed to persist merge-thrash counter; '
+                'escalating to human (counter cannot be trusted): %s',
                 self.task_id, exc,
             )
+            return await self._mark_blocked(
+                f'Failed to persist merge-thrash counter: {exc}',
+                detail=f'merge_outcome_signature={current_signature}',
+                escalate_to_human=True,
+            )
 
-        if counter >= self.config.max_consecutive_merge_thrash:
+        if verdict.escalate:
+            counter = verdict.ledger.consecutive_merge_thrash
             logger.warning(
                 'Task %s: consecutive_merge_thrash=%d at threshold %d — '
                 'merge-phase thrash confirmed; escalating to human',
@@ -3650,7 +3659,7 @@ class TaskWorkflow:
             )
             root_cause = (
                 f'merge-outcome-thrash:{self._last_merge_failure_category}:'
-                f'{_normalize_cause_hint(self._last_merge_failure_cause_hint)}'
+                f'{RetryLedger.normalize_cause_hint(self._last_merge_failure_cause_hint)}'
             )
             return await self._mark_blocked(
                 f'Repeated merge-phase thrash (counter={counter})',

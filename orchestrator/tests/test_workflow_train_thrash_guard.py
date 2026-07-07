@@ -215,8 +215,10 @@ async def test_merge_outcome_thrash_fires_for_non_train():
     f = _make(
         metadata={
             # No 'train' key — non-train task
-            'consecutive_merge_thrash': 2,
-            'last_merge_outcome_signature': 'sig-xyz',
+            'retry_ledger': {
+                'consecutive_merge_thrash': 2,
+                'last_merge_outcome_signature': 'sig-xyz',
+            },
         },
         max_consecutive_merge_thrash=3,
     )
