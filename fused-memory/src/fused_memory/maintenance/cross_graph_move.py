@@ -145,6 +145,27 @@ async def _read_compact_vector(falkor_client: Any, *, group_id: str, cypher: str
     return '[' + ', '.join(tokens) + ']'
 
 
+class ForeignDuplicateSuspectedError(Exception):
+    """Raised when a uuid present in both graphs looks like a genuine duplicate.
+
+    ``move_entity_across_graphs``'s target-presence probe (see its docstring's
+    "Idempotency" section) treats any uuid already present in *both*
+    source_graph and target_graph as a partially-completed move ("resume"):
+    a prior run crashed strictly between the node CREATE and the source
+    DETACH DELETE. But this problem domain is cross-graph duplication, so the
+    uuid may instead legitimately name a genuine, DIVERGENT duplicate in
+    target_graph -- exactly the scenario ``merge_foreign_duplicate`` (S6)
+    exists to handle -- rather than a resumable remnant of the SAME node.
+
+    The cheap divergence guard (name + created_at mismatch between the
+    source and target copies) raises this error instead of silently treating
+    a genuine duplicate as a resume, which would otherwise overwrite the
+    target's relationship topology and delete the source copy with no
+    signal. Callers hitting this should route the uuid through
+    ``merge_foreign_duplicate`` instead of ``move_entity_across_graphs``.
+    """
+
+
 @dataclass
 class MoveResult:
     """Result of a ``move_entity_across_graphs`` call.
@@ -156,8 +177,23 @@ class MoveResult:
         already_moved: True when the idempotency probe short-circuited the
             call as a no-op (uuid already present in target, absent from
             source). Defaults to False.
-        edges_moved: Count of RELATES_TO edges reattached to the moved node.
-        mentions_moved: Count of Episodic MENTIONS links reattached.
+        edges_moved: Count of RELATES_TO edges actually reattached to the
+            moved node -- verified via the target CREATE's own
+            ``relationships_created`` stat, NOT merely attempted. An edge
+            whose CREATE silently matched no endpoint in target_graph is
+            excluded from this count (see edges_skipped).
+        edges_skipped: Count of RELATES_TO edges whose target CREATE
+            matched no endpoint (the edge's other endpoint not yet present
+            in target_graph) and was therefore silently skipped by
+            FalkorDB. Exposed so callers can detect the drop from the
+            returned MoveResult alone, without independently re-querying
+            either graph.
+        mentions_moved: Count of Episodic MENTIONS links actually
+            reattached (same relationships_created verification as
+            edges_moved).
+        mentions_skipped: Count of MENTIONS links silently skipped (same
+            cause as edges_skipped -- the episode node not yet present in
+            target_graph).
     """
 
     uuid: str
@@ -165,7 +201,9 @@ class MoveResult:
     target_graph: str
     already_moved: bool = False
     edges_moved: int = 0
+    edges_skipped: int = 0
     mentions_moved: int = 0
+    mentions_skipped: int = 0
 
 
 async def move_entity_across_graphs(
@@ -183,14 +221,19 @@ async def move_entity_across_graphs(
     via the raw ``--compact`` transport, and ``CREATE``s the node in target
     with a byte-exact ``vecf32([...])`` literal.
 
-    Edges (step-7/8): every RELATES_TO edge incident to the node (either
-    direction) is recreated on the corresponding target-graph node with a
-    byte-exact ``fact_embedding``, provided the OTHER endpoint already
-    exists in target_graph (silently skipped otherwise -- see inline note).
+    Edges (step-7/8, amended): every RELATES_TO edge incident to the node
+    (either direction) is recreated on the corresponding target-graph node
+    with a byte-exact ``fact_embedding``, provided the OTHER endpoint
+    already exists in target_graph. FalkorDB silently matches nothing (and
+    creates nothing) when that endpoint is absent -- this is detected via
+    the CREATE's own ``relationships_created`` stat, so it is counted in
+    ``MoveResult.edges_skipped`` rather than being miscounted as moved.
 
-    Mentions (step-9/10): every Episodic MENTIONS link onto the node is
-    recreated in target_graph, provided the episode node already exists
-    there (same silent-skip rule as edges; MENTIONS carries no embedding).
+    Mentions (step-9/10, amended): every Episodic MENTIONS link onto the
+    node is recreated in target_graph, provided the episode node already
+    exists there (same silent-skip detection as edges, via
+    ``relationships_created``; MENTIONS carries no embedding). Skips are
+    counted in ``MoveResult.mentions_skipped``.
 
     Delete (step-11/12): once every target CREATE above has been awaited,
     the source node is ``DETACH DELETE``d -- always the LAST mutation, so a
@@ -208,13 +251,23 @@ async def move_entity_across_graphs(
       ``already_moved=True`` and neither graph is touched again.
     - Absent from source, absent from target: genuinely not found --
       raises NodeNotFoundError.
-    - Present in BOTH source and target: a prior run crashed strictly
-      BETWEEN the node CREATE and the source DETACH DELETE. The node
-      CREATE is skipped (target already has it -- re-issuing CREATE here
-      would duplicate it, since multi-tenant FalkorDB builds no uniqueness
+    - Present in BOTH source and target: EITHER a prior run crashed
+      strictly BETWEEN the node CREATE and the source DETACH DELETE
+      (genuine resume), OR target_graph happens to hold a genuine,
+      divergent duplicate of this uuid (this problem domain is cross-graph
+      duplication, so that is not a remote possibility -- see
+      ``merge_foreign_duplicate``). A cheap divergence guard (amended)
+      distinguishes the two: target's ``name``/``created_at`` are compared
+      against source's. On a match (genuine resume), the node CREATE is
+      skipped (target already has it -- re-issuing CREATE here would
+      duplicate it, since multi-tenant FalkorDB builds no uniqueness
       constraint on Entity.uuid), and the call proceeds straight to
       (re-)attempting the edge/mention reattachment and the source delete,
       so a retry converges on a single target copy instead of a duplicate.
+      On a mismatch, ``ForeignDuplicateSuspectedError`` is raised instead --
+      before any edge/mention read or mutation on either graph -- rather
+      than silently overwriting the target's divergent topology and
+      deleting the source copy.
 
     Residual hazard (NOT closed by the above): a resumed move does not
     itself deduplicate RELATES_TO/MENTIONS rows that were already recreated
@@ -225,7 +278,9 @@ async def move_entity_across_graphs(
     recreate (and thus duplicate) rows it already created before crashing.
     Fully closing this would need per-edge/mention idempotent writes, which
     is out of scope here; callers needing exact-once edge/mention semantics
-    across crash-recovery should independently verify post-move counts.
+    across crash-recovery should independently verify post-move counts
+    (distinct from the silent-endpoint-missing skips that edges_skipped/
+    mentions_skipped already surface directly on the returned MoveResult).
 
     Group-id rewrite (step-15/16): ``new_group_id`` (rewrite_group_id if
     given, else the source node's own group_id) is applied uniformly to the
@@ -252,6 +307,10 @@ async def move_entity_across_graphs(
         NodeNotFoundError: if no Entity node with *uuid* exists in
             *source_graph* (and it is also absent from *target_graph* --
             otherwise the idempotency no-op above applies instead).
+        ForeignDuplicateSuspectedError: if *uuid* is present in BOTH graphs
+            but target's name/created_at diverge from source's -- see the
+            "Idempotency" section above. Callers hitting this should route
+            *uuid* through ``merge_foreign_duplicate`` instead.
     """
     source = graphiti._graph_for(source_graph)
     target = graphiti._graph_for(target_graph)
@@ -270,7 +329,7 @@ async def move_entity_across_graphs(
     # CREATE and the source DETACH DELETE (present in BOTH graphs) -- see
     # the "Idempotency" section of this function's docstring.
     target_probe = await target.ro_query(
-        'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid',
+        'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid, n.name, n.created_at',
         {'uuid': uuid},
     )
     node_already_in_target = bool(target_probe.result_set)
@@ -295,6 +354,25 @@ async def move_entity_across_graphs(
     new_group_id = group_id if rewrite_group_id is None else rewrite_group_id
 
     if node_already_in_target:
+        # Present in BOTH graphs: distinguish a genuine resume (this SAME
+        # node, recreated by a prior run that crashed strictly between the
+        # node CREATE and the source DETACH DELETE) from a genuine foreign
+        # duplicate (a DIFFERENT, divergent Entity that happens to share
+        # this uuid in target_graph -- merge_foreign_duplicate's territory,
+        # not this function's). This is a cheap heuristic (name +
+        # created_at), not a full deep-equality check -- see the docstring's
+        # "Idempotency" section and ForeignDuplicateSuspectedError.
+        _target_uuid, target_name, target_created_at = target_probe.result_set[0]
+        if target_name != name or target_created_at != created_at:
+            raise ForeignDuplicateSuspectedError(
+                f'move_entity_across_graphs: uuid={uuid} exists in target_graph '
+                f'{target_graph!r} with a diverging name/created_at from the '
+                f'source_graph {source_graph!r} copy (target name={target_name!r} '
+                f'created_at={target_created_at!r}; source name={name!r} '
+                f'created_at={created_at!r}) -- this looks like a genuine '
+                'cross-graph duplicate, not a partially-completed move. Route '
+                'it through merge_foreign_duplicate instead.'
+            )
         # Resuming after a crash strictly between the node CREATE and the
         # source DETACH DELETE below: skip re-CREATE-ing the node (it's
         # already there -- see the docstring's "Idempotency" section) and
@@ -342,6 +420,7 @@ async def move_entity_across_graphs(
         {'uuid': uuid},
     )
     edges_moved = 0
+    edges_skipped = 0
     for row in edges_result.result_set or []:
         (edge_uuid, edge_name, fact, valid_at, invalid_at, edge_created_at,
          _edge_group_id, episodes, src_uuid, dst_uuid) = row
@@ -362,8 +441,10 @@ async def move_entity_across_graphs(
         # edge to be recreated -- otherwise this MATCH yields no rows and
         # the edge is silently skipped (left for the caller to move the
         # other endpoint too, or accept the drop; see the docstring's
-        # "Residual hazard" note).
-        await target.query(
+        # "Residual hazard" note). relationships_created (FalkorDB's own
+        # CREATE stat) distinguishes the two outcomes -- edges_moved only
+        # counts a genuine create, never a silent no-op MATCH.
+        edge_create_result = await target.query(
             'MATCH (a:Entity {uuid: $src_uuid}), (b:Entity {uuid: $dst_uuid}) '
             'CREATE (a)-[r:RELATES_TO]->(b) '
             'SET r.uuid = $edge_uuid, '
@@ -388,7 +469,16 @@ async def move_entity_across_graphs(
                 'episodes': episodes,
             },
         )
-        edges_moved += 1
+        if edge_create_result.relationships_created:
+            edges_moved += 1
+        else:
+            edges_skipped += 1
+            logger.warning(
+                'move_entity_across_graphs: RELATES_TO edge uuid=%s silently '
+                'skipped -- other endpoint uuid=%s not present in '
+                'target_graph=%s (uuid=%s source=%s)',
+                edge_uuid, dst_uuid, target_graph, uuid, source_graph,
+            )
 
     # --- Episodic MENTIONS links (step-9/10) ---
     # MENTIONS carries no embedding (graphiti_core's own save query, see
@@ -400,12 +490,15 @@ async def move_entity_across_graphs(
         {'uuid': uuid},
     )
     mentions_moved = 0
+    mentions_skipped = 0
     for row in mentions_result.result_set or []:
         mention_uuid, _mention_group_id, mention_created_at, episode_uuid = row
         # As with RELATES_TO's other endpoint: the Episodic node is not moved
         # by this primitive and must already exist in target_graph, or this
-        # MATCH yields no rows and the mention is silently skipped.
-        await target.query(
+        # MATCH yields no rows and the mention is silently skipped --
+        # relationships_created distinguishes the two outcomes, same as the
+        # RELATES_TO loop above.
+        mention_create_result = await target.query(
             'MATCH (ep:Episodic {uuid: $episode_uuid}), (n:Entity {uuid: $entity_uuid}) '
             'CREATE (ep)-[e:MENTIONS]->(n) '
             'SET e.uuid = $edge_uuid, '
@@ -419,7 +512,16 @@ async def move_entity_across_graphs(
                 'created_at': mention_created_at,
             },
         )
-        mentions_moved += 1
+        if mention_create_result.relationships_created:
+            mentions_moved += 1
+        else:
+            mentions_skipped += 1
+            logger.warning(
+                'move_entity_across_graphs: MENTIONS link uuid=%s silently '
+                'skipped -- episode uuid=%s not present in target_graph=%s '
+                '(uuid=%s source=%s)',
+                mention_uuid, episode_uuid, target_graph, uuid, source_graph,
+            )
 
     # --- source DETACH DELETE (step-11/12) ---
     # Always the LAST mutation: every target CREATE (node, edges, mentions)
@@ -433,15 +535,18 @@ async def move_entity_across_graphs(
 
     logger.info(
         'move_entity_across_graphs: node moved uuid=%s source=%s target=%s '
-        'edges_moved=%d mentions_moved=%d',
-        uuid, source_graph, target_graph, edges_moved, mentions_moved,
+        'edges_moved=%d edges_skipped=%d mentions_moved=%d mentions_skipped=%d',
+        uuid, source_graph, target_graph, edges_moved, edges_skipped,
+        mentions_moved, mentions_skipped,
     )
     return MoveResult(
         uuid=uuid,
         source_graph=source_graph,
         target_graph=target_graph,
         edges_moved=edges_moved,
+        edges_skipped=edges_skipped,
         mentions_moved=mentions_moved,
+        mentions_skipped=mentions_skipped,
     )
 
 
