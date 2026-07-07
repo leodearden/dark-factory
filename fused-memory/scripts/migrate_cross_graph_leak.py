@@ -424,7 +424,35 @@ async def run(args: Any, memory_service: Any) -> dict:
                 {'uuid': uuid, 'disposition': disposition, 'applied': False, 'blocked': True},
             )
 
+    # POST-VERIFY: re-census foreign counts per graph and compare to the
+    # expected residual -- the per-graph count of UNRESOLVED manifest nodes,
+    # which are the only foreign nodes a clean apply should ever leave
+    # behind. A mismatch means a MOVE/MERGE silently failed to clear its
+    # source copy; any UNRESOLVED node blocks success outright regardless of
+    # whether the counts otherwise reconcile (PRD decision 4).
+    populated = set(await graphiti.list_graphs())
+    after_counts: dict[str, int] = {}
+    for graph_key in populated:
+        foreign = await census_foreign_nodes(graphiti, graph_key, page_size=args.page_size)
+        after_counts[graph_key] = len(foreign)
+
+    expected_residual: dict[str, int] = dict.fromkeys(populated, 0)
+    for node in manifest['nodes']:
+        if node['disposition'] == UNRESOLVED:
+            expected_residual[node['source_graph']] = (
+                expected_residual.get(node['source_graph'], 0) + 1
+            )
+
+    matched = after_counts == expected_residual
+    has_unresolved = bool(manifest.get('unresolved_uuids'))
+
     report = dict(manifest)
     report['dry_run'] = False
     report['apply_results'] = apply_results
+    report['post_verify'] = {
+        'matched': matched,
+        'expected': expected_residual,
+        'actual': after_counts,
+    }
+    report['exit_code'] = 0 if (matched and not has_unresolved) else 1
     return report
