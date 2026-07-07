@@ -1084,3 +1084,60 @@ class TestRecordDrivenRecovery:
 
         harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_quarantine_on_registration_divergence(
+        self, harness: Harness, caplog,
+    ):
+        """B2: durable record ASSIGNED:'42' branch='task/42' but the git
+        admin entry is gone (the 2097/2098 orphaned-worktree divergence) ->
+        QUARANTINE, never re-pinned.  Quarantine is two explicit steps
+        (git_ops.quarantine_worktree then git_ops._lane_lifecycle.transition
+        to QUARANTINED -- see the design decision on the stale injected
+        callable), the lane is left FREE in the pool cache (never restored/
+        re-pinned), and the next dispatch for a different task must still
+        find a usable lane.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane = base / '_lane-0'
+        lane.mkdir(parents=True, exist_ok=True)  # the lane dir itself (no .task/ needed)
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        harness.git_ops._is_registered_worktree = AsyncMock(return_value=False)
+        harness.scheduler.get_status = AsyncMock(return_value=None)  # non-terminal
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._recover_crashed_tasks()
+
+        harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
+            lane, 'task/42', 'recovery-record-divergence',
+        )
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.QUARANTINED
+
+        # Never re-pinned: no assignment, lane stays FREE in the cache, and
+        # no plan is recovered for the divergent record.
+        assert pool.assignment_for('42') is None
+        assert pool.state(lane) == LaneState.FREE
+        assert '42' not in harness._recovered_plans
+
+        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[attr-defined]
+        assert EventType.worktree_quarantined in emitted
+
+        assert any(
+            rec.levelno == logging.WARNING
+            and '42' in rec.getMessage()
+            and 'quarantin' in rec.getMessage().lower()
+            for rec in caplog.records
+        ), f'expected a quarantine warning naming task 42; got: {caplog.text!r}'
+
+        # Next dispatch is clean: a different task can still acquire a lane
+        # (no lingering assignment/exhaustion from the quarantined lane).
+        result = await pool.acquire_for('task/99')
+        assert result is not None, (
+            'pool must not be stuck exhausted after quarantining a lane'
+        )
