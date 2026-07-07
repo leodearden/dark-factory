@@ -74,6 +74,8 @@ class StreakCounter:
             if key not in self.first_seen:
                 self.first_seen[key] = now
             return self.first_seen[key]
+        if cause is None:
+            raise TypeError("touch() requires either 'now' or 'cause' to be given")
         if self.causes.get(key) != cause:
             self.counts[key] = 0
         self.causes[key] = cause
