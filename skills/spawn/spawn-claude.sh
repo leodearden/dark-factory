@@ -22,9 +22,16 @@
 #   126    — no terminal emulator found
 #   127    — launcher itself failed (emulator exited before writing the sentinel)
 #   129    — terminal window closed while the session was alive (SIGHUP)
+#   144    — Claude never started within the started-grace window (registry marked failed-to-start)
 #   2      — bad usage
 
 set -u
+
+# Distinct exit code for the started-verification watchdog's failed-to-start
+# signal (Attention Rail T4) -- see the exit-codes comment above. 144-199 is
+# free (0-125 claude, 126 no-emulator, 127 launcher-fail, 129 window-closed,
+# 143 SIGTERM, 2 usage), so this is additive and backward-compatible.
+EXIT_FAILED_TO_START=144
 
 # Absolute path to the repo root, computed from this script's own location
 # (skills/spawn/spawn-claude.sh -> skills/spawn -> skills -> repo root) so the
@@ -42,6 +49,20 @@ cwd="$1"
 skip_perms="$2"
 title="$3"
 prompt="$4"
+
+# Started-verification watchdog (Attention Rail T4) state: a spawn-time
+# reference marker (mtime = spawn start, used by the step-4 transcript-
+# appearance probe to distinguish a fresh transcript from a stale one), a
+# failed-to-start marker path (NOT created here -- mktemp -u only reserves a
+# unique name; the watchdog creates the file itself when it flags), the
+# started-grace window, and the transcript-scan root. All independent of
+# SPAWN_LAUNCH_GRACE_SECS so genuine-launcher-failure (127) paths are
+# unaffected and existing tests (which only shrink the launch grace) never
+# trip the new code.
+spawn_ref="$(mktemp -t spawn-claude-ref-XXXXXX)"
+fts_marker="$(mktemp -u -t spawn-claude-XXXXXX.fts)"
+SPAWN_STARTED_GRACE_SECS="${SPAWN_STARTED_GRACE_SECS:-90}"
+CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 
 # Session-registry: record this spawn as LAUNCHING (task 2285, Attention Rail
 # T3). Best-effort and fully additive -- a missing python3 or any registry
@@ -101,7 +122,7 @@ cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 SPAWN_LAUNCH_GRACE_SECS="${SPAWN_LAUNCH_GRACE_SECS:-5}"
 
 await_sentinel() {
-  while [ ! -f "$sentinel" ]; do sleep 2; done
+  while [ ! -f "$sentinel" ] && [ ! -f "$fts_marker" ]; do sleep 1; done
 }
 
 # Wait up to SPAWN_LAUNCH_GRACE_SECS for the sentinel to appear.
@@ -129,12 +150,70 @@ finish() {
   exit "$rc"
 }
 
+# True when the started-watchdog has flagged failed-to-start AND no exit
+# sentinel has appeared since. A real exit sentinel (the session actually
+# ran) always wins over a late marker -- this is what lets await_sentinel/
+# resolve_* unblock on the marker while never overriding a genuine exit.
+_failed_to_start_pending() {
+  [ -f "$fts_marker" ] && [ ! -f "$sentinel" ]
+}
+
+# Exit via the distinct failed-to-start code. Deliberately does NOT call the
+# session-registry `exit` subcommand (unlike finish()) -- that would
+# overwrite the failed-to-start status the watchdog already wrote with
+# EXITED, destroying the signal this whole mechanism exists to produce.
+finish_failed_to_start() {
+  local code
+  code=$(cat "$fts_marker" 2>/dev/null || echo "$EXIT_FAILED_TO_START")
+  rm -f "$fts_marker" "$sentinel"
+  exit "$code"
+}
+
+# Backgrounded started-verification watchdog (Attention Rail T4). Forked once
+# right before the emulator case dispatch so it is already running whether
+# the launcher turns out to be foreground (blocks until window-close) or
+# detached (returns immediately). Polls up to SPAWN_STARTED_GRACE_SECS for
+# start-evidence; this step only checks the exit sentinel (the transcript
+# and claude-descendant probes are added in step-4).
+#
+# On grace-expiry with no evidence, flags failed-to-start: best-effort marks
+# the session-registry record, emits a loud caller-visible stderr line, and
+# writes the fts_marker so await_sentinel/resolve_* can break out of what
+# would otherwise be an unbounded wait.
+_started_watchdog() {
+  # Clear inherited traps in this backgrounded copy -- without this, the
+  # child would run the parent's _cleanup on its own return, which would be
+  # wrong (double cleanup / killing its own pid) and is never what we want
+  # for a background job.
+  trap - EXIT HUP TERM
+
+  local end
+  end=$(( $(date +%s) + SPAWN_STARTED_GRACE_SECS ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    [ -f "$sentinel" ] && return 0
+    sleep 0.25
+  done
+  # Final check -- avoid flagging on a sentinel that landed right at the
+  # deadline boundary.
+  [ -f "$sentinel" ] && return 0
+
+  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status failed-to-start || true
+  fi
+  echo "spawn-claude.sh: FAILED-TO-START — claude never started within ${SPAWN_STARTED_GRACE_SECS}s (no transcript, no claude process); registry marked failed-to-start; exiting ${EXIT_FAILED_TO_START}." >&2
+  echo "$EXIT_FAILED_TO_START" > "$fts_marker"
+  return 0
+}
+
 # resolve_foreground: called after a foreground emulator returns.
 # Sentinel present (or appears within a short grace) → session ran; its code
 # wins.  Absent → launcher never started the payload → 127.
 resolve_foreground() {
   if [ -f "$sentinel" ] || _wait_sentinel_grace; then
     finish
+  fi
+  if _failed_to_start_pending; then
+    finish_failed_to_start
   fi
   exit 127
 }
@@ -155,6 +234,9 @@ resolve_detached() {
     exit 127
   else
     await_sentinel
+    if _failed_to_start_pending; then
+      finish_failed_to_start
+    fi
     finish
   fi
 }
@@ -185,6 +267,21 @@ fi
 # Dispatch by the first word of $emulator so $CLAUDE_TERMINAL_CMD="gnome-terminal --foo"
 # still hits the gnome-terminal branch.
 first_word="${emulator%% *}"
+
+# Kill the started-watchdog on EVERY exit path -- MANDATORY. A backgrounded
+# child left running past this script's exit would hold the caller-captured
+# stdout/stderr pipe open (blocking /spawn's background task, and any test
+# harness's subprocess.wait()) until the full started-grace elapsed. Set
+# before the fork so no exit between here and the fork can leak the child.
+_cleanup() {
+  [ -n "${watchdog_pid:-}" ] && kill "$watchdog_pid" 2>/dev/null
+  rm -f "$spawn_ref" "$fts_marker"
+}
+trap _cleanup EXIT
+
+watchdog_pid=""
+_started_watchdog &
+watchdog_pid=$!
 
 case "$first_word" in
   gnome-terminal)
@@ -228,6 +325,9 @@ case "$first_word" in
     open -a Terminal "$tmpscript" || { rm -f "$tmpscript" "$sentinel"; exit 127; }
     await_sentinel
     rm -f "$tmpscript"
+    if _failed_to_start_pending; then
+      finish_failed_to_start
+    fi
     finish
     ;;
   *)
