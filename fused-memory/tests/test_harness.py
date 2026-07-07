@@ -9583,3 +9583,215 @@ async def test_finding_persistence_count_journal_failure_fails_toward_escalate(
         f'when journal.get_recent_runs raises, got {result!r}. '
         'RED: current impl returns 0 (suppresses escalation).'
     )
+
+
+# ---------------------------------------------------------------------------
+# _maybe_escalate_stale_task_count_snapshot — task 2278 step-9/10
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_stage_reports(stat: int | None) -> dict:
+    """Build a stage_reports dict carrying (or omitting) the freshness stat.
+
+    Raw-dict shape (not a StageReport model) — extract_snapshot_written
+    handles both, and the raw shape keeps these test doubles lightweight.
+    """
+    if stat is None:
+        return {}
+    return {'task_knowledge_sync': {'stats': {'task_count_snapshot_written': stat}}}
+
+
+def _make_current_run(run_id: str, stat: int | None) -> ReconciliationRun:
+    """Build a real ReconciliationRun (not a SimpleNamespace stand-in) so it
+    type-checks against _maybe_escalate_stale_task_count_snapshot's ``run:
+    ReconciliationRun`` parameter — mirrors the ``_make_fake_rfc`` convention
+    used elsewhere in this file.
+    """
+    return ReconciliationRun(
+        id=run_id,
+        project_id='test-project',
+        run_type=RunType.full,
+        trigger_reason='test',
+        started_at=datetime.now(UTC),
+        stage_reports=_snapshot_stage_reports(stat),
+    )
+
+
+def _make_prior_run(
+    run_id: str, run_type: str, status: str, stat: int | None, *, offset_seconds: int
+) -> ReconciliationRun:
+    """Build a real ReconciliationRun for prior-run journal fixtures (see
+    _make_current_run for why this isn't a SimpleNamespace)."""
+    return ReconciliationRun(
+        id=run_id,
+        project_id='test-project',
+        run_type=RunType(run_type),
+        trigger_reason='test',
+        started_at=datetime.now(UTC) - timedelta(seconds=offset_seconds),
+        status=RunStatus(status),
+        stage_reports=_snapshot_stage_reports(stat),
+    )
+
+
+class TestMaybeEscalateStaleTaskCountSnapshot:
+    """_maybe_escalate_stale_task_count_snapshot(project_id, run_id, run).
+
+    Escalates category 'recon_stale_task_count_snapshot' after 2+ consecutive
+    full-cycle CONFIRMED misses, filtering prior runs to run_type=='full' AND
+    status=='completed' so remediation/targeted/failed runs neither count
+    toward nor reset the streak.
+    """
+
+    @staticmethod
+    def _escalate_call_category_and_finding(mock_escalate):
+        call = mock_escalate.call_args
+        category = call.args[0] if len(call.args) >= 1 else call.kwargs.get('category')
+        run_id = call.args[1] if len(call.args) >= 2 else call.kwargs.get('run_id')
+        finding = call.kwargs.get('finding')
+        return category, run_id, finding
+
+    @pytest.mark.asyncio
+    async def test_two_consecutive_full_cycle_misses_escalates(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """(a) current miss + 1 prior full/completed miss -> streak 2 -> escalate."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        project_id = 'test-project'
+        run_id = 'run-current'
+        run = _make_current_run(run_id, 0)
+        harness.journal.get_recent_runs = AsyncMock(return_value=[
+            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
+        ])
+        harness._escalate = MagicMock()
+
+        await harness._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
+
+        harness._escalate.assert_called_once()
+        category, esc_run_id, finding = self._escalate_call_category_and_finding(harness._escalate)
+        assert category == 'recon_stale_task_count_snapshot'
+        assert esc_run_id == run_id
+        assert finding['affected_ids'] == [f'task_count_snapshot:{project_id}']
+
+    @pytest.mark.asyncio
+    async def test_single_miss_below_threshold_not_called(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """(b) current miss + no prior full-cycle misses -> streak 1 -> NOT called."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = _make_current_run('run-current', 0)
+        harness.journal.get_recent_runs = AsyncMock(return_value=[])
+        harness._escalate = MagicMock()
+
+        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
+
+        harness._escalate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_current_written_not_called(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """(c) current cycle wrote the snapshot -> NOT called, regardless of priors."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = _make_current_run('run-current', 1)
+        harness.journal.get_recent_runs = AsyncMock(return_value=[
+            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
+        ])
+        harness._escalate = MagicMock()
+
+        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
+
+        harness._escalate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_current_stat_absent_not_called(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """(d) current cycle's stat is absent (unknown) -> NOT called."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = _make_current_run('run-current', None)
+        harness.journal.get_recent_runs = AsyncMock(return_value=[
+            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
+        ])
+        harness._escalate = MagicMock()
+
+        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
+
+        harness._escalate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_blocked_project_not_called_despite_long_streak(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """(e) is_snapshot_write_blocked project (know_live) -> NOT called.
+
+        Also asserts the efficiency fix (amendment round, reviewer finding):
+        the blocked check short-circuits BEFORE the journal read, so a
+        blocked project's cycle never issues a get_recent_runs query or
+        rebuilds/sorts a prior-flags list that evaluate_snapshot_cadence
+        would discard anyway.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = _make_current_run('run-current', 0)
+        harness.journal.get_recent_runs = AsyncMock(return_value=[
+            _make_prior_run('run-prior-1', 'full', 'completed', 0, offset_seconds=100),
+            _make_prior_run('run-prior-2', 'full', 'completed', 0, offset_seconds=200),
+        ])
+        harness._escalate = MagicMock()
+
+        await harness._maybe_escalate_stale_task_count_snapshot('know_live', 'run-current', run)
+
+        harness._escalate.assert_not_called()
+        harness.journal.get_recent_runs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_remediation_run_interleaved_ignored_still_escalates(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """(f1) A remediation-run miss interleaved with a full-run miss is ignored
+        (not counted), but the full-run miss still contributes -> streak 2 -> escalate."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = _make_current_run('run-current', 0)
+        harness.journal.get_recent_runs = AsyncMock(return_value=[
+            _make_prior_run('run-prior-remediation', 'remediation', 'completed', 0, offset_seconds=50),
+            _make_prior_run('run-prior-full', 'full', 'completed', 0, offset_seconds=100),
+        ])
+        harness._escalate = MagicMock()
+
+        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
+
+        harness._escalate.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_remediation_run_only_does_not_reach_threshold(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """(f2) Only a remediation-run miss in history (no full-cycle prior) ->
+        filtered out entirely -> streak 1 -> NOT called."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = _make_current_run('run-current', 0)
+        harness.journal.get_recent_runs = AsyncMock(return_value=[
+            _make_prior_run('run-prior-remediation', 'remediation', 'completed', 0, offset_seconds=50),
+        ])
+        harness._escalate = MagicMock()
+
+        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
+
+        harness._escalate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failed_full_run_skipped_streak_bridges_to_next_completed(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """(g) A failed full run is skipped (not counted, not a reset); the
+        streak bridges across it to the next completed full run's miss."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = _make_current_run('run-current', 0)
+        harness.journal.get_recent_runs = AsyncMock(return_value=[
+            _make_prior_run('run-prior-failed', 'full', 'failed', 0, offset_seconds=50),
+            _make_prior_run('run-prior-completed', 'full', 'completed', 0, offset_seconds=100),
+        ])
+        harness._escalate = MagicMock()
+
+        await harness._maybe_escalate_stale_task_count_snapshot('test-project', 'run-current', run)
+
+        harness._escalate.assert_called_once()

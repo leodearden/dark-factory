@@ -55,6 +55,9 @@ from fused_memory.reconciliation.summary_pool import (
     enforce_summary_pool_cap,
     pretrim_summary_pool,
 )
+from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    TASK_COUNT_SNAPSHOT_KIND,
+)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_task_dump_contamination,
@@ -1904,6 +1907,95 @@ async def _verify_stage2_summary_written(
     return count
 
 
+async def _verify_task_count_snapshot_written(
+    memory_service,
+    project_id: str,
+    run_window_start: datetime | None,
+    *,
+    scroll_limit: int = 1000,
+) -> bool | None:
+    """Best-effort freshness check: was a task_count_snapshot written this run window?
+
+    Enumerates existing ``kind='task_count_snapshot'`` Mem0 records via
+    ``get_memories_by_metadata`` (deterministic Qdrant scroll, NOT semantic
+    search) and checks whether any record's ``created_at`` falls within the
+    current run window via :func:`_marker_is_within_run_window`.
+
+    The existing snapshot write does not reliably carry ``metadata.run_id``,
+    so this checks the write's *timestamp* against the run window rather than
+    matching on run_id (which would read 0 forever).
+
+    Mirrors :func:`_verify_stage2_summary_written`'s never-raises, best-effort,
+    WARNING-on-failure contract, including the crucial distinction between a
+    CONFIRMED miss (``False``) and an inconclusive check (``None``).
+
+    Unlike that helper, this one passes an explicit ``limit`` (mirroring
+    ``_sweep_stale_flag_markers`` et al. — task_count_snapshot has no GC or
+    pool-cap, so its record count grows unbounded over cycles) and treats a
+    saturated page as INCONCLUSIVE rather than a confirmed miss: Qdrant's
+    scroll orders by point id, not ``created_at``, so once matches exceed
+    *scroll_limit* the freshest record can fall outside the returned page —
+    misreading that as a confirmed miss would eventually fire a false
+    stale-snapshot escalation even though a fresh snapshot exists. A ``True``
+    result is unaffected by truncation: finding a match anywhere in a
+    (possibly partial) page is still real evidence of a fresh write.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata``.
+        project_id: Project scope for the query.
+        run_window_start: Start of the current run window, or ``None`` when
+            unknown.
+        scroll_limit: Max records to enumerate in one scroll (default 1000,
+            matching the sibling GC helpers in this module).
+
+    Returns:
+        ``True`` when a record's ``created_at`` falls within the run window
+        (confirmed fresh). ``False`` when the query succeeded, the page was
+        NOT saturated (fewer than *scroll_limit* records), and no record
+        falls within the window (confirmed miss). ``None`` when
+        *run_window_start* is ``None`` (window unknown), the query itself
+        raised (transient failure), or no match was found in a saturated
+        (possibly-truncated) page — "unknown", never miscounted as a
+        confirmed miss.
+    """
+    if run_window_start is None:
+        return None
+    try:
+        members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
+            limit=scroll_limit,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._verify_task_count_snapshot_written: '
+            'get_memories_by_metadata failed for project_id=%s; absence NOT '
+            'confirmed (transient failure, not treated as a miss)',
+            project_id,
+            extra={'project_id': project_id},
+        )
+        return None
+    found = any(
+        _marker_is_within_run_window(member.get('created_at'), run_window_start)
+        for member in members
+    )
+    if found:
+        return True
+    if len(members) >= scroll_limit:
+        logger.warning(
+            'reconciliation._verify_task_count_snapshot_written: enumerated '
+            '%d of scroll_limit=%d task_count_snapshot records with none in '
+            'the current run window — Qdrant scroll is point-id ordered, NOT '
+            'created_at ordered, so a truncated page may exclude the '
+            'freshest record; treating as unknown rather than a confirmed '
+            'miss. Re-run with a higher scroll_limit.',
+            len(members), scroll_limit,
+            extra={'project_id': project_id},
+        )
+        return None
+    return False
+
+
 async def _repair_stage2_summary_stage_metadata(
     memory_service,
     project_id: str,
@@ -2707,6 +2799,25 @@ class TaskKnowledgeSync(BaseStage):
         report.stats['stage2_cycle_summary_verified_count'] = (
             verified_count if verified_count is not None else 0
         )
+
+        # --- task_count_snapshot freshness stat (task 2278) ---
+        # Best-effort structural guard against the Mem0 task_count_snapshot
+        # write-cadence gap: written is None when the run window is unknown
+        # or the freshness query itself failed transiently, in which case the
+        # stat key is left absent entirely so the harness
+        # (_maybe_escalate_stale_task_count_snapshot) can distinguish a
+        # CONFIRMED miss (0) from "unknown" (never miscounted as a miss).
+        # run_window_start forwards whatever assemble_payload stashed on
+        # self._run_window_start this cycle, mirroring the
+        # _sweep_stale_flag_markers forwarding immediately below.
+        task_count_snapshot_written = await _verify_task_count_snapshot_written(
+            self.memory, self.project_id,
+            getattr(self, '_run_window_start', None),
+        )
+        if task_count_snapshot_written is not None:
+            report.stats['task_count_snapshot_written'] = (
+                1 if task_count_snapshot_written else 0
+            )
 
         # --- stage1_flag_marker age-based + cross-cycle fp: GC (task 1944, task-2047 Gap 2) ---
         # The stage1_flag_marker pool is written by Stage 1, not by this stage's
