@@ -2107,6 +2107,47 @@ class TestHandlersAcceptProjectScope:
         assert any(a['type'] == 'hints_attached' for a in result.get('actions', []))
 
 
+class TestShouldWithholdBatchPromotionAcceptsScope:
+    """RED: _should_withhold_batch_promotion accepts a single ProjectScope.
+
+    Calls the guard DIRECTLY (bypassing reconcile_task/_on_task_done) to pin
+    the new positional shape (ep_uuid, scope, statuses_cache): today the
+    signature is (self, ep_uuid, project_id, project_root, statuses_cache),
+    so passing `scope` as the 2nd positional argument leaves `statuses_cache`
+    unbound, raising TypeError. Reuses the batch-plan content shape from
+    TestBatchPlanPromotionGate above.
+    """
+
+    @pytest.mark.asyncio
+    async def test_withholds_when_a_sibling_is_active(
+        self, reconciler, mock_memory_service, mock_taskmaster
+    ):
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value='Merge-queue batch queued together as df 1985-2002'
+        )
+        mock_taskmaster.get_statuses = AsyncMock(return_value={'1990': 'in-progress'})
+
+        result = await reconciler._should_withhold_batch_promotion('ep-uuid', scope, {})
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_promotes_when_all_siblings_terminal(
+        self, reconciler, mock_memory_service, mock_taskmaster
+    ):
+        scope = ProjectScope(ProjectId('test-project'), ProjectRoot('/tmp/test'))
+        mock_memory_service.get_episode_content = AsyncMock(
+            return_value='Merge-queue batch queued together as df 1985-2002'
+        )
+        statuses = {str(tid): 'done' for tid in range(1985, 2003)}
+        mock_taskmaster.get_statuses = AsyncMock(return_value=statuses)
+
+        result = await reconciler._should_withhold_batch_promotion('ep-uuid', scope, {})
+
+        assert result is False
+
+
 # ── Pre-echo authoritative-resolution check (task 1984) ─────────────────────
 #
 # _on_task_done's completion echo must not re-append a stale raw description
