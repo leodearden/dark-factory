@@ -112,3 +112,31 @@ MERGE: str = 'MERGE'
 UNRESOLVED: str = 'UNRESOLVED'
 
 DEFAULT_PAGE_SIZE: int = 1000
+
+
+# ---------------------------------------------------------------------------
+# Pure core
+# ---------------------------------------------------------------------------
+
+def resolve_target_graph(
+    group_id: str,
+    populated_graphs: set[str] | list[str] | frozenset[str],
+    alias_map: dict[str, str],
+) -> str | None:
+    """Resolve *group_id* to its correct home graph, or None if UNRESOLVED.
+
+    Resolution order (PRD decision 4 -- no silent canonicalization beyond
+    this explicit, human-reviewable table):
+      1. *group_id* itself names a real, already-populated graph -> that is
+         its home (a displaced-only node: it just needs to move back).
+      2. *group_id* is an orphan (not populated) but has an explicit
+         *alias_map* entry -> the mapped canonical target.
+      3. Neither -> None (UNRESOLVED). Never falls back to a generic
+         normalization (e.g. blind hyphen->underscore rewrite) and never
+         invents/targets a new, unpopulated graph.
+    """
+    if group_id in populated_graphs:
+        return group_id
+    if group_id in alias_map:
+        return alias_map[group_id]
+    return None
