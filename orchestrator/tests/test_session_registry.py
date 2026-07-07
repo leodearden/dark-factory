@@ -50,3 +50,82 @@ def _make_record(**overrides: object) -> "sr.SessionRecord":
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
+
+
+# ---------------------------------------------------------------------------
+# Step-1: schema / contract
+# ---------------------------------------------------------------------------
+
+
+def test_schema_version_is_int() -> None:
+    assert isinstance(sr.SCHEMA_VERSION, int)
+
+
+def test_status_enum_has_exact_six_wire_values() -> None:
+    assert issubclass(sr.Status, str)
+    values = {member.value for member in sr.Status}
+    assert values == {
+        'launching',
+        'running',
+        'awaiting-input',
+        'idle',
+        'exited',
+        'failed-to-start',
+    }
+    assert len(list(sr.Status)) == 6
+    # Spot-check the documented wire-value <-> member mapping.
+    assert sr.Status('launching') is sr.Status.LAUNCHING
+    assert sr.Status('running') is sr.Status.RUNNING
+    assert sr.Status('awaiting-input') is sr.Status.AWAITING_INPUT
+    assert sr.Status('idle') is sr.Status.IDLE
+    assert sr.Status('exited') is sr.Status.EXITED
+    assert sr.Status('failed-to-start') is sr.Status.FAILED_TO_START
+
+
+def test_session_record_schema_version_defaults_to_schema_version() -> None:
+    r = _make_record()
+    assert r.schema_version == sr.SCHEMA_VERSION
+
+
+def test_session_record_carries_all_required_fields() -> None:
+    r = _make_record()
+    for field_name in (
+        'schema_version',
+        'session_slug',
+        'title',
+        'role',
+        'project',
+        'task_id',
+        'escalation_id',
+        'prompt',
+        'cwd',
+        'launcher_pid',
+        'start_ts',
+        'status',
+        'exit_code',
+        'result_file',
+        'transcript_path',
+    ):
+        assert hasattr(r, field_name), f'SessionRecord missing field {field_name!r}'
+
+
+def test_session_record_dict_round_trip_is_lossless() -> None:
+    r = _make_record()
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+
+
+def test_session_record_json_round_trip_is_lossless() -> None:
+    r = _make_record()
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+
+
+def test_session_record_json_round_trip_with_null_fields() -> None:
+    """exit_code/result_file/task_id/escalation_id may legitimately be None
+    (a freshly-launched record has no exit code yet); the round trip must
+    preserve that, not coerce it to a string or drop the key.
+    """
+    r = _make_record(
+        task_id=None, escalation_id=None, exit_code=None,
+        result_file=None, transcript_path=None,
+    )
+    assert sr.SessionRecord.from_json(r.to_json()) == r
