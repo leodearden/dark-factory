@@ -15,12 +15,16 @@ import json
 import logging
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_HOOKS_DIR = _REPO_ROOT / 'skills' / 'spawn' / 'hooks'
 
 # ---------------------------------------------------------------------------
 # Step-1: identity + slug resolution
@@ -507,3 +511,43 @@ def test_merge_hook_settings_creates_hooks_key_when_absent(tmp_path: Path) -> No
 
     assert set(after['hooks']) == {'SessionStart', 'Notification', 'Stop'}
     assert after['env'] == before['env']
+
+
+# ---------------------------------------------------------------------------
+# Step-13: bash-level integration test (skills/spawn/hooks/*.sh entrypoints)
+# ---------------------------------------------------------------------------
+
+
+def _run_hook_script(
+    script_name: str,
+    hook_input: dict[str, object],
+    root: Path,
+) -> subprocess.CompletedProcess[bytes]:
+    env = dict(os.environ)
+    env['CLAUDE_FLEET_ROOT'] = str(root)
+    return subprocess.run(
+        [str(_HOOKS_DIR / script_name)],
+        input=json.dumps(hook_input).encode(),
+        env=env,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+def test_session_start_sh_then_notification_sh_flip_status(tmp_path: Path) -> None:
+    # Proves the PYTHONPATH=orchestrator/src wiring, stdin passthrough to
+    # python, and fail-soft exit for the real bash entrypoints end-to-end.
+    hook_input = {'session_id': 'sess-bash-1', 'cwd': '/home/leo/src/dark-factory'}
+
+    start_result = _run_hook_script('session-start.sh', hook_input, tmp_path)
+    assert start_result.returncode == 0
+
+    slug = sh.hook_session_slug(hook_input, env={})
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+
+    notification_result = _run_hook_script('notification.sh', hook_input, tmp_path)
+    assert notification_result.returncode == 0
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.AWAITING_INPUT
