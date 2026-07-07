@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
+from pydantic import ValidationError
+
 # Runtime import of the BORN_AT_L2_SEVERITIES constant from escalation.models.
 # escalation.models is listed under TYPE_CHECKING above (:77-78) for the Escalation
 # type annotation; a separate runtime import is needed here because
@@ -3390,10 +3392,15 @@ class TaskWorkflow:
         """Block on a no-plan / malformed-plan failure with cycle detection.
 
         Fix C — increments ``consecutive_no_plan_failures`` keyed by
-        ``last_no_plan_main_sha`` in the task's metadata.  When the
-        counter hits ≥ 2 with the same main SHA, the no-plan loop has
-        been observed and we escalate to a human directly (skip the
-        steward) rather than letting the workflow re-pend.
+        ``last_no_plan_main_sha`` inside the typed ``metadata.retry_ledger``
+        blob (see :func:`_evaluate_no_plan`).  When the counter hits ≥ 2
+        with the same main SHA, the no-plan loop has been observed and we
+        escalate to a human directly (skip the steward) rather than
+        letting the workflow re-pend.
+
+        Persist failure escalates to a human immediately rather than
+        logging and proceeding: a silently-lost counter increment would
+        let this money-burning loop under-fire.
         """
         try:
             current_main_sha = await self.git_ops.get_main_sha()
@@ -3405,56 +3412,46 @@ class TaskWorkflow:
             current_main_sha = ''
 
         metadata = self.task.get('metadata') or {}
-        last_sha = str(metadata.get('last_no_plan_main_sha') or '')
         try:
-            counter = int(metadata.get('consecutive_no_plan_failures') or 0)
-        except (TypeError, ValueError):
-            counter = 0
-        try:
-            total = int(metadata.get('total_no_plan_failures') or 0)
-        except (TypeError, ValueError):
-            total = 0
+            ledger = RetryLedger(**(metadata.get('retry_ledger') or {}))
+        except ValidationError:
+            ledger = RetryLedger()
 
-        if not current_main_sha or last_sha != current_main_sha:
-            counter = 1
-        else:
-            counter += 1
-
-        # Total counter never resets — backstops the SHA-keyed counter when
-        # main keeps moving and the per-SHA counter never reaches 2 (the
-        # bug behind 16 successive Opus calls on task 917).
-        total += 1
+        verdict = _evaluate_no_plan(ledger, current_main_sha)
 
         # Read-modify-write: see _merge_fresh_metadata for the merge policy.
         new_metadata = await self._merge_fresh_metadata(
             metadata, log_context='no-plan counter',
         )
-        new_metadata['last_no_plan_main_sha'] = current_main_sha
-        # Counters intentionally sourced from in-memory metadata; backend overlay is only for non-counter keys (e.g. memory_hints).
-        new_metadata['consecutive_no_plan_failures'] = counter
-        new_metadata['total_no_plan_failures'] = total
+        # In-memory ledger intentionally wins over any backend retry_ledger;
+        # the backend overlay above is only for non-counter keys (e.g. memory_hints).
+        new_metadata['retry_ledger'] = verdict.ledger.model_dump()
         self.task['metadata'] = new_metadata
         try:
             await self.scheduler.update_task(self.task_id, metadata=new_metadata)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
             logger.warning(
-                'Task %s: failed to persist no-plan cycle counter: %s',
+                'Task %s: failed to persist no-plan cycle counter; '
+                'escalating to human (counter cannot be trusted): %s',
                 self.task_id, exc,
             )
-
-        if counter >= 2 or total >= 3:
-            trigger = (
-                'same-SHA counter' if counter >= 2 else 'total counter'
+            return await self._mark_blocked(
+                f'Failed to persist no-plan cycle counter: {exc}',
+                detail=detail, escalate_to_human=True,
             )
+
+        if verdict.escalate:
+            counter = verdict.ledger.consecutive_no_plan_failures
+            total = verdict.ledger.total_no_plan_failures
             logger.warning(
                 'Task %s: no-plan loop confirmed (%s) — '
                 'consecutive=%d on main SHA %s, total=%d; escalating to human',
-                self.task_id, trigger, counter,
+                self.task_id, verdict.trigger, counter,
                 current_main_sha[:12] or '<unknown>', total,
             )
             full_reason = (
                 f'Repeated no-plan failure (counter={counter}, total={total}) '
-                f'via {trigger}: {reason}'
+                f'via {verdict.trigger}: {reason}'
             )
             return await self._mark_blocked(
                 full_reason, detail=detail, escalate_to_human=True,
