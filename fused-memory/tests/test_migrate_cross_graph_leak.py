@@ -870,6 +870,7 @@ class TestRunApplyDispatch:
 
         move_mock.assert_awaited_once_with(
             memory_service.graphiti, 'u-move', 'reify', 'dark_factory',
+            rewrite_group_id='dark_factory',
         )
         merge_mock.assert_awaited_once_with(
             memory_service.graphiti, 'u-merge', wrong_graph='reify', home_graph='know_live',
@@ -880,6 +881,37 @@ class TestRunApplyDispatch:
             'uuid': 'u-unresolved', 'disposition': _mod.UNRESOLVED,
             'applied': False, 'blocked': True,
         }]
+
+    @pytest.mark.asyncio
+    async def test_move_dispatch_passes_rewrite_group_id_matching_target(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression guard (review-fix cycle 1, Bug 2): a MOVE dispatch
+        must pass rewrite_group_id == the node's target_graph, so an
+        alias-mapped move re-keys the moved node (and, via epsilon's
+        uniform new_group_id, its edges/mentions) to its home-graph name.
+        Without this, the recreated node keeps its variant group_id, stays
+        foreign in its new home, and post-verify miscounts it as residual
+        (a false exit 1). Pinned as its OWN focused test so a future
+        refactor cannot silently drop the kwarg without a test failing."""
+        move_node = _classified_node(
+            'u-move', source_graph='reify', target_graph='know_live', disposition=_mod.MOVE,
+        )
+        manifest = _mod.build_manifest([move_node], {'reify': 1}, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+
+        move_mock = AsyncMock()
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        monkeypatch.setattr(_mod, 'merge_foreign_duplicate', AsyncMock())
+
+        memory_service = _make_memory_service({})
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        await _mod.run(args, memory_service)
+
+        _call_args, call_kwargs = move_mock.await_args
+        assert call_kwargs.get('rewrite_group_id') == 'know_live'
 
 
 # ===========================================================================
