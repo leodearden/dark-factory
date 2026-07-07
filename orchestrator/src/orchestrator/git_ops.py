@@ -2878,11 +2878,13 @@ class GitOps:
                             '%s; releasing lane',
                             rc, lane,
                         )
-                    # release_warm_lane (not a bare pool.release) — detaches
-                    # HEAD first so the branch _reset_warm_lane just checked
-                    # out here doesn't leak a "already used by worktree"
+                    # _abort_lane_acquisition (task 2199) — detaches HEAD
+                    # first so the branch _reset_warm_lane just checked out
+                    # here doesn't leak a "already used by worktree"
                     # collision for the next acquire (task 2062 mid-run leak).
-                    await self.release_warm_lane(lane, branch_name)
+                    await self._abort_lane_acquisition(
+                        lane, branch_name, remove_worktree=False,
+                    )
                     return _seed_rc_to_unavailable(rc)
                 # Falls through to shared tail
 
@@ -2934,7 +2936,9 @@ class GitOps:
                             self.worktree_base, lane,
                         )
                         self._note_pool_storage_absent()
-                        await self.release_warm_lane(lane, branch_name)
+                        await self._abort_lane_acquisition(
+                            lane, branch_name, remove_worktree=False,
+                        )
                         return WarmLaneUnavailable.BASE_ABSENT
                 # Self-heal: remove a stale unregistered directory so
                 # git worktree add doesn't refuse a non-empty dir.
@@ -3001,11 +3005,9 @@ class GitOps:
                                 '(rc=%d) for %s; removing worktree',
                                 _co_seed_rc, lane,
                             )
-                        await _run(
-                            ['git', 'worktree', 'remove', str(lane), '--force'],
-                            cwd=self.project_root,
+                        await self._abort_lane_acquisition(
+                            lane, branch_name, remove_worktree=True,
                         )
-                        await self.warm_lane_pool.release(lane)
                         return _seed_rc_to_unavailable(_co_seed_rc)
                     return await self._reuse_warm_lane(lane, full_branch)
 
@@ -3017,7 +3019,9 @@ class GitOps:
                     logger.warning(
                         'acquire_warm_lane: git worktree add failed for %s: %s', lane, err,
                     )
-                    await self.warm_lane_pool.release(lane)
+                    await self._abort_lane_acquisition(
+                        lane, branch_name, remove_worktree=True,
+                    )
                     return WarmLaneUnavailable.FAULT
 
                 seed_rc = await self._seed_warm_lane(lane, '--fresh-checkout')
@@ -3043,34 +3047,22 @@ class GitOps:
                             'removing worktree',
                             seed_rc, lane,
                         )
-                    await _run(
-                        ['git', 'worktree', 'remove', str(lane), '--force'],
-                        cwd=self.project_root,
+                    # _abort_lane_acquisition (task 2199) now absorbs the
+                    # former Task-2112/angle-A-2 degenerate-branch-delete
+                    # logic that used to live here inline: `git worktree add
+                    # -b full_branch <lane> start_ref` (above) already
+                    # created full_branch — often at a foreign 'Merge
+                    # task/<other> into main' commit — and merely removing
+                    # the worktree would leave that zero-commit branch ref
+                    # parked. The primitive gates deletion on
+                    # warm_lane_ref_is_degenerate (passed `branch_name`, the
+                    # BARE task id — e.g. '321', NOT the prefixed
+                    # 'task/321' — exactly as before) then
+                    # _delete_branch_if_on_main, so a commit-bearing branch
+                    # is never destroyed.
+                    await self._abort_lane_acquisition(
+                        lane, branch_name, remove_worktree=True,
                     )
-                    await self.warm_lane_pool.release(lane)
-                    # Task 2112 / angle A-2 — delete the degenerate task-branch
-                    # ref residue. `git worktree add -b full_branch <lane>
-                    # start_ref` (above) already created full_branch — often
-                    # at a foreign 'Merge task/<other> into main' commit — and
-                    # `git worktree remove --force` only drops the worktree
-                    # directory, leaving that zero-commit branch ref parked.
-                    # Gated on the read-only primitive (fail-soft False on any
-                    # doubt); _delete_branch_if_on_main is a second guard that
-                    # retains (never deletes) any branch carrying commits
-                    # beyond main. Scoped to this create-once seed-fault path
-                    # only — the reattach/reuse paths deliberately retain
-                    # commit-bearing branches and are untouched.
-                    # Task 2112 amendment: `branch_name` here is acquire_warm_lane's
-                    # own parameter — the BARE task id, e.g. '321', NOT the
-                    # prefixed `full_branch` ('task/321'). warm_lane_ref_is_degenerate
-                    # forwards it verbatim as `--task <branch_name>`, which is the
-                    # flag the reify script expects. Passing full_branch here would
-                    # silently misclassify (the script would look up a ref literally
-                    # named 'task/task/321').
-                    if await self.warm_lane_ref_is_degenerate(branch_name):
-                        await self._delete_branch_if_on_main(
-                            full_branch, context='acquire_warm_lane seed-fault',
-                        )
                     return _seed_rc_to_unavailable(seed_rc)
             else:
                 # ── Already-registered lane — check on-disk backstop first ─
@@ -3195,7 +3187,7 @@ class GitOps:
             logger.warning(
                 'acquire_warm_lane: unexpected error for %s; releasing', lane, exc_info=True,
             )
-            await self.warm_lane_pool.release(lane)
+            await self._abort_lane_acquisition(lane, branch_name, remove_worktree=False)
             return WarmLaneUnavailable.FAULT
 
     async def _reuse_warm_lane(
@@ -3447,12 +3439,13 @@ class GitOps:
                     'retry for %s -> FAULT (escalate per 1859)',
                     lane, exc_info=True,
                 )
-                # release_warm_lane (not a bare pool.release) — detaches HEAD
-                # first so a branch left checked out by a partially-applied
+                # _abort_lane_acquisition (task 2199) — detaches HEAD first
+                # so a branch left checked out by a partially-applied
                 # _reset_warm_lane doesn't leak a collision for the next
                 # acquire (task 2062 mid-run leak).
-                await self.release_warm_lane(
+                await self._abort_lane_acquisition(
                     lane, full_branch[len(self.config.branch_prefix):],
+                    remove_worktree=False,
                 )
                 return WarmLaneUnavailable.FAULT
 
@@ -3475,12 +3468,12 @@ class GitOps:
                     '%s; releasing lane',
                     rc, lane,
                 )
-            # release_warm_lane (not a bare pool.release) — detaches HEAD
-            # first so the branch _reset_warm_lane just checked out here
-            # doesn't leak a collision for the next acquire (task 2062
-            # mid-run leak).
-            await self.release_warm_lane(
+            # _abort_lane_acquisition (task 2199) — detaches HEAD first so
+            # the branch _reset_warm_lane just checked out here doesn't leak
+            # a collision for the next acquire (task 2062 mid-run leak).
+            await self._abort_lane_acquisition(
                 lane, full_branch[len(self.config.branch_prefix):],
+                remove_worktree=False,
             )
             return _seed_rc_to_unavailable(rc)
 
@@ -3566,6 +3559,134 @@ class GitOps:
             lane, bare_id,
         )
         return True
+
+    async def _abort_lane_acquisition(
+        self, lane: Path, bare_id: str, *, remove_worktree: bool,
+    ) -> None:
+        """Never-raise teardown for any :meth:`acquire_warm_lane` fault exit.
+
+        Task 2199 (task-2062 residual): every fault-exit path in
+        ``acquire_warm_lane`` and its recycle/reset helpers routes through
+        this single primitive so a partially-acquired lane is always left in
+        a consistent state before its pool slot is freed — in particular,
+        HEAD must be detached before the lane is released, or a requeue can
+        collide with "already used by worktree".
+
+        Never raises. ``self.warm_lane_pool.release(lane)`` is always the
+        LAST action, so the slot is never marked FREE while lane git state
+        is still being mutated.
+        """
+        if self.warm_lane_pool is None:
+            return
+
+        full_branch = f'{self.config.branch_prefix}{bare_id}'
+
+        # (a) Best-effort WIP snapshot BEFORE any ref movement — mirrors
+        # detach_lane_checkout's commit-before-detach contract (never
+        # discard uncommitted WIP). Guarded on HEAD actually being on
+        # full_branch: a reattach-guard raise (γ, create-once and
+        # reset-in-place sites) can leave the lane still checked out on a
+        # STALE PREVIOUS OCCUPANT's branch when the reattach itself failed —
+        # committing unconditionally would contaminate that foreign branch
+        # with WIP that was never its own. Skip (fail toward not touching
+        # foreign state) unless HEAD affirmatively resolves to full_branch.
+        # Best-effort: the very fault that triggered this abort may itself
+        # be a commit() failure (e.g. the _reuse_warm_lane commit()
+        # RuntimeError) — never re-raise.
+        try:
+            _rc_head, _cur_branch, _ = await _run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+            )
+            if _rc_head == 0 and _cur_branch.strip() == full_branch:
+                # Gate the commit on real changes existing OUTSIDE target/
+                # (review-fix, task 2199). target/ is the reify build/seed
+                # output dir and is NOT gitignored inside a lane checkout
+                # (the root .gitignore's `.worktrees/` entry does not reach
+                # into a lane's own working tree). The create-once and
+                # recycle re-seed fault routes reach this step right after a
+                # FAILED seed script, which can leave a partially-written
+                # target/ behind. There is by definition no genuine user WIP
+                # under target/ on those routes, so unconditionally
+                # committing here would turn a would-be-degenerate 0-commit
+                # ref into a RETAINED, commit-bearing branch full of seed
+                # garbage — defeating the degenerate-gated retention below.
+                # Fail toward committing (never-discard-WIP) if the status
+                # probe itself errors.
+                _rc_status, _status_out, _ = await _run(
+                    ['git', 'status', '--porcelain', '--', '.', ':!target'],
+                    cwd=lane,
+                )
+                if _rc_status != 0 or _status_out.strip():
+                    await self.commit(lane, 'chore: save WIP before lane-acquire abort')
+                else:
+                    logger.debug(
+                        '_abort_lane_acquisition: lane %s has no changes '
+                        'outside target/ — skipping WIP commit (avoids '
+                        'committing seed residue as a retained garbage '
+                        'branch)', lane,
+                    )
+            else:
+                logger.debug(
+                    '_abort_lane_acquisition: lane %s HEAD is not on %s '
+                    '(got %r) — skipping WIP commit to avoid contaminating '
+                    'a foreign branch', lane, full_branch,
+                    _cur_branch.strip() if _rc_head == 0 else None,
+                )
+        except Exception:
+            logger.warning(
+                '_abort_lane_acquisition: commit error for %s (task %s)',
+                lane, bare_id, exc_info=True,
+            )
+
+        # (b) Detach HEAD — frees git's single-checkout lock (the task-2062
+        # fix: a lane must never be released FREE while task/<bare_id> is
+        # still checked out).
+        try:
+            rc, _, err = await _run(['git', 'checkout', '--detach'], cwd=lane)
+            if rc != 0:
+                logger.warning(
+                    '_abort_lane_acquisition: checkout --detach failed for '
+                    '%s (task %s): %s', lane, bare_id, err,
+                )
+        except Exception:
+            logger.warning(
+                '_abort_lane_acquisition: checkout --detach error for %s '
+                '(task %s)', lane, bare_id, exc_info=True,
+            )
+
+        # (c) Degenerate-gated retention — upgrades the task-2112 classifier
+        # from create-once-only to every fault route. Both guards are
+        # retention-biased (fail-soft False → retain; commit-bearing →
+        # retain), so this can never destroy an orphan commit.
+        try:
+            if await self.warm_lane_ref_is_degenerate(bare_id):
+                await self._delete_branch_if_on_main(
+                    full_branch, context='acquire_warm_lane abort',
+                )
+        except Exception:
+            logger.warning(
+                '_abort_lane_acquisition: degenerate-check/delete error for '
+                '%s (task %s)', full_branch, bare_id, exc_info=True,
+            )
+
+        if remove_worktree:
+            try:
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'remove', '--force', str(lane)],
+                    cwd=self.project_root,
+                )
+                if rc != 0:
+                    logger.warning(
+                        '_abort_lane_acquisition: worktree remove --force '
+                        'failed for %s (task %s): %s', lane, bare_id, err,
+                    )
+            except Exception:
+                logger.warning(
+                    '_abort_lane_acquisition: worktree remove error for %s '
+                    '(task %s)', lane, bare_id, exc_info=True,
+                )
+
+        await self.warm_lane_pool.release(lane)
 
     async def release_lane_for_terminal_task(
         self,
