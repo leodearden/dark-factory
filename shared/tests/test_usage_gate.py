@@ -1313,7 +1313,12 @@ class TestTransitionSideEffectsLifecycle:
         acct = gate._accounts[0]
         acct.phase = AccountPhase.CAPPED
         acct.probe_count = 3
+        # Backdate BOTH clocks — faithful to what the real cap-entry path
+        # stamps for a sole/last account (step-29/30: _total_pause_secs is
+        # gate-level-only, so the gate clock is what feeds the assertion
+        # below; the per-account clock is still expected to be cleared).
         acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=120)
+        gate._pause_started_at = datetime.now(UTC) - timedelta(seconds=120)
 
         gate._transition(acct, AccountPhase.PROBING)
 
@@ -1661,7 +1666,10 @@ class TestUncapViaTransition:
         acct.phase = AccountPhase.CAPPED
         acct.probe_count = 3
         acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
+        # Backdate BOTH clocks (step-29/30: _total_pause_secs is
+        # gate-level-only, so the gate clock is what feeds it).
         acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=120)
+        gate._pause_started_at = datetime.now(UTC) - timedelta(seconds=120)
         gate._total_pause_secs = 0.0
 
         result = await gate._refresh_capped_accounts()
@@ -1690,7 +1698,10 @@ class TestUncapViaTransition:
         acct.phase = AccountPhase.CAPPED
         acct.probe_count = 0
         acct.resets_at = datetime.now(UTC) - timedelta(minutes=1)
+        # Backdate BOTH clocks (step-29/30: _total_pause_secs is
+        # gate-level-only, so the gate clock is what feeds it).
         acct.pause_started_at = datetime.now(UTC) - timedelta(seconds=60)
+        gate._pause_started_at = datetime.now(UTC) - timedelta(seconds=60)
         gate._total_pause_secs = 0.0
         gate._run_probe = AsyncMock(return_value=True)
 

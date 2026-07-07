@@ -412,10 +412,12 @@ class UsageGate:
         gate-level pause into ``_total_pause_secs`` and clearing
         ``_pause_started_at`` when an edge reopens the gate — plus recovery
         bookkeeping when leaving a blocked phase (probe_count reset,
-        per-account pause-time consumption into ``_total_pause_secs``,
-        ``auth_failed_at`` clearing). The ``resumed``/``auth_resumed`` cost
-        events are NOT fired here — they stay in the async callers that
-        carry a probe-count label.
+        per-account ``pause_started_at``/``auth_failed_at`` clearing).
+        ``_total_pause_secs`` is a purely gate-level measure: only the
+        gate-level ``_pause_started_at`` clock above feeds it, so a pause is
+        counted exactly once regardless of how many accounts it affects. The
+        ``resumed``/``auth_resumed`` cost events are NOT fired here — they
+        stay in the async callers that carry a probe-count label.
 
         ``clear_near_cap`` defaults to True (the phase write always implies
         a fresh near-cap read for every caller except one): ``release_probe_slot``
@@ -444,14 +446,14 @@ class UsageGate:
             acct.near_cap = False
 
         # --- Recovery bookkeeping for the edge just taken -----------------
-        if (
-            old_phase == AccountPhase.CAPPED
-            and new_phase != AccountPhase.CAPPED
-            and acct.pause_started_at is not None
-        ):
-            self._total_pause_secs += (
-                datetime.now(UTC) - acct.pause_started_at
-            ).total_seconds()
+        # NOTE: this per-account clock does NOT feed _total_pause_secs — that
+        # would double-count alongside the gate-level consumption below,
+        # since the real cap-entry path stamps both clocks at the same
+        # instant when this is the sole/last open account (regression fixed
+        # at step-29/30). acct.pause_started_at is retained only for
+        # per-account diagnostics / field hygiene (e.g. the SIGHUP field-clear
+        # assertion).
+        if old_phase == AccountPhase.CAPPED and new_phase != AccountPhase.CAPPED:
             acct.pause_started_at = None
         if old_phase == AccountPhase.AUTH_FAILED and new_phase != AccountPhase.AUTH_FAILED:
             acct.auth_failed_at = None
@@ -484,11 +486,15 @@ class UsageGate:
             self._open.set()
             # Symmetric counterpart to the closing branch below: consume the
             # gate-level pause into _total_pause_secs and clear
-            # _pause_started_at on reopen, mirroring the per-account
-            # bookkeeping above. Without this, total_pause_secs (which adds
-            # "now - _pause_started_at" whenever the latter is truthy) would
-            # keep growing forever after the very first full-gate pause, even
-            # while the gate sits open and accounts serve traffic.
+            # _pause_started_at on reopen. This is the SOLE accumulation site
+            # for _total_pause_secs (gate-level-only — see _transition's
+            # docstring); the per-account recovery block above intentionally
+            # does not also add to it, to avoid double-counting the same
+            # elapsed interval. Without this branch, total_pause_secs (which
+            # adds "now - _pause_started_at" whenever the latter is truthy)
+            # would keep growing forever after the very first full-gate
+            # pause, even while the gate sits open and accounts serve
+            # traffic.
             if self._pause_started_at is not None:
                 self._total_pause_secs += (
                     datetime.now(UTC) - self._pause_started_at
