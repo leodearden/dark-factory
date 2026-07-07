@@ -14,6 +14,7 @@ from dashboard.data.metrics import (
     _split_queue_stats,
     _split_status,
     downsample_metrics,
+    get_curator_sparks,
     get_memory_24h_ago,
     get_memory_sparks,
     get_merge_active_series,
@@ -291,6 +292,232 @@ async def test_merge_active_series_per_project_filter(metrics_db_path: Path):
         await db.close()
     assert agg['values'] == [5]
     assert scoped['values'] == [4]
+
+
+# ---------------------------------------------------------------------------
+# now-threading (task 2281) — mirrors test_costs_data.py Test_Cutoff:
+# fixed-now determinism per function, plus one no-now real-clock bracket.
+#
+# FIXED_NOW is anchored months away from the real wall clock on purpose: if a
+# function silently ignored its `now=` argument and fell back to
+# datetime.now(UTC) internally, the "inside window" row (offset from
+# FIXED_NOW) would land far outside whatever cutoff the real clock produces
+# and the assertions below would fail loudly instead of passing by accident.
+# ---------------------------------------------------------------------------
+
+FIXED_NOW = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_orchestrators_series_uses_provided_now(metrics_db_path: Path):
+    conn = sqlite3.connect(str(metrics_db_path))
+    inside = (FIXED_NOW - timedelta(hours=12)).isoformat()
+    outside = (FIXED_NOW - timedelta(days=2)).isoformat()
+    conn.execute(
+        'INSERT INTO orchestrator_snapshots (ts, project_id, running_count) VALUES (?, ?, ?)',
+        (inside, 'proj-a', 4),
+    )
+    conn.execute(
+        'INSERT INTO orchestrator_snapshots (ts, project_id, running_count) VALUES (?, ?, ?)',
+        (outside, 'proj-a', 99),
+    )
+    conn.commit()
+    conn.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        series = await get_orchestrators_running_series(db, days=1, now=FIXED_NOW)
+    finally:
+        await db.close()
+    assert series['values'] == [4]
+
+
+@pytest.mark.asyncio
+async def test_memory_sparks_uses_provided_now(metrics_db_path: Path):
+    conn = sqlite3.connect(str(metrics_db_path))
+    inside = (FIXED_NOW - timedelta(hours=12)).isoformat()
+    outside = (FIXED_NOW - timedelta(days=2)).isoformat()
+    conn.executemany(
+        'INSERT INTO memory_snapshots (ts, project_id, graphiti_nodes, mem0_memories) '
+        'VALUES (?, ?, ?, ?)',
+        [(inside, 'a', 10, 20), (outside, 'a', 999, 999)],
+    )
+    conn.commit()
+    conn.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        sparks = await get_memory_sparks(db, days=1, now=FIXED_NOW)
+    finally:
+        await db.close()
+    assert sparks['graphiti_nodes']['values'] == [10]
+    assert sparks['mem0_memories']['values'] == [20]
+
+
+@pytest.mark.asyncio
+async def test_memory_24h_ago_uses_provided_now(metrics_db_path: Path):
+    target = FIXED_NOW - timedelta(hours=24)
+    conn = sqlite3.connect(str(metrics_db_path))
+    conn.execute(
+        'INSERT INTO memory_snapshots (ts, project_id, graphiti_nodes, mem0_memories) '
+        'VALUES (?, ?, ?, ?)',
+        ((target - timedelta(minutes=30)).isoformat(), 'proj-a', 100, 200),
+    )
+    # Anchored to the *real* current clock — this is the row that would win
+    # "closest to 24h ago" if the function ignored `now=FIXED_NOW` and read
+    # datetime.now(UTC) internally instead.
+    conn.execute(
+        'INSERT INTO memory_snapshots (ts, project_id, graphiti_nodes, mem0_memories) '
+        'VALUES (?, ?, ?, ?)',
+        ((datetime.now(UTC) - timedelta(hours=24)).isoformat(), 'proj-a', 999, 999),
+    )
+    conn.commit()
+    conn.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        result = await get_memory_24h_ago(db, now=FIXED_NOW)
+    finally:
+        await db.close()
+    assert result['proj-a']['graphiti_nodes'] == 100
+
+
+@pytest.mark.asyncio
+async def test_queue_pending_series_uses_provided_now(metrics_db_path: Path):
+    conn = sqlite3.connect(str(metrics_db_path))
+    inside = (FIXED_NOW - timedelta(hours=12)).isoformat()
+    outside = (FIXED_NOW - timedelta(days=2)).isoformat()
+    conn.execute(
+        'INSERT INTO queue_snapshots (ts, pending, retry, dead) VALUES (?, ?, ?, ?)',
+        (inside, 7, 1, 0),
+    )
+    conn.execute(
+        'INSERT INTO queue_snapshots (ts, pending, retry, dead) VALUES (?, ?, ?, ?)',
+        (outside, 999, 0, 0),
+    )
+    conn.commit()
+    conn.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        series = await get_queue_pending_series(db, days=1, now=FIXED_NOW)
+    finally:
+        await db.close()
+    assert series['values'] == [7]
+
+
+@pytest.mark.asyncio
+async def test_queue_pending_series_no_now_brackets_real_clock(metrics_db_path: Path):
+    """Without an explicit `now`, the days=1 cutoff still derives from the real
+    UTC clock (via resolve_now), not a frozen/ignored value.
+
+    Mirrors Test_Cutoff.test_cutoff_no_now_uses_current_time: brackets the
+    write with a real `datetime.now(UTC)` read and a small tolerance rather
+    than freezing time.
+    """
+    before = datetime.now(UTC)
+    conn = sqlite3.connect(str(metrics_db_path))
+    inside = (before - timedelta(days=1) + timedelta(minutes=5)).isoformat()
+    outside = (before - timedelta(days=2)).isoformat()
+    conn.execute(
+        'INSERT INTO queue_snapshots (ts, pending, retry, dead) VALUES (?, ?, ?, ?)',
+        (inside, 42, 0, 0),
+    )
+    conn.execute(
+        'INSERT INTO queue_snapshots (ts, pending, retry, dead) VALUES (?, ?, ?, ?)',
+        (outside, 99, 0, 0),
+    )
+    conn.commit()
+    conn.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        series = await get_queue_pending_series(db, days=1)
+    finally:
+        await db.close()
+    assert series['values'] == [42]
+
+
+@pytest.mark.asyncio
+async def test_recon_sparks_uses_provided_now(metrics_db_path: Path):
+    conn = sqlite3.connect(str(metrics_db_path))
+    inside = (FIXED_NOW - timedelta(hours=12)).isoformat()
+    outside = (FIXED_NOW - timedelta(days=2)).isoformat()
+    conn.execute(
+        'INSERT INTO recon_snapshots (ts, buffered_count, active_agents) VALUES (?, ?, ?)',
+        (inside, 5, 2),
+    )
+    conn.execute(
+        'INSERT INTO recon_snapshots (ts, buffered_count, active_agents) VALUES (?, ?, ?)',
+        (outside, 999, 999),
+    )
+    conn.commit()
+    conn.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        recon = await get_recon_sparks(db, days=1, now=FIXED_NOW)
+    finally:
+        await db.close()
+    assert recon['buffered_count']['values'] == [5]
+    assert recon['active_agents']['values'] == [2]
+
+
+@pytest.mark.asyncio
+async def test_curator_sparks_uses_provided_now(metrics_db_path: Path):
+    conn = sqlite3.connect(str(metrics_db_path))
+    inside = (FIXED_NOW - timedelta(hours=12)).isoformat()
+    outside = (FIXED_NOW - timedelta(days=2)).isoformat()
+    conn.execute(
+        'INSERT INTO curator_snapshots '
+        '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        (inside, 3, 0, 100, 200, 300),
+    )
+    conn.execute(
+        'INSERT INTO curator_snapshots '
+        '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        (outside, 999, 1, 999, 999, 999),
+    )
+    conn.commit()
+    conn.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        sparks = await get_curator_sparks(db, days=1, now=FIXED_NOW)
+    finally:
+        await db.close()
+    assert sparks['pending']['values'] == [3]
+    assert sparks['p50']['values'] == [100]
+
+
+@pytest.mark.asyncio
+async def test_merge_active_series_uses_provided_now(metrics_db_path: Path):
+    conn = sqlite3.connect(str(metrics_db_path))
+    inside = (FIXED_NOW - timedelta(hours=12)).isoformat()
+    outside = (FIXED_NOW - timedelta(days=2)).isoformat()
+    conn.executemany(
+        'INSERT INTO merge_snapshots (ts, project_id, active_count) VALUES (?, ?, ?)',
+        [(inside, 'a', 4), (outside, 'a', 999)],
+    )
+    conn.commit()
+    conn.close()
+
+    db = await aiosqlite.connect(f'file:{metrics_db_path}?mode=ro', uri=True)
+    db.row_factory = aiosqlite.Row
+    try:
+        series = await get_merge_active_series(db, days=1, now=FIXED_NOW)
+    finally:
+        await db.close()
+    assert series['values'] == [4]
 
 
 # ---------------------------------------------------------------------------
