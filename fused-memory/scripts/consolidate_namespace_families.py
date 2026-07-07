@@ -230,3 +230,76 @@ async def merge_graph_family(
         summary['mentions_moved'] += result.mentions_moved
         summary['mentions_skipped'] += result.mentions_skipped
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Qdrant collection merge
+# ---------------------------------------------------------------------------
+
+async def scroll_collection_points(
+    qdrant_client: Any,
+    collection: str,
+    *,
+    limit: int = 1000,
+) -> list:
+    """Read-only scroll of every point in *collection*, WITH vectors.
+
+    ``with_vectors=True`` is essential: omitting it drops embeddings from
+    the returned points, which would silently destroy them once re-upserted
+    into the target collection (see ``merge_collection``).
+    """
+    points, _next_offset = await qdrant_client.scroll(
+        collection_name=collection,
+        with_payload=True,
+        with_vectors=True,
+        limit=limit,
+    )
+    if len(points) >= limit:
+        logger.warning(
+            "consolidate_namespace_families: scrolled %d point(s) from "
+            "collection '%s', which hit limit=%d -- scroll may be "
+            "incomplete/capped. Re-run with a higher --limit value before "
+            "merging, or the source collection will not be deleted "
+            '(see merge_collection).',
+            len(points), collection, limit,
+        )
+    return points
+
+
+async def merge_collection(
+    qdrant_client: Any,
+    source: str,
+    target: str,
+    canonical_user_id: str,
+    points: list,
+    *,
+    capped: bool,
+) -> dict:
+    """Upsert *points* (payload user_id rewritten to canonical) into *target*.
+
+    Preserves each point's original id and vector -- only the payload's
+    user_id is rewritten. The *source* collection is deleted ONLY when
+    *capped* is False (the scroll that produced *points* was NOT capped,
+    i.e. fully drained): a capped scroll means the enumeration may be
+    incomplete, so deleting source would risk losing un-migrated data --
+    the caller marks that case UNRESOLVED instead.
+    """
+    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+    upsert_points = [
+        qmodels.PointStruct(
+            id=point.id,
+            vector=point.vector,
+            payload=rewrite_point_payload_user_id(dict(point.payload or {}), canonical_user_id),
+        )
+        for point in points
+    ]
+    if upsert_points:
+        await qdrant_client.upsert(collection_name=target, points=upsert_points)
+
+    source_deleted = False
+    if not capped:
+        await qdrant_client.delete_collection(source)
+        source_deleted = True
+
+    return {'points_upserted': len(upsert_points), 'source_deleted': source_deleted}
