@@ -40,6 +40,42 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
 
 @pytest.fixture(autouse=True)
+def _derive_meta_root_like_production(monkeypatch):
+    """Mirror ε1 (task 2258) meta_root derivation in the agent-side doubles.
+
+    In production the workflow's ``self.artifacts`` is constructed with the
+    derived sibling ``.task-meta/<name>`` root
+    (``TaskArtifacts(worktree, _meta_root_for_worktree(worktree))``) and the
+    real ``plan_tools.py`` MCP writer is launched with the *same* ``--meta-root``
+    — so every reader/writer for a worktree resolves through one consistent
+    ``meta_root``.
+
+    These e2e doubles (``AgentStub._architect`` / ``_implementer`` and ~50
+    other call sites) bypass the real ``plan_tools.py`` subprocess and emulate
+    agent-side writes by hand-constructing ``TaskArtifacts(worktree)`` with no
+    ``meta_root`` (legacy-only, ``root == worktree/'.task'``). After the
+    workflow's migrate-on-write methods (``stamp_plan_provenance``/``lock_plan``)
+    establish the NEW copy, those legacy-only doubles write step status only to
+    the legacy copy — invisible to the workflow's relocated ``self.artifacts``
+    — so ``get_pending_steps()`` never observes completion and the task blocks
+    with "Execution iterations exhausted".
+
+    Rather than thread the derived root through every call site, patch the
+    constructor to default ``meta_root`` to the same sibling root production
+    derives whenever it is omitted. Explicit ``meta_root`` args (the workflow's
+    own and ``plan_tools.py``'s) are untouched.
+    """
+    orig_init = TaskArtifacts.__init__
+
+    def _init(self, worktree, meta_root=None):
+        if meta_root is None:
+            meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        orig_init(self, worktree, meta_root)
+
+    monkeypatch.setattr(TaskArtifacts, '__init__', _init)
+
+
+@pytest.fixture(autouse=True)
 def _dry_run_unblock_e2e_guard(request, monkeypatch):
     """File-local autouse fail-fast guard for run_dry_run_unblock.
 

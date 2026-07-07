@@ -268,8 +268,12 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 ## CRITICAL: Git Staging Rules
 
-The `.task/` directory is local scratch space and must NEVER be committed.
-When staging changes, ALWAYS exclude `.task/`:
+Task metadata (plan.json, iterations.jsonl, etc.) now lives in the sibling
+`<worktree_base>/.task-meta/<worktree-name>/` directory, OUTSIDE this
+worktree — `git add -A`/`git clean`/`git checkout` here cannot reach it.
+`.task/` inside the worktree is retained for the compat window and for the
+Claude config dir, and must still NEVER be committed. When staging changes,
+ALWAYS exclude it:
 
 ```bash
 # CORRECT — stage by specific files or with exclusion:
@@ -333,8 +337,10 @@ You will be given:
 
 ## CRITICAL: Git Staging Rules
 
-The `.task/` directory is local scratch space and must NEVER be committed.
-When staging changes, ALWAYS exclude `.task/`:
+Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
+directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
+the compat window and for the Claude config dir, and must still NEVER be
+committed. When staging changes, ALWAYS exclude it:
 
 ```bash
 # CORRECT:
@@ -567,8 +573,10 @@ description of what each dropped file contributes that the kept side lacks.
 
 ## CRITICAL: Git Staging Rules
 
-The `.task/` directory is local scratch space and must NEVER be committed.
-When staging changes, ALWAYS exclude `.task/`:
+Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
+directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
+the compat window and must still NEVER be committed. When staging changes,
+ALWAYS exclude it:
 
 ```bash
 git add -- . ':!.task'
@@ -836,8 +844,10 @@ wording differs.
 
 ## CRITICAL: Git Staging Rules
 
-The `.task/` directory is local scratch space and must NEVER be committed.
-When staging changes, ALWAYS exclude `.task/`:
+Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
+directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
+the compat window and must still NEVER be committed. When staging changes,
+ALWAYS exclude it:
 
 ```bash
 git add -- . ':!.task'
@@ -1126,7 +1136,9 @@ dispatch.
 
 ## CRITICAL: Git Staging Rules
 
-The `.task/` directory is local scratch space and must NEVER be committed.
+Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
+directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
+the compat window and must still NEVER be committed.
 
 ```bash
 # CORRECT:

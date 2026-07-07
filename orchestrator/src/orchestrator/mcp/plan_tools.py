@@ -596,8 +596,11 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             reason: One-line explanation of what's missing — file/symbol
                 names and where this task expected to find them.
         """
-        # ``artifacts.root`` is ``worktree / '.task'`` so the worktree is its parent.
-        worktree = artifacts.root.parent
+        # ``artifacts.root`` is a SIBLING of the worktree once a meta_root is
+        # supplied (`.task-meta/<name>/`), so `artifacts.root.parent` is the
+        # `.task-meta` base, NOT the worktree. `artifacts.worktree` is always
+        # correct, legacy or relocated (see TaskArtifacts.__init__).
+        worktree = artifacts.worktree
         main_sha = _resolve_main_sha(worktree)
         return _report_blocking_dependency(
             artifacts, depends_on_task_id, reason, main_sha,
@@ -707,21 +710,45 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    """Parse --worktree and run the stdio MCP server."""
+def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
+    """Parse ``--worktree``/``--meta-root`` and return the corresponding
+    ``TaskArtifacts``.
+
+    Mirrors workflow.py's orchestrator-side construction
+    (``TaskArtifacts(worktree, _meta_root_for_worktree(worktree))``) so both
+    sides resolve the IDENTICAL meta_root for a given worktree
+    (worktree-lane-lifecycle PRD task ε1). When ``--meta-root`` is omitted,
+    behaviour is byte-identical to before this argument existed: the root
+    dir checked for existence is the legacy ``<worktree>/.task``.
+    """
     parser = argparse.ArgumentParser(description='Plan-tools MCP server (stdio)')
     parser.add_argument(
         '--worktree', type=Path, required=True,
         help='Path to the git worktree containing .task/',
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        '--meta-root', type=Path, default=None,
+        help=(
+            'Optional `.task-meta` root (sibling of the worktree). When '
+            'omitted, plan.json et al. are read/written at the legacy '
+            '<worktree>/.task location.'
+        ),
+    )
+    args = parser.parse_args(argv)
 
     worktree = args.worktree.resolve()
-    if not (worktree / '.task').is_dir():
-        print(f'Error: {worktree / ".task"} does not exist', file=sys.stderr)
+    meta_root = args.meta_root.resolve() if args.meta_root is not None else None
+    root_to_check = meta_root if meta_root is not None else worktree / '.task'
+    if not root_to_check.is_dir():
+        print(f'Error: {root_to_check} does not exist', file=sys.stderr)
         sys.exit(1)
 
-    artifacts = TaskArtifacts(worktree)
+    return TaskArtifacts(worktree, meta_root)
+
+
+def main() -> None:
+    """Parse --worktree/--meta-root and run the stdio MCP server."""
+    artifacts = _artifacts_from_args()
     server = create_server(artifacts)
     server.run(transport='stdio')
 

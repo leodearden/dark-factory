@@ -1,7 +1,13 @@
 """Worktree identity helpers — guard against task-id recycling collisions.
 
-Standalone module (no orchestrator imports) so both :mod:`git_ops` and the
-harness can use it without re-introducing an artifacts↔git_ops import cycle.
+Otherwise standalone (no other orchestrator imports) so both :mod:`git_ops`
+and the harness can use it without re-introducing an import cycle. The one
+exception is :class:`orchestrator.artifacts.TaskArtifacts`, imported narrowly
+below to resolve the relocated sibling ``.task-meta`` root via the single
+derivation owner ``TaskArtifacts.meta_root_for`` (W11 epsilon1) — this is
+cycle-safe because ``artifacts.py`` imports only :mod:`orchestrator.config`
+(a leaf with no orchestrator imports) and never imports :mod:`git_ops` or
+this module, so ``worktree_identity -> artifacts -> config`` is a DAG.
 
 A worktree is keyed purely on its numeric task id.  When an id is recycled —
 an abandoned task is deleted and its id re-minted onto unrelated work (reify
@@ -19,6 +25,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
+from orchestrator.artifacts import TaskArtifacts
 
 # Leading bracketed tag groups the orchestrator prepends to titles, e.g.
 # "[auto-eval redo] Fix X" or "[redo] [hotfix] Fix X".  Stripped before
@@ -57,21 +65,33 @@ def identities_match(stored: str | None, live: str | None) -> bool:
 
 
 def read_worktree_title(worktree: Path) -> str | None:
-    """Read the worktree's stored task title from its ``.task`` sidecar.
+    """Read the worktree's stored task title — new-root-then-legacy-root.
 
-    Prefers ``.task/metadata.json`` ``title``, falls back to
-    ``.task/plan.json`` ``title``.  Returns ``None`` if neither is readable or
-    carries a non-blank title — callers treat ``None`` as "unprovable", which
+    Resolves the sibling ``.task-meta/<name>`` root first (via the single
+    derivation owner :meth:`TaskArtifacts.meta_root_for`, W11 epsilon1),
+    falling back to the legacy in-worktree ``<worktree>/.task`` sidecar for
+    the compat window. Within EACH root, prefers ``metadata.json`` ``title``,
+    falling back to ``plan.json`` ``title`` — mirroring the new-then-old
+    idiom already used for plan.json reads elsewhere (e.g.
+    ``TaskArtifacts._read_path``, the disk-backstop scan in ``git_ops.py``).
+
+    Returns ``None`` if no root/file is readable or carries a non-blank
+    title — callers treat ``None`` as "unprovable", which
     :func:`identities_match` fails open on.
     """
-    for rel in ('metadata.json', 'plan.json'):
-        path = worktree / '.task' / rel
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict):
-            title = data.get('title')
-            if isinstance(title, str) and title.strip():
-                return title
+    roots = (
+        TaskArtifacts.meta_root_for(worktree.parent, worktree.name),
+        worktree / '.task',
+    )
+    for root in roots:
+        for rel in ('metadata.json', 'plan.json'):
+            path = root / rel
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict):
+                title = data.get('title')
+                if isinstance(title, str) and title.strip():
+                    return title
     return None

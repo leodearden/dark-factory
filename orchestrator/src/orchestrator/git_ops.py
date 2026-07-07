@@ -3018,6 +3018,27 @@ class GitOps:
                     shutil.rmtree(lane)
                 lane.parent.mkdir(parents=True, exist_ok=True)
 
+                # Clear the sibling .task-meta/<name> before (re)building the
+                # worktree (W11 ε1). This create-once branch is reached only
+                # for an UNREGISTERED lane, whose worktree is always rebuilt
+                # fresh below (self-heal rmtree above, or `git worktree add`
+                # into an absent dir). In the legacy `.task/` world the
+                # metadata lived INSIDE the worktree, so that rebuild always
+                # destroyed the prior occupant's plan.json/already_done.json/
+                # false_premise.json. The relocated .task-meta/<name> lives
+                # OUTSIDE the worktree and survives the rebuild unscathed, so
+                # a DIFFERENT-task acquisition through this branch (orphan
+                # window: registration lost but sibling meta survived, guard
+                # at ~2846) would otherwise hand the incoming task the prior
+                # occupant's metadata — a data-integrity regression relative
+                # to the legacy cleanup (reviewer_comprehensive blocker,
+                # create-once route). Cleared unconditionally so it covers
+                # BOTH the FRESH (`add -b`) and REATTACH (`_reuse_warm_lane`)
+                # sub-routes below AND the lane-dir-already-gone case where
+                # the self-heal rmtree never ran. init()/_reuse_warm_lane
+                # re-provision this task's own metadata afterward.
+                self._clear_foreign_meta_root(lane)
+
                 # ── γ reattach guard (create-once site) ──────────────────────
                 # If the leftover task/<id> branch still carries commits beyond
                 # main, attach the worktree to it (no -b) rather than letting
@@ -3147,9 +3168,17 @@ class GitOps:
                 # Identity guard: if expected_title is set and the stored title
                 # does not match, treat as fresh (recycled-id guard).
                 # Any read/parse error falls safe toward the fresh reset path.
+                #
+                # Read new-then-old (W11 ε1): plan.json now lives at the sibling
+                # .task-meta/<name> location first (workflow.py's self.artifacts
+                # writes new-path-only), falling back to the legacy
+                # <lane>/.task/plan.json so lanes seeded before this relocation
+                # still resolve — mirrors _find_lane_by_plan_task_id's idiom.
                 disk_reuse = False
                 try:
-                    plan_path = lane / '.task' / 'plan.json'
+                    plan_path = TaskArtifacts.meta_root_for(self.worktree_base, lane.name) / 'plan.json'
+                    if not plan_path.exists():
+                        plan_path = lane / '.task' / 'plan.json'
                     if plan_path.exists():
                         import json as _json
                         data = _json.loads(plan_path.read_text())
@@ -3234,6 +3263,13 @@ class GitOps:
                     # inherits a foreign plan.json/iterations.jsonl/reviews/
                     # (reify esc-4920-163: _lane-26 4949→4920 contamination).
                     shutil.rmtree(lane / '.task', ignore_errors=True)
+                    # The sibling .task-meta/<name> (W11 ε1) belongs to the same
+                    # previous occupant but, unlike .task/, lives OUTSIDE the
+                    # worktree — checkout -f cannot touch it, so it must be
+                    # cleared explicitly too (same rationale as immediately
+                    # above; reviewer_comprehensive robustness/data-integrity
+                    # blocker at workflow.py:1736).
+                    self._clear_foreign_meta_root(lane)
                     info = await self._reuse_warm_lane(lane, full_branch)
                     self._note_assigned_via_route(
                         info.path, route, branch_name, expected_title, full_branch,
@@ -3508,6 +3544,31 @@ class GitOps:
             return True, err
         return False, err
 
+    def _clear_foreign_meta_root(self, lane: Path) -> None:
+        """Remove the sibling ``.task-meta/<name>`` dir for *lane* (W11 ε1).
+
+        ``.task-meta/<name>`` lives OUTSIDE the worktree, so none of
+        ``checkout -f -B``, ``git clean``, ``checkout -f``, or the create-once
+        worktree rebuild (self-heal ``rmtree`` + ``git worktree add``) touch
+        it — a DIFFERENT-task acquisition (RECYCLE / RESET_IN_PLACE_REATTACH /
+        CREATE_ONCE_FRESH / CREATE_ONCE_REATTACH) would otherwise hand the
+        incoming task the PRIOR occupant's
+        plan.json/metadata.json/blocking_dependency.json. Mirrors the
+        already-landed interactive-reap cleanup (``reap_interactive_worktrees``).
+        Best-effort (``ignore_errors=True``); never raises. Must NOT be called
+        on same-task reuse routes (REUSE / DISK_BACKSTOP_REUSE) — those
+        legitimately preserve the lane's own artifacts.
+        """
+        shutil.rmtree(
+            TaskArtifacts.meta_root_for(self.worktree_base, lane.name),
+            ignore_errors=True,
+        )
+        logger.debug(
+            '_clear_foreign_meta_root: cleared .task-meta/%s for a different-task '
+            'acquisition',
+            lane.name,
+        )
+
     async def _reset_warm_lane(
         self, lane_dir: Path, full_branch: str, target_commit: str,
     ) -> None:
@@ -3520,6 +3581,11 @@ class GitOps:
         removes stray untracked files while retaining all artifact dirs —
         mirroring reset_persistent_merge_worktree's single-pass clean so
         >1 artifact dir all survive (per-dir-loop bug from κ, step-19).
+
+        Only ever reached for a DIFFERENT-task acquisition (RECYCLE) — same-
+        task reuse routes through ``_reuse_warm_lane`` instead — so once the
+        in-worktree reset succeeds, the sibling ``.task-meta/<name>`` (which
+        the reset above cannot touch) is cleared too (W11 ε1).
 
         Added as a stub here (step-8); fully exercised by step-10 tests.
         """
@@ -3542,6 +3608,7 @@ class GitOps:
             raise RuntimeError(
                 f'_reset_warm_lane: git clean failed for {lane_dir}: {err}'
             )
+        self._clear_foreign_meta_root(lane_dir)
 
     async def _reset_and_seed_recycled_lane(
         self,
