@@ -2007,16 +2007,14 @@ Output JSON matching the schema. Every task must appear in the output.
             # Consult the durable LaneLifecycle record FIRST, before any of
             # the plan.json heuristics below: a record in ASSIGNED/IN_USE is
             # the durable source of truth for "this lane belongs to this
-            # task". Adopt only on an EXACT git-reality match (still a
+            # task". A terminal task releases the lane outright (see below).
+            # Otherwise adopt only on an EXACT git-reality match (still a
             # registered worktree AND — when resolvable — its checked-out
-            # branch matches the record) for a non-terminal task. ANY other
-            # rec.state (including no record at all — the pre-W11 compat
-            # case) falls through unchanged to the existing heuristic path
-            # below. A divergent ASSIGNED/IN_USE record also falls through
-            # for now (harmless: the heuristic path re-derives the same
-            # registration check independently) — quarantine-on-divergence
-            # and the terminal-task release/branch-mismatch cells are added
-            # by later steps of this task.
+            # branch matches the record); ANY divergence (orphaned admin
+            # entry OR a stale-branch collision) quarantines instead — never
+            # adopt-on-doubt, never silently re-pin. ANY other rec.state
+            # (including no record at all — the pre-W11 compat case) falls
+            # through unchanged to the existing heuristic path below.
             if is_lane and pool is not None:
                 rec = self.git_ops._lane_lifecycle.read(entry)
                 if (
@@ -2024,6 +2022,30 @@ Output JSON matching the schema. Every task must appear in the output.
                     and rec.state in (DurableLaneState.ASSIGNED, DurableLaneState.IN_USE)
                     and rec.task_id is not None
                 ):
+                    # Terminal-task release (T10 amplifier fix, mirrored onto
+                    # the record-driven path): resolved BEFORE the
+                    # git-reality adopt/quarantine decision below, so a
+                    # terminal task's lane is released even when registration
+                    # and branch both still check out fine — otherwise every
+                    # restart would re-pin a dead task's lane forever,
+                    # shrinking the pool. A transient/None status falls
+                    # through to the git-reality check (safe default; layer A
+                    # self-heals the lane on the next reconcile interval).
+                    term_status = await self.scheduler.get_status(rec.task_id)
+                    if term_status in ('done', 'cancelled'):
+                        logger.info(
+                            'Recovery: lane %s record ASSIGNED for task %s '
+                            'but task is terminal (%s) — releasing, not '
+                            'adopting',
+                            entry.name, rec.task_id, term_status,
+                        )
+                        await self.git_ops.cleanup_worktree(entry, rec.task_id)
+                        self.git_ops._lane_lifecycle.transition(
+                            entry, DurableLaneState.RELEASED,
+                        )
+                        cleaned += 1
+                        continue
+
                     try:
                         is_registered = await self.git_ops._is_registered_worktree(entry)
                     except OSError:
