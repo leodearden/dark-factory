@@ -1825,12 +1825,11 @@ class TaskWorkflow:
             # the DONE status.  Short-circuiting here prevents the architect
             # from being invoked and keeps the run idempotent.
             #
-            # NOTE: a related guard runs just below (before EXECUTE) and has
-            # deliberately different semantics: the post-PLAN guard falls through
-            # to the SUCCESS path (writes completion memory, uses merge-sha
-            # provenance), and it also checks has_uncommitted_work (useful
-            # post-execution, premature here).  If you change the
-            # is_ancestor/has_work logic, check both guards.
+            # NOTE: a related guard runs just below (before EXECUTE) and one
+            # more runs inside the merge phase.  All three already-merged
+            # guards now share one journal-first check — MergeProvenance.lookup
+            # — and finalise identically through _finalise_recovery_done
+            # (PRD workflow-state-machine α).
             recovery = await self._recover_if_already_merged()
             if recovery == WorkflowOutcome.DONE:
                 return recovery
@@ -7332,13 +7331,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Does NOT catch subprocess or git exceptions — callers wrap as needed.
         ``_recover_if_already_merged`` wraps the call in ``try/except`` and
-        logs ``'merge-check failed'`` before returning None; the pre-EXECUTE
-        ghost-loop guard in ``workflow.run()`` lets exceptions propagate.  The
-        divergent downstream logic at each call site is intentional — do not
-        collapse them.
+        logs ``'merge-check failed'`` before returning None; ``_recover_before_execute``
+        lets exceptions propagate.  This exception-handling difference is the
+        one thing that still varies per call site — otherwise all three
+        already-merged guards (pre-PLAN, pre-EXECUTE, merge-phase) now share
+        the same journal-first check (``MergeProvenance.lookup``) and
+        finalise identically through ``_finalise_recovery_done`` (PRD
+        workflow-state-machine α).
 
-        See also: ``_recover_if_already_merged`` (pre-PLAN guard) and the
-        ghost-loop guard around ``workflow.py:431`` (pre-EXECUTE guard).
+        See also: ``_recover_if_already_merged`` (pre-PLAN guard),
+        ``_recover_before_execute`` (pre-EXECUTE guard), and
+        ``_recover_before_merge`` (merge-phase guard).
         """
         if self.worktree is None or self.git_ops is None:
             return None
