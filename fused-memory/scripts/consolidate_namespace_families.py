@@ -64,3 +64,45 @@ from typing import Any
 from fused_memory.maintenance.cross_graph_move import MoveResult, move_entity_across_graphs
 
 logger = logging.getLogger('consolidate_namespace_families')
+
+
+# ---------------------------------------------------------------------------
+# Module-level constants (reviewable config -- PRD decision 4)
+# ---------------------------------------------------------------------------
+
+# Sibling FalkorDB graph key -> canonical underscore-form key. Canonical is
+# always the underscore spelling (config.yaml, registry keys, factory-init
+# rule -- PRD decision 6 identity rewrite target). The solar family
+# (my_solar_challenge / solar_challenge_platform) is DELIBERATELY EXCLUDED:
+# PRD Open Q1's default is keep-separate absent an explicit human decision;
+# flipping it to a merge is a one-line addition at ι, not a default here.
+GRAPH_FAMILY_ALIASES: dict[str, str] = {
+    'know-live': 'know_live',
+    'knowlive': 'know_live',
+    'pump-web-ui': 'pump_web_ui',
+}
+
+# Legacy/divergent Qdrant collection -> canonical fused_<project> target.
+# These collections hold REAL data from old per-project collection_prefix
+# configs (RCA §4) -- the contract is merge, never plain-delete. The
+# ambiguous collections (reify_ -- empty project id; fused_fused_memory) are
+# DELIBERATELY OMITTED: PRD Open Q2 defers their disposition to ι human
+# inspection, since auto-merging them risks mis-routing real data into the
+# wrong project.
+COLLECTION_MERGES: dict[str, str] = {
+    'fused_dark-factory': 'fused_dark_factory',
+    'reify_reify': 'fused_reify',
+    'autopilot_video_autopilot_video': 'fused_autopilot_video',
+}
+
+# Known-junk FalkorDB graph keys with no legitimate data (RCA §"empty junk
+# keys" inventory) -- removal is guarded on a live node count of 0 (see
+# delete_junk_key), so listing a key here never itself causes data loss.
+JUNK_KEYS: tuple[str, ...] = (
+    'dark-factory',
+    '-home-leo-src-dark-factory',
+    'my-project',
+    'test-project',
+    'default',
+    '1098',
+)
