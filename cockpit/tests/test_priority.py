@@ -9,6 +9,7 @@ every later implementation step.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from hypothesis import given
@@ -19,6 +20,23 @@ _STATES = ['open', 'answered', 'dropped']
 _TIMESTAMPS = st.datetimes(timezones=st.just(UTC))
 _SHORT_TEXT = st.text(max_size=20)
 _BOOSTS = st.integers(min_value=-10_000, max_value=10_000)
+
+_NOW = datetime(2026, 7, 7, tzinfo=UTC)
+
+
+def _make_item(**overrides):
+    from cockpit.priority import ScoringItem
+
+    fields = {
+        'severity': 'medium',
+        'category': 'unmapped-category',
+        'project': 'unmapped-project',
+        'filed_at': datetime(2026, 7, 1, tzinfo=UTC),
+        'manual_boost': 0,
+        'state': 'open',
+    }
+    fields.update(overrides)
+    return ScoringItem(**fields)
 
 
 class TestScorePureFloat:
@@ -66,3 +84,61 @@ class TestScorePureFloat:
         weights = Priorities.default()
 
         assert score(item, weights, now) == score(item, weights, now)
+
+
+class TestCategoryProjectWeights:
+    def test_raising_project_weight_increases_score(self):
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        low = replace(weights, project_weights={'proj-a': 0.5})
+        high = replace(weights, project_weights={'proj-a': 5.0})
+        item = _make_item(project='proj-a')
+
+        assert score(item, high, _NOW) > score(item, low, _NOW)
+
+    def test_raising_category_weight_increases_score(self):
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        low = replace(weights, category_weights={'cat-a': 0.5})
+        high = replace(weights, category_weights={'cat-a': 5.0})
+        item = _make_item(category='cat-a')
+
+        assert score(item, high, _NOW) > score(item, low, _NOW)
+
+    def test_severity_fallback_matches_explicit_default(self):
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        absent = _make_item(severity='unmapped-severity')
+        explicit_weights = replace(
+            weights, severity_weights={'mapped-severity': weights.defaults.severity}
+        )
+        explicit = _make_item(severity='mapped-severity')
+
+        assert score(absent, weights, _NOW) == score(explicit, explicit_weights, _NOW)
+
+    def test_category_fallback_matches_explicit_default(self):
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        absent = _make_item(category='unmapped-category')
+        explicit_weights = replace(
+            weights, category_weights={'mapped-category': weights.defaults.category}
+        )
+        explicit = _make_item(category='mapped-category')
+
+        assert score(absent, weights, _NOW) == score(explicit, explicit_weights, _NOW)
+
+    def test_project_fallback_matches_explicit_default(self):
+        from cockpit.priority import Priorities, score
+
+        weights = Priorities.default()
+        absent = _make_item(project='unmapped-project')
+        explicit_weights = replace(
+            weights, project_weights={'mapped-project': weights.defaults.project}
+        )
+        explicit = _make_item(project='mapped-project')
+
+        assert score(absent, weights, _NOW) == score(explicit, explicit_weights, _NOW)
