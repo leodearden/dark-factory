@@ -379,3 +379,73 @@ class TestCountGraphNodes:
         result = await _mod.count_graph_nodes(graphiti, 'default')
 
         assert result == 0
+
+
+# ===========================================================================
+# Tests: merge_graph_family
+# ===========================================================================
+
+class TestMergeGraphFamily:
+    """Tests for async merge_graph_family(graphiti, sibling, canonical, node_rows)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_move_once_per_node_with_rewrite_group_id(self, monkeypatch):
+        """move_entity_across_graphs is called once per node row, with
+        source=sibling, target=canonical, and rewrite_group_id=canonical --
+        the Phase-2 identity rewrite (PRD decision 6)."""
+        node_rows = [{'uuid': 'uuid-1', 'name': 'A'}, {'uuid': 'uuid-2', 'name': 'B'}]
+        move_mock = AsyncMock(side_effect=[
+            _mod.MoveResult(uuid='uuid-1', source_graph='know-live', target_graph='know_live'),
+            _mod.MoveResult(uuid='uuid-2', source_graph='know-live', target_graph='know_live'),
+        ])
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        graphiti = MagicMock()
+
+        await _mod.merge_graph_family(graphiti, 'know-live', 'know_live', node_rows)
+
+        assert move_mock.call_count == 2
+        for call, row in zip(move_mock.call_args_list, node_rows, strict=True):
+            assert call.args == (graphiti, row['uuid'], 'know-live', 'know_live')
+            assert call.kwargs == {'rewrite_group_id': 'know_live'}
+
+    @pytest.mark.asyncio
+    async def test_tallies_move_results(self, monkeypatch):
+        """The MoveResults' edges/mentions counters are summed, and
+        nodes_moved reflects the number of nodes processed."""
+        node_rows = [{'uuid': 'uuid-1', 'name': 'A'}, {'uuid': 'uuid-2', 'name': 'B'}]
+        move_mock = AsyncMock(side_effect=[
+            _mod.MoveResult(
+                uuid='uuid-1', source_graph='know-live', target_graph='know_live',
+                edges_moved=2, edges_skipped=1, mentions_moved=3, mentions_skipped=0,
+            ),
+            _mod.MoveResult(
+                uuid='uuid-2', source_graph='know-live', target_graph='know_live',
+                edges_moved=1, edges_skipped=0, mentions_moved=0, mentions_skipped=1,
+            ),
+        ])
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        graphiti = MagicMock()
+
+        summary = await _mod.merge_graph_family(graphiti, 'know-live', 'know_live', node_rows)
+
+        assert summary['nodes_moved'] == 2
+        assert summary['edges_moved'] == 3
+        assert summary['edges_skipped'] == 1
+        assert summary['mentions_moved'] == 3
+        assert summary['mentions_skipped'] == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_node_rows_returns_zeroed_summary_without_calling_move(self, monkeypatch):
+        """No node rows -> move_entity_across_graphs is never called, and the
+        summary is all-zero."""
+        move_mock = AsyncMock()
+        monkeypatch.setattr(_mod, 'move_entity_across_graphs', move_mock)
+        graphiti = MagicMock()
+
+        summary = await _mod.merge_graph_family(graphiti, 'know-live', 'know_live', [])
+
+        move_mock.assert_not_called()
+        assert summary == {
+            'nodes_moved': 0, 'edges_moved': 0, 'edges_skipped': 0,
+            'mentions_moved': 0, 'mentions_skipped': 0,
+        }
