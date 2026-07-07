@@ -15,6 +15,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+
+
+def _scope(project_id: str, project_root: str) -> ProjectScope:
+    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
+    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
+
 # ---------------------------------------------------------------------------
 # _query_recon_report_findings — RED until step-11 adds the helper
 # ---------------------------------------------------------------------------
@@ -234,8 +241,8 @@ def _make_configured_stage(
     from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
     stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **deps)
-    stage.project_id = project_id
-    stage.project_root = project_root
+    stage.scope = _scope(project_id, stage.scope.project_root)
+    stage.scope = _scope(stage.scope.project_id, project_root)
     stage._current_run_id = run_id
     return stage
 
@@ -261,6 +268,7 @@ class TestAssemblePayloadReconReportChannel:
             'taskmaster': taskmaster,
             'journal': journal,
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
