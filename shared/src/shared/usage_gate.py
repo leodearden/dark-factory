@@ -1294,6 +1294,12 @@ class UsageGate:
 
     async def shutdown(self) -> None:
         """Cancel all resume probe tasks and drain in-flight background cost-event tasks."""
+        # Arm the B10 guard FIRST — before cancelling/draining anything —
+        # so a _transition racing this teardown (e.g. a probe or cost-event
+        # task completing concurrently) cannot start a new resume/reprobe
+        # task via _start_account_resume_probe/_start_auth_reprobe, which
+        # would otherwise leak a background task past shutdown.
+        self._shutting_down = True
         for acct in self._accounts:
             if acct.resume_task and not acct.resume_task.done():
                 acct.resume_task.cancel()
