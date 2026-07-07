@@ -71,3 +71,91 @@ class TestPermitLedgerAcquire:
             # acquire, by construction — no intervening await between the
             # semaphore decrement and the `live` registration.
             assert ledger.slot_available + len(ledger.live) == ledger.depth
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN: PermitLedger.release
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPermitLedgerRelease:
+    """PermitLedger.release() — idempotent + live-checked (task 2159 step-3).
+
+    RED until step-4 GREEN adds PermitLedger.release.
+    """
+
+    @pytest.mark.parametrize('depth', [1, 2])
+    async def test_release_restores_slot_and_marks_permit_released(
+        self, depth: int,
+    ) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth)
+        p = await ledger.acquire()
+
+        ledger.release(p)
+
+        assert p.released is True
+        assert p not in ledger.live
+        assert ledger.slot_available == depth
+        assert ledger.slot_available + len(ledger.live) == ledger.depth
+
+    @pytest.mark.parametrize('depth', [1, 2])
+    async def test_double_release_is_a_silent_noop(self, depth: int) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth)
+        p = await ledger.acquire()
+        ledger.release(p)
+
+        ledger.release(p)  # second release — must not raise or over-release
+
+        assert p.released is True
+        assert p not in ledger.live
+        assert ledger.slot_available == depth  # never exceeds depth
+        assert ledger.slot_available + len(ledger.live) == ledger.depth
+
+    async def test_release_of_a_never_acquired_permit_raises(self) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_types import SpecPermit
+
+        ledger = PermitLedger(asyncio.Semaphore(1), 1)
+        stranger = SpecPermit()
+
+        with pytest.raises(AssertionError):
+            ledger.release(stranger)
+
+    async def test_mixed_acquire_release_sequence_conserves_the_identity(
+        self,
+    ) -> None:
+        """A realistic mixed sequence — acquire/acquire/release/acquire/
+        double-release/release/release — keeps ``slot_available +
+        len(live) == depth`` at every single step (the ledger-level B7, in
+        isolation from any real verifier release).
+        """
+        from orchestrator.merge_speculation_controller import PermitLedger
+
+        depth = 3
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth)
+
+        def _assert_identity() -> None:
+            assert ledger.slot_available + len(ledger.live) == ledger.depth
+
+        _assert_identity()
+        p1 = await ledger.acquire()
+        _assert_identity()
+        p2 = await ledger.acquire()
+        _assert_identity()
+        ledger.release(p1)
+        _assert_identity()
+        p3 = await ledger.acquire()
+        _assert_identity()
+        ledger.release(p1)  # double-release of an already-released token
+        _assert_identity()
+        ledger.release(p2)
+        _assert_identity()
+        ledger.release(p3)
+        _assert_identity()
+        assert ledger.slot_available == depth
+        assert ledger.live == frozenset()
