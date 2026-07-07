@@ -455,12 +455,18 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
 
     The decision rules fire in order — the first match wins:
 
-    1. ``result.success`` → ``SUCCESS``.
+    1. ``classify_invocation(result, strict_confirm=True)`` is ``OK``
+       (mirrors ``result.success``) → ``SUCCESS``.
     2. ``result.timed_out`` → ``TIMED_OUT``.
     3. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
        (high ``turns`` + non-zero ``output_tokens`` but empty ``output``).
-    4. ``result.api_error_status`` set → ``API_ERROR`` (includes status code
-       in the summary; transient — worth retrying against another account).
+    4. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
+       ``API_ERROR`` (includes status code in the summary; transient — worth
+       retrying against another account). ``AuthFailed`` ({401, 403}) is a
+       strict subset of "api_error_status is not None", so the ``OR`` never
+       changes the verdict — it keeps this rule visibly tied to the
+       InvocationOutcome contract without narrowing API_ERROR away from
+       429/5xx, which InvocationOutcome does not model.
     5. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
        (may be transient).
     6. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
@@ -472,6 +478,13 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     duration_ms, timed_out, api_error_status, output length, last 500 chars
     of stdout output, and last 500 chars of stderr.
     """
+    # Lazy (function-local) import — see the identical note in
+    # invoke_with_cap_retry: a module-top import here would create a
+    # cli_invoke<->invocation_outcome circular import.
+    from shared.invocation_outcome import OK, AuthFailed, classify_invocation
+
+    outcome = classify_invocation(result, strict_confirm=True)
+
     tail_out = result.output[-500:] if result.output else ''
     tail_err = result.stderr[-500:] if result.stderr else ''
     diagnostic_detail = (
@@ -486,7 +499,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         f'stderr (last 500 chars):\n{tail_err}'
     )
 
-    if result.success:
+    if isinstance(outcome, OK):
         return AgentFailureClass(
             kind=AgentFailureKind.SUCCESS,
             summary='agent succeeded',
@@ -510,7 +523,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
             ),
             diagnostic_detail=diagnostic_detail,
         )
-    if result.api_error_status is not None:
+    if result.api_error_status is not None or isinstance(outcome, AuthFailed):
         return AgentFailureClass(
             kind=AgentFailureKind.API_ERROR,
             summary=f'agent API error: HTTP {result.api_error_status}',
