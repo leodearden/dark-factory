@@ -807,6 +807,86 @@ class TestAcquireClearsForeignTaskMeta:
 
 
 # ---------------------------------------------------------------------------
+# Identity guard must read the RELOCATED .task-meta (W11 epsilon1 regression):
+# read_worktree_title used to read only <worktree>/.task/, which the epsilon1
+# relocation leaves permanently empty, so identities_match(None, ...) fails
+# OPEN and the recycled-id guard is silently disabled.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcquireIdentityGuardReadsRelocatedTaskMeta:
+    """The disk-backstop identity guard (`expected_title`) must resolve the
+    stored title from the relocated sibling `.task-meta/<name>`, not the
+    (now permanently empty) legacy in-worktree `.task/`."""
+
+    async def test_disk_backstop_reads_relocated_title_and_mismatches(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane(
+            '321', start_ref, expected_title='Old Title',
+        )
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+        assert git_ops.warm_lane_pool is not None
+        # Bare pool release: FREE + registered, no git/file cleanup — only
+        # the on-disk plan.json scan (disk-backstop) can discover the match.
+        await git_ops.warm_lane_pool.release(lane)
+
+        # Seed the relocated sibling .task-meta/<name> with a title that
+        # matches THIS task_id but differs from the new expected_title below
+        # — the recycled-id signal the guard must catch.
+        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(
+            json.dumps({'task_id': '321', 'title': 'Old Title'})
+        )
+        (meta_root / 'plan.json').write_text(
+            json.dumps({'task_id': '321', 'title': 'Old Title', 'steps': []})
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane(
+                '321', start_ref, expected_title='Totally Different Title',
+            )
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+
+        # (1) An identity-MISMATCH warning must have fired.
+        assert 'identity' in caplog.text and 'MISMATCH' in caplog.text, (
+            f'expected an identity-MISMATCH warning in caplog:\n{caplog.text}'
+        )
+
+        # (2) The route taken must be a FRESH-RESET route, NOT a reuse route
+        # — the guard must not have failed open on the (previously) empty
+        # legacy .task/ read.
+        for reuse_route in (AcquireRoute.REUSE, AcquireRoute.DISK_BACKSTOP_REUSE):
+            needle = f'route={reuse_route.value} edge='
+            assert needle not in caplog.text, (
+                f'expected NO {needle!r} in caplog (guard failed open):\n{caplog.text}'
+            )
+        fresh_reset_logged = any(
+            f'route={route.value} edge=' in caplog.text
+            for route in (AcquireRoute.RECYCLE, AcquireRoute.RESET_IN_PLACE_REATTACH)
+        )
+        assert fresh_reset_logged, (
+            f'expected a fresh-reset route (RECYCLE or RESET_IN_PLACE_REATTACH) '
+            f'in caplog:\n{caplog.text}'
+        )
+
+        # (3) Belt-and-suspenders: the seeded foreign .task-meta must have
+        # been cleared by step-9's _clear_foreign_meta_root.
+        assert not meta_root.exists(), (
+            f'expected {meta_root} to be cleared on the fresh-reset route, '
+            f'but it still exists'
+        )
+
+
+# ---------------------------------------------------------------------------
 # release_warm_lane -> durable RELEASED record
 # ---------------------------------------------------------------------------
 
