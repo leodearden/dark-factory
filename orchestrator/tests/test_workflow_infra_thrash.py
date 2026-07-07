@@ -345,6 +345,47 @@ async def test_corrupt_counter_metadata_treated_as_zero():
 
 
 @pytest.mark.asyncio
+async def test_non_dict_retry_ledger_treated_as_fresh_ledger():
+    """A non-dict ``retry_ledger`` blob (hand-edited/legacy corruption) must
+    not crash the helper via ``TypeError`` from ``RetryLedger(**raw)``.
+
+    Unlike ``test_corrupt_counter_metadata_treated_as_zero`` (a dict with a
+    bad field, caught by ``ValidationError``), this seeds ``retry_ledger``
+    itself as a bare string — ``**raw`` would raise ``TypeError`` if not
+    guarded by an isinstance(dict) check. Must reset to a fresh all-zero
+    ledger instead of propagating the exception.
+    """
+    f = _make(
+        metadata={'retry_ledger': 'garbage'},
+        iteration_log=[{'iteration': i} for i in range(5)],
+        resolved_l0s=[_esc(category='infra_issue')],
+    )
+
+    outcome = await f.wf._check_infra_resume_thrash()
+
+    assert outcome is None
+    md = _persisted_metadata(f.update_task)
+    assert md['retry_ledger']['consecutive_infra_resume_failures'] == 1
+    assert md['retry_ledger']['last_infra_resume_iteration_count'] == 5
+
+
+@pytest.mark.asyncio
+async def test_list_retry_ledger_treated_as_fresh_ledger():
+    """Same as above but for a list-shaped ``retry_ledger`` blob."""
+    f = _make(
+        metadata={'retry_ledger': ['not', 'a', 'dict']},
+        iteration_log=[{'iteration': i} for i in range(5)],
+        resolved_l0s=[_esc(category='infra_issue')],
+    )
+
+    outcome = await f.wf._check_infra_resume_thrash()
+
+    assert outcome is None
+    md = _persisted_metadata(f.update_task)
+    assert md['retry_ledger']['consecutive_infra_resume_failures'] == 1
+
+
+@pytest.mark.asyncio
 async def test_picks_most_recent_resolved_l0_by_resolved_at():
     """Multiple resolved L0s: use the most recent one for category."""
     older = _esc(category='task_failure', resolved_at='2026-04-27T10:00:00Z')

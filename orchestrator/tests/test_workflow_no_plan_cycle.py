@@ -382,6 +382,30 @@ async def test_corrupt_counter_metadata_treated_as_zero(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_non_dict_retry_ledger_treated_as_fresh_ledger(tmp_path: Path):
+    """A non-dict ``retry_ledger`` blob must not crash via ``TypeError``.
+
+    ``RetryLedger(**raw)`` raises ``TypeError`` (not ``ValidationError``) if
+    ``raw`` isn't a mapping — must reset to a fresh all-zero ledger instead
+    of propagating the exception.
+    """
+    f = _make(
+        project_root=tmp_path,
+        main_sha='SHA-A',
+        metadata={'retry_ledger': 'garbage'},
+    )
+
+    outcome = await f.wf._handle_no_plan_failure('no plan', detail='')
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    _, kwargs = f.mark_blocked.await_args
+    assert kwargs.get('escalate_to_human') is not True
+    metadata = _persisted_metadata(f.update_task)
+    assert metadata['retry_ledger']['consecutive_no_plan_failures'] == 1
+    assert metadata['retry_ledger']['total_no_plan_failures'] == 1
+
+
+@pytest.mark.asyncio
 async def test_persists_memory_hints_from_fresh_backend_metadata(tmp_path: Path):
     """memory_hints added by Stage-2 reconciliation after load survive the write.
 

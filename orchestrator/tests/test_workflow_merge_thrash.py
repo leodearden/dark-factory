@@ -231,6 +231,28 @@ async def test_corrupt_counter_metadata_treated_as_zero():
 
 
 @pytest.mark.asyncio
+async def test_non_dict_retry_ledger_treated_as_fresh_ledger():
+    """A non-dict ``retry_ledger`` blob must not crash via ``TypeError``.
+
+    ``RetryLedger(**raw)`` raises ``TypeError`` (not ``ValidationError``) if
+    ``raw`` isn't a mapping — must reset to a fresh all-zero ledger instead
+    of propagating the exception.
+    """
+    f = _make(metadata={'retry_ledger': 'garbage'})
+
+    outcome = await f.wf._check_merge_outcome_thrash(
+        prev_signature='sig-abc', current_signature='sig-abc',
+    )
+
+    # Fresh ledger has no prev signature → resets to 1 regardless of the
+    # caller-supplied prev_signature; below threshold (default 2) → None.
+    assert outcome is None
+    md = _persisted_metadata(f.update_task)
+    assert md['retry_ledger']['consecutive_merge_thrash'] == 1
+    assert md['retry_ledger']['last_merge_outcome_signature'] == 'sig-abc'
+
+
+@pytest.mark.asyncio
 async def test_persistence_failure_escalates_to_human():
     """If scheduler.update_task raises, the counter can't be trusted to have
     landed — escalate to a human immediately rather than logging and
