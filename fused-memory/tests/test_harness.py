@@ -20,9 +20,27 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageReport,
 )
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
+
+
+def _scope(project_id: str, project_root: str) -> ProjectScope:
+    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
+    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
+
+
+def _rescope(stages, scope: ProjectScope) -> list:
+    """Re-scope each pinned stage instance in *stages* to *scope*, in place.
+
+    Lets a `_make_stages` monkeypatch shim honor whatever scope production
+    code passes in, while still returning the same pinned stage instances
+    the test set up (and mocked .run on).
+    """
+    for s in stages:
+        s.scope = scope
+    return stages
 
 
 @pytest_asyncio.fixture

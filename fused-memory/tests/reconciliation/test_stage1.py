@@ -42,9 +42,22 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.models.scope import ProjectScope
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+
+def _rescope(stages, scope: ProjectScope) -> list:
+    """Re-scope each pinned stage instance in *stages* to *scope*, in place.
+
+    Local mirror of test_harness.py's `_rescope` — lets this file's single
+    `_make_stages` monkeypatch shim (below) honor whatever scope production
+    code passes in.
+    """
+    for s in stages:
+        s.scope = scope
+    return stages
 
 
 def _make_consolidator(project_root: str = '') -> MemoryConsolidator:
