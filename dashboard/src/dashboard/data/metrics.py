@@ -117,6 +117,22 @@ async def fan_out_list_tickets(
                     ),
                     timeout=timeout,
                 )
+                count = result.get('count', 0) or 0
+                if count >= effective_limit:
+                    logger.warning(
+                        'list_tickets returned count=%d at-or-above the requested '
+                        'limit of %d for %s / %s — '
+                        'pending_total may be clipped at the server limit',
+                        count,
+                        effective_limit,
+                        url,
+                        root_str,
+                    )
+                project_id = result.get('project_id', '')
+                root_tickets = [
+                    {**r, 'project_id': project_id} for r in result.get('tickets', [])
+                ]
+                return count, root_tickets
             except TimeoutError:
                 logger.warning(
                     'list_tickets timed out for project_root=%s url=%s after %.1fs',
@@ -134,6 +150,11 @@ async def fan_out_list_tickets(
                 )
                 raise ValueError('http') from None
             except Exception:
+                # Also catches a buggy/older MCP server returning a non-dict
+                # (list/None) for list_tickets: result.get(...) above raises
+                # AttributeError, which must be caught HERE (inside the try)
+                # so it is normalized to ValueError and first_success falls
+                # through to the next URL instead of the whole root aborting.
                 logger.warning(
                     'list_tickets unexpected error for %s / %s',
                     url,
@@ -141,21 +162,6 @@ async def fan_out_list_tickets(
                     exc_info=True,
                 )
                 raise ValueError('unexpected') from None
-
-            count = result.get('count', 0) or 0
-            if count >= effective_limit:
-                logger.warning(
-                    'list_tickets returned count=%d at-or-above the requested '
-                    'limit of %d for %s / %s — '
-                    'pending_total may be clipped at the server limit',
-                    count,
-                    effective_limit,
-                    url,
-                    root_str,
-                )
-            project_id = result.get('project_id', '')
-            root_tickets = [{**r, 'project_id': project_id} for r in result.get('tickets', [])]
-            return count, root_tickets
 
         return await first_success(
             config.fused_memory_urls,

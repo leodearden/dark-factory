@@ -1785,3 +1785,56 @@ async def test_fan_out_list_tickets_invalidates_session_on_failover(tmp_path: Pa
         assert tickets == []
     finally:
         reset_sessions()
+
+
+# ---------------------------------------------------------------------------
+# task-2218 amendment: a malformed (non-dict) result from the first URL must
+# fail over to the second URL, not abort the whole root.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_failover_on_malformed_result(tmp_path: Path):
+    """A non-dict (malformed) MCP result on url[0] must fail over to url[1].
+
+    Setup: single root (tmp_path), two fused_memory_urls ['http://bad', 'http://good'].
+    'http://bad' returns a list (a buggy/older-server-shaped malformed result)
+    instead of the expected dict; 'http://good' returns a valid dict with count=3.
+
+    Assertions:
+    - pending_total == 3 (url[1]'s count, not lost)
+    - mock_mcp.call_count == 2 (both URLs attempted — failover happened)
+    - tickets == [] (url[1]'s empty tickets list)
+
+    Regression guard: _call's result-processing (`result.get(...)`) must live
+    INSIDE the try/except so an AttributeError from a non-dict result is
+    normalized to ValueError and caught by first_success's narrow catch tuple,
+    instead of escaping uncaught and aborting the entire root to (0, []).
+    """
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg = DashboardConfig(
+        project_root=tmp_path,
+        fused_memory_urls=['http://bad', 'http://good'],
+        known_project_roots=[],
+    )
+
+    async def _side_effect(http_client, url, *args, **kwargs):
+        if url == 'http://bad':
+            return ['unexpected', 'list', 'shape']
+        return {'count': 3, 'tickets': [], 'project_id': 'p'}
+
+    mock_mcp = AsyncMock(side_effect=_side_effect)
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    with patch('dashboard.data.metrics.mcp_tool_call', mock_mcp):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            tickets, pending_total = await fan_out_list_tickets(http_client, cfg)
+
+    assert pending_total == 3, (
+        f'Expected pending_total=3 (from url[1] after failover), got {pending_total}'
+    )
+    assert mock_mcp.call_count == 2, (
+        f'Expected 2 mcp_tool_call invocations (both URLs tried), got {mock_mcp.call_count}'
+    )
+    assert tickets == [], f'Expected empty tickets list, got {tickets}'
