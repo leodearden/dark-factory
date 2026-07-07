@@ -26,11 +26,12 @@ test_merge_queue_train_attribution.py) with a real ``LandedOutbox`` on
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.git_ops import AdvanceOutcome
+from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow
 from orchestrator.merge_queue import _journal_landed_then_advance, reconcile_landed_outbox
 
@@ -261,3 +262,72 @@ class TestReconcileLandedOutboxRobustness:
             'status-unknown row must be LEFT unconsumed for the next startup to retry'
         )
         assert report['skipped'] == 1
+
+
+# ---------------------------------------------------------------------------
+# step-9 — Harness startup wiring
+# ---------------------------------------------------------------------------
+
+
+def _build_harness(mock_orch_config) -> Harness:
+    """Construct a Harness with heavy constructors patched out.
+
+    Mirrors test_harness_orphan_merge_reaper_wiring._build_harness /
+    test_harness_merge_store_wiring's bare-harness construction helper.
+    """
+    mock_orch_config.max_concurrent_tasks = 2
+    mock_orch_config.fused_memory.project_id = 'test'
+
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        return Harness(mock_orch_config)
+
+
+@pytest.mark.asyncio
+class TestHarnessReconcileLandedOutboxWiring:
+    """Harness._reconcile_landed_outbox: None-guard + delegation to the module fn."""
+
+    async def test_none_worker_is_noop(self, mock_orch_config) -> None:
+        """RED until step-10 adds Harness._reconcile_landed_outbox.
+
+        Mirrors _reap_orphaned_merge_worktrees's None-guard: no worker means
+        nothing to reconcile — must not touch git_ops/scheduler.
+        """
+        h = _build_harness(mock_orch_config)
+        h._merge_worker = None
+
+        with patch(
+            'orchestrator.harness.reconcile_landed_outbox', new=AsyncMock(),
+        ) as mock_reconcile:
+            await h._reconcile_landed_outbox()
+
+        mock_reconcile.assert_not_called()
+
+    async def test_delegates_with_worker_landed_outbox_git_ops_and_scheduler(
+        self, mock_orch_config,
+    ) -> None:
+        """RED until step-10 adds Harness._reconcile_landed_outbox.
+
+        When a merge worker with a bound LandedOutbox is present, the
+        harness delegates to the module-level reconcile_landed_outbox with
+        the worker's outbox plus the harness's own git_ops/scheduler.
+        """
+        h = _build_harness(mock_orch_config)
+        worker = MagicMock()
+        worker._landed_outbox = MagicMock()
+        h._merge_worker = worker
+
+        empty_report = {
+            'pruned_not_landed': 0, 'marked_done': 0,
+            'already_done_pruned': 0, 'skipped': 0, 'errors': 0,
+        }
+        with patch(
+            'orchestrator.harness.reconcile_landed_outbox',
+            new=AsyncMock(return_value=empty_report),
+        ) as mock_reconcile:
+            await h._reconcile_landed_outbox()
+
+        mock_reconcile.assert_awaited_once_with(
+            worker._landed_outbox, h.git_ops, h.scheduler,
+        )

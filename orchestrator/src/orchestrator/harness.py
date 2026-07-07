@@ -32,6 +32,7 @@ from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.merge_queue import reconcile_landed_outbox
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.overrides import OverrideStore
