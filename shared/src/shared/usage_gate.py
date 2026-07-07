@@ -1303,70 +1303,62 @@ class UsageGate:
             logger.warning(f'Account {acct.name}: probe error: {exc}')
             return False
 
-        combined = (
-            (stderr_bytes.decode(errors='replace') if stderr_bytes else '')
-            + '\n'
-            + (stdout_bytes.decode(errors='replace') if stdout_bytes else '')
-        )
+        stdout_text = stdout_bytes.decode(errors='replace') if stdout_bytes else ''
+        stderr_text = stderr_bytes.decode(errors='replace') if stderr_bytes else ''
 
-        # NOTE — intentional asymmetry with detect_cap_hit:
-        # This loop does NOT apply the CAP_CONFIRM_KEYWORDS guard used by
-        # detect_cap_hit.  The probe runs only while an account is already
-        # blocked (capped or auth_failed); any whiff of a cap prefix in the
-        # probe output means the account is still capped and we must NOT
-        # unpause it.  Being conservative here avoids the far worse outcome
-        # of unpausing a capped account and burning quota on a still-limited
-        # account.  See CAP_CONFIRM_KEYWORDS (module top) for the current
-        # keyword list.  Do not 'fix' this asymmetry without understanding the
-        # safety-margin implications — see
-        # test_probe_prefix_only_without_confirm_keyword_still_returns_false.
-        #
-        # Demote auth_failed → capped on cap-prefix: an auth_failed account
-        # whose reprobe shows a cap-prefix is a 429 misclassification we
-        # correct in-flight via the single legal AUTH_FAILED -> CAPPED edge
-        # (see _LEGAL_TRANSITIONS) rather than leaving it on the
-        # longer-cadence auth-reprobe loop.
-        for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
-            for prefix in prefixes:
-                if prefix.lower() in combined.lower():
-                    logger.info(
-                        f'Account {acct.name}: probe got cap message: {prefix}',
-                    )
-                    if acct.phase == AccountPhase.AUTH_FAILED:
-                        resets_at = _parse_resets_at(combined)
-                        reason = (
-                            _extract_cap_message(combined, prefix)
-                            or f'Cap detected via auth-reprobe: {prefix}'
-                        )
-                        logger.warning(
-                            f'Account {acct.name}: auth-reprobe saw cap '
-                            f'message — demoting auth_failed → capped'
-                        )
-                        # Cancel + clear the stale auth-reprobe task now (the
-                        # current call IS that task; cancel() only takes
-                        # effect at its next suspension point, so the field
-                        # is cleared explicitly here rather than left to
-                        # settle asynchronously).
-                        if (
-                            acct.auth_reprobe_task is not None
-                            and not acct.auth_reprobe_task.done()
-                        ):
-                            acct.auth_reprobe_task.cancel()
-                        acct.auth_reprobe_task = None
-                        # resets_at is persisted here (mirrors
-                        # _handle_cap_detected) — _transition only threads
-                        # resets_at into the cap_hit cost-event details, it
-                        # does not write acct.resets_at itself.
-                        acct.resets_at = resets_at
-                        # _transition owns: the phase write, clearing
-                        # auth_failed_at, starting the account-resume probe
-                        # loop, the cap_hit cost event, and the centralized
-                        # _open recompute.
-                        self._transition(
-                            acct, AccountPhase.CAPPED,
-                            resets_at=resets_at, reason=reason,
-                        )
-                    return False
+        # NOTE — intentional asymmetry with detect_cap_hit: strict_confirm=False
+        # skips the CAP_CONFIRM_KEYWORDS guard applied by detect_cap_hit's
+        # strict_confirm=True regime (see DD-2 on classify_invocation).  The
+        # probe runs only while an account is already blocked (capped or
+        # auth_failed); any whiff of a cap prefix in the probe output means the
+        # account is still capped and we must NOT unpause it.  Being
+        # conservative here avoids the far worse outcome of unpausing a capped
+        # account and burning quota on a still-limited account.  Do not 'fix'
+        # this asymmetry without understanding the safety-margin implications
+        # — see test_probe_prefix_only_without_confirm_keyword_still_returns_false.
+        result = AgentResult(success=False, output=stdout_text, stderr=stderr_text)
+        outcome = classify_invocation(result, strict_confirm=False, backend='claude')
+        if isinstance(outcome, (CapHit, NearCap)):
+            logger.info(
+                f'Account {acct.name}: probe got cap message: {outcome.reason}',
+            )
+            # Demote auth_failed → capped on cap-prefix: an auth_failed
+            # account whose reprobe shows a cap-prefix is a 429
+            # misclassification we correct in-flight via the single legal
+            # AUTH_FAILED -> CAPPED edge (see _LEGAL_TRANSITIONS) rather than
+            # leaving it on the longer-cadence auth-reprobe loop.
+            if acct.phase == AccountPhase.AUTH_FAILED:
+                resets_at = outcome.resets_at if isinstance(outcome, CapHit) else None
+                reason = outcome.reason
+                logger.warning(
+                    f'Account {acct.name}: auth-reprobe saw cap '
+                    f'message — demoting auth_failed → capped'
+                )
+                # Cancel + clear the stale auth-reprobe task now (the
+                # current call IS that task; cancel() only takes
+                # effect at its next suspension point, so the field
+                # is cleared explicitly here rather than left to
+                # settle asynchronously).
+                if (
+                    acct.auth_reprobe_task is not None
+                    and not acct.auth_reprobe_task.done()
+                ):
+                    acct.auth_reprobe_task.cancel()
+                acct.auth_reprobe_task = None
+                # resets_at is persisted here (mirrors
+                # _handle_cap_detected) — _transition only threads
+                # resets_at into the cap_hit cost-event details, it
+                # does not write acct.resets_at itself.
+                acct.resets_at = resets_at
+                # _transition owns: the phase write, clearing
+                # auth_failed_at, starting the account-resume probe
+                # loop, the cap_hit cost event, and the centralized
+                # _open recompute.
+                self._transition(
+                    acct, AccountPhase.CAPPED,
+                    resets_at=resets_at, reason=reason,
+                )
+            return False
 
         if proc.returncode != 0:
             # Distinguish the probe's own $0.01 budget exhaustion from real
