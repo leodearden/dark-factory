@@ -4168,7 +4168,18 @@ class TestScopeFallbackToolToSubproject:
         assert _scope_fallback_tool_to_subproject(cmd, 'pyright', 'cockpit') == cmd
 
     def test_command_with_existing_project_flag_unchanged(self):
-        """A command already carrying `--project` is left alone (no re-target)."""
+        """A command already carrying `--project` is left alone (no re-target).
+
+        Acknowledged coverage boundary (task 2355 review): this also covers
+        the case where the pre-existing `--project` targets a *different*
+        member than *sub* (e.g. a stale/hardcoded `--project shared` on a
+        cockpit-only diff) — the "don't second-guess an explicit uv context"
+        contract doesn't distinguish "scoped to the right place" from
+        "scoped to the wrong place". Such a command keeps racing *sub*'s
+        dev-dep sync on a cold verify worktree; task 2355 only closes the
+        race for the "no uv context at all" shapes (bare `npx pyright` /
+        bare `uv run <tool>`), not this one.
+        """
         cmd = 'uv run --project foo pyright cockpit/tests/test_c3.py'
         assert _scope_fallback_tool_to_subproject(cmd, 'pyright', 'cockpit') == cmd
 
@@ -4176,6 +4187,30 @@ class TestScopeFallbackToolToSubproject:
         """A command already carrying `--directory` is left alone (no double-wrap)."""
         cmd = 'uv run --directory foo pyright cockpit/tests/test_c3.py'
         assert _scope_fallback_tool_to_subproject(cmd, 'pyright', 'cockpit') == cmd
+
+    def test_project_flag_in_a_different_chained_clause_does_not_block_scoping(self):
+        """A `--project` in a *preceding* `&&` clause must not suppress scoping
+        the tool's own (bare) clause, and the inserted uv context lands right
+        before that clause's content — not at the start of the whole command.
+
+        Amendment (task 2355 review): the "already scoped" guard originally
+        tested the whole command string for `--project`/`--directory`, so a
+        chained command whose *other* clause already carried `--project`
+        would bail out entirely, leaving the tool's own bare clause unscoped
+        and the cold-verify race unclosed. This shape doesn't occur in
+        current configs (see helper docstring), but the guard — and the
+        insertion point — must be scoped to the tool's own clause, mirroring
+        `_reproject_bare_uv_run`'s clause-scoped guard.
+        """
+        cmd = (
+            'uv run --project shared pytest tests/scripts/ '
+            '&& npx pyright cockpit/tests/test_c3.py'
+        )
+        result = _scope_fallback_tool_to_subproject(cmd, 'pyright', 'cockpit')
+        assert result == (
+            'uv run --project shared pytest tests/scripts/ '
+            '&& uv run --project cockpit npx pyright cockpit/tests/test_c3.py'
+        )
 
     def test_none_command_returns_none(self):
         """`None` is returned unchanged (propagates absent commands)."""

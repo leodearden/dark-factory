@@ -324,7 +324,15 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
 
     *cmd* is expected to already be scoped to the touched files and stripped
     of any leading ``cd`` (i.e. :func:`_scope_command` + :func:`_strip_leading_cd`
-    have already run) — this helper only adds/adjusts the uv context.
+    have already run) — this helper only adds/adjusts the uv context. In
+    practice that pipeline always yields a single ``&&``-clause (``_scope_command``
+    truncates at the first *tool_keyword* occurrence, dropping any trailing
+    clauses — see ``_build_fallback_config``). The "already scoped" check and
+    the insertion point below are nonetheless scoped to the single clause
+    containing *tool_keyword* — mirroring :func:`_reproject_bare_uv_run`'s own
+    clause-scoped guard (verify.py:295-302) rather than the whole command
+    string — so this helper stays correct if a multi-clause command ever
+    reaches it.
 
     Returns:
         ``None`` when *cmd* is ``None``.
@@ -333,11 +341,15 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
         The :func:`_reproject_bare_uv_run` result when it changed *cmd* (a
         bare ``uv run <tool_keyword>`` is reprojected to
         ``uv run --project <sub> <tool_keyword>``).
-        *cmd* unchanged when it already carries ``--project`` or
-        ``--directory`` (an explicit uv context is already set; don't
-        second-guess it).
-        Otherwise, *cmd* with ``uv run --project <sub> `` prepended (a
-        non-uv runner like ``npx pyright``, or a bare tool invocation).
+        *cmd* unchanged when the clause containing *tool_keyword* already
+        carries ``--project`` or ``--directory`` (an explicit uv context is
+        already set for that clause; don't second-guess it — this
+        deliberately also covers a command explicitly pre-scoped to a
+        *different* member than *sub*, which is left alone rather than
+        re-targeted).
+        Otherwise, *cmd* with ``uv run --project <sub> `` inserted
+        immediately before that clause's content (a non-uv runner like
+        ``npx pyright``, or a bare tool invocation).
     """
     if cmd is None:
         return None
@@ -346,9 +358,27 @@ def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: 
     reprojected = _reproject_bare_uv_run(cmd, tool_keyword, sub)
     if reprojected != cmd:
         return reprojected
-    if '--project' in cmd or '--directory' in cmd:
+    # Clause-scope the guard (and the insertion point below) to the single
+    # `&&`-delimited clause containing *tool_keyword*, mirroring
+    # _reproject_bare_uv_run's own clause-scoped guard (verify.py:295-302)
+    # rather than testing/rewriting the whole command string. Every real
+    # caller today feeds a single-clause *cmd* (see docstring), so
+    # clause_start is always 0 in practice; scoping the logic keeps this
+    # helper correct — rather than silently skipping a needed rescope — if a
+    # multi-clause command with a foreign `--project`/`--directory` in an
+    # earlier clause ever reaches it (task 2355 review).
+    idx = cmd.find(tool_keyword)
+    clause_start = cmd.rfind('&&', 0, idx)
+    clause_start = clause_start + 2 if clause_start != -1 else 0
+    while clause_start < len(cmd) and cmd[clause_start] == ' ':
+        clause_start += 1
+    clause_end = cmd.find('&&', idx)
+    if clause_end == -1:
+        clause_end = len(cmd)
+    clause = cmd[clause_start:clause_end]
+    if '--project' in clause or '--directory' in clause:
         return cmd
-    return f'uv run --project {sub} ' + cmd
+    return cmd[:clause_start] + f'uv run --project {sub} ' + cmd[clause_start:]
 
 
 # Cargo subcommands whose ``--workspace`` flag we know how to rewrite.  Other
