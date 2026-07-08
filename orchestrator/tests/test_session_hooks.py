@@ -565,6 +565,68 @@ def test_merge_hook_settings_creates_hooks_key_when_absent(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# _hooks_script_dir: resolves to the PRIMARY checkout, not a linked worktree
+# ---------------------------------------------------------------------------
+
+
+def _init_primary_checkout_with_hooks(tmp_path: Path) -> Path:
+    """Create a temp git checkout under *tmp_path* with a real hooks trio, committed."""
+    primary = tmp_path / 'primary'
+    primary.mkdir()
+    subprocess.run(['git', 'init', '-q'], cwd=primary, check=True)
+    subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=primary, check=True)
+    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=primary, check=True)
+    hooks_dir = primary / 'skills' / 'spawn' / 'hooks'
+    hooks_dir.mkdir(parents=True)
+    for script_name in ('session-start.sh', 'notification.sh', 'stop.sh'):
+        (hooks_dir / script_name).write_text('#!/bin/sh\n')
+    (primary / 'README.md').write_text('primary checkout\n')
+    subprocess.run(['git', 'add', '-A'], cwd=primary, check=True)
+    subprocess.run(['git', 'commit', '-q', '-m', 'init'], cwd=primary, check=True)
+    return primary
+
+
+def _fake_session_hooks_path(root: Path) -> Path:
+    """Mirror the real repo layout (<root>/orchestrator/src/orchestrator/session_hooks.py)."""
+    fake_file = root / 'orchestrator' / 'src' / 'orchestrator' / 'session_hooks.py'
+    fake_file.parent.mkdir(parents=True)
+    fake_file.write_text('# stub for _hooks_script_dir test\n')
+    return fake_file
+
+
+def test_hooks_script_dir_resolves_to_primary_checkout_from_linked_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _init_primary_checkout_with_hooks(tmp_path)
+    worktree = tmp_path / 'worktree-2288'
+    subprocess.run(
+        ['git', 'worktree', 'add', '-q', str(worktree), '-b', 'wt-2288'],
+        cwd=primary,
+        check=True,
+    )
+    fake_file = _fake_session_hooks_path(worktree)
+    monkeypatch.setattr(sh, '__file__', str(fake_file))
+
+    resolved = sh._hooks_script_dir()
+
+    assert resolved == (primary / 'skills' / 'spawn' / 'hooks').resolve()
+    assert resolved != fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
+
+
+def test_hooks_script_dir_falls_back_to_parents3_when_not_a_git_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_file = _fake_session_hooks_path(tmp_path)
+    monkeypatch.setattr(sh, '__file__', str(fake_file))
+
+    resolved = sh._hooks_script_dir()
+
+    assert resolved == fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
+
+
+# ---------------------------------------------------------------------------
 # _run_install: missing-file create, backup-on-existing, atomic JSON write
 # ---------------------------------------------------------------------------
 

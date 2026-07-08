@@ -29,6 +29,7 @@ import copy
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping
@@ -333,9 +334,47 @@ def merge_hook_settings(settings: Mapping[str, Any], script_dir: str | Path) -> 
 
 
 def _hooks_script_dir() -> Path:
-    """Absolute path to the in-repo skills/spawn/hooks/ dir, derived from this file's own path."""
-    repo_root = Path(__file__).resolve().parents[3]
-    return repo_root / 'skills' / 'spawn' / 'hooks'
+    """Absolute path to the in-repo skills/spawn/hooks/ dir.
+
+    Resolves to the PRIMARY checkout's ``skills/spawn/hooks/``, even when
+    this file is itself executing from inside a linked git worktree (e.g.
+    ``.worktrees/<id>/``). Otherwise the ephemeral worktree's path gets
+    baked into the absolute hook commands written into
+    ``~/.claude/settings.json``, and every hook breaks the moment that
+    worktree is reaped (observed live 2026-07-08: worktree 2288 was reaped
+    after authoring this trio, orphaning all three hook commands).
+
+    Runs ``git -C <this file's dir> rev-parse --path-format=absolute
+    --git-common-dir``: the *common* git dir always points at the primary
+    repo's ``.git``, even from a linked worktree, so its parent is the
+    primary checkout root. Falls back to the previous
+    ``Path(__file__).resolve().parents[3]`` behaviour whenever git is
+    absent, this isn't a git checkout, the command errors, or the resolved
+    directory doesn't actually contain the three hook scripts -- install
+    must stay robust and never raise.
+    """
+    fallback = Path(__file__).resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
+    file_dir = Path(__file__).resolve().parent
+    try:
+        result = subprocess.run(
+            ['git', '-C', str(file_dir), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+            capture_output=True,
+            text=True,
+            timeout=_HOOK_TIMEOUT_SECS,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return fallback
+
+    git_common_dir = result.stdout.strip()
+    if not git_common_dir:
+        return fallback
+
+    primary_root = Path(git_common_dir).resolve().parent
+    candidate = primary_root / 'skills' / 'spawn' / 'hooks'
+    if all((candidate / script_name).is_file() for script_name in _HOOK_SCRIPTS.values()):
+        return candidate
+    return fallback
 
 
 _DEFAULT_SETTINGS_PATH = Path.home() / '.claude' / 'settings.json'
