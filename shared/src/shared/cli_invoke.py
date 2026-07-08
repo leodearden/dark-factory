@@ -670,6 +670,7 @@ async def invoke_with_cap_retry(
     role: str = '',
     cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
     max_cap_retries: int | None = None,
+    rebuild_prompt: Callable[[bool], Awaitable[str]] | None = None,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     **invoke_kwargs,
@@ -698,6 +699,17 @@ async def invoke_with_cap_retry(
     the time-based bound) before the next cooldown sleep.  Defaults to
     ``None``, which preserves the existing patient, count-unbounded wait —
     only *cap_wait_sanity_secs* bounds the retry loop.
+
+    *rebuild_prompt*, when provided, is awaited as ``rebuild_prompt(True)``
+    on a cap retry whose session cannot be resumed (no ``session_id`` on the
+    capped result) — ``True`` signals ``session_lost``.  Its return value
+    replaces ``prompt`` for the next invocation, letting the caller rebuild
+    fresh context (e.g. re-gathered pending escalations) instead of reusing
+    the stale original prompt.  The resumable path (capped result carries a
+    ``session_id``) is unaffected — it keeps resuming with
+    ``CAP_HIT_RESUME_PROMPT`` and never calls this hook.  Defaults to
+    ``None``, which preserves the existing fresh-retry behaviour (reuse the
+    original prompt unchanged).
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
@@ -771,6 +783,17 @@ async def invoke_with_cap_retry(
                 'next_probe_in_s': round(cooldown, 1),
             }, default=str))
             last_cap_wait_log_at = now
+
+    async def _rebuild_fresh_prompt() -> None:
+        """Let the caller rebuild the prompt for an unresumable cap retry.
+
+        session_lost is always True at both call sites (exact-detect and
+        heuristic FRESH cap paths) — this helper only runs where the capped
+        session cannot be resumed, per the rebuild_prompt hook contract
+        (PRD §7.4 / task W4-zeta). Closes over: rebuild_prompt, invoke_kwargs.
+        """
+        if rebuild_prompt is not None:
+            invoke_kwargs['prompt'] = await rebuild_prompt(True)
 
     account_name = ''
     unattributed_cap = False  # True when heuristic fires but token is unresolvable;
@@ -921,6 +944,7 @@ async def invoke_with_cap_retry(
                         resume_or_fresh = 'resuming'
                     else:
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                        await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh'
 
                     if acct_name:
