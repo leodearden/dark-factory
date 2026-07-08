@@ -4731,3 +4731,72 @@ class TestDefaultSshHeartbeatRun:
         assert rc == 0
         assert stdout == ''
         assert stderr == ''
+
+
+# ---------------------------------------------------------------------------
+# γ step-9: RemoteRunner ssh_run routing seam — the load-bearing ssh dispatch
+# goes through a distinct self._ssh_run, not self._run (git ops)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerSshRunSeam:
+    """The ssh dispatch in run_merge_verify is routed through self._ssh_run, a
+    seam parallel to self._run (git ops).  self._ssh_run resolves: injected
+    ssh_run -> injected run (back-compat) -> heartbeat default (production)."""
+
+    async def test_ssh_routed_through_ssh_run_happy_path_unchanged(self):
+        """run=fake_git only ever sees git argv; ssh_run=fake_ssh receives the
+        ['ssh', ..., host, remote_cmd] argv and its VerifyResult JSON is
+        returned unchanged — the happy path is byte-identical to today's."""
+        git_calls = []
+        ssh_calls = []
+
+        async def fake_git(argv, *, cwd=None):
+            assert argv[0] == 'git', f'self._run (git-only) received non-git argv: {argv!r}'
+            git_calls.append((argv, cwd))
+            return (0, '', '')
+
+        expected = VerifyResult(
+            passed=True, test_output='all green', lint_output='', type_output='',
+            summary='ok',
+        )
+
+        async def fake_ssh(argv, *, cwd=None):
+            assert argv[0] == 'ssh', f'self._ssh_run received non-ssh argv: {argv!r}'
+            ssh_calls.append((argv, cwd))
+            return (0, result_to_json(expected), '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_git,
+            ssh_run=fake_ssh,
+            id_factory=lambda: 'fixed-id',
+        )
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result == expected
+        # exactly one ssh dispatch, routed through ssh_run, host + remote_cmd shape intact
+        assert len(ssh_calls) == 1
+        ssh_argv, _ = ssh_calls[0]
+        assert ssh_argv[0] == 'ssh'
+        assert ssh_argv[-2] == 'laptop.local'
+        # git ops (merge-sha push) went through run, never ssh_run
+        assert len(git_calls) == 1
+        assert git_calls[0][0] == ['git', 'push', 'origin', 'abc123:refs/merge-verify/fixed-id']
+
+    async def test_default_construction_wires_distinct_heartbeat_ssh_runner(self):
+        """With no run/ssh_run injected, self._ssh_run is a distinct callable
+        from self._run (the heartbeat default), asserted via identity only —
+        no ssh is ever spawned."""
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+        )
+        assert runner._ssh_run is not runner._run
