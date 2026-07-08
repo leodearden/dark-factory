@@ -886,6 +886,10 @@ async def run_server():
         write_journal=write_journal,
         memory_service=memory_service,
         known_projects=_known_projects_map,
+        # Guarded like event_buffer/ticket_store above: recon_ledger's
+        # unconditional pre-init lands in a later step (task 2219 step-20);
+        # this guard is safe both before and after that pre-init exists.
+        recon_ledger=recon_ledger if 'recon_ledger' in locals() else None,
     )
     if _checkpoint_targets:
         checkpoint_task = asyncio.create_task(
@@ -1085,6 +1089,7 @@ def _collect_checkpoint_targets(
     write_journal,
     memory_service,
     known_projects: dict[str, str] | None = None,
+    recon_ledger=None,
 ) -> list[tuple[str, object]]:
     """Gather every live SQLite store that exposes a ``checkpoint`` method.
 
@@ -1108,6 +1113,8 @@ def _collect_checkpoint_targets(
         targets.append(('event_buffer', event_buffer.checkpoint))
     if ticket_store is not None and hasattr(ticket_store, 'checkpoint'):
         targets.append(('ticket_store', ticket_store.checkpoint))
+    if recon_ledger is not None and hasattr(recon_ledger, 'checkpoint'):
+        targets.append(('recon_ledger', recon_ledger.checkpoint))
     if write_journal is not None and hasattr(write_journal, 'checkpoint'):
         targets.append(('write_journal', write_journal.checkpoint))
     dq = getattr(memory_service, 'durable_queue', None)
