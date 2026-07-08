@@ -9529,6 +9529,53 @@ class TestStage3PayloadIncludesProjectRoot:
         )
 
 
+class TestMemoryConsolidatorPayloadIncludesProjectRoot:
+    """MemoryConsolidator.assemble_payload() emits an unconditional Use project_root="..." directive.
+
+    Characterization test for task 2150 step-5: pins the contract that
+    _build_project_root_directive's dead `if not self.project_root: return ''`
+    branch (step-6) must preserve. A stage is only constructible with a validated
+    ProjectScope, so project_root is always a non-empty absolute path and the
+    directive is always emitted — there is no remaining '' case to pin (β/task
+    2146 already removed the 3 empty-root TestStage1 cases).
+    """
+
+    @pytest.fixture
+    def memory_mock(self):
+        m = AsyncMock()
+        m.get_episodes = AsyncMock(return_value=[])
+        m.mem0 = AsyncMock()
+        m.mem0.get_all = AsyncMock(return_value={'results': []})
+        m.get_status = AsyncMock(return_value={})
+        return m
+
+    @pytest.fixture
+    def mock_deps(self, memory_mock):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': memory_mock,
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('reify', '/home/leo/src/reify'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_memory_consolidator_payload_emits_use_project_root_directive(self, mock_deps):
+        """assemble_payload() must contain Use project_root="/home/leo/src/reify"."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.episode_limit = 125
+        stage.memory_limit = 250
+
+        watermark = Watermark(project_id='reify')
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert 'Use project_root="/home/leo/src/reify"' in payload, (
+            f'Stage 1 payload must contain Use project_root="..." directive '
+            f'(task 2150 step-5). Got payload:\n{payload[-500:]}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Task 1154 — Stage 2 same-run Stage 1 human_operator_required suppression
 # ---------------------------------------------------------------------------
