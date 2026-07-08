@@ -8923,6 +8923,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 quarantine=self._runner_quarantine,
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
+                escalation_queue=self._escalation_queue,
             ))
             while True:
                 done, _ = await asyncio.wait(
