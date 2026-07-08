@@ -441,44 +441,47 @@ class TestFinalizeHeadSpeculativeAccounting:
 
 
 class TestDispatchGapSpeculativeAccounting:
-    """Unit tests for the task-2096 dispatch-gap (_dispatching_item) fix.
-
-    RED pre-fix: self._dispatching_item is not yet an attribute
-    _inflight_speculative_count() scans (it does not exist on the worker at
-    all until step-4's __init__ change), so a drained permit "in dispatch"
-    reads as a conservation violation. Tests set it via ad-hoc attribute
-    assignment (mirroring how TestFinalizeHeadSpeculativeAccounting sets
-    worker._finalizing_head above) — this works pre-fix because Python
-    allows setting a new instance attribute even before __init__ declares it;
-    the count just doesn't look at it yet.
+    """Ledger-based accounting for a speculative permit held by an in-
+    dispatch item — see the combined header comment above
+    TestRedispatchSpeculativeAccounting for the task 2096 → task 2160/η
+    context.
     """
 
-    def test_dispatching_item_alone_counted(
+    @pytest.mark.asyncio
+    async def test_dispatching_item_permit_is_counted_via_the_ledger_alone(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=1)
 
-        # Drain the single speculation permit; the in-dispatch item is the
-        # ONLY place a speculative item can be during the dispatch-gap.
-        worker._speculation_slot._value = 0
-        worker._dispatching_item = _make_spec_item(tmp_path, speculative=True)  # type: ignore[attr-defined]
+        # Acquire the single permit THROUGH the ledger and attach it to the
+        # item. Deliberately NOT placed on worker._dispatching_item — post-η
+        # the count must not depend on structural location, only on ledger
+        # membership.
+        item = _make_spec_item(tmp_path, speculative=True)
+        item.permit = await worker._speculation_ledger.acquire()
 
         assert worker._inflight_speculative_count() == 1
         assert worker.speculation_accounting_violations() == []
         assert worker.snapshot()['speculation']['inflight_speculative'] == 1
 
-    def test_dispatching_item_plus_inflight_both_counted(
+    @pytest.mark.asyncio
+    async def test_dispatching_item_plus_inflight_both_counted(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
         from orchestrator.merge_queue import InflightEntry, SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
-        # Drain both permits: one is in-dispatch, one is already in _inflight.
-        worker._speculation_slot._value = 0
-        worker._dispatching_item = _make_spec_item(tmp_path, speculative=True)  # type: ignore[attr-defined]
+        # Acquire both permits THROUGH the ledger: one attached to a
+        # dispatch-gap-shaped item, one to an _inflight entry. Deliberately
+        # NOT placed on worker._dispatching_item / worker._inflight — post-η
+        # the count must not depend on structural location, only on ledger
+        # membership. The dispatch-gap item is never read again beyond
+        # triggering the ledger acquisition — leading underscore marks it.
+        _dispatching_shaped_item = _make_spec_item(tmp_path, speculative=True)
+        _dispatching_shaped_item.permit = await worker._speculation_ledger.acquire()
         worker._inflight.append(InflightEntry(
             item=_make_spec_item(tmp_path, speculative=True),
             lease=None,
@@ -486,6 +489,7 @@ class TestDispatchGapSpeculativeAccounting:
             merge_wt=None,
             was_speculative=True,
             phase='verifying',
+            permit=await worker._speculation_ledger.acquire(),
         ))
 
         assert worker._inflight_speculative_count() == 2
@@ -495,8 +499,9 @@ class TestDispatchGapSpeculativeAccounting:
     def test_nonspeculative_dispatching_item_not_counted(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
-        """A non-speculative in-dispatch item contributes 0 — else the fix
-        would over-count and could mask a genuine imbalance.
+        """A non-speculative in-dispatch item carries no permit and
+        contributes 0 — else the ledger-only invariant would be broken and
+        could mask a genuine imbalance.
         """
         from orchestrator.merge_queue import SpeculativeMergeWorker
 

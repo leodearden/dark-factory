@@ -4471,11 +4471,15 @@ class TestRedispatchSpeculativeConservation:
 
 @pytest.mark.asyncio
 class TestFinalizeHeadSpeculativeAccountingThroughout:
-    """RED pre-fix (task 2096): _inflight_speculative_count() never scans
-    self._finalizing_head, so while a speculative finalizing head is paused
-    mid-`await entry.verify_task` (gated below), the identity check is short
-    by one and speculation_accounting_violations() reports a spurious
-    conservation violation for the whole window.
+    """Ledger-based accounting for a speculative permit held by a finalizing
+    head, THROUGHOUT the real `await entry.verify_task` window (task 2096 →
+    task 2160/η).
+
+    RED (pre-η GREEN): the entries below now carry real ledger-issued
+    tokens (``entry.permit``) instead of relying on structural location,
+    but _inflight_speculative_count() still scans the five old
+    ``was_speculative``/``.speculative`` locations rather than
+    ``ledger.live`` — see step-6 GREEN.
     """
 
     async def _make_merged_item(
@@ -4534,11 +4538,9 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
         alloc.cancel_and_release = AsyncMock()
         worker._host_allocator = alloc
 
-        # Drain both speculation permits up front: the gated finalizing head
-        # (was_speculative=True below) accounts for one, a second speculative
-        # entry parked in _inflight accounts for the other.
-        worker._speculation_slot._value = 0
-
+        # Acquire both permits THROUGH the ledger up front: the gated
+        # finalizing head (below) holds one, a second speculative entry
+        # parked in _inflight holds the other.
         _, second_item = await self._make_merged_item(
             git_ops, config, 'fh-spec-second', 'fhspec2.py', 'y = 2\n',
         )
@@ -4549,6 +4551,7 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
             merge_wt=second_item.merge_wt,
             was_speculative=True,
             phase='awaiting_verify',
+            permit=await worker._speculation_ledger.acquire(),
         ))
 
         local_lease = HostLease(name='local', runner=MagicMock(), is_local=True)
@@ -4560,6 +4563,7 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
             merge_wt=None,
             was_speculative=True,
             phase='verifying',
+            permit=await worker._speculation_ledger.acquire(),
         )
 
         # Launch _finalize_inflight; it will pause at `await entry.verify_task`.
