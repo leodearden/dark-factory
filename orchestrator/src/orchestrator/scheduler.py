@@ -67,6 +67,20 @@ _DISPATCH_DEFERRED_LOG_SECS: float = 180.0
 # distinguish these two cases since ``None`` IS the clear value.
 _CLAIMANT_ABSENT = object()
 
+
+def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
+    """Return only the *pairs* entries whose value is not *sentinel*.
+
+    Small shared shape for the tri-state (untouched / clear / set)
+    kwarg-forwarding pattern used by both ``set_task_status`` (sentinel
+    ``None``) and ``set_task_claimant`` (sentinel ``_CLAIMANT_ABSENT``)
+    below (task 2188) — kept local to this module rather than shared with
+    the interceptor/MCP-tools layers, since each layer needs its own
+    sentinel (JSON cannot carry Python's ``_UNSET`` object across the wire).
+    """
+    return {k: v for k, v in pairs.items() if v is not sentinel}
+
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -1694,10 +1708,9 @@ class Scheduler:
             arguments['done_provenance'] = done_provenance
         if reopen_reason is not None:
             arguments['reopen_reason'] = reopen_reason
-        if claimant_run_id is not None:
-            arguments['claimant_run_id'] = claimant_run_id
-        if heartbeat_at is not None:
-            arguments['heartbeat_at'] = heartbeat_at
+        arguments.update(_maybe_kwargs(
+            None, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        ))
 
         # C3.2 (task 1620, β Pair E): action-teardown suppression guard.
         # When the Harness stamps _action_teardown_tasks for a task being killed
@@ -1850,10 +1863,9 @@ class Scheduler:
         stranded-task sweep).
         """
         arguments: dict = {'id': task_id, 'project_root': self._project_root}
-        if claimant_run_id is not _CLAIMANT_ABSENT:
-            arguments['claimant_run_id'] = claimant_run_id
-        if heartbeat_at is not _CLAIMANT_ABSENT:
-            arguments['heartbeat_at'] = heartbeat_at
+        arguments.update(_maybe_kwargs(
+            _CLAIMANT_ABSENT, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        ))
         try:
             response = await self.dispatch_tool('set_task_claimant', arguments, timeout=15)
             rejection = extract_rejection(response)

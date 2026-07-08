@@ -111,6 +111,26 @@ class TaskBackendProtocol(Protocol):
         """
         ...
 
+    async def set_task_claimant(
+        self,
+        task_id: str,
+        project_root: str,
+        *,
+        claimant_run_id: str | None = None,
+        heartbeat_at: str | None = None,
+        tag: str | None = None,
+    ) -> dict:
+        """Stamp/refresh/clear claimant_run_id/heartbeat_at without touching status.
+
+        Dedicated status-untouching write path (task 2182, PRD C4/D4) — kept
+        separate from ``set_task_status``, which owns the status-FSM gates.
+        Tri-state per param: implementations treat a sentinel default as
+        "leave untouched"; the protocol exposes ``None`` defaults so callers
+        may supply them and backends stay assignable to this shape (mirrors
+        ``set_task_status`` above).
+        """
+        ...
+
     async def add_task(
         self,
         project_root: str,

@@ -566,7 +566,27 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
 # default. This string sentinel plays that role for claimant_run_id/
 # heartbeat_at: the wire default means "leave untouched" (mapped to the
 # interceptor's own _UNSET), while JSON null (Python None) means "clear".
+#
+# RESERVED VALUE: '__unset__' is reserved and can never be stamped — a
+# caller that passed it literally as claimant_run_id would be silently
+# treated as "omitted" rather than stamped. This cannot happen today because
+# claimant_run_id is always machine-composed by
+# shared.task_claimant.compose_claimant_run_id() (format 'run/session/pid=N'),
+# never freeform text, but keep the reservation in mind before relaxing that
+# producer or introducing a new one.
 _CLAIMANT_WIRE_UNSET = '__unset__'
+
+
+def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
+    """Return only the *pairs* entries whose value is not *sentinel*.
+
+    Small shared shape for the tri-state (untouched / clear / set)
+    kwarg-forwarding pattern repeated below for claimant_run_id/heartbeat_at
+    (task 2188) — kept local to this module rather than shared with the
+    interceptor/scheduler layers, since each layer needs its own sentinel
+    (JSON cannot carry Python's ``_UNSET`` object across the wire).
+    """
+    return {k: v for k, v in pairs.items() if v is not sentinel}
 
 
 def create_mcp_server(
@@ -2929,11 +2949,9 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
-        claimant_kwargs: dict[str, Any] = {}
-        if claimant_run_id is not _CLAIMANT_WIRE_UNSET:
-            claimant_kwargs['claimant_run_id'] = claimant_run_id
-        if heartbeat_at is not _CLAIMANT_WIRE_UNSET:
-            claimant_kwargs['heartbeat_at'] = heartbeat_at
+        claimant_kwargs: dict[str, Any] = _maybe_kwargs(
+            _CLAIMANT_WIRE_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        )
         try:
             return await task_interceptor.set_task_status(
                 task_id=id,
@@ -2985,11 +3003,9 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        claimant_kwargs: dict[str, Any] = {}
-        if claimant_run_id is not _CLAIMANT_WIRE_UNSET:
-            claimant_kwargs['claimant_run_id'] = claimant_run_id
-        if heartbeat_at is not _CLAIMANT_WIRE_UNSET:
-            claimant_kwargs['heartbeat_at'] = heartbeat_at
+        claimant_kwargs: dict[str, Any] = _maybe_kwargs(
+            _CLAIMANT_WIRE_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+        )
         try:
             return await task_interceptor.set_task_claimant(
                 task_id=id,
