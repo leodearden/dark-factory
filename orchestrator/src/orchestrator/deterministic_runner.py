@@ -860,6 +860,76 @@ class DeterministicRunner:
 
         return WorkflowOutcome.BLOCKED
 
+    async def _file_milestone_check_failed_and_block(
+        self,
+        task_id: str,
+        summary: str,
+        detail: str,
+    ) -> WorkflowOutcome:
+        """File a born-at-L2 ``milestone_check_failed`` escalation and block (γ-predicate).
+
+        A non-zero predicate exit code is a milestone VERDICT ("the invariant
+        does not hold") — semantically distinct from an infra fault, so this
+        mirrors ``_file_infra_issue_and_block``'s dedup/file/block shape but
+        with a dedicated category AND additionally stamps ``gate_escalated_at``
+        (mirroring ``_file_milestone_gate_and_block``) so the next dispatch
+        routes through section-1's existing quiescence/resolve-to-done fork —
+        a human resolving the escalation drives the task to done with no
+        extra wiring.
+
+        Includes a dedup guard — if a pending escalation already exists (e.g.
+        prior crash-safe re-dispatch), filing is skipped to avoid duplicate L2
+        escalations.
+
+        Returns:
+            WorkflowOutcome.BLOCKED
+        """
+        from escalation.models import Escalation
+
+        existing_pending = self.escalation_queue.get_by_task(
+            task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+        )
+        if existing_pending:
+            logger.info(
+                'DeterministicRunner: task %s already has %d pending escalation(s) — '
+                'skipping re-file (milestone_check_failed dedup guard)',
+                task_id, len(existing_pending),
+            )
+        else:
+            esc = Escalation(
+                id=self.escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role=DETERMINISTIC_AGENT_ROLE,
+                severity='critical',
+                category='milestone_check_failed',
+                summary=summary[:200],
+                detail=detail,
+                level=2,
+            )
+            self.escalation_queue.submit(esc)
+            logger.info(
+                'DeterministicRunner: filed L2 milestone_check_failed escalation %s for task %s',
+                esc.id, task_id,
+            )
+
+        # Stamp gate_escalated_at AFTER successful escalation submit (file-before-stamp
+        # ordering, same as _file_milestone_gate_and_block) so a stamp failure re-files
+        # on the next dispatch rather than silently skipping it.  A predicate NEVER
+        # stamps before_done_ran_at — there is no I1 side effect to guard here.
+        now_iso = datetime.now(UTC).isoformat()
+        await self.scheduler.update_task(
+            task_id,
+            {'gate_escalated_at': now_iso},
+            metadata_mode='merge',
+        )
+
+        await self.scheduler.set_task_status(task_id, 'blocked')
+        logger.info(
+            'DeterministicRunner: task %s blocked — milestone_check_failed', task_id,
+        )
+
+        return WorkflowOutcome.BLOCKED
+
     async def _run_predicate(
         self, task_id: str, before_done: dict, description: str,
     ) -> WorkflowOutcome:
@@ -902,6 +972,22 @@ class DeterministicRunner:
                 ) from exc
 
         rc, out = await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)
+
+        if rc != 0:
+            # A non-zero exit is a milestone VERDICT ("invariant does not
+            # hold"), not an infra fault — file milestone_check_failed (NOT
+            # infra_issue) and stamp gate_escalated_at so a human resolving
+            # the escalation drives the task to done on the next dispatch.
+            fail_detail = '\n'.join([
+                description,
+                f'Predicate check exit code: rc={rc}',
+                f'Output:\n{out}',
+            ])
+            return await self._file_milestone_check_failed_and_block(
+                task_id,
+                summary=f'Milestone predicate check failed (rc={rc})',
+                detail=fail_detail,
+            )
 
         logger.info(
             'DeterministicRunner: task %s predicate check passed (rc=0) — setting done',
