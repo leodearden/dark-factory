@@ -260,23 +260,34 @@ class ReconLedgerStore:
         is one of :data:`MARKER_KINDS` and its ``task_id`` is in
         ``terminal_task_ids``. Returns the number of rows deleted.
 
-        Assumes ``terminal_task_ids`` is non-empty (SQLite rejects an empty
-        ``IN ()`` list); callers with an empty set should use the expiry-only
-        path.
+        When ``terminal_task_ids`` is empty, the terminal-referenced clause is
+        omitted entirely and an expiry-only DELETE runs instead — an explicit
+        guard rather than relying on an empty ``IN ()`` (which SQLite treats
+        as always-false, but that's implicit engine behaviour, not a
+        contract this store leans on).
         """
-        marker_placeholders = ','.join('?' * len(MARKER_KINDS))
-        terminal_placeholders = ','.join('?' * len(terminal_task_ids))
         async with self._txn() as db:
-            cursor = await db.execute(
-                f"""
-                DELETE FROM recon_ledger
-                WHERE project_id = ? AND (
-                    expires_at < ?
-                    OR (record_kind IN ({marker_placeholders}) AND task_id IN ({terminal_placeholders}))
+            if terminal_task_ids:
+                marker_placeholders = ','.join('?' * len(MARKER_KINDS))
+                terminal_placeholders = ','.join('?' * len(terminal_task_ids))
+                cursor = await db.execute(
+                    f"""
+                    DELETE FROM recon_ledger
+                    WHERE project_id = ? AND (
+                        expires_at < ?
+                        OR (record_kind IN ({marker_placeholders}) AND task_id IN ({terminal_placeholders}))
+                    )
+                    """,
+                    (project_id, now, *MARKER_KINDS, *terminal_task_ids),
                 )
-                """,
-                (project_id, now, *MARKER_KINDS, *terminal_task_ids),
-            )
+            else:
+                cursor = await db.execute(
+                    """
+                    DELETE FROM recon_ledger
+                    WHERE project_id = ? AND expires_at < ?
+                    """,
+                    (project_id, now),
+                )
         return cursor.rowcount
 
     async def close(self) -> None:
