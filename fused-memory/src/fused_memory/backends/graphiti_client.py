@@ -677,6 +677,7 @@ class GraphitiBackend:
             logger.warning(f'Graphiti retrieve_episodes timed out after {self._read_timeout}s')
             return []
 
+    @_canonicalize_group_args
     async def get_episode_by_uuid(self, episode_uuid: str, *, group_id: str) -> EpisodicNode | None:
         """Fetch an episode node by UUID.
 
@@ -700,6 +701,7 @@ class GraphitiBackend:
             logger.warning(f'Graphiti get_episode_by_uuid timed out after {self._read_timeout}s')
             return None
 
+    @_canonicalize_group_args
     async def remove_episode(self, episode_uuid: str, *, group_id: str) -> None:
         """Delete an episode by UUID."""
         driver = self._driver_for(group_id)
@@ -709,6 +711,7 @@ class GraphitiBackend:
             timeout=self._write_timeout,
         )
 
+    @_canonicalize_group_args
     async def remove_edge(self, edge_uuid: str, *, group_id: str) -> None:
         """Delete an entity edge (fact) by UUID. Idempotent — missing edges are ignored."""
         driver = self._driver_for(group_id)
@@ -722,6 +725,7 @@ class GraphitiBackend:
             timeout=self._write_timeout,
         )
 
+    @_canonicalize_group_args
     async def update_edge(
         self, edge_uuid: str, fact: str | None = None, *, group_id: str,
         invalid_at: datetime | None = None,
@@ -825,6 +829,7 @@ class GraphitiBackend:
                 timeout=self._write_timeout,
             )
 
+    @_canonicalize_group_args
     async def query_stale_node_embeddings(
         self, expected_dim: int, *, group_id: str
     ) -> list[tuple[str, str, int]]:
@@ -851,6 +856,7 @@ class GraphitiBackend:
                 stale.append((row[0], row[1], dim))
         return stale
 
+    @_canonicalize_group_args
     async def query_stale_edge_embeddings(
         self, expected_dim: int, *, group_id: str
     ) -> list[tuple[str, str, int]]:
@@ -875,6 +881,7 @@ class GraphitiBackend:
                 stale.append((row[0], row[1], dim))
         return stale
 
+    @_canonicalize_group_args
     async def query_edges_by_time_range(
         self, start: str, end: str, *, group_id: str
     ) -> list[dict]:
@@ -908,6 +915,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    @_canonicalize_group_args
     async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
@@ -944,6 +952,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    @_canonicalize_group_args
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
         """Return distinct UUID strings of entities connected to the given node via valid edges.
 
@@ -972,6 +981,7 @@ class GraphitiBackend:
         result = await graph.ro_query(cypher, {'uuid': uuid})
         return [row[0] for row in (result.result_set or [])]
 
+    @_canonicalize_group_args
     async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
         """Return all currently-valid RELATES_TO edges grouped by entity UUID.
 
@@ -1025,6 +1035,7 @@ class GraphitiBackend:
             grouped.setdefault(entity_uuid, []).append(self._edge_dict(row[1], row[2], row[3]))
         return grouped
 
+    @_canonicalize_group_args
     async def bulk_remove_edges(self, uuids: list[str], *, group_id: str) -> int:
         """Delete RELATES_TO edges by UUID list. Returns count of actually matched edges.
 
@@ -1061,6 +1072,7 @@ class GraphitiBackend:
         await graph.query(delete_cypher, {'uuids': uuids})
         return found
 
+    @_canonicalize_group_args
     async def dedup_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> int:
         """Collapse post-merge parallel duplicate valid edges incident to a node.
 
@@ -1107,6 +1119,7 @@ class GraphitiBackend:
             return 0
         return await self.bulk_remove_edges(duplicate_uuids, group_id=group_id)
 
+    @_canonicalize_group_args
     async def redirect_node_edges(
         self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
     ) -> dict:
@@ -1267,6 +1280,7 @@ class GraphitiBackend:
             'inter_node_deleted': inter_node_deleted,
         }
 
+    @_canonicalize_group_args
     async def merge_entities(
         self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
     ) -> dict:
@@ -1339,6 +1353,7 @@ class GraphitiBackend:
             },
         }
 
+    @_canonicalize_group_args
     async def delete_entity(
         self,
         uuid: str,
@@ -1422,6 +1437,7 @@ class GraphitiBackend:
             'refresh_errors': refresh_errors,
         }
 
+    @_canonicalize_group_args
     async def delete_entity_node(self, uuid: str, *, group_id: str) -> None:
         """Delete an Entity node and all remaining relationships.
 
@@ -1451,6 +1467,7 @@ class GraphitiBackend:
         )
         logger.info('delete_entity_node: deleted node=%s', uuid)
 
+    @_canonicalize_group_args
     async def get_node_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, summary) for the Entity node with the given UUID.
 
@@ -1470,6 +1487,7 @@ class GraphitiBackend:
         row = result.result_set[0]
         return (row[0], row[1] or '')
 
+    @_canonicalize_group_args
     async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
         """Resolve an entity name to its UUID via an exact Cypher lookup.
 
@@ -1784,6 +1802,7 @@ class GraphitiBackend:
             'summary_line_count': len(summary_lines),
         }
 
+    @_canonicalize_group_args
     async def refresh_entity_summary(
         self,
         node_uuid: str,
@@ -1844,6 +1863,7 @@ class GraphitiBackend:
             'edge_count': len(edges),
         }
 
+    @_canonicalize_group_args
     async def set_entity_summary(
         self,
         node_uuid: str,
@@ -1891,6 +1911,7 @@ class GraphitiBackend:
             'new_summary': summary,
         }
 
+    @_canonicalize_group_args
     async def rename_entity_node(
         self,
         node_uuid: str,
@@ -1955,6 +1976,7 @@ class GraphitiBackend:
             'new_name': new_name,
         }
 
+    @_canonicalize_group_args
     async def list_entity_nodes(self, *, group_id: str) -> list[dict]:
         """Return all Entity nodes (uuid, name, summary) for a given group_id.
 
@@ -1981,6 +2003,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    @_canonicalize_group_args
     async def detect_stale_with_edges(
         self, *, group_id: str
     ) -> StaleSummaryResult:
@@ -2008,6 +2031,7 @@ class GraphitiBackend:
                 stale.append(entry)
         return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
 
+    @_canonicalize_group_args
     async def detect_stale_dry_run(
         self, *, group_id: str, max_concurrency: int = 10
     ) -> tuple[list[dict], int]:
@@ -2077,6 +2101,7 @@ class GraphitiBackend:
 
         return (stale, len(entities))
 
+    @_canonicalize_group_args
     async def detect_stale_summaries(self, *, group_id: str) -> list[dict]:
         """Identify Entity nodes whose summary is out of sync with valid edge facts.
 
@@ -2108,6 +2133,7 @@ class GraphitiBackend:
         result = await self.detect_stale_with_edges(group_id=group_id)
         return result.stale
 
+    @_canonicalize_group_args
     async def rebuild_entity_from_edges(
         self, uuid: str, name: str, edges: list[EdgeDict], *, group_id: str,
         old_summary: str,
@@ -2159,6 +2185,7 @@ class GraphitiBackend:
             'edge_count': len(edges),
         }
 
+    @_canonicalize_group_args
     async def update_node_summary(self, uuid: str, summary: str, *, group_id: str) -> None:
         """Update the summary text property on an Entity node.
 
@@ -2174,6 +2201,7 @@ class GraphitiBackend:
         )
         await graph.query(cypher, {'uuid': uuid, 'summary': summary})
 
+    @_canonicalize_group_args
     async def update_node_name(self, uuid: str, name: str, *, group_id: str) -> None:
         """Update the name property on an Entity node.
 
@@ -2189,6 +2217,7 @@ class GraphitiBackend:
         )
         await graph.query(cypher, {'uuid': uuid, 'name': name})
 
+    @_canonicalize_group_args
     async def get_edge_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
         """Return (name, fact) for the RELATES_TO edge with the given UUID.
 
@@ -2208,6 +2237,7 @@ class GraphitiBackend:
         row = result.result_set[0]
         return (row[0] or '', row[1] or '')
 
+    @_canonicalize_group_args
     async def get_edge_invalid_at(self, uuid: str, *, group_id: str) -> Any:
         """Return the raw stored ``invalid_at`` for the RELATES_TO edge with the given UUID.
 
@@ -2231,6 +2261,7 @@ class GraphitiBackend:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         return result.result_set[0][0]
 
+    @_canonicalize_group_args
     async def update_node_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
         """Update the name_embedding vector for an Entity node using vecf32()."""
         graph = self._graph_for(group_id)
@@ -2240,6 +2271,7 @@ class GraphitiBackend:
         )
         await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
 
+    @_canonicalize_group_args
     async def update_edge_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
         """Update the fact_embedding vector for a RELATES_TO edge using vecf32()."""
         graph = self._graph_for(group_id)
@@ -2249,6 +2281,7 @@ class GraphitiBackend:
         )
         await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
 
+    @_canonicalize_group_args
     async def list_indices(self, *, group_id: str) -> list[dict]:
         """Return parsed index records from the graph.
 
@@ -2285,12 +2318,14 @@ class GraphitiBackend:
             })
         return indices
 
+    @_canonicalize_group_args
     async def drop_index(self, label: str, field: str, *, group_id: str) -> None:
         """Drop an index on the given label and field (FalkorDB syntax)."""
         graph = self._graph_for(group_id)
         cypher = f'DROP INDEX ON :{label}({field})'
         await graph.query(cypher)
 
+    @_canonicalize_group_args
     async def drop_vector_indices(self, *, group_id: str) -> list[dict]:
         """Drop all VECTOR-type indices in the graph.
 
