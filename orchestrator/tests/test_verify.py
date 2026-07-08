@@ -4170,6 +4170,27 @@ class TestSingleSubprojectPrefix:
         result = _single_subproject_prefix(['tests/scripts/test_x.py'], tmp_path)
         assert result is None
 
+    def test_mixed_root_and_subproject_files_returns_none(self, tmp_path: Path) -> None:
+        """A repo-root file alongside a subproject file → None, not the subproject alone.
+
+        Regression guard: a naive ``{f.split('/', 1)[0] for f in files if '/' in
+        f}`` silently drops files with no '/', so ``['cockpit/tests/test_a.py',
+        'top_level.py']`` would collapse to ``{'cockpit'}`` and return
+        'cockpit' — scoping the test command to cockpit alone and dropping
+        test validation of the root-level file entirely (lint/type still
+        cover it, but tests would not).  A mixed root+subproject diff must
+        disqualify subproject scoping so the caller falls back to the
+        fleet/verbatim command instead.
+        """
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _single_subproject_prefix(
+            ['cockpit/tests/test_a.py', 'top_level.py'], tmp_path,
+        )
+        assert result is None
+
 
 class TestBuildFallbackConfigWithNonDefaultCommands:
     """``_build_fallback_config`` uses project-configured commands when non-default.
@@ -4438,6 +4459,79 @@ class TestBuildFallbackConfigSubprojectScoped:
 
         assert result is not None
         assert result.test_command == 'cd cockpit && uv run pytest tests'
+
+    def test_conftest_at_subproject_root_scopes_to_dot(self, tmp_path: Path) -> None:
+        """A conftest.py directly at the subproject root scopes to '.', not the prefix.
+
+        Regression guard: 'cockpit/conftest.py' maps (via the existing
+        conftest-parent-dir logic) to the bare target 'cockpit', which equals
+        `sub` itself rather than `sub + '/...'`.  Naively stripping only the
+        `sub + '/'` prefix leaves 'cockpit' unchanged, producing the invalid
+        `cd cockpit && uv run pytest cockpit` (pytest resolves this against
+        cwd 'cockpit' as the nonexistent 'cockpit/cockpit' and false-blocks
+        the task).  The target must map to '.' instead.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/conftest.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'cd cockpit && uv run pytest .'
+
+    def test_data_module_only_change_emits_warning_and_yields_no_test_command(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A subproject data-module-only change warns instead of silently skipping.
+
+        No collectable tests and no conftest in the diff means there's no
+        anchor to derive a subproject test target from, so test_command is
+        None (same "ships unvalidated" outcome as the bare-pytest branch) —
+        but that coverage gap must be surfaced via the same task-1852 warning
+        the bare-pytest branch already emits, not silently.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _build_fallback_config(
+                ['cockpit/tests/some_data.py'], cfg, worktree=worktree,
+            )
+
+        assert result is not None
+        assert result.test_command is None
+        assert any(
+            'test-tree data module' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), (
+            'Expected a WARNING about the skipped test-tree data module; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_mixed_root_and_subproject_files_uses_fleet_chain_verbatim(
+        self, tmp_path: Path,
+    ) -> None:
+        """A diff mixing a repo-root file with a subproject file falls back to the fleet chain.
+
+        Regression guard: ``_single_subproject_prefix`` must not collapse
+        ``['cockpit/tests/test_a.py', 'top_level.py']`` to 'cockpit' (which
+        would drop test validation of the root-level file). With subproject
+        detection correctly disqualified (mixed root+subproject), the
+        pre-existing non-default-configured-command branch takes over and
+        the verbatim fleet chain runs — still validating both files, just not
+        scoped as narrowly as a pure-subproject diff would be.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/tests/test_a.py', 'top_level.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == self._FLEET_TEST_COMMAND
 
 
 class TestRunScopedVerificationForwardsWorktreeToFallback:

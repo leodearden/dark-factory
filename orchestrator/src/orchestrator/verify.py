@@ -1555,13 +1555,18 @@ def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | 
     (e.g. ``cockpit/``) from a bare repo-root directory like ``tests/`` or
     ``src/`` that has no ``pyproject.toml`` of its own.
 
-    Returns ``None`` when *worktree* is ``None``, *files* is empty, the files
-    span more than one top-level directory, or the sole top-level directory
-    lacks its own ``pyproject.toml``.
+    Returns ``None`` when *worktree* is ``None``, *files* is empty, any file
+    lives at the repo root (no top-level directory to attribute it to — a
+    mixed root+subproject diff must not collapse to the subproject alone and
+    silently drop the root-level file from test scoping), the files span more
+    than one top-level directory, or the sole top-level directory lacks its
+    own ``pyproject.toml``.
     """
     if worktree is None or not files:
         return None
-    components = {f.split('/', 1)[0] for f in files if '/' in f}
+    if any('/' not in f for f in files):
+        return None
+    components = {f.split('/', 1)[0] for f in files}
     if len(components) != 1:
         return None
     (prefix,) = components
@@ -1682,8 +1687,30 @@ def _build_fallback_config(
             sub_targets = collectable_tests
         else:
             sub_targets = []
+            if has_test_data:
+                # Same coverage gap the bare-pytest branch below already
+                # surfaces (task 1852): no collectable tests and no conftest
+                # to anchor a directory target, so this data-module change
+                # ships unvalidated.  Warn rather than silently skipping
+                # (amendment to task 2344).
+                _data_files = [
+                    f for f in py_files
+                    if _is_test_file(f) and not _is_collectable_test_file(f)
+                ]
+                logger.warning(
+                    '_build_fallback_config: test-tree data module(s) %s skipped '
+                    '— no tests will run for this change; configure a non-default '
+                    'test_command to validate data-module changes (task 1852)',
+                    _data_files,
+                )
+        # A conftest/collectable target that sits directly at the subproject
+        # root (e.g. 'cockpit/conftest.py') equals `sub` itself, not
+        # `sub + '/...'` — map it to '.' so the command becomes `cd cockpit &&
+        # uv run pytest .` rather than the invalid `pytest cockpit` (which
+        # pytest would resolve against cwd 'cockpit' as the nonexistent
+        # 'cockpit/cockpit').
         rel_targets = [
-            t[len(sub) + 1:] if t.startswith(sub + '/') else t
+            '.' if t == sub else (t[len(sub) + 1:] if t.startswith(sub + '/') else t)
             for t in sub_targets
         ]
         test_cmd = (
