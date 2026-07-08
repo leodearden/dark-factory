@@ -899,8 +899,16 @@ class MemoryService:
     async def _invalidate_stale_superseded_ttl_edges(
         self, result: Any, *, group_id: str
     ) -> int:
-        """Invalidate pre-existing stale priority-override/TTL edges left
+        """Invalidate pre-existing stale priority-override scalar edges left
         behind when Graphiti's upstream LLM edge-resolver under-invalidates.
+
+        Covers every fact shape recognized by ``_is_priority_override_scalar_fact``
+        — the TTL scalar (task 2319) and the reserve_now boolean scalar (task
+        2351, follow-up to 2319 via esc-2319-8) — since both are genuinely
+        single-valued-per-subject fields on the scheduler override model and
+        share the identical under-invalidation risk. The rest of this
+        docstring refers to "priority-override/TTL" for historical continuity
+        with task 2319, but every step applies equally to reserve_now facts.
 
         Mirror-image (under-invalidation direction) counterpart of
         ``_restore_falsely_superseded_sibling_edges`` (task 2111), which
@@ -921,7 +929,7 @@ class MemoryService:
 
         1. Scans *result* for the "authoritative fresh" set — valid
            (``invalid_at is None``) edges whose fact matches
-           ``_is_priority_override_ttl_fact``. If none, returns 0 without
+           ``_is_priority_override_scalar_fact``. If none, returns 0 without
            any graph query — this scopes the hook to fire only when the
            current episode actually wrote a priority-override/TTL fact.
         2. For each distinct SUBJECT (``source_node_uuid``) of an
@@ -942,7 +950,7 @@ class MemoryService:
            unnecessary. This is what enforces the docstring invariant that
            only *same-subject* single-valued scalars are superseded.
         3. Invalidates every returned edge that also matches
-           ``_is_priority_override_ttl_fact`` and is not itself one of the
+           ``_is_priority_override_scalar_fact`` and is not itself one of the
            authoritative-fresh edges: it is a same-subject, single-valued
            contradiction of the fact just written. The invalidation
            timestamp is computed PER SUBJECT — the newest ``valid_at`` among
@@ -1005,7 +1013,7 @@ class MemoryService:
         for edge in edges:
             if getattr(edge, 'invalid_at', None) is not None:
                 continue
-            if not _is_priority_override_ttl_fact(getattr(edge, 'fact', '') or ''):
+            if not _is_priority_override_scalar_fact(getattr(edge, 'fact', '') or ''):
                 continue
             edge_uuid = getattr(edge, 'uuid', '') or ''
             if edge_uuid:
@@ -1050,7 +1058,7 @@ class MemoryService:
                 candidate_uuid = candidate.get('uuid', '') or ''
                 if not candidate_uuid or candidate_uuid in keep_uuids:
                     continue
-                if not _is_priority_override_ttl_fact(candidate.get('fact', '') or ''):
+                if not _is_priority_override_scalar_fact(candidate.get('fact', '') or ''):
                     continue
                 if candidate_uuid in processed_uuids:
                     # Undirected per-node query: an edge shared between two
