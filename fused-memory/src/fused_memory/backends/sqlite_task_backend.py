@@ -21,7 +21,7 @@ from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daem
 from shared.task_metadata import SchemaWarning, apply_migrations, parse_metadata
 from shared.task_statuses import TaskStatus
 
-from fused_memory.backends.task_backend_errors import TaskmasterError
+from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError, TaskmasterError
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
     DependencyResult,
@@ -1244,62 +1244,92 @@ class SqliteTaskBackend:
         # raising; the key must never be the reason an insert fails.
         candidate_key = compute_candidate_key(title, _files_for_key(metadata))
 
-        async with self._write_lock(project_root), self._txn(project_root) as conn:
-            # High-water across BOTH live rows and the persisted counter, so a
-            # deleted top-level id is never reissued (see id_counters in the
-            # schema).  max(MAX(tasks.id), stored)+1 self-heals legacy DBs that
-            # predate the counter: the existing row high-water is honoured on
-            # the first post-upgrade alloc, then the counter holds the line.
-            cursor = await conn.execute(
-                """
-                SELECT MAX(highwater) FROM (
-                    SELECT COALESCE(MAX(id), 0) AS highwater FROM tasks
-                        WHERE tag = ?
-                    UNION ALL
-                    SELECT COALESCE(max_id, 0) AS highwater FROM id_counters
-                        WHERE tag = ?
-                )
-                """,
-                (tag, tag),
-            )
-            _max_row = await cursor.fetchone()
-            assert _max_row is not None  # aggregate MAX always returns one row
-            next_id = (_max_row[0] or 0) + 1
-            await self._validate_metadata_on_write(
-                metadata, project_root=project_root, tag=tag, task_id=next_id,
-            )
-            await conn.execute(
-                """
-                    INSERT INTO tasks (tag, id, title, description,
-                                       details, test_strategy, status, priority,
-                                       metadata, updated_at, candidate_key)
-                    VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+        try:
+            async with self._write_lock(project_root), self._txn(project_root) as conn:
+                # High-water across BOTH live rows and the persisted counter, so a
+                # deleted top-level id is never reissued (see id_counters in the
+                # schema).  max(MAX(tasks.id), stored)+1 self-heals legacy DBs that
+                # predate the counter: the existing row high-water is honoured on
+                # the first post-upgrade alloc, then the counter holds the line.
+                cursor = await conn.execute(
+                    """
+                    SELECT MAX(highwater) FROM (
+                        SELECT COALESCE(MAX(id), 0) AS highwater FROM tasks
+                            WHERE tag = ?
+                        UNION ALL
+                        SELECT COALESCE(max_id, 0) AS highwater FROM id_counters
+                            WHERE tag = ?
+                    )
                     """,
-                (
-                    tag, next_id, title,
-                    description or '', details or '',
-                    status, priority or 'medium', metadata, _now(),
-                    candidate_key,
-                ),
-            )
-            for dep in deps_list:
-                await conn.execute(
-                    'INSERT OR IGNORE INTO dependencies '
-                    '(tag, task_id, depends_on) VALUES (?, ?, ?)',
-                    (tag, next_id, dep),
+                    (tag, tag),
                 )
-            await conn.execute(
-                """
-                INSERT INTO id_counters (tag, max_id) VALUES (?, ?)
-                    ON CONFLICT(tag) DO UPDATE SET max_id = excluded.max_id
-                        WHERE excluded.max_id > id_counters.max_id
-                """,
-                (tag, next_id),
+                _max_row = await cursor.fetchone()
+                assert _max_row is not None  # aggregate MAX always returns one row
+                next_id = (_max_row[0] or 0) + 1
+                await self._validate_metadata_on_write(
+                    metadata, project_root=project_root, tag=tag, task_id=next_id,
+                )
+                await conn.execute(
+                    """
+                        INSERT INTO tasks (tag, id, title, description,
+                                           details, test_strategy, status, priority,
+                                           metadata, updated_at, candidate_key)
+                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                        """,
+                    (
+                        tag, next_id, title,
+                        description or '', details or '',
+                        status, priority or 'medium', metadata, _now(),
+                        candidate_key,
+                    ),
+                )
+                for dep in deps_list:
+                    await conn.execute(
+                        'INSERT OR IGNORE INTO dependencies '
+                        '(tag, task_id, depends_on) VALUES (?, ?, ?)',
+                        (tag, next_id, dep),
+                    )
+                await conn.execute(
+                    """
+                    INSERT INTO id_counters (tag, max_id) VALUES (?, ?)
+                        ON CONFLICT(tag) DO UPDATE SET max_id = excluded.max_id
+                            WHERE excluded.max_id > id_counters.max_id
+                    """,
+                    (tag, next_id),
+                )
+            return {
+                'id': str(next_id),
+                'message': f'Successfully added new task #{next_id}',
+            }
+        except sqlite3.IntegrityError as exc:
+            # Only the partial UNIQUE index on candidate_key is mapped to a
+            # typed collision — any other integrity violation (e.g. a PRIMARY
+            # KEY clash, which the id high-water allocation above should make
+            # unreachable) is unrelated and re-raised untouched. SQLite names
+            # the violated columns in the message ('UNIQUE constraint failed:
+            # tasks.tag, tasks.candidate_key'), and this is the only index
+            # that references candidate_key, so the substring check is
+            # unambiguous. A NULL candidate_key can never trip this index
+            # (the partial predicate excludes it), so it's checked first.
+            if candidate_key is None or 'candidate_key' not in str(exc):
+                raise
+            # `_txn` above has already rolled back the failed INSERT (zero
+            # orphan rows) by the time this except runs. Look up the
+            # surviving non-cancelled row with this (tag, candidate_key) on
+            # a fresh read over the same cached connection.
+            conn = await self._get_connection(project_root)
+            survivor_cursor = await conn.execute(
+                "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                (tag, candidate_key),
             )
-        return {
-            'id': str(next_id),
-            'message': f'Successfully added new task #{next_id}',
-        }
+            survivor = await survivor_cursor.fetchone()
+            raise DuplicateCandidateKeyError(
+                existing_id=survivor['id'] if survivor is not None else None,
+                existing_status=survivor['status'] if survivor is not None else None,
+                tag=tag,
+                candidate_key=candidate_key,
+            ) from exc
 
     async def update_task(
         self,
