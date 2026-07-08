@@ -2341,6 +2341,93 @@ async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     )
 
 
+@pytest.mark.asyncio
+async def test_v3_to_v4_self_gating_skips_index_and_escalates_on_residual_duplicates(
+    tmp_path, caplog,
+):
+    """When a residual non-cancelled duplicate candidate_key group is still
+    present at connection-open, the v3->v4 step must SKIP the index build,
+    leave user_version at 3, log a loud ERROR naming the group, and invoke
+    the injectable ``residual_dup_escalation_cb`` seam — all without raising
+    (connection-open migrations must be fail-safe).
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v1_schema_db_no_candidate_key(db_path)
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.ERROR, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Triggers connection-open (_SCHEMA_SQL + _migrate, chaining
+            # v1->v2->v3->v4).
+            await b.get_tasks(project_root=project_root)  # (a) must not raise
+    finally:
+        await b.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+    finally:
+        conn.close()
+
+    # (b) no index references candidate_key — the build was skipped.
+    assert not any('candidate_key' in idx for idx in indexes), (
+        f'No index should reference candidate_key on a residual-dup skip; got: {indexes}'
+    )
+    # (c) user_version stays at 3 — the skip does not stamp 4.
+    assert user_version == 3, (
+        f'Expected user_version to stay at 3 on residual-dup skip; got {user_version}'
+    )
+
+    expected_key = compute_candidate_key('Fix the bug', ['a.py', 'b.py'])
+
+    # (d) exactly one ERROR record naming the residual group via
+    # residual_group_count=, and it must NOT contain the v2->v3 audit's
+    # duplicate_groups= token — the two audits' log-scraping assertions must
+    # never collide.
+    error_records = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and 'residual_group_count=' in r.message
+    ]
+    assert len(error_records) == 1, (
+        f'Expected exactly one residual_group_count= ERROR record; got '
+        f'{len(error_records)}: {[r.message for r in error_records]}'
+    )
+    msg = error_records[0].message
+    assert re.search(r'\bresidual_group_count=1\b', msg), msg
+    assert 'duplicate_groups=' not in msg, (
+        f'v3->v4 ERROR message must not reuse the v2->v3 duplicate_groups= token; got: {msg!r}'
+    )
+    assert expected_key in msg, (
+        f'Expected the shared candidate_key in the ERROR message; got: {msg!r}'
+    )
+    assert 'ids=[1,2]' in msg, (
+        f'Expected the offending ids named in the ERROR message; got: {msg!r}'
+    )
+
+    # (e) the escalation stub was invoked once, naming the same group.
+    assert len(recorded) == 1, (
+        f'Expected exactly one escalation callback invocation; got {recorded}'
+    )
+    called_project_root, residual_groups = recorded[0]
+    assert called_project_root == project_root
+    assert residual_groups == [
+        {'tag': 'master', 'candidate_key': expected_key, 'task_ids': ['1', '2'], 'count': 2},
+    ], residual_groups
+
+
 # ── candidate_key collision (fm-task-dedup W8 task A2) ───────────────
 
 
