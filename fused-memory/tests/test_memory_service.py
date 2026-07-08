@@ -374,6 +374,83 @@ class TestAddMemory:
         )
 
 
+class TestAddSystemRecord:
+    """MemoryService.add_system_record — dedup-exempt, Mem0-only (task 2222 / W5-δ)."""
+
+    @pytest.mark.asyncio
+    async def test_calls_dedup_exempt_backend_method_not_general_add(self, service):
+        """Must go through mem0.add_system_record, never mem0.add."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'run_id': 'r1'},
+            causation_id='c1',
+        )
+
+        service.mem0.add_system_record.assert_awaited_once()
+        service.mem0.add.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stamps_category_into_backend_metadata(self, service):
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'run_id': 'r1'},
+            causation_id='c1',
+        )
+
+        call_kwargs = service.mem0.add_system_record.await_args.kwargs
+        assert call_kwargs['content'] == 'cycle summary'
+        assert call_kwargs['metadata']['category'] == 'observations_and_summaries'
+        # Caller-supplied metadata keys must survive alongside the stamped category.
+        assert call_kwargs['metadata']['kind'] == 'cycle_summary'
+        assert call_kwargs['metadata']['run_id'] == 'r1'
+        assert call_kwargs['scope'].project_id == 'dark_factory'
+        assert call_kwargs['scope'].agent_id == 'recon-stage-task_knowledge_sync'
+
+    @pytest.mark.asyncio
+    async def test_returns_mem0_only_add_memory_response(self, service):
+        """Response shape: memory_ids from mem0, stores_written=[mem0] only, category resolved."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        result = await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'run_id': 'r1'},
+            causation_id='c1',
+        )
+
+        assert result.memory_ids == ['sys-1']
+        assert result.stores_written == [SourceStore.mem0]
+        assert result.category == MemoryCategory.observations_and_summaries
+
+    @pytest.mark.asyncio
+    async def test_never_routes_to_graphiti(self, service):
+        """No Graphiti enqueue, regardless of category — Mem0-only by design."""
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'run_id': 'r1'},
+            causation_id='c1',
+        )
+
+        service.durable_queue.enqueue.assert_not_called()
+
+
 class TestAddEpisode:
     @pytest.mark.asyncio
     async def test_episode_enqueued(self, service):
