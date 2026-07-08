@@ -339,7 +339,27 @@ class InvokeSlot:
           ``release_probe_slot``.
         - Anything else (ZeroOutputWedge/CliLocalError/Failure) ->
           ``release_probe_slot`` only; no phase change.
+
+        Q4 stale-lease fail-safe: if ``lease`` no longer reflects the live
+        account state (``UsageGate.lease_is_current`` is False — a
+        concurrent sibling re-transitioned the same account since this
+        lease was taken), logs a warning and fires a ``lease_stale`` cost
+        event, then falls through and proceeds with the normal transition
+        + settle anyway (log-and-proceed, never raises). Safe because the
+        underlying ``_handle_*``/``confirm_account_ok`` handlers are
+        already idempotent and guarded against illegal transitions on a
+        raced account.
         """
+        if self.lease is not None and not self._gate.lease_is_current(self.lease):
+            logger.warning(
+                f'Account {self.account_name}: stale lease (generation '
+                f'drifted since claimed) — reporting {type(outcome).__name__} '
+                f'anyway (Q4 log-and-proceed fail-safe)',
+            )
+            self._gate._fire_cost_event(
+                self.account_name, 'lease_stale',
+                json.dumps({'outcome': type(outcome).__name__}),
+            )
         token = self.token
         try:
             if isinstance(outcome, OK):
