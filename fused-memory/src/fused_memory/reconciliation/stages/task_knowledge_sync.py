@@ -25,6 +25,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.models.scope import ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
