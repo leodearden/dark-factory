@@ -342,6 +342,12 @@ class ReconciliationHarness:
     # as a convenience instance attribute (harness.stages = harness._make_stages(scope))
     # to keep their harness.stages[N] access pattern — this annotation is what lets
     # pyright resolve that access.
+    #
+    # Known trade-off (task 2146 review follow-up): this couples dozens of test
+    # call sites to the private _make_stages signature via monkeypatching. A
+    # dedicated test factory/fixture (e.g. make_pinned_harness) that builds and
+    # pins stages would centralize that contract instead — deferred, since
+    # migrating those call sites spans files/ownership beyond a focused amendment.
     stages: list[Any]
 
     def __init__(
@@ -612,10 +618,13 @@ class ReconciliationHarness:
     def _propagate_escalation_queue(self, stages: Iterable[Any]) -> None:
         """Apply harness's escalation URL and queue to each stage in *stages*.
 
-        Shared by ``_make_stages`` (cold path: fresh stages each cycle) and
-        ``_start_escalation_server`` (hot path: stages pre-built in __init__).
-        Defensive: only assigns when the harness has a value, so cold-path
-        callers before escalation startup leave stages untouched.
+        Called from ``_make_stages`` once per cycle (task 2146 β — there is no
+        long-lived ``self.stages`` list to push into from
+        ``_start_escalation_server`` anymore; escalation startup only stores
+        ``self._escalation_url``/``self._escalation_queue`` for the next
+        ``_make_stages`` call to pick up). Defensive: only assigns when the
+        harness has a value, so calls before escalation startup leave stages
+        untouched.
 
         Single-pass over *stages* so single-pass iterables (generators, ``iter(...)``)
         work correctly — the prior two-pass form would silently skip the queue
