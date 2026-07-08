@@ -2952,6 +2952,58 @@ def create_mcp_server(
             return {'error': str(e), 'error_type': type(e).__name__}
 
     @mcp.tool()
+    async def set_task_claimant(
+        id: str,
+        project_root: str,
+        tag: str | None = None,
+        claimant_run_id: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
+    ) -> dict[str, Any]:
+        """Stamp/refresh/clear claimant_run_id/heartbeat_at without touching status.
+
+        Thin pass-through to ``interceptor.set_task_claimant`` (task 2188, PRD
+        task-status-authority C4/D4): no status-FSM gate, no event emission,
+        no reconciliation. This is the orchestrator's status-untouching
+        counterpart to ``set_task_status`` — used for the periodic heartbeat
+        refresh and for clearing the claimant at task release, where a
+        repeated/terminal ``set_task_status`` write would be unsafe or
+        rejected.
+
+        Args:
+            id: Task ID
+            project_root: Absolute path to project root
+            tag: Tag context (optional)
+            claimant_run_id: Orchestrator claimant identity. Omit (default) to
+                leave the column untouched (e.g. a heartbeat-only refresh);
+                pass ``null`` explicitly to clear it (release).
+            heartbeat_at: Companion liveness timestamp for claimant_run_id,
+                same tri-state contract (omit = untouched, null = clear).
+        """
+        if err := _reject_if_ticket_id('id', id):
+            return err
+        _normalized = _normalize_project_root(project_root)
+        if isinstance(_normalized, dict):
+            return _normalized
+        project_root = _normalized
+        claimant_kwargs: dict[str, Any] = {}
+        if claimant_run_id is not _CLAIMANT_WIRE_UNSET:
+            claimant_kwargs['claimant_run_id'] = claimant_run_id
+        if heartbeat_at is not _CLAIMANT_WIRE_UNSET:
+            claimant_kwargs['heartbeat_at'] = heartbeat_at
+        try:
+            return await task_interceptor.set_task_claimant(
+                task_id=id,
+                project_root=project_root,
+                tag=tag,
+                **claimant_kwargs,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.exception(f'set_task_claimant error: {e}')
+            return {'error': str(e), 'error_type': type(e).__name__}
+
+    @mcp.tool()
     @mcp_tool_errors()
     async def submit_task(
         project_root: str,
