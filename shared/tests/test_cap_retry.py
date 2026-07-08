@@ -2417,14 +2417,16 @@ class TestVestigialParamsRemoved:
 
     RED until step-2 removes max_cap_retries / cap_retry_deadline_secs from the
     invoke_with_cap_retry signature and deletes the corresponding module constants.
-    """
 
-    def test_signature_has_no_max_cap_retries(self):
-        """invoke_with_cap_retry must NOT have a max_cap_retries parameter."""
-        params = inspect.signature(invoke_with_cap_retry).parameters
-        assert 'max_cap_retries' not in params, (
-            'max_cap_retries is vestigial (task-1401): remove it from the signature'
-        )
+    task-1401's ``max_cap_retries`` was vestigial because it was never wired
+    into the heuristic cap-hit branch (only the exact-detect branch honoured
+    it) — a count bound that silently didn't apply uniformly. Task 2136
+    (W4-zeta) reintroduces a parameter with the same name but wires it into
+    the shared ``_check_cap_wait`` choke point that BOTH cap branches call,
+    fixing the original defect rather than resurrecting it — see
+    TestCapRetryMaxCapRetries. Only the signature guard below is retired;
+    the deadline_secs / constant-importability guards still hold.
+    """
 
     def test_signature_has_no_cap_retry_deadline_secs(self):
         """invoke_with_cap_retry must NOT have a cap_retry_deadline_secs parameter."""

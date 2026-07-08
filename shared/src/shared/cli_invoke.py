@@ -669,6 +669,7 @@ async def invoke_with_cap_retry(
     project_id: str = '',
     role: str = '',
     cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
+    max_cap_retries: int | None = None,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     **invoke_kwargs,
@@ -690,6 +691,13 @@ async def invoke_with_cap_retry(
     ``AllAccountsCappedException`` is raised so the caller can escalate.
     Defaults to 14 days (``_DEFAULT_CAP_WAIT_SANITY_SECS``).  Pass ``None``
     to wait indefinitely.
+
+    *max_cap_retries* is an optional count-based sibling of
+    *cap_wait_sanity_secs*: when the number of consecutive cap hits reaches
+    this value, ``AllAccountsCappedException`` is raised (same exception as
+    the time-based bound) before the next cooldown sleep.  Defaults to
+    ``None``, which preserves the existing patient, count-unbounded wait —
+    only *cap_wait_sanity_secs* bounds the retry loop.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
@@ -725,12 +733,22 @@ async def invoke_with_cap_retry(
     def _check_cap_wait(now: float, elapsed: float, cooldown: float, hits: int) -> None:
         """Guard and throttled log for cap-wait iterations.
 
-        Raises AllAccountsCappedException when the 14-day sanity bound is exceeded.
+        Raises AllAccountsCappedException when the 14-day sanity bound is exceeded,
+        or when the count-based max_cap_retries bound is reached.
         Emits a structured 'cap_wait' JSON log at most once per _CAP_WAIT_LOG_INTERVAL_SECS.
-        Closes over: cap_wait_sanity_secs, label, num_accounts, usage_gate,
-        last_cap_wait_log_at (nonlocal write).
+        Closes over: cap_wait_sanity_secs, max_cap_retries, label, num_accounts,
+        usage_gate, last_cap_wait_log_at (nonlocal write).
         """
         nonlocal last_cap_wait_log_at
+        if max_cap_retries is not None and hits >= max_cap_retries:
+            logger.error(
+                f'{label}: max cap-retries bound ({max_cap_retries}) reached after {hits} retries',
+            )
+            raise AllAccountsCappedException(
+                retries=hits,
+                elapsed_secs=elapsed,
+                label=label,
+            )
         if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
             logger.error(
                 f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
