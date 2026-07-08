@@ -422,10 +422,37 @@ class UsageGate:
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
         self._shutting_down: bool = False
 
-        self._probe_config_dir = TaskConfigDir('usage-gate-probe')
         self._accounts: list[AccountState] = self._init_accounts()
+        # Per-(account, pid) probe config dirs (PRD §6 task θ, finding 5):
+        # concurrent probes across the ~6-process fleet, and the SIGHUP
+        # parallel all-account probe gather within one process, must not
+        # share a single .credentials.json. pid disambiguates cross-process
+        # same-account probes; acct.name disambiguates same-process
+        # cross-account probes.
+        self._probe_config_dirs: dict[str, TaskConfigDir] = {
+            acct.name: TaskConfigDir(f'usage-gate-probe-{acct.name}-{os.getpid()}')
+            for acct in self._accounts
+        }
+        # Back-compat alias: several sibling test suites (test_probe_loop.py,
+        # test_usage_gate_exhaustive.py, orchestrator/tests/_orch_helpers.py)
+        # monkeypatch/assert against a single gate._probe_config_dir. In the
+        # common single-account case this is the same object as the sole
+        # dict entry, so those assertions keep holding.
+        self._probe_config_dir = next(
+            iter(self._probe_config_dirs.values()), None
+        ) or TaskConfigDir(f'usage-gate-probe-{os.getpid()}')
         self._sighup_handler_installed: bool = False
         self.register_signal_handlers()
+
+    def _config_dir_for(self, acct: AccountState) -> TaskConfigDir:
+        """Return the per-account probe config dir for ``acct``.
+
+        Falls back to the back-compat ``_probe_config_dir`` alias (mirroring
+        the file's ``getattr(self, '_shutting_down', False)`` defensive-read
+        idiom) so ``__new__``-built test fixtures that set only the alias
+        still work.
+        """
+        return getattr(self, '_probe_config_dirs', {}).get(acct.name) or self._probe_config_dir
 
     def _init_accounts(self) -> list[AccountState]:
         """Resolve account tokens from env vars.
