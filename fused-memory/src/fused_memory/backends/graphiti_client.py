@@ -2,7 +2,9 @@
 
 import asyncio
 import contextlib
+import functools
 import importlib.util
+import inspect
 import logging
 import re
 import uuid
@@ -27,6 +29,7 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
+from fused_memory.utils.validation import canonicalize_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +117,63 @@ def check_openai_responses_api() -> None:
         "and restart the service to install a compatible openai version. "
         "(task 2053)"
     )
+
+
+def _canonicalize_group_args(func):
+    """Canonicalize bound ``group_id``/``group_ids`` arguments at method entry.
+
+    PRD seam S4 (task γ, plans/cross-graph-entity-leak-prd.md): every public
+    GraphitiBackend method taking a project group_id/group_ids must
+    canonicalize those ARGUMENTS via α's ``canonicalize_project_id`` before
+    the method body runs, so the FalkorDB graph KEY (``_driver_for`` /
+    ``_graph_for``), the node/edge ``group_id`` PROPERTY (graphiti_core's
+    ``client.add_episode``), and any direct-Cypher ``$group_id`` FILTER
+    always agree (RCA §4).
+
+    Computes ``inspect.signature(func)`` once at decoration time. On each
+    call, binds the actual args/kwargs and:
+
+    - if a ``group_id`` argument is bound and is a ``str``, replaces it with
+      ``canonicalize_project_id(group_id)``;
+    - if a ``group_ids`` argument is bound and is not ``None``, replaces it
+      with ``[canonicalize_project_id(g) for g in group_ids]`` (each element
+      canonicalized independently; ``None`` — meaning global/no-scope —
+      passes through untouched).
+
+    Method BODIES are never touched by this decorator — it only normalizes
+    the two argument names above, before delegating to *func* unchanged.
+    Handles both async callables (every DB-facing method) and the one sync
+    accessor, ``_identity_lock_for``, via ``inspect.iscoroutinefunction``.
+    """
+    sig = inspect.signature(func)
+
+    def _canonicalize_bound(bound: inspect.BoundArguments) -> None:
+        if 'group_id' in bound.arguments:
+            value = bound.arguments['group_id']
+            if isinstance(value, str):
+                bound.arguments['group_id'] = canonicalize_project_id(value)
+        if 'group_ids' in bound.arguments:
+            value = bound.arguments['group_ids']
+            if value is not None:
+                bound.arguments['group_ids'] = [canonicalize_project_id(g) for g in value]
+
+    if inspect.iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            bound = sig.bind(*args, **kwargs)
+            _canonicalize_bound(bound)
+            return await func(*bound.args, **bound.kwargs)
+
+        return async_wrapper
+
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs):
+        bound = sig.bind(*args, **kwargs)
+        _canonicalize_bound(bound)
+        return func(*bound.args, **bound.kwargs)
+
+    return sync_wrapper
 
 
 class EdgeDict(TypedDict):
@@ -1436,6 +1496,7 @@ class GraphitiBackend:
             )
         return rows[0][0]
 
+    @_canonicalize_group_args
     async def get_nodes_by_exact_name(self, name: str, *, group_id: str) -> list[dict]:
         """Resolve an entity name to full node data via an exact, case-sensitive Cypher match.
 
@@ -1479,6 +1540,7 @@ class GraphitiBackend:
             for row in (result.result_set or [])
         ]
 
+    @_canonicalize_group_args
     async def find_duplicate_entity_nodes(self, name: str, *, group_id: str) -> list[dict]:
         """Return every Entity node sharing an exact name, canonical-ordered.
 
