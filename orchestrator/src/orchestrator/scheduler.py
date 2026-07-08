@@ -12,7 +12,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -2965,6 +2965,79 @@ class Scheduler:
         """
         metadata = task.get('metadata') or {}
         return bool(metadata.get('deferred_watch')) and not metadata.get('trigger_met')
+
+    def _milestone_time_gated(self, task: dict, now_wall: datetime) -> bool:
+        """Return True when *task* must be withheld from dispatch by its
+        ``metadata.milestone`` time gate (task 2335 β).
+
+        Pure predicate — sibling to :meth:`_deferred_watch_gated`.  Reads the
+        RAW ``metadata.milestone`` dict directly, NOT the heavier
+        :func:`~shared.task_metadata.parse_metadata` pipeline used by
+        :func:`_task_external_deps`: the α ``Milestone`` model-validator and
+        δ's submit guard already validate at write time, so this gate is
+        defense-in-depth, not the primary validation path.
+
+        Modes (``metadata.milestone['mode']``):
+        - ``'dated'``: withhold while ``now_wall < milestone['at']``.
+        - ``'delayed'``: withhold while
+          ``metadata.milestone_deps_satisfied_at`` is unset, OR while
+          ``now_wall < anchor + after_secs``.  The anchor is stamped once,
+          frozen-once, by :meth:`_stamp_milestone_deps_satisfied`.
+
+        No ``metadata.milestone`` (missing/falsy) → not gated (``False``).
+        Any malformed or unrecognised value — a non-dict milestone, an
+        unknown mode, an unparseable ``at``/anchor timestamp, or an
+        ``after_secs`` that can't combine with a timestamp — fails safe:
+        withhold (``True``) plus a WARNING log, rather than crash the
+        dispatch tick or let a broken milestone spec dispatch early.
+
+        ``at``/anchor timestamps that parse as tz-naive are normalized to
+        UTC (``.replace(tzinfo=UTC)``): the α model only requires
+        ``datetime.fromisoformat``-parseable, not tz-aware, but comparing a
+        tz-naive and tz-aware datetime directly raises ``TypeError`` — left
+        unhandled that would otherwise fall into the fail-safe branch and
+        withhold the task forever.
+        """
+        metadata = task.get('metadata') or {}
+        milestone = metadata.get('milestone')
+        if not milestone:
+            return False
+        if not isinstance(milestone, dict):
+            logger.warning(
+                'Task %s: metadata.milestone is not a dict (%r) — fail-safe withhold',
+                task.get('id', '?'), milestone,
+            )
+            return True
+
+        mode = milestone.get('mode')
+        try:
+            if mode == 'dated':
+                at_dt = datetime.fromisoformat(milestone.get('at'))
+                if at_dt.tzinfo is None:
+                    at_dt = at_dt.replace(tzinfo=UTC)
+                return now_wall < at_dt
+            elif mode == 'delayed':
+                anchor_raw = metadata.get('milestone_deps_satisfied_at')
+                if not anchor_raw:
+                    return True
+                anchor_dt = datetime.fromisoformat(anchor_raw)
+                if anchor_dt.tzinfo is None:
+                    anchor_dt = anchor_dt.replace(tzinfo=UTC)
+                fire_at = anchor_dt + timedelta(seconds=milestone.get('after_secs'))
+                return now_wall < fire_at
+            else:
+                logger.warning(
+                    'Task %s: metadata.milestone has unknown mode %r — fail-safe withhold',
+                    task.get('id', '?'), mode,
+                )
+                return True
+        except Exception:
+            logger.warning(
+                'Task %s: malformed metadata.milestone %r — fail-safe withhold',
+                task.get('id', '?'), milestone,
+                exc_info=True,
+            )
+            return True
 
     def _eligible_for_dispatch(
         self,
