@@ -5454,79 +5454,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Single source of truth for the ``inflight_speculative`` term shared
         by :meth:`snapshot`'s ``'speculation'`` key and
-        :meth:`speculation_accounting_violations`. From the instant a
-        speculative item's permit transfers to the verifier
-        (``SpeculationController.on_transfer``/``on_transfer_terminal``, at
-        the ``_verifier_queue.put()`` call site) until the permit is
-        released, the item must be counted from exactly one of these
-        locations — the same CPython internal-deque read ``snapshot()``
-        already performs elsewhere (synchronous, no await, no lock; safe
-        under asyncio's single-loop model):
+        :meth:`speculation_accounting_violations`.
 
-          * ``self._inflight``      — entries with ``was_speculative`` (task θ/1993).
-          * ``self._verifier_queue`` — items with ``.speculative`` (task θ/1993).
-          * ``self._redispatch``    — items with ``.speculative`` (task 2063): a
-            speculative item parked here, still holding its permit, when
-            ``_dispatch_item`` returns ``None`` because ``free_host_count()
-            == 0`` (verify hosts < speculation_depth) — awaiting a host, not
-            abandoned. Omitting this deque undercounts by one for the whole
-            multi-heartbeat window the item spends parked.
-          * ``self._finalizing_head`` — ``was_speculative`` (task 2096): set at
-            the top of ``_finalize_inflight`` and held for the ENTIRE
-            ``await entry.verify_task`` — i.e. the full verify duration
-            (20-60 min observed on reify), *not* the "single-tick,
-            sub-heartbeat transient" task 2063 originally characterized this
-            window as. Before this term was added, a speculative head's
-            permit was invisible to this count for that whole duration,
-            producing a spurious ``speculation-slot conservation violated``
-            audit finding for the entire verify (confirmed via the reify
-            esc-__merge_resource_leak__-23/-24 incidents) — the dominant,
-            longest-lived instance of the under-count class task 2063 first
-            fixed the shorter ``_redispatch``-parked case of.
-          * ``self._dispatching_item`` — ``.speculative`` (task 2096): set in
-            ``_verifier_loop``'s DISPATCH-FILL immediately before ``await
-            self._dispatch_item(item)`` and cleared in a bulletproof
-            ``finally``. Covers the "dispatch-gap": the item is off
-            ``_redispatch``/``_verifier_queue`` but not yet appended to
-            ``self._inflight`` during that await (host-acquisition git
-            calls, in-dispatch speculative-remerge). A speculative item's
-            ``.speculative`` is stable across this await (Mechanism 2's
-            chain-remerge is skipped for speculative items), so the gap is
-            safely countable. This is census-only: unlike
-            ``_finalizing_head``/``_remerging_item``, ``_dispatching_item``
-            is NOT surfaced in ``snapshot()``'s ``'entries'`` section —
-            that observability parity is task 2068's scope.
-
-        With all five locations covered, every point from permit-transfer
-        (``on_transfer``/``on_transfer_terminal``) to the verifier-side
-        release is accounted for — no uncounted location remains.
+        Task 2160 (η): conservation is now structural rather than location-
+        audited. Every permit transfer (``SpeculationController.on_transfer``/
+        ``on_transfer_terminal``) stamps the detached :class:`SpecPermit`
+        token onto the pipeline item/entry's ``.permit`` field, and every
+        verifier-side release routes through
+        ``self._speculation_ledger.release(permit)``. So
+        ``self._speculation_ledger.live`` already contains exactly the set of
+        not-yet-released permits — both the one the merger currently holds
+        (``held_by_merger``) and the ones transferred to the verifier (this
+        method's return value). Subtracting the merger's own held permit from
+        ``len(live)`` yields the verifier-owned count directly, independent
+        of which of ``self._inflight``/``self._verifier_queue``/
+        ``self._redispatch``/``self._finalizing_head``/
+        ``self._dispatching_item`` the item currently sits in — the
+        five-location scan those fields used to require (tasks 2063/2096) is
+        no longer needed; the fields themselves remain for other consumers
+        (snapshot's ``'entries'`` section, dispatch/remerge logic).
         """
         return (
-            sum(1 for _ie in self._inflight if _ie.was_speculative)
-            + sum(
-                1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
-                if _item is not None and _item.speculative
-            )
-            + sum(
-                # Unlike the _verifier_queue._queue scan above (which can
-                # hold a real ``None`` stop-sentinel), _redispatch never
-                # holds None — both parking sites only ever append a
-                # RealMergeItem. The `is not None` guard here is kept solely
-                # for scan-shape parity with that comprehension, not because
-                # _redispatch has a None case to handle.
-                1 for _item in self._redispatch
-                if _item is not None and _item.speculative
-            )
-            + (
-                1 if self._finalizing_head is not None
-                and self._finalizing_head.was_speculative
-                else 0
-            )
-            + (
-                1 if self._dispatching_item is not None
-                and self._dispatching_item.speculative
-                else 0
-            )
+            len(self._speculation_ledger.live)
+            - self._speculation_controller.held_by_merger
         )
 
     def _inflight_cap_count(self) -> int:
@@ -5550,11 +5500,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Empty list → both conservation identities hold. Checks:
 
-          (a) speculation-slot identity: ``slot_available + held_by_merger +
-              inflight_speculative == depth`` — the permit-conservation
-              identity task theta/1993 built ``SpeculationController`` to
-              make computable (its ``held_by_merger`` docstring names this
-              task explicitly).
+          (a) speculation-slot identity: ``slot_available + len(ledger.live)
+              == depth`` (task 2160/η, PRD DD6) — the ledger-derived
+              collapse of the permit-conservation identity task theta/1993
+              built ``SpeculationController`` to make computable. Equivalent
+              to the decomposed ``slot_available + held_by_merger +
+              inflight_speculative == depth`` form (still exposed via
+              :meth:`snapshot`'s ``'speculation'`` key for callers that want
+              the merger/verifier split) since ``len(ledger.live) ==
+              held_by_merger + inflight_speculative`` once every permit
+              release routes through the ledger.
           (b) merge-ahead-cap identity: ``merge_ahead_cap._value +
               inflight_cap_count == depth`` — the Mechanism-1 cap analogue.
 
@@ -5567,9 +5522,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         check has its own try/except so an unexpected exception in one never
         suppresses the other, and is surfaced as a violation string rather
         than raised — mirrors :meth:`two_layer_invariants`'s idiom. Reads
-        ``self._speculation_controller.snapshot()`` and the two helpers
-        above; deliberately does NOT call ``self.snapshot()`` (that would
-        recurse via the ``resource_audit`` key).
+        ``self._speculation_ledger``/``self._speculation_controller.snapshot()``
+        and the cap helper below; deliberately does NOT call ``self.snapshot()``
+        (that would recurse via the ``resource_audit`` key).
         """
         if not self._running:
             return []
@@ -5581,15 +5536,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             spec = self._speculation_controller.snapshot()
             depth = spec['depth']
             slot_available = spec['slot_available']
-            held_by_merger = spec['held_by_merger']
-            inflight_speculative = self._inflight_speculative_count()
-            total = slot_available + held_by_merger + inflight_speculative
+            live_permits = len(self._speculation_ledger.live)
+            total = slot_available + live_permits
             if total != depth:
                 violations.append(
                     f'speculation-slot conservation violated: slot_available'
-                    f'({slot_available}) + held_by_merger({held_by_merger}) + '
-                    f'inflight_speculative({inflight_speculative}) == {total}, '
-                    f'expected depth={depth}'
+                    f'({slot_available}) + live_permits({live_permits}) == '
+                    f'{total}, expected depth={depth}'
                 )
         except Exception as exc:  # pragma: no cover — defensive
             violations.append(
@@ -6261,17 +6214,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # θ=1993 additive key: merger-side speculation state (from
             # self._speculation_controller.snapshot()) plus
             # inflight_speculative — the count of speculative items now owned
-            # by the verifier (self._inflight entries with was_speculative +
-            # self._verifier_queue items with .speculative + self._redispatch
-            # items with .speculative — task 2063's fix for the parked-item
-            # under-count + self._finalizing_head was_speculative — task
-            # 2096's fix for the verify-duration finalize-head under-count;
-            # same CPython internal-deque read as the 'entries' section
-            # above). Together these make the permit-conservation identity
-            # slot_available + held_by_merger + inflight_speculative == depth
-            # fully computable from snapshot() (task iota's conservation
-            # audit). Pure synchronous read — no await, no git calls. No
-            # collision with existing keys.
+            # by the verifier. Task 2160 (η): derived structurally as
+            # len(self._speculation_ledger.live) - held_by_merger rather than
+            # scanning self._inflight/self._verifier_queue/self._redispatch/
+            # self._finalizing_head/self._dispatching_item (tasks 2063/2096's
+            # historical location-scanning fixes — see
+            # _inflight_speculative_count's docstring). Together these make
+            # the permit-conservation identity slot_available + held_by_merger
+            # + inflight_speculative == depth fully computable from
+            # snapshot() (task iota's conservation audit). Pure synchronous
+            # read — no await, no git calls. No collision with existing keys.
             'speculation': {
                 **self._speculation_controller.snapshot(),
                 'inflight_speculative': self._inflight_speculative_count(),

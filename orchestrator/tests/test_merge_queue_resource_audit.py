@@ -135,7 +135,10 @@ class TestSpeculationAccountingViolations:
     """Unit tests for SpeculativeMergeWorker.speculation_accounting_violations().
 
     Covers the I4 permit/cap conservation identities:
-      (a) slot_available + held_by_merger + inflight_speculative == depth
+      (a) slot_available + len(speculation_ledger.live) == depth (task
+          2160/η, PRD DD6 — collapses the merger/verifier-decomposed
+          slot_available + held_by_merger + inflight_speculative == depth
+          form still exposed via snapshot()['speculation'])
       (b) merge_ahead_cap._value + inflight_cap_count == depth
 
     RED until step-2 GREEN adds the method to merge_queue.py.
