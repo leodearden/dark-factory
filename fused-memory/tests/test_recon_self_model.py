@@ -161,3 +161,25 @@ class TestFingerprintIdentityFields:
         no task anchor exists."""
         assert 'description' in m.FINGERPRINT_IDENTITY_FIELDS
         assert 'flag_type' in m.FINGERPRINT_IDENTITY_FIELDS
+
+
+# --------------------------------------------------------------------------- #
+# render_marker_lifecycle_section (step-7/8)
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderMarkerLifecycleSection:
+    """render_marker_lifecycle_section() renders the marker-lifecycle /
+    run_id-fresh-per-cycle prose faithful to stage1.py:562-592."""
+
+    def test_returns_non_empty_str(self):
+        assert isinstance(m.render_marker_lifecycle_section(), str)
+        assert m.render_marker_lifecycle_section()
+
+    def test_contains_load_bearing_invariant_tokens(self):
+        text = m.render_marker_lifecycle_section()
+        assert 'run_id' in text
+        assert 'single-cycle' in text or 'single cycle' in text
+        assert 'swept' in text
+        assert 'stage1_flag_marker' in text
+        assert 'flag_for_stage2' in text
