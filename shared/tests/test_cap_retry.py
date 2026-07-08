@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
@@ -27,7 +28,23 @@ from shared.cli_invoke import (
     invoke_with_cap_retry,
 )
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import SessionBudgetExhausted, UsageGate
+from shared.invocation_outcome import (
+    OK,
+    AuthFailed,
+    CapHit,
+    CliLocalError,
+    Failure,
+    NearCap,
+    ZeroOutputWedge,
+)
+from shared.usage_gate import (
+    AccountLease,
+    AccountPhase,
+    AccountState,
+    InvokeSlot,
+    SessionBudgetExhausted,
+    UsageGate,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2383,3 +2400,106 @@ class TestVestigialParamsRemoved:
         """_DEFAULT_CAP_RETRY_DEADLINE_SECS must NOT be importable from shared.cli_invoke."""
         with pytest.raises(ImportError):
             from shared.cli_invoke import _DEFAULT_CAP_RETRY_DEADLINE_SECS  # type: ignore[attr-defined]  # noqa: PLC0415, F401, I001
+
+
+# ===================================================================
+# TestInvokeSlotReport  (task W4-ε, PRD §7.4, step 1)
+# ===================================================================
+
+
+def _make_probe_in_flight_slot(gate: UsageGate) -> tuple[AccountState, InvokeSlot]:
+    """Put gate's sole account into PROBE_IN_FLIGHT and wrap it in a real InvokeSlot.
+
+    Mirrors the state before_invoke() leaves an account in after claiming a
+    probe slot (PROBING -> PROBE_IN_FLIGHT) — the precondition InvokeSlot.report()
+    runs under in production. Every report() outcome maps to a legal edge from
+    PROBE_IN_FLIGHT (_LEGAL_TRANSITIONS[PROBE_IN_FLIGHT] == {AVAILABLE, CAPPED,
+    AUTH_FAILED}), so a single starting phase exercises every variant.
+    """
+    acct = gate._accounts[0]
+    acct.probe_in_flight = True
+    lease = AccountLease(name=acct.name, token=acct.token, generation=acct.generation)
+    return acct, InvokeSlot(gate, lease)
+
+
+class TestInvokeSlotReport:
+    """InvokeSlot.report(outcome) applies the matching gate transition AND
+    settles the slot, atomically, for every InvocationOutcome variant — the
+    B6 'settled iff gate informed' invariant (PRD §7.4, task W4-ε).
+    """
+
+    def test_ok_confirms_account_and_settles(self):
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+        acct.near_cap = True
+
+        slot.report(OK())
+
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.near_cap is False
+        assert slot._settled is True
+
+    def test_cap_hit_transitions_to_capped_and_settles(self):
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+        resets_at = datetime(2026, 7, 8, 12, 0, tzinfo=UTC)
+
+        slot.report(CapHit(resets_at=resets_at, reason='cap hit reason'))
+
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.resets_at == resets_at
+        assert slot._settled is True
+
+    def test_auth_failed_transitions_to_auth_failed_and_settles(self):
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+
+        slot.report(AuthFailed(status=403))
+
+        assert acct.phase == AccountPhase.AUTH_FAILED
+        assert slot._settled is True
+
+    def test_near_cap_annotates_releases_probe_and_settles(self):
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+
+        slot.report(NearCap(reason="You're close to your usage limit"))
+
+        assert acct.near_cap is True
+        # NearCap is an annotation, not a block — the probe claim must still
+        # be released rather than left wedged at PROBE_IN_FLIGHT.
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert slot._settled is True
+
+    def test_failure_releases_probe_without_phase_change_and_settles(self):
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+
+        slot.report(Failure(kind='unclassified'))
+
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.capped is False
+        assert acct.auth_failed is False
+        assert slot._settled is True
+
+    def test_zero_output_wedge_releases_probe_without_phase_change_and_settles(self):
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+
+        slot.report(ZeroOutputWedge())
+
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.capped is False
+        assert acct.auth_failed is False
+        assert slot._settled is True
+
+    def test_cli_local_error_releases_probe_without_phase_change_and_settles(self):
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+
+        slot.report(CliLocalError(marker='unrecognized arguments'))
+
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.capped is False
+        assert acct.auth_failed is False
+        assert slot._settled is True
