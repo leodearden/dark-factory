@@ -572,6 +572,7 @@ class GraphitiBackend:
             timeout=self._write_timeout,
         )
 
+    @_canonicalize_group_args
     async def search(
         self,
         query: str,
@@ -598,6 +599,7 @@ class GraphitiBackend:
             logger.warning(f'Graphiti search timed out after {self._read_timeout}s')
             return []
 
+    @_canonicalize_group_args
     async def search_nodes(
         self,
         query: str,
@@ -625,6 +627,7 @@ class GraphitiBackend:
             logger.warning(f'Graphiti search_nodes timed out after {self._read_timeout}s')
             return []
 
+    @_canonicalize_group_args
     async def retrieve_episodes(
         self,
         group_ids: list[str],
@@ -792,6 +795,7 @@ class GraphitiBackend:
             'refreshed_nodes': refreshed,
         }
 
+    @_canonicalize_group_args
     async def build_communities(self, group_ids: list[str] | None = None) -> None:
         """Build community summaries.
 
