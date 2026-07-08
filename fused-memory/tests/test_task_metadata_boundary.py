@@ -77,3 +77,48 @@ def _schema_warning_messages(caplog) -> list[str]:
         and r.name == 'fused_memory.backends.sqlite_task_backend'
         and 'task_metadata.schema_warning' in r.message
     ]
+
+
+# ── Row 1 — producer/legacy-read (I1 round-trip) ─────────────────────
+
+
+def test_legacy_blob_roundtrip_preserves_unknown_keys_and_upgrades_memory_hints():
+    """A v0-shaped legacy blob upgrades memory_hints and never silently drops keys.
+
+    No ``schema_version`` key (a legacy row) carrying a legacy list-shaped
+    ``memory_hints``, an unknown non-namespaced key, and an ``x_``-prefixed
+    key. ``parse_metadata(direction='read')`` is the single legacy-read seam
+    both fused-memory and the orchestrator use — I1 requires every unknown
+    key survive the round-trip, and the v0->v1 migration upgrades the legacy
+    list shape to the canonical ``{entities, queries}`` dict.
+    """
+    blob = {
+        'memory_hints': [
+            {'entity': 'E1', 'query': 'Q1'},
+            {'entity': 'E2', 'query': 'Q2'},
+        ],
+        'legacy_only_key': 'v',
+        'x_private': {'a': 1},
+    }
+
+    # apply_migrations is the standalone migration seam parse_metadata calls
+    # internally — exercised directly here as well as end-to-end below.
+    migrated = apply_migrations(blob)
+    assert migrated['memory_hints'] == {'entities': ['E1', 'E2'], 'queries': ['Q1', 'Q2']}
+
+    model, warnings = parse_metadata(blob, direction='read')
+    assert isinstance(model, TaskMetadata)
+    dumped = model.model_dump()
+
+    # (a) Unknown keys survive byte-for-value (I1 — extra='allow', no silent drop).
+    assert dumped['legacy_only_key'] == 'v'
+    assert dumped['x_private'] == {'a': 1}
+
+    # (b) Legacy list memory_hints upgraded to the canonical {entities, queries} shape.
+    assert dumped['memory_hints'] == {'entities': ['E1', 'E2'], 'queries': ['Q1', 'Q2']}
+    assert model.memory_hints == MemoryHints(entities=['E1', 'E2'], queries=['Q1', 'Q2'])
+
+    # (c) 'legacy_only_key' is warned as unknown; 'x_private' (x_-namespaced) is not.
+    unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+    assert 'legacy_only_key' in unknown_key_fields
+    assert 'x_private' not in unknown_key_fields
