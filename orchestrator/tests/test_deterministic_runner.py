@@ -107,6 +107,49 @@ def _deploy_task(
     }
 
 
+def _predicate_task(
+    task_id: str = '700',
+    title: str = 'Milestone predicate check',
+    description: str = 'Predicate that verifies the milestone invariant',
+    script: str = '/tmp/test-predicate.sh',
+    args: list | None = None,
+    env: dict | None = None,
+    cwd: str = '/tmp',
+    timeout_secs: int | float = 30,
+    gate_escalated_at: str | None = None,
+) -> dict:
+    """Build a deterministic PREDICATE task dict (before_done.kind='predicate', γ-predicate).
+
+    A predicate is a READ-ONLY exit-code verdict check — never a systemd
+    deploy — so ``target_unit`` is always None (mirrors ``_deploy_task``'s
+    shape, minus the unit to deploy against).  ``gate_escalated_at``, when
+    given, seeds ``metadata['gate_escalated_at']`` for the resume/quiescence
+    tests (mirrors ``_gate_task``'s same-named parameter).
+    """
+    before_done: dict = {
+        'script': script,
+        'args': args if args is not None else [],
+        'env': env if env is not None else {},
+        'cwd': cwd,
+        'timeout_secs': timeout_secs,
+        'target_unit': None,
+        'kind': 'predicate',
+    }
+    metadata: dict = {
+        'task_kind': 'deterministic',
+        'always_escalates': False,
+        'before_done': before_done,
+    }
+    if gate_escalated_at is not None:
+        metadata['gate_escalated_at'] = gate_escalated_at
+    return {
+        'id': task_id,
+        'title': title,
+        'description': description,
+        'metadata': metadata,
+    }
+
+
 # Unit states used across B6/B7 deploy tests
 _BASELINE_UNIT_STATE: dict = {
     'MainPID': 100,
