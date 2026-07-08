@@ -889,6 +889,19 @@ def create_mcp_server(
                 'agent_id': agent_id,
                 'content_excerpt': content[:200],
             }
+        if (
+            category == 'temporal_facts'
+            and isinstance(agent_id, str)
+            and agent_id.startswith('recon-stage-')
+            and is_conflicting_task_status_framing(content)
+        ):
+            return {
+                'error': 'conflicting_task_status_framing_write_blocked',
+                'error_type': 'ReconConflictingTaskStatusWriteRejected',
+                'agent_id': agent_id,
+                'content_excerpt': content[:200],
+                'conflicting_task_ids': sorted(find_conflicting_task_status_ids(content)),
+            }
         try:
             causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
             result = await memory_service.add_memory(
