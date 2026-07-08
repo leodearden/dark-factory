@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +31,7 @@ __all__ = [
     'parse_pressure_file',
     'read_pressure',
     'PsiSample',
+    'read_psi_sample',
 ]
 
 _AVG10_RE = re.compile(r'avg10=([0-9]+(?:\.[0-9]+)?)')
@@ -117,3 +119,25 @@ class PsiSample:
             or self.mem_full10 >= cfg.mem_full_avg10
             or self.io_some10 >= cfg.io_some_avg10
         )
+
+
+def read_psi_sample(*, read: Callable[[str], str] = read_pressure) -> PsiSample:
+    """Read and parse /proc/pressure/{cpu,memory,io} into a PsiSample.
+
+    Maps cpu.some -> cpu_some10, mem.some -> mem_some10, mem.full ->
+    mem_full10, and io.some -> io_some10.
+
+    Note:
+        This is the happy path only; fail-open handling (DA-D6) for an
+        unreadable or unparseable source is layered on in a later revision.
+    """
+    cpu = parse_pressure_file(read('cpu'))
+    mem = parse_pressure_file(read('memory'))
+    io = parse_pressure_file(read('io'))
+    return PsiSample(
+        cpu_some10=cpu['some_avg10'],
+        mem_some10=mem['some_avg10'],
+        mem_full10=mem['full_avg10'],
+        io_some10=io['some_avg10'],
+        read_ok=True,
+    )
