@@ -48,6 +48,7 @@ from fused_memory.middleware.lock_charter_guard import (
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
     check_candidate_for_scope,
+    check_files_for_scope,
     check_text_for_scope,
     is_routing_override,
 )
@@ -1160,6 +1161,31 @@ class TaskInterceptor:
             spawn_context=str(meta.get('spawn_context') or 'manual'),
         )
 
+    def _files_scope_check(
+        self,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_id: str,
+    ) -> PathGuardVerdict:
+        """Run the FILES-CERTAIN path-scope check and return its verdict.
+
+        Classifies concrete ``metadata.files`` entries via the exact
+        ``registry.project_for_path`` lookup (:func:`check_files_for_scope`)
+        — the CERTAIN counterpart to the heuristic regex-over-prose
+        :meth:`_path_guard_check`.  A rejection here is definitive: the
+        file is either owned by a known other project or it isn't, so
+        there is nothing for an LLM to adjudicate (task 2206).
+
+        A no-op (``ok``) when no :attr:`_prefix_registry` is configured —
+        without a registry there is no per-project owner map to classify a
+        file against.
+        """
+        files = (
+            candidate.files_to_modify if candidate is not None
+            else self._extract_meta_files(kwargs)
+        )
+        return check_files_for_scope(files, project_id, self._prefix_registry)
+
     def _path_guard_check(
         self,
         candidate: CandidateTask | None,
@@ -1337,6 +1363,19 @@ class TaskInterceptor:
             return None
         if candidate is None:
             candidate = self._build_candidate(kwargs)
+
+        # FILES-CERTAIN (task 2206): an exact metadata.files owner-mismatch
+        # is a hard reject, no LLM adjudication — nothing to adjudicate when
+        # the file's owner is known exactly. Runs BEFORE the heuristic prose
+        # scan below. A no-op without a registry configured.
+        files_verdict = self._files_scope_check(candidate, kwargs, project_id)
+        if files_verdict.is_rejection:
+            self._emit_scope_violation_escalation(
+                files_verdict, candidate, kwargs, project_root, project_id,
+                llm_reason=None,
+            )
+            return files_verdict.to_error_dict()
+
         verdict = self._path_guard_check(candidate, kwargs, project_id)
         if not verdict.is_rejection:
             return None

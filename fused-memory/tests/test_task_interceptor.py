@@ -4996,37 +4996,36 @@ class TestPathGuardOrSkip:
     async def test_path_guard_or_skip_propagates_rejection(
         self,
         interceptor,
-        monkeypatch,
+        tmp_path,
     ):
-        """When _path_guard_check returns a rejection verdict, the helper
-        returns its to_error_dict() output.
-        """
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        """When the FILES-certain check finds a metadata.files owner-mismatch,
+        the helper returns its to_error_dict() output directly (hard reject,
+        no LLM).
 
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='some_other_project',
-            matched_paths=('orchestrator/',),
-            suggested_project='dark_factory',
+        Repointed (task 2206): a PROSE-only hit is now a non-rejecting
+        advisory, so only a metadata.files mismatch still triggers
+        propagation of a rejection verdict from _path_guard_or_skip.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
         )
 
-        def fake_build(kwargs):
-            return None
-
-        def fake_check(self, candidate, kwargs, project_id):
-            return verdict
-
-        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'dark-factory')])
+        interceptor._prefix_registry = registry
 
         result = await interceptor._path_guard_or_skip(
-            {'prompt': 'something'},
+            {
+                'prompt': 'something',
+                'metadata': {'files': ['orchestrator/harness.py']},
+            },
             '/some/project_root',
             'some_other_project',
         )
         assert result is not None
         assert result.get('error_type') == 'DarkFactoryPathScopeViolation'
-        assert result.get('matched_paths') == ['orchestrator/']
+        assert result.get('matched_paths') == ['orchestrator/harness.py']
         assert result.get('suggested_project') == 'dark_factory'
 
     # -- Case 5: routing override skips both guards -----------------------
@@ -5077,31 +5076,29 @@ class TestPathGuardOrSkip:
     async def test_empty_routing_override_reason_does_not_skip_guards(
         self,
         interceptor,
-        monkeypatch,
+        tmp_path,
     ):
-        """With routing_override_reason='' (default), a rejecting _path_guard_check
-        still returns the error dict — behavior is unchanged.
-        """
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        """With routing_override_reason='' (default), a rejecting FILES-certain
+        check still returns the error dict — behavior is unchanged: only a
+        non-empty override reason skips the guard, not merely its absence.
 
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='some_other_project',
-            matched_paths=('orchestrator/',),
-            suggested_project='dark_factory',
+        Repointed (task 2206): drives the rejection via a metadata.files
+        owner-mismatch since a PROSE-only hit is now a non-rejecting advisory.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
         )
 
-        def fake_build(kwargs):
-            return None
-
-        def fake_check(self, candidate, kwargs, project_id):
-            return verdict
-
-        monkeypatch.setattr(TaskInterceptor, '_build_candidate', staticmethod(fake_build))
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', fake_check)
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'dark-factory')])
+        interceptor._prefix_registry = registry
 
         result = await interceptor._path_guard_or_skip(
-            {'prompt': 'something'},
+            {
+                'prompt': 'something',
+                'metadata': {'files': ['orchestrator/harness.py']},
+            },
             '/some/project_root',
             'some_other_project',
             routing_override_reason='',
@@ -5224,13 +5221,17 @@ class TestMultiProjectRoutingWiring:
     async def test_rejection_fires_scope_violation_escalator(
         self,
         interceptor,
-        monkeypatch,
         tmp_path,
     ):
-        """A path-guard rejection invokes scope_violation_escalator.report_rejection
-        with project_root, matched_paths, and suggested_project from the verdict.
+        """A FILES-certain path-guard rejection invokes
+        scope_violation_escalator.report_rejection with project_root,
+        matched_paths, and suggested_project from the verdict.
+
+        Repointed (task 2206) from a PROSE-mention rejection to a
+        metadata.files owner-mismatch — prose hits are now a non-rejecting
+        advisory, so only a FILES-certain mismatch still triggers a hard
+        reject + escalation.
         """
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
         from fused_memory.middleware.project_prefix_registry import (
             ProjectPrefixRegistry,
         )
@@ -5258,21 +5259,11 @@ class TestMultiProjectRoutingWiring:
 
         interceptor._scope_violation_escalator = FakeEscalator()
 
-        # Force a rejection verdict from the check function.
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='reify',
-            matched_paths=('fused-memory/',),
-            suggested_project='dark_factory',
-        )
-        monkeypatch.setattr(
-            TaskInterceptor,
-            '_path_guard_check',
-            lambda self, c, k, p: verdict,
-        )
-
         result = await interceptor._path_guard_or_skip(
-            {'title': 'Edit fused-memory/X'},
+            {
+                'title': 'Generic title, no prose hit',
+                'metadata': {'files': ['fused-memory/x.py']},
+            },
             str(tmp_path / 'reify'),
             'reify',
         )
@@ -5284,7 +5275,7 @@ class TestMultiProjectRoutingWiring:
         call = escalator_calls[0]
         assert call['project_root'] == str(tmp_path / 'reify')
         assert call['project_id'] == 'reify'
-        assert call['matched_paths'] == ('fused-memory/',)
+        assert call['matched_paths'] == ('fused-memory/x.py',)
         assert call['suggested_project'] == 'dark_factory'
         # suggested_root resolved from registry.
         assert call['suggested_root'] == str((tmp_path / 'dark-factory').resolve())
@@ -5292,11 +5283,14 @@ class TestMultiProjectRoutingWiring:
     async def test_escalator_failure_swallowed(
         self,
         interceptor,
-        monkeypatch,
         tmp_path,
     ):
-        """An escalator that raises must NOT turn the rejection into an exception."""
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
+        """An escalator that raises must NOT turn the rejection into an exception.
+
+        Repointed (task 2206) to drive the rejection via a metadata.files
+        owner-mismatch (FILES-certain, still a hard reject) rather than a
+        prose-only hit (now a non-rejecting advisory).
+        """
         from fused_memory.middleware.project_prefix_registry import (
             ProjectPrefixRegistry,
         )
@@ -5311,21 +5305,13 @@ class TestMultiProjectRoutingWiring:
                 raise RuntimeError('boom')
 
         interceptor._scope_violation_escalator = BoomEscalator()
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='other',
-            matched_paths=('crates/',),
-            suggested_project='reify',
-        )
-        monkeypatch.setattr(
-            TaskInterceptor,
-            '_path_guard_check',
-            lambda self, c, k, p: verdict,
-        )
 
         # Must not raise.
         result = await interceptor._path_guard_or_skip(
-            {'title': 'crates/widget'},
+            {
+                'title': 'generic title',
+                'metadata': {'files': ['crates/widget.rs']},
+            },
             '/foo',
             'other',
         )
