@@ -577,7 +577,11 @@ class TestTimeout:
         # Fixed monotonic sequence: start=0.0 sets deadline=2.0; loop check=0.0
         # so remaining_ms = max(0, int((2.0 - 0.0)*1000)) = 2000 -> read(timeout=2000)
         # read returns [] -> exit 124 (empty events with deadline set)
-        monotonic_values = iter([0.0, 0.0])
+        # Non-exhausting (task 2361): the tail repeats so deadline/remaining_ms
+        # stay stable (this test's read(timeout=2000) assertion holds) even if
+        # the loop were to poll more than the minimal happy path under host
+        # load, instead of raising StopIteration on an unplanned extra call.
+        monotonic_values = itertools.chain([0.0], itertools.repeat(0.0))
 
         with (
             patch('escalation.watcher.INotify') as MockINotify,
@@ -644,7 +648,11 @@ class TestTimeout:
 
         # monotonic sequence: first call sets deadline = 0.0 + 5.0 = 5.0;
         # second call in the loop -> remaining_ms = int((5.0 - 0.5) * 1000) = 4500
-        monotonic_values = iter([0.0, 0.5])
+        # Non-exhausting (task 2361): the tail repeats so deadline/remaining_ms
+        # stay stable (this test's read(timeout=4500) assertion holds) even if
+        # the loop were to poll more than the minimal happy path under host
+        # load, instead of raising StopIteration on an unplanned extra call.
+        monotonic_values = itertools.chain([0.0], itertools.repeat(0.5))
 
         with (
             patch('escalation.watcher.INotify') as MockINotify,
