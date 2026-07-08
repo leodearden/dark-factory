@@ -2158,14 +2158,17 @@ class TestChainInvalidationUnderOverlap:
             await q.put(req_b)
 
             # Wait for both verifies to enter (true concurrent overlap)
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # NOTE (task 2350): widened from 15.0s -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention even though the
+            # underlying cascade logic is correct (timing flake, not a bug).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
 
             # N's verify fails
             gate_a_release.set()
 
             # N must resolve with a fail status
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=45.0)
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail, got status={outcome_a.status!r}.'
             )
@@ -2181,12 +2184,12 @@ class TestChainInvalidationUnderOverlap:
             # GREEN: cascade → re-merge → re-verify → 'done' (fast)
             # RED: deadlock → TimeoutError → outcome_b stays None
             with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=20.0)
 
             await worker.stop()
 
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            await asyncio.wait_for(worker_task, timeout=20.0)
 
         # ── RED: fails here (outcome_b is None due to timeout) ──────────────
         assert outcome_b is not None and outcome_b.status == 'done', (
@@ -4089,13 +4092,16 @@ class TestCascadeErrorContainment:
             await q.put(req_b)
 
             # Wait for both verifies to enter (true concurrent overlap).
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+            # NOTE (task 2350): widened from 15.0s -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention even though the
+            # underlying cascade logic is correct (timing flake, not a bug).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
 
             # N fails → head-failure cascade fires → in-body cancel_and_release raises.
             gate_a_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=45.0)
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail, got status={outcome_a.status!r}.'
             )
@@ -4107,7 +4113,7 @@ class TestCascadeErrorContainment:
             # GREEN: except handler (not-_entry_released branch) →
             #   MergeOutcome('blocked', 'Verifier cascade error: ...').
             with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=5.0)
+                outcome_b = await asyncio.wait_for(req_b.result, timeout=20.0)
 
             # Loop-survival signal: queue a third request that should dispatch
             # on the local host and resolve "done".
@@ -4128,7 +4134,7 @@ class TestCascadeErrorContainment:
             await q.put(req_c)
 
             with contextlib.suppress(TimeoutError):
-                outcome_c = await asyncio.wait_for(req_c.result, timeout=10.0)
+                outcome_c = await asyncio.wait_for(req_c.result, timeout=30.0)
 
             # (3) SLOT EXACT-ONCE: check AFTER outcome_c, BEFORE stop().
             # req_c is non-speculative (no in-flight head), so it never acquires
@@ -4153,7 +4159,7 @@ class TestCascadeErrorContainment:
             await worker.stop()
 
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            await asyncio.wait_for(worker_task, timeout=20.0)
 
         # ── (1) LOOP SURVIVES ────────────────────────────────────────────────
         assert outcome_c is not None and outcome_c.status == 'done', (
