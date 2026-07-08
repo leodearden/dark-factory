@@ -73,6 +73,7 @@ class TestBeforeDone:
         assert bd.cwd == '.'
         assert bd.timeout_secs == 120
         assert bd.target_unit == 'u.service'
+        assert bd.kind == 'deploy'
 
     def test_defaults_when_omitted(self):
         bd = BeforeDone(script='scripts/x.sh', timeout_secs=60)
@@ -102,6 +103,21 @@ class TestBeforeDone:
         bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, x_extra='keep-me')  # type: ignore[call-arg]
         dumped = bd.model_dump()
         assert dumped['x_extra'] == 'keep-me'
+
+    def test_kind_defaults_to_deploy(self):
+        # Default preserves every existing deterministic task byte-identically
+        # — no existing blob carries `kind`, so the default equals the prior
+        # implicit deploy behavior.
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60)
+        assert bd.kind == 'deploy'
+
+    def test_kind_predicate_accepted(self):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, kind='predicate')
+        assert bd.kind == 'predicate'
+
+    def test_kind_bogus_rejected(self):
+        with pytest.raises(ValidationError):
+            BeforeDone(script='scripts/x.sh', timeout_secs=60, kind='bogus')  # type: ignore[arg-type]
 
 
 class TestDoneProvenance:
