@@ -174,14 +174,20 @@ def _section_dict(data: dict[str, Any], key: str) -> dict[str, Any]:
 def _weight_table(data: dict[str, Any], key: str, fallback: dict[str, float]) -> dict[str, float]:
     """Return data[key] iff it's a mapping, else *fallback*.
 
-    Mirrors _section_dict for the top-level weight tables: a scalar/list,
-    absent/null, or empty value falls back to the bundled default so
-    score()'s later ``.get()`` lookups never see a non-mapping. (An empty
-    mapping falls back too, preserving the prior ``... or fallback``
-    semantics.)
+    Mirrors _section_dict for the top-level weight tables: absent, null,
+    and non-mapping (scalar/list) values all fall back to the bundled
+    default so score()'s later ``.get()`` lookups never see a
+    non-mapping. An explicit empty mapping (``key: {}``) is deliberately
+    NOT replaced by *fallback* — an operator hand-writing
+    ``severity_weights: {}`` to intentionally clear all per-severity
+    overrides gets exactly that (an empty table, everything falling back
+    to defaults.severity in score()), not the bundled table resurrected.
+    Conflating "empty" with "absent" would make an intentionally-empty
+    table inexpressible by hand. Per-entry numeric coercion happens
+    downstream in _coerce_weight_table.
     """
     section = data.get(key)
-    return section if isinstance(section, dict) and section else fallback
+    return section if isinstance(section, dict) else fallback
 
 
 def _priorities_from_dict(data: dict[str, Any]) -> Priorities:

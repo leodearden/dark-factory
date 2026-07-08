@@ -222,6 +222,39 @@ class TestLoadPriorities:
         assert isinstance(score(item, weights, datetime(2026, 7, 7, tzinfo=UTC)), float)
 
 
+    def test_explicit_empty_weight_table_is_not_replaced_by_bundled_defaults(self, tmp_path):
+        """An explicit ``severity_weights: {}`` clears the table, not resurrects defaults.
+
+        ``{}`` (present-but-empty) is distinct from absent/null: an operator
+        hand-writing ``severity_weights: {}`` is intentionally saying "no
+        per-severity overrides, use defaults.severity for everything."
+        Conflating that with an absent section would make an
+        intentionally-empty table inexpressible by hand.
+        """
+        from datetime import UTC, datetime
+
+        from cockpit.priority import Priorities, ScoringItem, load_priorities, score
+
+        custom_path = tmp_path / 'priorities.yaml'
+        custom_path.write_text(yaml.safe_dump({'severity_weights': {}}))
+
+        result = load_priorities(custom_path)
+        default = Priorities.default()
+
+        assert result.severity_weights == {}
+        assert result.severity_weights != default.severity_weights
+
+        item = ScoringItem(
+            severity='critical',
+            category='chore',
+            project='some-project',
+            filed_at=datetime(2026, 7, 1, tzinfo=UTC),
+            manual_boost=0,
+            state='open',
+        )
+        assert isinstance(score(item, result, datetime(2026, 7, 7, tzinfo=UTC)), float)
+
+
 class TestEnsurePrioritiesFile:
     def test_creates_parent_dirs_and_round_trips_to_defaults(self, tmp_path):
         from cockpit.priority import Priorities, ensure_priorities_file, load_priorities
