@@ -1984,6 +1984,88 @@ class MemoryService:
             message=msg,
         )
 
+    async def add_system_record(
+        self,
+        content: str,
+        *,
+        project_id: str,
+        agent_id: str | None,
+        category: str | MemoryCategory,
+        metadata: dict | None = None,
+        causation_id: str | None = None,
+        session_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> AddMemoryResponse:
+        """Dedup-exempt, Mem0-only system write (task 2222 / W5-δ).
+
+        Always writes through ``Mem0Backend.add_system_record`` — never the
+        general ``add()`` — so the write is structurally exempt from Mem0's
+        (future) dedup behaviour regardless of any change to the general
+        add path. Never routes to Graphiti, regardless of ``category``:
+        category is stamped into the metadata as a tag only, not used for
+        store routing. Models the Mem0 branch of :meth:`add_memory` minus
+        the Graphiti half and minus the general-add dedup-dependent path.
+        """
+        scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
+        write_op_id = str(uuid_mod.uuid4())
+
+        resolved_category = MemoryCategory(category) if isinstance(category, str) else category
+
+        meta = dict(metadata or {})
+        meta['category'] = resolved_category.value
+
+        mem0_result = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            backend='mem0',
+            operation='add',
+            payload={'content': content[:200]},
+            coro=self.mem0.add_system_record(content=content, scope=scope, metadata=meta),
+        )
+        mem0_ids = [
+            r['id']
+            for r in (mem0_result or {}).get('results', [])
+            if isinstance(r, dict) and 'id' in r
+        ]
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='add_system_record',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'content': content[:200], 'category': resolved_category.value},
+                result_summary={
+                    'memory_ids': mem0_ids,
+                    'stores': [SourceStore.mem0.value],
+                },
+                success=True,
+            )
+
+        await self._emit_event(ReconciliationEvent(
+            id=str(uuid_mod.uuid4()),
+            type=EventType.memory_added,
+            source=EventSource.agent,
+            project_id=project_id,
+            timestamp=datetime.now(UTC),
+            payload={
+                'memory_ids': mem0_ids,
+                'category': resolved_category.value,
+                'content_preview': content[:200],
+            },
+            agent_id=agent_id,
+        ))
+
+        return AddMemoryResponse(
+            memory_ids=mem0_ids,
+            stores_written=[SourceStore.mem0],
+            category=resolved_category,
+            message=f'Memory queued for {[SourceStore.mem0.value]}',
+        )
+
     # ------------------------------------------------------------------
     # Replay: re-ingest Mem0 memories into Graphiti
     # ------------------------------------------------------------------
