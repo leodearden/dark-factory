@@ -246,3 +246,26 @@ def render_marker_lifecycle_section() -> str:
         'delivery channel that survives this sweep — the marker is only a '
         'same-cycle relay.'
     )
+
+
+def render_suppression_schema_section() -> str:
+    """Render the canonical suppression-record schema section, faithful to
+    reconciliation/prompts/stage1.py:498-560."""
+    return (
+        '## Suppression Schema\n'
+        'Canonical suppression record schema (Mem0, observations_and_summaries '
+        "category) — the producer's contract read by the Stage 1 post-processor:\n"
+        '  - `metadata.kind = "stage1_flag_suppression"`\n'
+        '  - `metadata.task_id = <N>` (int)\n'
+        '  - `metadata.flag_types = [<str>, ...]` (OPTIONAL scoping allowlist)\n'
+        '  - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`\n\n'
+        'Scoped vs. legacy/blanket suppression: a record WITH a non-empty '
+        '`metadata.flag_types` is a scoped record that suppresses ONLY those '
+        '(task_id, flag_type) pairs, leaving other flag_types for the same '
+        'task_id free to surface. A record WITHOUT `flag_types` (absent, None, '
+        'or empty — the legacy shape) is a blanket record that suppresses ALL '
+        'flag_types for that task_id. When both a scoped and a legacy/blanket '
+        'record exist for the same task_id, the blanket record wins (union '
+        'semantics) — a blanket suppression cannot be narrowed by a more '
+        'specific scoped record.'
+    )
