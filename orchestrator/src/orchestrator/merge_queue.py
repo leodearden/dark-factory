@@ -861,6 +861,7 @@ async def _run_post_merge_verify(
     quarantine: set[str] | None = None,
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
+    escalation_queue: Any = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -897,6 +898,12 @@ async def _run_post_merge_verify(
             this call — they rely on the heartbeat mtime / grace-period
             mechanism to avoid premature removal in the residual window between
             snapshot capture and prune execution.
+        escalation_queue: Live escalation queue or ``None`` (default).  Used
+            solely to file a born-at-L2 escalation (task 2307 β) when
+            *verify* is the distinguished flock-worktree-contention outcome
+            (``is_flock_contention_failure``); has no effect on any other
+            failure path.  None-safe — omitting it keeps every existing
+            call site byte-identical.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -1010,6 +1017,25 @@ async def _run_post_merge_verify(
 
     if not verify.passed:
         await git_ops.cleanup_merge_worktree(merge_wt)
+
+        # Flock-worktree-contention sentinel (task 2307 β): a laptop-side verify
+        # reported that .merge_verify.lock was already held (task 2306 α).  Checked
+        # FIRST — before the unscoped-gate sentinel and the main-health probe — since
+        # contention is not a pre-existing main-HEAD break; probing would be wasteful
+        # and misleading.  Files a born-at-L2 escalation and keeps the merge blocked.
+        if is_flock_contention_failure(verify):
+            payload = verify.contention or {}
+            _alarm_verify_worktree_contention(
+                escalation_queue,
+                host=payload.get('host', '<unknown>'),
+                holder_pgid=payload.get('holder_pgid'),
+                waiter_pgid=payload.get('waiter_pgid'),
+            )
+            return MergeOutcome(
+                'blocked',
+                reason=f'Post-merge verification blocked: {verify.summary} [category: {verify.category}]',
+                failure_category=verify.category,
+            )
 
         # Unscoped-gate sentinel: check this BEFORE the ENOSPC guard because the
         # sentinel's type_output field carries type-check output (gate.detail) that
