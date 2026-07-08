@@ -300,7 +300,8 @@ class TestCapHitRotation:
 
         # First call returns max-f's token
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
-        assert token == 'token-max-f', f"Expected 'token-max-f', got {token!r}"
+        assert token is not None
+        assert token.token == 'token-max-f', f"Expected 'token-max-f', got {token!r}"
 
         # Simulate cap hit on max-f
         gate._handle_cap_detected(
@@ -311,7 +312,8 @@ class TestCapHitRotation:
 
         # Second call should return max-e's token
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
-        assert token == 'token-max-e', f"Expected 'token-max-e', got {token!r}"
+        assert token is not None
+        assert token.token == 'token-max-e', f"Expected 'token-max-e', got {token!r}"
 
     @pytest.mark.asyncio
     async def test_failover_chain_f_to_e_to_c(self):
@@ -333,7 +335,8 @@ class TestCapHitRotation:
 
         # Should return max-c's token
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
-        assert token == 'token-max-c', f"Expected 'token-max-c', got {token!r}"
+        assert token is not None
+        assert token.token == 'token-max-c', f"Expected 'token-max-c', got {token!r}"
 
     @pytest.mark.asyncio
     async def test_failover_chain_full_f_e_c_to_d(self):
@@ -348,7 +351,8 @@ class TestCapHitRotation:
             )
 
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
-        assert token == 'token-max-d', f"Expected 'token-max-d', got {token!r}"
+        assert token is not None
+        assert token.token == 'token-max-d', f"Expected 'token-max-d', got {token!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +393,8 @@ class TestAllCappedBlockResume:
 
         # Gate should unblock and return max-e's token
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
-        assert token == 'token-max-e', (
+        assert token is not None
+        assert token.token == 'token-max-e', (
             f"Expected 'token-max-e' after uncapping, got {token!r}"
         )
 
@@ -429,7 +434,8 @@ class TestAllCappedBlockResume:
         gate._open.set()
 
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
-        assert token == 'token-max-f'
+        assert token is not None
+        assert token.token == 'token-max-f'
 
     def test_is_paused_reflects_all_capped_state(self):
         """gate.is_paused is True only when all 4 accounts are capped."""

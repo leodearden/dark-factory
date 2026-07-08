@@ -44,14 +44,16 @@ __all__ = [
     'AccountState',
     'SessionBudgetExhausted',
 ]
-# NOTE: AccountPhase and IllegalTransitionError are intentionally NOT listed
-# here even though they are part of this module's public surface (imported
-# directly by shared.tests.test_usage_gate). shared/tests/test_public_api.py
-# pins this module's __all__ to an exact set (and shared.__all__ to the union
-# of every submodule's __all__) — both out of this task's edit scope. Adding
+# NOTE: AccountPhase, IllegalTransitionError, and AccountLease are
+# intentionally NOT listed here even though they are part of this module's
+# public surface (AccountPhase/IllegalTransitionError are imported directly
+# by shared.tests.test_usage_gate; AccountLease by consumers of
+# before_invoke()/InvokeSlot.lease). shared/tests/test_public_api.py pins
+# this module's __all__ to an exact set (and shared.__all__ to the union of
+# every submodule's __all__) — both out of this task's edit scope. Adding
 # entries here would fail that pinned assertion. __all__ only governs
 # `from shared.usage_gate import *`; explicit `from shared.usage_gate import
-# AccountPhase` works regardless of __all__ membership.
+# AccountPhase` (or `AccountLease`) works regardless of __all__ membership.
 
 # Patterns that indicate a usage cap has been hit (from Claude Code CLI output)
 CAP_HIT_PREFIXES = [
@@ -176,6 +178,11 @@ class AccountState:
     near_cap: bool = False
     auth_failed_at: datetime | None = None
     auth_reprobe_task: asyncio.Task | None = field(default=None, repr=False)
+    # Monotonic counter bumped once per successful `_transition` edge (task
+    # W4-δ, PRD §7.4). Lets a capturer of an `AccountLease` (see below)
+    # detect whether the account has re-transitioned since the lease was
+    # taken — see `UsageGate.lease_is_current`.
+    generation: int = 0
 
     # --- Legacy-compat boolean shim -----------------------------------
     #
@@ -238,6 +245,29 @@ class AccountState:
             self.phase = AccountPhase.AVAILABLE
 
 
+@dataclass(frozen=True)
+class AccountLease:
+    """Frozen snapshot of the account :meth:`UsageGate.before_invoke` selected
+    (task W4-δ, PRD §7.4).
+
+    Built IN-LOCK at selection time (after any PROBING -> PROBE_IN_FLIGHT
+    claim), so ``name`` and ``token`` always identify the SAME account —
+    closing a skew where :class:`InvokeSlot` used to re-derive
+    ``account_name`` from :attr:`UsageGate.active_account_name` independently
+    of the ``token`` ``before_invoke`` returned, which could name a
+    different account (finding 3 / boundary test B5).
+
+    ``generation`` is a snapshot of :attr:`AccountState.generation` at
+    capture time — compare it against the account's live value (see
+    :meth:`UsageGate.lease_is_current`) to detect a lease gone stale from a
+    mid-flight re-transition.
+    """
+
+    name: str
+    token: str | None
+    generation: int
+
+
 class SessionBudgetExhausted(Exception):
     """Raised when the per-run session budget is exceeded."""
 
@@ -265,13 +295,28 @@ class InvokeSlot:
         # any other exit: __aexit__ calls release_probe_slot
     """
 
-    __slots__ = ('_gate', 'token', 'account_name', '_settled')
+    __slots__ = ('_gate', 'lease', '_settled')
 
-    def __init__(self, gate: UsageGate, token: str | None) -> None:
+    def __init__(self, gate: UsageGate, lease: AccountLease | None) -> None:
         self._gate = gate
-        self.token = token
-        self.account_name = gate.active_account_name or ''
+        self.lease = lease
         self._settled = False
+
+    @property
+    def token(self) -> str | None:
+        """OAuth token of the leased account (task W4-δ, PRD §7.4)."""
+        return self.lease.token if self.lease is not None else None
+
+    @property
+    def account_name(self) -> str:
+        """Name of the leased account — the SAME account ``token`` came from.
+
+        Derived from ``lease`` rather than independently re-resolved (the
+        old ``gate.active_account_name`` re-derivation omitted
+        ``probe_in_flight`` from its predicate, so it could name a
+        *different* account than ``token`` — finding 3 / boundary test B5).
+        """
+        return self.lease.name if self.lease is not None else ''
 
     def detect_cap_hit(
         self,
@@ -397,7 +442,10 @@ class UsageGate:
     ) -> None:
         """Sole writer of ``AccountState.phase`` (PRD §7.3, task W4-γ).
 
-        Writes the new phase, then recomputes the shared ``_open`` event in
+        Writes the new phase, bumps ``acct.generation`` (task W4-δ, PRD
+        §7.4 — the sole increment site, so an ``AccountLease`` captured
+        before this call can later be checked for staleness via
+        ``lease_is_current``), then recomputes the shared ``_open`` event in
         ONE place from the current phase of every account (DD-5 invariant:
         ``_open.is_set() <=> any(a.phase in {AVAILABLE, PROBING})``) —
         replacing the ~10 scattered ``self._open.set()``/``.clear()`` call
@@ -442,6 +490,11 @@ class UsageGate:
 
         old_phase = acct.phase
         acct.phase = new_phase
+        # Bump the monotonic generation counter on every successful edge
+        # (including force=True SIGHUP resets) — task W4-δ, PRD §7.4. This
+        # is the sole increment site, mirroring _transition's role as the
+        # sole writer of `phase`.
+        acct.generation += 1
         if clear_near_cap:
             acct.near_cap = False
 
@@ -548,10 +601,14 @@ class UsageGate:
             len(self._accounts),
         )
 
-    async def before_invoke(self) -> str | None:
-        """Block until at least one account is available. Return its OAuth token.
+    async def before_invoke(self) -> AccountLease | None:
+        """Block until at least one account is available. Return its lease.
 
-        Returns ``None`` if no accounts are configured (no token override).
+        Returns an :class:`AccountLease` snapshotting the selected account's
+        name/token/generation (task W4-δ, PRD §7.4) — built IN-LOCK, after
+        any PROBING -> PROBE_IN_FLIGHT claim, so the returned lease always
+        names the SAME account as its token. Returns ``None`` if no accounts
+        are configured (no token override).
         """
         # Session budget check
         if (self._config.session_budget_usd is not None
@@ -597,7 +654,9 @@ class UsageGate:
                             )
                     else:
                         self._last_account_name = acct.name
-                    return acct.token
+                    return AccountLease(
+                        name=acct.name, token=acct.token, generation=acct.generation,
+                    )
 
             # All capped — check if any reset times have passed before blocking.
             refreshed = await self._refresh_capped_accounts()
@@ -639,13 +698,13 @@ class UsageGate:
                     break          # probe settled by confirm
                 # any other exit path (continue, exception): auto-released
         """
-        token = await self.before_invoke()
-        slot = InvokeSlot(self, token)
+        lease = await self.before_invoke()
+        slot = InvokeSlot(self, lease)
         try:
             yield slot
         finally:
             if not slot._settled:
-                self.release_probe_slot(token)
+                self.release_probe_slot(lease.token if lease is not None else None)
 
     def detect_cap_hit(
         self,
@@ -1507,6 +1566,23 @@ class UsageGate:
             # this method's documented "does NOT touch near_cap" contract —
             # this is an exception path, orthogonal to cap status.
             self._transition(acct, AccountPhase.AVAILABLE, clear_near_cap=False)
+
+    def lease_is_current(self, lease: AccountLease) -> bool:
+        """Whether ``lease`` still reflects the live state of its account (task W4-δ).
+
+        Resolves the account by ``lease.name`` and compares its live
+        ``generation`` against the snapshot captured in the lease. A
+        mismatch — or the account no longer existing (e.g. removed on
+        SIGHUP reload) — means the account has transitioned (or vanished)
+        since the lease was taken, so the lease is stale.
+
+        This is a pure detectability primitive: it makes no decision about
+        what to do with a stale lease. Consumer task W4-ε's
+        ``InvokeSlot.report()`` uses this to implement the Q4 log-and-proceed
+        fail-safe policy.
+        """
+        acct = next((a for a in self._accounts if a.name == lease.name), None)
+        return acct is not None and acct.generation == lease.generation
 
     @property
     def project_id(self) -> str | None:

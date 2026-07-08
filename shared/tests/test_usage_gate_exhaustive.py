@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -17,12 +18,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from shared.cli_invoke import AgentResult, invoke_with_cap_retry
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.usage_gate import (
     CAP_HIT_PREFIXES,
     CODEX_CAP_PATTERNS,
     GEMINI_CAP_PATTERNS,
     NEAR_CAP_PREFIXES,
+    AccountLease,
+    AccountPhase,
     SessionBudgetExhausted,
     UsageGate,
     _extract_cap_message,
@@ -67,6 +71,7 @@ def make_gate(
 def make_mock_cost_store() -> AsyncMock:
     store = AsyncMock()
     store.save_account_event = AsyncMock(return_value=None)
+    store.save_invocation = AsyncMock(return_value=None)
     return store
 
 
@@ -1398,26 +1403,30 @@ class TestBeforeInvokeCore:
 
     async def test_returns_first_available_token(self):
         gate = make_gate(['a', 'b'])
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease is not None
+        assert lease.token == 'fake-token-a'
 
     async def test_skips_capped_accounts(self):
         gate = make_gate(['a', 'b'])
         gate._accounts[0].capped = True
-        token = await gate.before_invoke()
-        assert token == 'fake-token-b'
+        lease = await gate.before_invoke()
+        assert lease is not None
+        assert lease.token == 'fake-token-b'
 
     async def test_skips_probe_in_flight_accounts(self):
         gate = make_gate(['a', 'b'])
         gate._accounts[0].probe_in_flight = True
-        token = await gate.before_invoke()
-        assert token == 'fake-token-b'
+        lease = await gate.before_invoke()
+        assert lease is not None
+        assert lease.token == 'fake-token-b'
 
     async def test_claims_probe_slot(self):
         gate = make_gate(['a'])
         gate._accounts[0].probing = True
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease is not None
+        assert lease.token == 'fake-token-a'
         assert gate._accounts[0].probing is False
         assert gate._accounts[0].probe_in_flight is True
         # Gate should be cleared (not set) to block other tasks
@@ -1426,8 +1435,9 @@ class TestBeforeInvokeCore:
     async def test_session_budget_below_limit(self):
         gate = make_gate(['a'], session_budget_usd=10.0)
         gate._cumulative_cost = 5.0
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease is not None
+        assert lease.token == 'fake-token-a'
 
     async def test_session_budget_at_exact_limit_raises(self):
         gate = make_gate(['a'], session_budget_usd=10.0)
@@ -1445,15 +1455,17 @@ class TestBeforeInvokeCore:
     async def test_session_budget_not_configured(self):
         gate = make_gate(['a'], session_budget_usd=None)
         gate._cumulative_cost = 999999.0
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease is not None
+        assert lease.token == 'fake-token-a'
 
     async def test_session_budget_float_edge(self):
         gate = make_gate(['a'], session_budget_usd=10.0)
         gate._cumulative_cost = 9.999999999
         # 9.999999999 < 10.0, so should not raise
-        token = await gate.before_invoke()
-        assert token == 'fake-token-a'
+        lease = await gate.before_invoke()
+        assert lease is not None
+        assert lease.token == 'fake-token-a'
 
     async def test_no_accounts_raises_runtime_error(self):
         gate = make_gate(['a'])
@@ -1479,8 +1491,9 @@ class TestBeforeInvokeCore:
             gate._open.set()
 
         task = asyncio.create_task(open_gate_soon())
-        token = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
-        assert token == 'fake-token-a'
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease is not None
+        assert lease.token == 'fake-token-a'
         await task
 
     async def test_failover_event_on_account_change(self):
@@ -2273,3 +2286,201 @@ class TestAuthReprobeDemoteOnCapMessage:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
+
+
+# =========================================================================
+# TestAccountGeneration — monotonic per-account counter (PRD §7.4, task W4-δ)
+#
+# `generation` is bumped exactly once inside `_transition` (γ's sole
+# phase-writer) on every successful edge, so an `AccountLease` captured
+# before a mid-flight re-transition can be detected as stale by comparing
+# its `generation` snapshot against the account's current value.
+# =========================================================================
+
+
+class TestAccountGeneration:
+    """AccountState.generation: monotonic counter bumped by every legal
+    ``_transition`` edge."""
+
+    def test_fresh_account_generation_is_zero(self):
+        gate = make_gate(['a'])
+        assert gate._accounts[0].generation == 0
+
+    def test_transition_bumps_generation_monotonically(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        g0 = acct.generation
+
+        gate._transition(
+            acct, AccountPhase.CAPPED,
+            resets_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        assert acct.generation == g0 + 1
+
+        gate._transition(acct, AccountPhase.PROBING)
+        assert acct.generation == g0 + 2
+
+
+# =========================================================================
+# TestAccountLease — frozen (name, token, generation) snapshot of the
+# account selected by before_invoke() (PRD §7.4, task W4-δ). Not added to
+# usage_gate.__all__ (see the NOTE near that list) — imported explicitly.
+# =========================================================================
+
+
+class TestAccountLease:
+    """AccountLease: frozen, hashable dataclass with name/token/generation."""
+
+    def test_fields(self):
+        lease = AccountLease(name='a', token='fake-token-a', generation=0)
+        assert lease.name == 'a'
+        assert lease.token == 'fake-token-a'
+        assert lease.generation == 0
+
+    def test_frozen(self):
+        lease = AccountLease(name='a', token='fake-token-a', generation=0)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            lease.name = 'b'  # type: ignore[misc]
+
+    def test_hashable(self):
+        lease = AccountLease(name='a', token='fake-token-a', generation=0)
+        other = AccountLease(name='a', token='fake-token-a', generation=0)
+        assert hash(lease) == hash(other)
+
+
+# =========================================================================
+# TestBeforeInvokeReturnsLease — before_invoke() returns an AccountLease
+# (not a bare token) whose name/token/generation match the account it
+# actually selected, across every selection branch (PRD §7.4, task W4-δ).
+# =========================================================================
+
+
+@pytest.mark.asyncio
+class TestBeforeInvokeReturnsLease:
+    async def test_first_available_returns_lease(self):
+        gate = make_gate(['a', 'b'])
+        lease = await gate.before_invoke()
+        assert isinstance(lease, AccountLease)
+        assert lease.name == 'a'
+        assert lease.token == 'fake-token-a'
+        assert lease.generation == gate._accounts[0].generation
+
+    async def test_skip_capped_returns_lease_for_next_account(self):
+        gate = make_gate(['a', 'b'])
+        gate._accounts[0].capped = True
+        lease = await gate.before_invoke()
+        assert isinstance(lease, AccountLease)
+        assert lease.name == 'b'
+        assert lease.token == 'fake-token-b'
+        assert lease.generation == gate._accounts[1].generation
+
+    async def test_skip_probe_in_flight_returns_lease_for_next_account(self):
+        gate = make_gate(['a', 'b'])
+        gate._accounts[0].probe_in_flight = True
+        lease = await gate.before_invoke()
+        assert isinstance(lease, AccountLease)
+        assert lease.name == 'b'
+        assert lease.token == 'fake-token-b'
+        assert lease.generation == gate._accounts[1].generation
+
+    async def test_probe_claim_returns_lease(self):
+        gate = make_gate(['a'])
+        gate._accounts[0].probing = True
+        lease = await gate.before_invoke()
+        assert isinstance(lease, AccountLease)
+        assert lease.name == 'a'
+        assert lease.token == 'fake-token-a'
+        assert gate._accounts[0].probe_in_flight is True
+        # The lease is built AFTER the PROBING -> PROBE_IN_FLIGHT claim, so
+        # its generation snapshot must reflect that transition's bump.
+        assert lease.generation == gate._accounts[0].generation
+
+
+# =========================================================================
+# TestInvokeSlotLease — the real InvokeSlot (via gate.invoke_slot()) carries
+# an AccountLease; token/account_name are read-only properties derived from
+# it rather than independently re-resolved (PRD §7.4, task W4-δ).
+# =========================================================================
+
+
+@pytest.mark.asyncio
+class TestInvokeSlotLease:
+    async def test_invoke_slot_carries_lease(self):
+        gate = make_gate(['a'])
+        async with gate.invoke_slot() as slot:
+            assert isinstance(slot.lease, AccountLease)
+            assert slot.account_name == slot.lease.name
+            assert slot.token == slot.lease.token
+
+
+# =========================================================================
+# TestB5AttributionSkew — boundary test B5 / finding 3: with account[0] in
+# PROBE_IN_FLIGHT and account[1] handed to the caller, the account NAMED
+# for attribution must match the account INVOKED WITH. Before this fix,
+# InvokeSlot re-derived account_name from active_account_name, whose
+# predicate (`not capped and not auth_failed`) omits probe_in_flight, so it
+# named account[0] while slot.token (and now slot.lease) named account[1].
+# =========================================================================
+
+
+@pytest.mark.asyncio
+class TestB5AttributionSkew:
+    async def test_pure_gate_skew(self):
+        gate = make_gate(['a', 'b'])
+        gate._accounts[0].probe_in_flight = True
+        async with gate.invoke_slot() as slot:
+            assert isinstance(slot.lease, AccountLease)
+            assert slot.lease.name == 'b'
+            assert slot.account_name == 'b'
+            assert slot.token == 'fake-token-b'
+
+    async def test_cost_store_records_invoked_account_not_probe_in_flight_one(self):
+        cost_store = make_mock_cost_store()
+        gate = make_gate(['a', 'b'])
+        gate._accounts[0].probe_in_flight = True
+
+        async def stub_invoke_fn(**kwargs) -> AgentResult:
+            return AgentResult(success=True, output='ok', cost_usd=0.02, turns=3)
+
+        result = await invoke_with_cap_retry(
+            gate,
+            'test-label',
+            cost_store=cost_store,
+            invoke_fn=stub_invoke_fn,
+            prompt='do the thing',
+            model='opus',
+        )
+
+        assert result.success is True
+        cost_store.save_invocation.assert_awaited_once()
+        _, kwargs = cost_store.save_invocation.call_args
+        assert kwargs['account_name'] == 'b'
+
+
+# =========================================================================
+# TestLeaseIsCurrent — gate.lease_is_current(lease) detects a lease gone
+# stale from a mid-flight account re-transition (PRD §7.4, task W4-δ). This
+# is the detectability primitive consumer ε's InvokeSlot.report() Q4
+# log-and-proceed fail-safe hooks into.
+# =========================================================================
+
+
+@pytest.mark.asyncio
+class TestLeaseIsCurrent:
+    async def test_current_lease_then_stale_after_transition(self):
+        gate = make_gate(['a'])
+        async with gate.invoke_slot() as slot:
+            lease = slot.lease
+
+        assert isinstance(lease, AccountLease)
+        acct = gate._accounts[0]
+        assert gate.lease_is_current(lease) is True
+        assert lease.generation == acct.generation
+
+        gate._transition(
+            acct, AccountPhase.CAPPED,
+            resets_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+
+        assert gate.lease_is_current(lease) is False
+        assert lease.generation != acct.generation
