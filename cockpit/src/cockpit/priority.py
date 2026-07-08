@@ -164,9 +164,9 @@ def _priorities_from_dict(data: dict[str, Any]) -> Priorities:
     age_curve_section = data.get('age_curve') or {}
     manual_boost_section = data.get('manual_boost') or {}
     return Priorities(
-        severity_weights=data.get('severity_weights', fallback.severity_weights),
-        category_weights=data.get('category_weights', fallback.category_weights),
-        project_weights=data.get('project_weights', fallback.project_weights),
+        severity_weights=data.get('severity_weights') or fallback.severity_weights,
+        category_weights=data.get('category_weights') or fallback.category_weights,
+        project_weights=data.get('project_weights') or fallback.project_weights,
         defaults=Defaults(
             severity=defaults_section.get('severity', fallback.defaults.severity),
             category=defaults_section.get('category', fallback.defaults.category),
