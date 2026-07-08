@@ -1562,177 +1562,50 @@ async def test_dedup_flags_hit_delete_gated_on_confirmation_not_memory_ids(
 
 
 # ---------------------------------------------------------------------------
-# TestFilterSuppressedLedger (task 2227 step-3) — filter_suppressed reads the
-# ReconLedgerStore's indexed list_suppressions(project_id) query; no Mem0
-# search. RED until step-4 rewrites filter_suppressed onto the ledger, at
-# which point this class folds into TestFilterSuppressed below (replacing its
-# Mem0-search-based body).
-# ---------------------------------------------------------------------------
-
-
-class TestFilterSuppressedLedger:
-    """filter_suppressed(memory_service, project_id, flags) reads
-    ledger.list_suppressions(project_id) — an indexed (project_id,
-    record_kind, state) query — instead of issuing a Mem0 search."""
-
-    @pytest.mark.asyncio
-    async def test_wildcard_row_drops_every_flag_type_for_its_task(
-        self, ledger_memory_service
-    ):
-        """A blanket/wildcard suppression row (flag_type='') drops ALL
-        flag_types for its task_id; an unrelated task's flags are kept."""
-        from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
-
-        flags = [
-            {'task_id': 42, 'flag_type': 'missing_deliverable'},
-            {'task_id': 42, 'flag_type': 'stale_metadata'},
-            {'task_id': 99, 'flag_type': 'missing_deliverable'},
-        ]
-        result = await filter_suppressed(ledger_memory_service, 'p', flags)
-
-        assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
-        ledger_memory_service.search.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_scoped_row_drops_only_matching_flag_type(self, ledger_memory_service):
-        """A scoped suppression row drops only its flag_type, keeping other
-        flag_types for the same task_id."""
-        from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '7', 'cross_project')
-
-        flags = [
-            {'task_id': 7, 'flag_type': 'cross_project'},
-            {'task_id': 7, 'flag_type': 'stale_metadata'},
-        ]
-        result = await filter_suppressed(ledger_memory_service, 'p', flags)
-
-        assert result == [{'task_id': 7, 'flag_type': 'stale_metadata'}]
-        ledger_memory_service.search.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_flag_with_no_flag_type_kept_under_scoped_dropped_under_wildcard(
-        self, ledger_memory_service
-    ):
-        """A flag with no flag_type cannot match a scoped allowlist (kept),
-        but is still dropped by a wildcard row (no flag_type to check against)."""
-        from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '7', 'cross_project')
-        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
-
-        flag_no_type_scoped = {'task_id': 7}
-        flag_no_type_wildcard = {'task_id': 42}
-        result = await filter_suppressed(
-            ledger_memory_service, 'p', [flag_no_type_scoped, flag_no_type_wildcard]
-        )
-
-        assert result == [flag_no_type_scoped]
-
-    @pytest.mark.asyncio
-    async def test_wildcard_wins_when_both_blanket_and_scoped_rows_exist(
-        self, ledger_memory_service
-    ):
-        """When a task has BOTH a scoped row and a blanket/wildcard row, the
-        wildcard wins — every flag_type for that task is dropped."""
-        from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '99', 'some_flag')
-        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '99', '')
-
-        flags = [
-            {'task_id': 99, 'flag_type': 'some_flag'},
-            {'task_id': 99, 'flag_type': 'totally_different'},
-        ]
-        result = await filter_suppressed(ledger_memory_service, 'p', flags)
-
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_unrelated_task_kept(self, ledger_memory_service):
-        """A task with no suppression row at all is never dropped."""
-        from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
-
-        flag = {'task_id': 12345, 'flag_type': 'anything'}
-        result = await filter_suppressed(ledger_memory_service, 'p', [flag])
-
-        assert result == [flag]
-
-    @pytest.mark.asyncio
-    async def test_never_calls_memory_service_search(self, ledger_memory_service):
-        """filter_suppressed must never call memory_service.search — the
-        ledger's indexed query replaces the old project-wide Mem0 search."""
-        from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
-
-        await filter_suppressed(ledger_memory_service, 'p', [{'task_id': 42, 'flag_type': 'x'}])
-
-        ledger_memory_service.search.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# TestFilterSuppressed (task-1186 step-1) — filter_suppressed behavior
+# TestFilterSuppressed (task-1186 step-1; rewritten onto the ledger at task
+# 2227 step-4) — filter_suppressed reads the ReconLedgerStore's indexed
+# list_suppressions(project_id) query; no Mem0 search.
 # ---------------------------------------------------------------------------
 
 
 class TestFilterSuppressed:
     """Tests for filter_suppressed(memory_service, project_id, flags).
 
-    All tests import filter_suppressed from flag_dedup; they will fail with
-    ImportError until the implementation is added in step-2.
+    filter_suppressed reads memory_service.recon_ledger.list_suppressions(
+    project_id) — an indexed (project_id, record_kind, state) query — instead
+    of issuing a Mem0 search (task 2227 step-4).
     """
 
     @pytest.mark.asyncio
-    async def test_empty_flags_returns_empty_no_io(self):
-        """(a) Empty flags input → empty result + zero I/O."""
+    async def test_empty_flags_returns_empty_no_io(self, ledger_memory_service):
+        """(a) Empty flags input → empty result + zero I/O (ledger never queried)."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        memory_service = AsyncMock()
-        result = await filter_suppressed(memory_service, 'p', [])
+        result = await filter_suppressed(ledger_memory_service, 'p', [])
         assert result == []
-        memory_service.search.assert_not_called()
+        ledger_memory_service.search.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_empty_search_results_all_flags_pass_through(self):
-        """(b) Empty search results → all flags pass through unchanged."""
+    async def test_no_suppression_rows_all_flags_pass_through(self, ledger_memory_service):
+        """(b) No suppression rows in the ledger → all flags pass through unchanged."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[])
         flags = [
             {'task_id': 42, 'flag_type': 'missing_deliverable'},
             {'task_id': 99, 'flag_type': 'stale_metadata'},
         ]
-        result = await filter_suppressed(memory_service, 'p', flags)
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
         assert result == flags
 
     @pytest.mark.asyncio
-    async def test_search_called_with_canonical_kwargs(self):
-        """(c) search called with canonical kwargs (project_id, categories, stores, limit, query).
-
-        limit=501 is used internally (not 500) so that genuine overflow can be
-        detected without false positives at the boundary — see filter_suppressed
-        docstring for details.
-        """
+    async def test_never_calls_memory_service_search(self, ledger_memory_service):
+        """filter_suppressed must never call memory_service.search — the
+        ledger's indexed query fully replaces the old project-wide Mem0 search."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[])
-        flags = [{'task_id': 1, 'flag_type': 'missing_deliverable'}]
-        await filter_suppressed(memory_service, 'p', flags)
-
-        memory_service.search.assert_called_once()
-        kwargs = memory_service.search.call_args.kwargs
-        assert kwargs.get('project_id') == 'p'
-        assert kwargs.get('categories') == ['observations_and_summaries']
-        assert kwargs.get('stores') == ['mem0']
-        assert kwargs.get('limit') == 501  # sentinel: request one extra to detect overflow
-        assert 'stage1_flag_suppression' in kwargs.get('query', '')
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
+        await filter_suppressed(ledger_memory_service, 'p', [{'task_id': 42, 'flag_type': 'x'}])
+        ledger_memory_service.search.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1745,203 +1618,140 @@ class TestFilterSuppressed:
         ],
     )
     async def test_suppressed_flag_dropped_and_unrelated_kept(
-        self, flag_task_id, record_task_id
+        self, ledger_memory_service, flag_task_id, record_task_id
     ):
-        """(d) suppression record with matching task_id drops the flag; unrelated flags kept.
+        """(d) blanket suppression row with matching task_id drops the flag;
+        unrelated flags kept.
 
         Parametrized: int-int, int-str, str-int, str-str coercion combinations
-        so that symmetric str() coercion is verified on both sides.
+        so that symmetric str() coercion is verified on both sides (the
+        ledger's task_id column is always TEXT; _seed_suppression stringifies
+        its task_id argument the same way write_suppression_record will).
         """
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        suppression_record = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            'task_id': record_task_id,
-        })
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[suppression_record])
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', record_task_id, '')
 
         suppressed_flag = {'task_id': flag_task_id, 'flag_type': 'missing_deliverable'}
         unrelated_flag = {'task_id': 99, 'flag_type': 'stale_metadata'}
         flags = [suppressed_flag, unrelated_flag]
 
-        result = await filter_suppressed(memory_service, 'p', flags)
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
         assert len(result) == 1
         assert result[0] == unrelated_flag
 
     @pytest.mark.asyncio
-    async def test_wrong_kind_not_treated_as_suppression(self):
-        """(e) result with metadata.kind != 'stage1_flag_suppression' is NOT treated as suppression.
-
-        Canonical-schema enforcement: vector-search near-miss must be rejected.
-        The flag must pass through unchanged.
-        """
+    async def test_row_with_empty_task_id_ignored(self, ledger_memory_service):
+        """(f) A suppression row with an empty task_id is ignored — it can
+        never match a flag (mirrors the old producer-side empty-task_id guard)."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        near_miss_record = _make_memory_result({
-            'kind': 'some_other_kind',
-            'task_id': 42,
-        })
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[near_miss_record])
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '', '')
 
         flags = [{'task_id': 42, 'flag_type': 'missing_deliverable'}]
-        result = await filter_suppressed(memory_service, 'p', flags)
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
         assert len(result) == 1
         assert result[0] == flags[0]
 
     @pytest.mark.asyncio
-    async def test_correct_kind_but_no_task_id_key_ignored(self):
-        """(f) result with metadata.kind correct but no task_id key → ignored, flag passes through."""
-        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+    @pytest.mark.parametrize(
+        'seeded_task_id,label',
+        [
+            (None, 'empty_set'),
+            ('None', 'none_string_in_set'),
+            ('42', 'other_valid_id_in_set'),
+        ],
+        ids=['empty_set', 'none_string_in_set', 'other_valid_id_in_set'],
+    )
+    async def test_flag_with_none_task_id_never_dropped(
+        self, ledger_memory_service, seeded_task_id, label
+    ):
+        """(h) flag with task_id=None is never suppressed regardless of ledger contents.
 
-        no_task_id_record = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            # 'task_id' key intentionally absent
-        })
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[no_task_id_record])
-
-        flags = [{'task_id': 42, 'flag_type': 'missing_deliverable'}]
-        result = await filter_suppressed(memory_service, 'p', flags)
-        assert len(result) == 1
-        assert result[0] == flags[0]
-
-    @pytest.mark.asyncio
-    async def test_metadata_none_guard_does_not_crash(self):
-        """(g) result with metadata=None → defensive (r.metadata or {}) guard, doesn't crash, flag passes through."""
-        from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-        null_metadata_record = _make_memory_result(None)
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[null_metadata_record])
-
-        flags = [{'task_id': 42, 'flag_type': 'missing_deliverable'}]
-        result = await filter_suppressed(memory_service, 'p', flags)
-        assert len(result) == 1
-        assert result[0] == flags[0]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize('suppression_records,label', [
-        ([], 'empty_set'),
-        (
-            [_make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': 'None'})],
-            'none_string_in_set',
-        ),
-        (
-            [_make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': 42})],
-            'other_valid_id_in_set',
-        ),
-    ], ids=['empty_set', 'none_string_in_set', 'other_valid_id_in_set'])
-    async def test_flag_with_none_task_id_never_dropped(self, suppression_records, label):
-        """(h) flag with task_id=None is never suppressed regardless of suppression set contents.
-
-        The consumer-side guard short-circuits to 'keep' when flag_tid is None,
-        regardless of what is in the suppressed_task_ids set.  This is symmetric
-        with the producer-side suppression-record guard that skips None/empty
-        task_ids when building the suppressed set.
-
-        Three cases are parametrized to express the invariant directly:
-        - empty_set: trivially preserved (no suppression records at all)
-        - none_string_in_set: 'None' as a literal string passes the producer
-          guard; without the consumer guard, str(None) == 'None' would drop
+        The consumer-side guard short-circuits to 'keep' when flag_tid is
+        None, regardless of what rows exist in the ledger.  Three cases:
+        - empty_set: trivially preserved (no suppression rows at all).
+        - none_string_in_set: a row with the literal string task_id='None'
+          exists; without the consumer guard, str(None) == 'None' would drop
           the flag — this is the key regression scenario.
-        - other_valid_id_in_set: a real suppression id (42) must not suppress
-          a flag whose task_id is None.
+        - other_valid_id_in_set: a real suppression row (task_id='42') must
+          not suppress a flag whose task_id is None.
         """
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=suppression_records)
+        if seeded_task_id is not None:
+            await _seed_suppression(ledger_memory_service.recon_ledger, 'p', seeded_task_id, '')
 
-        # Flag whose task_id key is present but set to Python None.
-        flag_with_None_task_id = {'task_id': None, 'flag_type': 'missing_deliverable'}
-        flags = [flag_with_None_task_id]
+        flag_with_none_task_id = {'task_id': None, 'flag_type': 'missing_deliverable'}
+        result = await filter_suppressed(ledger_memory_service, 'p', [flag_with_none_task_id])
 
-        result = await filter_suppressed(memory_service, 'p', flags)
-
-        # The flag must always be preserved — task_id=None is not a valid suppression target.
-        assert len(result) == 1, (
-            f'[{label}] Expected flag with task_id=None to be preserved but result was: {result}'
-        )
-        assert result[0] == flag_with_None_task_id, (
-            f'[{label}] Preserved flag differs from input: {result[0]}'
+        assert result == [flag_with_none_task_id], (
+            f'[{label}] Expected flag with task_id=None to be preserved but got: {result}'
         )
 
     # -----------------------------------------------------------------
-    # Scoped (task_id, flag_type) suppression — task-1966 step-3
-    #
-    # RED until step-4 rewrites filter_suppressed's matching to a
-    # task_id -> (wildcard | flag_types-set) map.
+    # Scoped (task_id, flag_type) suppression — task-1966, ledger-backed
     # -----------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_scoped_record_drops_only_matching_flag_type(self):
-        """(a) A SCOPED suppression record drops only its listed flag_type(s),
-        keeping other flag_types for the same task_id — the core fix."""
+    async def test_scoped_row_drops_only_matching_flag_type(self, ledger_memory_service):
+        """(a) A SCOPED suppression row drops only its flag_type, keeping
+        other flag_types for the same task_id — the core fix."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        scoped_record = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            'task_id': 452,
-            'flag_types': ['human_review_required_deferred'],
-        })
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[scoped_record])
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '452', 'human_review_required_deferred'
+        )
 
         suppressed_flag = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
         surviving_flag = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}
-        result = await filter_suppressed(memory_service, 'p', [suppressed_flag, surviving_flag])
+        result = await filter_suppressed(
+            ledger_memory_service, 'p', [suppressed_flag, surviving_flag]
+        )
 
         assert result == [surviving_flag]
 
     @pytest.mark.asyncio
-    async def test_legacy_record_still_blanket_drops_all_flag_types(self):
-        """(b) A LEGACY record (no flag_types key) still blanket-drops ALL
-        flag_types for that task_id — backward compat, mirrors
-        test_suppressed_flag_dropped_and_unrelated_kept."""
+    async def test_wildcard_row_still_blanket_drops_all_flag_types(self, ledger_memory_service):
+        """(b) A blanket/wildcard row (flag_type='') still drops ALL
+        flag_types for that task_id — backward-compat with the legacy shape."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        legacy_record = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            'task_id': 452,
-        })
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[legacy_record])
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '452', '')
 
         flag_a = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
         flag_b = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}
-        result = await filter_suppressed(memory_service, 'p', [flag_a, flag_b])
+        result = await filter_suppressed(ledger_memory_service, 'p', [flag_a, flag_b])
 
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_absent_flag_type_kept_against_scoped_but_dropped_against_legacy(self):
+    async def test_absent_flag_type_kept_against_scoped_but_dropped_against_wildcard(
+        self, ledger_memory_service, tmp_path
+    ):
         """(c) A flag whose flag_type is None/absent cannot match a specific
-        flag_type, so it is KEPT against a scoped record — but a legacy
-        blanket record still drops it (no flag_type to check against)."""
+        flag_type, so it is KEPT against a scoped row — but a wildcard row
+        still drops it (no flag_type to check against)."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
         flag_no_type = {'task_id': 452}  # flag_type key intentionally absent
 
-        scoped_record = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            'task_id': 452,
-            'flag_types': ['human_review_required_deferred'],
-        })
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[scoped_record])
-        result = await filter_suppressed(memory_service, 'p', [flag_no_type])
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', '452', 'human_review_required_deferred'
+        )
+        result = await filter_suppressed(ledger_memory_service, 'p', [flag_no_type])
         assert result == [flag_no_type], 'flag_type=None cannot match a scoped allowlist'
 
-        legacy_record = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            'task_id': 452,
-        })
-        memory_service_legacy = AsyncMock()
-        memory_service_legacy.search = AsyncMock(return_value=[legacy_record])
-        result2 = await filter_suppressed(memory_service_legacy, 'p', [flag_no_type])
-        assert result2 == [], 'legacy blanket record must still drop a flag with no flag_type'
+        wildcard_ledger = ReconLedgerStore(tmp_path / 'wildcard_reconciliation.db')
+        await wildcard_ledger.initialize()
+        try:
+            await _seed_suppression(wildcard_ledger, 'p', '452', '')
+            wildcard_service = AsyncMock()
+            wildcard_service.recon_ledger = wildcard_ledger
+            result2 = await filter_suppressed(wildcard_service, 'p', [flag_no_type])
+            assert result2 == [], 'wildcard row must still drop a flag with no flag_type'
+        finally:
+            await wildcard_ledger.close()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1953,191 +1763,55 @@ class TestFilterSuppressed:
             pytest.param('452', '452', id='str-str'),
         ],
     )
-    async def test_scoped_record_task_id_coercion(self, flag_task_id, record_task_id):
-        """(d) task_id str/int coercion still applies with scoped records."""
+    async def test_scoped_row_task_id_coercion(
+        self, ledger_memory_service, flag_task_id, record_task_id
+    ):
+        """(d) task_id str/int coercion still applies with scoped rows."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        scoped_record = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            'task_id': record_task_id,
-            'flag_types': ['human_review_required_deferred'],
-        })
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=[scoped_record])
+        await _seed_suppression(
+            ledger_memory_service.recon_ledger, 'p', record_task_id, 'human_review_required_deferred'
+        )
 
         suppressed_flag = {'task_id': flag_task_id, 'flag_type': 'human_review_required_deferred'}
-        result = await filter_suppressed(memory_service, 'p', [suppressed_flag])
+        result = await filter_suppressed(ledger_memory_service, 'p', [suppressed_flag])
         assert result == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'record_order',
         [
-            pytest.param('scoped_first', id='scoped-then-legacy'),
-            pytest.param('legacy_first', id='legacy-then-scoped'),
+            pytest.param('scoped_first', id='scoped-then-wildcard'),
+            pytest.param('wildcard_first', id='wildcard-then-scoped'),
         ],
     )
-    async def test_scoped_and_legacy_records_for_same_task_id_union_to_blanket(
-        self, record_order
+    async def test_scoped_and_wildcard_rows_for_same_task_id_union_to_blanket(
+        self, ledger_memory_service, record_order
     ):
-        """(e) One scoped + one legacy-blanket record for the same task_id
-        results in blanket suppression (union semantics: wildcard wins),
-        regardless of which order Mem0's search returns them in — result
-        ordering is nondeterministic in practice, so both orders occur.
+        """(e) One scoped + one wildcard row for the same task_id results in
+        blanket suppression (union semantics: wildcard wins), regardless of
+        upsert/iteration order — SQLite gives no ordering guarantee without
+        ORDER BY, so both orders occur in practice.
 
-        'legacy-then-scoped' exercises the wildcard-already-present
+        'wildcard-then-scoped' exercises the wildcard-already-present
         short-circuit branch (``if tid_str in suppressed and
-        suppressed[tid_str] is None: continue``), which 'scoped-then-legacy'
-        never reaches (the scoped record's ``set`` is simply overwritten by
-        the legacy record's wildcard in that order)."""
+        suppressed[tid_str] is None: continue``), which 'scoped-then-wildcard'
+        never reaches (the scoped row's ``set`` is simply overwritten by the
+        wildcard row in that order)."""
         from fused_memory.reconciliation.flag_dedup import filter_suppressed
 
-        scoped_record = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            'task_id': 452,
-            'flag_types': ['human_review_required_deferred'],
-        })
-        legacy_record = _make_memory_result({
-            'kind': 'stage1_flag_suppression',
-            'task_id': 452,
-        })
-        records = (
-            [scoped_record, legacy_record]
-            if record_order == 'scoped_first'
-            else [legacy_record, scoped_record]
-        )
-        memory_service = AsyncMock()
-        memory_service.search = AsyncMock(return_value=records)
+        ledger = ledger_memory_service.recon_ledger
+        if record_order == 'scoped_first':
+            await _seed_suppression(ledger, 'p', '452', 'human_review_required_deferred')
+            await _seed_suppression(ledger, 'p', '452', '')
+        else:
+            await _seed_suppression(ledger, 'p', '452', '')
+            await _seed_suppression(ledger, 'p', '452', 'human_review_required_deferred')
 
         flag_a = {'task_id': 452, 'flag_type': 'human_review_required_deferred'}
         flag_b = {'task_id': 452, 'flag_type': 'live_workflow_recurrence_counter_needed'}
-        result = await filter_suppressed(memory_service, 'p', [flag_a, flag_b])
+        result = await filter_suppressed(ledger_memory_service, 'p', [flag_a, flag_b])
         assert result == []
-
-
-# ---------------------------------------------------------------------------
-# task-1186 step-3 — filter_suppressed: search exception → pass-through + WARNING
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_filter_suppressed_search_exception_returns_flags_unchanged_and_warns(caplog):
-    """Search exception in filter_suppressed → conservative pass-through + WARNING.
-
-    When memory_service.search raises, filter_suppressed must:
-    (a) NOT raise
-    (b) return both flags unchanged
-    (c) emit at least one WARNING log mentioning the failure and the function name
-    """
-    import logging
-
-    from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(side_effect=RuntimeError('Mem0 down'))
-
-    flags = [
-        {'task_id': '55', 'flag_type': 'stale_metadata'},
-        {'task_id': '66', 'flag_type': 'missing_deliverable'},
-    ]
-
-    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
-        result = await filter_suppressed(memory_service, 'p', flags)
-
-    # (a) Does NOT raise
-    # (b) Returns both flags unchanged
-    assert result == flags
-    # (c) At least one WARNING log mentions failure and filter_suppressed
-    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any(
-        'filter_suppressed' in m
-        for m in warning_messages
-    ), f'Expected WARNING mentioning filter_suppressed but got: {warning_messages}'
-
-
-# ---------------------------------------------------------------------------
-# task-1188 step-3 — filter_suppressed: saturation WARNING at limit=500
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_filter_suppressed_warns_when_search_results_saturate_limit(caplog):
-    """filter_suppressed emits WARNING when search returns > 500 records (true overflow).
-
-    The search uses limit=501 internally so that exactly-500-result sets are
-    not false-positive warned.  501 results confirm the real set is larger than
-    500 and genuine truncation is occurring.  Operators need a WARNING so
-    dashboards can alert on incomplete coverage.
-
-    Asserts:
-    (a) At least one WARNING is emitted.
-    (b) The WARNING message mentions the project_id ('proj_saturation').
-    (c) The WARNING message contains '500', 'saturat', or 'truncat' to signal the
-        saturation condition without pinning exact wording.
-    (d) The non-suppressed flag (task_id=9999) is preserved in the result — a
-        regression where saturation swallowed all flags would be caught here.
-    """
-    import logging
-
-    from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-    records_501 = [
-        _make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': i})
-        for i in range(501)
-    ]
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=records_501)
-
-    flags = [{'task_id': 9999, 'flag_type': 'missing_deliverable'}]
-
-    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
-        result = await filter_suppressed(memory_service, 'proj_saturation', flags)
-
-    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any(
-        'proj_saturation' in m for m in warning_messages
-    ), f'Expected WARNING mentioning project_id but got: {warning_messages}'
-    assert any(
-        ('500' in m or 'saturat' in m or 'truncat' in m)
-        for m in warning_messages
-    ), f'Expected WARNING signalling saturation condition but got: {warning_messages}'
-    # (d) Non-suppressed flag must pass through even at the saturation boundary.
-    assert result == flags, (
-        f'Expected non-suppressed flag to be preserved at saturation but got: {result}'
-    )
-
-
-@pytest.mark.asyncio
-async def test_filter_suppressed_does_not_warn_when_search_results_below_limit(caplog):
-    """filter_suppressed does NOT emit saturation WARNING when results count is <= 500.
-
-    Negative test: prevents accidental always-on logging.  500 results (the
-    effective business limit) must NOT trigger the saturation signal — only
-    501+ (genuine overflow) should warn.  This eliminates the false-positive
-    boundary case that would otherwise fire whenever a project has exactly 500
-    active suppression records with no truncation occurring.
-    """
-    import logging
-
-    from fused_memory.reconciliation.flag_dedup import filter_suppressed
-
-    records_500 = [
-        _make_memory_result({'kind': 'stage1_flag_suppression', 'task_id': i})
-        for i in range(500)
-    ]
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=records_500)
-
-    flags = [{'task_id': 9999, 'flag_type': 'missing_deliverable'}]
-
-    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
-        await filter_suppressed(memory_service, 'proj_below', flags)
-
-    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-    assert not any(
-        ('500' in m or 'saturat' in m or 'truncat' in m)
-        for m in warning_messages
-    ), f'Unexpected saturation WARNING with 500 results: {warning_messages}'
 
 
 # ---------------------------------------------------------------------------
