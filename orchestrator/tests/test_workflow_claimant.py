@@ -106,6 +106,10 @@ async def test_dispatch_stamps_claimant_run_id_and_heartbeat(tmp_path: Path):
         heartbeat_at=fixed_now.isoformat(),
     )
 
+    # _setup started the background heartbeat loop; stop it so the test does
+    # not leak a pending task (run()'s finally owns this in production).
+    await wf._stop_claimant_heartbeat()
+
 
 @pytest.mark.asyncio
 async def test_dispatch_stamp_embeds_run_id_session_id_and_pid(tmp_path: Path):
@@ -119,6 +123,10 @@ async def test_dispatch_stamp_embeds_run_id_session_id_and_pid(tmp_path: Path):
     assert 'run-xyz789' in claimant_run_id
     assert wf.session_id in claimant_run_id
     assert f'pid={os.getpid()}' in claimant_run_id
+
+    # _setup started the background heartbeat loop; stop it so the test does
+    # not leak a pending task (run()'s finally owns this in production).
+    await wf._stop_claimant_heartbeat()
 
 
 # ---------------------------------------------------------------------------
