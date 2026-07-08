@@ -739,7 +739,9 @@ class TestProbeConfigDirIsolation:
         captured_envs: list[dict] = []
 
         async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
-            captured_envs.append(kwargs.get('env'))
+            env = kwargs.get('env')
+            assert isinstance(env, dict)
+            captured_envs.append(env)
             proc = MagicMock()
             proc.returncode = 0
             proc.communicate = AsyncMock(return_value=(b'{"ok":true}', b''))
@@ -772,15 +774,21 @@ class TestProbeConfigDirIsolation:
         .cleanup() (a single dir), so the 'personal' dir is never cleaned.
         """
         gate = make_gate(['work', 'personal'])
-        for name in ('work', 'personal'):
-            gate._probe_config_dirs[name] = MagicMock()
+        # Keep mocks in a MagicMock-typed local dict — pyright can't narrow
+        # gate._probe_config_dirs[name] past its declared TaskConfigDir
+        # value type when the assignment key is a loop variable, so asserting
+        # through the dict-of-TaskConfigDir directly resolves .cleanup as the
+        # real bound method rather than the mock.
+        mocks = {name: MagicMock() for name in ('work', 'personal')}
+        for name, mock in mocks.items():
+            gate._probe_config_dirs[name] = mock
         # Keep the back-compat alias consistent with the (mocked) dict.
         gate._probe_config_dir = gate._probe_config_dirs['work']
 
         await gate.shutdown()
 
-        gate._probe_config_dirs['work'].cleanup.assert_called_once()
-        gate._probe_config_dirs['personal'].cleanup.assert_called_once()
+        mocks['work'].cleanup.assert_called_once()
+        mocks['personal'].cleanup.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
