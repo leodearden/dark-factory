@@ -163,6 +163,9 @@ async def test_orchestrator_done_provenance_all_kinds_accepted_by_backend(
 
     task = await backend.get_task(dto['id'], project_root=project_root)
     assert task['metadata']['done_provenance']['kind'] == kind
+    # Full dict survives byte-for-value — a consumer that silently dropped
+    # or mangled a non-kind field (commit/note/pid/unit) must not pass.
+    assert task['metadata']['done_provenance'] == built
 
 
 # ── Row 3 — consumer/write negative: symmetric rejection ─────────────
