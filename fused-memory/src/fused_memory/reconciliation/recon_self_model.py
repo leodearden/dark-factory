@@ -29,6 +29,7 @@ therefore does not modify, and is not yet imported by, any prompt file.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from fused_memory.reconciliation.recon_pool_map import (
@@ -359,3 +360,74 @@ def markers_deleted_only_by_gc() -> bool:
     performs.
     """
     return True
+
+
+# --------------------------------------------------------------------------- #
+# premise_lint
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Violation:
+    """One detected false-premise match in a task description.
+
+    ``invariant`` names the assertable predicate (e.g.
+    ``'run_id_is_fresh_per_run'``) defined in this module that the matched
+    premise contradicts.
+    """
+
+    premise: str
+    invariant: str
+    detail: str
+
+
+# Module-level rule table for premise_lint: (compiled case-insensitive
+# regex, invariant_name, detail). Each rule encodes one known-false premise
+# from the 2083/2092/2093 false-premise batch, which mis-modeled run_id and
+# stage1_flag_marker lifecycle. Extend this table as new false premises are
+# discovered; premise_lint returns one Violation per matching rule.
+_PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (
+        re.compile(
+            r'run_id\s+(?:persists?|is\s+persist(?:ed|ent)|stable|the\s+same)'
+            r'\s+across\s+(?:cycles|runs)',
+            re.IGNORECASE,
+        ),
+        'run_id_is_fresh_per_run',
+        (
+            'run_id is minted fresh per run and is never persisted across '
+            'cycles (see render_marker_lifecycle_section()) — it is not a '
+            'stable, cross-cycle identifier.'
+        ),
+    ),
+    (
+        re.compile(
+            r'(?:stage\s*3|remediation|the\s+llm)[^.]*\bdeletes?\b[^.]*'
+            r'\b(?:flag_for_stage2|flag\s+marker|stage1_flag_marker|marker)\b',
+            re.IGNORECASE,
+        ),
+        'markers_deleted_only_by_gc',
+        (
+            'Per-task markers (stage1_flag_marker, flag_for_stage2, '
+            'stage2_persistence_marker) are deleted only by GC on terminal '
+            'task (or TTL) — never by Stage 3 remediation or the LLM.'
+        ),
+    ),
+)
+
+
+def premise_lint(task_description: str) -> list[Violation]:
+    """Scan *task_description* for known-false premises about recon's
+    control-plane mechanisms, returning one :class:`Violation` per match.
+
+    Pure, sync, no I/O — driven entirely by :data:`_PREMISE_RULES`. An empty
+    return means no KNOWN false premise was detected; it is not a proof the
+    description is otherwise correct.
+    """
+    violations: list[Violation] = []
+    for pattern, invariant, detail in _PREMISE_RULES:
+        if pattern.search(task_description):
+            violations.append(
+                Violation(premise=task_description, invariant=invariant, detail=detail)
+            )
+    return violations
