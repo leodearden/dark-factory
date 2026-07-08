@@ -686,6 +686,39 @@ class TestUsageGateProbeExitCodeClassification:
 
 
 # ---------------------------------------------------------------------------
+# Probe config-dir isolation per (account, pid) — task 2139 (PRD §6 task θ,
+# finding 5 cheap-now half). Concurrent probes across the ~6-process fleet,
+# and the SIGHUP parallel all-account probe gather within one process, must
+# not share a single .credentials.json — each (account, pid) pair gets its
+# own TaskConfigDir.
+# ---------------------------------------------------------------------------
+
+
+class TestProbeConfigDirIsolation:
+    """Per-(account, pid) probe config dirs — steps 1/3/5 (task 2139)."""
+
+    def test_config_dir_for_differs_per_account(self):
+        gate = make_gate(['work', 'personal'])
+        work, personal = gate._accounts
+
+        assert gate._config_dir_for(work).path != gate._config_dir_for(personal).path
+
+    def test_config_dir_name_contains_account_name_and_pid(self):
+        gate = make_gate(['work', 'personal'])
+        pid = os.getpid()
+
+        for acct in gate._accounts:
+            config_dir = gate._config_dir_for(acct)
+            assert config_dir.path.name == f'claude-config-usage-gate-probe-{acct.name}-{pid}'
+            # Must not collapse back onto the old shared, unqualified dir.
+            assert config_dir.path.name != 'claude-config-usage-gate-probe'
+
+    def test_probe_config_dirs_dict_keyed_by_account_name(self):
+        gate = make_gate(['work', 'personal'])
+        assert set(gate._probe_config_dirs.keys()) == {'work', 'personal'}
+
+
+# ---------------------------------------------------------------------------
 # wait_for_open — used by curator worker for AllAccountsCappedException defer
 # ---------------------------------------------------------------------------
 
