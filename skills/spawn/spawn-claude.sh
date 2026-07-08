@@ -190,13 +190,24 @@ _claude_descendant_alive() {
 
   local -A ppid_of=()
   local -a claude_pids=()
-  local pid ppid comm
+  local pid ppid rest tok1 tok2 discard
 
-  while read -r pid ppid comm; do
+  while read -r pid ppid rest; do
     [ -n "$pid" ] || continue
     ppid_of["$pid"]="$ppid"
-    [ "$comm" = "claude" ] && claude_pids+=("$pid")
-  done < <(ps -eo pid=,ppid=,comm= 2>/dev/null)
+    # A real `claude` CLI is commonly a shebang wrapper (e.g. node/bash), in
+    # which case `comm` reports the INTERPRETER, not "claude" -- the kernel
+    # rewrites the exec to run the interpreter with the script's own path as
+    # an argument (empirically verified: a `#!/usr/bin/env bash` script named
+    # `claude` reports comm=bash, args="bash /path/to/claude"). Match on the
+    # first two whitespace-separated tokens of the full command line instead,
+    # covering both a raw `claude` binary (tok1) and an interpreter+script
+    # pair (tok2), by comparing each token's basename.
+    read -r tok1 tok2 discard <<<"$rest"
+    if [ "${tok1##*/}" = "claude" ] || [ "${tok2##*/}" = "claude" ]; then
+      claude_pids+=("$pid")
+    fi
+  done < <(ps -eo pid=,ppid=,args= 2>/dev/null)
 
   local cand anc hops
   for cand in "${claude_pids[@]}"; do
