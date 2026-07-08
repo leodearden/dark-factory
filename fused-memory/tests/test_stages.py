@@ -13,6 +13,7 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_MEMORY_WRITES,
@@ -74,9 +75,6 @@ def _extract_section(payload: str, header: str) -> str:
     if end == -1:
         end = len(payload)
     return payload[start:end]
-
-
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 
 
 def _scope(project_id: str, project_root: str) -> ProjectScope:

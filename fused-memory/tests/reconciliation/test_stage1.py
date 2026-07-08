@@ -1082,8 +1082,10 @@ class TestMemoryConsolidatorRunWiring:
 
         RED before step-6: run() does not set this stat at all (task-2312 step-5).
         """
+        # project_id='test_project' is already set via the scope passed into
+        # _make_consolidator (task 2146) — project_id is now a read-only
+        # property, so the old post-construction assignment is deleted.
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
 
         plain_flag = {
             'task_id': '100',
@@ -1128,8 +1130,10 @@ class TestMemoryConsolidatorRunWiring:
 
         RED before step-6: run() does not set this stat at all (task-2312 step-5).
         """
+        # project_id='test_project' is already set via the scope passed into
+        # _make_consolidator (task 2146) — project_id is now a read-only
+        # property, so the old post-construction assignment is deleted.
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.project_id = 'test_project'
 
         completion_flag = {
             'task_id': '77',

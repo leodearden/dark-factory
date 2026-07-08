@@ -111,7 +111,7 @@ class TestBaseStageScopeContract:
     def test_stub_stage_without_scope_raises_type_error(self):
         """scope is a required keyword-only argument — omitting it is a TypeError."""
         with pytest.raises(TypeError):
-            _StubStage(*_minimal_ctor_args())
+            _StubStage(*_minimal_ctor_args())  # type: ignore[call-arg]
 
     def test_memory_consolidator_without_scope_raises_type_error(self):
         """The contract propagates through MemoryConsolidator's *args/**kwargs forward."""
@@ -129,13 +129,17 @@ class TestBaseStageScopeContract:
         scope = ProjectScope(ProjectId('p'), ProjectRoot('/root'))
         stage = _StubStage(*_minimal_ctor_args(), scope=scope)
         with pytest.raises(AttributeError):
-            stage.project_id = 'x'
+            # setattr, not a direct attribute assignment, so this stays pyright-clean
+            # (a direct assignment to a read-only property is reportAttributeAccessIssue).
+            setattr(stage, 'project_id', 'x')  # noqa: B010
 
     def test_project_root_has_no_setter(self):
         scope = ProjectScope(ProjectId('p'), ProjectRoot('/root'))
         stage = _StubStage(*_minimal_ctor_args(), scope=scope)
         with pytest.raises(AttributeError):
-            stage.project_root = 'y'
+            # setattr, not a direct attribute assignment, so this stays pyright-clean
+            # (a direct assignment to a read-only property is reportAttributeAccessIssue).
+            setattr(stage, 'project_root', 'y')  # noqa: B010
 
     def test_known_projects_defaults_to_empty_dict(self):
         scope = ProjectScope(ProjectId('p'), ProjectRoot('/root'))
