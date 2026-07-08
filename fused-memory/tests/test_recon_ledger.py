@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.server import main as server_main
 
 EXPECTED_COLUMNS = {
     'project_id',
@@ -432,3 +433,24 @@ async def test_mark_addressed_on_missing_identity_is_noop(store):
         'proj-missing', 'stage1_flag_marker', task_id='task-none', flag_type='drift_flag', run_id='run-none'
     )
     assert fetched is None
+
+
+@pytest.mark.asyncio
+async def test_build_recon_ledger_store_initializes_schema(tmp_path):
+    """server.main._build_recon_ledger_store() builds and initializes a
+    ReconLedgerStore against data_dir/'reconciliation.db' (step-19)."""
+    built_store = await server_main._build_recon_ledger_store(tmp_path)
+    try:
+        assert isinstance(built_store, ReconLedgerStore)
+        db_file = tmp_path / 'reconciliation.db'
+        assert db_file.exists()
+
+        db = built_store._db
+        assert db is not None
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='recon_ledger'"
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+    finally:
+        await built_store.close()
