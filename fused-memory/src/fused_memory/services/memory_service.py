@@ -78,6 +78,38 @@ def _is_dependency_fact(fact: str | None) -> bool:
     return bool(fact) and _DEPENDENCY_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
 
 
+# Priority-override facts carry several independent sub-attributes (e.g.
+# boost_tier, pinned, reserve_now, TTL) that legitimately coexist as distinct
+# valid edges on the same entity. Matching on the "priority override" phrase
+# alone would treat all of those sub-attributes as one single-valued
+# predicate and wrongly invalidate one when another is written — recreating
+# the over-invalidation failure mode task 2111 fixed. Requiring BOTH tokens
+# restricts this classifier to the genuinely single-valued TTL scalar named
+# in the task 2265 incident, used by
+# ``_invalidate_stale_superseded_ttl_edges`` to identify same-subject
+# contradictions that Graphiti's upstream edge-resolver under-invalidated.
+_PRIORITY_OVERRIDE_TTL_FACT_RE = re.compile(
+    r'\bpriority[-\s]+override\b.*\bTTL\b|\bTTL\b.*\bpriority[-\s]+override\b',
+    re.I | re.S,
+)
+
+
+def _is_priority_override_ttl_fact(fact: str | None) -> bool:
+    """Return True when *fact* expresses a priority-override TTL value.
+
+    Requires BOTH a ``priority[-\\s]+override`` phrase AND a ``TTL`` token
+    (case-insensitive, in either order) — see
+    ``_PRIORITY_OVERRIDE_TTL_FACT_RE`` for why both are required. The
+    separator allows one-or-more hyphen/whitespace characters (not just a
+    single hyphen or ASCII space) so LLM-generated free text with double
+    spaces, newlines, or other Unicode whitespace between the two words is
+    still classified correctly.
+    """
+    return (
+        bool(fact) and _PRIORITY_OVERRIDE_TTL_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
+    )
+
+
 # Canonical stage -> recon_pool map for per-cycle reconciliation summaries
 # (metadata.kind == 'cycle_summary'), imported above from the leaf module
 # reconciliation/recon_pool_map.py (task 2140) so this map and the per-stage
@@ -312,15 +344,18 @@ class ReconcileStats:
     Returned to the caller and logged for observability — NOT wired into the
     durable write-journal schema (extending that schema is out of scope for
     task 2202 / W6-β). Each field mirrors the int return of the
-    correspondingly-named post-write sweep. ``errors`` collects the label of
-    any sub-pass that raised (task 2202 step-4's best-effort guard); an
-    all-zeros, empty-errors instance signals a fully-converged, idempotent
-    reconcile.
+    correspondingly-named post-write sweep — including
+    ``stale_ttl_edges_invalidated`` (task 2319), the under-invalidation-
+    direction counterpart of ``sibling_edges_restored``. ``errors`` collects
+    the label of any sub-pass that raised (task 2202 step-4's best-effort
+    guard); an all-zeros, empty-errors instance signals a fully-converged,
+    idempotent reconcile.
     """
 
     edges_deduped: int = 0
     dependency_edges_restored: int = 0
     sibling_edges_restored: int = 0
+    stale_ttl_edges_invalidated: int = 0
     nodes_resolved: int = 0
     task_names_normalized: int = 0
     errors: list[str] = field(default_factory=list)
@@ -716,7 +751,12 @@ class MemoryService:
         a surviving valid edge (a same-node-pair invalidation) is left
         untouched, since it may be a legitimate contradiction the LLM
         correctly resolved — that case is left to the LLM's judgment
-        (documented follow-up, not handled here).
+        (documented follow-up, not handled here). The opposite-direction
+        gap — a pre-existing edge the LLM failed to invalidate at all,
+        left coexisting with a fresh contradictory edge — is handled for
+        the narrow priority-override/TTL fact-shape by
+        ``_invalidate_stale_superseded_ttl_edges`` (task 2319); it remains
+        unhandled here for other fact shapes.
 
         Modelled on ``_restore_superseded_dependency_edges``; handles None /
         empty result the same way. Dependency-fact edges (``_is_dependency_fact``)
@@ -805,6 +845,199 @@ class MemoryService:
                 failed,
             )
         return restored
+
+    async def _invalidate_stale_superseded_ttl_edges(
+        self, result: Any, *, group_id: str
+    ) -> int:
+        """Invalidate pre-existing stale priority-override/TTL edges left
+        behind when Graphiti's upstream LLM edge-resolver under-invalidates.
+
+        Mirror-image (under-invalidation direction) counterpart of
+        ``_restore_falsely_superseded_sibling_edges`` (task 2111), which
+        fixes the OVER-invalidation direction and documents this exact gap
+        in its "Known limitation" note. Graphiti's ``dedupe_edges``/
+        ``resolve_edge_contradictions`` pipeline can fail to set
+        ``invalid_at`` on a pre-existing edge that a freshly-written edge
+        contradicts, leaving two-or-more ``invalid_at is None`` edges
+        asserting contradictory values for the same single-valued scalar
+        (task 2265's TTL incident: 10800 and 86400 both valid for ~2h10m).
+
+        Unlike the sibling hook, which scans only ``result``'s edges (because
+        graphiti TOUCHES the edges it falsely invalidates, so they carry the
+        fresh ``invalid_at`` and appear in the result), this hook must
+        re-query live graph state: the pre-existing stale edge was NOT
+        touched by this episode, so it is generally absent from
+        ``result.edges``. It therefore:
+
+        1. Scans *result* for the "authoritative fresh" set — valid
+           (``invalid_at is None``) edges whose fact matches
+           ``_is_priority_override_ttl_fact``. If none, returns 0 without
+           any graph query — this scopes the hook to fire only when the
+           current episode actually wrote a priority-override/TTL fact.
+        2. For each distinct SUBJECT (``source_node_uuid``) of an
+           authoritative-fresh edge — never the object/target node — queries
+           ``graphiti.get_valid_edges_for_node`` for every currently-valid
+           edge on that node — including pre-existing stale edges this
+           episode never touched. The target/object of a TTL fact is a
+           generic value/concept node ("TTL", "X seconds") shared across
+           every task that ever mentioned a TTL; because
+           ``get_valid_edges_for_node`` is UNDIRECTED, querying that shared
+           node would return — and this hook would then invalidate — the
+           priority-override/TTL edges of OTHER subjects, silently destroying
+           valid, current facts belonging to unrelated entities (the
+           cross-entity over-invalidation failure mode this hook must NOT
+           reintroduce). The subject Task node is on BOTH the stale and the
+           fresh edge, so querying it alone still catches the genuine
+           same-subject stale edge; the target query is both harmful and
+           unnecessary. This is what enforces the docstring invariant that
+           only *same-subject* single-valued scalars are superseded.
+        3. Invalidates every returned edge that also matches
+           ``_is_priority_override_ttl_fact`` and is not itself one of the
+           authoritative-fresh edges: it is a same-subject, single-valued
+           contradiction of the fact just written. The invalidation
+           timestamp is computed PER SUBJECT — the newest ``valid_at`` among
+           *that subject's own* authoritative-fresh edges (falling back to
+           ``datetime.now(UTC)`` only when that subject's fresh edge(s)
+           carried no ``valid_at``), so the stale fact's supersession is
+           stamped as of the moment that subject's own new fact became
+           valid. A single episode may write fresh TTL facts for two
+           different subjects at different ``valid_at`` times; using a
+           single global max across every subject instead would stamp an
+           earlier subject's stale edge with a later subject's timestamp,
+           reopening a same-subject overlap window between the two — the
+           exact defect this hook exists to close. A processed-uuid set
+           deduplicates edges reachable from more than one subject node (an
+           undirected per-node query returns an edge spanning two queried
+           subjects under both endpoints), so each stale edge is
+           invalidated at most once. Each invalidation attempt is
+           individually best-effort — mirroring the sibling hook's per-edge
+           guard — so a transient backend failure for one stale edge is
+           logged and counted but does not stop the remaining edges from
+           being processed or fail the already-committed episode.
+
+        This enforces the invariant that the newest write for a given
+        (entity, predicate)-shape is the only ``invalid_at is None`` edge of
+        that shape. It is idempotent: a re-run sees only the single
+        surviving fresh edge and no-ops. It structurally cannot invalidate
+        the fresh edge itself, since authoritative-fresh uuids are excluded
+        from the invalidation candidates.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                    AddEpisodeResults object with an ``edges`` attribute).
+                    Handles ``None`` and objects with empty/missing edges
+                    gracefully.
+            group_id: The project graph to query/write.
+
+        Returns:
+            Number of stale priority-override/TTL edges invalidated (0 when
+            nothing to do).
+        """
+        if result is None:
+            return 0
+
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
+        if not edges:
+            return 0
+
+        keep_uuids: set[str] = set()
+        subject_node_uuids: set[str] = set()
+        # PER-SUBJECT supersession stamps, not a single global max: see the
+        # docstring's step 3 for why using one global max across every
+        # subject touched by this episode would be imprecise when the
+        # episode writes fresh TTL facts for multiple distinct subjects at
+        # different valid_at times.
+        subject_stamps: dict[str, datetime] = {}
+        for edge in edges:
+            if getattr(edge, 'invalid_at', None) is not None:
+                continue
+            if not _is_priority_override_ttl_fact(getattr(edge, 'fact', '') or ''):
+                continue
+            edge_uuid = getattr(edge, 'uuid', '') or ''
+            if edge_uuid:
+                keep_uuids.add(edge_uuid)
+            # SUBJECT-SCOPED: collect ONLY the subject/source node, never the
+            # object/target. For a fact "Task N priority override TTL of X
+            # seconds" the source is the subject Task node and the target is a
+            # generic value/concept node ("TTL", "X seconds") shared across
+            # every task that ever mentioned a TTL. get_valid_edges_for_node is
+            # UNDIRECTED, so querying that shared target node would return the
+            # priority-override/TTL edges of OTHER subjects and invalidate their
+            # valid, current facts — the cross-entity over-invalidation failure
+            # mode. The subject Task node is on BOTH the stale and the fresh
+            # edge, so querying it alone still catches the genuine same-subject
+            # stale edge; the target query is both harmful and unnecessary.
+            src = getattr(edge, 'source_node_uuid', '') or ''
+            valid_at = getattr(edge, 'valid_at', None)
+            if src:
+                subject_node_uuids.add(src)
+                if valid_at is not None and (
+                    src not in subject_stamps or valid_at > subject_stamps[src]
+                ):
+                    subject_stamps[src] = valid_at
+
+        if not keep_uuids:
+            # This episode did not write a fresh priority-override/TTL fact —
+            # nothing to supersede, and no graph query needed.
+            return 0
+
+        invalidated = 0
+        failed = 0
+        processed_uuids: set[str] = set()
+        for node_uuid in subject_node_uuids:
+            candidates = await self.graphiti.get_valid_edges_for_node(
+                node_uuid, group_id=group_id,
+            )
+            # This subject's own stamp — the newest valid_at among its
+            # authoritative-fresh edges, falling back to now(UTC) only when
+            # unavailable for THIS subject (never another subject's stamp).
+            stamp = subject_stamps.get(node_uuid) or datetime.now(UTC)
+            for candidate in candidates:
+                candidate_uuid = candidate.get('uuid', '') or ''
+                if not candidate_uuid or candidate_uuid in keep_uuids:
+                    continue
+                if not _is_priority_override_ttl_fact(candidate.get('fact', '') or ''):
+                    continue
+                if candidate_uuid in processed_uuids:
+                    # Undirected per-node query: an edge shared between two
+                    # touched nodes is returned once per endpoint. Invalidate
+                    # it at most once.
+                    continue
+                processed_uuids.add(candidate_uuid)
+                try:
+                    await self.graphiti.update_edge(
+                        candidate_uuid, group_id=group_id, invalid_at=stamp,
+                    )
+                    invalidated += 1
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    # Best-effort: a transient backend error (lock contention,
+                    # write timeout) must not fail an already-committed episode
+                    # write.  Log and continue so the episode reports success.
+                    logger.exception(
+                        'Failed to invalidate stale priority-override/TTL edge %s; '
+                        'will retry on next episode',
+                        candidate_uuid,
+                    )
+                    failed += 1
+
+        if invalidated > 0:
+            logger.info(
+                'Invalidated %d stale superseded priority-override/TTL edge(s) '
+                'after add_episode',
+                invalidated,
+            )
+        if failed > 0:
+            logger.warning(
+                'Failed to invalidate %d stale priority-override/TTL edge(s) after add_episode',
+                failed,
+            )
+        return invalidated
 
     async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
         """Canonicalize non-canonical task-entity node names to 'Task N'.
@@ -929,7 +1162,7 @@ class MemoryService:
     async def _reconcile_episode_identity(
         self, result: Any, *, group_id: str
     ) -> ReconcileStats:
-        """Fold the five post-write identity/dedup sweeps into one call.
+        """Fold the six post-write identity/dedup sweeps into one call.
 
         Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
         runs immediately after ``add_episode``, inside α's (task 2198)
@@ -941,13 +1174,18 @@ class MemoryService:
         lock and could race with a concurrent same-group write; folding them
         into one locked reconcile closes that race.
 
-        Runs the five sub-passes in their pre-existing chain order —
+        Runs the six sub-passes in their pre-existing chain order —
         dependency-restore before sibling-restore, matching the ordering
         this replaces at the ``_execute_graphiti_write`` call site (a
         dependency edge must be un-superseded before the sibling-restore
         pass considers it, so it is correctly skipped there rather than
         double-processed) — and aggregates each sub-pass's int return into
-        the matching ``ReconcileStats`` field.
+        the matching ``ReconcileStats`` field. ``_invalidate_stale_superseded_
+        ttl_edges`` (task 2319) runs immediately after
+        ``_restore_falsely_superseded_sibling_edges``, grouping the two
+        edge-temporal passes together, and before ``_dedup_episode_nodes``:
+        it is the mirror-image, under-invalidation-direction counterpart of
+        the sibling-restore pass.
 
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
@@ -997,6 +1235,10 @@ class MemoryService:
         stats.sibling_edges_restored = await _run_pass(
             '_restore_falsely_superseded_sibling_edges',
             self._restore_falsely_superseded_sibling_edges(result, group_id=group_id),
+        )
+        stats.stale_ttl_edges_invalidated = await _run_pass(
+            '_invalidate_stale_superseded_ttl_edges',
+            self._invalidate_stale_superseded_ttl_edges(result, group_id=group_id),
         )
         stats.nodes_resolved = await _run_pass(
             '_dedup_episode_nodes',
