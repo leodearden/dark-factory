@@ -874,7 +874,14 @@ class MemoryService:
            timestamp is the newest ``valid_at`` among the authoritative-fresh
            edges (falling back to ``datetime.now(UTC)`` when unavailable),
            so the stale fact's supersession is stamped as of the moment the
-           new fact became valid.
+           new fact became valid. A processed-uuid set deduplicates edges
+           reachable from more than one touched node (an undirected
+           per-node query returns a shared edge under both endpoints), so
+           each stale edge is invalidated at most once. Each invalidation
+           attempt is individually best-effort — mirroring the sibling
+           hook's per-edge guard — so a transient backend failure for one
+           stale edge is logged and counted but does not stop the remaining
+           edges from being processed or fail the already-committed episode.
 
         This enforces the invariant that the newest write for a given
         (entity, predicate)-shape is the only ``invalid_at is None`` edge of
@@ -937,6 +944,8 @@ class MemoryService:
             supersession_stamp = datetime.now(UTC)
 
         invalidated = 0
+        failed = 0
+        processed_uuids: set[str] = set()
         for node_uuid in touched_node_uuids:
             candidates = await self.graphiti.get_valid_edges_for_node(
                 node_uuid, group_id=group_id,
@@ -947,16 +956,40 @@ class MemoryService:
                     continue
                 if not _is_priority_override_ttl_fact(candidate.get('fact', '') or ''):
                     continue
-                await self.graphiti.update_edge(
-                    candidate_uuid, group_id=group_id, invalid_at=supersession_stamp,
-                )
-                invalidated += 1
+                if candidate_uuid in processed_uuids:
+                    # Undirected per-node query: an edge shared between two
+                    # touched nodes is returned once per endpoint. Invalidate
+                    # it at most once.
+                    continue
+                processed_uuids.add(candidate_uuid)
+                try:
+                    await self.graphiti.update_edge(
+                        candidate_uuid, group_id=group_id, invalid_at=supersession_stamp,
+                    )
+                    invalidated += 1
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    # Best-effort: a transient backend error (lock contention,
+                    # write timeout) must not fail an already-committed episode
+                    # write.  Log and continue so the episode reports success.
+                    logger.exception(
+                        'Failed to invalidate stale priority-override/TTL edge %s; '
+                        'will retry on next episode',
+                        candidate_uuid,
+                    )
+                    failed += 1
 
         if invalidated > 0:
             logger.info(
                 'Invalidated %d stale superseded priority-override/TTL edge(s) '
                 'after add_episode',
                 invalidated,
+            )
+        if failed > 0:
+            logger.warning(
+                'Failed to invalidate %d stale priority-override/TTL edge(s) after add_episode',
+                failed,
             )
         return invalidated
 
