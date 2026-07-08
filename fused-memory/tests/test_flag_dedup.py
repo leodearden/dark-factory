@@ -8172,3 +8172,108 @@ class TestIsCompletionFlag:
         flag = {'unexpected_key': 'unexpected_value'}
         assert _is_completion_flag(flag) is False
 
+
+# ---------------------------------------------------------------------------
+# dedup_flags — completion-marker same-cycle self-delete (task-2312 step-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_completion_flag_self_deletes_marker_same_cycle():
+    """flag_for_stage2=False marks a ONE-TIME completed-work finding: dedup_flags
+    emits its stage1_flag_marker (add_memory) via _write_and_confirm_marker, then
+    reclaims it in the SAME call via acknowledge_flag_marker(mode='delete')
+    (delete_memory) — bypassing the persist-for-dedup MISS/HIT path entirely.
+
+    No prior markers exist before this call; the marker search finds (and
+    deletes) exactly the one just written, proving no persistent marker
+    survives the cycle.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    written_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'kind': 'stage1_flag_marker',
+        'task_id': '77',
+        'flag_type': 'duplicate_flag_marker_cleanup',
+        'run_id': 'r1',
+        'last_seen_run_id': 'r1',
+    })
+    written_marker.id = 'written-77'
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('77', 'duplicate_flag_marker_cleanup'): [[written_marker], [written_marker]]},
+    ))
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{
+        'task_id': 77,
+        'flag_type': 'duplicate_flag_marker_cleanup',
+        'description': 'cleaned up an orphaned duplicate flag marker',
+        'flag_for_stage2': False,
+    }]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # (a) Marker emitted via the canonical write-and-confirm path.
+    memory_service.add_memory.assert_called_once()
+    _assert_valid_stage1_marker(
+        memory_service.add_memory.call_args.kwargs,
+        task_id='77', flag_type='duplicate_flag_marker_cleanup', run_id='r1',
+    )
+
+    # (b) ... then self-deleted within the SAME dedup_flags call.
+    memory_service.delete_memory.assert_called_once()
+    assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'written-77', (
+        'the just-written marker (found by search) must be the one deleted'
+    )
+
+    # (c) Flag annotated; persist-for-dedup fields are NOT set (bypassed).
+    assert len(result) == 1
+    assert result[0]['completion_marker_self_deleted'] is True
+    assert result[0]['last_seen_run_id'] == 'r1'
+    assert 'persisted_from_run' not in result[0]
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_recurring_flag_without_flag_for_stage2_unaffected():
+    """Dedup-safety guard: a flag WITHOUT flag_for_stage2 (an ordinary recurring
+    finding, MISS path) is completely unchanged by the completion-marker
+    feature — its marker is written and NOT deleted, proving cross-cycle
+    dedup is not regressed by the new branch.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[])  # no prior marker, no suppression
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': '99', 'flag_type': 'stale_metadata', 'description': 'bar'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
+    assert 'completion_marker_self_deleted' not in result[0]
+
+    memory_service.add_memory.assert_called_once()
+    _assert_valid_stage1_marker(
+        memory_service.add_memory.call_args.kwargs,
+        task_id='99', flag_type='stale_metadata', run_id='r1',
+    )
+    memory_service.delete_memory.assert_not_called()
+
