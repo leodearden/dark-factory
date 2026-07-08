@@ -26,6 +26,7 @@ from orchestrator.verify import (
     _resolve_verify_env,
     _run_cmd,
     _scope_cargo_workspace,
+    _single_subproject_prefix,
     run_full_verification,
     run_scoped_verification,
     run_verification,
@@ -4120,6 +4121,77 @@ class TestReprojectBareUvRun:
         )
 
 
+class TestSingleSubprojectPrefix:
+    """`_single_subproject_prefix` identifies a single real subproject touched by files.
+
+    A "subproject" is a top-level directory that carries its own
+    ``pyproject.toml`` — the same discriminator ``workflow._sync_worktree_venvs``
+    already uses to decide which task modules need their own ``uv sync``. This
+    distinguishes a real subproject (e.g. ``cockpit/``) from a bare repo-root
+    directory like ``tests/`` that has no ``pyproject.toml`` of its own.
+    """
+
+    def test_single_subproject_with_pyproject_returns_prefix(self, tmp_path: Path) -> None:
+        """All files under cockpit/, and cockpit/pyproject.toml exists → 'cockpit'."""
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _single_subproject_prefix(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], tmp_path,
+        )
+        assert result == 'cockpit'
+
+    def test_files_spanning_two_top_level_dirs_returns_none(self, tmp_path: Path) -> None:
+        """Files touching two different top-level dirs → None (not a single subproject)."""
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+        shared = tmp_path / 'shared'
+        shared.mkdir()
+        (shared / 'pyproject.toml').write_text('[project]\nname = "shared"\n')
+
+        result = _single_subproject_prefix(
+            ['cockpit/tests/test_a.py', 'shared/tests/test_b.py'], tmp_path,
+        )
+        assert result is None
+
+    def test_worktree_none_returns_none(self) -> None:
+        """No worktree to check pyproject.toml against → None."""
+        result = _single_subproject_prefix(['cockpit/tests/test_c3.py'], None)
+        assert result is None
+
+    def test_single_top_level_dir_without_pyproject_returns_none(self, tmp_path: Path) -> None:
+        """A single top-level dir ('tests') lacking its own pyproject.toml → None.
+
+        Distinguishes repo-root ``tests/`` (not an independent subproject) from
+        a real subproject like ``cockpit/``.
+        """
+        result = _single_subproject_prefix(['tests/scripts/test_x.py'], tmp_path)
+        assert result is None
+
+    def test_mixed_root_and_subproject_files_returns_none(self, tmp_path: Path) -> None:
+        """A repo-root file alongside a subproject file → None, not the subproject alone.
+
+        Regression guard: a naive ``{f.split('/', 1)[0] for f in files if '/' in
+        f}`` silently drops files with no '/', so ``['cockpit/tests/test_a.py',
+        'top_level.py']`` would collapse to ``{'cockpit'}`` and return
+        'cockpit' — scoping the test command to cockpit alone and dropping
+        test validation of the root-level file entirely (lint/type still
+        cover it, but tests would not).  A mixed root+subproject diff must
+        disqualify subproject scoping so the caller falls back to the
+        fleet/verbatim command instead.
+        """
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _single_subproject_prefix(
+            ['cockpit/tests/test_a.py', 'top_level.py'], tmp_path,
+        )
+        assert result is None
+
+
 class TestBuildFallbackConfigWithNonDefaultCommands:
     """``_build_fallback_config`` uses project-configured commands when non-default.
 
@@ -4287,6 +4359,230 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         assert (
             result.lint_command
             == 'uv run --project shared ruff check tests/scripts/test_orchestrator_watchdog.py'
+        )
+
+
+class TestBuildFallbackConfigSubprojectScoped:
+    """`_build_fallback_config` scopes TEST to the task's own subproject (task 2344).
+
+    When every touched ``.py`` file lives under a single top-level directory
+    that is itself a real subproject (its own ``pyproject.toml`` in
+    *worktree*), the TEST command must be derived from that subproject alone
+    — NOT ``config.test_command``'s fleet-wide chain verbatim, which would
+    drag every OTHER fleet subproject's suite (and its unrelated red-main
+    state) into this task's verify.  Regression guard for esc-2293-13 (task
+    2293/cockpit was green in isolation but false-blocked by the fleet-wide
+    fallback picking up unrelated fused-memory failures).
+    """
+
+    #: The real dark_factory root-level fleet chain (orchestrator/config.yaml).
+    _FLEET_TEST_COMMAND = (
+        'cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ '
+        '&& cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ '
+        '&& cd ../dashboard && uv run pytest tests/'
+    )
+    _FLEET_LINT_COMMAND = 'uv run ruff check shared escalation fused-memory orchestrator dashboard'
+
+    def _make_config(self, tmp_path: Path, **kwargs) -> OrchestratorConfig:
+        kwargs.setdefault('test_command', self._FLEET_TEST_COMMAND)
+        kwargs.setdefault('lint_command', self._FLEET_LINT_COMMAND)
+        return OrchestratorConfig(project_root=tmp_path, **kwargs)
+
+    def _make_cockpit_worktree(self, tmp_path: Path) -> Path:
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+        return tmp_path
+
+    def test_test_command_scoped_to_cockpit_not_fleet(self, tmp_path: Path) -> None:
+        """cockpit source + test file → test_command targets only cockpit, never the fleet."""
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'cd cockpit && uv run pytest tests/test_c3.py'
+        # False-block guard: no OTHER fleet subproject may appear in the scoped command.
+        assert 'shared' not in result.test_command
+        assert 'fused-memory' not in result.test_command
+        assert 'escalation' not in result.test_command
+        assert 'dashboard' not in result.test_command
+        # Lint scoping is unaffected — still the existing file-scoped behavior.
+        assert result.lint_command is not None
+        assert 'cockpit/src/cockpit/c3.py' in result.lint_command
+        assert 'cockpit/tests/test_c3.py' in result.lint_command
+
+    def test_source_only_change_yields_no_test_command(self, tmp_path: Path) -> None:
+        """A cockpit source-only diff (no test files touched) → test_command is None."""
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command is None
+
+    def test_repo_root_tests_dir_without_pyproject_uses_fleet_chain_verbatim(
+        self, tmp_path: Path,
+    ) -> None:
+        """A repo-root tests/ file, with no tests/pyproject.toml, keeps the verbatim fleet chain.
+
+        Regression guard: the pyproject.toml discriminator must not mis-scope a
+        bare repo-root directory like tests/ (no pyproject.toml of its own,
+        unlike a real subproject) into a bogus ``cd tests && ...`` command.
+        """
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['tests/scripts/test_spawn_claude.py'], cfg, worktree=tmp_path,
+        )
+
+        assert result is not None
+        assert result.test_command == self._FLEET_TEST_COMMAND
+        assert not result.test_command.startswith('cd tests ')
+
+    def test_conftest_under_subproject_scopes_to_subproject_tests_dir(
+        self, tmp_path: Path,
+    ) -> None:
+        """A conftest.py inside cockpit/tests/ scopes to the subproject's tests dir."""
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/tests/conftest.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'cd cockpit && uv run pytest tests'
+
+    def test_conftest_at_subproject_root_scopes_to_dot(self, tmp_path: Path) -> None:
+        """A conftest.py directly at the subproject root scopes to '.', not the prefix.
+
+        Regression guard: 'cockpit/conftest.py' maps (via the existing
+        conftest-parent-dir logic) to the bare target 'cockpit', which equals
+        `sub` itself rather than `sub + '/...'`.  Naively stripping only the
+        `sub + '/'` prefix leaves 'cockpit' unchanged, producing the invalid
+        `cd cockpit && uv run pytest cockpit` (pytest resolves this against
+        cwd 'cockpit' as the nonexistent 'cockpit/cockpit' and false-blocks
+        the task).  The target must map to '.' instead.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/conftest.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'cd cockpit && uv run pytest .'
+
+    def test_data_module_only_change_emits_warning_and_yields_no_test_command(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A subproject data-module-only change warns instead of silently skipping.
+
+        No collectable tests and no conftest in the diff means there's no
+        anchor to derive a subproject test target from, so test_command is
+        None (same "ships unvalidated" outcome as the bare-pytest branch) —
+        but that coverage gap must be surfaced via the same task-1852 warning
+        the bare-pytest branch already emits, not silently.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _build_fallback_config(
+                ['cockpit/tests/some_data.py'], cfg, worktree=worktree,
+            )
+
+        assert result is not None
+        assert result.test_command is None
+        assert any(
+            'test-tree data module' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), (
+            'Expected a WARNING about the skipped test-tree data module; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_mixed_root_and_subproject_files_uses_fleet_chain_verbatim(
+        self, tmp_path: Path,
+    ) -> None:
+        """A diff mixing a repo-root file with a subproject file falls back to the fleet chain.
+
+        Regression guard: ``_single_subproject_prefix`` must not collapse
+        ``['cockpit/tests/test_a.py', 'top_level.py']`` to 'cockpit' (which
+        would drop test validation of the root-level file). With subproject
+        detection correctly disqualified (mixed root+subproject), the
+        pre-existing non-default-configured-command branch takes over and
+        the verbatim fleet chain runs — still validating both files, just not
+        scoped as narrowly as a pure-subproject diff would be.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/tests/test_a.py', 'top_level.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == self._FLEET_TEST_COMMAND
+
+
+class TestRunScopedVerificationForwardsWorktreeToFallback:
+    """`run_scoped_verification` forwards *worktree* into `_build_fallback_config` (task 2344).
+
+    Without this wiring the subproject-scoped fallback fix is dead code: the
+    production call site would never pass `worktree`, so
+    `_single_subproject_prefix` always sees `worktree=None` and returns None,
+    leaving the stale fleet-wide fallback in place for every real task.
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=(
+                'cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ '
+                '&& cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ '
+                '&& cd ../dashboard && uv run pytest tests/'
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_worktree_forwarded_to_build_fallback_config(self, tmp_path: Path) -> None:
+        """The worktree argument passed to run_scoped_verification reaches _build_fallback_config."""
+        cockpit = tmp_path / 'cockpit'
+        (cockpit / 'tests').mkdir(parents=True)
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+        (cockpit / 'tests' / 'test_c3.py').write_text('def test_x():\n    pass\n')
+
+        captured: dict = {}
+
+        def fake_fallback(task_files, config=None, worktree=None):
+            captured['worktree'] = worktree
+            return None
+
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        with patch('orchestrator.verify._build_fallback_config', side_effect=fake_fallback), \
+             patch('orchestrator.verify.run_verification', new=AsyncMock(return_value=passing)):
+            await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['cockpit/tests/test_c3.py'],
+                role='task',
+            )
+
+        assert captured.get('worktree') == tmp_path, (
+            f'Expected _build_fallback_config to be called with worktree={tmp_path!r}; '
+            f'got {captured.get("worktree")!r}'
         )
 
 

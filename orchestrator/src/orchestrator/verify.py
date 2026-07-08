@@ -1545,9 +1545,38 @@ def scope_module_config(
     )
 
 
+def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | None:
+    """Return the sole top-level subproject directory shared by *files*, else ``None``.
+
+    A "subproject" is a top-level directory of *worktree* that carries its own
+    ``pyproject.toml`` — the same ``(worktree / prefix / 'pyproject.toml').exists()``
+    check ``workflow._sync_worktree_venvs`` already uses to decide which task
+    modules need their own ``uv sync``.  This distinguishes a real subproject
+    (e.g. ``cockpit/``) from a bare repo-root directory like ``tests/`` or
+    ``src/`` that has no ``pyproject.toml`` of its own.
+
+    Returns ``None`` when *worktree* is ``None``, *files* is empty, any file
+    lives at the repo root (no top-level directory to attribute it to — a
+    mixed root+subproject diff must not collapse to the subproject alone and
+    silently drop the root-level file from test scoping), the files span more
+    than one top-level directory, or the sole top-level directory lacks its
+    own ``pyproject.toml``.
+    """
+    if worktree is None or not files:
+        return None
+    if any('/' not in f for f in files):
+        return None
+    components = {f.split('/', 1)[0] for f in files}
+    if len(components) != 1:
+        return None
+    (prefix,) = components
+    return prefix if (worktree / prefix / 'pyproject.toml').is_file() else None
+
+
 def _build_fallback_config(
     task_files: list[str],
     config: OrchestratorConfig | None = None,
+    worktree: Path | None = None,
 ) -> ModuleConfig | None:
     """Build a synthetic ModuleConfig from *task_files* when no module configs match.
 
@@ -1560,10 +1589,18 @@ def _build_fallback_config(
     narrows the configured command to the touched files when the standard tool
     keyword appears (e.g. ``ruff check`` in ``uv run ruff check``), and
     returns the command unchanged when it doesn't (e.g. ``true`` or
-    ``mypy``-based type checking).  For ``test_command``, the configured
-    command is used as-is when it differs from the bare ``pytest`` default so
-    that complex flag sequences like ``-m 'not slow' --ignore=tests/e2e`` are
-    not mangled by :func:`_scope_command`'s naive dash-token extraction.
+    ``mypy``-based type checking).  For ``test_command``: when *worktree* is
+    given and every touched file lives under a single top-level directory
+    that is itself a real subproject (its own ``pyproject.toml`` — see
+    :func:`_single_subproject_prefix`), the test command is scoped to run
+    from *inside* that subproject alone.  This prevents a fleet-wide
+    configured ``test_command`` (e.g. ``cd shared && uv run pytest tests/ &&
+    cd ../escalation && ...``) from dragging every OTHER subproject's suite —
+    and its unrelated red-main state — into this task's verify (regression
+    guard for esc-2293-13 / task 2293).  Otherwise, the configured command is
+    used as-is when it differs from the bare ``pytest`` default so that
+    complex flag sequences like ``-m 'not slow' --ignore=tests/e2e`` are not
+    mangled by :func:`_scope_command`'s naive dash-token extraction.
 
     Returns ``None`` when no ``.py`` files are found.
     """
@@ -1618,6 +1655,74 @@ def _build_fallback_config(
     else:
         lint_cmd = 'ruff check ' + ' '.join(py_files)
         type_cmd = 'pyright ' + ' '.join(py_files)
+
+    # Subproject-scoped TEST command (task 2344): when every touched file
+    # lives under a single top-level directory that is itself a real
+    # subproject (its own pyproject.toml in *worktree*), scope TEST to that
+    # subproject alone rather than falling through to config.test_command's
+    # fleet-wide chain verbatim below.  lint_cmd/type_cmd above are already
+    # scoped to the touched files, so only test_command needs this treatment.
+    sub = _single_subproject_prefix(py_files, worktree)
+    if sub is not None:
+        # Same conftest/collectable target-selection logic as the bare-pytest
+        # branch below (conftest parent-dirs + outside collectable tests,
+        # else collectable tests, else none) — duplicated rather than shared
+        # so the bare-pytest branch is left untouched for the
+        # worktree=None / non-subproject cases.
+        if has_conftest:
+            conftest_dirs = sorted({
+                f.rsplit('/', 1)[0] if '/' in f else '.'
+                for f in py_files
+                if _is_conftest(f)
+            })
+            if '.' not in conftest_dirs:
+                outside = [
+                    t for t in collectable_tests
+                    if not any(t.startswith(d + '/') for d in conftest_dirs)
+                ]
+            else:
+                outside = []
+            sub_targets = conftest_dirs + outside
+        elif collectable_tests:
+            sub_targets = collectable_tests
+        else:
+            sub_targets = []
+            if has_test_data:
+                # Same coverage gap the bare-pytest branch below already
+                # surfaces (task 1852): no collectable tests and no conftest
+                # to anchor a directory target, so this data-module change
+                # ships unvalidated.  Warn rather than silently skipping
+                # (amendment to task 2344).
+                _data_files = [
+                    f for f in py_files
+                    if _is_test_file(f) and not _is_collectable_test_file(f)
+                ]
+                logger.warning(
+                    '_build_fallback_config: test-tree data module(s) %s skipped '
+                    '— no tests will run for this change; configure a non-default '
+                    'test_command to validate data-module changes (task 1852)',
+                    _data_files,
+                )
+        # A conftest/collectable target that sits directly at the subproject
+        # root (e.g. 'cockpit/conftest.py') equals `sub` itself, not
+        # `sub + '/...'` — map it to '.' so the command becomes `cd cockpit &&
+        # uv run pytest .` rather than the invalid `pytest cockpit` (which
+        # pytest would resolve against cwd 'cockpit' as the nonexistent
+        # 'cockpit/cockpit').
+        rel_targets = [
+            '.' if t == sub else (t[len(sub) + 1:] if t.startswith(sub + '/') else t)
+            for t in sub_targets
+        ]
+        test_cmd = (
+            'cd ' + sub + ' && uv run pytest ' + ' '.join(rel_targets)
+            if rel_targets else None
+        )
+        return ModuleConfig(
+            prefix=sub,
+            lint_command=lint_cmd,
+            type_check_command=type_cmd,
+            test_command=test_cmd,
+        )
 
     # Test command: when a non-default configured command exists (e.g.
     # `uv run --extra dev --extra web pytest -m 'not slow' --ignore=tests/e2e`),
@@ -3217,7 +3322,7 @@ async def run_scoped_verification(
                     return _trivial_pass(
                         'No source files changed — verify trivially passes',
                     )
-            fallback = _build_fallback_config(existing_files, config)
+            fallback = _build_fallback_config(existing_files, config, worktree=worktree)
             if fallback is not None:
                 fallback = _apply_cargo_scope(
                     fallback, existing_files, worktree, scope_cargo_enabled,
