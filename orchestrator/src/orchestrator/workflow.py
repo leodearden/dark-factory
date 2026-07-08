@@ -36,6 +36,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
+from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger
 
 from orchestrator.agents.briefing import COMPLETION_JUDGE_SCHEMA
@@ -245,6 +246,16 @@ class _SchedulerLike(Protocol):
         *,
         done_provenance: dict | None = ...,
         reopen_reason: str | None = ...,
+        claimant_run_id: str | None = ...,
+        heartbeat_at: str | None = ...,
+    ) -> None: ...
+    async def set_task_claimant(
+        self,
+        task_id: str,
+        /,
+        *,
+        claimant_run_id: str | None = ...,
+        heartbeat_at: str | None = ...,
     ) -> None: ...
     async def mark_done(
         self,
@@ -1683,7 +1694,19 @@ class TaskWorkflow:
                 raw='preempt: task terminal at dispatch',
             )
 
-        await self.scheduler.set_task_status(self.task_id, 'in-progress')
+        # PRD task-status-authority C4/D4 (task 2188, omega1): stamp the
+        # claimant atomically with the dispatch status write, so there is no
+        # window where the task is in-progress with no live claimant.
+        await self.scheduler.set_task_status(
+            self.task_id, 'in-progress',
+            claimant_run_id=compose_claimant_run_id(
+                self._process_run_id or '', self.session_id, os.getpid(),
+            ),
+            heartbeat_at=datetime.now(UTC).isoformat(),
+        )
+        self._claimant_heartbeat_task = asyncio.create_task(
+            self._claimant_heartbeat_loop(),
+        )
 
         # Create worktree (captures base commit for stable diffs).
         # If the caller pre-created the worktree (eval mode) skip creation
@@ -1795,6 +1818,41 @@ class TaskWorkflow:
                 ['git', 'rm', '-r', '--cached', '--', '.task/'],
                 cwd=self.worktree,
             )
+
+    async def _claimant_heartbeat_loop(self) -> None:
+        """Background loop refreshing heartbeat_at on a bounded cadence.
+
+        PRD task-status-authority C4/D4 (task 2188, omega1): guarantees the
+        claimant's heartbeat stays fresh even across one long phase (e.g. a
+        30-minute execute-agent call), which a phase-transition hook alone
+        would miss. Deliberately uses ``scheduler.set_task_claimant`` — never
+        ``set_task_status`` — so this refresh never re-triggers the
+        status-FSM/reconciliation. ``claimant_run_id`` is intentionally NOT
+        passed on each tick: this is a refresh of liveness, not a re-stamp of
+        identity. Runs until cancelled by :meth:`_stop_claimant_heartbeat`;
+        ``scheduler.set_task_claimant`` is itself best-effort, so a transient
+        failure here just means the next tick tries again.
+        """
+        while True:
+            await asyncio.sleep(self.config.claimant_heartbeat_interval_secs)
+            await self.scheduler.set_task_claimant(
+                self.task_id, heartbeat_at=datetime.now(UTC).isoformat(),
+            )
+
+    async def _stop_claimant_heartbeat(self) -> None:
+        """Cancel and await the heartbeat loop task, if one was started.
+
+        Called from ``run()``'s finally (before the harness clears the
+        claimant at slot release) so the loop can never race a post-clear
+        re-stamp. A no-op when the loop was never started (e.g. dispatch
+        raised before reaching that point).
+        """
+        if self._claimant_heartbeat_task is None:
+            return
+        self._claimant_heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._claimant_heartbeat_task
+        self._claimant_heartbeat_task = None
 
     async def run(  # pyright: ignore[reportGeneralTypeIssues]
         self,
@@ -2241,6 +2299,11 @@ class TaskWorkflow:
             return await self._mark_blocked(f'Workflow error: {e}')
 
         finally:
+            # Stop the claimant heartbeat loop FIRST — before any other
+            # teardown — so it can never race the harness's post-release
+            # claimant clear with a stray refresh (task 2188, PRD
+            # task-status-authority C4/D4).
+            await self._stop_claimant_heartbeat()
             # Stop steward if running
             if self._steward:
                 await self._steward.stop()
