@@ -810,6 +810,8 @@ class TaskWorkflow:
         cost_store: CostStore | None = None,
         cancel_event: asyncio.Event | None = None,
         resume_session_id: dict | None = None,
+        *,
+        run_id: str | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -966,6 +968,17 @@ class TaskWorkflow:
         # right after session_id_val is determined; read by _capture_zero_output_evidence
         # so it can locate the transcript even when result.session_id is '' (hard SIGKILL).
         self._last_invoke_session_id: str | None = None
+
+        # PRD plans/task-status-authority-prd.md contract C4/D4 (task 2188,
+        # omega1).  Process-level run_id (harness.py self._run_id), threaded
+        # through so the dispatch-stamp claimant_run_id can embed it via
+        # shared.task_claimant.compose_claimant_run_id.  None when the
+        # workflow is constructed without a harness (e.g. some tests/evals);
+        # compose_claimant_run_id callers treat that as an empty component.
+        self._process_run_id: str | None = run_id
+        # Background asyncio.Task running _claimant_heartbeat_loop, started
+        # right after the dispatch stamp and cancelled in run()'s finally.
+        self._claimant_heartbeat_task: asyncio.Task | None = None
 
     @property
     def state(self) -> WorkflowState:

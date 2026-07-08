@@ -5462,6 +5462,7 @@ Output JSON matching the schema. Every task must appear in the output.
                 cost_store=self.cost_store,
                 cancel_event=cancel_event,
                 resume_session_id=recovered_session,
+                run_id=self._run_id,
             )
 
             if self.event_store:
