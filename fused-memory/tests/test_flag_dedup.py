@@ -8088,3 +8088,287 @@ class TestAcknowledgeResolvedFlags:
         )
         assert result == 2
 
+
+# ---------------------------------------------------------------------------
+# _is_completion_flag pure predicate tests (task-2312 step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestIsCompletionFlag:
+    """Unit tests for _is_completion_flag(flag: dict) -> bool.
+
+    The helper must return True ONLY when flag['flag_for_stage2'] is
+    present AND explicitly false (bool False, or a case-insensitive 'false'
+    string) — never on mere absence of the key. Absence is the shape every
+    dedup MISS/HIT marker and every ordinary recurring flag has, so treating
+    absence as "false" would misclassify recurring findings as one-time
+    completions.
+    """
+
+    # ----- ACCEPT cases: present-and-explicitly-false -----
+
+    def test_bool_false_is_completion_flag(self):
+        """flag_for_stage2=False (bool) — the canonical completion signal."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': False}
+        assert _is_completion_flag(flag) is True
+
+    def test_string_false_lowercase_is_completion_flag(self):
+        """flag_for_stage2='false' (str) is accepted case-insensitively."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': 'false'}
+        assert _is_completion_flag(flag) is True
+
+    def test_string_false_titlecase_is_completion_flag(self):
+        """flag_for_stage2='False' (str, title-case) is accepted case-insensitively."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': 'False'}
+        assert _is_completion_flag(flag) is True
+
+    # ----- REJECT cases -----
+
+    def test_absent_key_is_not_completion_flag(self):
+        """Key absent entirely — MUST NOT be treated as a completion flag.
+
+        Dedup-safety-critical case: dedup MISS markers never set
+        flag_for_stage2, so gating on absence would delete markers that
+        cross-cycle dedup depends on.
+        """
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x'}
+        assert _is_completion_flag(flag) is False
+
+    def test_bool_true_is_not_completion_flag(self):
+        """flag_for_stage2=True (bool) is a normal Stage-2-bound flag, not a completion marker."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': True}
+        assert _is_completion_flag(flag) is False
+
+    def test_string_true_is_not_completion_flag(self):
+        """flag_for_stage2='true' (truthy string) is not a completion marker."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': 'true'}
+        assert _is_completion_flag(flag) is False
+
+    def test_none_value_is_not_completion_flag(self):
+        """flag_for_stage2=None is not an explicit false — not a completion marker."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': None}
+        assert _is_completion_flag(flag) is False
+
+    def test_non_flag_shaped_dict_is_not_completion_flag(self):
+        """A dict with none of the usual flag fields (no task_id/flag_type/
+        flag_for_stage2) must not crash and must return False.
+        """
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'unexpected_key': 'unexpected_value'}
+        assert _is_completion_flag(flag) is False
+
+
+# ---------------------------------------------------------------------------
+# dedup_flags — completion-marker same-cycle self-delete (task-2312 step-3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_completion_flag_sweeps_prior_without_writing_new_marker():
+    """flag_for_stage2=False marks a ONE-TIME completed-work finding: dedup_flags
+    does NOT write a new stage1_flag_marker for it (task-2312 review amendment —
+    an emit-then-self-delete design raced Mem0 read-after-write indexing lag and
+    could leave a fresh orphan). Instead it only sweeps any PRIOR marker for the
+    signature via acknowledge_flag_marker(mode='delete') — bypassing the
+    persist-for-dedup MISS/HIT path entirely.
+
+    A prior marker (simulating one left over from an earlier cycle) is found
+    and deleted; no marker is (re-)written.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    prior_marker = _make_memory_result({
+        'source': 'stage1_flag_marker',
+        'kind': 'stage1_flag_marker',
+        'task_id': '77',
+        'flag_type': 'duplicate_flag_marker_cleanup',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
+    })
+    prior_marker.id = 'prior-77'
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('77', 'duplicate_flag_marker_cleanup'): [[prior_marker]]},
+    ))
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{
+        'task_id': 77,
+        'flag_type': 'duplicate_flag_marker_cleanup',
+        'description': 'cleaned up an orphaned duplicate flag marker',
+        'flag_for_stage2': False,
+    }]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    # (a) No marker is (re-)written for a completion flag — only one search
+    # (acknowledge_flag_marker's own find_prior_memories) is issued for the
+    # marker query; the search stub would raise on a second, unconfigured pop.
+    memory_service.add_memory.assert_not_called()
+
+    # (b) The pre-existing prior is swept.
+    memory_service.delete_memory.assert_called_once()
+    assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'prior-77'
+
+    # (c) Flag annotated; persist-for-dedup fields are NOT set (bypassed).
+    assert len(result) == 1
+    assert result[0]['completion_marker_self_deleted'] is True
+    assert result[0]['last_seen_run_id'] == 'r1'
+    assert 'persisted_from_run' not in result[0]
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_completion_flag_with_no_priors_is_noop_sweep():
+    """A completion flag whose signature has no prior marker at all (the common
+    case: nothing was ever persisted for it) is a clean no-op sweep — no
+    add_memory, no delete_memory — and is still annotated
+    completion_marker_self_deleted=True.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('77', 'duplicate_flag_marker_cleanup'): [[]]},
+    ))
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{
+        'task_id': 77,
+        'flag_type': 'duplicate_flag_marker_cleanup',
+        'description': 'cleaned up an orphaned duplicate flag marker',
+        'flag_for_stage2': False,
+    }]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    memory_service.add_memory.assert_not_called()
+    memory_service.delete_memory.assert_not_called()
+
+    assert len(result) == 1
+    assert result[0]['completion_marker_self_deleted'] is True
+    assert result[0]['last_seen_run_id'] == 'r1'
+    assert 'persisted_from_run' not in result[0]
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_completion_flag_duplicate_signature_in_batch_swept_once():
+    """Idempotency (task-2312 review amendment): when the SAME (task_id,
+    flag_type) completion signature is emitted twice in one items_flagged
+    batch, only the FIRST occurrence runs the acknowledge_flag_marker sweep —
+    the second is caught by the in-batch seen_signatures memo (task-1978)
+    because the completion branch now registers its signature there too,
+    instead of independently re-running a second sweep.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        # Only ONE entry configured: a second, unmemoized sweep would exhaust
+        # the queue and raise inside the search stub, failing the test.
+        marker={('77', 'duplicate_flag_marker_cleanup'): [[]]},
+    ))
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [
+        {
+            'task_id': 77,
+            'flag_type': 'duplicate_flag_marker_cleanup',
+            'description': 'cleaned up an orphaned duplicate flag marker',
+            'flag_for_stage2': False,
+        },
+        {
+            'task_id': 77,
+            'flag_type': 'duplicate_flag_marker_cleanup',
+            'description': 'same signature, re-evaluated within this run',
+            'flag_for_stage2': False,
+        },
+    ]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    memory_service.add_memory.assert_not_called()
+    memory_service.delete_memory.assert_not_called()
+
+    assert len(result) == 2
+    # First occurrence: resolved directly by the completion branch.
+    assert result[0]['completion_marker_self_deleted'] is True
+    assert result[0]['last_seen_run_id'] == 'r1'
+    assert 'persisted_from_run' not in result[0]
+    # Second occurrence: short-circuited by the in-batch memo instead of
+    # re-running the sweep.
+    assert result[1].get('persisted_from_run') == 'r1'
+    assert result[1]['last_seen_run_id'] == 'r1'
+    assert 'completion_marker_self_deleted' not in result[1]
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_recurring_flag_without_flag_for_stage2_unaffected():
+    """Dedup-safety guard: a flag WITHOUT flag_for_stage2 (an ordinary recurring
+    finding, MISS path) is completely unchanged by the completion-marker
+    feature — its marker is written and NOT deleted, proving cross-cycle
+    dedup is not regressed by the new branch.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(return_value=[])  # no prior marker, no suppression
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{'task_id': '99', 'flag_type': 'stale_metadata', 'description': 'bar'}]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    assert len(result) == 1
+    assert 'persisted_from_run' not in result[0]
+    assert 'completion_marker_self_deleted' not in result[0]
+
+    memory_service.add_memory.assert_called_once()
+    _assert_valid_stage1_marker(
+        memory_service.add_memory.call_args.kwargs,
+        task_id='99', flag_type='stale_metadata', run_id='r1',
+    )
+    memory_service.delete_memory.assert_not_called()
+

@@ -217,6 +217,72 @@ attempted because the breaker is open).  The ACTIVE wording is
 During a brownout this lets operators distinguish genuine confirmation misses
 from gate-only flags raised purely from the memory_ids check.
 
+Completion-marker same-cycle self-delete (task-2312)
+-----------------------------------------------------
+The MISS-branch orphan-growth caveat above assumes every flag_type recurs
+indefinitely or is eventually swept by a slower out-of-band GC. In practice
+some Stage 1 findings represent ONE-TIME completed or bookkeeping work (e.g.
+"duplicate flag marker cleaned up", "dependency-parity gap resolved", "mem0
+duplicate cluster consolidated") that will never recur — so the HIT-path
+collapse-to-one-row self-healing never fires for them, and their MISS marker
+orphans permanently (the existing sweeps are too slow/narrow to reliably
+catch it — see the "Orphan-growth caveat" comment in the MISS branch above).
+
+``dedup_flags`` closes this gap with an explicit, producer-driven signal:
+when a flag carries ``flag_for_stage2`` present-and-explicitly-false (checked
+by the pure helper ``_is_completion_flag`` — bool ``False`` or a
+case-insensitive ``'false'`` string; ABSENCE of the key does not count), the
+flag is treated as a completion marker instead of a recurring finding:
+
+1. NO new ``stage1_flag_marker`` is written for it — a completion marker
+   must never survive the cycle that reported it, so (unlike the MISS/HIT
+   paths below) there is nothing worth persisting in the first place.
+2. Any priors accumulated by earlier cycles for this exact (task_id,
+   flag_type) signature are swept via
+   ``acknowledge_flag_marker(mode='delete')`` (self-healing any pre-existing
+   orphan for that signature; a no-op — 0 acknowledged — when none exist).
+3. The flag is annotated ``completion_marker_self_deleted=True`` (plus the
+   usual ``last_seen_run_id``) and appended to the result — bypassing the
+   persist-for-dedup MISS/HIT path entirely. It carries no
+   ``persisted_from_run`` field since no marker survives for a future cycle
+   to find.
+4. The signature is recorded in the in-batch ``seen_signatures`` memo (see
+   "In-batch signature memoization" above) so a repeat of the SAME
+   completion signature later in this same ``dedup_flags`` call is annotated
+   from the memo instead of re-running the sweep.
+
+amend (task-2312 review): an earlier version of this branch emitted (wrote
+and confirmed) a marker via ``_write_and_confirm_marker`` and then
+immediately reclaimed it via ``acknowledge_flag_marker`` in the SAME call.
+``acknowledge_flag_marker`` runs its OWN independent ``find_prior_memories``
+search rather than consuming the id the write just returned, so under the
+same Mem0 read-after-write indexing lag documented in "Confirmation
+circuit-breaker" below, that search could race the just-written marker and
+miss it — leaving a fresh orphan. Because completion flags by definition
+never recur, that orphan would never later collapse the way the HIT path's
+collapse-to-one-row behavior does. Skipping the write removes the race
+outright: there is no new marker to lose track of, and any genuinely
+pre-existing prior is still found and deleted.
+
+Dedup-safety (why this cannot regress recurring-flag dedup): the MISS branch
+above never sets ``flag_for_stage2`` at all, and recurring-finding flags
+either omit the key or set it truthy — neither shape is ever accepted by
+``_is_completion_flag``. Gating on PRESENT-AND-FALSE (never on mere absence)
+means this branch only ever fires for flags the producer has positively
+identified as one-time completions, so every existing recurring-flag
+HIT/MISS/in-batch-memoization behavior above is completely unchanged. This
+branch is checked AFTER the in-batch ``seen_signatures`` memo, so a signature
+already resolved earlier in the same ``dedup_flags`` call (by any path) is
+annotated from the memo instead of re-running this sweep. Residual
+ordering-dependent edge case (accepted, producer-shouldn't-do-that): if the
+SAME signature appears as a recurring (non-completion) flag first and a
+completion flag second within one batch, the second is annotated from the
+memo (``persisted_from_run``) rather than ``completion_marker_self_deleted``;
+in the reverse order, the completion occurrence self-deletes and registers
+the memo, so the later recurring occurrence is itself annotated from the
+memo instead of MISS-writing a fresh marker. Neither ordering regresses
+cross-cycle dedup for a signature that is used consistently by its producer.
+
 Public API
 ----------
 - ``compute_flag_signature(flag)`` — cheap, sync, no I/O.
@@ -226,7 +292,11 @@ Public API
   project-scoped Mem0 search; drops suppressed flags before signature dedup.
 - ``dedup_flags(memory_service, project_id, run_id, flags)`` — async, calls
   ``filter_suppressed`` first then does Mem0 search + write + confirm + delete
-  per flag; best-effort (exceptions are logged, not raised).
+  per flag; best-effort (exceptions are logged, not raised).  Flags explicitly
+  marked ``flag_for_stage2=False`` are instead treated as one-time completion
+  markers: no marker is written for them; any priors are swept within the
+  same call (see "Completion-marker same-cycle self-delete" above) rather
+  than persisting a new marker for cross-cycle dedup.
 - ``acknowledge_flag_marker(memory_service, *, project_id, run_id, task_id, flag_type, mode, log)``
   — async, best-effort delete or tag (write-replacement + delete-old) of the
   prior ``stage1_flag_marker``(s) for one (task_id, flag_type) signature;
@@ -780,6 +850,34 @@ async def _write_and_confirm_marker(
     )
 
 
+def _is_completion_flag(flag: dict[str, Any]) -> bool:
+    """Return True iff *flag* explicitly marks itself as ONE-TIME completed work.
+
+    A flag is a completion marker iff ``flag['flag_for_stage2']`` is present
+    AND explicitly false: the bool ``False``, or a string equal to ``'false'``
+    case-insensitively (e.g. ``'false'``, ``'False'``, ``'FALSE'``).
+
+    Absence of the key is DELIBERATELY excluded from this predicate — it must
+    NOT be treated as a completion marker. The dedup MISS-branch markers
+    ``_write_and_confirm_marker`` writes for recurring findings never set
+    ``flag_for_stage2`` at all, and recurring-finding flags either omit the
+    key or set it truthy. Treating absence as "false" would misclassify every
+    ordinary recurring flag as a one-time completion, deleting the very
+    marker cross-cycle dedup depends on and turning every cycle into a fresh
+    MISS (infinite re-flagging). Only an EXPLICIT false value is a safe,
+    unambiguous signal that the producer intends this finding to be a
+    same-cycle completion marker rather than a recurring finding.
+
+    Pure, sync, no I/O.
+    """
+    if 'flag_for_stage2' not in flag:
+        return False
+    value = flag['flag_for_stage2']
+    if value is False:
+        return True
+    return isinstance(value, str) and value.strip().casefold() == 'false'
+
+
 async def dedup_flags(
     memory_service: Any,
     project_id: str,
@@ -1008,6 +1106,70 @@ async def dedup_flags(
             flag['last_seen_run_id'] = run_id
             result.append(flag)
             continue
+
+        # --- Completion-marker same-cycle self-delete (task-2312) ---
+        # A flag the producer explicitly marks flag_for_stage2=False represents
+        # ONE-TIME completed/bookkeeping work (e.g. a duplicate-marker cleanup or
+        # a resolved dependency-parity gap) rather than a recurring finding that
+        # must persist for cross-cycle dedup. Unlike the MISS/HIT paths below,
+        # NO new stage1_flag_marker is written for it: a completion marker must
+        # never survive the cycle that reported it, so there is nothing worth
+        # persisting in the first place. This branch only SWEEPS any priors
+        # accumulated by earlier cycles for this exact (task_id, flag_type)
+        # signature via acknowledge_flag_marker(mode='delete') — self-healing
+        # any pre-existing orphan for that signature (a no-op when none exist).
+        #
+        # amend (task-2312 review): an earlier version of this branch emitted a
+        # marker via _write_and_confirm_marker and then immediately reclaimed it
+        # via acknowledge_flag_marker in the SAME call. acknowledge_flag_marker
+        # runs its OWN independent find_prior_memories search rather than
+        # consuming the id the write just returned, so under the same Mem0
+        # read-after-write indexing lag this module documents elsewhere (see
+        # "Confirmation circuit-breaker" in the module docstring), that search
+        # could race the just-written marker and miss it — leaving a fresh
+        # orphan that (unlike the HIT path's collapse-to-one-row self-heal)
+        # would never later collapse, because completion flags by definition
+        # never recur. Skipping the write removes the race outright: there is
+        # no new marker to lose track of, and any genuinely pre-existing prior
+        # is still found and deleted below.
+        #
+        # Dedup-safety: _is_completion_flag requires flag_for_stage2 to be
+        # PRESENT and explicitly false. Absence (the shape every dedup
+        # MISS/HIT marker and every ordinary recurring flag has) never matches,
+        # so this branch is strictly additive and cannot regress cross-cycle
+        # dedup for recurring findings — see _is_completion_flag's docstring.
+        if _is_completion_flag(flag):
+            # Best-effort, never raises (see acknowledge_flag_marker docstring).
+            # Sweeps any priors left over from earlier cycles for this exact
+            # (tid, ftype) signature; returns 0 (no-op) when none are found.
+            await acknowledge_flag_marker(
+                memory_service,
+                project_id=project_id,
+                run_id=run_id,
+                task_id=tid,
+                flag_type=ftype,
+                mode='delete',
+                log=logger,
+            )
+            flag = dict(flag)
+            flag['completion_marker_self_deleted'] = True
+            flag['last_seen_run_id'] = run_id
+            # In-batch memoization (task-1978 parity; task-2312 review amendment):
+            # register this signature so a repeat of the SAME completion
+            # signature later in this batch hits the in-batch memo check above
+            # instead of re-running this sweep (mirrors the unconditional
+            # seen_signatures recording at the end of the HIT/MISS path below).
+            # Residual ordering-dependent asymmetry (accepted,
+            # producer-shouldn't-do-that edge case, same spirit as the
+            # HIT-first/MISS-first trade-off documented below): if the SAME
+            # signature appears as a recurring flag first and a completion flag
+            # second within one batch, the second is annotated from the memo
+            # (persisted_from_run) rather than completion_marker_self_deleted.
+            # Neither ordering regresses cross-cycle dedup.
+            seen_signatures[(tid, ftype)] = run_id
+            result.append(flag)
+            continue
+
         # Delegate search+filter to the shared helper.  find_prior_memories logs a
         # WARNING under logger on search failure and returns [] so the else
         # branch below writes a fresh marker (best-effort on transient Mem0 outage).

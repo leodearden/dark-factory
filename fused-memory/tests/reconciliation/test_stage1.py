@@ -1081,6 +1081,105 @@ class TestMemoryConsolidatorRunWiring:
             "RED: current impl's except handler drops ALL raises as inconclusive."
         )
 
+    @pytest.mark.asyncio
+    async def test_completion_markers_self_deleted_stat_present_when_zero(self):
+        """report.stats['stage1_completion_markers_self_deleted'] is ALWAYS present,
+        even when items_flagged contains no completion-marker-annotated flags (== 0).
+
+        RED before step-6: run() does not set this stat at all (task-2312 step-5).
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+
+        plain_flag = {
+            'task_id': '100',
+            'flag_type': 'missing_deliverable',
+            'description': 'Task 100 has no deliverable',
+        }
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[plain_flag],
+            stats={},
+        )
+        # dedup_flags passes the flag through unannotated (no completion marker).
+        dedup_mock = AsyncMock(return_value=[plain_flag])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step5-a',
+            )
+
+        assert 'stage1_completion_markers_self_deleted' in report.stats, (
+            "run() must ALWAYS set report.stats['stage1_completion_markers_self_deleted']; "
+            f"got stats={report.stats!r}. "
+            "RED: the stat is not yet wired into run()."
+        )
+        assert report.stats['stage1_completion_markers_self_deleted'] == 0
+
+    @pytest.mark.asyncio
+    async def test_completion_markers_self_deleted_stat_counts_annotated_flags(self):
+        """report.stats['stage1_completion_markers_self_deleted'] equals the count of
+        flags dedup_flags annotated completion_marker_self_deleted=True.
+
+        RED before step-6: run() does not set this stat at all (task-2312 step-5).
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.project_id = 'test_project'
+
+        completion_flag = {
+            'task_id': '77',
+            'flag_type': 'duplicate_flag_marker_cleanup',
+            'description': 'cleaned up an orphaned duplicate flag marker',
+            'flag_for_stage2': False,
+            'completion_marker_self_deleted': True,
+            'last_seen_run_id': 'run-step5-b',
+        }
+        plain_flag = {
+            'task_id': '100',
+            'flag_type': 'missing_deliverable',
+            'description': 'Task 100 has no deliverable',
+        }
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[completion_flag, plain_flag],
+            stats={},
+        )
+        # dedup_flags returns exactly the annotated flags it would produce for this
+        # input — the completion flag self-deleted (annotated), the plain flag untouched.
+        dedup_mock = AsyncMock(return_value=[completion_flag, plain_flag])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-step5-b',
+            )
+
+        assert report.stats.get('stage1_completion_markers_self_deleted') == 1, (
+            "Expected exactly 1 completion-marker self-delete counted; "
+            f"got stats={report.stats!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-11 (RED) / step-12 (GREEN): task_count_verification stat wiring
