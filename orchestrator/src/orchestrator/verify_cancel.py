@@ -56,6 +56,7 @@ import os
 import re
 import select
 import signal
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -602,3 +603,44 @@ def fire_watchdog_kill(
             kill(pid, signal.SIGKILL)
 
     exit_fn(exit_code)
+
+
+def start_stdin_watchdog(
+    pgid: int,
+    *,
+    heartbeat_timeout: float = WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+    grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
+    read_fd: int = 0,
+    select_fn=select.select,
+    read_fn=os.read,
+    fire=None,
+) -> threading.Thread:
+    """Spawn a started daemon thread running :func:`run_stdin_watchdog` against *read_fd*.
+
+    On fire (stdin EOF or heartbeat starvation), the default *fire* callback
+    kills the build subtree rooted at *pgid* and self-terminates (see
+    :func:`fire_watchdog_kill`).  A dedicated OS thread with a blocking
+    ``select`` loop -- rather than an asyncio task -- fires even if the
+    build's own event loop is saturated or wedged; ``daemon=True`` so this
+    thread never blocks interpreter shutdown on its own.
+
+    *fire* is injectable for tests (default: a closure over
+    :func:`fire_watchdog_kill` bound to *pgid* and *grace_secs*).
+    *select_fn* / *read_fn* / *read_fd* pass through to
+    :func:`run_stdin_watchdog`.
+    """
+    on_fire = fire if fire is not None else (
+        lambda: fire_watchdog_kill(pgid, grace_secs=grace_secs)
+    )
+    thread = threading.Thread(
+        target=run_stdin_watchdog,
+        args=(read_fd, on_fire),
+        kwargs={
+            'heartbeat_timeout': heartbeat_timeout,
+            'select_fn': select_fn,
+            'read_fn': read_fn,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return thread
