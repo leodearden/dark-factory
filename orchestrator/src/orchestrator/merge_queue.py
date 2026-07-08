@@ -174,6 +174,7 @@ from orchestrator.verify_runner import (
     VerifyRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
+    is_flock_contention_failure,
     is_unscoped_gate_failure,
     unscoped_gate_failing_subprojects,
 )
@@ -753,6 +754,96 @@ async def _classify_main_health_red(
     )
     _emit_merge_attempt(event_store, req.task_id, OutcomeKind.main_health_red)
     return outcome
+
+
+# Sentinel task_id prefix for a laptop-side flock-worktree-contention alarm
+# (task 2307 β, PRD plans/laptop-warm-verify-flock-orphan-prd.md §8.2).
+# Mirrors _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX's per-host sentinel shape.
+_VERIFY_WORKTREE_CONTENTION_SENTINEL_PREFIX = '__verify_worktree_contention__'
+
+
+def _verify_worktree_contention_sentinel(host: str) -> str:
+    """Return the per-host sentinel task_id for a flock-worktree-contention alarm."""
+    return f'{_VERIFY_WORKTREE_CONTENTION_SENTINEL_PREFIX}{host}'
+
+
+def _alarm_verify_worktree_contention(
+    escalation_queue: Any,
+    *,
+    host: str,
+    holder_pgid: int | None,
+    waiter_pgid: int | None,
+) -> None:
+    """Submit a born-at-L2 escalation for a laptop-side flock-worktree-contention outcome.
+
+    Fired when a remote verify (task 2306 α's ``make_flock_contention_result``)
+    reports that ``.merge_verify.lock`` could not be acquired within the
+    bounded wait — another verify invocation already holds the persistent
+    warm merge-verify worktree.  The laptop CLI holds no escalation client
+    (the escalation MCP server binds 127.0.0.1:8100), so the workstation
+    files this on the laptop's behalf.
+
+    The escalation is:
+
+    * ``level=2`` / ``severity='critical'`` — born-at-L2 (PRD §8.2): routes
+      straight to a human, bypassing the auto-watcher.
+    * ``agent_role='orchestrator-verify-host-monitor'`` — the ``orchestrator-``
+      prefix marks this as a harness sentinel so the escalation server never
+      downgrades the severity (mirrors ``_emit_loop_terminal_escalation``).
+    * ``category='verify_worktree_contention'``
+    * ``task_id=_verify_worktree_contention_sentinel(host)``
+
+    None-safe: returns immediately when *escalation_queue* is None.  No
+    dedup (unlike ``_alarm_verify_host_unreachable``): contention should
+    essentially never fire, and the born-at-L2 escalation blocks the task,
+    so quiescence prevents re-fire for the same merge.  No event emission —
+    the escalation is the sole user-observable signal (PRD §8.2).
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        host: Laptop host name that reported the contention.
+        holder_pgid: pgid of the process holding the lock, or ``None`` when
+            the holder's pgid file is absent or corrupt (α's fail-safe).
+        waiter_pgid: pgid of the process that lost the race and reported.
+    """
+    if escalation_queue is None:
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    sentinel = _verify_worktree_contention_sentinel(host)
+    summary = (
+        f'Flock contention on {host!r}: another verify holds the persistent '
+        f'merge-verify worktree lock'
+    )
+    detail = (
+        f'Host: {host}\n'
+        f'Holder pgid: {holder_pgid if holder_pgid is not None else "<unknown>"}\n'
+        f'Waiter pgid: {waiter_pgid if waiter_pgid is not None else "<unknown>"}\n'
+        '\n'
+        f'The laptop-side verify on {host!r} could not acquire '
+        '.merge_verify.lock within the bounded wait, so it reported '
+        'contention instead of falling back to an ephemeral worktree. '
+        'The merge is blocked pending investigation.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-verify-host-monitor',
+        severity='critical',
+        level=2,
+        category='verify_worktree_contention',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            f'Inspect the holder process (pgid {holder_pgid}) on {host!r} — '
+            'confirm it is a legitimate in-progress verify and not an orphan. '
+            'Kill an orphaned holder to release .merge_verify.lock, or wait '
+            'for it to finish, then re-submit the blocked merge.'
+        ),
+    )
+    escalation_queue.submit(esc)
 
 
 async def _run_post_merge_verify(
