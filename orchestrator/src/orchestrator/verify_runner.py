@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
+from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -665,6 +666,64 @@ async def _default_subprocess_run(
         cwd=cwd,
     )
     stdout_b, stderr_b = await proc.communicate()
+    return (
+        proc.returncode or 0,
+        stdout_b.decode().strip(),
+        stderr_b.decode().strip(),
+    )
+
+
+async def _default_ssh_heartbeat_run(
+    argv: list[str],
+    *,
+    cwd: str | Path | None = None,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL_SECS,
+) -> tuple[int, str, str]:
+    """Default ssh-dispatch subprocess helper — like :func:`_default_subprocess_run`,
+    plus a stdin heartbeat (connection-death protocol, PRD §8.1).
+
+    Opens *argv* with ``stdin=PIPE`` (unlike :func:`_default_subprocess_run`,
+    whose stdin is unset/inherited) and runs a concurrent writer task that
+    sends a heartbeat newline down the child's stdin every
+    *heartbeat_interval* seconds for the full duration of the call.  This is
+    the dispatcher half of the connection-death protocol: the remote
+    verify-merge watchdog (``verify_cancel.run_stdin_watchdog``) fires if
+    heartbeats stop arriving, tying the remote build's lifetime to this ssh
+    child's lifetime.
+
+    A heartbeat write failing with ``BrokenPipeError``/``ConnectionResetError``
+    means the child is already gone (EPIPE) — benign, since the existing
+    transport-failure handling (non-zero rc / unparseable stdout ->
+    RunnerUnavailable) already covers the dead-channel outcome.  Swallowed so
+    it never raises out of the writer nor alters the returned
+    ``(rc, stdout, stderr)``.  The writer task is cancelled once
+    ``communicate()`` completes.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(heartbeat_interval)
+            try:
+                proc.stdin.write(b'\n')
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # child already gone -- benign, transport-failure path handles it
+
+    heartbeat_task = asyncio.ensure_future(_heartbeat())
+    try:
+        stdout_b, stderr_b = await proc.communicate()
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
     return (
         proc.returncode or 0,
         stdout_b.decode().strip(),
