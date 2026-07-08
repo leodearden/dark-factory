@@ -399,7 +399,16 @@ class TestIdempotentResumeAndQuiescence:
         outcome = await runner.run(assignment)
 
         assert outcome == WorkflowOutcome.DONE
-        scheduler.set_task_status.assert_awaited_once_with('100', 'done')
+        # Pure-gate leg stamps deterministic-gate provenance (task 2331) so the
+        # done write passes require_done_provenance instead of churning forever.
+        scheduler.set_task_status.assert_awaited_once_with(
+            '100',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+            },
+        )
 
     async def test_resume_no_new_escalation_filed(self, tmp_path: Path):
         """Resume path must NOT file a new escalation (no re-escalate)."""
@@ -2571,7 +2580,16 @@ class TestDeterministicRunnerResolutionProofAliasing:
             "An unrelated pending escalation must not alias as this runner's "
             'own open gate — the gate itself is resolved, so resume must proceed'
         )
-        scheduler.set_task_status.assert_awaited_once_with('801', 'done')
+        # Pure-gate leg stamps deterministic-gate provenance (task 2331) so the
+        # done write passes require_done_provenance instead of churning forever.
+        scheduler.set_task_status.assert_awaited_once_with(
+            '801',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+            },
+        )
 
     # --- run()'s before_done quiescence aliasing -----------------------------
 
