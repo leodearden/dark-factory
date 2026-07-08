@@ -20,7 +20,6 @@ from shared.locking import (
     files_to_modules,
     modules_conflict,
     normalize_lock,
-    strip_directory_locks,
 )
 from shared.mcp_envelope import parse_tool_result, resolver_failed
 from shared.psi import PsiSample, read_psi_sample
@@ -4526,7 +4525,7 @@ class Scheduler:
         ``{**fresh_md, 'files': honest}`` — existing keys win except ``files``.
 
         ``files`` must be file-level paths (not depth-coarsened module paths).
-        Directory entries are stripped via ``strip_directory_locks`` so that the
+        Directory entries are stripped via ``sanitize_files_for_persist`` so that the
         persisted ``metadata.files`` field always holds genuine file paths —
         making it genuinely idempotent at all lock depths.  On restart
         ``_get_modules`` can re-derive the correct module lock from a file-level
@@ -4540,7 +4539,7 @@ class Scheduler:
         """
         fresh = await self.get_task(task_id)
         fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
-        honest = strip_directory_locks(files)
+        honest = sanitize_files_for_persist(files)
         dropped = sorted(set(files) - set(honest))
         if dropped:
             logger.debug(
@@ -4657,7 +4656,7 @@ class Scheduler:
             f'Task {task_id} needs modules {needed} but locks unavailable. Requeuing.'
         )
         # Cache expanded modules in memory so _get_modules uses them on retry
-        self._module_cache[task_id] = sorted(needed_set)
+        self._write_module_cache(task_id, sorted(needed_set))
         # Read-modify-write so memory_hints / _causation_id attached by Stage-2
         # reconciliation survive the blast-radius-failure files write (task 1511).
         # get_task already swallows MCP errors → None, so the isinstance guard
