@@ -1296,12 +1296,25 @@ class TestRecoveryTerminalTaskLaneRelease:
 
     async def test_recovery_releases_terminal_task_lane(self, tmp_path: Path):
         """(21) Done task: cleanup_worktree called, restore_assignment NOT called,
-        task NOT stored in _recovered_plans."""
+        task NOT stored in _recovered_plans.
+
+        step-16 review-fix regression guard: exercises the REAL release path
+        (side_effect=real_cleanup) rather than a bare mock.  cleanup_worktree
+        on a warm lane routes through release_warm_lane -> _lifecycle_note_released,
+        which already writes the durable ASSIGNED -> RELEASED edge; a bare
+        AsyncMock decouples cleanup from that durable write and masks the bug
+        where the harness's OWN unconditional `transition(entry, RELEASED)`
+        afterward then hits an illegal RELEASED -> RELEASED edge and raises
+        out of the recovery loop.
+        """
         harness, git_ops, pool, lane_entry = await self._make_recovery_setup(tmp_path)
 
         harness.scheduler.get_status = AsyncMock(return_value='done')
 
-        with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
+        real_cleanup = git_ops.cleanup_worktree
+        with patch.object(
+            git_ops, 'cleanup_worktree', new_callable=AsyncMock, side_effect=real_cleanup,
+        ) as mock_cleanup, \
              patch.object(pool, 'restore_assignment') as mock_restore:
             await harness._recover_crashed_tasks()
 
@@ -1313,6 +1326,12 @@ class TestRecoveryTerminalTaskLaneRelease:
         assert '3459' not in harness._recovered_plans, (
             'terminal task lane must not be stored in _recovered_plans'
         )
+        # The REAL release path already wrote the durable RELEASED edge —
+        # _recover_crashed_tasks must complete without raising a redundant
+        # RELEASED -> RELEASED transition.
+        record = git_ops._lane_lifecycle.read(lane_entry)
+        assert record is not None
+        assert record.state == DurableLaneState.RELEASED
 
     async def test_recovery_restores_non_terminal_task_lane(self, tmp_path: Path):
         """(22) Non-terminal task (in-progress): restore_assignment IS called;

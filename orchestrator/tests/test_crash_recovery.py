@@ -1201,6 +1201,15 @@ class TestRecordDrivenRecovery:
         shrink the pool forever.  This is resolved BEFORE the git-reality
         adopt/quarantine decision, so it must win even though registration
         and branch both check out fine.
+
+        step-16 review-fix regression guard: cleanup_worktree's side_effect
+        performs the REAL durable RELEASED write (mirroring what
+        release_warm_lane -> _lifecycle_note_released does for a real warm
+        lane) BEFORE the harness's own explicit transition runs, so an
+        unconditional second RELEASED -> RELEASED transition would raise
+        IllegalLaneTransition uncaught out of the recovery loop.  A second,
+        non-terminal lane seeded AFTER this one proves recovery keeps going
+        instead of aborting mid-loop.
         """
         pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
@@ -1209,13 +1218,27 @@ class TestRecordDrivenRecovery:
         lifecycle = harness.git_ops._lane_lifecycle
         _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
 
+        # Second, non-terminal lane seeded AFTER the terminal one -- proves
+        # the loop doesn't abort mid-recovery on the redundant-transition bug.
+        lane2 = base / '_lane-1'
+        plan2 = _make_plan(steps_done=1, steps_total=2, task_id='99')
+        _setup_lane(base, '_lane-1', plan2)
+        _seed_lane_record(lifecycle, lane2, task_id='99', branch='task/99')
+
         harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
         harness.git_ops.lane_branch_checkouts = AsyncMock(
-            return_value={'42': lane},
+            return_value={'42': lane, '99': lane2},
         )
-        harness.scheduler.get_status = AsyncMock(return_value='done')  # terminal
 
-        await harness._recover_crashed_tasks()
+        async def _get_status(task_id):
+            return 'done' if task_id == '42' else None
+
+        harness.scheduler.get_status = AsyncMock(side_effect=_get_status)
+        harness.git_ops.cleanup_worktree.side_effect = (
+            lambda entry, tid: harness.git_ops._lifecycle_note_released(entry)
+        )
+
+        await harness._recover_crashed_tasks()  # must not raise
 
         harness.git_ops.cleanup_worktree.assert_called_once_with(  # type: ignore[attr-defined]
             lane, '42',
@@ -1228,6 +1251,11 @@ class TestRecordDrivenRecovery:
 
         assert pool.assignment_for('42') is None
         assert '42' not in harness._recovered_plans
+
+        # The second, non-terminal lane is still adopted -- recovery did not
+        # abort mid-loop when it hit the terminal lane's redundant transition.
+        assert pool.assignment_for('99') == lane2
+        assert '99' in harness._recovered_plans
 
     async def test_quarantine_on_branch_mismatch(self, harness: Harness):
         """The 2062 detached-HEAD/stale-branch collision: durable record
