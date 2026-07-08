@@ -149,6 +149,78 @@ async def test_collect_targets_filters_to_those_with_checkpoint(monkeypatch):
     assert 'planned_episode_registry' not in names
 
 
+@pytest.mark.asyncio
+async def test_collect_targets_includes_recon_ledger_when_present():
+    """_collect_checkpoint_targets appends a ('recon_ledger', checkpoint) target
+    when recon_ledger exposes an async checkpoint() (task 2219, step-17)."""
+
+    class HasCheckpoint:
+        async def checkpoint(self):
+            return (0, 0, 0)
+
+    class _NoAttr:
+        pass
+
+    targets = server_main._collect_checkpoint_targets(
+        taskmaster=None,
+        recon_journal=None,
+        event_buffer=None,
+        ticket_store=None,
+        write_journal=None,
+        memory_service=_NoAttr(),
+        recon_ledger=HasCheckpoint(),
+    )
+    names = {name for name, _ in targets}
+    assert 'recon_ledger' in names
+
+
+@pytest.mark.asyncio
+async def test_collect_targets_omits_recon_ledger_when_none_or_no_checkpoint():
+    """recon_ledger=None (the default) or an object lacking checkpoint() adds
+    no 'recon_ledger' target."""
+
+    class NoCheckpoint:
+        pass
+
+    class _NoAttr:
+        pass
+
+    # Default (recon_ledger not passed at all) — existing call sites unaffected.
+    targets_default = server_main._collect_checkpoint_targets(
+        taskmaster=None,
+        recon_journal=None,
+        event_buffer=None,
+        ticket_store=None,
+        write_journal=None,
+        memory_service=_NoAttr(),
+    )
+    assert 'recon_ledger' not in {name for name, _ in targets_default}
+
+    # Explicit None.
+    targets_none = server_main._collect_checkpoint_targets(
+        taskmaster=None,
+        recon_journal=None,
+        event_buffer=None,
+        ticket_store=None,
+        write_journal=None,
+        memory_service=_NoAttr(),
+        recon_ledger=None,
+    )
+    assert 'recon_ledger' not in {name for name, _ in targets_none}
+
+    # Present but lacking checkpoint().
+    targets_no_checkpoint = server_main._collect_checkpoint_targets(
+        taskmaster=None,
+        recon_journal=None,
+        event_buffer=None,
+        ticket_store=None,
+        write_journal=None,
+        memory_service=_NoAttr(),
+        recon_ledger=NoCheckpoint(),
+    )
+    assert 'recon_ledger' not in {name for name, _ in targets_no_checkpoint}
+
+
 # ---------------------------------------------------------------------------
 # Step 1 — existence-guarded override-DB checkpoint helper
 # ---------------------------------------------------------------------------
