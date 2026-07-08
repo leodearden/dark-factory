@@ -105,6 +105,8 @@ __all__ = [
     # α additions (task 2306 — laptop flock-guard contention outcome)
     "FLOCK_CONTENTION_CATEGORY",
     "make_flock_contention_result",
+    # task 2307 additions — workstation consumer discriminant for the α outcome
+    "is_flock_contention_failure",
 ]
 
 # Sentinel category constants — encode an unscoped-gate failure inside a
@@ -1073,6 +1075,18 @@ class RemoteRunner:
 def is_unscoped_gate_failure(vr: VerifyResult) -> bool:
     """True when vr carries a sentinel category from LocalRunner's unscoped gate."""
     return vr.category in _UNSCOPED_SENTINEL_CATEGORIES
+
+
+def is_flock_contention_failure(vr: VerifyResult) -> bool:
+    """True when vr is the distinguished flock-contention outcome (task 2306 α).
+
+    Keyed on the stable FLOCK_CONTENTION_CATEGORY constant (not on
+    ``contention is not None``) so the check stays robust even if the payload
+    shape changes.  Consumed by merge_queue (task 2307 β) to recognize a
+    laptop-side flock-guard contention VerifyResult and file a born-at-L2
+    escalation instead of treating it as an ordinary verify failure.
+    """
+    return vr.category == FLOCK_CONTENTION_CATEGORY
 
 
 def unscoped_gate_failing_subprojects(vr: VerifyResult) -> list[str]:

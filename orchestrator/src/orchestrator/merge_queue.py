@@ -174,6 +174,7 @@ from orchestrator.verify_runner import (
     VerifyRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
+    is_flock_contention_failure,
     is_unscoped_gate_failure,
     unscoped_gate_failing_subprojects,
 )
@@ -755,6 +756,114 @@ async def _classify_main_health_red(
     return outcome
 
 
+# Sentinel task_id prefix for a laptop-side flock-worktree-contention alarm
+# (task 2307 β, PRD plans/laptop-warm-verify-flock-orphan-prd.md §8.2).
+# Mirrors _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX's per-host sentinel shape.
+_VERIFY_WORKTREE_CONTENTION_SENTINEL_PREFIX = '__verify_worktree_contention__'
+
+
+def _verify_worktree_contention_sentinel(host: str) -> str:
+    """Return the per-host sentinel task_id for a flock-worktree-contention alarm."""
+    return f'{_VERIFY_WORKTREE_CONTENTION_SENTINEL_PREFIX}{host}'
+
+
+def _alarm_verify_worktree_contention(
+    escalation_queue: Any,
+    *,
+    host: str,
+    holder_pgid: int | None,
+    waiter_pgid: int | None,
+) -> None:
+    """Submit a born-at-L2 escalation for a laptop-side flock-worktree-contention outcome.
+
+    Fired when a remote verify (task 2306 α's ``make_flock_contention_result``)
+    reports that ``.merge_verify.lock`` could not be acquired within the
+    bounded wait — another verify invocation already holds the persistent
+    warm merge-verify worktree.  The laptop CLI holds no escalation client
+    (the escalation MCP server binds 127.0.0.1:8100), so the workstation
+    files this on the laptop's behalf.
+
+    The escalation is:
+
+    * ``level=2`` / ``severity='critical'`` — born-at-L2 (PRD §8.2): routes
+      straight to a human, bypassing the auto-watcher.
+    * ``agent_role='orchestrator-verify-host-monitor'`` — the ``orchestrator-``
+      prefix marks this as a harness sentinel so the escalation server never
+      downgrades the severity (mirrors ``_emit_loop_terminal_escalation``).
+    * ``category='verify_worktree_contention'``
+    * ``task_id=_verify_worktree_contention_sentinel(host)``
+
+    None-safe: returns immediately when *escalation_queue* is None.  Dedup:
+    returns immediately when an open L2 already exists for this host's
+    sentinel task_id.  An orphaned lock-holder (the PRD scenario) persists
+    until manually killed, so without this guard every subsequent distinct
+    merge routed to the host would file another L2 — a burst of duplicate
+    criticals at the human while the orphan lives.  The check goes through
+    ``get_by_task(sentinel, status='pending', level=2)`` rather than
+    ``_alarm_verify_host_unreachable``'s ``has_open_l1``: that helper is
+    hardcoded to ``level=1`` (see ``escalation/queue.py``) and would never
+    match this level=2 escalation.  No event emission — the escalation is
+    the sole user-observable signal (PRD §8.2).
+
+    Args:
+        escalation_queue: Live escalation queue or ``None``.
+        host: Laptop host name that reported the contention.
+        holder_pgid: pgid of the process holding the lock, or ``None`` when
+            the holder's pgid file is absent or corrupt (α's fail-safe).
+        waiter_pgid: pgid of the process that lost the race and reported.
+    """
+    if escalation_queue is None:
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    sentinel = _verify_worktree_contention_sentinel(host)
+
+    # Dedup: don't re-alarm while an open L2 already exists for this host.
+    # has_open_l1 is hardcoded to level=1 (escalation/queue.py), so it would
+    # never match this level=2 escalation; get_by_task is used directly.
+    if escalation_queue.get_by_task(sentinel, status='pending', level=2):
+        return
+
+    # Rendered once and reused below so the detail and suggested_action
+    # fields agree on how a fail-safe None pgid reads to the operator.
+    holder_display = holder_pgid if holder_pgid is not None else '<unknown>'
+    waiter_display = waiter_pgid if waiter_pgid is not None else '<unknown>'
+
+    summary = (
+        f'Flock contention on {host!r}: another verify holds the persistent '
+        f'merge-verify worktree lock'
+    )
+    detail = (
+        f'Host: {host}\n'
+        f'Holder pgid: {holder_display}\n'
+        f'Waiter pgid: {waiter_display}\n'
+        '\n'
+        f'The laptop-side verify on {host!r} could not acquire '
+        '.merge_verify.lock within the bounded wait, so it reported '
+        'contention instead of falling back to an ephemeral worktree. '
+        'The merge is blocked pending investigation.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(sentinel),
+        task_id=sentinel,
+        agent_role='orchestrator-verify-host-monitor',
+        severity='critical',
+        level=2,
+        category='verify_worktree_contention',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            f'Inspect the holder process (pgid {holder_display}) on {host!r} — '
+            'confirm it is a legitimate in-progress verify and not an orphan. '
+            'Kill an orphaned holder to release .merge_verify.lock, or wait '
+            'for it to finish, then re-submit the blocked merge.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -770,6 +879,7 @@ async def _run_post_merge_verify(
     quarantine: set[str] | None = None,
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
+    escalation_queue: Any = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -806,6 +916,12 @@ async def _run_post_merge_verify(
             this call — they rely on the heartbeat mtime / grace-period
             mechanism to avoid premature removal in the residual window between
             snapshot capture and prune execution.
+        escalation_queue: Live escalation queue or ``None`` (default).  Used
+            solely to file a born-at-L2 escalation (task 2307 β) when
+            *verify* is the distinguished flock-worktree-contention outcome
+            (``is_flock_contention_failure``); has no effect on any other
+            failure path.  None-safe — omitting it keeps every existing
+            call site byte-identical.
     """
     # Pre-verify disk guard: if free space is low, prune stale merge
     # worktrees; if still low, skip the build and escalate as transient
@@ -919,6 +1035,25 @@ async def _run_post_merge_verify(
 
     if not verify.passed:
         await git_ops.cleanup_merge_worktree(merge_wt)
+
+        # Flock-worktree-contention sentinel (task 2307 β): a laptop-side verify
+        # reported that .merge_verify.lock was already held (task 2306 α).  Checked
+        # FIRST — before the unscoped-gate sentinel and the main-health probe — since
+        # contention is not a pre-existing main-HEAD break; probing would be wasteful
+        # and misleading.  Files a born-at-L2 escalation and keeps the merge blocked.
+        if is_flock_contention_failure(verify):
+            payload = verify.contention or {}
+            _alarm_verify_worktree_contention(
+                escalation_queue,
+                host=payload.get('host', '<unknown>'),
+                holder_pgid=payload.get('holder_pgid'),
+                waiter_pgid=payload.get('waiter_pgid'),
+            )
+            return MergeOutcome(
+                'blocked',
+                reason=f'Post-merge verification blocked: {verify.summary} [category: {verify.category}]',
+                failure_category=verify.category,
+            )
 
         # Unscoped-gate sentinel: check this BEFORE the ENOSPC guard because the
         # sentinel's type_output field carries type-check output (gate.detail) that
@@ -8806,6 +8941,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 quarantine=self._runner_quarantine,
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
+                escalation_queue=self._escalation_queue,
             ))
             while True:
                 done, _ = await asyncio.wait(

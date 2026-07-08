@@ -329,6 +329,114 @@ class TestRunPostMergeVerifyPoolWiring:
         assert spec_calls[0] is None
 
 
+# ---------------------------------------------------------------------------
+# Task 2307 step-5 RED: _run_post_merge_verify recognizes alpha's flock-
+# contention discriminant -> files born-at-L2 + blocks the merge.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerifyFlockContention:
+    """_run_post_merge_verify recognizes the flock-contention VerifyResult (task 2307 step-5).
+
+    RED until step-6 GREEN threads escalation_queue and adds the recognition
+    branch to the `if not verify.passed:` block.
+    """
+
+    def _make_stub_remote(self, result):
+        stub = MagicMock()
+        stub.is_local = False
+        stub.run_merge_verify = AsyncMock(return_value=result)
+        return stub
+
+    async def test_contention_result_blocks_and_files_born_at_l2(self, tmp_path):
+        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.verify_runner import make_flock_contention_result
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+        stub_remote = self._make_stub_remote(
+            make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
+        )
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            runner=stub_remote,
+            escalation_queue=fake_eq,
+        )
+
+        # (1) merge is blocked, tagged with the contention category
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        assert outcome.failure_category == 'flock_contention'
+
+        # (2) exactly one escalation submitted, naming host + both pgids
+        assert len(fake_eq.submitted) == 1
+        esc = fake_eq.submitted[0]
+        assert esc.level == 2
+        assert esc.category == 'verify_worktree_contention'
+        assert 'leo-laptop' in esc.summary
+        assert 'leo-laptop' in esc.detail
+        assert '4242' in esc.detail
+        assert '4343' in esc.detail
+
+    async def test_non_contention_failure_invariant_no_escalation(self, tmp_path):
+        """INVARIANT: a plain non-contention passed=False result files no escalation."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+        plain_fail = VerifyResult(
+            passed=False, test_output='FAILED test_x', lint_output='', type_output='',
+            summary='1 failure', category='',
+        )
+        stub_remote = self._make_stub_remote(plain_fail)
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            runner=stub_remote,
+            escalation_queue=fake_eq,
+        )
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'  # handled exactly as today
+        assert fake_eq.submitted == []  # no escalation for a non-contention failure
+
+    async def test_contention_result_none_safe_without_escalation_queue(self, tmp_path):
+        """NONE-SAFE: a contention result with escalation_queue omitted still blocks, no raise."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.verify_runner import make_flock_contention_result
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+        stub_remote = self._make_stub_remote(
+            make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
+        )
+
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            runner=stub_remote,
+            # escalation_queue omitted — must default to None and not raise
+        )
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+
+
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyLocalOnly:
     """β step-17: _run_post_merge_verify is LOCAL-ONLY for all direct callers (decision 6)."""
@@ -1051,6 +1159,65 @@ class TestRunInflightVerifyRunnerUnavailableReason:
 
 
 # ---------------------------------------------------------------------------
+# Task 2307 step-7 RED: production wiring — _run_inflight_verify threads the
+# worker's escalation queue into _run_post_merge_verify, so a laptop-side
+# flock-contention VerifyResult can reach the born-at-L2 alarm (step-6).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyThreadsEscalationQueue:
+    """_run_inflight_verify passes self._escalation_queue into
+    _run_post_merge_verify (task 2307 step-7).
+
+    RED until step-8 GREEN adds escalation_queue=self._escalation_queue to
+    the _run_post_merge_verify call site inside _run_inflight_verify.
+    """
+
+    async def test_escalation_queue_threaded_into_post_merge_verify(self, tmp_path):
+        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        git_ops = _make_git_ops_mock()
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        sentinel_eq = MagicMock()
+        worker._escalation_queue = sentinel_eq
+
+        merge_wt_path = tmp_path / 'merge-wt'
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=[], worktree=tmp_path)
+
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt_path,
+            base_sha='base123',
+            speculative=False,
+        )
+
+        # REMOTE lease — bypasses local warm-swap path (mirrors 1795/step-3's builder)
+        fake_runner = MagicMock()
+        fake_runner.name = 'leo-laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+
+        spy = AsyncMock(return_value=None)
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=spy):
+            await worker._run_inflight_verify(item, lease)
+
+        assert spy.await_args is not None, '_run_post_merge_verify was not called'
+        # RED: escalation_queue is not yet threaded through by _run_inflight_verify
+        assert spy.await_args.kwargs.get('escalation_queue') is sentinel_eq, (
+            '_run_inflight_verify must pass escalation_queue=self._escalation_queue '
+            "into _run_post_merge_verify — the worker's queue was not threaded through"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 1795/step-5 RED: per-host unavailability tracker on the worker
 # ---------------------------------------------------------------------------
 
@@ -1207,6 +1374,15 @@ class _FakeEscalationQueue:
     def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
         return self._open_l1
 
+    def get_by_task(self, task_id: str, status: str | None = None, level: int | None = None) -> list:
+        """Real-shape filter over submitted escalations (task_id/status/level)."""
+        return [
+            e for e in self.submitted
+            if e.task_id == task_id
+            and (status is None or e.status == status)
+            and (level is None or e.level == level)
+        ]
+
     def make_id(self, task_id: str) -> str:
         self._seq += 1
         return f'esc-{self._seq}'
@@ -1334,6 +1510,108 @@ class TestAlarmVerifyHostUnreachable:
         # Must not raise even though event_store=None
         self._call(eq, 'host1', 'err', streak=3, duration_s=60.0, event_store=None)
         assert len(eq.submitted) == 1  # escalation still submitted
+
+
+# ---------------------------------------------------------------------------
+# Task 2307 step-3 RED: _alarm_verify_worktree_contention born-at-L2 helper
+# ---------------------------------------------------------------------------
+
+
+class TestAlarmVerifyWorktreeContention:
+    """_alarm_verify_worktree_contention module-level helper (task 2307 step-3).
+
+    Mirrors TestAlarmVerifyHostUnreachable, reusing _FakeEscalationQueue.
+    RED until step-4 GREEN adds the function and sentinel to merge_queue.py.
+    """
+
+    def _call(self, eq, *, host='leo-laptop', holder_pgid: int | None = 4242, waiter_pgid: int | None = 4343):
+        from orchestrator.merge_queue import _alarm_verify_worktree_contention
+        _alarm_verify_worktree_contention(
+            eq, host=host, holder_pgid=holder_pgid, waiter_pgid=waiter_pgid,
+        )
+
+    def test_none_queue_is_noop(self):
+        """None escalation_queue → returns silently, no raise."""
+        self._call(None)  # must not raise
+
+    def test_submits_exactly_one_escalation(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert len(eq.submitted) == 1
+
+    def test_escalation_has_level_2(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert eq.submitted[0].level == 2
+
+    def test_escalation_has_critical_severity(self):
+        """severity=='critical' — in BORN_AT_L2_SEVERITIES, so it stays born-at-L2."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert eq.submitted[0].severity == 'critical'
+
+    def test_escalation_has_orchestrator_verify_host_monitor_role(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert eq.submitted[0].agent_role == 'orchestrator-verify-host-monitor'
+
+    def test_escalation_has_verify_worktree_contention_category(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert eq.submitted[0].category == 'verify_worktree_contention'
+
+    def test_escalation_task_id_is_per_host_sentinel(self):
+        from orchestrator.merge_queue import _verify_worktree_contention_sentinel
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop')
+        assert eq.submitted[0].task_id == _verify_worktree_contention_sentinel('leo-laptop')
+
+    def test_summary_names_the_host(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop')
+        assert 'leo-laptop' in eq.submitted[0].summary
+
+    def test_detail_names_host_and_pgids(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
+        detail = eq.submitted[0].detail
+        assert 'leo-laptop' in detail
+        assert '4242' in detail
+        assert '4343' in detail
+
+    def test_none_holder_pgid_still_submits_and_does_not_raise(self):
+        """holder_pgid=None (holder pgid file absent/corrupt) is handled fail-safe."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop', holder_pgid=None, waiter_pgid=4343)
+        assert len(eq.submitted) == 1
+        assert eq.submitted[0].detail  # still emitted, no raise
+
+    def test_second_call_for_same_host_is_deduped(self):
+        """An open pending L2 for the host's sentinel suppresses a second submission.
+
+        Regression for the amendment-pass finding: an orphaned lock-holder
+        persists until manually killed, so every subsequent distinct merge
+        routed to the same host must NOT file another L2.
+        """
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop')
+        self._call(eq, host='leo-laptop')
+        assert len(eq.submitted) == 1
+
+    def test_different_host_is_not_deduped(self):
+        """Dedup is per-host (keyed on the per-host sentinel), not global."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop')
+        self._call(eq, host='other-host')
+        assert len(eq.submitted) == 2
+
+    def test_none_holder_pgid_renders_unknown_in_suggested_action(self):
+        """suggested_action renders holder_pgid=None as '<unknown>', not the literal 'None'."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop', holder_pgid=None, waiter_pgid=4343)
+        suggested = eq.submitted[0].suggested_action
+        assert 'None' not in suggested
+        assert '<unknown>' in suggested
 
 
 # ---------------------------------------------------------------------------
