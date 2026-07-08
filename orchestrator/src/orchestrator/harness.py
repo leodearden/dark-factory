@@ -2121,7 +2121,22 @@ Output JSON matching the schema. Every task must appear in the output.
                                     f'{self.git_ops.config.branch_prefix}{bare_id}'
                                 )
                                 break
-                    branch_ok = rec.branch is None or registered_branch == rec.branch
+                    # Fail-safe on an unresolvable read: lane_branch_checkouts()
+                    # returns None when the pool is disabled or `git worktree
+                    # list` errors (its documented contract — "never mass-mutate
+                    # on an unreliable read"). A transient git hiccup must NOT be
+                    # read as a branch divergence; otherwise every assigned lane
+                    # carrying a branch record (the normal case, `task/<id>`)
+                    # would be quarantined and its recovered plan dropped. Only
+                    # treat a branch mismatch as divergence when the checkout map
+                    # was actually obtained (checkouts is a dict — possibly empty,
+                    # which IS a genuine "lane absent from checkouts" divergence).
+                    # This mirrors the is_registered OSError fail-safe above.
+                    branch_ok = (
+                        rec.branch is None
+                        or checkouts is None
+                        or registered_branch == rec.branch
+                    )
                     if is_registered and branch_ok:
                         pool.restore_assignment(rec.task_id, entry)
                         rec_plan_path = self._resolve_recovery_artifact(
