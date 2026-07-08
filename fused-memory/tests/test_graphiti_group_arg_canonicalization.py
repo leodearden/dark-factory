@@ -126,3 +126,90 @@ class TestAddEpisodePropertyAgreement:
             await backend.add_episode(name='e', content='c', group_id=_PATH_SHAPED)
 
         backend.client.add_episode.assert_not_called()
+
+
+class TestGroupIdsFilterAgreement:
+    """search / search_nodes / build_communities: the group_ids forwarded to
+    graphiti_core's client (client-param agreement) and, for the two
+    methods that select a driver, the graph chosen via _driver_for
+    (driver-selection agreement) must both carry the canonical form.
+    """
+
+    @pytest.mark.asyncio
+    async def test_search_canonicalizes_client_param_and_driver_selection(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        backend.client.search = AsyncMock(return_value=[])
+
+        await backend.search('q', group_ids=['know-live'])
+
+        assert backend.client.search.call_args.kwargs['group_ids'] == ['know_live']
+        assert backend._driver.clone.call_args.kwargs['database'] == 'know_live'
+
+    @pytest.mark.asyncio
+    async def test_search_group_ids_none_passthrough(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        backend.client.search = AsyncMock(return_value=[])
+
+        await backend.search('q', group_ids=None)
+
+        assert backend.client.search.call_args.kwargs['group_ids'] == []
+        backend._driver.clone.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_search_rejects_path_shaped_element(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        backend.client.search = AsyncMock(return_value=[])
+
+        with pytest.raises(PathShapedProjectIdError):
+            await backend.search('q', group_ids=[_PATH_SHAPED])
+
+        backend.client.search.assert_not_called()
+        backend._driver.clone.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_search_nodes_canonicalizes_client_param_and_driver_selection(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        backend.client.search_ = AsyncMock(return_value=MagicMock(nodes=[]))
+
+        await backend.search_nodes('q', group_ids=['know-live'])
+
+        assert backend.client.search_.call_args.kwargs['group_ids'] == ['know_live']
+        assert backend._driver.clone.call_args.kwargs['database'] == 'know_live'
+
+    @pytest.mark.asyncio
+    async def test_search_nodes_rejects_path_shaped_element(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        backend.client.search_ = AsyncMock(return_value=MagicMock(nodes=[]))
+
+        with pytest.raises(PathShapedProjectIdError):
+            await backend.search_nodes('q', group_ids=[_PATH_SHAPED])
+
+        backend.client.search_.assert_not_called()
+        backend._driver.clone.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_build_communities_canonicalizes_client_param(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        backend.client.build_communities = AsyncMock()
+
+        await backend.build_communities(group_ids=['know-live'])
+
+        assert backend.client.build_communities.call_args.kwargs['group_ids'] == ['know_live']
+
+    @pytest.mark.asyncio
+    async def test_build_communities_rejects_path_shaped_element(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        backend.client.build_communities = AsyncMock()
+
+        with pytest.raises(PathShapedProjectIdError):
+            await backend.build_communities(group_ids=[_PATH_SHAPED])
+
+        backend.client.build_communities.assert_not_called()
