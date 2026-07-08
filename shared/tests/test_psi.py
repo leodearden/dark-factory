@@ -101,7 +101,7 @@ class TestPsiSampleSaturated:
             read_ok=True,
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
-            sample.cpu_some10 = 99.0
+            sample.cpu_some10 = 99.0  # type: ignore[misc]
 
     def test_cpu_some_only_trips_saturation(self):
         from shared.psi import PsiSample
