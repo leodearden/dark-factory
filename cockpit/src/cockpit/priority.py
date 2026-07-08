@@ -157,16 +157,43 @@ def _load_bundled_defaults() -> dict[str, Any]:
     return yaml.safe_load(_read_bundled_defaults_text()) or {}
 
 
+def _section_dict(data: dict[str, Any], key: str) -> dict[str, Any]:
+    """Return data[key] iff it's a mapping, else {}.
+
+    A hand-edited priorities.yaml may set a section to a scalar or list
+    (e.g. ``age_curve: 0`` or ``manual_boost: 5``). ``data.get(key) or {}``
+    would let such a truthy non-mapping through and then blow up on the
+    subsequent ``.get(...)`` call — the exact AttributeError that would
+    violate load_priorities' 'never raises' contract. Coercing to {} here
+    makes the field-level defaulting below total over any parsed YAML.
+    """
+    section = data.get(key)
+    return section if isinstance(section, dict) else {}
+
+
+def _weight_table(data: dict[str, Any], key: str, fallback: dict[str, float]) -> dict[str, float]:
+    """Return data[key] iff it's a mapping, else *fallback*.
+
+    Mirrors _section_dict for the top-level weight tables: a scalar/list,
+    absent/null, or empty value falls back to the bundled default so
+    score()'s later ``.get()`` lookups never see a non-mapping. (An empty
+    mapping falls back too, preserving the prior ``... or fallback``
+    semantics.)
+    """
+    section = data.get(key)
+    return section if isinstance(section, dict) and section else fallback
+
+
 def _priorities_from_dict(data: dict[str, Any]) -> Priorities:
     """Build a Priorities from a parsed YAML dict, defaulting missing sections/fields."""
     fallback = Priorities.default()
-    defaults_section = data.get('defaults') or {}
-    age_curve_section = data.get('age_curve') or {}
-    manual_boost_section = data.get('manual_boost') or {}
+    defaults_section = _section_dict(data, 'defaults')
+    age_curve_section = _section_dict(data, 'age_curve')
+    manual_boost_section = _section_dict(data, 'manual_boost')
     return Priorities(
-        severity_weights=data.get('severity_weights') or fallback.severity_weights,
-        category_weights=data.get('category_weights') or fallback.category_weights,
-        project_weights=data.get('project_weights') or fallback.project_weights,
+        severity_weights=_weight_table(data, 'severity_weights', fallback.severity_weights),
+        category_weights=_weight_table(data, 'category_weights', fallback.category_weights),
+        project_weights=_weight_table(data, 'project_weights', fallback.project_weights),
         defaults=Defaults(
             severity=defaults_section.get('severity', fallback.defaults.severity),
             category=defaults_section.get('category', fallback.defaults.category),

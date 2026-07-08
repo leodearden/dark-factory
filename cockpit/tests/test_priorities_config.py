@@ -170,6 +170,58 @@ class TestLoadPriorities:
         assert isinstance(score(item, result, datetime(2026, 7, 7, tzinfo=UTC)), float)
 
 
+    def test_scalar_or_list_sections_fall_back_without_raising(self, tmp_path):
+        """A section set to a scalar/list must fall back to defaults, never raise.
+
+        A hand-edited priorities.yaml where a section is a scalar or list
+        (e.g. ``age_curve: 0``, ``defaults: foo``, ``manual_boost: 5``,
+        ``severity_weights: [1, 2]``) is parseable YAML but malformed. It must
+        not make load_priorities() raise AttributeError — that would violate
+        the documented 'never raises' contract and the cockpit's 'a view must
+        never be a dependency' guarantee.
+        """
+        from cockpit.priority import Priorities, load_priorities
+
+        custom_path = tmp_path / 'priorities.yaml'
+        custom_path.write_text(
+            yaml.safe_dump(
+                {
+                    'severity_weights': [1, 2],
+                    'category_weights': 3,
+                    'project_weights': 'nope',
+                    'defaults': 'foo',
+                    'age_curve': 0,
+                    'manual_boost': 5,
+                }
+            )
+        )
+
+        result = load_priorities(custom_path)
+
+        assert result == Priorities.default()
+
+    def test_scalar_section_does_not_raise_in_score(self, tmp_path):
+        """The scores from a scalar-section config must still be usable floats."""
+        from datetime import UTC, datetime
+
+        from cockpit.priority import ScoringItem, load_priorities, score
+
+        custom_path = tmp_path / 'priorities.yaml'
+        custom_path.write_text(yaml.safe_dump({'age_curve': 0, 'severity_weights': 7}))
+
+        weights = load_priorities(custom_path)
+        item = ScoringItem(
+            severity='medium',
+            category='chore',
+            project='some-project',
+            filed_at=datetime(2026, 7, 1, tzinfo=UTC),
+            manual_boost=0,
+            state='open',
+        )
+
+        assert isinstance(score(item, weights, datetime(2026, 7, 7, tzinfo=UTC)), float)
+
+
 class TestEnsurePrioritiesFile:
     def test_creates_parent_dirs_and_round_trips_to_defaults(self, tmp_path):
         from cockpit.priority import Priorities, ensure_priorities_file, load_priorities
