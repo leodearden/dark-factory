@@ -14,6 +14,8 @@ drift invariant to own.
 
 from __future__ import annotations
 
+import pytest
+
 from fused_memory.reconciliation import recon_self_model as m
 
 # --------------------------------------------------------------------------- #
@@ -298,3 +300,44 @@ class TestInvariantPredicates:
         result = m.markers_deleted_only_by_gc()
         assert isinstance(result, bool)
         assert result is True
+
+
+# --------------------------------------------------------------------------- #
+# premise_lint + Violation (step-17/18)
+# --------------------------------------------------------------------------- #
+
+
+class TestPremiseLint:
+    """premise_lint(task_description) -> list[Violation] flags task
+    descriptions containing known-false premises about recon's control-plane
+    mechanisms (the 2083/2092/2093 false-premise batch)."""
+
+    def test_flags_run_id_persistence_premise(self):
+        """A description asserting run_id persists across cycles is flagged,
+        referencing the run_id-fresh invariant."""
+        violations = m.premise_lint('run_id persists across cycles')
+        assert violations
+        for v in violations:
+            assert v.invariant == 'run_id_is_fresh_per_run'
+
+    def test_flags_stage3_deletes_marker_premise(self):
+        """A description asserting Stage 3 remediation deletes the flag
+        marker is flagged, referencing the markers_deleted_only_by_gc
+        invariant."""
+        violations = m.premise_lint('Stage 3 remediation deletes the flag marker')
+        assert violations
+        for v in violations:
+            assert v.invariant == 'markers_deleted_only_by_gc'
+
+    def test_benign_description_returns_empty_list(self):
+        """A benign, true description matches no known false premise."""
+        violations = m.premise_lint('Reconcile task 7 status against the knowledge graph')
+        assert violations == []
+
+    def test_violation_is_a_frozen_dataclass(self):
+        import dataclasses
+
+        v = m.Violation(premise='x', invariant='y', detail='z')
+        assert dataclasses.is_dataclass(v)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            v.premise = 'mutated'
