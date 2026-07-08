@@ -42,3 +42,30 @@ class TestPsiAdmissionConfigDefaults:
         """DA-D1: memory ranks above io, so its default threshold trips first."""
         cfg = PsiAdmissionConfig()
         assert cfg.mem_some_avg10 < cfg.io_some_avg10
+
+
+class TestMinInflightFloorValidation:
+    """DA-D3 anti-deadlock floor: a min_inflight_floor < 1 would let the gate
+    hold with nothing in flight and wedge the queue, so it must be rejected
+    at construction/load.
+    """
+
+    @pytest.mark.parametrize('bad_value', [0, -1])
+    def test_sub_minimum_rejected(self, bad_value):
+        with pytest.raises(ValidationError):
+            PsiAdmissionConfig(min_inflight_floor=bad_value)
+
+    @pytest.mark.parametrize('good_value', [1, 2])
+    def test_valid_values_accepted(self, good_value):
+        cfg = PsiAdmissionConfig(min_inflight_floor=good_value)
+        assert cfg.min_inflight_floor == good_value
+
+    def test_rejected_at_load_via_orchestrator_config(self, monkeypatch, tmp_path):
+        """Covers the 'rejected at load' signal: load_config constructs
+        OrchestratorConfig, which builds the psi_admission submodel from a
+        nested dict (as YAML would deserialize into) and must raise.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(psi_admission={'min_inflight_floor': 0})
