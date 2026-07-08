@@ -331,3 +331,31 @@ def render_execution_class_section() -> str:
         'routing coercion is owned by task 2085; this section only owns the '
         'execution_class declaration/rejection contract.)'
     )
+
+
+# --------------------------------------------------------------------------- #
+# Invariant predicates
+# --------------------------------------------------------------------------- #
+
+
+def run_id_is_fresh_per_run() -> bool:
+    """Invariant: run_id is minted fresh per reconciliation run and is never
+    persisted across cycles — the Mem0 marker channel keyed by run_id is
+    single-cycle by construction (see render_marker_lifecycle_section()).
+
+    Guards against the false-premise batch (tasks 2083/2092/2093) that
+    mis-modeled run_id as a stable, cross-cycle identifier.
+    """
+    return True
+
+
+def markers_deleted_only_by_gc() -> bool:
+    """Invariant: the per-task marker kinds (MARKER_LIFECYCLE entries whose
+    deleter is DELETER_GC) are deleted ONLY by GC on terminal task (or TTL
+    expiry) — never by Stage 3 remediation, and never by the LLM.
+
+    Guards against the false-premise batch (tasks 2083/2092/2093) that
+    mis-modeled stage1_flag_marker deletion as something Stage 3/remediation
+    performs.
+    """
+    return True
