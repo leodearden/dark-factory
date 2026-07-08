@@ -650,16 +650,14 @@ Review the above data and perform memory consolidation:
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
     def _build_project_root_directive(self) -> str:
-        """Return the project_root directive line for payload footers, or empty string.
+        """Return the project_root directive line for payload footers.
 
-        When ``self.project_root`` is falsy (the BaseStage default ``''``), returns
-        ``''`` so the payload ends immediately after the project_id guideline with no
-        trailing newline.  When set, returns ``'\\nUse project_root=...'`` (leading
-        newline keeps it on its own line after the preceding guideline).  Both payload
-        methods call this helper so the f-string fragment stays in a single place.
+        A stage is only constructible with a validated ``ProjectScope``, so
+        ``self.project_root`` is always a non-empty absolute path — this always
+        returns ``'\\nUse project_root=...'`` (leading newline keeps it on its own
+        line after the preceding guideline).  Both payload methods call this
+        helper so the f-string fragment stays in a single place.
         """
-        if not self.project_root:
-            return ''
         return f'\nUse project_root="{self.project_root}" for tasks scoped to this project.'
 
     def _build_task_tree_section(self) -> str:
