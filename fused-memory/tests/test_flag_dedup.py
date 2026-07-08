@@ -4,16 +4,19 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 """
 from __future__ import annotations
 
+import json
 import uuid as _uuid_mod
 from collections import deque
 from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.flag_dedup import _marker_query, build_suppression_payload
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 
 _STUB_ADD_MEMORY_RESPONSE = AddMemoryResponse(memory_ids=['stub-id'])
 
@@ -256,6 +259,110 @@ def _assert_valid_stage1_marker(
     assert meta.get('flag_type') == flag_type
     assert meta.get('run_id') == run_id
     assert meta.get('last_seen_run_id') == run_id
+
+
+# ---------------------------------------------------------------------------
+# Ledger-backed memory_service fixture (task 2227 prereq-1)
+#
+# Shared by every ledger-backed RED test that exercises filter_suppressed's
+# indexed query, write_suppression_record's upsert, acknowledge's
+# mark_addressed, or dedup_flags' marker UPSERT + completion sweep. Mirrors
+# the `store` fixture in tests/test_recon_ledger.py (tmp_path + init/close).
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def ledger_memory_service(tmp_path):
+    """AsyncMock memory_service (.search/.add_memory/.delete_memory mockable)
+    with a REAL initialized ReconLedgerStore attached as `.recon_ledger`."""
+    ledger = ReconLedgerStore(tmp_path / 'reconciliation.db')
+    await ledger.initialize()
+    service = AsyncMock()
+    service.recon_ledger = ledger
+    service.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['mirror-id']))
+    try:
+        yield service
+    finally:
+        await ledger.close()
+
+
+async def _seed_marker(
+    ledger: ReconLedgerStore,
+    project_id: str,
+    task_id: str,
+    flag_type: str,
+    *,
+    run_id: str = 'seed-run',
+    last_seen_run_id: str | None = None,
+    state: str = 'active',
+    created_at: str = '2026-01-01T00:00:00+00:00',
+    expires_at: str | None = '2099-01-01T00:00:00+00:00',
+    extra_payload: dict | None = None,
+) -> None:
+    """Seed a stage1_flag_marker row directly via ledger.upsert (bypasses dedup_flags).
+
+    Identity is (project_id, 'stage1_flag_marker', task_id, flag_type, run_id='') —
+    dedup identity excludes run_id from the PK; run_id/last_seen_run_id ride in
+    payload_json (see ReconLedgerRecord PK design decision in plan.json).
+    """
+    payload = {
+        'source': 'stage1_flag_marker',
+        'kind': 'stage1_flag_marker',
+        'task_id': task_id,
+        'flag_type': flag_type,
+        'run_id': run_id,
+        'last_seen_run_id': last_seen_run_id or run_id,
+    }
+    if extra_payload:
+        payload.update(extra_payload)
+    await ledger.upsert(ReconLedgerRecord(
+        project_id=project_id,
+        record_kind='stage1_flag_marker',
+        payload_json=json.dumps(payload),
+        state=state,
+        created_at=created_at,
+        task_id=task_id,
+        flag_type=flag_type,
+        run_id='',
+        expires_at=expires_at,
+    ))
+
+
+async def _seed_suppression(
+    ledger: ReconLedgerStore,
+    project_id: str,
+    task_id: str,
+    flag_type: str = '',
+    *,
+    state: str = 'active',
+    created_at: str = '2026-01-01T00:00:00+00:00',
+) -> None:
+    """Seed a stage1_flag_suppression row directly via ledger.upsert.
+
+    flag_type='' (default) seeds a blanket/wildcard row; a non-empty
+    flag_type seeds a scoped row.
+    """
+    payload = {'kind': 'stage1_flag_suppression', 'task_id': task_id}
+    if flag_type:
+        payload['flag_types'] = [flag_type]
+    await ledger.upsert(ReconLedgerRecord(
+        project_id=project_id,
+        record_kind='stage1_flag_suppression',
+        payload_json=json.dumps(payload),
+        state=state,
+        created_at=created_at,
+        task_id=str(task_id),
+        flag_type=flag_type,
+        run_id='',
+        expires_at=None,
+    ))
+
+
+async def _get_marker(
+    ledger: ReconLedgerStore, project_id: str, task_id: str, flag_type: str
+) -> ReconLedgerRecord | None:
+    """Read back a stage1_flag_marker row (fixed run_id='' identity)."""
+    return await ledger.get_by_identity(project_id, 'stage1_flag_marker', task_id, flag_type, '')
 
 
 @pytest.mark.asyncio
