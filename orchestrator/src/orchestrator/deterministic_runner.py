@@ -1074,6 +1074,29 @@ class DeterministicRunner:
                 return WorkflowOutcome.BLOCKED
             else:
                 # Escalation resolved — drive to done (I2/B4/B11).
+                # γ-predicate: a read-only predicate NEVER stamps before_done_ran_at
+                # (no I1 side effect to prove), so it must short-circuit here, BEFORE
+                # the before_done_ran_at proof-check below — otherwise a resolved
+                # milestone_check_failed escalation would wrongly raise
+                # NotImplementedError.  Provenance is 'deterministic-milestone', not
+                # the deploy leg's 'deterministic-deploy', so the audit trail never
+                # claims a systemd deploy happened.
+                if before_done is not None and before_done.get('kind') == 'predicate':
+                    logger.info(
+                        'DeterministicRunner: task %s predicate resume — '
+                        'gate resolved — setting done (deterministic-milestone)',
+                        task_id,
+                    )
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance=_build_done_provenance(
+                            'deterministic-milestone',
+                            note='resumed after milestone_check_failed resolution',
+                        ),
+                    )
+                    return WorkflowOutcome.DONE
+
                 # γ: if before_done is set, the action must have already ran (I1) for us
                 # to safely drive to done here.  Check before_done_ran_at as proof.
                 if before_done is not None:
