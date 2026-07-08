@@ -37,7 +37,14 @@ from shared.locking import (
 )
 from shared.safe_io import load_json_or_warn
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
-from shared.usage_gate import AccountState, InvokeSlot, SessionBudgetExhausted, UsageGate
+from shared.usage_gate import (
+    AccountPhase,
+    AccountState,
+    IllegalTransitionError,
+    InvokeSlot,
+    SessionBudgetExhausted,
+    UsageGate,
+)
 
 __version__ = '0.1.0'
 
@@ -69,8 +76,10 @@ __all__ = [
     'CostStore',
     'UsageGate',
     'AccountState',
+    'AccountPhase',
     'InvokeSlot',
     'SessionBudgetExhausted',
+    'IllegalTransitionError',
     'normalize_lock',
     'files_to_modules',
     'modules_conflict',
