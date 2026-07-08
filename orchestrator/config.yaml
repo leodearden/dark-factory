@@ -24,6 +24,9 @@ max_concurrent_tasks: 24
 # by the 5 subprojects' own tests/ dirs) via ``--project shared``, mirroring
 # scripts/orchestrator.yaml, so a task scoped only to tests/scripts/ is no
 # longer gated on unrelated subprojects while its own tests never run.
+# NOTE: any pytest segment added to this chain in the future must also carry
+# --timeout>60 — enforced by
+# tests/scripts/test_fallback_verify_config.py::test_fallback_verify_raises_per_test_timeout.
 test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd .. && uv run --project shared pytest tests/scripts/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
