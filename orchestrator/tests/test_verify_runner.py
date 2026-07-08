@@ -328,6 +328,76 @@ class TestMakeFlockContentionResult:
 
 
 # ---------------------------------------------------------------------------
+# Task 2307 step-1: is_flock_contention_failure — the discriminant predicate
+# consumed by task beta (workstation merge_queue) to recognize alpha's
+# distinguished flock-contention VerifyResult.  Mirrors is_unscoped_gate_failure.
+# ---------------------------------------------------------------------------
+
+
+class TestIsFlockContentionFailure:
+    """is_flock_contention_failure(vr) is keyed on vr.category == FLOCK_CONTENTION_CATEGORY."""
+
+    def test_true_for_make_flock_contention_result(self):
+        from orchestrator.verify_runner import (
+            is_flock_contention_failure,
+            make_flock_contention_result,
+        )
+        result = make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
+        assert is_flock_contention_failure(result) is True
+
+    def test_true_for_hand_built_result_with_matching_category(self):
+        from orchestrator.verify_runner import is_flock_contention_failure
+        vr = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='flock contention',
+            category='flock_contention',
+        )
+        assert is_flock_contention_failure(vr) is True
+
+    def test_false_for_plain_non_contention_failure_empty_category(self):
+        from orchestrator.verify_runner import is_flock_contention_failure
+        vr = VerifyResult(
+            passed=False,
+            test_output='FAILED test_foo',
+            lint_output='',
+            type_output='',
+            summary='1 failure',
+        )
+        assert is_flock_contention_failure(vr) is False
+
+    def test_false_for_test_failure_category(self):
+        from orchestrator.verify_runner import is_flock_contention_failure
+        vr = VerifyResult(
+            passed=False,
+            test_output='FAILED test_foo',
+            lint_output='',
+            type_output='',
+            summary='1 failure',
+            category='test_failure',
+        )
+        assert is_flock_contention_failure(vr) is False
+
+    def test_false_for_passed_true_result(self):
+        from orchestrator.verify_runner import is_flock_contention_failure
+        vr = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='all good',
+        )
+        assert is_flock_contention_failure(vr) is False
+
+    def test_importable_and_exported(self):
+        from orchestrator import verify_runner
+        assert 'is_flock_contention_failure' in verify_runner.__all__
+        assert callable(verify_runner.is_flock_contention_failure)
+
+
+# ---------------------------------------------------------------------------
 # Golden round-trip test — wire codec (spec_to_json / result_to_json)
 # ---------------------------------------------------------------------------
 
