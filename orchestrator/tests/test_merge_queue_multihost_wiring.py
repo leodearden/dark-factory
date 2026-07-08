@@ -329,6 +329,114 @@ class TestRunPostMergeVerifyPoolWiring:
         assert spec_calls[0] is None
 
 
+# ---------------------------------------------------------------------------
+# Task 2307 step-5 RED: _run_post_merge_verify recognizes alpha's flock-
+# contention discriminant -> files born-at-L2 + blocks the merge.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunPostMergeVerifyFlockContention:
+    """_run_post_merge_verify recognizes the flock-contention VerifyResult (task 2307 step-5).
+
+    RED until step-6 GREEN threads escalation_queue and adds the recognition
+    branch to the `if not verify.passed:` block.
+    """
+
+    def _make_stub_remote(self, result):
+        stub = MagicMock()
+        stub.is_local = False
+        stub.run_merge_verify = AsyncMock(return_value=result)
+        return stub
+
+    async def test_contention_result_blocks_and_files_born_at_l2(self, tmp_path):
+        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.verify_runner import make_flock_contention_result
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+        stub_remote = self._make_stub_remote(
+            make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
+        )
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            runner=stub_remote,
+            escalation_queue=fake_eq,
+        )
+
+        # (1) merge is blocked, tagged with the contention category
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        assert outcome.failure_category == 'flock_contention'
+
+        # (2) exactly one escalation submitted, naming host + both pgids
+        assert len(fake_eq.submitted) == 1
+        esc = fake_eq.submitted[0]
+        assert esc.level == 2
+        assert esc.category == 'verify_worktree_contention'
+        assert 'leo-laptop' in esc.summary
+        assert 'leo-laptop' in esc.detail
+        assert '4242' in esc.detail
+        assert '4343' in esc.detail
+
+    async def test_non_contention_failure_invariant_no_escalation(self, tmp_path):
+        """INVARIANT: a plain non-contention passed=False result files no escalation."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+        plain_fail = VerifyResult(
+            passed=False, test_output='FAILED test_x', lint_output='', type_output='',
+            summary='1 failure', category='',
+        )
+        stub_remote = self._make_stub_remote(plain_fail)
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            runner=stub_remote,
+            escalation_queue=fake_eq,
+        )
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'  # handled exactly as today
+        assert fake_eq.submitted == []  # no escalation for a non-contention failure
+
+    async def test_contention_result_none_safe_without_escalation_queue(self, tmp_path):
+        """NONE-SAFE: a contention result with escalation_queue omitted still blocks, no raise."""
+        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.verify_runner import make_flock_contention_result
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = _make_git_ops_mock()
+        stub_remote = self._make_stub_remote(
+            make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
+        )
+
+        outcome = await _run_post_merge_verify(
+            git_ops, req, tmp_path,
+            timeouts={}, enospc_retries={},
+            max_timeouts=2, max_enospc=1,
+            merge_sha='abc123',
+            runner=stub_remote,
+            # escalation_queue omitted — must default to None and not raise
+        )
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+
+
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyLocalOnly:
     """β step-17: _run_post_merge_verify is LOCAL-ONLY for all direct callers (decision 6)."""
