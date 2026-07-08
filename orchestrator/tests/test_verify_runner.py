@@ -4785,9 +4785,11 @@ class TestRemoteRunnerSshRunSeam:
         ssh_argv, _ = ssh_calls[0]
         assert ssh_argv[0] == 'ssh'
         assert ssh_argv[-2] == 'laptop.local'
-        # git ops (merge-sha push) went through run, never ssh_run
-        assert len(git_calls) == 1
+        # git ops (merge-sha push + best-effort ref cleanup in the finally) went
+        # through run, never ssh_run
+        assert len(git_calls) == 2
         assert git_calls[0][0] == ['git', 'push', 'origin', 'abc123:refs/merge-verify/fixed-id']
+        assert git_calls[1][0] == ['git', 'push', 'origin', '--delete', 'refs/merge-verify/fixed-id']
 
     async def test_default_construction_wires_distinct_heartbeat_ssh_runner(self):
         """With no run/ssh_run injected, self._ssh_run is a distinct callable
