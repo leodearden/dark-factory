@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from shared.locking import (
-    directory_locks,
     files_to_modules,
     modules_conflict,
     normalize_lock,
@@ -38,6 +37,7 @@ from orchestrator.config import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
+from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.streaks import StreakCounter, StreakRegistry
@@ -4901,6 +4901,21 @@ class Scheduler:
         self.clear_requeue_count(task_id)
         return report_path
 
+    def _write_module_cache(self, task_id: str, modules: list[str]) -> list[str]:
+        """The ONLY call site that assigns into ``self._module_cache``.
+
+        Every derive-and-cache path (``_get_modules``, the blast-radius
+        acquire-failure path, ``seed_modules``) routes through here so the
+        cache has a single writer.  Before task 2122, ``_get_modules`` derived
+        without caching while ``handle_blast_radius_expansion`` and
+        ``Harness._tag_task_modules`` each wrote ``_module_cache`` directly —
+        three independent writers that could diverge.  The terminal/redispatch
+        eviction sweep's ``self._module_cache.pop(tid_str, None)`` is a
+        delete, not a write, and does not violate this invariant.
+        """
+        self._module_cache[task_id] = modules
+        return modules
+
     def _get_modules(self, task: dict) -> list[str]:
         """Extract module list from task metadata, normalized for locking.
 
@@ -4927,25 +4942,9 @@ class Scheduler:
         if isinstance(metadata, dict):
             files = metadata.get('files', [])
             if isinstance(files, list) and files:
-                # α strip: remove directory-shaped entries before lock derivation.
-                # A directory entry (no recognised file extension) would produce a
-                # subtree-wide prefix lock that blocks every task touching any file
-                # under that subtree (reify-3468).  Strip them so only real file
-                # siblings derive locks.  When ALL entries are directories the
-                # stripped list is empty → files_to_modules returns [] → we fall
-                # through to the task-<id> synthetic fallback (conflicts with
-                # nothing).  Diagnostic names the stripped directories.
-                dirs = directory_locks(files)
-                if dirs:
-                    logger.info(
-                        'Task %s: α strip — rejected directory charter entries: %s',
-                        task_id,
-                        dirs,
-                    )
-                file_only = strip_directory_locks(files)
-                derived = files_to_modules(file_only, depth)
+                derived = derive_modules(files, depth, task_id=task_id)
                 if derived:
-                    return derived
+                    return self._write_module_cache(task_id, derived)
         # Fallback: use a generic module name based on task id
         if task_id not in self._fallback_warned:
             logger.warning(

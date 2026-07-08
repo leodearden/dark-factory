@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _recording_event_store import _RecordingEventStore
+from shared.locking import directory_locks
 
 from orchestrator.config import (
     TIER_BASE,
@@ -23,7 +24,6 @@ from orchestrator.scheduler import (
     ExternalResolverError,
     ModuleLockTable,
     Scheduler,
-    directory_locks,
     files_to_modules,
 )
 from orchestrator.streaks import StreakCounter, StreakRegistry
