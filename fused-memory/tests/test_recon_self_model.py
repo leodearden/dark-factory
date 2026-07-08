@@ -278,3 +278,23 @@ class TestRenderExecutionClassSection:
         assert 'architect' in text
         assert 'TDD' in text
         assert 'routed off' in text
+
+
+# --------------------------------------------------------------------------- #
+# Invariant predicates (step-15/16)
+# --------------------------------------------------------------------------- #
+
+
+class TestInvariantPredicates:
+    """run_id_is_fresh_per_run() / markers_deleted_only_by_gc() are the
+    assertable predicates premise_lint (and downstream consumers) reference."""
+
+    def test_run_id_is_fresh_per_run(self):
+        result = m.run_id_is_fresh_per_run()
+        assert isinstance(result, bool)
+        assert result is True
+
+    def test_markers_deleted_only_by_gc(self):
+        result = m.markers_deleted_only_by_gc()
+        assert isinstance(result, bool)
+        assert result is True
