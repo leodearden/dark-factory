@@ -4870,6 +4870,66 @@ class TestIsDependencyFact:
         assert _is_dependency_fact(None) is False  # type: ignore[arg-type]
 
 
+# ---------------------------------------------------------------------------
+# Task 2319 step-1: _is_priority_override_ttl_fact helper RED tests
+# ---------------------------------------------------------------------------
+
+class TestIsPriorityOverrideTtlFact:
+    """Module-level _is_priority_override_ttl_fact helper: True only when a
+    fact expresses BOTH a priority-override phrase AND a TTL token — mirrors
+    _is_dependency_fact's shape (compiled regex + falsy-guarded bool helper).
+    Requiring both tokens keeps distinct override sub-attributes (e.g.
+    boost_tier, pinned) from being wrongly collapsed into the same
+    single-valued TTL predicate.
+    """
+
+    def test_canonical_priority_override_ttl_fact(self):
+        from fused_memory.services.memory_service import _is_priority_override_ttl_fact
+        assert _is_priority_override_ttl_fact(
+            'Task 2265 has priority override TTL of 10800 seconds'
+        ) is True
+
+    def test_hyphenated_priority_override_ttl_fact(self):
+        from fused_memory.services.memory_service import _is_priority_override_ttl_fact
+        assert _is_priority_override_ttl_fact(
+            "Task 2265's priority-override TTL was updated to 86400 seconds"
+        ) is True
+
+    def test_case_insensitive(self):
+        from fused_memory.services.memory_service import _is_priority_override_ttl_fact
+        assert _is_priority_override_ttl_fact(
+            'TASK 2265 PRIORITY OVERRIDE ttl OF 10800 SECONDS'
+        ) is True
+
+    def test_priority_override_without_ttl_is_false(self):
+        """A boost_tier/pinned override sub-attribute (no TTL token) is a
+        distinct, legitimately-coexisting predicate — must not collapse."""
+        from fused_memory.services.memory_service import _is_priority_override_ttl_fact
+        assert _is_priority_override_ttl_fact(
+            'Task 2265 priority override boost_tier set to high'
+        ) is False
+
+    def test_bare_ttl_without_priority_override_is_false(self):
+        from fused_memory.services.memory_service import _is_priority_override_ttl_fact
+        assert _is_priority_override_ttl_fact('idempotency TTL is 600 seconds') is False
+
+    def test_dependency_fact_is_false(self):
+        from fused_memory.services.memory_service import _is_priority_override_ttl_fact
+        assert _is_priority_override_ttl_fact('Task 562 depends on Task 557') is False
+
+    def test_unrelated_fact_is_false(self):
+        from fused_memory.services.memory_service import _is_priority_override_ttl_fact
+        assert _is_priority_override_ttl_fact('Task 562 reached status done') is False
+
+    def test_empty_string(self):
+        from fused_memory.services.memory_service import _is_priority_override_ttl_fact
+        assert _is_priority_override_ttl_fact('') is False
+
+    def test_none_value(self):
+        from fused_memory.services.memory_service import _is_priority_override_ttl_fact
+        assert _is_priority_override_ttl_fact(None) is False  # type: ignore[arg-type]
+
+
 class TestReconPoolAutoTag:
     """Module-level _infer_recon_pool helper + _CYCLE_SUMMARY_STAGE_TO_RECON_POOL map.
 
