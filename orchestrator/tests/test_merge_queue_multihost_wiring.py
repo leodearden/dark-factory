@@ -1374,6 +1374,15 @@ class _FakeEscalationQueue:
     def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
         return self._open_l1
 
+    def get_by_task(self, task_id: str, status: str | None = None, level: int | None = None) -> list:
+        """Real-shape filter over submitted escalations (task_id/status/level)."""
+        return [
+            e for e in self.submitted
+            if e.task_id == task_id
+            and (status is None or e.status == status)
+            and (level is None or e.level == level)
+        ]
+
     def make_id(self, task_id: str) -> str:
         self._seq += 1
         return f'esc-{self._seq}'
@@ -1576,6 +1585,33 @@ class TestAlarmVerifyWorktreeContention:
         self._call(eq, host='leo-laptop', holder_pgid=None, waiter_pgid=4343)
         assert len(eq.submitted) == 1
         assert eq.submitted[0].detail  # still emitted, no raise
+
+    def test_second_call_for_same_host_is_deduped(self):
+        """An open pending L2 for the host's sentinel suppresses a second submission.
+
+        Regression for the amendment-pass finding: an orphaned lock-holder
+        persists until manually killed, so every subsequent distinct merge
+        routed to the same host must NOT file another L2.
+        """
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop')
+        self._call(eq, host='leo-laptop')
+        assert len(eq.submitted) == 1
+
+    def test_different_host_is_not_deduped(self):
+        """Dedup is per-host (keyed on the per-host sentinel), not global."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop')
+        self._call(eq, host='other-host')
+        assert len(eq.submitted) == 2
+
+    def test_none_holder_pgid_renders_unknown_in_suggested_action(self):
+        """suggested_action renders holder_pgid=None as '<unknown>', not the literal 'None'."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop', holder_pgid=None, waiter_pgid=4343)
+        suggested = eq.submitted[0].suggested_action
+        assert 'None' not in suggested
+        assert '<unknown>' in suggested
 
 
 # ---------------------------------------------------------------------------

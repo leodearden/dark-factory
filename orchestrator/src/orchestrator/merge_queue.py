@@ -793,11 +793,17 @@ def _alarm_verify_worktree_contention(
     * ``category='verify_worktree_contention'``
     * ``task_id=_verify_worktree_contention_sentinel(host)``
 
-    None-safe: returns immediately when *escalation_queue* is None.  No
-    dedup (unlike ``_alarm_verify_host_unreachable``): contention should
-    essentially never fire, and the born-at-L2 escalation blocks the task,
-    so quiescence prevents re-fire for the same merge.  No event emission —
-    the escalation is the sole user-observable signal (PRD §8.2).
+    None-safe: returns immediately when *escalation_queue* is None.  Dedup:
+    returns immediately when an open L2 already exists for this host's
+    sentinel task_id.  An orphaned lock-holder (the PRD scenario) persists
+    until manually killed, so without this guard every subsequent distinct
+    merge routed to the host would file another L2 — a burst of duplicate
+    criticals at the human while the orphan lives.  The check goes through
+    ``get_by_task(sentinel, status='pending', level=2)`` rather than
+    ``_alarm_verify_host_unreachable``'s ``has_open_l1``: that helper is
+    hardcoded to ``level=1`` (see ``escalation/queue.py``) and would never
+    match this level=2 escalation.  No event emission — the escalation is
+    the sole user-observable signal (PRD §8.2).
 
     Args:
         escalation_queue: Live escalation queue or ``None``.
@@ -812,14 +818,26 @@ def _alarm_verify_worktree_contention(
     from escalation.models import Escalation  # local import — escalation optional dep
 
     sentinel = _verify_worktree_contention_sentinel(host)
+
+    # Dedup: don't re-alarm while an open L2 already exists for this host.
+    # has_open_l1 is hardcoded to level=1 (escalation/queue.py), so it would
+    # never match this level=2 escalation; get_by_task is used directly.
+    if escalation_queue.get_by_task(sentinel, status='pending', level=2):
+        return
+
+    # Rendered once and reused below so the detail and suggested_action
+    # fields agree on how a fail-safe None pgid reads to the operator.
+    holder_display = holder_pgid if holder_pgid is not None else '<unknown>'
+    waiter_display = waiter_pgid if waiter_pgid is not None else '<unknown>'
+
     summary = (
         f'Flock contention on {host!r}: another verify holds the persistent '
         f'merge-verify worktree lock'
     )
     detail = (
         f'Host: {host}\n'
-        f'Holder pgid: {holder_pgid if holder_pgid is not None else "<unknown>"}\n'
-        f'Waiter pgid: {waiter_pgid if waiter_pgid is not None else "<unknown>"}\n'
+        f'Holder pgid: {holder_display}\n'
+        f'Waiter pgid: {waiter_display}\n'
         '\n'
         f'The laptop-side verify on {host!r} could not acquire '
         '.merge_verify.lock within the bounded wait, so it reported '
@@ -837,7 +855,7 @@ def _alarm_verify_worktree_contention(
         summary=summary,
         detail=detail,
         suggested_action=(
-            f'Inspect the holder process (pgid {holder_pgid}) on {host!r} — '
+            f'Inspect the holder process (pgid {holder_display}) on {host!r} — '
             'confirm it is a legitimate in-progress verify and not an orphan. '
             'Kill an orphaned holder to release .merge_verify.lock, or wait '
             'for it to finish, then re-submit the blocked merge.'
