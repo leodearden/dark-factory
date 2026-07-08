@@ -2628,3 +2628,67 @@ class TestInvokeSlotReport:
         assert acct.capped is False
         assert acct.auth_failed is False
         assert slot._settled is True
+
+
+# ===================================================================
+# TestReportStaleLease  (task W4-ε, PRD §7.4, step 5 — Q4 fail-safe)
+# ===================================================================
+
+
+class TestReportStaleLease:
+    """InvokeSlot.report() on a stale lease: log-and-proceed, never hard-fail
+    (Q4 fail-safe, PRD §7.4, task W4-ε).
+
+    A lease goes stale when the leased account's ``generation`` has drifted
+    past the snapshot captured in the lease (a concurrent sibling
+    re-transitioned the same account) — ``UsageGate.lease_is_current``
+    returns False. ``report()`` must still apply the outcome's transition
+    and settle; it only logs + fires a telemetry event, never raises.
+    """
+
+    def test_stale_lease_logs_warning(self, caplog):
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+        acct.generation += 1  # drift generation past the lease snapshot
+
+        with caplog.at_level(logging.WARNING):
+            slot.report(CapHit(resets_at=None, reason='cap'))
+
+        assert 'stale' in caplog.text.lower()
+        assert acct.name in caplog.text
+
+    def test_stale_lease_fires_lease_stale_cost_event(self):
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+        acct.generation += 1
+        gate._fire_cost_event = MagicMock()
+
+        slot.report(CapHit(resets_at=None, reason='cap'))
+
+        gate._fire_cost_event.assert_called_once()
+        call_args = gate._fire_cost_event.call_args.args
+        assert call_args[0] == acct.name
+        assert call_args[1] == 'lease_stale'
+        details = json.loads(call_args[2])
+        assert details['outcome'] == 'CapHit'
+
+    def test_stale_lease_still_applies_transition_and_settles(self):
+        """Log-and-proceed: a stale lease never blocks the transition."""
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+        acct.generation += 1
+
+        slot.report(CapHit(resets_at=None, reason='cap'))
+
+        assert acct.phase == AccountPhase.CAPPED
+        assert slot._settled is True
+
+    def test_fresh_lease_does_not_fire_stale_event(self):
+        """Sanity check: a current (non-drifted) lease takes the quiet path."""
+        gate = make_gate(['a'])
+        acct, slot = _make_probe_in_flight_slot(gate)
+        gate._fire_cost_event = MagicMock()
+
+        slot.report(OK())
+
+        gate._fire_cost_event.assert_not_called()
