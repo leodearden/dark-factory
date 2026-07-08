@@ -192,3 +192,42 @@ async def test_bogus_done_provenance_kind_rejected_symmetrically(make_backend, t
 
     task = await backend.get_task(dto['id'], project_root=project_root)
     assert task['metadata'] == {}
+
+
+# ── Row 4a — producer↔consumer ledger round-trip ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_retry_ledger_roundtrips_through_backend(make_backend, tmp_path):
+    """A typed RetryLedger survives the real durable write chokepoint intact.
+
+    Constructs a RetryLedger with real non-sentinel counter values exactly
+    as the workflow persists it (``ledger.model_dump()``), writes it through
+    an enforce-mode backend, and reads it back. This is the two-way boundary
+    the ε/2172 mock-scheduler unit tests do not cover: both the raw
+    byte-for-value round-trip AND re-parsing back to an equal typed
+    instance.
+    """
+    ledger = RetryLedger(
+        consecutive_infra_resume_failures=3,
+        last_infra_resume_iteration_count=7,
+        total_no_plan_failures=2,
+        last_no_plan_main_sha='deadbeef',
+        last_merge_outcome_signature='sig-abc123',
+    )
+    dumped = ledger.model_dump()
+
+    backend = await make_backend(enforce=True)
+    project_root = str(tmp_path / 'proj')
+    dto = await backend.add_task(project_root=project_root, title='t')
+
+    await backend.update_task(
+        dto['id'], project_root=project_root,
+        metadata=json.dumps({'retry_ledger': dumped}),
+    )
+
+    task = await backend.get_task(dto['id'], project_root=project_root)
+    reread = task['metadata']['retry_ledger']
+
+    assert reread == dumped
+    assert RetryLedger(**reread) == ledger
