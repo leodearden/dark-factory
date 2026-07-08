@@ -1284,6 +1284,63 @@ class TestGetModulesWriteThroughCache:
         assert '53' not in scheduler._module_cache
 
 
+class TestSeedModules:
+    """Scheduler.seed_modules is the harness's public entry point for
+    deriving-and-caching modules from freshly-tagged files (task 2122
+    step-7/8) — it must route through derive_modules + the single
+    _write_module_cache seam, matching the harness's pre-migration
+    ``if derived:`` skip-when-empty guard.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        return Scheduler(config)
+
+    def test_seed_modules_caches_derived_modules_for_real_files(
+        self, scheduler: Scheduler
+    ):
+        """A real file-level charter derives and caches at the configured depth."""
+        result = scheduler.seed_modules('60', ['src/config/schema.py'])
+        assert result == ['src/config']
+        assert scheduler._module_cache['60'] == ['src/config']
+
+    def test_seed_modules_all_directory_returns_empty_and_is_not_cached(
+        self, scheduler: Scheduler
+    ):
+        """An all-directory charter derives to [] and must NOT enter the
+        cache (parity with the harness's pre-migration ``if derived:`` guard).
+        """
+        result = scheduler.seed_modules('61', ['crates/reify-eval/src'])
+        assert result == []
+        assert '61' not in scheduler._module_cache
+
+    def test_seed_modules_routes_through_write_module_cache_seam(
+        self, scheduler: Scheduler
+    ):
+        """The write must go through the single seam: called for the
+        real-file case, NOT called for the all-directory case.
+        """
+        calls: list[tuple[str, list[str]]] = []
+        original_write = scheduler._write_module_cache
+
+        def spy(task_id: str, modules: list[str]) -> list[str]:
+            calls.append((task_id, modules))
+            return original_write(task_id, modules)
+
+        scheduler._write_module_cache = spy  # type: ignore[method-assign]
+
+        scheduler.seed_modules('62', ['src/config/schema.py'])
+        assert calls == [('62', ['src/config'])]
+
+        calls.clear()
+        scheduler.seed_modules('63', ['crates/reify-eval/src'])
+        assert calls == [], (
+            f'Expected _write_module_cache NOT called for an all-directory '
+            f'charter; got {calls}'
+        )
+
+
 class TestUpdateTaskMetadataSerialization:
     """Regression tests for update_task dict->JSON string coercion."""
 
