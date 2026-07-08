@@ -11,6 +11,7 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.neutral_cwd import neutral_cli_cwd
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.task_curator import (
     CURATOR_BATCH_OUTPUT_SCHEMA,
     CURATOR_OUTPUT_SCHEMA,
@@ -209,7 +210,38 @@ class TestHashShapeContract16:
     def test_normalize_key_is_16_chars(self):
         """TaskCurator._normalize_key() returns a 16-char hex string."""
         c = CandidateTask(title='t', files_to_modify=['f'])
-        assert len(TaskCurator._normalize_key(c)) == 16
+        key = TaskCurator._normalize_key(c)
+        assert key is not None
+        assert len(key) == 16
+
+
+class TestNormalizeKeyDelegatesToCandidateKey:
+    """TaskCurator._normalize_key must delegate to the single-owner
+    compute_candidate_key leaf (fm-task-dedup W8 task A1), rather than
+    keeping its own inline title/files hash.  Pins the delegation via the
+    externally-observable output rather than mocking the leaf.
+    """
+
+    def test_delegates_for_plain_candidate(self):
+        c = CandidateTask(title='Fix parser', files_to_modify=['a.py', 'b.py'])
+        assert TaskCurator._normalize_key(c) == compute_candidate_key(
+            c.title, c.files_to_modify,
+        )
+
+    def test_delegates_for_internal_whitespace_title(self):
+        """RED against the old .strip().lower() body — it doesn't collapse
+        internal whitespace, so it disagrees with compute_candidate_key
+        (which delegates to normalize_title) for this candidate."""
+        c = CandidateTask(title='Fix   the   bug', files_to_modify=['a.py', 'b.py'])
+        assert TaskCurator._normalize_key(c) == compute_candidate_key(
+            c.title, c.files_to_modify,
+        )
+
+    def test_delegates_for_file_order_swap(self):
+        c = CandidateTask(title='Fix parser', files_to_modify=['b.py', 'a.py'])
+        assert TaskCurator._normalize_key(c) == compute_candidate_key(
+            c.title, c.files_to_modify,
+        )
 
 
 # ----------------------------------------------------------------------

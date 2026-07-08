@@ -31,6 +31,7 @@ from fused_memory.backends.task_backend_types import (
     ValidateDependenciesResult,
 )
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.models.scope import resolve_project_id
 
 logger = logging.getLogger(__name__)
@@ -38,9 +39,13 @@ logger = logging.getLogger(__name__)
 
 # Incremented whenever the DB schema changes shape.  Stored in the SQLite
 # user_version header; read by ``_migrate`` at connection-open time.
-# v1 -> v2: added claimant_run_id/heartbeat_at columns to `tasks` (task 2182,
-# PRD plans/task-status-authority-prd.md C4/D4).
-_SCHEMA_VERSION = 2
+#   v1: flat schema (parent_id removed).
+#   v2: + claimant_run_id/heartbeat_at columns (task 2182, PRD
+#       plans/task-status-authority-prd.md C4/D4). See ``_migrate_v1_to_v2``.
+#   v3: + candidate_key column (fm-task-dedup W8 task A1) — computed on every
+#       insert going forward; backfilled for non-cancelled rows on migration.
+#       See ``_migrate_v2_to_v3``.
+_SCHEMA_VERSION = 3
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
@@ -69,6 +74,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at      TEXT NOT NULL,
     claimant_run_id TEXT,
     heartbeat_at    TEXT,
+    candidate_key   TEXT,
     PRIMARY KEY (tag, id)
 );
 
@@ -180,111 +186,228 @@ def _format_task_id(task_id: int) -> str:
     return str(task_id)
 
 
+def _files_for_key(metadata_raw: str | None) -> list[Any]:
+    """Extract the files list used for ``candidate_key`` computation from a
+    metadata JSON string.
+
+    Single owner of the "parse metadata JSON → prefer ``files``, fall back
+    to ``files_to_modify``, else ``[]``" precedence (Open Q #5: different
+    producers use either key). Every candidate_key computation site —
+    ``add_task`` / ``update_task`` (in-flight call args) and
+    ``_migrate_v2_to_v3`` (already-persisted rows) — calls this instead of
+    hand-mirroring the block, so a future change to the precedence lands in
+    exactly one place instead of three.
+
+    Defensive: a missing/``None``/malformed-JSON/non-dict ``metadata_raw``,
+    or a non-list value under either key, all yield ``[]`` rather than
+    raising — key computation must never be the reason an insert/update/
+    migration fails. (``compute_candidate_key`` further filters non-``str``
+    entries out of whatever list this returns.)
+    """
+    if not metadata_raw:
+        return []
+    try:
+        parsed = json.loads(metadata_raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    raw_files = parsed.get('files')
+    if raw_files is None:
+        raw_files = parsed.get('files_to_modify')
+    return raw_files if isinstance(raw_files, list) else []
+
+
 async def _migrate(conn: aiosqlite.Connection) -> None:
-    """Incremental idempotent migration, stepped by ``PRAGMA user_version``.
+    """Cumulative, idempotent, version-gated schema migration.
 
-    Skipped entirely when ``user_version >= _SCHEMA_VERSION``. Otherwise:
+    Gated on ``PRAGMA user_version``; a no-op once it reaches
+    ``_SCHEMA_VERSION``. Otherwise runs whichever of the following steps the
+    DB's current version still needs, in order, ending with the version
+    stamped to ``_SCHEMA_VERSION``:
 
-    * **v0 -> v2** (``parent_id`` column still present): full rebuild of all
-      three tables without parent_id (straggler subtask rows with
-      parent_id != 0 are silently dropped — by soak + DF-B there are none).
-      The rebuilt ``tasks`` table is created directly in v2 shape (including
-      ``claimant_run_id``/``heartbeat_at``), so a legacy parent_id DB lands
-      straight at v2 in one pass — it never passes through an intermediate
-      v1 ALTER. Sets ``user_version = 2``.
+    * v0 → v1: parent_id schema → flat schema. When ``tasks`` still has a
+      ``parent_id`` column: rebuild all three tables without it (straggler
+      subtask rows with parent_id != 0 are silently dropped — by soak + DF-B
+      there are none). If parent_id is already absent (fresh DB opened with
+      the new ``_SCHEMA_SQL``), this step just stamps version 1 — no rebuild
+      needed.
+    * v1 → v2: see :func:`_migrate_v1_to_v2` — add ``claimant_run_id`` /
+      ``heartbeat_at`` (task 2182, PRD plans/task-status-authority-prd.md).
+    * v2 → v3: see :func:`_migrate_v2_to_v3` — add + backfill
+      ``candidate_key`` (fm-task-dedup W8 task A1).
 
-    * **v1 -> v2** (``parent_id`` already absent): the common production
-      case — either an already-migrated v1 DB (parent_id gone, claimant
-      columns absent) or a brand-new DB just created by ``_SCHEMA_SQL``
-      (parent_id never existed, claimant columns already present).
-      Feature-detects each of ``claimant_run_id``/``heartbeat_at`` via
-      ``PRAGMA table_info`` and ``ALTER TABLE ADD COLUMN``s whichever is
-      missing (idempotent — a fresh DB has both already, so this is a
-      no-op there), then stamps ``user_version = 2``.
-
-      IMPORTANT: this branch must never be short-circuited into "parent_id
-      absent -> just stamp the version" — ``_SCHEMA_SQL`` uses
-      ``CREATE TABLE IF NOT EXISTS``, so it never adds columns to an
-      existing table. An already-migrated v1 production DB (the common
-      case) would silently keep missing columns forever if this branch
-      only stamped the version without also running the ALTERs.
+    Each ALTER step is column-presence-guarded, so a fresh DB whose
+    ``_SCHEMA_SQL`` already created every column runs all steps as no-op
+    ALTERs and only advances the ``user_version`` stamps.
     """
     row = await (await conn.execute('PRAGMA user_version')).fetchone()
-    if row and row[0] >= _SCHEMA_VERSION:
+    version = row[0] if row else 0
+    if version >= _SCHEMA_VERSION:
         return
 
+    if version < 1:
+        info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
+        col_names = {r[1] for r in info_rows}
+        if 'parent_id' in col_names:
+            # Full rebuild: parent_id column is still present in all three
+            # tables. Rows with parent_id != 0 (straggler subtasks) are
+            # dropped by the INSERT...SELECT WHERE parent_id = 0 — no prior
+            # cancellation needed. This step always lands at exactly v1 (NOT
+            # _SCHEMA_VERSION) — the claimant and candidate_key columns are
+            # added on top of this rebuilt table by the v1->v2 / v2->v3 steps
+            # below, in the same _migrate() call.
+            await conn.executescript("""
+                BEGIN;
+
+                CREATE TABLE tasks_new (
+                    tag           TEXT NOT NULL DEFAULT 'master',
+                    id            INTEGER NOT NULL,
+                    title         TEXT NOT NULL,
+                    description   TEXT,
+                    details       TEXT,
+                    test_strategy TEXT,
+                    status        TEXT NOT NULL,
+                    priority      TEXT,
+                    metadata      TEXT,
+                    updated_at    TEXT NOT NULL,
+                    PRIMARY KEY (tag, id)
+                );
+                INSERT INTO tasks_new
+                    (tag, id, title, description, details, test_strategy,
+                     status, priority, metadata, updated_at)
+                SELECT tag, id, title, description, details, test_strategy,
+                       status, priority, metadata, COALESCE(updated_at, '')
+                FROM tasks WHERE parent_id = 0;
+                DROP TABLE tasks;
+                ALTER TABLE tasks_new RENAME TO tasks;
+                CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+
+                CREATE TABLE dependencies_new (
+                    tag        TEXT NOT NULL DEFAULT 'master',
+                    task_id    INTEGER NOT NULL,
+                    depends_on INTEGER NOT NULL,
+                    PRIMARY KEY (tag, task_id, depends_on)
+                );
+                INSERT OR IGNORE INTO dependencies_new (tag, task_id, depends_on)
+                SELECT tag, task_id, depends_on FROM dependencies WHERE parent_id = 0;
+                DROP TABLE dependencies;
+                ALTER TABLE dependencies_new RENAME TO dependencies;
+
+                CREATE TABLE id_counters_new (
+                    tag    TEXT NOT NULL DEFAULT 'master',
+                    max_id INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (tag)
+                );
+                INSERT INTO id_counters_new (tag, max_id)
+                SELECT tag, MAX(max_id) FROM id_counters WHERE parent_id = 0 GROUP BY tag;
+                DROP TABLE id_counters;
+                ALTER TABLE id_counters_new RENAME TO id_counters;
+
+                PRAGMA user_version = 1;
+                COMMIT;
+            """)
+        else:
+            await conn.execute('PRAGMA user_version = 1')
+            await conn.commit()
+        version = 1
+
+    if version < 2:
+        await _migrate_v1_to_v2(conn)
+        version = 2
+
+    if version < 3:
+        await _migrate_v2_to_v3(conn)
+
+
+async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
+    """v1 -> v2 (task 2182, PRD plans/task-status-authority-prd.md C4/D4):
+    add the ``claimant_run_id`` / ``heartbeat_at`` columns.
+
+    Feature-detects each column via ``PRAGMA table_info`` and
+    ``ALTER TABLE ADD COLUMN``s whichever is missing (idempotent -- a fresh DB
+    created by ``_SCHEMA_SQL`` already has both, so neither ALTER fires), then
+    stamps ``user_version = 2``. Reached only after the v0->v1 step, so
+    ``parent_id`` is already gone by the time this runs.
+
+    IMPORTANT: never short-circuit to "parent_id absent -> just stamp the
+    version". ``_SCHEMA_SQL`` uses ``CREATE TABLE IF NOT EXISTS`` and never
+    adds columns to an existing table, so an already-migrated v1 production DB
+    (the common case) would silently keep missing columns forever if this step
+    only stamped the version without also running the ALTERs.
+    """
     info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
     col_names = {r[1] for r in info_rows}
-
-    if 'parent_id' in col_names:
-        # Full rebuild: parent_id column is still present in all three
-        # tables. Rows with parent_id != 0 (straggler subtasks) are dropped
-        # by the INSERT...SELECT WHERE parent_id = 0 — no prior cancellation
-        # needed. The rebuilt tasks_new already carries claimant_run_id /
-        # heartbeat_at (NULL for every migrated row) so this lands directly
-        # at v2.
-        await conn.executescript(f"""
-            BEGIN;
-
-            CREATE TABLE tasks_new (
-                tag             TEXT NOT NULL DEFAULT 'master',
-                id              INTEGER NOT NULL,
-                title           TEXT NOT NULL,
-                description     TEXT,
-                details         TEXT,
-                test_strategy   TEXT,
-                status          TEXT NOT NULL,
-                priority        TEXT,
-                metadata        TEXT,
-                updated_at      TEXT NOT NULL,
-                claimant_run_id TEXT,
-                heartbeat_at    TEXT,
-                PRIMARY KEY (tag, id)
-            );
-            INSERT INTO tasks_new
-                (tag, id, title, description, details, test_strategy,
-                 status, priority, metadata, updated_at)
-            SELECT tag, id, title, description, details, test_strategy,
-                   status, priority, metadata, COALESCE(updated_at, '')
-            FROM tasks WHERE parent_id = 0;
-            DROP TABLE tasks;
-            ALTER TABLE tasks_new RENAME TO tasks;
-            CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
-
-            CREATE TABLE dependencies_new (
-                tag        TEXT NOT NULL DEFAULT 'master',
-                task_id    INTEGER NOT NULL,
-                depends_on INTEGER NOT NULL,
-                PRIMARY KEY (tag, task_id, depends_on)
-            );
-            INSERT OR IGNORE INTO dependencies_new (tag, task_id, depends_on)
-            SELECT tag, task_id, depends_on FROM dependencies WHERE parent_id = 0;
-            DROP TABLE dependencies;
-            ALTER TABLE dependencies_new RENAME TO dependencies;
-
-            CREATE TABLE id_counters_new (
-                tag    TEXT NOT NULL DEFAULT 'master',
-                max_id INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (tag)
-            );
-            INSERT INTO id_counters_new (tag, max_id)
-            SELECT tag, MAX(max_id) FROM id_counters WHERE parent_id = 0 GROUP BY tag;
-            DROP TABLE id_counters;
-            ALTER TABLE id_counters_new RENAME TO id_counters;
-
-            PRAGMA user_version = {_SCHEMA_VERSION};
-            COMMIT;
-        """)
-        return
-
-    # v1 -> v2: parent_id is already absent. Feature-detect and ALTER in
-    # whichever claimant column is missing (idempotent; a fresh DB created
-    # by _SCHEMA_SQL already has both, so neither ALTER fires).
     if 'claimant_run_id' not in col_names:
         await conn.execute('ALTER TABLE tasks ADD COLUMN claimant_run_id TEXT')
     if 'heartbeat_at' not in col_names:
         await conn.execute('ALTER TABLE tasks ADD COLUMN heartbeat_at TEXT')
-    await conn.execute(f'PRAGMA user_version = {_SCHEMA_VERSION}')
+    await conn.execute('PRAGMA user_version = 2')
+    await conn.commit()
+
+
+async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
+    """v2 -> v3 (fm-task-dedup W8 task A1): add + backfill ``candidate_key``.
+
+    Adds the nullable ``candidate_key`` column when ``tasks`` doesn't already
+    have it (fresh DBs get it straight from ``_SCHEMA_SQL``, so this is a
+    no-op there), then backfills it for every NON-cancelled row from that
+    row's title + metadata files. Cancelled rows are deliberately left NULL:
+    a cancelled task's work may be legitimately re-filed later, so a
+    cancelled row should neither backfill nor count toward duplicates.
+
+    Emits exactly one report-only audit log line naming the number of
+    duplicate ``candidate_key`` groups (same tag, same key, >1 non-cancelled
+    row) -- WARNING when > 0, INFO when 0. NEVER deletes a row and NEVER
+    creates an index: the UNIQUE index is task A2's job, gated on this audit
+    coming back clean.
+    """
+    info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
+    col_names = {r[1] for r in info_rows}
+    if 'candidate_key' not in col_names:
+        await conn.execute('ALTER TABLE tasks ADD COLUMN candidate_key TEXT')
+
+    cursor = await conn.execute(
+        "SELECT tag, id, title, metadata FROM tasks WHERE status != 'cancelled'",
+    )
+    # Accumulate then apply as a single executemany rather than one UPDATE
+    # per row inside the loop: this is a one-shot migration, but on a large
+    # legacy tasks table N sequential round-trips would otherwise delay the
+    # first read after connection-open.
+    updates: list[tuple[str, str, int]] = []
+    for row in await cursor.fetchall():
+        candidate_key = compute_candidate_key(row['title'], _files_for_key(row['metadata']))
+        if candidate_key is not None:
+            updates.append((candidate_key, row['tag'], row['id']))
+    if updates:
+        await conn.executemany(
+            'UPDATE tasks SET candidate_key = ? WHERE tag = ? AND id = ?',
+            updates,
+        )
+
+    dup_cursor = await conn.execute(
+        """
+        SELECT COUNT(*) FROM (
+            SELECT tag, candidate_key FROM tasks
+            WHERE candidate_key IS NOT NULL AND status != 'cancelled'
+            GROUP BY tag, candidate_key
+            HAVING COUNT(*) > 1
+        )
+        """,
+    )
+    dup_row = await dup_cursor.fetchone()
+    dup_groups = dup_row[0] if dup_row else 0
+
+    log_fn = logger.warning if dup_groups > 0 else logger.info
+    log_fn(
+        'sqlite_task_backend: schema v2->v3 migration -- candidate_key '
+        'backfilled for non-cancelled rows (cancelled rows left NULL); '
+        'duplicate_groups=%d among non-cancelled rows (report-only -- no '
+        'rows modified/deleted, no index created; see fm-task-dedup task A2)',
+        dup_groups,
+    )
+
+    await conn.execute('PRAGMA user_version = 3')
     await conn.commit()
 
 
@@ -417,10 +540,12 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         'subtasks': [],
         'updatedAt': row['updated_at'],
         'metadata': metadata if metadata is not None else {},
-        # Guarded access (task 2182): a row from a not-yet-migrated connection
-        # (pre-ALTER window) simply surfaces None for both rather than raising.
+        # Guarded access (task 2182 / fm-task-dedup A1): a row from a
+        # not-yet-migrated connection (pre-ALTER window) simply surfaces None
+        # rather than raising.
         'claimant_run_id': row['claimant_run_id'] if 'claimant_run_id' in row_keys else None,
         'heartbeat_at': row['heartbeat_at'] if 'heartbeat_at' in row_keys else None,
+        'candidate_key': row['candidate_key'] if 'candidate_key' in row_keys else None,
     }
 
 
@@ -1006,6 +1131,14 @@ class SqliteTaskBackend:
 
         deps_list = _parse_dependency_list(dependencies)
 
+        # candidate_key (fm-task-dedup W8 task A1): computed from title +
+        # metadata['files'] (via the shared ``_files_for_key`` extraction,
+        # which falls back to metadata['files_to_modify'] — Open Q #5:
+        # different producers use either key) on every insert. Defensive —
+        # malformed/non-dict metadata yields an empty file list rather than
+        # raising; the key must never be the reason an insert fails.
+        candidate_key = compute_candidate_key(title, _files_for_key(metadata))
+
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             # High-water across BOTH live rows and the persisted counter, so a
             # deleted top-level id is never reissued (see id_counters in the
@@ -1034,13 +1167,14 @@ class SqliteTaskBackend:
                 """
                     INSERT INTO tasks (tag, id, title, description,
                                        details, test_strategy, status, priority,
-                                       metadata, updated_at)
-                    VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?)
+                                       metadata, updated_at, candidate_key)
+                    VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
                     """,
                 (
                     tag, next_id, title,
                     description or '', details or '',
                     status, priority or 'medium', metadata, _now(),
+                    candidate_key,
                 ),
             )
             for dep in deps_list:
@@ -1154,6 +1288,7 @@ class SqliteTaskBackend:
                 set_columns.append('details = ?')
                 set_values.append(new_details)
 
+            new_metadata: str | None = None
             if metadata is not None:
                 # Behavior note: on merge/additive, _merge_metadata RAISES
                 # TaskmasterError if the stored blob is corrupt — preventing a
@@ -1175,6 +1310,20 @@ class SqliteTaskBackend:
                 )
                 set_columns.append('metadata = ?')
                 set_values.append(new_metadata)
+
+            # candidate_key (fm-task-dedup W8 task A1 amendment): recompute
+            # whenever this call touches title and/or metadata — both feed
+            # the key, and a stale key (still reflecting the pre-update
+            # title/files) would silently break the future A2 dedup index.
+            # An update touching neither is left alone: the existing value
+            # still correctly describes the unchanged row.
+            if title is not None or metadata is not None:
+                final_title = title if title is not None else row['title']
+                final_metadata_raw = new_metadata if metadata is not None else row['metadata']
+                set_columns.append('candidate_key = ?')
+                set_values.append(
+                    compute_candidate_key(final_title, _files_for_key(final_metadata_raw)),
+                )
 
             # updated_at always advances, even on a no-op write — matches
             # the original behaviour and avoids surprising "stale" reads.

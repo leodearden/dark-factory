@@ -22,6 +22,7 @@ from fused_memory.backends.sqlite_task_backend import (
 )
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware.candidate_key import compute_candidate_key
 
 
 @pytest_asyncio.fixture
@@ -210,6 +211,61 @@ async def test_add_task_without_title_or_prompt_raises(backend, project_root):
     with pytest.raises(TaskmasterError) as exc:
         await backend.add_task(project_root=project_root)
     assert 'prompt' in exc.value.message
+
+
+# ── candidate_key (task 2186 — fm-task-dedup W8 task A1) ───────────
+
+
+@pytest.mark.asyncio
+async def test_add_task_computes_and_exposes_candidate_key(backend, project_root):
+    """add_task computes candidate_key from title + metadata['files'] and
+    stores it; get_task exposes it (store-level dedup key, fm-task-dedup A1)."""
+    await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['candidate_key'] == compute_candidate_key('Fix parser', ['a.py', 'b.py'])
+    assert one['candidate_key'] is not None
+
+
+@pytest.mark.asyncio
+async def test_add_task_candidate_key_falls_back_to_files_to_modify(backend, project_root):
+    """metadata['files_to_modify'] is accepted when 'files' is absent (Open Q #5)."""
+    await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files_to_modify': ['x.py']}),
+    )
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['candidate_key'] == compute_candidate_key('Fix parser', ['x.py'])
+
+
+@pytest.mark.asyncio
+async def test_add_task_candidate_key_computed_with_no_metadata(backend, project_root):
+    """metadata=None still yields a title-only (non-None) candidate_key."""
+    await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=None,
+    )
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['candidate_key'] == compute_candidate_key('Fix parser', [])
+    assert one['candidate_key'] is not None
+
+
+@pytest.mark.asyncio
+async def test_add_task_candidate_key_computed_with_empty_metadata_dict(backend, project_root):
+    """metadata='{}' (no files key at all) also yields a title-only candidate_key."""
+    await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({}),
+    )
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['candidate_key'] == compute_candidate_key('Fix parser', [])
+    assert one['candidate_key'] is not None
 
 
 # ── write-boundary validation (task 2162, warn-mode census) ──────────
@@ -493,9 +549,10 @@ def _make_v2_stamped_db_without_claimant_columns(db_path: Path) -> None:
 
     Simulates a connection whose claimant columns never got ALTERed in —
     e.g. a routine orchestrator restart racing ahead of the fused-memory
-    deploy that ships this migration. `_migrate` early-returns because
-    ``user_version >= _SCHEMA_VERSION``, so the columns stay absent,
-    exercising set_task_status's fail-safe (WARNING, no error) path.
+    deploy that ships this migration. Opening it runs only the v2->v3
+    candidate_key step (the v1->v2 claimant ALTER is gated on ``version < 2``
+    and is skipped for an already-v2 DB), so the claimant columns stay
+    absent, exercising set_task_status's fail-safe (WARNING, no error) path.
     """
     import sqlite3
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -746,6 +803,56 @@ async def test_update_task_overwrites_metadata_without_append(backend, project_r
     )
     one = await backend.get_task('1', project_root=project_root)
     assert one['metadata'] == {'prd': 'new.md'}
+
+
+# ── update_task: candidate_key stays in sync (task 2186 amendment) ──
+
+
+@pytest.mark.asyncio
+async def test_update_task_recomputes_candidate_key_on_title_change(backend, project_root):
+    """candidate_key must track the row's CURRENT title. Without this, an
+    update that changes title would leave a stale key that no longer
+    describes the row — silently undermining the future A2 dedup index."""
+    await backend.add_task(
+        project_root=project_root, title='Fix parser',
+        metadata=json.dumps({'files': ['a.py']}),
+    )
+    await backend.update_task('1', project_root=project_root, title='Fix the lexer')
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['candidate_key'] == compute_candidate_key('Fix the lexer', ['a.py'])
+
+
+@pytest.mark.asyncio
+async def test_update_task_recomputes_candidate_key_on_metadata_files_change(backend, project_root):
+    """Changing metadata['files'] via update_task must also refresh candidate_key."""
+    await backend.add_task(
+        project_root=project_root, title='Fix parser',
+        metadata=json.dumps({'files': ['a.py']}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+        metadata_mode='replace',
+    )
+    one = await backend.get_task('1', project_root=project_root)
+    assert one['candidate_key'] == compute_candidate_key('Fix parser', ['a.py', 'b.py'])
+
+
+@pytest.mark.asyncio
+async def test_update_task_candidate_key_unchanged_when_neither_title_nor_metadata_touched(
+    backend, project_root,
+):
+    """An update touching only e.g. priority leaves candidate_key exactly as
+    computed at insert time — it is not blanked or recomputed from nothing."""
+    await backend.add_task(
+        project_root=project_root, title='Fix parser',
+        metadata=json.dumps({'files': ['a.py']}),
+    )
+    before = await backend.get_task('1', project_root=project_root)
+    await backend.update_task('1', project_root=project_root, priority='high')
+    after = await backend.get_task('1', project_root=project_root)
+    assert after['candidate_key'] == before['candidate_key']
+    assert after['candidate_key'] == compute_candidate_key('Fix parser', ['a.py'])
 
 
 # ── _merge_metadata: new additive-merge semantics ─────────────────
@@ -1735,9 +1842,15 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
     assert 'parent_id' not in tasks_cols, f'tasks still has parent_id column: {tasks_cols}'
     assert 'parent_id' not in deps_cols, f'dependencies still has parent_id column: {deps_cols}'
     assert 'parent_id' not in counters_cols, f'id_counters still has parent_id column: {counters_cols}'
-    assert user_version == 2, f'Expected user_version=2 after migration; got {user_version}'
+    assert user_version == 3, f'Expected user_version=3 after migration; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns after full-rebuild migration; got {tasks_cols}'
+    )
+    # v0->v3 chained path also ALTERs in candidate_key (review S3): the
+    # rebuilt-then-ALTERed table must carry the candidate_key column so the
+    # v2->v3 backfill lands on this path too.
+    assert 'candidate_key' in tasks_cols, (
+        f'Expected candidate_key column after v0->v3 chained migration; got {tasks_cols}'
     )
     assert 'ix_tasks_parent' not in indexes, f'ix_tasks_parent should be gone: {indexes}'
     assert any('ix_tasks_status' in idx for idx in indexes), f'ix_tasks_status missing: {indexes}'
@@ -1747,7 +1860,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
 
 @pytest.mark.asyncio
 async def test_migration_idempotent_second_open(tmp_path):
-    """Opening an already-migrated DB a second time is a no-op: user_version stays 2."""
+    """Opening an already-migrated DB a second time is a no-op: user_version stays 3."""
     import sqlite3
 
     project_root = str(tmp_path / 'proj')
@@ -1774,13 +1887,13 @@ async def test_migration_idempotent_second_open(tmp_path):
     finally:
         conn.close()
 
-    assert user_version == 2
+    assert user_version == 3
     assert 'parent_id' not in tasks_cols
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_has_no_parent_id_and_user_version_2(tmp_path):
+async def test_fresh_db_has_no_parent_id_and_user_version_3(tmp_path):
     """A brand-new DB is created with the post-migration schema from the start."""
     import sqlite3
 
@@ -1806,21 +1919,26 @@ async def test_fresh_db_has_no_parent_id_and_user_version_2(tmp_path):
         conn.close()
 
     assert 'parent_id' not in tasks_cols, f'New DB should not have parent_id; got {tasks_cols}'
-    assert user_version == 2, f'Fresh DB should have user_version=2; got {user_version}'
+    assert user_version == 3, f'Fresh DB should have user_version=3; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns in fresh schema; got {tasks_cols}'
+    )
+    assert 'candidate_key' in tasks_cols, (
+        f'Expected candidate_key column in fresh schema; got {tasks_cols}'
     )
 
 
 def _make_v1_schema_db(db_path: Path) -> None:
-    """Create a tasks.db with the CURRENT v1 schema: no parent_id, NO claimant columns.
+    """Create a tasks.db with the v1 schema: no parent_id, NO claimant/candidate_key columns.
 
-    Mirrors ``_SCHEMA_SQL`` as it existed before this task added the claimant
-    columns, stamped ``user_version = 1``. This is the common production
-    shape (parent_id already dropped by a prior deploy, claimant columns not
-    yet added) that the v1->v2 ALTER-TABLE migration branch must handle.
+    Mirrors ``_SCHEMA_SQL`` as it existed before the claimant / candidate_key
+    columns were added, stamped ``user_version = 1``. This is the common
+    production shape (parent_id already dropped by a prior deploy, later
+    columns not yet added) that the v1->v2 and v2->v3 ALTER-TABLE migration
+    steps must handle.
     """
     import sqlite3
+
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.executescript("""
@@ -1837,16 +1955,13 @@ def _make_v1_schema_db(db_path: Path) -> None:
             updated_at    TEXT NOT NULL,
             PRIMARY KEY (tag, id)
         );
-
         CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
-
         CREATE TABLE IF NOT EXISTS dependencies (
             tag        TEXT NOT NULL DEFAULT 'master',
             task_id    INTEGER NOT NULL,
             depends_on INTEGER NOT NULL,
             PRIMARY KEY (tag, task_id, depends_on)
         );
-
         CREATE TABLE IF NOT EXISTS id_counters (
             tag    TEXT NOT NULL DEFAULT 'master',
             max_id INTEGER NOT NULL DEFAULT 0,
@@ -1864,13 +1979,14 @@ def _make_v1_schema_db(db_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
-    """Opening an already-migrated v1 DB ALTERs in the claimant columns and stamps v2.
+    """Opening an already-migrated v1 DB ALTERs in the claimant columns and
+    then chains the v2->v3 candidate_key step, landing at v3.
 
     This is the common production case: parent_id is already gone (a prior
     deploy ran the v0->v1 rebuild), but claimant_run_id/heartbeat_at don't
     exist yet. Distinct from test_migration_drops_parent_id_column_and_straggler
-    above, which exercises the v0->v2 full-rebuild path for DBs that still have
-    parent_id.
+    above, which exercises the v0->v3 full-rebuild-then-ALTER path for DBs that
+    still have parent_id.
     """
     import sqlite3
 
@@ -1899,7 +2015,282 @@ async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected ALTER TABLE to add claimant_run_id/heartbeat_at; got {tasks_cols}'
     )
-    assert user_version == 2, f'Expected user_version=2 after v1->v2 ALTER migration; got {user_version}'
+    assert user_version == 3, f'Expected user_version=3 after v1->v3 migration; got {user_version}'
+
+
+def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
+    """Create a v1 (flat, post-parent_id) tasks.db WITHOUT a candidate_key
+    column — simulates a real pre-task-2186 production DB that already went
+    through the parent_id->flat migration but predates candidate_key.
+
+    Rows:
+      id=1: non-cancelled, title='Fix the bug',    files=[a.py, b.py]
+      id=2: non-cancelled, title='fix   the  bug' (extra internal whitespace
+            + different case), files=[b.py, a.py] (swapped order) —
+            normalizes to the SAME candidate_key as id=1 (one duplicate
+            group of size 2).
+      id=3: CANCELLED, same title+files as id=1 — must NOT backfill/count.
+      id=4: non-cancelled, unique title+files — no duplicate.
+    """
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag           TEXT NOT NULL DEFAULT 'master',
+            id            INTEGER NOT NULL,
+            title         TEXT NOT NULL,
+            description   TEXT,
+            details       TEXT,
+            test_strategy TEXT,
+            status        TEXT NOT NULL,
+            priority      TEXT,
+            metadata      TEXT,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    rows = [
+        (1, 'Fix the bug', 'pending', {'files': ['a.py', 'b.py']}),
+        (2, 'fix   the  bug', 'in-progress', {'files': ['b.py', 'a.py']}),
+        (3, 'Fix the bug', 'cancelled', {'files': ['a.py', 'b.py']}),
+        (4, 'Totally different task', 'pending', {'files': ['z.py']}),
+    ]
+    for task_id, title, status, metadata in rows:
+        conn.execute(
+            "INSERT INTO tasks (tag, id, title, status, metadata, updated_at) "
+            "VALUES ('master', ?, ?, ?, ?, '2026-01-01T00:00:00.000Z')",
+            (task_id, title, status, json.dumps(metadata)),
+        )
+    conn.execute("INSERT INTO id_counters (tag, max_id) VALUES ('master', 4)")
+    conn.execute('PRAGMA user_version = 1')
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_to_v3_migration_backfills_candidate_key_and_audits_duplicates(
+    tmp_path, caplog,
+):
+    """Opening a legacy v1 DB (no candidate_key column) chains v1->v2->v3: the
+    v2->v3 step backfills candidate_key for non-cancelled rows, leaves
+    cancelled rows' candidate_key NULL, emits a report-only audit log naming
+    the duplicate-group count, bumps user_version to 3, and creates NO index —
+    nothing is ever deleted.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v1_schema_db_no_candidate_key(db_path)
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Triggers connection-open (_SCHEMA_SQL + _migrate).
+            await b.get_tasks(project_root=project_root)
+        # (h) get_task exposes candidate_key through the normal read path.
+        one = await b.get_task('1', project_root=project_root)
+    finally:
+        await b.close()
+
+    expected_key = compute_candidate_key('Fix the bug', ['a.py', 'b.py'])
+    assert one['candidate_key'] == expected_key
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tasks_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        indexes = {r[1] for r in conn.execute('PRAGMA index_list(tasks)')}
+        rows = conn.execute(
+            "SELECT id, status, candidate_key FROM tasks WHERE tag='master' ORDER BY id",
+        ).fetchall()
+    finally:
+        conn.close()
+    by_id = {r[0]: (r[1], r[2]) for r in rows}
+
+    # (a) candidate_key column now exists.
+    assert 'candidate_key' in tasks_cols, f'candidate_key column missing: {tasks_cols}'
+
+    # (g) report-only — all 4 original rows survive untouched, nothing deleted.
+    assert set(by_id) == {1, 2, 3, 4}, f'Expected all 4 rows to survive; got ids={set(by_id)}'
+
+    # (b) both non-cancelled dup rows (id=1, id=2) backfilled to the SAME key
+    # — case/whitespace-insensitive title match, order-insensitive files.
+    assert by_id[1][1] == expected_key, by_id[1]
+    assert by_id[2][1] == expected_key, by_id[2]
+
+    # (c) the cancelled row's (id=3) candidate_key IS NULL — cancelled rows
+    # are excluded from backfill (a cancelled task's work may be re-filed).
+    assert by_id[3][0] == 'cancelled'
+    assert by_id[3][1] is None
+
+    # id=4 is unique — gets its own, different key.
+    unique_key = compute_candidate_key('Totally different task', ['z.py'])
+    assert by_id[4][1] == unique_key
+    assert by_id[4][1] != expected_key
+
+    # (e) user_version bumped to 3.
+    assert user_version == 3, f'Expected user_version=3 after migration; got {user_version}'
+
+    # (f) no index references candidate_key yet — the UNIQUE index is task
+    # A2's job, gated on a clean audit; this task must not create one.
+    assert not any('candidate_key' in idx for idx in indexes), (
+        f'No index should reference candidate_key yet (A2 builds it); got: {indexes}'
+    )
+
+    # (d) exactly one audit log record naming duplicate_groups=1 (id=1/id=2
+    # form the one duplicate group; the cancelled id=3 does not count).
+    audit_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.INFO and 'duplicate_groups=' in r.message
+    ]
+    assert len(audit_msgs) == 1, (
+        f'Expected exactly one candidate_key audit log record; got '
+        f'{len(audit_msgs)}: {audit_msgs}'
+    )
+    assert re.search(r'\bduplicate_groups=1\b', audit_msgs[0]), (
+        f'Expected duplicate_groups=1 in audit log; got: {audit_msgs[0]!r}'
+    )
+
+
+def _make_v1_schema_db_no_candidate_key_all_unique(db_path: Path) -> None:
+    """Create a v1 (flat, post-parent_id) tasks.db WITHOUT a candidate_key
+    column, where every non-cancelled row has a distinct (title, files) —
+    the CLEAN audit case (duplicate_groups == 0). Companion to
+    ``_make_v1_schema_db_no_candidate_key`` (which pins the >0 / WARNING
+    branch); this fixture pins the ==0 / INFO branch.
+
+    Rows (all non-cancelled, all unique):
+      id=1: title='Fix the bug',        files=[a.py]
+      id=2: title='Add the feature',    files=[c.py]
+      id=3: title='Refactor the thing', files=[] (no metadata key at all)
+    """
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag           TEXT NOT NULL DEFAULT 'master',
+            id            INTEGER NOT NULL,
+            title         TEXT NOT NULL,
+            description   TEXT,
+            details       TEXT,
+            test_strategy TEXT,
+            status        TEXT NOT NULL,
+            priority      TEXT,
+            metadata      TEXT,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    rows = [
+        (1, 'Fix the bug', 'pending', {'files': ['a.py']}),
+        (2, 'Add the feature', 'in-progress', {'files': ['c.py']}),
+        (3, 'Refactor the thing', 'done', None),
+    ]
+    for task_id, title, status, metadata in rows:
+        conn.execute(
+            "INSERT INTO tasks (tag, id, title, status, metadata, updated_at) "
+            "VALUES ('master', ?, ?, ?, ?, '2026-01-01T00:00:00.000Z')",
+            (task_id, title, status, json.dumps(metadata) if metadata is not None else None),
+        )
+    conn.execute("INSERT INTO id_counters (tag, max_id) VALUES ('master', 3)")
+    conn.execute('PRAGMA user_version = 1')
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
+    tmp_path, caplog,
+):
+    """Companion to the duplicate-group migration test above: when every
+    non-cancelled row's candidate_key is unique, the migration still
+    backfills all of them, but the one-shot audit line logs at INFO (not
+    WARNING) naming duplicate_groups=0 — the expected steady-state outcome
+    that gates task A2's UNIQUE index.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v1_schema_db_no_candidate_key_all_unique(db_path)
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Triggers connection-open (_SCHEMA_SQL + _migrate).
+            await b.get_tasks(project_root=project_root)
+    finally:
+        await b.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        rows = conn.execute(
+            "SELECT id, candidate_key FROM tasks WHERE tag='master' ORDER BY id",
+        ).fetchall()
+    finally:
+        conn.close()
+    by_id = {r[0]: r[1] for r in rows}
+
+    # All three (unique, non-cancelled) rows are backfilled with distinct,
+    # non-NULL keys.
+    assert by_id[1] is not None and by_id[2] is not None and by_id[3] is not None, by_id
+    assert len({by_id[1], by_id[2], by_id[3]}) == 3, f'Expected 3 distinct keys; got {by_id}'
+    assert by_id[1] == compute_candidate_key('Fix the bug', ['a.py'])
+    assert by_id[2] == compute_candidate_key('Add the feature', ['c.py'])
+    assert by_id[3] == compute_candidate_key('Refactor the thing', [])
+    assert user_version == 3, f'Expected user_version=3 after migration; got {user_version}'
+
+    # Exactly one audit record, at INFO (not WARNING), naming duplicate_groups=0.
+    audit_records = [r for r in caplog.records if 'duplicate_groups=' in r.message]
+    assert len(audit_records) == 1, (
+        f'Expected exactly one candidate_key audit log record; got '
+        f'{len(audit_records)}: {[r.message for r in audit_records]}'
+    )
+    assert audit_records[0].levelno == logging.INFO, (
+        f'Expected INFO level for a clean (0-duplicate) audit; got '
+        f'{logging.getLevelName(audit_records[0].levelno)}'
+    )
+    assert re.search(r'\bduplicate_groups=0\b', audit_records[0].message), (
+        f'Expected duplicate_groups=0 in audit log; got: {audit_records[0].message!r}'
+    )
 
 
 # ── Concurrency ────────────────────────────────────────────────────
