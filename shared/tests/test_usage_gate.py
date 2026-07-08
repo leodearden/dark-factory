@@ -14,7 +14,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
+from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 from shared.usage_gate import (
     _LEGAL_TRANSITIONS,
     AccountPhase,
@@ -2283,3 +2285,85 @@ class TestHandleAuthFailureOnCappedAccountIsNoop:
 
         assert result is True
         assert acct.phase == AccountPhase.AUTH_FAILED
+
+
+# ---------------------------------------------------------------------------
+# task 2129 (W4-beta) step-1: rewired detect_cap_hit must route through the
+# single classify_invocation seam (strict_confirm=True regime) so CliLocalError
+# precedence (reify-3604) applies uniformly, not just at the cli_invoke layer.
+# ---------------------------------------------------------------------------
+
+
+class TestDetectCapHitClassifyInvocationConsistency:
+    """detect_cap_hit's verdicts must agree with classify_invocation(strict_confirm=True).
+
+    The first test below is RED against today's detect_cap_hit: it scans
+    CAP_HIT_PREFIXES/CAP_CONFIRM_KEYWORDS directly and has no notion of
+    NON_CAP_CLI_ERROR_MARKERS, so a message that satisfies the cap regime but
+    also contains a local-CLI-error marker is (incorrectly) detected as a cap
+    hit today. Once detect_cap_hit is rewired onto classify_invocation
+    (step-2), CliLocalError precedence applies uniformly and this goes green.
+    The remaining tests pin the already-correct claude/codex/near-cap verdicts
+    against the classifier so the rewire is verified not to regress them.
+    """
+
+    def test_cap_message_with_non_cap_marker_is_not_a_cap_hit(self):
+        """reify-3604 structural fix applied to detect_cap_hit, not just cli_invoke.
+
+        The text below satisfies the strict-confirm cap regime (CAP_HIT_PREFIX
+        "You've hit your" + CAP_CONFIRM_KEYWORD "usage limit"/"resets") but ALSO
+        contains the NON_CAP_CLI_ERROR_MARKER "permission denied". CliLocalError
+        must outrank CapHit, so detect_cap_hit must return False and mark no
+        account as capped or near-cap.
+        """
+        gate = make_gate(['a'])
+        text = (
+            "You've hit your usage limit. Your plan resets in 3h. "
+            'permission denied: /tmp/x'
+        )
+        outcome = classify_invocation(
+            AgentResult(success=False, output=text), strict_confirm=True,
+        )
+        assert not isinstance(outcome, CapHit)
+
+        result = gate.detect_cap_hit('', text)
+        assert result is False
+        assert gate._accounts[0].capped is False
+        assert gate._accounts[0].near_cap is False
+
+    def test_cap_hit_prefix_with_confirm_keyword_agrees_with_classifier(self):
+        gate = make_gate(['a'])
+        text = "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours."
+        outcome = classify_invocation(
+            AgentResult(success=False, output=text), strict_confirm=True,
+        )
+        assert isinstance(outcome, CapHit)
+
+        result = gate.detect_cap_hit('', text)
+        assert result is True
+        assert gate._accounts[0].capped is True
+
+    def test_codex_usage_limit_reached_agrees_with_classifier(self):
+        gate = make_gate(['a'])
+        text = 'Error: usage limit reached'
+        outcome = classify_invocation(
+            AgentResult(success=False, output=text), strict_confirm=True, backend='codex',
+        )
+        assert isinstance(outcome, CapHit)
+
+        result = gate.detect_cap_hit('', text, backend='codex')
+        assert result is True
+        assert gate._accounts[0].capped is True
+
+    def test_near_cap_resets_phrase_agrees_with_classifier_and_sets_near_cap(self):
+        gate = make_gate(['a'])
+        text = "You're close to reaching your usage limit. Your plan resets in 1h."
+        outcome = classify_invocation(
+            AgentResult(success=False, output=text), strict_confirm=True,
+        )
+        assert isinstance(outcome, NearCap)
+
+        result = gate.detect_cap_hit('', text)
+        assert result is True
+        assert gate._accounts[0].near_cap is True
+        assert gate._accounts[0].capped is False

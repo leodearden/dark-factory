@@ -36,6 +36,7 @@ from shared.cli_invoke import (
     is_zero_output_timeout,
     read_transcript_records,
 )
+from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
 
 
@@ -1951,6 +1952,120 @@ class TestHeuristicCapGating:
         assert second_cooldown == _CAP_HIT_COOLDOWN_SECS * 2
 
 
+@pytest.mark.asyncio
+class TestInvokeWithCapRetryOutcomeRouting:
+    """Pin invoke_with_cap_retry's auth/wedge/heuristic routing to a single
+    classify_invocation call (task beta consumer-rewire, reify-3604 at the
+    cli layer).
+
+    Each test asserts both (1) the caller-visible routing behaviour is
+    unchanged, and (2) the routing decision is actually driven by
+    ``classify_invocation`` via a ``wraps=`` spy on
+    ``shared.invocation_outcome.classify_invocation``. Assertion (2) is RED
+    today — invoke_with_cap_retry does not call classify_invocation at all
+    yet (auth/wedge/heuristic routing reads AgentResult fields directly, and
+    the cap path delegates to ``slot.detect_cap_hit`` on a *mocked* gate here,
+    which never touches the real classifier) — and turns GREEN once the
+    consumer-rewire lands.
+    """
+
+    async def test_reify_3604_cli_local_error_not_treated_as_cap(self):
+        """A zero-cost, <=1-turn, sub-5s failure whose stderr carries a
+        NON_CAP_CLI_ERROR_MARKER classifies as CliLocalError and must NOT be
+        treated as a cap hit: single invocation, no _handle_cap_detected
+        call, no sleep, failed result returned verbatim.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        result = _make_result(
+            success=False, cost_usd=0, turns=0, duration_ms=300,
+            stderr='Error: is already in use foo bar',
+        )
+        with (
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
+                  return_value=result) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            patch('shared.invocation_outcome.classify_invocation',
+                  wraps=classify_invocation) as spy_classify,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        mock_invoke.assert_awaited_once()
+        gate._handle_cap_detected.assert_not_called()
+        mock_sleep.assert_not_awaited()
+        assert got is result
+        assert got.success is False
+        assert spy_classify.called, (
+            'invoke_with_cap_retry must classify the result via '
+            'classify_invocation so CliLocalError precedence applies'
+        )
+
+    async def test_auth_failure_401_403_routes_via_outcome(self):
+        """A 401/403 result routes to _handle_auth_failure + failover,
+        without sleeping (i.e. not counted as a cap hit).
+        """
+        gate = make_gate_mock(
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            active_account_name='acct-a',
+        )
+        gate._handle_auth_failure = MagicMock(return_value=True)
+        auth_failed = _make_result(
+            success=False, output='Unauthorized', api_error_status=403,
+            cost_usd=0.0,
+        )
+        ok = _make_result(success=True, cost_usd=0.5)
+        with (
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
+                  side_effect=[auth_failed, ok]) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            patch('shared.invocation_outcome.classify_invocation',
+                  wraps=classify_invocation) as spy_classify,
+        ):
+            got = await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        assert got.success is True
+        assert mock_invoke.await_count == 2
+        gate._handle_auth_failure.assert_called_once()
+        mock_sleep.assert_not_awaited()
+        assert spy_classify.called, (
+            'invoke_with_cap_retry must classify the result via '
+            'classify_invocation so AuthFailed is derived from it'
+        )
+
+    async def test_zero_output_wedge_on_resume_clears_session(self):
+        """A zero-output timed-out result on a caller-initiated resume clears
+        the wedged resume_session_id and retries fresh with the original
+        prompt.
+        """
+        gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=False))
+        wedge = AgentResult(
+            success=False, output='', cost_usd=0.0,
+            duration_ms=300_000, turns=0, session_id='wedged-Y',
+            timed_out=True, transcript_turns=0,
+        )
+        ok = _make_result(success=True, cost_usd=0.5)
+        with (
+            patch('shared.cli_invoke.invoke_claude_agent', new_callable=AsyncMock,
+                  side_effect=[wedge, ok]) as mock_invoke,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+            patch('shared.invocation_outcome.classify_invocation',
+                  wraps=classify_invocation) as spy_classify,
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', prompt='real-prompt', resume_session_id='wedged-Y',
+            )
+
+        assert got.success is True
+        assert mock_invoke.await_count == 2
+        second = mock_invoke.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') is None
+        assert second.kwargs.get('prompt') == 'real-prompt'
+        assert spy_classify.called, (
+            'invoke_with_cap_retry must classify the result via '
+            'classify_invocation so ZeroOutputWedge is derived from it'
+        )
+
+
 # ── _run_subprocess process-group fix ────────────────────────────────────────
 
 
@@ -2033,6 +2148,99 @@ class TestClassifyAgentFailure:
         cls = classify_agent_failure(result)
         assert cls.kind is AgentFailureKind.TIMED_OUT
         assert '1800000ms' in cls.summary
+
+
+class TestClassifyAgentFailureOutcomeProjection:
+    """Pin the DD-3 projection: classify_agent_failure derives its verdict
+    from a single classify_invocation call (task beta consumer-rewire), while
+    preserving every branch InvocationOutcome does not model.
+
+    The ``spy_classify.called`` assertions are RED today — classify_agent_failure
+    does not call classify_invocation at all yet — and turn GREEN once step-8's
+    re-derivation lands. The plain ``kind is`` assertions are contract locks:
+    they already hold today and must keep holding after the derivation change
+    — in particular, guarding against the API_ERROR branch being wrongly
+    narrowed to AuthFailed-only, since classify_invocation's AuthFailed only
+    covers {401, 403}, never 429/5xx.
+    """
+
+    def test_success_consistent_with_ok_outcome(self):
+        """result.success=True (classify_invocation -> OK) => kind SUCCESS,
+        and the verdict is actually derived via classify_invocation."""
+        result = AgentResult(success=True, output='done', subtype='success', turns=3)
+        with patch('shared.invocation_outcome.classify_invocation',
+                   wraps=classify_invocation) as spy_classify:
+            cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.SUCCESS
+        assert spy_classify.called, (
+            'classify_agent_failure must derive SUCCESS via classify_invocation (OK)'
+        )
+
+    @pytest.mark.parametrize('status', [401, 403])
+    def test_401_403_consistent_with_auth_failed_outcome(self, status):
+        """api_error_status in {401, 403} (classify_invocation -> AuthFailed)
+        => kind API_ERROR, and the verdict is actually derived via
+        classify_invocation."""
+        result = AgentResult(
+            success=False, output='Unauthorized', subtype='', api_error_status=status,
+        )
+        with patch('shared.invocation_outcome.classify_invocation',
+                   wraps=classify_invocation) as spy_classify:
+            cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.API_ERROR
+        assert spy_classify.called, (
+            'classify_agent_failure must derive API_ERROR via classify_invocation (AuthFailed)'
+        )
+
+    def test_non_4xx_api_error_status_still_api_error(self):
+        """A non-401/403 api_error_status (e.g. 500 — classify_invocation does
+        NOT tag this AuthFailed) must still classify as API_ERROR: this rule
+        is an AgentResult-field read InvocationOutcome does not model, and
+        must survive the derivation change as a superset of AuthFailed."""
+        result = AgentResult(
+            success=False, output='Internal error', subtype='', api_error_status=500,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.API_ERROR
+
+    def test_max_turns_preserved(self):
+        """subtype=='error_max_turns' => MAX_TURNS — not modelled by
+        InvocationOutcome, must be preserved as a direct AgentResult-field read."""
+        result = AgentResult(
+            success=False, output='', subtype='error_max_turns',
+            turns=75, output_tokens=12345,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.MAX_TURNS
+
+    def test_empty_output_preserved(self):
+        """subtype=='error_empty_output' => EMPTY_OUTPUT — not modelled by
+        InvocationOutcome, must be preserved as a direct AgentResult-field read."""
+        result = AgentResult(
+            success=False, output='', subtype='error_empty_output', turns=1,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.EMPTY_OUTPUT
+
+    def test_schema_salvaged_preserved(self):
+        """schema_salvaged=True => STRUCTURAL — not modelled by
+        InvocationOutcome, must be preserved as a direct AgentResult-field read."""
+        result = AgentResult(
+            success=False, output='', subtype='', schema_salvaged=True,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.STRUCTURAL
+
+    def test_timed_out_preserved(self):
+        """timed_out=True => TIMED_OUT — not modelled by InvocationOutcome,
+        must be preserved as a direct AgentResult-field read (and still beats
+        subtype-based rules, per the existing rule order)."""
+        result = AgentResult(
+            success=False, output='', subtype='error_max_turns',
+            turns=50, duration_ms=1_800_000, timed_out=True,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.TIMED_OUT
 
 
 class TestBuildFailureMessage:

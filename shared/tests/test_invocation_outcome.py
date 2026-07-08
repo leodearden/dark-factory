@@ -11,15 +11,10 @@ from pathlib import Path
 import pytest
 
 from shared import cli_invoke as cli_invoke_module
+from shared import invocation_outcome as invocation_outcome_module
 from shared import usage_gate as usage_gate_module
 from shared.cli_invoke import AgentResult
 from shared.invocation_outcome import (
-    CAP_CONFIRM_KEYWORDS,
-    CAP_HIT_PREFIXES,
-    CODEX_CAP_PATTERNS,
-    GEMINI_CAP_PATTERNS,
-    NEAR_CAP_PREFIXES,
-    NON_CAP_CLI_ERROR_MARKERS,
     OK,
     AuthFailed,
     CapHit,
@@ -213,44 +208,47 @@ class TestExtractCapMessage:
         assert message != ''
 
 
-class TestStringTableDriftGuard:
-    """Guard against silent divergence of the copied string tables.
+class TestSingleSourceOwnership:
+    """Guard that the six cap/error string tables live ONLY in
+    shared.invocation_outcome, after the beta consumer-rewire collapsed the
+    duplicated copies out of shared.usage_gate / shared.cli_invoke.
 
-    invocation_outcome.py intentionally duplicates these tables rather than
-    importing them (see the module docstring: additive-only, consumer
-    rewire removes the duplication later). Until that rewire lands, a future
-    edit to one home must not silently diverge from the other — these tests
-    fail loudly the moment it does.
-
-    Scope: this guard covers ONLY the six plain string-table constants below
-    (CAP_HIT_PREFIXES, CAP_CONFIRM_KEYWORDS, NEAR_CAP_PREFIXES,
-    CODEX_CAP_PATTERNS, GEMINI_CAP_PATTERNS, NON_CAP_CLI_ERROR_MARKERS). It
-    does NOT cover ``_parse_resets_at``/``_extract_cap_message`` — those are
-    also forked from usage_gate.py, are larger and already known to have
-    diverged (see the fork note above ``_parse_resets_at`` in
-    invocation_outcome.py), and are where a real silent regression is more
-    likely. Once the beta consumer-rewire removes the duplication entirely,
-    this whole class should be deleted rather than left to outlive its
-    purpose.
+    Replaces TestStringTableDriftGuard (deleted): that guard compared two
+    live copies for drift while the duplication was still intentional. Now
+    that the consumer-rewire (tasks alpha->beta) has repointed every reader
+    at the single source, this guard instead asserts there is exactly one
+    copy left, rather than two copies kept in sync.
     """
 
-    def test_cap_hit_prefixes_matches_usage_gate(self):
-        assert CAP_HIT_PREFIXES == usage_gate_module.CAP_HIT_PREFIXES
+    @pytest.mark.parametrize('name', [
+        'CAP_HIT_PREFIXES',
+        'CAP_CONFIRM_KEYWORDS',
+        'NEAR_CAP_PREFIXES',
+        'CODEX_CAP_PATTERNS',
+        'GEMINI_CAP_PATTERNS',
+    ])
+    def test_usage_gate_no_longer_defines_the_table(self, name):
+        assert not hasattr(usage_gate_module, name), (
+            f'shared.usage_gate must not define {name} anymore — '
+            'it lives only in shared.invocation_outcome'
+        )
 
-    def test_cap_confirm_keywords_matches_usage_gate(self):
-        assert CAP_CONFIRM_KEYWORDS == usage_gate_module.CAP_CONFIRM_KEYWORDS
+    def test_cli_invoke_no_longer_defines_non_cap_cli_error_markers(self):
+        assert not hasattr(cli_invoke_module, 'NON_CAP_CLI_ERROR_MARKERS')
 
-    def test_near_cap_prefixes_matches_usage_gate(self):
-        assert NEAR_CAP_PREFIXES == usage_gate_module.NEAR_CAP_PREFIXES
+    def test_cli_invoke_no_longer_defines_is_non_cap_cli_error(self):
+        assert not hasattr(cli_invoke_module, '_is_non_cap_cli_error')
 
-    def test_codex_cap_patterns_matches_usage_gate(self):
-        assert CODEX_CAP_PATTERNS == usage_gate_module.CODEX_CAP_PATTERNS
-
-    def test_gemini_cap_patterns_matches_usage_gate(self):
-        assert GEMINI_CAP_PATTERNS == usage_gate_module.GEMINI_CAP_PATTERNS
-
-    def test_non_cap_cli_error_markers_matches_cli_invoke(self):
-        assert NON_CAP_CLI_ERROR_MARKERS == cli_invoke_module.NON_CAP_CLI_ERROR_MARKERS
+    @pytest.mark.parametrize('name', [
+        'CAP_HIT_PREFIXES',
+        'CAP_CONFIRM_KEYWORDS',
+        'NEAR_CAP_PREFIXES',
+        'CODEX_CAP_PATTERNS',
+        'GEMINI_CAP_PATTERNS',
+        'NON_CAP_CLI_ERROR_MARKERS',
+    ])
+    def test_invocation_outcome_still_defines_the_table(self, name):
+        assert hasattr(invocation_outcome_module, name)
 
 
 class TestClassifyInvocationAuthFailedPrecedence:

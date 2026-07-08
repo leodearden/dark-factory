@@ -20,11 +20,13 @@ import pytest
 
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import (
+from shared.invocation_outcome import (
     CAP_HIT_PREFIXES,
     CODEX_CAP_PATTERNS,
     GEMINI_CAP_PATTERNS,
     NEAR_CAP_PREFIXES,
+)
+from shared.usage_gate import (
     AccountLease,
     AccountPhase,
     SessionBudgetExhausted,

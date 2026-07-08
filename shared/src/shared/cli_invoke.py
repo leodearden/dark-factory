@@ -114,22 +114,10 @@ CAP_HIT_RESUME_PROMPT = (
 # should stay a plain "continue" rather than mentioning usage limits.
 CRASH_RECOVERY_RESUME_PROMPT = 'continue'
 
-# Concrete CLI/usage errors that exit instantly with no output but are NOT usage
-# caps. Matched case-insensitively against stderr/output so the zero-cost cap
-# heuristic doesn't misfire (and loop forever) on a local CLI failure.
-NON_CAP_CLI_ERROR_MARKERS = [
-    'is already in use',        # --session-id collision (reify-3604)
-    'unrecognized arguments',
-    'unknown option',
-    'invalid value',
-    'no such file or directory',
-    'permission denied',
-]
-
-
-def _is_non_cap_cli_error(stderr: str, output: str) -> bool:
-    blob = f'{stderr or ""}\n{output or ""}'.lower()
-    return any(m in blob for m in NON_CAP_CLI_ERROR_MARKERS)
+# The NON_CAP_CLI_ERROR_MARKERS table and its _is_non_cap_cli_error scanner
+# that used to live here have moved to shared.invocation_outcome (task
+# W4-beta single-source collapse); this module now consumes the verdict
+# indirectly via classify_invocation's CliLocalError variant.
 
 
 __all__ = [
@@ -455,12 +443,18 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
 
     The decision rules fire in order — the first match wins:
 
-    1. ``result.success`` → ``SUCCESS``.
+    1. ``classify_invocation(result, strict_confirm=True)`` is ``OK``
+       (mirrors ``result.success``) → ``SUCCESS``.
     2. ``result.timed_out`` → ``TIMED_OUT``.
     3. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
        (high ``turns`` + non-zero ``output_tokens`` but empty ``output``).
-    4. ``result.api_error_status`` set → ``API_ERROR`` (includes status code
-       in the summary; transient — worth retrying against another account).
+    4. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
+       ``API_ERROR`` (includes status code in the summary; transient — worth
+       retrying against another account). ``AuthFailed`` ({401, 403}) is a
+       strict subset of "api_error_status is not None", so the ``OR`` never
+       changes the verdict — it keeps this rule visibly tied to the
+       InvocationOutcome contract without narrowing API_ERROR away from
+       429/5xx, which InvocationOutcome does not model.
     5. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
        (may be transient).
     6. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
@@ -472,6 +466,13 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     duration_ms, timed_out, api_error_status, output length, last 500 chars
     of stdout output, and last 500 chars of stderr.
     """
+    # Lazy (function-local) import — see the identical note in
+    # invoke_with_cap_retry: a module-top import here would create a
+    # cli_invoke<->invocation_outcome circular import.
+    from shared.invocation_outcome import OK, AuthFailed, classify_invocation
+
+    outcome = classify_invocation(result, strict_confirm=True)
+
     tail_out = result.output[-500:] if result.output else ''
     tail_err = result.stderr[-500:] if result.stderr else ''
     diagnostic_detail = (
@@ -486,7 +487,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         f'stderr (last 500 chars):\n{tail_err}'
     )
 
-    if result.success:
+    if isinstance(outcome, OK):
         return AgentFailureClass(
             kind=AgentFailureKind.SUCCESS,
             summary='agent succeeded',
@@ -510,7 +511,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
             ),
             diagnostic_detail=diagnostic_detail,
         )
-    if result.api_error_status is not None:
+    if result.api_error_status is not None or isinstance(outcome, AuthFailed):
         return AgentFailureClass(
             kind=AgentFailureKind.API_ERROR,
             summary=f'agent API error: HTTP {result.api_error_status}',
@@ -799,6 +800,20 @@ async def invoke_with_cap_retry(
                 )
                 completed_at = datetime.now(UTC).isoformat()
 
+                # Lazy (function-local) import: invocation_outcome.py imports
+                # shared.cli_invoke at module top (for is_zero_output_timeout),
+                # so a module-top import here would create a circular import.
+                # Importing inside the loop body runs after both modules are
+                # fully loaded, breaking the cycle at negligible cost (the
+                # module is already in sys.modules).
+                from shared.invocation_outcome import (
+                    AuthFailed,
+                    CliLocalError,
+                    ZeroOutputWedge,
+                    classify_invocation,
+                )
+                outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+
                 # Auth-failure routing (401/403): distinct from cap hits.
                 # Mark the account auth_failed and fail over; don't count
                 # toward consecutive_cap_hits so the cooldown doesn't compound.
@@ -808,7 +823,9 @@ async def invoke_with_cap_retry(
                 # we route 429 here the slot.detect_cap_hit() call never runs,
                 # AllAccountsCappedException never fires, and the curator
                 # worker's cap-defer machinery silently never engages.
-                if result.api_error_status in (401, 403):
+                # classify_invocation mirrors this exact narrowing: AuthFailed
+                # is only returned for {401, 403} (see invocation_outcome.py).
+                if isinstance(outcome, AuthFailed):
                     auth_marked = usage_gate._handle_auth_failure(
                         f'HTTP {result.api_error_status}: {result.output[:120]}',
                         slot.token,
@@ -846,7 +863,7 @@ async def invoke_with_cap_retry(
                 # on the very next iteration.  At most one extra full-timeout
                 # (~configured_timeout_ms) is incurred before the cap is re-detected.
                 if (
-                    is_zero_output_timeout(result)
+                    isinstance(outcome, ZeroOutputWedge)
                     and invoke_kwargs.get('resume_session_id')
                 ):
                     logger.warning(
@@ -919,7 +936,7 @@ async def invoke_with_cap_retry(
                     and result.turns <= 1
                     and result.duration_ms < 5000
                 ):
-                    if _is_non_cap_cli_error(result.stderr, result.output):
+                    if isinstance(outcome, CliLocalError):
                         # A recognised local CLI/usage error (e.g. --session-id
                         # collision) exits zero-cost and instantly, but it is NOT a
                         # usage cap.  Counting it as a cap loops forever (reify-3604).

@@ -29,8 +29,10 @@ from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
+from shared.cli_invoke import AgentResult
 from shared.config_dir import TaskConfigDir
 from shared.config_models import UsageCapConfig
+from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:
@@ -55,52 +57,9 @@ __all__ = [
 # `from shared.usage_gate import AccountLease` works regardless of __all__
 # membership.
 
-# Patterns that indicate a usage cap has been hit (from Claude Code CLI output)
-CAP_HIT_PREFIXES = [
-    "You've hit your",
-    "You've used",
-    "You're out of extra",
-    "You're now using extra",
-]
-# Secondary confirmation — at least one of these keywords must also appear in
-# the same text for a CAP_HIT or NEAR_CAP prefix match to be accepted
-# (defense-in-depth against ambiguous prefix false positives).
-# NOTE: 'upgrade' was narrowed to multi-word phrases because the bare verb is
-# too common in unrelated CLI messaging (e.g. 'Upgrade to v2 for more features')
-# and would effectively reduce the guard to a near-prefix-only match in those
-# cases.  'upgrade your plan' and 'upgrade your subscription' are natural SaaS
-# cap-message phrases unlikely to appear in non-cap contexts.  The primary
-# defense remains the CAP_HIT_PREFIXES / NEAR_CAP_PREFIXES prefix match.
-#
-# Known verbatim Claude CLI cap-hit messages that motivated this list
-# (update if Claude changes its wording):
-#   "You've hit your usage limit for Claude Pro. Your plan resets in 3 hours."
-#       → 'usage limit', 'resets'
-#   "You've used all available credits. Upgrade your plan for more capacity."
-#       → 'upgrade your plan'
-#   "You're out of extra usage for this billing period. Your plan resets in 2h."
-#       → 'resets'
-#   "You're now using extra compute credits. Your plan resets in 1h."
-#       → 'resets'
-#   "You're close to reaching your usage limit. Your plan resets in 1h."  (near-cap)
-#       → 'usage limit', 'resets'
-# See also: TestCapDetectionPatterns.test_realistic_cap_messages in
-# test_usage_gate_exhaustive.py for the full parametrized fixture set.
-CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade your plan", "upgrade your subscription"]
-
-# Patterns for near-cap warnings (pause proactively)
-NEAR_CAP_PREFIXES = [
-    "You're close to",
-]
-
-# Codex (OpenAI) cap-hit patterns
-CODEX_CAP_PATTERNS = ['usage limit reached', 'rate limit', 'quota exceeded',
-                      'insufficient_quota', 'rate_limit_exceeded']
-
-# Gemini (Google) cap-hit patterns
-GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
-                       'RESOURCE_EXHAUSTED', 'quota_exceeded']
-
+# The cap/near-cap/backend-pattern string tables that used to live here have
+# moved to shared.invocation_outcome (task W4-beta single-source collapse);
+# this module now consumes them indirectly via classify_invocation.
 CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 
 
@@ -715,6 +674,18 @@ class UsageGate:
     ) -> bool:
         """Scan stderr and result text for cap-hit patterns.
 
+        Delegates to ``classify_invocation`` (task W4-beta consumer-rewire):
+        builds a synthetic ``AgentResult`` from *stderr*/*result_text*
+        (``success=False`` so the OK short-circuit never fires; a real
+        ``api_error_status``/``timed_out`` is never available here, so those
+        default to None/False and AuthFailed/ZeroOutputWedge can never be
+        produced by this call) and classifies it with ``strict_confirm=True``
+        — the detect_cap_hit regime, which demands the CAP_CONFIRM_KEYWORDS
+        guard (see DD-2 on ``classify_invocation`` for the asymmetry with the
+        ``_run_probe`` regime). CliLocalError now outranks CapHit/NearCap
+        uniformly here, exactly as it already did at the cli_invoke layer
+        (reify-3604).
+
         Returns True if a cap-hit or near-cap pattern was detected **and** an
         account was successfully resolved and mutated.  Returns False both when
         no pattern matches and when a pattern matches but ``_resolve_account``
@@ -723,50 +694,33 @@ class UsageGate:
         consecutive_cap_hits or trigger a cooldown, since before_invoke() would
         return the same token on the next iteration.
         """
-        combined = f'{stderr}\n{result_text}'
+        result = AgentResult(success=False, output=result_text, stderr=stderr)
+        outcome = classify_invocation(result, strict_confirm=True, backend=backend)
 
-        # Check backend-specific patterns first
-        if backend == 'codex':
-            for pattern in CODEX_CAP_PATTERNS:
-                if pattern.lower() in combined.lower():
-                    return self._handle_cap_detected(
-                        f'Codex cap hit: {pattern}', None, oauth_token,
-                    )
-        elif backend == 'gemini':
-            for pattern in GEMINI_CAP_PATTERNS:
-                if pattern.lower() in combined.lower():
-                    return self._handle_cap_detected(
-                        f'Gemini cap hit: {pattern}', None, oauth_token,
-                    )
+        if isinstance(outcome, CapHit):
+            return self._handle_cap_detected(outcome.reason, outcome.resets_at, oauth_token)
+        if isinstance(outcome, NearCap):
+            return self._handle_near_cap_warning(outcome.reason, oauth_token)
 
-        # Claude cap/near-cap detection: require both a prefix match AND a
-        # secondary confirmation keyword (defence against false positives on
-        # generic prefixes like "You've used" or "You're close to").
-        combined_lower = combined.lower()
-        has_confirm_keyword = any(kw in combined_lower for kw in CAP_CONFIRM_KEYWORDS)
-        if has_confirm_keyword:
-            for prefix in CAP_HIT_PREFIXES:
-                if prefix.lower() in combined_lower:
-                    resets_at = _parse_resets_at(combined)
-                    reason = _extract_cap_message(combined, prefix) or f'Cap detected: {prefix}'
-                    return self._handle_cap_detected(reason, resets_at, oauth_token)
+        # Not a cap/near-cap verdict (Failure, or CliLocalError overriding a
+        # cap-like prefix) — if a cap-like prefix IS present, emit a debug
+        # breadcrumb so silent false-negatives leave a trace (e.g. stderr
+        # truncation, Claude changes its message format, or a CLI-error
+        # marker happened to co-occur with cap-like text). Kept as a direct
+        # prefix scan since classify_invocation has no "breadcrumb-only" outcome.
+        # Local import (rather than a module-top binding): keeps these two
+        # names out of this module's own namespace so single-source-ownership
+        # holds (see TestSingleSourceOwnership in test_invocation_outcome.py).
+        from shared.invocation_outcome import CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES
 
-            for prefix in NEAR_CAP_PREFIXES:
-                if prefix.lower() in combined_lower:
-                    reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
-                    return self._handle_near_cap_warning(reason, oauth_token)
-        else:
-            # No confirm keyword — the confirm-keyword guard above would have blocked
-            # detection anyway, but if a cap-like prefix IS present, emit a
-            # debug breadcrumb so silent false-negatives leave a trace
-            # (e.g. stderr truncation or Claude changes its message format).
-            for prefix in (*CAP_HIT_PREFIXES, *NEAR_CAP_PREFIXES):
-                if prefix.lower() in combined_lower:
-                    logger.debug(
-                        'Cap-like prefix %r seen but no confirm keyword; ignoring',
-                        prefix,
-                    )
-                    break  # first match is sufficient; avoid log spam
+        combined_lower = f'{stderr}\n{result_text}'.lower()
+        for prefix in (*CAP_HIT_PREFIXES, *NEAR_CAP_PREFIXES):
+            if prefix.lower() in combined_lower:
+                logger.debug(
+                    'Cap-like prefix %r seen but no confirm keyword; ignoring',
+                    prefix,
+                )
+                break  # first match is sufficient; avoid log spam
 
         return False
 
@@ -1311,70 +1265,62 @@ class UsageGate:
             logger.warning(f'Account {acct.name}: probe error: {exc}')
             return False
 
-        combined = (
-            (stderr_bytes.decode(errors='replace') if stderr_bytes else '')
-            + '\n'
-            + (stdout_bytes.decode(errors='replace') if stdout_bytes else '')
-        )
+        stdout_text = stdout_bytes.decode(errors='replace') if stdout_bytes else ''
+        stderr_text = stderr_bytes.decode(errors='replace') if stderr_bytes else ''
 
-        # NOTE — intentional asymmetry with detect_cap_hit:
-        # This loop does NOT apply the CAP_CONFIRM_KEYWORDS guard used by
-        # detect_cap_hit.  The probe runs only while an account is already
-        # blocked (capped or auth_failed); any whiff of a cap prefix in the
-        # probe output means the account is still capped and we must NOT
-        # unpause it.  Being conservative here avoids the far worse outcome
-        # of unpausing a capped account and burning quota on a still-limited
-        # account.  See CAP_CONFIRM_KEYWORDS (module top) for the current
-        # keyword list.  Do not 'fix' this asymmetry without understanding the
-        # safety-margin implications — see
-        # test_probe_prefix_only_without_confirm_keyword_still_returns_false.
-        #
-        # Demote auth_failed → capped on cap-prefix: an auth_failed account
-        # whose reprobe shows a cap-prefix is a 429 misclassification we
-        # correct in-flight via the single legal AUTH_FAILED -> CAPPED edge
-        # (see _LEGAL_TRANSITIONS) rather than leaving it on the
-        # longer-cadence auth-reprobe loop.
-        for prefixes in (CAP_HIT_PREFIXES, NEAR_CAP_PREFIXES):
-            for prefix in prefixes:
-                if prefix.lower() in combined.lower():
-                    logger.info(
-                        f'Account {acct.name}: probe got cap message: {prefix}',
-                    )
-                    if acct.phase == AccountPhase.AUTH_FAILED:
-                        resets_at = _parse_resets_at(combined)
-                        reason = (
-                            _extract_cap_message(combined, prefix)
-                            or f'Cap detected via auth-reprobe: {prefix}'
-                        )
-                        logger.warning(
-                            f'Account {acct.name}: auth-reprobe saw cap '
-                            f'message — demoting auth_failed → capped'
-                        )
-                        # Cancel + clear the stale auth-reprobe task now (the
-                        # current call IS that task; cancel() only takes
-                        # effect at its next suspension point, so the field
-                        # is cleared explicitly here rather than left to
-                        # settle asynchronously).
-                        if (
-                            acct.auth_reprobe_task is not None
-                            and not acct.auth_reprobe_task.done()
-                        ):
-                            acct.auth_reprobe_task.cancel()
-                        acct.auth_reprobe_task = None
-                        # resets_at is persisted here (mirrors
-                        # _handle_cap_detected) — _transition only threads
-                        # resets_at into the cap_hit cost-event details, it
-                        # does not write acct.resets_at itself.
-                        acct.resets_at = resets_at
-                        # _transition owns: the phase write, clearing
-                        # auth_failed_at, starting the account-resume probe
-                        # loop, the cap_hit cost event, and the centralized
-                        # _open recompute.
-                        self._transition(
-                            acct, AccountPhase.CAPPED,
-                            resets_at=resets_at, reason=reason,
-                        )
-                    return False
+        # NOTE — intentional asymmetry with detect_cap_hit: strict_confirm=False
+        # skips the CAP_CONFIRM_KEYWORDS guard applied by detect_cap_hit's
+        # strict_confirm=True regime (see DD-2 on classify_invocation).  The
+        # probe runs only while an account is already blocked (capped or
+        # auth_failed); any whiff of a cap prefix in the probe output means the
+        # account is still capped and we must NOT unpause it.  Being
+        # conservative here avoids the far worse outcome of unpausing a capped
+        # account and burning quota on a still-limited account.  Do not 'fix'
+        # this asymmetry without understanding the safety-margin implications
+        # — see test_probe_prefix_only_without_confirm_keyword_still_returns_false.
+        result = AgentResult(success=False, output=stdout_text, stderr=stderr_text)
+        outcome = classify_invocation(result, strict_confirm=False, backend='claude')
+        if isinstance(outcome, (CapHit, NearCap)):
+            logger.info(
+                f'Account {acct.name}: probe got cap message: {outcome.reason}',
+            )
+            # Demote auth_failed → capped on cap-prefix: an auth_failed
+            # account whose reprobe shows a cap-prefix is a 429
+            # misclassification we correct in-flight via the single legal
+            # AUTH_FAILED -> CAPPED edge (see _LEGAL_TRANSITIONS) rather than
+            # leaving it on the longer-cadence auth-reprobe loop.
+            if acct.phase == AccountPhase.AUTH_FAILED:
+                resets_at = outcome.resets_at if isinstance(outcome, CapHit) else None
+                reason = outcome.reason
+                logger.warning(
+                    f'Account {acct.name}: auth-reprobe saw cap '
+                    f'message — demoting auth_failed → capped'
+                )
+                # Cancel + clear the stale auth-reprobe task now (the
+                # current call IS that task; cancel() only takes
+                # effect at its next suspension point, so the field
+                # is cleared explicitly here rather than left to
+                # settle asynchronously).
+                if (
+                    acct.auth_reprobe_task is not None
+                    and not acct.auth_reprobe_task.done()
+                ):
+                    acct.auth_reprobe_task.cancel()
+                acct.auth_reprobe_task = None
+                # resets_at is persisted here (mirrors
+                # _handle_cap_detected) — _transition only threads
+                # resets_at into the cap_hit cost-event details, it
+                # does not write acct.resets_at itself.
+                acct.resets_at = resets_at
+                # _transition owns: the phase write, clearing
+                # auth_failed_at, starting the account-resume probe
+                # loop, the cap_hit cost event, and the centralized
+                # _open recompute.
+                self._transition(
+                    acct, AccountPhase.CAPPED,
+                    resets_at=resets_at, reason=reason,
+                )
+            return False
 
         if proc.returncode != 0:
             # Distinguish the probe's own $0.01 budget exhaustion from real
