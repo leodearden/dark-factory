@@ -303,6 +303,84 @@ def _reproject_bare_uv_run(
     return pattern.sub(f'uv run --project {member} ', cmd, count=1)
 
 
+def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: str) -> str | None:
+    """Rescope a fallback TYPE/LINT command into subpackage *sub*'s own uv context.
+
+    Cold-verify dev-dep race (task 2355): on a cold throwaway merge-verify
+    worktree (:func:`create_throwaway_verify_worktree`) the shared ``.venv``
+    starts empty. When a diff lives entirely under a single real subpackage
+    (see :func:`_single_subproject_prefix`), the TEST command is already
+    scoped to run *inside* that subpackage via ``uv run`` (task 2344), which
+    syncs the subpackage's deps — including its dev group (e.g.
+    ``hypothesis``) — as a side effect. TYPE and LINT, however, were left
+    running in the worktree-root uv context (``_reproject_bare_uv_run``'s
+    hardcoded ``_FALLBACK_UV_PROJECT``, or no uv context at all for a
+    non-uv-run runner like ``npx pyright``). Because verify runs test/lint/type
+    concurrently via one ``asyncio.gather``, TYPE/LINT would race the TEST
+    command's sync and could deterministically fail to resolve a dev-only
+    import (esc-2293-20). Rescoping TYPE/LINT to ``uv run --project <sub>``
+    makes each self-sync *sub*'s deps before the tool runs, closing that race
+    regardless of a warm or cold venv.
+
+    *cmd* is expected to already be scoped to the touched files and stripped
+    of any leading ``cd`` (i.e. :func:`_scope_command` + :func:`_strip_leading_cd`
+    have already run) — this helper only adds/adjusts the uv context. In
+    practice that pipeline always yields a single ``&&``-clause (``_scope_command``
+    truncates at the first *tool_keyword* occurrence, dropping any trailing
+    clauses — see ``_build_fallback_config``). The "already scoped" check and
+    the insertion point below are nonetheless scoped to the single clause
+    containing *tool_keyword* — mirroring :func:`_reproject_bare_uv_run`'s own
+    clause-scoped guard (verify.py:295-302) rather than the whole command
+    string — so this helper stays correct if a multi-clause command ever
+    reaches it.
+
+    Returns:
+        ``None`` when *cmd* is ``None``.
+        *cmd* unchanged when *tool_keyword* is not present (no-op ``true``,
+        an unrelated tool like ``mypy``).
+        The :func:`_reproject_bare_uv_run` result when it changed *cmd* (a
+        bare ``uv run <tool_keyword>`` is reprojected to
+        ``uv run --project <sub> <tool_keyword>``).
+        *cmd* unchanged when the clause containing *tool_keyword* already
+        carries ``--project`` or ``--directory`` (an explicit uv context is
+        already set for that clause; don't second-guess it — this
+        deliberately also covers a command explicitly pre-scoped to a
+        *different* member than *sub*, which is left alone rather than
+        re-targeted).
+        Otherwise, *cmd* with ``uv run --project <sub> `` inserted
+        immediately before that clause's content (a non-uv runner like
+        ``npx pyright``, or a bare tool invocation).
+    """
+    if cmd is None:
+        return None
+    if tool_keyword not in cmd:
+        return cmd
+    reprojected = _reproject_bare_uv_run(cmd, tool_keyword, sub)
+    if reprojected != cmd:
+        return reprojected
+    # Clause-scope the guard (and the insertion point below) to the single
+    # `&&`-delimited clause containing *tool_keyword*, mirroring
+    # _reproject_bare_uv_run's own clause-scoped guard (verify.py:295-302)
+    # rather than testing/rewriting the whole command string. Every real
+    # caller today feeds a single-clause *cmd* (see docstring), so
+    # clause_start is always 0 in practice; scoping the logic keeps this
+    # helper correct — rather than silently skipping a needed rescope — if a
+    # multi-clause command with a foreign `--project`/`--directory` in an
+    # earlier clause ever reaches it (task 2355 review).
+    idx = cmd.find(tool_keyword)
+    clause_start = cmd.rfind('&&', 0, idx)
+    clause_start = clause_start + 2 if clause_start != -1 else 0
+    while clause_start < len(cmd) and cmd[clause_start] == ' ':
+        clause_start += 1
+    clause_end = cmd.find('&&', idx)
+    if clause_end == -1:
+        clause_end = len(cmd)
+    clause = cmd[clause_start:clause_end]
+    if '--project' in clause or '--directory' in clause:
+        return cmd
+    return cmd[:clause_start] + f'uv run --project {sub} ' + cmd[clause_start:]
+
+
 # Cargo subcommands whose ``--workspace`` flag we know how to rewrite.  Other
 # cargo subcommands (doc, bench, ...) are left alone to avoid semantic drift.
 _CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
@@ -1640,21 +1718,17 @@ def _build_fallback_config(
         # path the scoper just inserted. _reproject_bare_uv_run then reprojects
         # a bare ``uv run <tool>`` into a tool-bearing member uv context (task
         # 2036): the depless workspace-root project cannot spawn ruff/pyright.
-        lint_cmd = _reproject_bare_uv_run(
-            _strip_leading_cd(
-                _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
-            ),
-            'ruff check',
+        lint_scoped = _strip_leading_cd(
+            _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
         )
-        type_cmd = _reproject_bare_uv_run(
-            _strip_leading_cd(
-                _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
-            ),
-            'pyright',
+        lint_cmd = _reproject_bare_uv_run(lint_scoped, 'ruff check')
+        type_scoped = _strip_leading_cd(
+            _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
         )
+        type_cmd = _reproject_bare_uv_run(type_scoped, 'pyright')
     else:
-        lint_cmd = 'ruff check ' + ' '.join(py_files)
-        type_cmd = 'pyright ' + ' '.join(py_files)
+        lint_scoped = lint_cmd = 'ruff check ' + ' '.join(py_files)
+        type_scoped = type_cmd = 'pyright ' + ' '.join(py_files)
 
     # Subproject-scoped TEST command (task 2344): when every touched file
     # lives under a single top-level directory that is itself a real
@@ -1717,6 +1791,13 @@ def _build_fallback_config(
             'cd ' + sub + ' && uv run pytest ' + ' '.join(rel_targets)
             if rel_targets else None
         )
+        # Cold-verify dev-dep race (task 2355): rescope TYPE/LINT into *sub*'s
+        # own uv context so `uv run --project <sub>` syncs its dev-group deps
+        # (e.g. hypothesis) before the tool runs, rather than racing the
+        # concurrently-run TEST command's `uv run` sync on a cold shared
+        # .venv (esc-2293-20).
+        type_cmd = _scope_fallback_tool_to_subproject(type_scoped, 'pyright', sub)
+        lint_cmd = _scope_fallback_tool_to_subproject(lint_scoped, 'ruff check', sub)
         return ModuleConfig(
             prefix=sub,
             lint_command=lint_cmd,
