@@ -1337,6 +1337,81 @@ class TestAlarmVerifyHostUnreachable:
 
 
 # ---------------------------------------------------------------------------
+# Task 2307 step-3 RED: _alarm_verify_worktree_contention born-at-L2 helper
+# ---------------------------------------------------------------------------
+
+
+class TestAlarmVerifyWorktreeContention:
+    """_alarm_verify_worktree_contention module-level helper (task 2307 step-3).
+
+    Mirrors TestAlarmVerifyHostUnreachable, reusing _FakeEscalationQueue.
+    RED until step-4 GREEN adds the function and sentinel to merge_queue.py.
+    """
+
+    def _call(self, eq, *, host='leo-laptop', holder_pgid=4242, waiter_pgid=4343):
+        from orchestrator.merge_queue import _alarm_verify_worktree_contention
+        _alarm_verify_worktree_contention(
+            eq, host=host, holder_pgid=holder_pgid, waiter_pgid=waiter_pgid,
+        )
+
+    def test_none_queue_is_noop(self):
+        """None escalation_queue → returns silently, no raise."""
+        self._call(None)  # must not raise
+
+    def test_submits_exactly_one_escalation(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert len(eq.submitted) == 1
+
+    def test_escalation_has_level_2(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert eq.submitted[0].level == 2
+
+    def test_escalation_has_critical_severity(self):
+        """severity=='critical' — in BORN_AT_L2_SEVERITIES, so it stays born-at-L2."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert eq.submitted[0].severity == 'critical'
+
+    def test_escalation_has_orchestrator_verify_host_monitor_role(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert eq.submitted[0].agent_role == 'orchestrator-verify-host-monitor'
+
+    def test_escalation_has_verify_worktree_contention_category(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq)
+        assert eq.submitted[0].category == 'verify_worktree_contention'
+
+    def test_escalation_task_id_is_per_host_sentinel(self):
+        from orchestrator.merge_queue import _verify_worktree_contention_sentinel
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop')
+        assert eq.submitted[0].task_id == _verify_worktree_contention_sentinel('leo-laptop')
+
+    def test_summary_names_the_host(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop')
+        assert 'leo-laptop' in eq.submitted[0].summary
+
+    def test_detail_names_host_and_pgids(self):
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
+        detail = eq.submitted[0].detail
+        assert 'leo-laptop' in detail
+        assert '4242' in detail
+        assert '4343' in detail
+
+    def test_none_holder_pgid_still_submits_and_does_not_raise(self):
+        """holder_pgid=None (holder pgid file absent/corrupt) is handled fail-safe."""
+        eq = _FakeEscalationQueue(open_l1=False)
+        self._call(eq, host='leo-laptop', holder_pgid=None, waiter_pgid=4343)
+        assert len(eq.submitted) == 1
+        assert eq.submitted[0].detail  # still emitted, no raise
+
+
+# ---------------------------------------------------------------------------
 # 1795/step-9 RED: RU branch of _finalize_inflight wired to tracker + alarm
 # ---------------------------------------------------------------------------
 
