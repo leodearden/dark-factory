@@ -110,6 +110,43 @@ def _is_priority_override_ttl_fact(fact: str | None) -> bool:
     )
 
 
+# Sibling of _PRIORITY_OVERRIDE_TTL_FACT_RE (task 2351, follow-up to 2319,
+# esc-2319-8). reserve_now is the SAME class of single-valued scalar as TTL:
+# the scheduler overrides table (server/tools.py) stores it as a single
+# INTEGER column per task_id row, written/cleared via COALESCE the same way
+# boost_tier/pinned/ttl_until are — never a list of co-existing values for one
+# subject. So a fresh "reserve_now = true" (or false/cleared) fact leaving a
+# pre-existing "reserve_now" edge with the opposite value still valid on the
+# same subject is the identical under-invalidation risk task 2319 fixed for
+# TTL — a reader (or the scheduler dispatch loop) could believe a reservation
+# is active when it was cleared, or vice versa. Requiring BOTH the
+# "priority override" phrase AND a reserve_now token (accepting the
+# underscore/hyphen/space separator variants an LLM-generated fact might use,
+# mirroring _PRIORITY_OVERRIDE_TTL_FACT_RE's own separator tolerance) keeps
+# this matcher from collapsing other override sub-attributes (boost_tier,
+# pinned, TTL) into the reserve_now predicate.
+_PRIORITY_OVERRIDE_RESERVE_NOW_FACT_RE = re.compile(
+    r'\bpriority[-\s]+override\b.*\breserve[-\s_]+now\b'
+    r'|\breserve[-\s_]+now\b.*\bpriority[-\s]+override\b',
+    re.I | re.S,
+)
+
+
+def _is_priority_override_reserve_now_fact(fact: str | None) -> bool:
+    """Return True when *fact* expresses a priority-override reserve_now value.
+
+    Sibling of ``_is_priority_override_ttl_fact`` (task 2351) for the
+    reserve_now boolean scalar — same single-valued-per-subject shape and the
+    same under-invalidation risk; see
+    ``_PRIORITY_OVERRIDE_RESERVE_NOW_FACT_RE`` for why both tokens are
+    required.
+    """
+    return (
+        bool(fact)
+        and _PRIORITY_OVERRIDE_RESERVE_NOW_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
+    )
+
+
 # Canonical stage -> recon_pool map for per-cycle reconciliation summaries
 # (metadata.kind == 'cycle_summary'), imported above from the leaf module
 # reconciliation/recon_pool_map.py (task 2140) so this map and the per-stage
