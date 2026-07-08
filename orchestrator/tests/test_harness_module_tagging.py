@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from _orch_helpers import assert_update_wire_mode
@@ -13,6 +13,7 @@ from shared.cli_invoke import AllAccountsCappedException
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import Scheduler
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
@@ -433,3 +434,73 @@ async def test_tag_task_modules_strips_directories_in_writeback(tmp_path):
         f'Persisted files must contain no directory-shaped entries; '
         f'got {directory_locks(persisted)!r}.'
     )
+
+
+@pytest.mark.asyncio
+async def test_tag_task_modules_routes_through_seed_modules(tmp_path):
+    """_tag_task_modules must route through scheduler.seed_modules and
+    sanitize_files_for_persist instead of the old inline
+    directory_locks/files_to_modules block + direct _module_cache poke
+    (task 2122 step-9/10).
+
+    seed_modules is replaced with a no-op Mock: if _tag_task_modules still
+    had a parallel direct-write code path (today's code does), the cache
+    would populate even with seed_modules doing nothing — proving there is
+    no other writer left once the migration lands.
+    """
+    config = OrchestratorConfig(project_root=tmp_path, lock_depth=2)
+    h = Harness(config)
+
+    tasks = [
+        {
+            'id': '1',
+            'title': 'Mixed-charter task',
+            'description': '',
+            'status': 'pending',
+            'metadata': {},
+            'dependencies': [],
+        },
+    ]
+    raw_files = ['src/config/schema.py', 'crates/reify-eval/src']
+    agent_response = {'tasks': [{'id': '1', 'files': raw_files}]}
+
+    h.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    h.scheduler.update_task = AsyncMock()
+    mock_seed_modules = Mock(return_value=[])
+    h.scheduler.seed_modules = mock_seed_modules
+
+    agent_result = AgentResult(
+        success=True,
+        output=json.dumps(agent_response),
+        structured_output=agent_response,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+    with (
+        patch(
+            'orchestrator.harness.sanitize_files_for_persist',
+            wraps=sanitize_files_for_persist,
+        ) as mock_sanitize,
+        patch('orchestrator.harness.invoke_agent', AsyncMock(return_value=agent_result)),
+    ):
+        await h._tag_task_modules()
+
+    # Routes through seed_modules with the RAW agent-predicted files (the α
+    # strip lives inside derive_modules, called by seed_modules itself).
+    mock_seed_modules.assert_called_once_with('1', raw_files)
+
+    # No other code path writes _module_cache directly: with seed_modules
+    # mocked to a no-op, the cache must stay empty.
+    assert '1' not in h.scheduler._module_cache, (
+        f'_tag_task_modules must not assign scheduler._module_cache directly; '
+        f'got _module_cache={h.scheduler._module_cache!r} despite seed_modules '
+        f'being mocked out'
+    )
+
+    # Writeback sanitizes via sanitize_files_for_persist, not a raw
+    # strip_directory_locks call.
+    mock_sanitize.assert_called_once_with(raw_files)
+    h.scheduler.update_task.assert_awaited_once()
+    task_id, metadata_json = h.scheduler.update_task.call_args.args
+    assert task_id == '1'
+    assert json.loads(metadata_json)['files'] == ['src/config/schema.py']
