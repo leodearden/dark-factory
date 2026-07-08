@@ -54,6 +54,7 @@ import contextlib
 import fcntl
 import os
 import re
+import select
 import signal
 import time
 from collections import deque
@@ -457,3 +458,89 @@ def read_lock_holder_pgid(worktree_base: Path) -> int | None:
 def remove_lock_holder_pgid(worktree_base: Path) -> None:
     """Remove the recorded flock-holder pgid file; idempotent when absent."""
     remove_pgid_file(pgid_file(worktree_base, LOCK_HOLDER_PGID_KEY))
+
+
+# ---------------------------------------------------------------------------
+# Connection-death stdin heartbeat-watchdog (task 2308 γ)
+#
+# PRD: plans/laptop-warm-verify-flock-orphan-prd.md, Change B, §4 B1/B2 + §8.1.
+# Ties a dispatched ``verify-merge --request-id`` process's lifetime to its
+# ssh dispatch connection: when the VerifyResult becomes undeliverable (the
+# orchestrator was killed, ssh dropped, or a hard network partition occurred)
+# the remote terminates itself AND its whole build subtree instead of
+# surviving as a setsid orphan (the exact failure mode ``cancel_request``
+# above cleans up *after the fact*; this watchdog prevents it from ever being
+# needed on the connection-death path).
+#
+# Protocol: the dispatcher (``verify_runner.RemoteRunner.run_merge_verify``)
+# opens the ssh child with ``stdin=PIPE`` and writes a heartbeat newline down
+# the channel every ``HEARTBEAT_INTERVAL_SECS`` for the full verify span. The
+# remote (``orchestrator verify-merge --request-id``) spawns a watchdog
+# thread owning fd 0 *before* the build starts (see :func:`start_stdin_watchdog`).
+# It fires on stdin EOF (the channel was cleanly closed) or when no heartbeat
+# arrives within ``WATCHDOG_HEARTBEAT_TIMEOUT_SECS`` (a hard partition, no
+# clean close).  ``setsid`` + the pgid file are unchanged by this protocol —
+# ``setsid`` does not close fd 0, so the watchdog reads stdin regardless of
+# session, and ``cancel_request`` keeps tree-killing by pgid with zero
+# contract churn.
+# ---------------------------------------------------------------------------
+
+#: Heartbeat cadence (seconds) the dispatcher writes down the ssh child's
+#: stdin for the full verify span.  A module constant rather than a config
+#: leaf (PRD §11 Q2: "small constant first"; promote later only if
+#: field-tuning is needed).  Both hosts run the same ``df`` checkout, so the
+#: dispatcher (which imports this one-way from here — see verify_runner.py)
+#: and this watchdog always agree on the cadence.
+HEARTBEAT_INTERVAL_SECS: float = 5.0
+
+#: The watchdog fires if no heartbeat (or EOF) arrives within this window.
+#: 2x the heartbeat cadence tolerates a single missed/delayed beat before
+#: declaring the dispatch channel dead.
+WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 2 * HEARTBEAT_INTERVAL_SECS
+
+#: Grace period between the SIGTERM and SIGKILL passes when the watchdog
+#: fires and kills the build subtree (see :func:`fire_watchdog_kill`).
+WATCHDOG_KILL_GRACE_SECS: float = 5.0
+
+
+def run_stdin_watchdog(
+    read_fd: int,
+    on_fire,
+    *,
+    heartbeat_timeout: float = WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+    select_fn=select.select,
+    read_fn=os.read,
+    read_size: int = 4096,
+) -> None:
+    """Blocking fd-0 trigger loop: calls *on_fire* once on stdin EOF or heartbeat starvation.
+
+    Intended to run in a dedicated daemon thread (see :func:`start_stdin_watchdog`)
+    with a *blocking* ``select`` loop — rather than an asyncio task sharing the
+    build's event loop — so it fires even if that loop is saturated or wedged.
+
+    Each iteration waits up to *heartbeat_timeout* seconds for *read_fd* to
+    become readable:
+
+    * Timeout (empty ready set) -> no heartbeat arrived in time (hard network
+      partition) -> call *on_fire* and return.
+    * Readable, but the read returns ``b''`` -> the writing end closed the
+      channel (orchestrator killed or ssh dropped) -> call *on_fire* and
+      return.
+    * Readable with non-empty data -> a heartbeat byte arrived; the window
+      resets and the loop continues watching.
+
+    *on_fire* is called at most once — the function returns immediately
+    afterward.  *select_fn* / *read_fn* are injectable (default
+    ``select.select`` / ``os.read``) so tests can script deterministic fd-0
+    behavior without a real pipe or wall-clock waits.
+    """
+    while True:
+        ready, _, _ = select_fn([read_fd], [], [], heartbeat_timeout)
+        if not ready:
+            on_fire()
+            return
+        data = read_fn(read_fd, read_size)
+        if data == b'':
+            on_fire()
+            return
+        # Non-empty data: a heartbeat arrived -- window resets, keep watching.
