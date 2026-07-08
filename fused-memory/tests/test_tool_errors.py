@@ -14,10 +14,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
+import fused_memory.server.tools as tools_module
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.server.tools import create_mcp_server
 
@@ -238,3 +240,37 @@ async def test_gap_handlers_return_shape_identical_error_on_failure(mcp_server):
         'cancel_ticket', {'ticket_id': 'tkt_X'},
     )
     assert cancel_result == expected
+
+
+def test_all_registered_tools_carry_mcp_tool_errors_marker():
+    """Every handler registered via @mcp.tool() carries the __mcp_tool_errors__
+    marker (task epsilon: uniform application across the whole of tools.py,
+    not just the 4 gap handlers task delta covered). Asserts the property on
+    each tool by name rather than a hardcoded count, so this keeps working as
+    tools are added or removed.
+    """
+    mock_service = AsyncMock()
+    server = create_mcp_server(mock_service)
+
+    tools = server._tool_manager.list_tools()
+    assert tools, 'expected at least one registered tool'
+    for tool in tools:
+        assert getattr(tool.fn, '__mcp_tool_errors__', False) is True, (
+            f'{tool.name} is not decorated with @mcp_tool_errors()'
+        )
+
+
+def test_tools_module_has_no_hand_copied_cancellation_guards():
+    """Source-scan drift guard: tools.py must contain zero hand-copied
+    cancellation-guard tails. Once every handler is decorated with
+    @mcp_tool_errors(), the guard clause lives centrally in tool_errors.py —
+    any reappearance in tools.py means a handler was hand-written instead of
+    decorated.
+    """
+    source = Path(tools_module.__file__).read_text()
+    needle = 'except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):'
+    count = source.count(needle)
+    assert count == 0, (
+        f'found {count} hand-copied cancellation-guard tail(s) in '
+        f'{tools_module.__file__}; use @mcp_tool_errors() instead'
+    )
