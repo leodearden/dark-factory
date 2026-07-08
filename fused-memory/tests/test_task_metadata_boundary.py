@@ -231,3 +231,79 @@ async def test_retry_ledger_roundtrips_through_backend(make_backend, tmp_path):
 
     assert reread == dumped
     assert RetryLedger(**reread) == ledger
+
+
+# ── Row 4b — producer↔consumer ledger: persist failure escalates ─────
+
+
+def _make_workflow(
+    *,
+    task_id: str = '99',
+    main_sha: str = 'SHA-A',
+    update_task_raises: bool = False,
+) -> tuple[TaskWorkflow, AsyncMock]:
+    """Build a REAL TaskWorkflow around mocked collaborators.
+
+    A local, trimmed port of ``orchestrator/tests/test_workflow_no_plan_cycle.py``'s
+    ``_make`` — that module (and its ``_orch_helpers.pydantic_spec``) is not
+    on the fused-memory pythonpath, so the harness is reconstructed here.
+    ``config`` is a plain (non-spec'd) MagicMock: ``_handle_no_plan_failure``
+    and the persist-fail path it exercises never read ``self.config``, only
+    ``TaskWorkflow.__init__``'s ``_resolve_module_configs()`` does (via
+    ``config.for_module``), and a bare MagicMock satisfies that without
+    stubbing.
+    """
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {'id': task_id, 'title': 'T', 'description': 'd', 'metadata': {}}
+    assignment.modules = ['mod_a']
+
+    config = MagicMock()
+
+    if update_task_raises:
+        update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
+    else:
+        update_task = AsyncMock(return_value=True)
+
+    scheduler = MagicMock()
+    scheduler.update_task = update_task
+    scheduler.get_task = AsyncMock(return_value={'id': task_id, 'metadata': {}})
+
+    git_ops = MagicMock()
+    git_ops.get_main_sha = AsyncMock(return_value=main_sha)
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+    )
+
+    # Stub _mark_blocked — this test only asserts how _handle_no_plan_failure
+    # routes into it, not _mark_blocked's own internals.
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+    return wf, mark_blocked
+
+
+@pytest.mark.asyncio
+async def test_retry_ledger_persist_failure_escalates_to_human():
+    """A failed retry_ledger persist escalates to a human rather than under-firing.
+
+    Drives the REAL orchestrator guard ``TaskWorkflow._handle_no_plan_failure``
+    with ``scheduler.update_task`` raising. If the counter can't be trusted
+    to have landed, the guard must escalate immediately rather than silently
+    losing the increment (which would let the no-plan loop under-fire) —
+    even on what would otherwise be a first, non-escalating failure.
+    """
+    wf, mark_blocked = _make_workflow(update_task_raises=True)
+
+    outcome = await wf._handle_no_plan_failure('no plan.json produced', detail='')
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    mark_blocked.assert_awaited_once()
+    _, kwargs = mark_blocked.await_args
+    assert kwargs.get('escalate_to_human') is True
