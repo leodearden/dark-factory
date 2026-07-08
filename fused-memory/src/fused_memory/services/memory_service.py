@@ -152,12 +152,49 @@ def _is_priority_override_scalar_fact(fact: str | None) -> bool:
     priority-override scalar shape (TTL or reserve_now).
 
     ``_invalidate_stale_superseded_ttl_edges`` (task 2319, extended by task
-    2351) uses this combined matcher instead of calling
-    ``_is_priority_override_ttl_fact`` directly, so adding a future sibling
-    scalar shape only requires extending this function rather than editing
-    the hook's body.
+    2351) uses this combined matcher ONLY as a cheap pre-filter for whether
+    the hook should fire at all — NOT for deciding which stale edge
+    contradicts which fresh edge. Cross-predicate discrimination (a reserve_now
+    write must never invalidate a still-valid TTL edge on the same subject, and
+    vice versa) is done by ``_priority_override_scalar_predicates`` instead;
+    see that helper and the hook body for why the union matcher is unsafe for
+    candidate matching.
     """
     return _is_priority_override_ttl_fact(fact) or _is_priority_override_reserve_now_fact(fact)
+
+
+# The set of distinct single-valued priority-override predicate classes a fact
+# can carry. TTL and reserve_now are DISTINCT, legitimately-coexisting
+# sub-attributes on the same subject (see the module comment at the top of
+# this section) — a fresh reserve_now write does NOT contradict a valid TTL
+# edge, and vice versa. The stale-superseded hook uses this per-edge predicate
+# set (never the union matcher) to decide which candidates a fresh edge
+# actually supersedes: only same-predicate candidates are invalidated. Using
+# the union matcher for candidate matching would collapse TTL and reserve_now
+# into one class and re-introduce the cross-predicate over-invalidation the
+# two-token matchers (task 2111 lineage) exist to prevent.
+_PRIORITY_OVERRIDE_SCALAR_PREDICATES: tuple[tuple[str, Any], ...] = (
+    ('ttl', _is_priority_override_ttl_fact),
+    ('reserve_now', _is_priority_override_reserve_now_fact),
+)
+
+
+def _priority_override_scalar_predicates(fact: str | None) -> frozenset[str]:
+    """Return the set of single-valued priority-override predicate classes
+    *fact* matches (a subset of ``{'ttl', 'reserve_now'}``).
+
+    A fact normally matches exactly one class, but the return type is a set so
+    a (rare) fact mentioning both scalars is handled without silently picking
+    one. The stale-superseded hook invalidates a candidate edge only when its
+    predicate set INTERSECTS the fresh edge's predicate set for the same
+    subject — the discrimination that keeps a reserve_now write from
+    invalidating a valid TTL edge (and vice versa).
+    """
+    if not fact:
+        return frozenset()
+    return frozenset(
+        name for name, matcher in _PRIORITY_OVERRIDE_SCALAR_PREDICATES if matcher(fact)
+    )
 
 
 # Canonical stage -> recon_pool map for per-cycle reconciliation summaries
@@ -1004,6 +1041,13 @@ class MemoryService:
 
         keep_uuids: set[str] = set()
         subject_node_uuids: set[str] = set()
+        # PER-SUBJECT predicate classes freshly written by THIS episode. A
+        # candidate stale edge is invalidated only when its own predicate
+        # class(es) intersect the fresh classes recorded for its subject —
+        # NOT merely because it matches the union scalar matcher. TTL and
+        # reserve_now legitimately coexist on one subject; a fresh reserve_now
+        # write must not invalidate a still-valid TTL edge (and vice versa).
+        subject_predicates: dict[str, set[str]] = {}
         # PER-SUBJECT supersession stamps, not a single global max: see the
         # docstring's step 3 for why using one global max across every
         # subject touched by this episode would be imprecise when the
@@ -1013,7 +1057,10 @@ class MemoryService:
         for edge in edges:
             if getattr(edge, 'invalid_at', None) is not None:
                 continue
-            if not _is_priority_override_scalar_fact(getattr(edge, 'fact', '') or ''):
+            fresh_predicates = _priority_override_scalar_predicates(
+                getattr(edge, 'fact', '') or ''
+            )
+            if not fresh_predicates:
                 continue
             edge_uuid = getattr(edge, 'uuid', '') or ''
             if edge_uuid:
@@ -1033,6 +1080,7 @@ class MemoryService:
             valid_at = getattr(edge, 'valid_at', None)
             if src:
                 subject_node_uuids.add(src)
+                subject_predicates.setdefault(src, set()).update(fresh_predicates)
                 if valid_at is not None and (
                     src not in subject_stamps or valid_at > subject_stamps[src]
                 ):
@@ -1054,11 +1102,20 @@ class MemoryService:
             # authoritative-fresh edges, falling back to now(UTC) only when
             # unavailable for THIS subject (never another subject's stamp).
             stamp = subject_stamps.get(node_uuid) or datetime.now(UTC)
+            # Predicate classes freshly written for THIS subject. Only a
+            # candidate carrying one of these same classes is a genuine
+            # supersession; a candidate of a different scalar class (e.g. a
+            # valid TTL edge when the fresh fact was reserve_now) coexists
+            # legitimately and must be left untouched.
+            fresh_classes = subject_predicates.get(node_uuid, set())
             for candidate in candidates:
                 candidate_uuid = candidate.get('uuid', '') or ''
                 if not candidate_uuid or candidate_uuid in keep_uuids:
                     continue
-                if not _is_priority_override_scalar_fact(candidate.get('fact', '') or ''):
+                candidate_classes = _priority_override_scalar_predicates(
+                    candidate.get('fact', '') or ''
+                )
+                if not (candidate_classes & fresh_classes):
                     continue
                 if candidate_uuid in processed_uuids:
                     # Undirected per-node query: an edge shared between two

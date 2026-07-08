@@ -5716,6 +5716,156 @@ class TestInvalidateStaleSupersededTtlEdges:
         assert count == 0
         service.graphiti.update_edge.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_fresh_reserve_now_does_not_invalidate_valid_ttl_edge(self, service):
+        """CROSS-PREDICATE GUARD (esc-2351-1): a fresh reserve_now write on a
+        subject that ALSO has a still-valid priority-override TTL edge must
+        NOT invalidate that TTL edge. TTL and reserve_now are distinct,
+        legitimately-coexisting single-valued scalars; a reserve_now write
+        does not contradict a TTL value. The union scalar matcher would have
+        collapsed them and wrongly invalidated the valid TTL edge."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_new = MockEdge(
+            fact='Task 3001 priority override reserve_now set to false',
+            uuid='fresh-reserve-false',
+            source_node_uuid='Task3001', target_node_uuid='reserve_now',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_new]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task3001':
+                return [
+                    {'uuid': 'fresh-reserve-false',
+                     'fact': 'Task 3001 priority override reserve_now set to false',
+                     'name': ''},
+                    # A DISTINCT, still-valid TTL scalar on the same subject.
+                    {'uuid': 'valid-ttl-edge',
+                     'fact': 'Task 3001 priority override TTL of 600 seconds',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock()
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        assert count == 0, (
+            'cross-predicate over-invalidation: a fresh reserve_now write '
+            'invalidated a still-valid TTL override edge on the same subject'
+        )
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fresh_ttl_does_not_invalidate_valid_reserve_now_edge(self, service):
+        """Symmetric CROSS-PREDICATE GUARD (esc-2351-1): a fresh TTL write on a
+        subject that ALSO has a still-valid reserve_now edge must NOT
+        invalidate that reserve_now edge."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_new = MockEdge(
+            fact='Task 3001 priority override TTL of 600 seconds',
+            uuid='fresh-ttl-edge',
+            source_node_uuid='Task3001', target_node_uuid='TTL',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_new]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task3001':
+                return [
+                    {'uuid': 'fresh-ttl-edge',
+                     'fact': 'Task 3001 priority override TTL of 600 seconds',
+                     'name': ''},
+                    # A DISTINCT, still-valid reserve_now scalar on the same subject.
+                    {'uuid': 'valid-reserve-now-edge',
+                     'fact': 'Task 3001 has priority override reserve_now enabled',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock()
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        assert count == 0, (
+            'cross-predicate over-invalidation: a fresh TTL write invalidated '
+            'a still-valid reserve_now override edge on the same subject'
+        )
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fresh_ttl_and_reserve_now_each_supersede_own_predicate(self, service):
+        """When an episode writes BOTH a fresh TTL and a fresh reserve_now
+        fact for the same subject, each fresh scalar supersedes only its own
+        stale same-predicate edge — the stale TTL and stale reserve_now edges
+        are BOTH invalidated, but neither fresh edge reaches across predicates."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_ttl = MockEdge(
+            fact='Task 3001 priority override TTL of 600 seconds',
+            uuid='fresh-ttl-edge',
+            source_node_uuid='Task3001', target_node_uuid='TTL',
+            invalid_at=None, valid_at=ts,
+        )
+        fresh_reserve = MockEdge(
+            fact='Task 3001 priority override reserve_now set to false',
+            uuid='fresh-reserve-false',
+            source_node_uuid='Task3001', target_node_uuid='reserve_now',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_ttl, fresh_reserve]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task3001':
+                return [
+                    {'uuid': 'fresh-ttl-edge',
+                     'fact': 'Task 3001 priority override TTL of 600 seconds',
+                     'name': ''},
+                    {'uuid': 'fresh-reserve-false',
+                     'fact': 'Task 3001 priority override reserve_now set to false',
+                     'name': ''},
+                    {'uuid': 'stale-ttl-edge',
+                     'fact': 'Task 3001 priority override TTL of 30 seconds',
+                     'name': ''},
+                    {'uuid': 'stale-reserve-true',
+                     'fact': 'Task 3001 has priority override reserve_now enabled',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'x', 'fact': 'y', 'refreshed_nodes': []}
+        )
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        invalidated_uuids = {c.args[0] for c in service.graphiti.update_edge.await_args_list}
+        assert invalidated_uuids == {'stale-ttl-edge', 'stale-reserve-true'}
+        assert count == 2
+
 
 # ---------------------------------------------------------------------------
 # Step 7: TRACK B.2 _is_dependency_fact helper RED tests
