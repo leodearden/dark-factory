@@ -1562,6 +1562,120 @@ async def test_dedup_flags_hit_delete_gated_on_confirmation_not_memory_ids(
 
 
 # ---------------------------------------------------------------------------
+# TestFilterSuppressedLedger (task 2227 step-3) — filter_suppressed reads the
+# ReconLedgerStore's indexed list_suppressions(project_id) query; no Mem0
+# search. RED until step-4 rewrites filter_suppressed onto the ledger, at
+# which point this class folds into TestFilterSuppressed below (replacing its
+# Mem0-search-based body).
+# ---------------------------------------------------------------------------
+
+
+class TestFilterSuppressedLedger:
+    """filter_suppressed(memory_service, project_id, flags) reads
+    ledger.list_suppressions(project_id) — an indexed (project_id,
+    record_kind, state) query — instead of issuing a Mem0 search."""
+
+    @pytest.mark.asyncio
+    async def test_wildcard_row_drops_every_flag_type_for_its_task(
+        self, ledger_memory_service
+    ):
+        """A blanket/wildcard suppression row (flag_type='') drops ALL
+        flag_types for its task_id; an unrelated task's flags are kept."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
+
+        flags = [
+            {'task_id': 42, 'flag_type': 'missing_deliverable'},
+            {'task_id': 42, 'flag_type': 'stale_metadata'},
+            {'task_id': 99, 'flag_type': 'missing_deliverable'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+
+        assert result == [{'task_id': 99, 'flag_type': 'missing_deliverable'}]
+        ledger_memory_service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scoped_row_drops_only_matching_flag_type(self, ledger_memory_service):
+        """A scoped suppression row drops only its flag_type, keeping other
+        flag_types for the same task_id."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '7', 'cross_project')
+
+        flags = [
+            {'task_id': 7, 'flag_type': 'cross_project'},
+            {'task_id': 7, 'flag_type': 'stale_metadata'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+
+        assert result == [{'task_id': 7, 'flag_type': 'stale_metadata'}]
+        ledger_memory_service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_flag_with_no_flag_type_kept_under_scoped_dropped_under_wildcard(
+        self, ledger_memory_service
+    ):
+        """A flag with no flag_type cannot match a scoped allowlist (kept),
+        but is still dropped by a wildcard row (no flag_type to check against)."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '7', 'cross_project')
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
+
+        flag_no_type_scoped = {'task_id': 7}
+        flag_no_type_wildcard = {'task_id': 42}
+        result = await filter_suppressed(
+            ledger_memory_service, 'p', [flag_no_type_scoped, flag_no_type_wildcard]
+        )
+
+        assert result == [flag_no_type_scoped]
+
+    @pytest.mark.asyncio
+    async def test_wildcard_wins_when_both_blanket_and_scoped_rows_exist(
+        self, ledger_memory_service
+    ):
+        """When a task has BOTH a scoped row and a blanket/wildcard row, the
+        wildcard wins — every flag_type for that task is dropped."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '99', 'some_flag')
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '99', '')
+
+        flags = [
+            {'task_id': 99, 'flag_type': 'some_flag'},
+            {'task_id': 99, 'flag_type': 'totally_different'},
+        ]
+        result = await filter_suppressed(ledger_memory_service, 'p', flags)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_unrelated_task_kept(self, ledger_memory_service):
+        """A task with no suppression row at all is never dropped."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
+
+        flag = {'task_id': 12345, 'flag_type': 'anything'}
+        result = await filter_suppressed(ledger_memory_service, 'p', [flag])
+
+        assert result == [flag]
+
+    @pytest.mark.asyncio
+    async def test_never_calls_memory_service_search(self, ledger_memory_service):
+        """filter_suppressed must never call memory_service.search — the
+        ledger's indexed query replaces the old project-wide Mem0 search."""
+        from fused_memory.reconciliation.flag_dedup import filter_suppressed
+
+        await _seed_suppression(ledger_memory_service.recon_ledger, 'p', '42', '')
+
+        await filter_suppressed(ledger_memory_service, 'p', [{'task_id': 42, 'flag_type': 'x'}])
+
+        ledger_memory_service.search.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # TestFilterSuppressed (task-1186 step-1) — filter_suppressed behavior
 # ---------------------------------------------------------------------------
 
