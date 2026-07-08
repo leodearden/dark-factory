@@ -78,6 +78,34 @@ def _is_dependency_fact(fact: str | None) -> bool:
     return bool(fact) and _DEPENDENCY_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
 
 
+# Priority-override facts carry several independent sub-attributes (e.g.
+# boost_tier, pinned, reserve_now, TTL) that legitimately coexist as distinct
+# valid edges on the same entity. Matching on the "priority override" phrase
+# alone would treat all of those sub-attributes as one single-valued
+# predicate and wrongly invalidate one when another is written — recreating
+# the over-invalidation failure mode task 2111 fixed. Requiring BOTH tokens
+# restricts this classifier to the genuinely single-valued TTL scalar named
+# in the task 2265 incident, used by
+# ``_invalidate_stale_superseded_ttl_edges`` to identify same-subject
+# contradictions that Graphiti's upstream edge-resolver under-invalidated.
+_PRIORITY_OVERRIDE_TTL_FACT_RE = re.compile(
+    r'\bpriority[- ]override\b.*\bTTL\b|\bTTL\b.*\bpriority[- ]override\b',
+    re.I | re.S,
+)
+
+
+def _is_priority_override_ttl_fact(fact: str | None) -> bool:
+    """Return True when *fact* expresses a priority-override TTL value.
+
+    Requires BOTH a ``priority[- ]override`` phrase AND a ``TTL`` token
+    (case-insensitive, in either order) — see
+    ``_PRIORITY_OVERRIDE_TTL_FACT_RE`` for why both are required.
+    """
+    return (
+        bool(fact) and _PRIORITY_OVERRIDE_TTL_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
+    )
+
+
 # Canonical stage -> recon_pool map for per-cycle reconciliation summaries
 # (metadata.kind == 'cycle_summary'), imported above from the leaf module
 # reconciliation/recon_pool_map.py (task 2140) so this map and the per-stage
