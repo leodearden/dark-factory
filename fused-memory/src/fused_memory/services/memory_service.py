@@ -147,6 +147,19 @@ def _is_priority_override_reserve_now_fact(fact: str | None) -> bool:
     )
 
 
+def _is_priority_override_scalar_fact(fact: str | None) -> bool:
+    """Return True when *fact* matches any recognized single-valued
+    priority-override scalar shape (TTL or reserve_now).
+
+    ``_invalidate_stale_superseded_ttl_edges`` (task 2319, extended by task
+    2351) uses this combined matcher instead of calling
+    ``_is_priority_override_ttl_fact`` directly, so adding a future sibling
+    scalar shape only requires extending this function rather than editing
+    the hook's body.
+    """
+    return _is_priority_override_ttl_fact(fact) or _is_priority_override_reserve_now_fact(fact)
+
+
 # Canonical stage -> recon_pool map for per-cycle reconciliation summaries
 # (metadata.kind == 'cycle_summary'), imported above from the leaf module
 # reconciliation/recon_pool_map.py (task 2140) so this map and the per-stage
