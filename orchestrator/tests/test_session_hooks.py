@@ -586,6 +586,26 @@ def _init_primary_checkout_with_hooks(tmp_path: Path) -> Path:
     return primary
 
 
+def _init_primary_checkout_with_partial_hooks(tmp_path: Path) -> Path:
+    """Like ``_init_primary_checkout_with_hooks`` but deliberately omits one
+    script, so the resolved candidate dir exists (git succeeds) yet fails the
+    ``all(...is_file())`` completeness guard in ``_hooks_script_dir``."""
+    primary = tmp_path / 'primary'
+    primary.mkdir()
+    subprocess.run(['git', 'init', '-q'], cwd=primary, check=True)
+    subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=primary, check=True)
+    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=primary, check=True)
+    hooks_dir = primary / 'skills' / 'spawn' / 'hooks'
+    hooks_dir.mkdir(parents=True)
+    # Deliberately omit stop.sh.
+    for script_name in ('session-start.sh', 'notification.sh'):
+        (hooks_dir / script_name).write_text('#!/bin/sh\n')
+    (primary / 'README.md').write_text('primary checkout with partial hooks\n')
+    subprocess.run(['git', 'add', '-A'], cwd=primary, check=True)
+    subprocess.run(['git', 'commit', '-q', '-m', 'init'], cwd=primary, check=True)
+    return primary
+
+
 def _fake_session_hooks_path(root: Path) -> Path:
     """Mirror the real repo layout (<root>/orchestrator/src/orchestrator/session_hooks.py)."""
     fake_file = root / 'orchestrator' / 'src' / 'orchestrator' / 'session_hooks.py'
@@ -614,12 +634,65 @@ def test_hooks_script_dir_resolves_to_primary_checkout_from_linked_worktree(
     assert resolved != fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
 
 
+def test_hooks_script_dir_falls_back_when_candidate_missing_a_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """git resolves fine and the candidate dir exists, but it is missing one
+    of the three hook scripts -- the ``all(...is_file())`` guard must reject
+    it and fall back to parents[3] rather than returning the incomplete
+    candidate (e.g. an installed/partial checkout where skills/spawn/hooks is
+    stale). Uses a linked worktree, like the resolves-to-primary-checkout
+    test above, so the (rejected) candidate and the fallback are observably
+    different directories -- otherwise a regression that wrongly accepted the
+    incomplete candidate would go unnoticed, since both would resolve to the
+    same path when the fake file lives directly under the primary checkout."""
+    primary = _init_primary_checkout_with_partial_hooks(tmp_path)
+    worktree = tmp_path / 'worktree-partial'
+    subprocess.run(
+        ['git', 'worktree', 'add', '-q', str(worktree), '-b', 'wt-partial'],
+        cwd=primary,
+        check=True,
+    )
+    fake_file = _fake_session_hooks_path(worktree)
+    monkeypatch.setattr(sh, '__file__', str(fake_file))
+
+    resolved = sh._hooks_script_dir()
+
+    assert resolved == fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
+    assert resolved != (primary / 'skills' / 'spawn' / 'hooks').resolve()
+
+
 def test_hooks_script_dir_falls_back_to_parents3_when_not_a_git_checkout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_file = _fake_session_hooks_path(tmp_path)
     monkeypatch.setattr(sh, '__file__', str(fake_file))
+    # Hermetic regardless of ambient git topology: cap git's upward .git
+    # search at tmp_path so this test's "not a git checkout" premise holds
+    # even if /tmp (or some ancestor) happens to sit inside a real repo.
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path))
+
+    resolved = sh._hooks_script_dir()
+
+    assert resolved == fake_file.resolve().parents[3] / 'skills' / 'spawn' / 'hooks'
+
+
+def test_hooks_script_dir_falls_back_when_git_common_dir_is_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Distinct fallback path from the not-a-git-checkout case above: git
+    itself succeeds (returncode 0) but reports an empty/blank
+    --git-common-dir, which must also degrade to the parents[3] fallback."""
+    fake_file = _fake_session_hooks_path(tmp_path)
+    monkeypatch.setattr(sh, '__file__', str(fake_file))
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout='   \n', stderr='')
+
+    monkeypatch.setattr(subprocess, 'run', _fake_run)
 
     resolved = sh._hooks_script_dir()
 
