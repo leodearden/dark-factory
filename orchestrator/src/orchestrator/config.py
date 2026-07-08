@@ -2683,6 +2683,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     _submodel_leaf_paths('timeouts', TimeoutsConfig),
     _submodel_leaf_paths('backends', BackendsConfig),
     _submodel_leaf_paths('unblock_auto', UnblockAutoConfig),
+    # L3b dispatch-admission gate (task 2327, DA2) — mirrors the
+    # fairness/starvation_watchdog submodel-group pattern: every threshold
+    # is green-tier hot-reloadable.
+    _submodel_leaf_paths('psi_admission', PsiAdmissionConfig),
     {
         # Steward grace
         'steward_completion_timeout',
