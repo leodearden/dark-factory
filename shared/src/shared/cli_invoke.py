@@ -139,7 +139,13 @@ __all__ = [
 
 
 class AllAccountsCappedException(Exception):
-    """Raised when the cap-hit retry loop exceeds the sanity-bound wall-clock deadline.
+    """Raised when the cap-hit retry loop exceeds its patience bound.
+
+    Two independent bounds share this exception, both raised from the same
+    ``_check_cap_wait`` choke point inside ``invoke_with_cap_retry``:
+    - the wall-clock ``cap_wait_sanity_secs`` sanity deadline (default 14
+      days), and
+    - the count-based ``max_cap_retries`` bound, when the caller opts in.
 
     Attributes:
     - ``retries``: number of consecutive cap hits before giving up
@@ -669,6 +675,8 @@ async def invoke_with_cap_retry(
     project_id: str = '',
     role: str = '',
     cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
+    max_cap_retries: int | None = None,
+    rebuild_prompt: Callable[[bool], Awaitable[str]] | None = None,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     **invoke_kwargs,
@@ -690,6 +698,32 @@ async def invoke_with_cap_retry(
     ``AllAccountsCappedException`` is raised so the caller can escalate.
     Defaults to 14 days (``_DEFAULT_CAP_WAIT_SANITY_SECS``).  Pass ``None``
     to wait indefinitely.
+
+    *max_cap_retries* is an optional count-based sibling of
+    *cap_wait_sanity_secs*: when the number of consecutive cap hits reaches
+    this value, ``AllAccountsCappedException`` is raised (same exception as
+    the time-based bound) before the next cooldown sleep.  Defaults to
+    ``None``, which preserves the existing patient, count-unbounded wait —
+    only *cap_wait_sanity_secs* bounds the retry loop.
+
+    *rebuild_prompt*, when provided, is awaited as ``rebuild_prompt(True)``
+    on a cap retry whose session cannot be resumed (no ``session_id`` on the
+    capped result) — ``True`` signals ``session_lost``.  Its return value
+    replaces ``prompt`` for the next invocation, letting the caller rebuild
+    fresh context (e.g. re-gathered pending escalations) instead of reusing
+    the stale original prompt.  The resumable path (capped result carries a
+    ``session_id``) is unaffected — it keeps resuming with
+    ``CAP_HIT_RESUME_PROMPT`` and never calls this hook.  Defaults to
+    ``None``, which preserves the existing fresh-retry behaviour (reuse the
+    original prompt unchanged).
+
+    The ``session_lost`` argument is currently always ``True`` — every wired
+    call site is an unresumable cap retry.  It is kept as an explicit
+    parameter (rather than a no-arg callable) as a forward-compat placeholder
+    matching the caller contract in PRD §7.4, so a future resumable-path call
+    (if ever wired) needs no signature change.  If the hook itself raises,
+    the failure is caught and logged, and the retry falls back to the
+    already-restored original prompt rather than aborting the retry loop.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
@@ -725,12 +759,22 @@ async def invoke_with_cap_retry(
     def _check_cap_wait(now: float, elapsed: float, cooldown: float, hits: int) -> None:
         """Guard and throttled log for cap-wait iterations.
 
-        Raises AllAccountsCappedException when the 14-day sanity bound is exceeded.
+        Raises AllAccountsCappedException when the 14-day sanity bound is exceeded,
+        or when the count-based max_cap_retries bound is reached.
         Emits a structured 'cap_wait' JSON log at most once per _CAP_WAIT_LOG_INTERVAL_SECS.
-        Closes over: cap_wait_sanity_secs, label, num_accounts, usage_gate,
-        last_cap_wait_log_at (nonlocal write).
+        Closes over: cap_wait_sanity_secs, max_cap_retries, label, num_accounts,
+        usage_gate, last_cap_wait_log_at (nonlocal write).
         """
         nonlocal last_cap_wait_log_at
+        if max_cap_retries is not None and hits >= max_cap_retries:
+            logger.error(
+                f'{label}: max cap-retries bound ({max_cap_retries}) reached after {hits} retries',
+            )
+            raise AllAccountsCappedException(
+                retries=hits,
+                elapsed_secs=elapsed,
+                label=label,
+            )
         if cap_wait_sanity_secs is not None and elapsed > cap_wait_sanity_secs:
             logger.error(
                 f'{label}: cap-wait sanity bound exceeded after {elapsed:.1f}s '
@@ -753,6 +797,34 @@ async def invoke_with_cap_retry(
                 'next_probe_in_s': round(cooldown, 1),
             }, default=str))
             last_cap_wait_log_at = now
+
+    async def _rebuild_fresh_prompt() -> None:
+        """Let the caller rebuild the prompt for an unresumable cap retry.
+
+        session_lost is always True at both call sites (exact-detect and
+        heuristic FRESH cap paths) — this helper only runs where the capped
+        session cannot be resumed, per the rebuild_prompt hook contract
+        (PRD §7.4 / task W4-zeta). Closes over: rebuild_prompt, invoke_kwargs,
+        label.
+
+        A failure raised by the caller's hook (e.g. a transient I/O/MCP error
+        while re-gathering pending escalations) is caught and logged rather
+        than propagated: propagating would abort the entire patient cap-retry
+        loop over a transient hook failure.  ``invoke_kwargs['prompt']`` was
+        already restored to ``original_prompt`` by the preceding
+        ``_reset_for_fresh_retry`` call, so on failure it is simply left as
+        that already-restored value — the retry degrades to the stale
+        original prompt instead of dying.
+        """
+        if rebuild_prompt is None:
+            return
+        try:
+            invoke_kwargs['prompt'] = await rebuild_prompt(True)
+        except Exception:
+            logger.warning(
+                f'{label}: rebuild_prompt hook raised — falling back to original prompt',
+                exc_info=True,
+            )
 
     account_name = ''
     unattributed_cap = False  # True when heuristic fires but token is unresolvable;
@@ -903,6 +975,7 @@ async def invoke_with_cap_retry(
                         resume_or_fresh = 'resuming'
                     else:
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                        await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh'
 
                     if acct_name:
@@ -982,6 +1055,7 @@ async def invoke_with_cap_retry(
                             )
                             # Cannot resume a session that never ran
                             _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                            await _rebuild_fresh_prompt()
                             acct_name = usage_gate.active_account_name
                             logger.warning(
                                 f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
