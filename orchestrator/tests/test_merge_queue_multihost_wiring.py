@@ -1159,6 +1159,65 @@ class TestRunInflightVerifyRunnerUnavailableReason:
 
 
 # ---------------------------------------------------------------------------
+# Task 2307 step-7 RED: production wiring — _run_inflight_verify threads the
+# worker's escalation queue into _run_post_merge_verify, so a laptop-side
+# flock-contention VerifyResult can reach the born-at-L2 alarm (step-6).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyThreadsEscalationQueue:
+    """_run_inflight_verify passes self._escalation_queue into
+    _run_post_merge_verify (task 2307 step-7).
+
+    RED until step-8 GREEN adds escalation_queue=self._escalation_queue to
+    the _run_post_merge_verify call site inside _run_inflight_verify.
+    """
+
+    async def test_escalation_queue_threaded_into_post_merge_verify(self, tmp_path):
+        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        git_ops = _make_git_ops_mock()
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        sentinel_eq = MagicMock()
+        worker._escalation_queue = sentinel_eq
+
+        merge_wt_path = tmp_path / 'merge-wt'
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+
+        config = _make_config()
+        req = _make_merge_request(config, task_files=[], worktree=tmp_path)
+
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=merge_wt_path,
+            base_sha='base123',
+            speculative=False,
+        )
+
+        # REMOTE lease — bypasses local warm-swap path (mirrors 1795/step-3's builder)
+        fake_runner = MagicMock()
+        fake_runner.name = 'leo-laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+
+        spy = AsyncMock(return_value=None)
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=spy):
+            await worker._run_inflight_verify(item, lease)
+
+        assert spy.await_args is not None, '_run_post_merge_verify was not called'
+        # RED: escalation_queue is not yet threaded through by _run_inflight_verify
+        assert spy.await_args.kwargs.get('escalation_queue') is sentinel_eq, (
+            '_run_inflight_verify must pass escalation_queue=self._escalation_queue '
+            "into _run_post_merge_verify — the worker's queue was not threaded through"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 1795/step-5 RED: per-host unavailability tracker on the worker
 # ---------------------------------------------------------------------------
 
