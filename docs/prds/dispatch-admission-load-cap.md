@@ -144,6 +144,20 @@ PSI thresholds, which are **operator-tunable config**, not premises.
   the gate reads — so sibling merge verifies naturally back off *new task dispatch* **without**
   double-governing the merge queue and **without** a deadlock between the two (the gate defers only
   *future* dispatch; it can never block a merge from completing and freeing load).
+- **DA-D9 — Reuse the existing tested PSI parser; re-home it to `shared` (do not reimplement).**
+  A correct, tested `/proc/pressure` parser already exists at
+  `sampler/src/sampler/metrics.py::parse_pressure_file` — it parses `avg10` only (matching DA-D1),
+  returns `{some_avg10, full_avg10}` (or `None` on empty/garbage, exactly DA-D6's fail-open
+  sentinel), and already handles the subtle "CPU has no `full` line on some kernels" asymmetry. Both
+  the orchestrator and the sampler depend on the **`dark-factory-shared`** workspace package, and the
+  parser is pure stdlib (`re`, `pathlib`). So the reader is **not new code** — DA1 **re-homes**
+  `parse_pressure_file` (+ its `read_pressure` reader) into `shared/src/shared/psi.py`, sampler
+  imports it from there (behavior-identical — its existing tests stay green), and the orchestrator
+  builds a thin `PsiSample` / `read_psi_sample()` wrapper on top exposing the four gated metrics
+  (`cpu.some10`, `mem.some10`, `mem.full10`, `io.some10`) plus a `saturated(cfg)` predicate. This
+  avoids a duplicate parser that would drift and re-derive the kernel-asymmetry bug. **Do not** make
+  the orchestrator depend on the `dark-factory-load-sampler` *service* package (wrong direction) — go
+  through `shared`.
 
 ## 3. Pre-conditions / substrate (G3 — all verified in-repo / on-host)
 
@@ -160,10 +174,13 @@ PSI thresholds, which are **operator-tunable config**, not premises.
 - **Heartbeat cadence exists.** Harness main loop re-polls in-flight tasks within ≤15 s
   (`harness.py:1550`); `acquire_next` returning `None`/deferring rides this — **no new loop**.
 - **PSI is live on the host.** `/proc/pressure/{cpu,memory,io}` all present and populated (Linux
-  6.14, 32 cores). **DF has no PSI reader today** — grep of `orchestrator/ shared/ scripts/` finds
-  none; the "PSI shim" in `workflow.py:7029` is reify's PATH-prepended `scripts/agent-bin` intercept
-  (agent-side cargo), **not** a DF scheduler reader. So **the PSI reader is new code L3b builds**
-  (DA1); no external prerequisite.
+  6.14, 32 cores). The **orchestrator** has no PSI reader today, and the "PSI shim" in
+  `workflow.py:7029` is reify's PATH-prepended `scripts/agent-bin` intercept (agent-side cargo), not
+  a scheduler reader. **However, a tested `/proc/pressure` parser already exists** at
+  `sampler/src/sampler/metrics.py::parse_pressure_file` / `collect_psi` (avg10-only; returns `None`
+  on garbage; handles the CPU-no-`full`-line asymmetry). DA1 **reuses** it by re-homing the pure
+  helper into `shared/src/shared/psi.py` (both packages already depend on `dark-factory-shared`) —
+  see DA-D9. No external prerequisite; no duplicate parser.
 - **Config submodel + reload plumbing exists.** Submodels attach to `OrchestratorConfig` as
   `name: NameConfig = Field(default_factory=NameConfig)` (e.g. `fairness`, `starvation_watchdog`,
   `warm_base_hard_down` at `config.py:2202–2210`). `RELOADABLE_FIELDS` (`config.py:2621`) whitelists
@@ -193,13 +210,18 @@ overlap, no double-governance (DA-D8).
 
 ## 5. Decomposition plan (leaf tasks — each names a user-observable signal, G2)
 
-- **DA1 — PSI reader primitive.** New `orchestrator/src/orchestrator/psi.py`: read
-  `/proc/pressure/{cpu,memory,io}`, parse the `some` and `full` lines' `avg10` (and expose `avg60`
-  for logging), return a small frozen dataclass (e.g. `PsiSample(cpu_some10, mem_some10, mem_full10,
-  io_some10, …)`). Absent/unparseable file / read error ⇒ **fail-open sentinel** (`saturated()`
-  returns False) + a caller-visible `read_ok=False` flag (DA-D6). *Signal:* a unit test parses a
-  fixture `/proc/pressure/*` and returns the correct per-metric avg10; a malformed/absent-file
-  fixture yields the fail-open sentinel with `read_ok=False`. *Modules:* `psi.py` (new). *Deps:* none.
+- **DA1 — PSI reader primitive (reuse via `shared`).** Re-home the pure `parse_pressure_file` (+
+  `read_pressure`) from `sampler/src/sampler/metrics.py` into **`shared/src/shared/psi.py`**; update
+  sampler to import it from there (behavior-identical — its existing PSI tests stay green). On top,
+  add an orchestrator-facing reader: `read_psi_sample()` → a frozen `PsiSample(cpu_some10, mem_some10,
+  mem_full10, io_some10, read_ok)` with a `saturated(cfg)` predicate (OR-of-per-metric-thresholds per
+  DA-D1). Absent/unparseable file / read error ⇒ **fail-open sentinel** (`read_ok=False`,
+  `saturated()` returns False) + a loud rate-limited warning (DA-D6, DA-D9). *Signal:* the re-homed
+  `shared.psi.parse_pressure_file` parses fixture `/proc/pressure/*` text to the correct per-metric
+  avg10 **and** sampler's existing metrics tests remain green (no behavior change); a malformed/
+  absent-file fixture yields the fail-open sentinel (`read_ok=False`, not saturated). *Modules:*
+  `shared/src/shared/psi.py` (new, holding the re-homed helper + `PsiSample`), `sampler/src/sampler/
+  metrics.py` (import-swap), `orchestrator` reads via `shared.psi`. *Deps:* none.
 - **DA2 — `PsiAdmissionConfig` submodel + green-tier reload registration.** New pydantic submodel
   (`enabled: bool = True`; `cpu_some_avg10`, `mem_some_avg10`, `mem_full_avg10`, `io_some_avg10`
   thresholds with the DA-D1 defaults; `min_inflight_floor: int = 1`, validated `>= 1`), attached as
