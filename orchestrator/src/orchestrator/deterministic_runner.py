@@ -910,7 +910,18 @@ class DeterministicRunner:
                         ),
                     )
                 else:
-                    await self.scheduler.set_task_status(task_id, 'done')
+                    # Pure-gate resume: no before_done action ran, so there is no
+                    # deploy/unit/pid evidence — stamp a dedicated gate-kind
+                    # provenance so the done write passes require_done_provenance
+                    # without lying about a deploy having happened (task 2331).
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance=_build_done_provenance(
+                            'deterministic-gate',
+                            note='pure gate resolved',
+                        ),
+                    )
                 return WorkflowOutcome.DONE
 
         # ── 2. before_done execution (γ) ────────────────────────────────────

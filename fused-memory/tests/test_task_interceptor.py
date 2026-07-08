@@ -2666,6 +2666,38 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
 
 
 @pytest.mark.asyncio
+async def test_done_provenance_accepts_deterministic_gate(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='deterministic-gate' with note only (no pid, no unit, no commit) is accepted.
+
+    The runner emits this shape on a pure gate's resolved->done path
+    (before_done is None; the escalation was the only work). No git commit
+    or deploy evidence is available, so this kind must pass the provenance
+    gate commit-less and pid-less.
+    """
+    # No git repo needed — deterministic-gate carries no commit.
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'deterministic-gate',
+            'note': 'pure gate resolved',
+        },
+    )
+
+    assert 'error' not in result, f'expected acceptance but got: {result}'
+    taskmaster.set_task_status.assert_called_once()
+    taskmaster.update_task.assert_called_once()
+    persisted = json.loads(taskmaster.update_task.call_args.kwargs['metadata'])['done_provenance']
+    assert persisted['kind'] == 'deterministic-gate'
+    assert persisted['note'] == 'pure gate resolved'
+
+
+@pytest.mark.asyncio
 async def test_done_provenance_accepts_deterministic_deploy_scheduled(
     taskmaster, reconciler, event_buffer, tmp_path
 ):

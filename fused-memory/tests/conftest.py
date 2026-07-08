@@ -20,6 +20,17 @@ _tests_dir = os.path.dirname(os.path.abspath(__file__))
 if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
 
+# Insert this worktree's shared/src at the front of sys.path so that
+# `import shared` loads the local (possibly modified) code rather than
+# whatever editable install the uv workspace has pinned to the main tree
+# (mirrors orchestrator/tests/conftest.py's _SHARED_SRC insertion).
+_shared_src = os.path.join(
+    os.path.dirname(os.path.dirname(_tests_dir)),  # workspace root
+    'shared', 'src',
+)
+if _shared_src not in sys.path:
+    sys.path.insert(0, _shared_src)
+
 # Make the sibling 'escalation' workspace package importable without installing it.
 # curator_escalator.py uses a try/except guard (HAS_ESCALATION) — adding the src
 # path here (before test files are collected) ensures the guard resolves to True so
