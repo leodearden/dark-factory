@@ -8,6 +8,7 @@ import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, Watermark
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -43,11 +44,10 @@ def _make_stage(
         AsyncMock(),  # taskmaster
         AsyncMock(),  # journal
         config,
+        scope=ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
         recon_report_port=recon_report_port,
         recon_report_state=recon_report_state,
     )
-    stage.project_id = 'test_project'
-    stage.project_root = '/tmp/test'
     return stage
 
 
@@ -66,10 +66,9 @@ def _make_consolidator(recon_report_port: int = 8003) -> MemoryConsolidator:
         AsyncMock(),  # taskmaster
         AsyncMock(),  # journal
         config,
+        scope=ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
         recon_report_port=recon_report_port,
     )
-    stage.project_id = 'test_project'
-    stage.project_root = '/tmp/test'
     stage.episode_limit = 5
     stage.memory_limit = 10
     return stage
@@ -89,6 +88,69 @@ class _FakeReconState:
     def get_assembled_report(self, run_id: str, stage: str) -> dict | None:
         self.calls.append(('get_assembled_report', run_id, stage))
         return self._assembled
+
+
+def _minimal_ctor_args():
+    """Positional args shared by every BaseStage subclass constructor in this file."""
+    config = ReconciliationConfig()
+    memory_mock = AsyncMock()
+    return (
+        StageId.memory_consolidator,
+        memory_mock,
+        AsyncMock(),  # taskmaster
+        AsyncMock(),  # journal
+        config,
+    )
+
+
+class TestBaseStageScopeContract:
+    """BaseStage requires a ProjectScope at construction (task 2146 / recon-project-scope
+    batch β); project_id/project_root become read-only views over it.
+    """
+
+    def test_stub_stage_without_scope_raises_type_error(self):
+        """scope is a required keyword-only argument — omitting it is a TypeError."""
+        with pytest.raises(TypeError):
+            _StubStage(*_minimal_ctor_args())  # type: ignore[call-arg]
+
+    def test_memory_consolidator_without_scope_raises_type_error(self):
+        """The contract propagates through MemoryConsolidator's *args/**kwargs forward."""
+        with pytest.raises(TypeError):
+            MemoryConsolidator(*_minimal_ctor_args())
+
+    def test_scope_populates_project_id_and_project_root(self):
+        scope = ProjectScope(ProjectId('p'), ProjectRoot('/root'))
+        stage = _StubStage(*_minimal_ctor_args(), scope=scope)
+        assert stage.project_id == 'p'
+        assert stage.project_root == '/root'
+        assert stage.scope is scope
+
+    def test_project_id_has_no_setter(self):
+        scope = ProjectScope(ProjectId('p'), ProjectRoot('/root'))
+        stage = _StubStage(*_minimal_ctor_args(), scope=scope)
+        with pytest.raises(AttributeError):
+            # setattr, not a direct attribute assignment, so this stays pyright-clean
+            # (a direct assignment to a read-only property is reportAttributeAccessIssue).
+            setattr(stage, 'project_id', 'x')  # noqa: B010
+
+    def test_project_root_has_no_setter(self):
+        scope = ProjectScope(ProjectId('p'), ProjectRoot('/root'))
+        stage = _StubStage(*_minimal_ctor_args(), scope=scope)
+        with pytest.raises(AttributeError):
+            # setattr, not a direct attribute assignment, so this stays pyright-clean
+            # (a direct assignment to a read-only property is reportAttributeAccessIssue).
+            setattr(stage, 'project_root', 'y')  # noqa: B010
+
+    def test_known_projects_defaults_to_empty_dict(self):
+        scope = ProjectScope(ProjectId('p'), ProjectRoot('/root'))
+        stage = _StubStage(*_minimal_ctor_args(), scope=scope)
+        assert stage.known_projects == {}
+
+    def test_known_projects_stored_when_passed(self):
+        scope = ProjectScope(ProjectId('p'), ProjectRoot('/root'))
+        known_projects = {'p': '/root', 'q': '/other'}
+        stage = _StubStage(*_minimal_ctor_args(), scope=scope, known_projects=known_projects)
+        assert stage.known_projects == known_projects
 
 
 class TestReconStateLifecycle:
@@ -239,7 +301,7 @@ class TestHarnessForwardsReconState:
         journal_mock = AsyncMock()
         event_buffer_mock = MagicMock()
 
-        return ReconciliationHarness(
+        harness = ReconciliationHarness(
             memory_service=memory_mock,
             taskmaster=None,
             journal=journal_mock,
@@ -247,6 +309,14 @@ class TestHarnessForwardsReconState:
             config=config,
             recon_report_state=state,
         )
+        # Task 2146 β: the harness no longer pre-builds a long-lived `self.stages`
+        # list at construction — every cycle builds fresh stages via
+        # `_make_stages(scope)`. Build one here and stash it so this fixture's
+        # callers keep their `harness.stages[N]` access pattern.
+        harness.stages = harness._make_stages(
+            ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test'))
+        )
+        return harness
 
     def test_stages_receive_recon_report_state(self):
         """All three stages get _recon_report_state set to the injected state object."""

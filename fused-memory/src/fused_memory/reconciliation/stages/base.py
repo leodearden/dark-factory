@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+    from fused_memory.models.scope import ProjectScope
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.services.memory_service import MemoryService
 
@@ -49,6 +50,8 @@ class BaseStage:
         config: ReconciliationConfig,
         usage_gate=None,
         *,
+        scope: ProjectScope,
+        known_projects: dict[str, str] | None = None,
         recon_report_port: int = 8003,
         recon_report_state=None,
     ):
@@ -57,20 +60,34 @@ class BaseStage:
         self.taskmaster = taskmaster
         self.journal = journal
         self.config = config
-        self.project_id: str = ''
-        self.project_root: str = ''
+        self.scope = scope
         # Cross-project routing: dict[project_id, project_root] of every
         # project the harness knows about (including this one).  Stage 2
         # surfaces this to the LLM so it can re-route a finding to the
         # correct project_root when the scope demands.  Empty until the
         # harness sets it per cycle.
-        self.known_projects: dict[str, str] = {}
+        self.known_projects: dict[str, str] = known_projects or {}
         self._usage_gate = usage_gate
         self._escalation_url: str | None = None
         self._escalation_queue: EscalationQueue | None = None
         # PRD γ: recon_report channel threading
         self._recon_report_port: int = recon_report_port
         self._recon_report_state = recon_report_state
+
+    @property
+    def project_id(self) -> str:
+        """Read-only view over ``self.scope.project_id`` (task 2146 β).
+
+        ``project_id``/``project_root`` are derived from ``self.scope`` — the
+        single source of truth threaded in at construction — so they cannot
+        drift apart via independent post-construction assignment.
+        """
+        return self.scope.project_id
+
+    @property
+    def project_root(self) -> str:
+        """Read-only view over ``self.scope.project_root`` (task 2146 β)."""
+        return self.scope.project_root
 
     def get_disallowed_tools(self) -> list[str]:
         """Override in subclass — return MCP tool names this stage may NOT use."""

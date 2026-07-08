@@ -30,7 +30,12 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageId,
 )
-from fused_memory.models.scope import build_known_projects_map
+from fused_memory.models.scope import (
+    ProjectId,
+    ProjectRoot,
+    ProjectScope,
+    build_known_projects_map,
+)
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -261,7 +266,7 @@ class UnknownProjectError(ValueError):
         registered via ``taskmaster.project_root`` or ``DASHBOARD_KNOWN_PROJECT_ROOTS``.
     (b) Subclasses ``ValueError`` for backward-compat: any existing or future
         ``except ValueError`` callsite (test code, callers of
-        ``_known_project_root_for``) continues to match.
+        ``_known_project_scope_for``) continues to match.
     (c) Exists as a distinct type so ``_project_loop`` can narrowly catch ONLY
         misconfiguration and let unrelated ``ValueError``s fall through to the
         existing ``except Exception`` retry path:
@@ -331,6 +336,19 @@ def build_stale_run_diagnostics(
 
 class ReconciliationHarness:
     """Orchestrates the three-stage reconciliation pipeline."""
+
+    # Declared, never assigned in __init__: production builds a fresh list per
+    # cycle via _make_stages(scope) (task 2146 β, decision 5). Tests assign this
+    # as a convenience instance attribute (harness.stages = harness._make_stages(scope))
+    # to keep their harness.stages[N] access pattern — this annotation is what lets
+    # pyright resolve that access.
+    #
+    # Known trade-off (task 2146 review follow-up): this couples dozens of test
+    # call sites to the private _make_stages signature via monkeypatching. A
+    # dedicated test factory/fixture (e.g. make_pinned_harness) that builds and
+    # pins stages would centralize that contract instead — deferred, since
+    # migrating those call sites spans files/ownership beyond a focused amendment.
+    stages: list[Any]
 
     def __init__(
         self,
@@ -423,31 +441,6 @@ class ReconciliationHarness:
         if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
             self.usage_gate = UsageGate(self.config.usage_cap)
 
-        # Build stages — thread recon_report_port and recon_report_state so BaseStage.run
-        # can call start_report / get_assembled_report directly (PRD γ, task 1546).
-        stage1 = MemoryConsolidator(
-            StageId.memory_consolidator, memory_service, taskmaster, journal, self.config,
-            usage_gate=self.usage_gate,
-            recon_report_port=self._recon_report_port,
-            recon_report_state=self._recon_report_state,
-        )
-
-        stage2 = TaskKnowledgeSync(
-            StageId.task_knowledge_sync, memory_service, taskmaster, journal, self.config,
-            usage_gate=self.usage_gate,
-            recon_report_port=self._recon_report_port,
-            recon_report_state=self._recon_report_state,
-        )
-
-        stage3 = IntegrityCheck(
-            StageId.integrity_check, memory_service, taskmaster, journal, self.config,
-            usage_gate=self.usage_gate,
-            recon_report_port=self._recon_report_port,
-            recon_report_state=self._recon_report_state,
-        )
-
-        self.stages = [stage1, stage2, stage3]
-
         # Judge — receives a callback that clears _halt_escalated so a
         # subsequent halt in the same process re-fires the escalation.
         self.judge = (
@@ -511,12 +504,13 @@ class ReconciliationHarness:
 
         Returns ``''`` when no taskmaster config is present.  Callers that need
         the canonical root for a *project_id* should use
-        ``_known_project_root_for(project_id)`` instead (task 1143).
+        ``_known_project_scope_for(project_id)`` instead (task 1143; renamed +
+        scope-returning per task 2146 β).
         """
         return self._project_root
 
-    def _known_project_root_for(self, project_id: str) -> str:
-        """Return the canonical project_root for *project_id* from the registry.
+    def _known_project_scope_for(self, project_id: str) -> ProjectScope:
+        """Return the canonical ProjectScope for *project_id* from the registry.
 
         This is the pre-flight cross-contamination guard introduced by task 1143.
         It looks up ``self._known_projects`` (populated at init from the configured
@@ -536,13 +530,13 @@ class ReconciliationHarness:
                 lowercase, dashes to underscores).
 
         Returns:
-            The absolute project_root path for *project_id*.
+            The ProjectScope (project_id + absolute project_root) for *project_id*.
 
         Raises:
             UnknownProjectError: (a ``ValueError`` subclass) If *project_id* is not in ``self._known_projects``.
         """
         try:
-            return self._known_projects[project_id]
+            return ProjectScope(ProjectId(project_id), ProjectRoot(self._known_projects[project_id]))
         except KeyError:
             known_sorted = sorted(self._known_projects)
             raise UnknownProjectError(
@@ -594,23 +588,26 @@ class ReconciliationHarness:
         """True when draining and all project loops have completed."""
         return self._draining and self._no_active_loops()
 
-    def _make_stages(self) -> list:
+    def _make_stages(self, scope: ProjectScope) -> list:
         """Create a fresh set of stage instances for one reconciliation cycle."""
         stage1 = MemoryConsolidator(
             StageId.memory_consolidator, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            scope=scope, known_projects=self._known_projects,
             recon_report_port=self._recon_report_port,
             recon_report_state=self._recon_report_state,
         )
         stage2 = TaskKnowledgeSync(
             StageId.task_knowledge_sync, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            scope=scope, known_projects=self._known_projects,
             recon_report_port=self._recon_report_port,
             recon_report_state=self._recon_report_state,
         )
         stage3 = IntegrityCheck(
             StageId.integrity_check, self.memory, self.taskmaster, self.journal,
             self.config, usage_gate=self.usage_gate,
+            scope=scope, known_projects=self._known_projects,
             recon_report_port=self._recon_report_port,
             recon_report_state=self._recon_report_state,
         )
@@ -621,10 +618,13 @@ class ReconciliationHarness:
     def _propagate_escalation_queue(self, stages: Iterable[Any]) -> None:
         """Apply harness's escalation URL and queue to each stage in *stages*.
 
-        Shared by ``_make_stages`` (cold path: fresh stages each cycle) and
-        ``_start_escalation_server`` (hot path: stages pre-built in __init__).
-        Defensive: only assigns when the harness has a value, so cold-path
-        callers before escalation startup leave stages untouched.
+        Called from ``_make_stages`` once per cycle (task 2146 β — there is no
+        long-lived ``self.stages`` list to push into from
+        ``_start_escalation_server`` anymore; escalation startup only stores
+        ``self._escalation_url``/``self._escalation_queue`` for the next
+        ``_make_stages`` call to pick up). Defensive: only assigns when the
+        harness has a value, so calls before escalation startup leave stages
+        untouched.
 
         Single-pass over *stages* so single-pass iterables (generators, ``iter(...)``)
         work correctly — the prior two-pass form would silently skip the queue
@@ -696,7 +696,7 @@ class ReconciliationHarness:
         stage.filtered_task_tree = filtered_task_tree
         stage.remediation_mode = remediation_mode
 
-    async def _fetch_filtered_task_tree(self, project_root: str) -> FilteredTaskTree:
+    async def _fetch_filtered_task_tree(self, project_root: ProjectRoot) -> FilteredTaskTree:
         """Fetch the task tree once and return a filtered subset of active tasks.
 
         Degrades gracefully on failure — returns an empty FilteredTaskTree so
@@ -773,7 +773,7 @@ class ReconciliationHarness:
             )
             return FilteredTaskTree()
 
-    async def _fetch_task_count_census(self, project_root: str) -> dict[str, str]:
+    async def _fetch_task_count_census(self, project_root: ProjectRoot) -> dict[str, str]:
         """Fetch the authoritative {id: status} map from taskmaster.get_statuses().
 
         Mirrors _fetch_filtered_task_tree's fail-open posture: guard against a
@@ -817,7 +817,7 @@ class ReconciliationHarness:
             )
             return {}
 
-    async def _check_graphiti_queue_health(self, project_id: str) -> dict | None:
+    async def _check_graphiti_queue_health(self, project_id: ProjectId) -> dict | None:
         """Read the Graphiti async-queue dead-letter count for project_id.
 
         Uses DurableWriteQueue.get_stats(group_id=project_id) to classify the
@@ -1105,7 +1105,7 @@ class ReconciliationHarness:
                 await self.buffer.mark_run_complete(
                     run.project_id, instance_id=run.instance_id,
                 )
-            await self._replay_deferred_writes(run.project_id)
+            await self._replay_deferred_writes(ProjectId(run.project_id))
             detail = (
                 f"project={diag['project_id']} run_type={diag['run_type']} "
                 f"instance={diag['instance_id']} age={diag['age_seconds']:.0f}s "
@@ -1291,7 +1291,7 @@ class ReconciliationHarness:
 
     # ── Deferred write replay ─────────────────────────────────────────
 
-    async def _replay_deferred_writes(self, project_id: str) -> None:
+    async def _replay_deferred_writes(self, project_id: ProjectId) -> None:
         """Replay targeted-recon writes that were deferred during a full cycle.
 
         Uses a claim → replay-one → delete-on-success pattern so that
@@ -1378,11 +1378,11 @@ class ReconciliationHarness:
         logger.info(f'Reconciliation escalation server starting on {host}:{port}')
         await _sleep(0.5)
 
-        # Store escalation URL and queue for _make_stages() and set on existing stages
+        # Store escalation URL and queue; _make_stages propagates them to each
+        # cycle's fresh stages via _propagate_escalation_queue (task 2146 β —
+        # there is no long-lived self.stages list to push into here anymore).
         escalation_url = f'http://{host}:{port}/mcp'
         self._escalation_url = escalation_url
-        # Both _escalation_url and _escalation_queue are set above, so helper will propagate.
-        self._propagate_escalation_queue(self.stages)
 
     async def _stop_escalation_server(self) -> None:
         """Stop the escalation server."""
@@ -1469,7 +1469,7 @@ class ReconciliationHarness:
 
     # ── Tier selection ─────────────────────────────────────────────────
 
-    async def _select_tier(self, project_id: str) -> TierConfig:
+    async def _select_tier(self, project_id: ProjectId) -> TierConfig:
         """Choose model tier based on buffer size."""
         buffer_count = (await self.buffer.get_buffer_stats(project_id)).get('size', 0)
         use_opus = buffer_count > (self.config.buffer_size_threshold * self.config.opus_threshold_ratio)
@@ -1621,7 +1621,7 @@ class ReconciliationHarness:
                         project_id, reason='judge halted reconciliation',
                     )
                     try:
-                        await self._replay_deferred_writes(project_id)
+                        await self._replay_deferred_writes(ProjectId(project_id))
                     finally:
                         # Scope the release to this instance — see
                         # plans/recon-stale-recovery-rca.md.
@@ -1642,7 +1642,7 @@ class ReconciliationHarness:
                             f'({remaining} cycles remaining)'
                         )
 
-                tier = await self._select_tier(project_id)
+                tier = await self._select_tier(ProjectId(project_id))
                 iterator = BacklogIterator(self.config, self.journal, self.buffer, self)
                 heartbeat_task = asyncio.create_task(self._heartbeat_loop(project_id))
                 use_iterator = False
@@ -1694,7 +1694,7 @@ class ReconciliationHarness:
                     await self.buffer.restore_drained(project_id)
                 finally:
                     try:
-                        await self._replay_deferred_writes(project_id)
+                        await self._replay_deferred_writes(ProjectId(project_id))
                     finally:
                         # Cancel heartbeat only after replay so the lock heartbeat
                         # keeps the per-project lock alive for the full replay
@@ -1783,7 +1783,8 @@ class ReconciliationHarness:
         """
         # task 1143: pre-flight guard — raises before any side effects (no journal row,
         # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
-        project_root = self._known_project_root_for(project_id)
+        scope = self._known_project_scope_for(project_id)
+        project_root = scope.project_root
 
         tier = tier or TierConfig()
         run_id = str(uuid4())
@@ -1815,7 +1816,7 @@ class ReconciliationHarness:
             },
         )
 
-        # project_root is already hard-bound via _known_project_root_for at the top
+        # project_root is already hard-bound via _known_project_scope_for at the top
         # of this function (task 1143); no _resolve_project_root call needed here.
 
         # Load prior S3 findings from last completed run (backstop for normal pass)
@@ -1835,18 +1836,15 @@ class ReconciliationHarness:
         )
 
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
-        graphiti_queue_health = await self._check_graphiti_queue_health(project_id)
+        graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
 
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
-        stages = self._make_stages()
+        stages = self._make_stages(scope)
         try:
             reports = []
             for stage in stages:
                 current_stage_name = stage.stage_id.value
-                stage.project_id = project_id
-                stage.project_root = project_root
-                stage.known_projects = self._known_projects
 
                 # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
                 if isinstance(stage, MemoryConsolidator):
@@ -1910,10 +1908,10 @@ class ReconciliationHarness:
             if self.judge:
                 asyncio.create_task(self._run_judge(run_id))
 
-            # Remediation pass: thread project_root resolved above (task 1163) and pass
+            # Remediation pass: thread scope resolved above (task 1163) and pass
             # pre-fetched tree to avoid a redundant fetch (ref: task 478).
             await self._maybe_remediate(project_id, run_id, run, tier,
-                                        project_root=project_root,
+                                        scope=scope,
                                         filtered_task_tree=filtered_task_tree)
 
             logger.info(
@@ -2360,7 +2358,7 @@ class ReconciliationHarness:
         parent_run: ReconciliationRun,
         tier: TierConfig,
         *,
-        project_root: str,
+        scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
         """Extract Stage 3 findings from the parent run and trigger remediation if needed."""
@@ -2513,7 +2511,7 @@ class ReconciliationHarness:
             )
             await self._run_remediation_pass(
                 project_id, parent_run_id, to_remediate, tier,
-                project_root=project_root,
+                scope=scope,
                 filtered_task_tree=filtered_task_tree,
             )
         except Exception as e:
@@ -2531,13 +2529,13 @@ class ReconciliationHarness:
         findings: list[dict],
         tier: TierConfig,
         *,
-        project_root: str,
+        scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
         """Run a focused S1→S2→S3 pass to remediate actionable findings.
 
-        project_root is threaded from the parent caller: run_full_cycle resolves it
-        once at entry via _known_project_root_for, before any side-effects, and
+        scope is threaded from the parent caller: run_full_cycle resolves it
+        once at entry via _known_project_scope_for, before any side-effects, and
         threads it through _maybe_remediate so remediation always uses the pre-cycle
         snapshot, immune to any mid-cycle registry mutations (task 1163).
 
@@ -2546,6 +2544,7 @@ class ReconciliationHarness:
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
         """
+        project_root = scope.project_root
         # Defense-in-depth assert deliberately omitted.  A registry-bound check such
         # as `assert project_root in self._known_projects.values()` would fail during
         # the mid-cycle mutation window that task 1163 was specifically designed to
@@ -2619,7 +2618,7 @@ class ReconciliationHarness:
             task_kind_by_id[tid] = _metadata.get('task_kind') if isinstance(_metadata, dict) else None
 
         current_stage_name: str | None = None
-        stages = self._make_stages()
+        stages = self._make_stages(scope)
         try:
             # Configure stages for remediation mode
             stage1 = stages[0]
@@ -2637,9 +2636,6 @@ class ReconciliationHarness:
             reports = []
             for stage in stages:
                 current_stage_name = stage.stage_id.value
-                stage.project_id = project_id
-                stage.project_root = project_root
-                stage.known_projects = self._known_projects
 
                 report = await stage.run(
                     [], watermark, reports, run_id, model=tier.model,
@@ -2914,13 +2910,13 @@ class BacklogIterator:
         cutoff = datetime.now(UTC)
 
         # task 1143: hard-bind project_root from registry — event payloads are informational only.
-        project_root = self.harness._known_project_root_for(project_id)
+        scope = self.harness._known_project_scope_for(project_id)
 
         assembler = ContextAssembler(
             memory_service=self.harness.memory,
             taskmaster=self.harness.taskmaster,
             config=self.config,
-            project_root=project_root,
+            project_root=scope.project_root,
         )
 
         watermark = await self.journal.get_watermark(project_id)

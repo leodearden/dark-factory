@@ -13,6 +13,7 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_MEMORY_WRITES,
@@ -76,6 +77,11 @@ def _extract_section(payload: str, header: str) -> str:
     return payload[start:end]
 
 
+def _scope(project_id: str, project_root: str) -> ProjectScope:
+    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
+    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
+
+
 def make_configured_task_knowledge_sync_stage(
     deps: dict, *, project_id: str, project_root: str, run_id: str = 'test-run'
 ) -> "TaskKnowledgeSync":
@@ -100,8 +106,8 @@ def make_configured_task_knowledge_sync_stage(
         A TaskKnowledgeSync instance ready for use in assemble_payload() tests.
     """
     stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **deps)
-    stage.project_id = project_id
-    stage.project_root = project_root
+    stage.scope = _scope(project_id, stage.scope.project_root)
+    stage.scope = _scope(stage.scope.project_id, project_root)
     stage._current_run_id = run_id
     return stage
 
@@ -200,6 +206,7 @@ class TestStageSubclasses:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def test_memory_consolidator_disallowed(self, mock_deps):
@@ -372,6 +379,7 @@ class TestPerStageReportSchema:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def test_integrity_check_returns_stage3_schema(self, mock_deps):
@@ -396,6 +404,7 @@ class TestMcpConfig:
         return BaseStage(
             StageId.memory_consolidator,
             AsyncMock(), AsyncMock(), AsyncMock(), config,
+            scope=_scope('test_project', '/tmp/test'),
         )
 
     def test_mcp_config_has_fused_memory(self, stage):
@@ -438,6 +447,7 @@ class TestTaskKnowledgeSyncPayload:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -556,6 +566,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -654,6 +665,7 @@ class TestDoneProvenanceSection:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @staticmethod
@@ -793,6 +805,7 @@ class BaseStageValidationTest:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _patch_stage(self, stage, cli_side_effect=None):
@@ -826,9 +839,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
     async def test_run_raises_on_empty_project_id(self, mock_deps):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = ''
 
         with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
+            stage.scope = _scope('', stage.scope.project_root)
             await stage.run(
                 events=[],
                 watermark=Watermark(project_id=''),
@@ -840,7 +853,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
     async def test_run_raises_on_whitespace_project_id(self, mock_deps):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = '   '
+        stage.scope = _scope('   ', stage.scope.project_root)
 
         with self._patch_stage(stage), pytest.raises(ValueError, match='project_id'):
             await stage.run(
@@ -854,7 +867,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
     async def test_run_raises_on_watermark_project_id_mismatch(self, mock_deps):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'project_a'
+        stage.scope = _scope('project_a', stage.scope.project_root)
 
         with self._patch_stage(stage), pytest.raises(ValueError) as exc_info:
             await stage.run(
@@ -871,7 +884,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
     async def test_run_allows_matching_watermark_project_id(self, mock_deps):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         with self._patch_stage(stage):
             result = await stage.run(
@@ -904,7 +917,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         in this situation."""
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         # Build a Watermark that bypasses the field_validator — project_id is NOT stripped.
         padded_watermark = Watermark.model_construct(project_id=' dark_factory ')
@@ -929,7 +942,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         check with a DEBUG log."""
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         # Build a Watermark that bypasses the field_validator — project_id is None.
         none_watermark = Watermark.model_construct(project_id=None)
@@ -966,7 +979,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
         """Empty or whitespace-only watermark project_id: mismatch check is skipped,
         a DEBUG log is emitted, and the run succeeds with full results."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         with self._patch_stage(stage), caplog.at_level(
             logging.DEBUG, logger='fused_memory.reconciliation.stages.base'
@@ -1004,7 +1017,7 @@ class TestProjectIdValidation(BaseStageValidationTest):
     async def test_recon_context_includes_project_id(self, mock_deps):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         captured_kwargs = {}
 
@@ -1106,6 +1119,7 @@ class TestProactiveSampling:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -1492,7 +1506,7 @@ class TestRunIdValidation(BaseStageValidationTest):
     async def test_run_raises_on_empty_run_id(self, mock_deps):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         with self._patch_stage(stage), pytest.raises(ValueError, match='run_id'):
             await stage.run(
@@ -1506,7 +1520,7 @@ class TestRunIdValidation(BaseStageValidationTest):
     async def test_run_raises_on_whitespace_run_id(self, mock_deps):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         with self._patch_stage(stage), pytest.raises(ValueError, match='run_id'):
             await stage.run(
@@ -1525,7 +1539,7 @@ class TestRunIdValidation(BaseStageValidationTest):
     async def test_run_raises_on_injection_run_id(self, mock_deps, bad_run_id):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         with self._patch_stage(stage), pytest.raises(ValueError, match='run_id'):
             await stage.run(
@@ -1539,7 +1553,7 @@ class TestRunIdValidation(BaseStageValidationTest):
     async def test_run_allows_valid_uuid_run_id(self, mock_deps):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         valid_uuid = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -1558,7 +1572,7 @@ class TestRunIdValidation(BaseStageValidationTest):
     async def test_recon_context_includes_run_id(self, mock_deps):
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         captured_kwargs = {}
         run_id_value = 'test-run-abc123'
@@ -1728,6 +1742,7 @@ class TestStage2NoTaskIdCeiling:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -1788,6 +1803,7 @@ class TestTierConfig:
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             AsyncMock(), AsyncMock(), AsyncMock(), config,
+            scope=_scope('test_project', '/tmp/test'),
         )
         assert stage.episode_limit is None
         assert stage.memory_limit is None
@@ -1797,6 +1813,7 @@ class TestTierConfig:
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             AsyncMock(), AsyncMock(), AsyncMock(), config,
+            scope=_scope('test_project', '/tmp/test'),
         )
         assert stage.episode_limit is None
         assert stage.memory_limit is None
@@ -1811,8 +1828,9 @@ class TestTierConfig:
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             AsyncMock(), AsyncMock(), AsyncMock(), config,
+            scope=_scope('test_project', '/tmp/test'),
         )
-        stage.project_id = 'test_project'
+        stage.scope = _scope('test_project', stage.scope.project_root)
         watermark = Watermark(project_id='test_project')
         with pytest.raises(ValueError, match='episode_limit and memory_limit must be explicitly set'):
             await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
@@ -1828,8 +1846,9 @@ class TestTierConfig:
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             memory_mock, AsyncMock(), AsyncMock(), config,
+            scope=_scope('test_project', '/tmp/test'),
         )
-        stage.project_id = 'test_project'
+        stage.scope = _scope('test_project', stage.scope.project_root)
         stage.episode_limit = 125
         stage.memory_limit = 250
         watermark = Watermark(project_id='test_project')
@@ -1844,8 +1863,9 @@ class TestTierConfig:
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             AsyncMock(), AsyncMock(), AsyncMock(), config,
+            scope=_scope('test_project', '/tmp/test'),
         )
-        stage.project_id = 'test_project'
+        stage.scope = _scope('test_project', stage.scope.project_root)
         # Set remediation findings but leave limits as None
         stage.remediation_findings = [{'description': 'test finding'}]
         watermark = Watermark(project_id='test_project')
@@ -1942,6 +1962,7 @@ class TestStagePayloadProjectIdGuideline:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -1999,13 +2020,13 @@ class TestStagePayloadProjectIdGuideline:
             'IntegrityCheck': IntegrityCheck,
         }
         stage = cls_map[stage_class](stage_id, **mock_deps_for_stage)
-        stage.project_id = project_id
+        stage.scope = _scope(project_id, stage.scope.project_root)
 
         if extra_setup == 'limits':
             stage.episode_limit = 125
             stage.memory_limit = 250
         elif extra_setup == 'taskmaster':
-            stage.project_root = '/home/leo/src/test_proj'
+            stage.scope = _scope(stage.scope.project_id, '/home/leo/src/test_proj')
             stage._current_run_id = 'test-run'
             mock_deps_for_stage['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -2083,6 +2104,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -2354,8 +2376,9 @@ class TestMemoryConsolidatorFilteredTaskTree:
         """assemble_payload includes '### Active Task Tree' when filtered_task_tree is set."""
         stage = MemoryConsolidator(
             StageId.memory_consolidator, mock_memory, None, AsyncMock(), AsyncMock(),
+            scope=_scope('test_project', '/tmp/test'),
         )
-        stage.project_id = 'test_project'
+        stage.scope = _scope('test_project', stage.scope.project_root)
         stage.episode_limit = 100
         stage.memory_limit = 200
         stage.filtered_task_tree = self._make_active_tree(3)
@@ -2370,8 +2393,9 @@ class TestMemoryConsolidatorFilteredTaskTree:
         """assemble_payload does NOT include '### Active Task Tree' when filtered_task_tree is None."""
         stage = MemoryConsolidator(
             StageId.memory_consolidator, mock_memory, None, AsyncMock(), AsyncMock(),
+            scope=_scope('test_project', '/tmp/test'),
         )
-        stage.project_id = 'test_project'
+        stage.scope = _scope('test_project', stage.scope.project_root)
         stage.episode_limit = 100
         stage.memory_limit = 200
         stage.filtered_task_tree = None
@@ -2395,8 +2419,9 @@ class TestMemoryConsolidatorFilteredTaskTree:
         )
         stage = MemoryConsolidator(
             StageId.memory_consolidator, mock_memory, None, AsyncMock(), AsyncMock(),
+            scope=_scope('test_project', '/tmp/test'),
         )
-        stage.project_id = 'test_project'
+        stage.scope = _scope('test_project', stage.scope.project_root)
         stage.episode_limit = 100
         stage.memory_limit = 200
         stage.assembled_payload = ap
@@ -2432,6 +2457,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -2747,6 +2773,7 @@ class TestInvariantAfterTask643:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -3452,6 +3479,7 @@ class TestStage2HandoffShortfallWarning:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -3550,6 +3578,7 @@ class TestBriefingKnownGapsRefresh:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -3760,8 +3789,8 @@ class TestBriefingKnownGapsRefresh:
     async def test_run_invokes_briefing_refresh_hook_before_super_run(self, mock_deps, tmp_path):
         """run() calls _maybe_queue_briefing_refresh_tasks then super().run()."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = str(tmp_path)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, str(tmp_path))
 
         mismatch = {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -3810,8 +3839,8 @@ class TestBriefingKnownGapsRefresh:
         'briefing_refresh_hook_failed' WARNING is produced.
         """
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = str(tmp_path)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, str(tmp_path))
 
         mismatch = {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -3871,8 +3900,8 @@ class TestBriefingKnownGapsRefresh:
     async def test_run_dedupes_when_invoked_twice_with_same_mismatch(self, mock_deps, tmp_path):
         """Calling run() twice: second call skips add_task because first created pending task."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = str(tmp_path)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, str(tmp_path))
 
         mismatch = {'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}
         canonical_title = 'Refresh briefing: remove task 1751 from known_gaps'
@@ -3921,8 +3950,8 @@ class TestBriefingKnownGapsRefresh:
     async def test_run_swallows_helper_failure(self, mock_deps, tmp_path, caplog):
         """If _run_briefing_known_gaps_script raises, run() still completes and logs WARNING."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = str(tmp_path)
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, str(tmp_path))
 
         fake_cli_result = MagicMock(success=True, report={'summary': 'ok'})
 
@@ -4197,13 +4226,14 @@ class TestMemoryConsolidatorFlagDedup:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
     async def test_normal_cycle_invokes_dedup_flags(self, mock_deps):
         """Normal (non-remediation) cycle calls dedup_flags with the report's flagged items."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
 
@@ -4253,7 +4283,7 @@ class TestMemoryConsolidatorFlagDedup:
     async def test_remediation_run_skips_dedup_flags(self, mock_deps):
         """Remediation runs (remediation_findings set) must NOT call dedup_flags."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
         stage.remediation_findings = [{'description': 'x'}]  # remediation mode
@@ -4309,6 +4339,7 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -4320,10 +4351,10 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
         so the marker write/delete churn stops.
         """
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
-        stage.project_root = '/proj'
+        stage.scope = _scope(stage.scope.project_id, '/proj')
 
         cancelled_flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
         active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
@@ -4418,6 +4449,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -4427,10 +4459,10 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         flag is NOT forwarded; report.stats reflects the mocked return value.
         """
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
-        stage.project_root = '/proj'
+        stage.scope = _scope(stage.scope.project_id, '/proj')
 
         dropped_flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
         active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
@@ -4495,10 +4527,10 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         is called with an empty list and the stat is explicitly 0 (not absent).
         """
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
-        stage.project_root = '/proj'
+        stage.scope = _scope(stage.scope.project_id, '/proj')
 
         active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
 
@@ -4553,10 +4585,10 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         (task-2029 amendment).
         """
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
-        stage.project_root = '/proj'
+        stage.scope = _scope(stage.scope.project_id, '/proj')
 
         base_report = StageReport(
             stage=StageId.memory_consolidator,
@@ -4590,10 +4622,10 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         (task-2029 amendment).
         """
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
-        stage.project_root = '/proj'
+        stage.scope = _scope(stage.scope.project_id, '/proj')
 
         suppressed_flag = {'task_id': '55', 'flag_type': 'stale_metadata'}
         active_flag = {'task_id': '2000', 'flag_type': 'stale_metadata'}
@@ -4672,10 +4704,10 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         (task-2029 amendment round 2, reviewer finding: test_coverage).
         """
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
-        stage.project_root = '/proj'
+        stage.scope = _scope(stage.scope.project_id, '/proj')
 
         terminal_flag = {'task_id': '1703', 'flag_type': 'stale_metadata'}
         suppressed_flag = {'task_id': '55', 'flag_type': 'stale_metadata'}
@@ -4758,6 +4790,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _make_base_report(self, items_flagged=None):
@@ -4775,7 +4808,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
     async def test_hor_flag_at_threshold_escalated(self, mock_deps):
         """(a) HOR flag at threshold → track called, compute returns stalled, escalate called; stats recorded."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
         fake_queue = MagicMock()
@@ -4819,7 +4852,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
     async def test_hor_flag_below_threshold_no_escalation(self, mock_deps):
         """(b) stall count below threshold → maybe_escalate NOT called; stalled=0, escalated=0."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
         fake_queue = MagicMock()
@@ -4856,7 +4889,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
     async def test_no_hor_flags_zero_cost_path(self, mock_deps):
         """(c) no HOR flags → none of the new helpers are awaited."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
         stage._escalation_queue = MagicMock()
@@ -4894,7 +4927,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
         markers that nothing will ever consume when escalation is unavailable.
         """
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
         stage._escalation_queue = None  # explicit None
@@ -4931,7 +4964,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
     async def test_remediation_mode_skips_all_stall_logic(self, mock_deps):
         """(e) remediation_findings set → ALL stale-operator logic skipped; no crash."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'p'
+        stage.scope = _scope('p', stage.scope.project_root)
         stage.episode_limit = 10
         stage.memory_limit = 10
         stage.remediation_findings = [{'description': 'fix me'}]  # remediation mode
@@ -7628,6 +7661,7 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -7836,8 +7870,8 @@ class TestTaskKnowledgeSyncActiveQueryFlags:
         memory_service.search should be awaited.
         """
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         # Intentionally NOT setting stage._current_run_id — that is the SUT condition.
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
@@ -7868,6 +7902,7 @@ class TestTaskKnowledgeSyncMem0ActiveQueryFlagRendering:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -7986,6 +8021,7 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -8133,8 +8169,8 @@ class TestTaskKnowledgeSyncStaleFlagEscalation:
         """A newly-rendered stale section must persist an escalation marker."""
         from unittest.mock import call as mock_call
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         stage._current_run_id = 'run-marker-test'
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['memory_service'].add_memory.return_value = {'memory_ids': ['m1']}
@@ -8171,6 +8207,7 @@ class TestTaskKnowledgeSyncStaleFixcSweptStat:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -8186,8 +8223,8 @@ class TestTaskKnowledgeSyncStaleFixcSweptStat:
         from fused_memory.models.reconciliation import StageId
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         # One current-cycle marker and two stale markers
         mock_deps['memory_service'].search.return_value = [
@@ -8239,8 +8276,8 @@ class TestTaskKnowledgeSyncStaleFixcSweptStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         # All markers have matching run_id → zero stale
         mock_deps['memory_service'].search.return_value = [
@@ -8293,6 +8330,7 @@ class TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -8307,8 +8345,8 @@ class TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -8358,8 +8396,8 @@ class TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -8410,8 +8448,8 @@ class TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         # Pre-seed a stale value as if left over from a PRIOR run() call.
         stage._run_window_start = datetime(2020, 1, 1, tzinfo=UTC)
 
@@ -8460,8 +8498,8 @@ class TestTaskKnowledgeSyncStaleFlagMarkersGcSweptStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -8516,6 +8554,7 @@ class TestTaskKnowledgeSyncTerminalTaskFlagMarkersGcSweptStat:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -8531,8 +8570,8 @@ class TestTaskKnowledgeSyncTerminalTaskFlagMarkersGcSweptStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -8577,8 +8616,8 @@ class TestTaskKnowledgeSyncTerminalTaskFlagMarkersGcSweptStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -8634,6 +8673,7 @@ class TestTaskKnowledgeSyncStalePersistenceMarkersGcSweptStat:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -8648,8 +8688,8 @@ class TestTaskKnowledgeSyncStalePersistenceMarkersGcSweptStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -8693,8 +8733,8 @@ class TestTaskKnowledgeSyncStalePersistenceMarkersGcSweptStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -8740,6 +8780,7 @@ class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -8754,8 +8795,8 @@ class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         # One current-cycle marker, one mismatched, and two with absent run_id
         mock_deps['memory_service'].search.return_value = [
@@ -8824,8 +8865,8 @@ class TestTaskKnowledgeSyncMissingRunIdMarkersStat:
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         # All markers have matching run_id → zero missing
         mock_deps['memory_service'].search.return_value = [
@@ -8880,6 +8921,7 @@ class TestAssemblePayloadRunWindowStart:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _fake_cli_result(self):
@@ -8899,8 +8941,8 @@ class TestAssemblePayloadRunWindowStart:
         )
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         run_window_start = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
@@ -8945,8 +8987,8 @@ class TestAssemblePayloadRunWindowStart:
         )
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         mock_deps['journal'].get_run = AsyncMock(side_effect=RuntimeError('journal unavailable'))
@@ -8985,8 +9027,8 @@ class TestAssemblePayloadRunWindowStart:
         )
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         mock_run = MagicMock()
@@ -9046,8 +9088,8 @@ class TestAssemblePayloadRunWindowStart:
         )
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         naive_started_at = datetime(2026, 5, 15, 10, 0, 0)  # NAIVE — no tzinfo
@@ -9125,6 +9167,7 @@ class TestSameCycleSweepFix:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _fake_cli_result(self):
@@ -9144,8 +9187,8 @@ class TestSameCycleSweepFix:
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         T0 = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
@@ -9211,8 +9254,8 @@ class TestSameCycleSweepFix:
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         # Journal raises → run_window_start=None → window guard dormant
@@ -9278,6 +9321,7 @@ class TestRescuedInWindowMarkersStat:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _fake_cli_result(self):
@@ -9296,8 +9340,8 @@ class TestRescuedInWindowMarkersStat:
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         T0 = datetime(2026, 5, 15, 10, 0, 0, tzinfo=UTC)
@@ -9347,8 +9391,8 @@ class TestRescuedInWindowMarkersStat:
         from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['journal'].get_run = AsyncMock(side_effect=RuntimeError('journal down'))
 
@@ -9393,8 +9437,8 @@ class TestRescuedInWindowMarkersStat:
         )
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
         mock_deps['journal'].get_run = AsyncMock(side_effect=RuntimeError('journal down'))
 
@@ -9450,14 +9494,15 @@ class TestStage3PayloadIncludesProjectRoot:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
     async def test_integrity_check_payload_emits_use_project_root_directive(self, mock_deps):
         """assemble_payload() for reify must contain Use project_root="/home/leo/src/reify"."""
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         watermark = Watermark(project_id='reify')
         payload = await stage.assemble_payload([], watermark, [])
@@ -9477,8 +9522,8 @@ class TestStage3PayloadIncludesProjectRoot:
     ):
         """assemble_payload() for dark_factory must use dark-factory root in directive."""
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/home/leo/src/dark-factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/dark-factory')
 
         watermark = Watermark(project_id='dark_factory')
         payload = await stage.assemble_payload([], watermark, [])
@@ -9636,6 +9681,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _make_cli_result(self, flagged_items: list[dict]) -> MagicMock:
@@ -9653,7 +9699,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
     async def test_run_suppresses_stage1_dup_and_keeps_unique(self, mock_deps, caplog):
         """run() drops Stage 2 items that duplicate Stage 1 human_operator_required flags."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         _now = datetime.now(tz=UTC)
         stage1_report = StageReport(
@@ -9738,7 +9784,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
     async def test_run_empty_prior_reports_no_op(self, mock_deps, caplog):
         """Empty prior_reports → no suppression, no log, items_flagged unchanged."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         stage2_flagged = [
             {'task_id': '99', 'flag_type': 'assumption_invalid', 'resolution_status': 'human_operator_required', 'description': 'item'},
@@ -9778,7 +9824,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
     async def test_run_empty_stage1_flags_no_op(self, mock_deps, caplog):
         """prior_reports[0].items_flagged empty → no suppression, no log."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         _now = datetime.now(tz=UTC)
         stage1_report = StageReport(
@@ -9825,7 +9871,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
     async def test_run_no_duplicates_no_suppression_log(self, mock_deps, caplog):
         """Stage 2 emits non-duplicate items only → all kept, no suppression log fired."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         _now = datetime.now(tz=UTC)
         stage1_report = StageReport(
@@ -9875,7 +9921,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
     async def test_run_prior_reports_first_stage_not_memory_consolidator_no_op(self, mock_deps, caplog):
         """prior_reports[0].stage != memory_consolidator → guard fires, no suppression even if items would match."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
 
         _now = datetime.now(tz=UTC)
         # Use StageId.task_knowledge_sync (a real-but-wrong stage) so the
@@ -9965,6 +10011,7 @@ def stage2_guard_mock_deps():
         'taskmaster': AsyncMock(),
         'journal': journal_mock,
         'config': config,
+        'scope': _scope('test_project', '/tmp/test'),
     }
 
 
@@ -10257,8 +10304,8 @@ class TestTaskKnowledgeSyncStage2Guards:
         async def test_run_applies_terminal_state_guard(self, stage2_guard_mock_deps, caplog):
             """run() decrements tasks_modified and adds not_applicable_count for terminal violations."""
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             # Synthetic op: stage-2 agent updated task 42 which is now done
             terminal_op = {
@@ -10373,8 +10420,8 @@ class TestTaskKnowledgeSyncStage2Guards:
         async def test_run_records_set_task_status_mismatch(self, stage2_guard_mock_deps, caplog):
             """run() decrements tasks_modified and adds set_task_status_post_action_mismatches."""
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             # Synthetic op: stage-2 agent called set_task_status(done) for task 7
             # but live status is pending (the interceptor rejected it silently)
@@ -10522,8 +10569,8 @@ class TestTaskKnowledgeSyncStage2Guards:
         async def test_run_records_stall_guard_freshness_violation(self, stage2_guard_mock_deps, caplog):
             """run() adds stall_guard_freshness_violations when snapshot_status mismatches live."""
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             stall_op = {
                 'id': 'op-stall-integration-1',
@@ -10674,8 +10721,8 @@ class TestTaskKnowledgeSyncStage2Guards:
         async def test_run_clamps_stage1_analytical_findings_processed_on_mismatch(self, stage2_guard_mock_deps, caplog):
             """run() clamps stage1_analytical_findings_processed to prior_reports[0] truth and warns."""
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             _now = datetime.now(tz=UTC)
             stage1_prior = StageReport(
@@ -10734,8 +10781,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             must be present in report.stats with value 0 even if the agent omitted them.
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             _now = datetime.now(tz=UTC)
             stage1_prior = StageReport(
@@ -10783,8 +10830,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             records list must match the counter for the value to be preserved.
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             _now = datetime.now(tz=UTC)
             stage1_prior = StageReport(
@@ -10844,8 +10891,8 @@ class TestTaskKnowledgeSyncStage2Guards:
               - stage1_mem0_flags_processed remains 4
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             _now = datetime.now(tz=UTC)
             stage1_prior = StageReport(
@@ -10989,8 +11036,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             entries → Guard 4b detects mismatch, emits WARNING, and clamps to 2.
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             _now = datetime.now(tz=UTC)
             stage1_prior = StageReport(
@@ -11060,6 +11107,7 @@ class TestTaskKnowledgeSyncStage2Guards:
                 'taskmaster': AsyncMock(),
                 'journal': journal_mock,
                 'config': config,
+                'scope': _scope('test_project', '/tmp/test'),
             }
 
         def _make_cli_result(self, flagged_items: list[dict], stats: dict | None = None) -> MagicMock:
@@ -11087,8 +11135,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             Stage 1 prior report: 4 items_flagged -> Guard 4 expects 4, reported 1 -> mismatch.
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             # Three ops that each trip a different guard
             ops = [
@@ -11240,8 +11288,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             mock_deps_composition['journal'].write_journal = None
 
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             _now = datetime.now(tz=UTC)
             stage1_prior = StageReport(
@@ -11303,8 +11351,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             """When self.journal is None entirely, Guards 1-3 skip; Guard 4 still fires."""
             deps = {**mock_deps_composition, 'journal': None}
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **deps)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             _now = datetime.now(tz=UTC)
             stage1_prior = StageReport(
@@ -11358,8 +11406,8 @@ class TestTaskKnowledgeSyncStage2Guards:
                 side_effect=RuntimeError('db connection lost')
             )
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             _now = datetime.now(tz=UTC)
             stage1_prior = StageReport(
@@ -11427,8 +11475,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             still logged.
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             # Three ops on the same task_id='99' — one per guard
             ops = [
@@ -11534,8 +11582,8 @@ class TestTaskKnowledgeSyncStage2Guards:
             → continue) and all helpers skip uniformly.
             """
             stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps_composition)
-            stage.project_id = 'dark_factory'
-            stage.project_root = '/project'
+            stage.scope = _scope('dark_factory', stage.scope.project_root)
+            stage.scope = _scope(stage.scope.project_id, '/project')
 
             ops = [
                 {  # Guard 1: terminal-state update_task
@@ -11639,6 +11687,7 @@ class TestBaseStageEscalationQueueAttribute:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def test_escalation_queue_initialised_to_none(self, mock_deps):
@@ -11683,7 +11732,7 @@ class TestHarnessWiresEscalationQueueOntoStages:
         fake_queue = MagicMock()
         minimal_harness._escalation_queue = fake_queue
 
-        stages = minimal_harness._make_stages()
+        stages = minimal_harness._make_stages(_scope('test_project', '/tmp/test'))
 
         for stage in stages:
             assert stage._escalation_queue is fake_queue, (
@@ -11695,7 +11744,7 @@ class TestHarnessWiresEscalationQueueOntoStages:
         # Ensure harness has no queue (default)
         minimal_harness._escalation_queue = None
 
-        stages = minimal_harness._make_stages()
+        stages = minimal_harness._make_stages(_scope('test_project', '/tmp/test'))
 
         for stage in stages:
             assert stage._escalation_queue is None
@@ -11823,6 +11872,7 @@ class TestStage2HintConversionDetection:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -12601,8 +12651,8 @@ class TestApplyPostFlightGuardsLiveWorkflow:
         )
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/project'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
 
         # Synthetic op: stage-2 agent called set_task_status on a live task
         live_sts_op = _make_sts_op(
@@ -12665,8 +12715,8 @@ class TestApplyPostFlightGuardsStatusCacheBuildWarns:
         Currently RED: non-dict result continues silently.
         """
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/project'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
 
         op = _make_sts_op(op_id='op-non-dict', task_id='9901')
         stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [op]
@@ -12703,8 +12753,8 @@ class TestApplyPostFlightGuardsStatusCacheBuildWarns:
         Currently RED: 'unknown' status continues silently.
         """
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/project'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
 
         op = _make_sts_op(op_id='op-unknown', task_id='9902')
         stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [op]
@@ -12736,8 +12786,8 @@ class TestApplyPostFlightGuardsStatusCacheBuildWarns:
     async def test_healthy_get_task_no_warning(self, stage2_guard_mock_deps, caplog):
         """REGRESSION: healthy get_task with resolvable status => cache populated, ZERO new warnings."""
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **stage2_guard_mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/project'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/project')
 
         op = _make_sts_op(op_id='op-healthy', task_id='9903')
         stage2_guard_mock_deps['journal'].write_journal.get_ops_by_causation.return_value = [op]
@@ -12788,6 +12838,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.fixture
@@ -13399,6 +13450,7 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _pool_members(self, count: int) -> list:
@@ -13437,8 +13489,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
             return_value=self._pool_members(3)
@@ -13464,8 +13516,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
             return_value=self._pool_members(1)
@@ -13487,8 +13539,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
             return_value=self._pool_members(2)
@@ -13512,8 +13564,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
         stage.remediation_mode = True
 
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
@@ -13563,8 +13615,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         with patch.object(BaseStage, 'run', new=AsyncMock(side_effect=record_agent)):
             await stage.run(
@@ -13617,8 +13669,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
             await stage.run(
@@ -13647,8 +13699,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
             report = await stage.run(
@@ -13667,8 +13719,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         mock_deps['memory_service'].count_memories_by_metadata.return_value = 0
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())), \
              caplog.at_level(logging.WARNING, logger=self._LOGGER):
@@ -13721,8 +13773,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         )
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
             report = await stage.run(
@@ -13754,8 +13806,8 @@ class TestTaskKnowledgeSyncCycleSummaryPoolCap:
         mock_deps['memory_service'].count_memories_by_metadata.return_value = 1
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         with patch.object(BaseStage, 'run', new=AsyncMock(return_value=self._base_report())):
             report = await stage.run(
@@ -13908,6 +13960,7 @@ class TestStage1CycleSummaryPoolTrim:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _pool_members(self, count: int) -> list:
@@ -13956,8 +14009,8 @@ class TestStage1CycleSummaryPoolTrim:
     async def test_stat_set_to_trimmed_count_when_pool_over_cap(self, mock_deps):
         """3 pool members → pre-trim to cap-1=1 → pool_trimmed==2."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
             return_value=self._pool_members(3)
@@ -13976,8 +14029,8 @@ class TestStage1CycleSummaryPoolTrim:
     async def test_stat_is_zero_when_pool_at_cap_minus_one(self, mock_deps):
         """1 member (already at cap-1=1) → no trim, pool_trimmed==0."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
             return_value=self._pool_members(1)
@@ -13996,8 +14049,8 @@ class TestStage1CycleSummaryPoolTrim:
     async def test_stat_is_one_when_pool_has_two_prior_members(self, mock_deps):
         """2 prior members → pre-trim to cap-1=1 → pool_trimmed==1."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
             return_value=self._pool_members(2)
@@ -14016,8 +14069,8 @@ class TestStage1CycleSummaryPoolTrim:
         """Pre-trim runs and stat is set even when remediation_findings is set
         (remediation passes still need the pool bounded every cycle)."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
         stage.remediation_findings = []
 
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
@@ -14052,8 +14105,8 @@ class TestStage1CycleSummaryPoolTrim:
         )
 
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         with patch.object(BaseStage, 'run', new=AsyncMock(side_effect=record_agent)):
             await stage.run(
@@ -14076,8 +14129,8 @@ class TestStage1CycleSummaryPoolTrim:
         _source='stage1_cycle_summary_trim' (producer/consumer contract with
         the Stage 1 prompt's add_memory metadata)."""
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         mock_deps['memory_service'].get_memories_by_metadata = AsyncMock(
             return_value=self._pool_members(2)
@@ -14199,6 +14252,7 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _fresh_report(self):
@@ -14220,7 +14274,7 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
         the direct-path coverage for mismatch is in TestDetectTaskDumpContamination.
         """
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
         stage.filtered_task_tree = FilteredTaskTree(
             active_tasks=[
                 {'id': '1654', 'title': 'impl(step-1)', 'status': 'in-progress'},
@@ -14249,7 +14303,7 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
     def test_clean_tree_does_not_record_stat(self, mock_deps):
         """When filtered_task_tree contains normal titles, no stat is recorded (non-destructive)."""
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
         stage.filtered_task_tree = FilteredTaskTree(
             active_tasks=[
                 {'id': '1654', 'title': 'Fix authentication bug', 'status': 'in-progress'},
@@ -14267,7 +14321,7 @@ class TestIntegrityCheckRecordTaskDumpSpotCheck:
     def test_no_filtered_task_tree_is_noop(self, mock_deps):
         """When filtered_task_tree is None, the method is a no-op."""
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
         # filtered_task_tree defaults to None (not yet set by harness)
         report = self._fresh_report()
         stage.record_task_dump_spot_check(report)
@@ -14295,8 +14349,9 @@ class TestMemoryConsolidatorMem0ResultsKeyWarns:
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             mem_svc, AsyncMock(), AsyncMock(), config,
+            scope=_scope('test_project', '/tmp/test'),
         )
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
         stage.episode_limit = 100
         stage.memory_limit = 200
         return stage
@@ -14561,6 +14616,7 @@ class TestIntegrityCheckBlockedSnapshotWiring:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -14573,7 +14629,7 @@ class TestIntegrityCheckBlockedSnapshotWiring:
         RED: run() does not yet apply the filter or set the stat.
         """
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.project_id = 'autopilot_video'
+        stage.scope = _scope('autopilot_video', stage.scope.project_root)
         stage.filtered_task_tree = None
 
         snapshot_flag = {
@@ -14631,7 +14687,7 @@ class TestIntegrityCheckBlockedSnapshotWiring:
         RED: run() does not yet apply the filter or set the stat.
         """
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
         stage.filtered_task_tree = None
 
         snapshot_flag = {
@@ -15218,6 +15274,7 @@ class TestRunStage2SummaryReconstructionWiring:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     def _fake_cli_result(self):
@@ -15244,8 +15301,8 @@ class TestRunStage2SummaryReconstructionWiring:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         verify_mock = AsyncMock(side_effect=[0, 1])
         repair_mock = AsyncMock(return_value=0)
@@ -15294,8 +15351,8 @@ class TestRunStage2SummaryReconstructionWiring:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         verify_mock = AsyncMock(return_value=1)
         repair_mock = AsyncMock(return_value=0)
@@ -15345,8 +15402,8 @@ class TestRunStage2SummaryReconstructionWiring:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         verify_mock = AsyncMock(side_effect=[0, 1])
         repair_mock = AsyncMock(return_value=1)
@@ -15401,8 +15458,8 @@ class TestRunStage2SummaryReconstructionWiring:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         verify_mock = AsyncMock(return_value=None)
         repair_mock = AsyncMock(return_value=0)
@@ -15461,8 +15518,8 @@ class TestRunStage2SummaryReconstructionWiring:
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'dark_factory'
-        stage.project_root = '/tmp/test'
+        stage.scope = _scope('dark_factory', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/tmp/test')
 
         verify_mock = AsyncMock(side_effect=[0, 0])
         repair_mock = AsyncMock(return_value=0)
@@ -15610,6 +15667,7 @@ class TestTaskKnowledgeSyncStage2FlagMarkersAcknowledgedStat:
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
             'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
         }
 
     @pytest.mark.asyncio
@@ -15629,8 +15687,8 @@ class TestTaskKnowledgeSyncStage2FlagMarkersAcknowledgedStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -15683,8 +15741,8 @@ class TestTaskKnowledgeSyncStage2FlagMarkersAcknowledgedStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         mock_deps['memory_service'].search.return_value = []
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': []}
@@ -15739,8 +15797,8 @@ class TestTaskKnowledgeSyncStage2FlagMarkersAcknowledgedStat:
         from fused_memory.reconciliation.stages.base import BaseStage
 
         stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
-        stage.project_id = 'reify'
-        stage.project_root = '/home/leo/src/reify'
+        stage.scope = _scope('reify', stage.scope.project_root)
+        stage.scope = _scope(stage.scope.project_id, '/home/leo/src/reify')
 
         # Simulate a previous run's leftover combined_flags sitting on the
         # instance BEFORE this run starts.

@@ -15,11 +15,17 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
 
-def _make_consolidator(project_root: str = '') -> MemoryConsolidator:
+def _scope(project_id: str, project_root: str) -> ProjectScope:
+    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
+    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
+
+
+def _make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
     """Build a MemoryConsolidator with mocked deps — mirrors test_stage1.py."""
     config = ReconciliationConfig()
     memory_mock = AsyncMock()
@@ -34,9 +40,8 @@ def _make_consolidator(project_root: str = '') -> MemoryConsolidator:
         AsyncMock(),  # taskmaster
         AsyncMock(),  # journal
         config,
+        scope=_scope('test_project', project_root),
     )
-    stage.project_id = 'test_project'
-    stage.project_root = project_root
     stage.episode_limit = 5
     stage.memory_limit = 10
     return stage
@@ -156,7 +161,7 @@ class TestRunSurfacesSnapshotStrippedStat:
         Mirrors the census-inconsistency pattern from TestMemoryConsolidatorRunWiring.
         """
         stage = _make_consolidator()
-        stage.project_id = 'test_project'
+        stage.scope = _scope('test_project', stage.scope.project_root)
         stage._entity_summary_snapshot_lines_stripped = 3
 
         base_report = StageReport(

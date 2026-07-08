@@ -68,7 +68,7 @@ async def test_single_registry_propagates_to_harness_and_janitor(
     Verifies:
     (a) harness._known_projects == registry
     (b) janitor._known_projects == registry
-    (c) harness._known_project_root_for('pid_a') returns the right path
+    (c) harness._known_project_scope_for('pid_a').project_root returns the right path
     (d) janitor._known_projects.get('pid_a') returns the right path
     (e) Defensive-copy contract: mutating registry after construction does NOT
         affect either harness or janitor.
@@ -109,7 +109,7 @@ async def test_single_registry_propagates_to_harness_and_janitor(
     assert janitor._known_projects == {'pid_a': '/path/a', 'pid_b': '/path/b'}
 
     # (c) harness lookup method works
-    assert harness._known_project_root_for('pid_a') == '/path/a'
+    assert harness._known_project_scope_for('pid_a').project_root == '/path/a'
 
     # (d) janitor direct dict access works
     assert janitor._known_projects.get('pid_a') == '/path/a'

@@ -40,6 +40,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.flag_dedup import _marker_query
 from fused_memory.server.recon_report import ReconReportState
 
@@ -56,6 +57,11 @@ _STUB_ADD_MEMORY_RESPONSE = AddMemoryResponse(memory_ids=['stub-id'])
 # ---------------------------------------------------------------------------
 # Local helpers (self-contained; do not import from test_flag_dedup.py)
 # ---------------------------------------------------------------------------
+
+
+def _scope(project_id: str, project_root: str) -> ProjectScope:
+    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
+    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
 def _make_memory_result(metadata: dict | None) -> MagicMock:
@@ -567,7 +573,7 @@ class TestUnknownProjectBranchHasNoAnchor:
 
         # Two-project case: 'reify' registered → section renders and contains 'reify'
         stage = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
-        stage.project_id = 'dark_factory'
+        stage.scope = _scope('dark_factory', '/a')
         stage.known_projects = {'dark_factory': '/a', 'reify': '/b'}
         section = stage._format_known_projects_section()
         assert 'reify' in section, (
@@ -578,7 +584,7 @@ class TestUnknownProjectBranchHasNoAnchor:
         # 'reify' is absent from the payload — the LLM's Known Projects section
         # does NOT list it, consistent with cite_task failing for an unregistered project
         stage_solo = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
-        stage_solo.project_id = 'dark_factory'
+        stage_solo.scope = _scope('dark_factory', '/a')
         stage_solo.known_projects = {'dark_factory': '/a'}
         section_solo = stage_solo._format_known_projects_section()
         assert section_solo == '', (
