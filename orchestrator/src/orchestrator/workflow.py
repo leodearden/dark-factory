@@ -7552,9 +7552,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # Trade-off: if create_worktree rebased a genuinely-implemented branch
         # onto a new main tip so that wt_head == new_base_commit, the SHA-primary
         # check returns has_work=False and this guard returns None (the workflow
-        # proceeds to PLAN).  The pre-EXECUTE guard at workflow.py:412-457 still
-        # uses the iteration-log fallback and will catch the rebased ghost-loop
-        # before EXECUTE, routing the workflow to the SUCCESS path.  Only one
+        # proceeds to PLAN).  The pre-EXECUTE guard (_recover_before_execute)
+        # still uses the iteration-log fallback and will catch the rebased
+        # ghost-loop before EXECUTE, finalising through the shared
+        # _finalise_recovery_done chokepoint (recovery-DONE).  Only one
         # architect invocation is wasted — bounded cost, far preferable to a
         # silent false-DONE that marks an unimplemented task complete with no
         # code written.  See _has_prior_implementation() for SHA-primary vs.
