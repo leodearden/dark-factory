@@ -162,3 +162,33 @@ async def test_orchestrator_done_provenance_all_kinds_accepted_by_backend(
 
     task = await backend.get_task(dto['id'], project_root=project_root)
     assert task['metadata']['done_provenance']['kind'] == kind
+
+
+# ── Row 3 — consumer/write negative: symmetric rejection ─────────────
+
+
+@pytest.mark.asyncio
+async def test_bogus_done_provenance_kind_rejected_symmetrically(make_backend, tmp_path):
+    """A kind unknown to the shared model is rejected identically on both sides.
+
+    Producer side: the orchestrator's ``_build_done_provenance`` refuses to
+    construct a bogus kind (``DoneProvenance.kind`` is a closed Literal).
+    Consumer side: an enforce-mode backend refuses to store the same bogus
+    kind, and the rolled-back txn leaves the task's metadata untouched. This
+    is the single-enum symmetry (I2) proven negatively.
+    """
+    with pytest.raises(ValidationError):
+        _build_done_provenance('bogus')
+
+    backend = await make_backend(enforce=True)
+    project_root = str(tmp_path / 'proj')
+    dto = await backend.add_task(project_root=project_root, title='t')
+
+    with pytest.raises(ValidationError):
+        await backend.update_task(
+            dto['id'], project_root=project_root,
+            metadata=json.dumps({'done_provenance': {'kind': 'bogus'}}),
+        )
+
+    task = await backend.get_task(dto['id'], project_root=project_root)
+    assert task['metadata'] == {}
