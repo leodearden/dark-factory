@@ -5565,6 +5565,58 @@ class TestMultiProjectRoutingWiring:
         assert result is not None
         assert result['error_type'] == 'DarkFactoryPathScopeViolation'
 
+    async def test_routing_override_short_circuits_files_certain_reject(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """Task 2206: routing_override_reason must skip BOTH the FILES-certain
+        reject and the PROSE advisory — it is checked first, before
+        ``_files_scope_check`` even runs.
+
+        Drives a genuine metadata.files owner-mismatch (the same shape that
+        rejects hard in test_escalator_failure_swallowed) but with a
+        non-empty override reason: the submission must be allowed, the
+        escalator must NOT fire, and no possible_scope_mismatch marker may
+        be attached — a silent files-certain reject would otherwise still
+        leak a loud advisory even though the caller asked to bypass it.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        kwargs = {
+            'title': 'generic title',
+            'metadata': {'files': ['crates/widget.rs']},
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs,
+            '/foo',
+            'other',
+            routing_override_reason='deliberate cross-cutting change',
+        )
+
+        assert result is None, f'Expected override to skip the reject, got: {result!r}'
+        assert escalator_calls == [], (
+            f'Escalator must NOT fire on a routing override, got: {escalator_calls}'
+        )
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {}), (
+            f"Override must not leave a possible_scope_mismatch marker: {kwargs['metadata']!r}"
+        )
+
     @pytest.mark.asyncio
     async def test_no_hit_adjudicator_not_consulted(
         self,
