@@ -262,6 +262,7 @@ def _make_workflow(
     assignment.task = {'id': task_id, 'title': 'T', 'description': 'd', 'metadata': {}}
     assignment.modules = ['mod_a']
 
+    # noqa: bare-magicmock — pydantic_spec unavailable on fused-memory pythonpath; only config.for_module is read (see docstring above)
     config = MagicMock()
 
     if update_task_raises:
