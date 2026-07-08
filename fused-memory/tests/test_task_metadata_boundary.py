@@ -338,6 +338,9 @@ async def test_done_provenance_malformed_write_warn_vs_enforce_staged_rollout(
     dto = await warn_backend.add_task(project_root=warn_root, title='t')
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        # Scope the census to exactly this write, not whatever the prior
+        # add_task calls in this test happened to (not) log.
+        caplog.clear()
         await warn_backend.update_task(
             dto['id'], project_root=warn_root, metadata=json.dumps(malformed),
         )
@@ -403,6 +406,9 @@ async def test_update_task_kind_deterministic_on_normal_task_rejected_post_merge
     )
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        # Scope the census to exactly this write, not whatever the prior
+        # add_task calls in this test happened to (not) log.
+        caplog.clear()
         await warn_backend.update_task(
             dto2['id'], project_root=warn_root,
             metadata=json.dumps({'task_kind': 'deterministic'}),
