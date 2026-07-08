@@ -708,6 +708,7 @@ async def _default_ssh_heartbeat_run(
     )
 
     async def _heartbeat() -> None:
+        assert proc.stdin is not None  # stdin=PIPE above guarantees this
         while True:
             await asyncio.sleep(heartbeat_interval)
             try:
