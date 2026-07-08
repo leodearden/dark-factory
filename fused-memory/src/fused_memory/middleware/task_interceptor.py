@@ -47,7 +47,6 @@ from fused_memory.middleware.lock_charter_guard import (
 )
 from fused_memory.middleware.path_scope_guard import (
     PathGuardVerdict,
-    check_candidate_for_scope,
     check_files_for_scope,
     check_text_for_scope,
     is_routing_override,
@@ -1192,32 +1191,43 @@ class TaskInterceptor:
         kwargs: dict,
         project_id: str,
     ) -> PathGuardVerdict:
-        """Run the path-scope guard and return its verdict.
+        """Run the PROSE-ONLY heuristic path-scope guard and return its verdict.
 
         Uses the generalised multi-project guard against
         :attr:`_prefix_registry` when one is configured; otherwise falls
         back to the dark-factory-only guard for back-compat with
         deployments that haven't yet supplied a registry.
 
-        Title-bearing submissions go through ``check_candidate_for_*``;
-        prompt-only submissions concatenate ``prompt + title + description
-        + details`` from *kwargs* (plus any metadata-supplied
-        ``files_to_modify`` / ``modules``) and use ``check_text_for_*``.
-        All four free-form fields and the metadata files are scanned so a
-        path hidden in any of them cannot bypass the guard (parity with
-        the title-bearing branch — closes the residual-leak class that
-        task 1094 fixed).
+        Multi-project (registry configured) — scans title / description /
+        details (candidate branch) or prompt / title / description / details
+        (prompt-only branch) ONLY.  Concrete ``metadata.files`` entries are
+        the FILES-certain check's job (:meth:`_files_scope_check` /
+        :func:`check_files_for_scope`) — this heuristic regex-over-prose
+        scanner must never re-scan them, or a file would be double-
+        classified by both the exact lookup and the heuristic (task 2206).
+        A rejection here is a non-rejecting advisory in
+        :meth:`_path_guard_or_skip`.
+
+        Back-compat (no registry configured) — UNCHANGED from before task
+        2206: the original task-1088 dark-factory-only guard, which also
+        scans ``files_to_modify`` / metadata files and hard-rejects on any
+        hit.  There is no registry for :func:`check_files_for_scope` to
+        certainly classify a file against in this mode, so demoting this
+        branch to advisory would be a silent gap rather than a loud one;
+        back-compat mode keeps its pre-task-2206 contract.
         """
         registry = self._prefix_registry
         if registry is not None and registry:
             if candidate is not None:
-                return check_candidate_for_scope(candidate, project_id, registry)
-            text = '\n'.join(
-                str(kwargs.get(k) or '') for k in ('prompt', 'title', 'description', 'details')
-            )
-            meta_files = self._extract_meta_files(kwargs)
-            if meta_files:
-                text = text + '\n' + '\n'.join(meta_files)
+                text = '\n'.join([
+                    candidate.title or '',
+                    candidate.description or '',
+                    candidate.details or '',
+                ])
+            else:
+                text = '\n'.join(
+                    str(kwargs.get(k) or '') for k in ('prompt', 'title', 'description', 'details')
+                )
             return check_text_for_scope(text, project_id, registry)
         # Back-compat: no multi-project registry → original dark-factory-only guard.
         if candidate is not None:
