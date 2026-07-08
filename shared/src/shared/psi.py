@@ -121,19 +121,41 @@ class PsiSample:
         )
 
 
+_FAIL_OPEN = PsiSample(
+    cpu_some10=0.0,
+    mem_some10=0.0,
+    mem_full10=0.0,
+    io_some10=0.0,
+    read_ok=False,
+)
+
+
 def read_psi_sample(*, read: Callable[[str], str] = read_pressure) -> PsiSample:
     """Read and parse /proc/pressure/{cpu,memory,io} into a PsiSample.
 
     Maps cpu.some -> cpu_some10, mem.some -> mem_some10, mem.full ->
     mem_full10, and io.some -> io_some10.
 
-    Note:
-        This is the happy path only; fail-open handling (DA-D6) for an
-        unreadable or unparseable source is layered on in a later revision.
+    Fail-open (DA-D6): if any source is unreadable (``read`` raises OSError)
+    or unparseable (``parse_pressure_file`` returns None), the WHOLE sample
+    degrades to the fail-open sentinel (all metrics 0.0, read_ok=False)
+    rather than gating on partial data — this must never wedge dispatch.
+    Loud, rate-limited logging on this condition is the caller's (DA3)
+    responsibility; this function stays side-effect-light (at most a single
+    debug line) to avoid per-tick log spam.
     """
-    cpu = parse_pressure_file(read('cpu'))
-    mem = parse_pressure_file(read('memory'))
-    io = parse_pressure_file(read('io'))
+    try:
+        cpu = parse_pressure_file(read('cpu'))
+        mem = parse_pressure_file(read('memory'))
+        io = parse_pressure_file(read('io'))
+    except OSError:
+        logger.debug('PSI read failed; failing open', exc_info=True)
+        return _FAIL_OPEN
+
+    if cpu is None or mem is None or io is None:
+        logger.debug('PSI parse failed (unparseable source); failing open')
+        return _FAIL_OPEN
+
     return PsiSample(
         cpu_some10=cpu['some_avg10'],
         mem_some10=mem['some_avg10'],
