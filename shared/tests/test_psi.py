@@ -162,3 +162,46 @@ class TestPsiSampleSaturated:
             read_ok=True,
         )
         assert sample.saturated(_saturation_cfg()) is False
+
+
+class TestReadPsiSampleHappyPath:
+    def _fake_read(self):
+        # Note: the memory pressure file is read under the name 'memory', not 'mem'.
+        sources = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+
+        def read(name):
+            return sources[name]
+
+        return read
+
+    def test_maps_per_metric_fields(self):
+        from shared.psi import read_psi_sample
+
+        sample = read_psi_sample(read=self._fake_read())
+
+        assert sample.read_ok is True
+        assert sample.cpu_some10 == pytest.approx(2.50)
+        assert sample.mem_some10 == pytest.approx(1.23)
+        assert sample.mem_full10 == 0.0
+        assert sample.io_some10 == pytest.approx(0.75)
+
+    def test_saturated_reflects_injected_values(self):
+        from shared.psi import read_psi_sample
+
+        sample = read_psi_sample(read=self._fake_read())
+
+        low_cpu_cfg = types.SimpleNamespace(
+            cpu_some_avg10=1.0,
+            mem_some_avg10=999.0,
+            mem_full_avg10=999.0,
+            io_some_avg10=999.0,
+        )
+        assert sample.saturated(low_cpu_cfg) is True
+
+        all_high_cfg = types.SimpleNamespace(
+            cpu_some_avg10=999.0,
+            mem_some_avg10=999.0,
+            mem_full_avg10=999.0,
+            io_some_avg10=999.0,
+        )
+        assert sample.saturated(all_high_cfg) is False
