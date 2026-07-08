@@ -90,7 +90,7 @@ taskmaster:
 # ValidationError. See shared/src/shared/task_metadata.py and
 # plans/task-metadata-schema-prd.md.
 task_metadata:
-  enforce: false
+  enforce: true
 
 reconciliation:
   enabled: true
