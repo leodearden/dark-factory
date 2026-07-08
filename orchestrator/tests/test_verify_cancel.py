@@ -588,3 +588,111 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
         f'These pids survived cancel_request (start_new_session escapes not reaped?): '
         f'{still_alive}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 2308 γ step-1: run_stdin_watchdog — fd-0 trigger loop
+#
+# Connection-death heartbeat-watchdog (PRD: plans/laptop-warm-verify-flock-
+# orphan-prd.md, Change B, §4 B1/B2 + §8.1). run_stdin_watchdog(read_fd,
+# on_fire, *, heartbeat_timeout, select_fn, read_fn) fires on_fire() exactly
+# once when either: (a) no heartbeat arrives within heartbeat_timeout
+# (starvation — empty select() ready set), or (b) read_fd hits EOF (a read
+# returns b'' — the writing end closed the channel).  A heartbeat (any
+# non-empty read) resets the window and the loop continues.  select_fn/
+# read_fn are injected so this is testable without a real pipe or wall-clock
+# waits.
+# ---------------------------------------------------------------------------
+
+
+class TestRunStdinWatchdog:
+    """run_stdin_watchdog(read_fd, on_fire, *, heartbeat_timeout, select_fn, read_fn)."""
+
+    def test_fires_on_eof(self):
+        """select_fn reports ready, read_fn returns b'' (EOF) -> on_fire fires once, loop returns."""
+        from orchestrator.verify_cancel import run_stdin_watchdog
+
+        select_calls = []
+        read_calls = []
+        fire_calls = []
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            select_calls.append((rlist, wlist, xlist, timeout))
+            return (rlist, [], [])  # fd ready
+
+        def fake_read(fd, size):
+            read_calls.append((fd, size))
+            return b''  # EOF
+
+        run_stdin_watchdog(
+            7,
+            lambda: fire_calls.append(True),
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert fire_calls == [True]
+        assert len(select_calls) == 1
+        assert select_calls[0] == ([7], [], [], 5.0)
+        assert len(read_calls) == 1
+
+    def test_fires_on_heartbeat_timeout(self):
+        """select_fn reports an empty ready set (timeout) -> on_fire fires once, without reading."""
+        from orchestrator.verify_cancel import run_stdin_watchdog
+
+        select_calls = []
+        read_calls = []
+        fire_calls = []
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            select_calls.append((rlist, wlist, xlist, timeout))
+            return ([], [], [])  # timeout -- nothing ready
+
+        def fake_read(fd, size):
+            read_calls.append((fd, size))
+            return b'\n'  # must never be reached
+
+        run_stdin_watchdog(
+            7,
+            lambda: fire_calls.append(True),
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert fire_calls == [True]
+        assert len(select_calls) == 1
+        assert read_calls == []  # starvation fires without ever reading
+
+    def test_survives_heartbeats_then_fires_on_eof(self):
+        """K heartbeats (non-empty reads) reset the window and do not fire; the (K+1)th EOF does."""
+        from orchestrator.verify_cancel import run_stdin_watchdog
+
+        K = 3
+        select_calls = []
+        read_calls = []
+        fire_calls = []
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            select_calls.append((rlist, wlist, xlist, timeout))
+            return (rlist, [], [])  # always "ready"
+
+        def fake_read(fd, size):
+            read_calls.append((fd, size))
+            if len(read_calls) <= K:
+                return b'\n'  # heartbeat -- resets the window, must not fire
+            return b''  # EOF on the (K+1)th read
+
+        run_stdin_watchdog(
+            7,
+            lambda: fire_calls.append(True),
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        # on_fire called exactly once, only after read_fn was called K+1 times
+        assert fire_calls == [True]
+        assert len(read_calls) == K + 1
+        assert len(select_calls) == K + 1
