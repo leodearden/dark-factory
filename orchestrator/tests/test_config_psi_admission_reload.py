@@ -69,3 +69,40 @@ class TestMinInflightFloorValidation:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
             OrchestratorConfig(psi_admission={'min_inflight_floor': 0})
+
+
+class TestPsiAdmissionReloadDisposition:
+    """Every psi_admission threshold is green-tier: hot-reloadable without a
+    process restart, mirroring the fairness/starvation_watchdog groups.
+    """
+
+    @pytest.mark.parametrize('leaf', list(PsiAdmissionConfig.model_fields))
+    def test_every_leaf_is_reloadable(self, leaf):
+        assert f'psi_admission.{leaf}' in RELOADABLE_FIELDS, (
+            f'psi_admission.{leaf!r} is expected to be green-tier reloadable '
+            f'but is missing from RELOADABLE_FIELDS'
+        )
+
+    def test_threshold_edit_lands_in_applied_candidates_not_restart_required(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0))
+        fresh = OrchestratorConfig(psi_admission=PsiAdmissionConfig(cpu_some_avg10=99.0))
+        diff = diff_config(live, fresh)
+        assert 'psi_admission.cpu_some_avg10' in diff.applied_candidates
+        assert 'psi_admission.cpu_some_avg10' not in diff.restart_required
+
+    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(psi_admission=PsiAdmissionConfig(cpu_some_avg10=85.0))
+        fresh = OrchestratorConfig(psi_admission=PsiAdmissionConfig(cpu_some_avg10=99.0))
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['applied']['psi_admission.cpu_some_avg10'] == {
+            'old': 85.0, 'new': 99.0,
+        }
+        assert 'psi_admission.cpu_some_avg10' not in report['restart_required']
+        assert live.psi_admission.cpu_some_avg10 == 99.0
