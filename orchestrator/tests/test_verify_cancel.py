@@ -696,3 +696,108 @@ class TestRunStdinWatchdog:
         assert fire_calls == [True]
         assert len(read_calls) == K + 1
         assert len(select_calls) == K + 1
+
+
+# ---------------------------------------------------------------------------
+# Task 2308 γ step-3: fire_watchdog_kill — SIGTERM descendants, grace, SIGKILL
+# survivors, unconditional self-exit
+# ---------------------------------------------------------------------------
+
+
+class TestFireWatchdogKill:
+    """fire_watchdog_kill(pgid, ...) — SIGTERM descendants, grace, SIGKILL survivors, exit."""
+
+    def test_signals_only_descendants_grace_then_sigkill_then_exit(self):
+        """(a)-(d): descendants only, grace between passes, SIGKILL survivors, exit is final."""
+        import signal
+
+        from orchestrator.verify_cancel import fire_watchdog_kill
+
+        # ppid_map: P(100) -> A(200) -> B(300); unrelated 999 (ppid 1, not a descendant of P)
+        ppid_map = {200: 100, 300: 200, 999: 1}
+
+        events = []
+        term_pids = []
+        kill_pids = []
+        killpg_calls = []
+
+        def fake_kill(pid, sig):
+            if sig == signal.SIGTERM:
+                term_pids.append(pid)
+                events.append(('term', pid))
+            elif sig == signal.SIGKILL:
+                kill_pids.append(pid)
+                events.append(('kill', pid))
+
+        def fake_killpg(pgid, sig):
+            killpg_calls.append((pgid, sig))
+
+        def fake_sleep(secs):
+            events.append(('sleep', secs))
+
+        def fake_exit(code):
+            events.append(('exit', code))
+
+        fire_watchdog_kill(
+            100,
+            grace_secs=5.0,
+            ppid_map_provider=lambda: ppid_map,
+            kill=fake_kill,
+            killpg=fake_killpg,
+            sleep=fake_sleep,
+            exit_fn=fake_exit,
+        )
+
+        # (a) SIGTERM sent to exactly the descendants {200, 300} -- never root/self, never unrelated
+        assert set(term_pids) == {200, 300}
+
+        # (b) sleep(grace_secs) called between the SIGTERM pass and the SIGKILL pass
+        sleep_idx = events.index(('sleep', 5.0))
+        assert all(events.index(('term', pid)) < sleep_idx for pid in (200, 300))
+
+        # (c) SIGKILL sent to surviving descendants {200, 300}
+        assert set(kill_pids) == {200, 300}
+        assert all(events.index(('kill', pid)) > sleep_idx for pid in (200, 300))
+
+        # (d) exit_fn called once with a non-zero code, as the final action
+        exit_events = [e for e in events if e[0] == 'exit']
+        assert len(exit_events) == 1
+        assert exit_events[0][1] != 0
+        assert events[-1] == exit_events[0]
+
+        # Design decision: the watchdog signals only descendants and never
+        # killpg's its own group (it runs inside the target group, unlike
+        # cancel_request) -- killpg is accepted for signature symmetry only.
+        assert killpg_calls == []
+
+    def test_dead_descendant_process_lookup_error_tolerated(self):
+        """(e): a descendant already dead (ProcessLookupError) is tolerated; exit_fn still fires."""
+        from orchestrator.verify_cancel import fire_watchdog_kill
+
+        ppid_map = {200: 100}  # single descendant, already gone
+        exit_calls = []
+
+        def fake_kill(pid, sig):
+            raise ProcessLookupError()
+
+        def fake_killpg(pgid, sig):
+            raise AssertionError('fire_watchdog_kill must not killpg its own group')
+
+        def fake_sleep(secs):
+            pass
+
+        def fake_exit(code):
+            exit_calls.append(code)
+
+        # Must not raise despite kill() always raising ProcessLookupError.
+        fire_watchdog_kill(
+            100,
+            grace_secs=0.0,
+            ppid_map_provider=lambda: ppid_map,
+            kill=fake_kill,
+            killpg=fake_killpg,
+            sleep=fake_sleep,
+            exit_fn=fake_exit,
+        )
+
+        assert exit_calls == [1]
