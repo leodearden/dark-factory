@@ -47,6 +47,7 @@ from shared.cli_invoke import (
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 
+from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 
 if TYPE_CHECKING:
@@ -660,24 +661,20 @@ class TaskCurator:
         return h.hexdigest()[:16]
 
     @staticmethod
-    def _normalize_key(candidate: CandidateTask) -> str:
+    def _normalize_key(candidate: CandidateTask) -> str | None:
         """Stable 16-char hash over normalised (title, files_to_modify).
 
         Case + whitespace insensitive on the title, file-order insensitive.
         Designed to catch "two reviewers raced with the same suggestion"
         without depending on embeddings. See plan R3 — pre-LLM
         short-circuit.
+
+        Delegates to :func:`fused_memory.middleware.candidate_key.compute_candidate_key`
+        — the single owner of this key definition (fm-task-dedup W8 task A1) — rather
+        than keeping its own hash. Returns ``None`` for a candidate whose title
+        normalises to empty (see that function's docstring).
         """
-        title = (candidate.title or '').strip().lower()
-        files = '\n'.join(sorted(candidate.files_to_modify or []))
-        h = hashlib.sha256()
-        h.update(title.encode())
-        h.update(b'|')
-        h.update(files.encode())
-        # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
-        # Any change to length or algorithm must be mirrored there and at the other
-        # task_curator.py mirror sites (payload_hash, _intra_batch_key).
-        return h.hexdigest()[:16]
+        return compute_candidate_key(candidate.title, candidate.files_to_modify)
 
     def _evict_stale_recent_creates(self, project_id: str, now: float) -> None:
         bucket = self._recent_creates.get(project_id)
@@ -705,6 +702,9 @@ class TaskCurator:
         now = time.monotonic()
         self._evict_stale_recent_creates(project_id, now)
         key = self._normalize_key(candidate)
+        if key is None:
+            # Title normalises to empty — no dedup signal to match on.
+            return None
         entry = bucket.get(key)
         if entry is None:
             return None
@@ -737,9 +737,15 @@ class TaskCurator:
 
         Call this *after* ``tm.add_task`` returns and within the
         project's add_task critical section so the next waiter sees it.
+
+        No-ops when the candidate's normalised key is ``None`` (title
+        normalises to empty) — there is no dedup signal worth caching.
         """
+        key = self._normalize_key(candidate)
+        if key is None:
+            return
         bucket = self._recent_creates.setdefault(project_id, {})
-        bucket[self._normalize_key(candidate)] = (task_id, time.monotonic())
+        bucket[key] = (task_id, time.monotonic())
 
     async def _maybe_blocklist_drop(
         self, candidate: CandidateTask, payload_hash: str,
