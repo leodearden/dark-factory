@@ -545,6 +545,9 @@ class TestUsageGateProbeProcessGroup:
         gate._probe_config_dir = MagicMock()
         gate._probe_config_dir.path = Path('/tmp/probe-test')
         gate._probe_config_dir.write_credentials = MagicMock()
+        # _config_dir_for(acct) resolves via _probe_config_dirs[acct.name] first
+        # (task 2139), so the per-account entry must point at the same mock.
+        gate._probe_config_dirs = {acct.name: gate._probe_config_dir}
         return gate, acct
 
     async def test_usage_gate_probe_passes_start_new_session_true(
@@ -618,6 +621,9 @@ class TestUsageGateProbeExitCodeClassification:
         gate._probe_config_dir = MagicMock()
         gate._probe_config_dir.path = Path('/tmp/probe-test')
         gate._probe_config_dir.write_credentials = MagicMock()
+        # _config_dir_for(acct) resolves via _probe_config_dirs[acct.name] first
+        # (task 2139), so the per-account entry must point at the same mock.
+        gate._probe_config_dirs = {acct.name: gate._probe_config_dir}
         return gate, acct
 
     async def test_probe_local_budget_exhaustion_returns_true(

@@ -1314,8 +1314,9 @@ class UsageGate:
         """
         _PROBE_TIMEOUT = 30
 
+        config_dir = self._config_dir_for(acct)
         if acct.token is not None:
-            self._probe_config_dir.write_credentials(acct.token)
+            config_dir.write_credentials(acct.token)
 
         cmd = [
             'claude', '--print', '--output-format', 'json',
@@ -1329,7 +1330,7 @@ class UsageGate:
         env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
         if acct.token is not None:
             env['CLAUDE_CODE_OAUTH_TOKEN'] = acct.token
-        env['CLAUDE_CONFIG_DIR'] = str(self._probe_config_dir.path)
+        env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
 
         proc: asyncio.subprocess.Process | None = None
         pgid: int | None = None
