@@ -151,6 +151,13 @@ class MemoryConsolidator(BaseStage):
         report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
         report.stats['stage1_cycle_summary_pool_trimmed'] = pretrimmed
 
+        # Always present (task-2312): set BEFORE the remediation early-return below
+        # so downstream consumers see this key on every run, including remediation
+        # passes (which skip dedup_flags entirely and so never reach the overwrite
+        # below). Overwritten after dedup_flags on a full (non-remediation) run with
+        # items_flagged; stays 0 otherwise.
+        report.stats['stage1_completion_markers_self_deleted'] = 0
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
@@ -203,6 +210,13 @@ class MemoryConsolidator(BaseStage):
                 project_id=self.project_id,
                 run_id=run_id,
                 flags=report.items_flagged,
+            )
+            # One-time completion markers dedup_flags emitted-then-self-deleted this
+            # cycle (task-2312) — counts flags annotated completion_marker_self_deleted
+            # by the flag_for_stage2=False branch; 0 when none were present.
+            report.stats['stage1_completion_markers_self_deleted'] = sum(
+                1 for f in report.items_flagged
+                if f.get('completion_marker_self_deleted') is True
             )
             # Signatures dropped specifically by dedup_flags' internal suppression
             # gate: present before dedup_flags, absent after.  dedup_flags never
