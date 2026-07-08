@@ -7,6 +7,9 @@ already-built backend/interceptor claimant write over MCP so the orchestrator
 Covers:
   - step-5/6: set_task_status tool forwards claimant_run_id/heartbeat_at to
     interceptor.set_task_status only when supplied (legacy calls unaffected).
+  - step-7/8: new set_task_claimant tool routes to
+    interceptor.set_task_claimant, preserving tri-state over the wire (a
+    wire-sentinel default is untouched; explicit JSON null clears).
 """
 
 from __future__ import annotations
@@ -85,5 +88,86 @@ async def test_set_task_status_without_claimant_kwargs_is_byte_identical(
     )
     task_interceptor.set_task_status.assert_called_once()
     kwargs = task_interceptor.set_task_status.call_args.kwargs
+    assert 'claimant_run_id' not in kwargs
+    assert 'heartbeat_at' not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# step-7/8: new set_task_claimant tool
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_tool_forwards_string_kwargs(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """A string claimant_run_id/heartbeat_at reaches interceptor.set_task_claimant."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_claimant',
+        {
+            'id': '1',
+            'project_root': '/project',
+            'claimant_run_id': 'run-x/session-y/pid=123',
+            'heartbeat_at': '2026-07-08T00:00:00+00:00',
+        },
+    )
+    task_interceptor.set_task_claimant.assert_called_once()
+    kwargs = task_interceptor.set_task_claimant.call_args.kwargs
+    assert kwargs.get('claimant_run_id') == 'run-x/session-y/pid=123'
+    assert kwargs.get('heartbeat_at') == '2026-07-08T00:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_tool_heartbeat_only_refresh_leaves_run_id_untouched(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Heartbeat-only refresh: claimant_run_id omitted -> untouched (not forwarded)."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_claimant',
+        {
+            'id': '1',
+            'project_root': '/project',
+            'heartbeat_at': '2026-07-08T00:00:00+00:00',
+        },
+    )
+    task_interceptor.set_task_claimant.assert_called_once()
+    kwargs = task_interceptor.set_task_claimant.call_args.kwargs
+    assert 'claimant_run_id' not in kwargs
+    assert kwargs.get('heartbeat_at') == '2026-07-08T00:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_tool_release_clear_forwards_explicit_none(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Release clear: explicit JSON null for both fields forwards as None."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_claimant',
+        {
+            'id': '1',
+            'project_root': '/project',
+            'claimant_run_id': None,
+            'heartbeat_at': None,
+        },
+    )
+    task_interceptor.set_task_claimant.assert_called_once()
+    kwargs = task_interceptor.set_task_claimant.call_args.kwargs
+    assert 'claimant_run_id' in kwargs
+    assert kwargs['claimant_run_id'] is None
+    assert 'heartbeat_at' in kwargs
+    assert kwargs['heartbeat_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_set_task_claimant_tool_no_kwargs_supplied_omits_both(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """Neither field supplied -> neither key reaches the interceptor call."""
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_claimant',
+        {'id': '1', 'project_root': '/project'},
+    )
+    task_interceptor.set_task_claimant.assert_called_once()
+    kwargs = task_interceptor.set_task_claimant.call_args.kwargs
     assert 'claimant_run_id' not in kwargs
     assert 'heartbeat_at' not in kwargs
