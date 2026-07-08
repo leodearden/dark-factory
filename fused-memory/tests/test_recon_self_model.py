@@ -183,3 +183,30 @@ class TestRenderMarkerLifecycleSection:
         assert 'swept' in text
         assert 'stage1_flag_marker' in text
         assert 'flag_for_stage2' in text
+
+
+# --------------------------------------------------------------------------- #
+# render_suppression_schema_section (step-9/10)
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderSuppressionSchemaSection:
+    """render_suppression_schema_section() renders the canonical suppression
+    record schema faithful to stage1.py:498-560."""
+
+    def test_returns_non_empty_str(self):
+        assert isinstance(m.render_suppression_schema_section(), str)
+        assert m.render_suppression_schema_section()
+
+    def test_contains_canonical_schema_tokens(self):
+        text = m.render_suppression_schema_section()
+        assert 'stage1_flag_suppression' in text
+        assert 'metadata.task_id' in text
+        assert 'metadata.flag_types' in text
+
+    def test_contains_scoped_vs_blanket_semantics(self):
+        text = m.render_suppression_schema_section()
+        assert 'blanket' in text
+        assert 'scoped' in text
+        # Blanket wins on conflict with a scoped record for the same task_id.
+        assert 'wins' in text
