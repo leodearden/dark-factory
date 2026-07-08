@@ -801,3 +801,46 @@ class TestFireWatchdogKill:
         )
 
         assert exit_calls == [1]
+
+
+# ---------------------------------------------------------------------------
+# Task 2308 γ step-5: start_stdin_watchdog — spawns a started daemon thread
+# running run_stdin_watchdog, wired to fire on stdin EOF/starvation
+# ---------------------------------------------------------------------------
+
+
+class TestStartStdinWatchdog:
+    """start_stdin_watchdog spawns a daemon thread running run_stdin_watchdog wired to fire."""
+
+    def test_spawns_started_daemon_thread_wired_to_fire(self):
+        """Returns a started daemon Thread; the injected fire callback runs exactly once."""
+        import threading
+
+        from orchestrator.verify_cancel import start_stdin_watchdog
+
+        fire_calls = []
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            return (rlist, [], [])  # immediately "ready"
+
+        def fake_read(fd, size):
+            return b''  # EOF
+
+        thread = start_stdin_watchdog(
+            12345,
+            heartbeat_timeout=5.0,
+            grace_secs=1.0,
+            read_fd=0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+            fire=lambda: fire_calls.append(True),
+        )
+
+        # (a) return value is a Thread with .daemon True; join() only succeeds if started
+        assert isinstance(thread, threading.Thread)
+        assert thread.daemon is True
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+        # (b) the injected fire was invoked exactly once (loop wired to on_fire)
+        assert fire_calls == [True]
