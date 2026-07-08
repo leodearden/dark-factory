@@ -381,6 +381,51 @@ async def test_gc_with_empty_terminal_task_ids_deletes_only_expired(store):
 
 
 @pytest.mark.asyncio
+async def test_gc_keeps_marker_kind_row_with_null_expires_when_task_not_terminal(store):
+    """A marker-kind row (e.g. stage1_flag_marker) with expires_at=None must
+    survive gc() when its task_id is NOT in terminal_task_ids — NULL
+    expires_at means never-expire regardless of record_kind, and the
+    terminal-referenced clause only deletes rows whose task_id actually
+    appears in terminal_task_ids."""
+    never_expire_marker = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='stage1_flag_marker',
+        payload_json='{}',
+        state='active',
+        created_at='2026-06-01T00:00:00+00:00',
+        task_id='task-live-forever',
+        flag_type='drift_flag',
+        expires_at=None,
+    )
+    await store.upsert(never_expire_marker)
+
+    deleted_count = await store.gc(
+        'proj-p', now='2026-07-01T00:00:00+00:00', terminal_task_ids=['some-other-task']
+    )
+
+    assert deleted_count == 0
+    assert (
+        await store.get_by_identity(
+            'proj-p', 'stage1_flag_marker', task_id='task-live-forever', flag_type='drift_flag'
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_returns_three_int_tuple(store):
+    """checkpoint() runs PRAGMA wal_checkpoint(TRUNCATE) directly and returns
+    a (busy, log, checkpointed) tuple of three ints — locks the return
+    contract independently of its indirect coverage via
+    _collect_checkpoint_targets membership."""
+    result = await store.checkpoint()
+
+    assert isinstance(result, tuple)
+    assert len(result) == 3
+    assert all(isinstance(value, int) for value in result)
+
+
+@pytest.mark.asyncio
 async def test_mark_addressed_sets_state_and_stamps_payload(store):
     """mark_addressed() flips state to 'addressed' and stamps addressed_by /
     addressed_run_id into payload_json (read-modify-write)."""

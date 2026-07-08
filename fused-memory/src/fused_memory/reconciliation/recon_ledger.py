@@ -76,6 +76,18 @@ class ReconLedgerRecord:
     ``expires_at`` of ``None`` means the record never expires via TTL (it can
     still be GC'd via the terminal-task-referenced path in
     :meth:`ReconLedgerStore.gc`).
+
+    ``payload_json`` should encode a JSON *object* (dict) — callers that
+    stamp acknowledgement metadata (:meth:`ReconLedgerStore.mark_addressed`)
+    assume object semantics, though that method defensively tolerates other
+    JSON shapes rather than raising.
+
+    ``created_at``/``expires_at`` must be normalized UTC ISO-8601 strings in
+    a single canonical, zero-padded format (e.g.
+    ``'2026-07-01T00:00:00+00:00'``). :meth:`ReconLedgerStore.gc` compares
+    ``expires_at`` against its ``now`` argument as plain SQLite TEXT, so
+    ordering is lexicographic and only correct when every timestamp shares
+    the same format/width/offset representation.
     """
 
     project_id: str
@@ -266,6 +278,15 @@ class ReconLedgerStore:
         guard rather than relying on an empty ``IN ()`` (which SQLite treats
         as always-false, but that's implicit engine behaviour, not a
         contract this store leans on).
+
+        ``now`` is compared against ``expires_at`` as plain SQLite TEXT
+        (lexicographic string ordering), not a parsed timestamp — this is
+        only correct when ``now`` and every stored ``expires_at`` are
+        normalized UTC ISO-8601 strings in the same canonical, zero-padded
+        format (see :class:`ReconLedgerRecord`). Mixed offset notations
+        (``'Z'`` vs ``'+00:00'``) or inconsistent zero-padding would silently
+        corrupt this comparison; callers are responsible for passing
+        normalized timestamps.
         """
         async with self._txn() as db:
             if terminal_task_ids:
@@ -310,6 +331,12 @@ class ReconLedgerStore:
         read-modify-write. A call against an identity with no matching row is
         a silent no-op — it must not raise and must not create a row (avoids
         resurrecting a GC'd marker).
+
+        ``payload_json`` is expected to hold a JSON object (see
+        :class:`ReconLedgerRecord`); a non-object payload (e.g. a JSON
+        list/number/string) is wrapped as ``{'_payload': <value>}`` before the
+        acknowledgement keys are stamped in, so this never raises — and never
+        rolls back the transaction — on an unexpected payload shape.
         """
         async with self._txn() as db:
             cursor = await db.execute(
@@ -324,6 +351,12 @@ class ReconLedgerStore:
             if row is None:
                 return
             payload = json.loads(row['payload_json'])
+            # Defensively tolerate a non-object payload_json (valid JSON that
+            # isn't a dict — a list, number, or string) instead of letting
+            # the item assignment below raise TypeError and roll back the
+            # whole transaction. See ReconLedgerRecord's payload_json contract.
+            if not isinstance(payload, dict):
+                payload = {'_payload': payload}
             payload['addressed_by'] = addressed_by
             payload['addressed_run_id'] = addressed_run_id
             await db.execute(
