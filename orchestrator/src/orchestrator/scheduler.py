@@ -4953,3 +4953,17 @@ class Scheduler:
             )
             self._fallback_warned.add(task_id)
         return [f'task-{task_id or "unknown"}']
+
+    def seed_modules(self, task_id: str, files: list[str]) -> list[str]:
+        """Public entry point for the harness module-tagger.
+
+        Derives modules from *files* via ``derive_modules`` (the α strip
+        applies) and, when non-empty, writes them through the single
+        cache-writing seam (``_write_module_cache``).  An empty derivation
+        (an all-directory charter) is NOT cached — parity with
+        ``_get_modules``'s fall-through to the task-<id> fallback.
+        """
+        derived = derive_modules(files, self.config.lock_depth, task_id=task_id)
+        if derived:
+            self._write_module_cache(task_id, derived)
+        return derived
