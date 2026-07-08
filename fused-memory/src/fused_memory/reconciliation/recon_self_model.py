@@ -29,6 +29,8 @@ therefore does not modify, and is not yet imported by, any prompt file.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
     STAGE1_CYCLE_SUMMARY_RECON_POOL,
@@ -54,6 +56,73 @@ MARKER_KINDS = (
     'flag_for_stage2',
     'cycle_summary',
 )
+
+# --------------------------------------------------------------------------- #
+# Marker lifecycle: who writes each record_kind, and who deletes it
+# --------------------------------------------------------------------------- #
+
+# Deleter sentinels — see MarkerLifecycle.deleter. These are descriptive
+# tags (not machine identifiers) naming the mechanism that removes a record.
+DELETER_GC = 'gc-on-terminal-or-ttl'
+DELETER_POOL_TRIM = 'cycle-summary-pool-cap-trim-or-ttl'
+DELETER_TTL = 'ttl-expiry'
+
+
+@dataclass(frozen=True)
+class MarkerLifecycle:
+    """Who writes a record_kind, and what deletes it.
+
+    ``writer``/``deleter`` are short human-readable descriptions documenting
+    the lifecycle contract for a record_kind — this is not a runtime
+    dispatch table.
+    """
+
+    writer: str
+    deleter: str
+
+
+# One entry per MARKER_KINDS value. The GC-on-terminal subset (deleter ==
+# DELETER_GC) is exactly recon_ledger.MARKER_KINDS — the per-task marker
+# kinds ReconLedgerStore.gc() deletes once their task_id goes terminal.
+# stage1_flag_suppression and cycle_summary are NOT per-task markers, so
+# they expire via TTL / pool-cap trim instead (see recon_ledger.py:62-66 and
+# recon_pool_map.py's docstring for the corresponding cycle_summary pool-cap
+# trim mechanism). test_recon_self_model.py cross-checks this subset against
+# recon_ledger.MARKER_KINDS to catch drift between the two modules.
+MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
+    'stage1_flag_marker': MarkerLifecycle(
+        writer=(
+            'Stage 1 flag_dedup post-processor (dedup_flags), one marker per '
+            '(task_id, flag_type)'
+        ),
+        deleter=DELETER_GC,
+    ),
+    'flag_for_stage2': MarkerLifecycle(
+        writer=(
+            'Stage 1 flag_dedup post-processor, for flagged items carrying '
+            'metadata.flag_for_stage2=true'
+        ),
+        deleter=DELETER_GC,
+    ),
+    'stage2_persistence_marker': MarkerLifecycle(
+        writer='Stage 2 / TaskKnowledgeSync post-processor',
+        deleter=DELETER_GC,
+    ),
+    'stage1_flag_suppression': MarkerLifecycle(
+        writer=(
+            'Operators / remediation hooks, via '
+            'flag_dedup.write_suppression_record'
+        ),
+        deleter=DELETER_TTL,
+    ),
+    'cycle_summary': MarkerLifecycle(
+        writer=(
+            "Python, from each stage's StageReport — one per stage per cycle "
+            "(metadata.kind='cycle_summary')"
+        ),
+        deleter=DELETER_POOL_TRIM,
+    ),
+}
 
 # --------------------------------------------------------------------------- #
 # §8.5 execution_class contract
