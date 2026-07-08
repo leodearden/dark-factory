@@ -5755,6 +5755,37 @@ class TestIsPriorityOverrideReserveNowFact:
         assert _is_priority_override_reserve_now_fact(None) is False  # type: ignore[arg-type]
 
 
+class TestIsPriorityOverrideScalarFact:
+    """Module-level _is_priority_override_scalar_fact combinator: True when
+    either the TTL or reserve_now sibling matcher matches (task 2351)."""
+
+    def test_ttl_fact_matches(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact(
+            'Task 2265 has priority override TTL of 10800 seconds'
+        ) is True
+
+    def test_reserve_now_fact_matches(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact(
+            'Task 3001 has priority override reserve_now enabled'
+        ) is True
+
+    def test_other_override_sub_attribute_is_false(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact(
+            'Task 3001 priority override boost_tier set to high'
+        ) is False
+
+    def test_unrelated_fact_is_false(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact('Task 562 reached status done') is False
+
+    def test_none_value(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact(None) is False  # type: ignore[arg-type]
+
+
 class TestReconPoolAutoTag:
     """Module-level _infer_recon_pool helper + _CYCLE_SUMMARY_STAGE_TO_RECON_POOL map.
 
