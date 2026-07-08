@@ -85,7 +85,7 @@ class TestConcurrentBeforeInvoke:
 
         assert len(results) == 10
         for token in results:
-            assert token in valid
+            assert token.token in valid
 
     async def test_10_tasks_1_account_all_get_same_token(self):
         """10 tasks with 1 account available: all get the same token (serialized)."""
@@ -95,7 +95,7 @@ class TestConcurrentBeforeInvoke:
         tasks = [asyncio.create_task(gate.before_invoke()) for _ in range(10)]
         results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
 
-        assert all(t == expected for t in results)
+        assert all(t.token == expected for t in results)
 
     async def test_5_tasks_2_accounts_tokens_distributed(self):
         """5 tasks with 2 accounts: each task gets one of the 2 tokens."""
@@ -106,7 +106,7 @@ class TestConcurrentBeforeInvoke:
         results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
 
         for token in results:
-            assert token in valid
+            assert token.token in valid
 
     async def test_50_tasks_burst_no_deadlock(self):
         """50 tasks burst: all complete without deadlock."""
@@ -118,7 +118,7 @@ class TestConcurrentBeforeInvoke:
         assert len(results) == 50
         valid = all_tokens(gate)
         for token in results:
-            assert token in valid
+            assert token.token in valid
 
     async def test_cap_mid_flight(self):
         """Tasks calling before_invoke while another task caps an account mid-flight.
@@ -150,7 +150,7 @@ class TestConcurrentBeforeInvoke:
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2.0)
 
         for token in results:
-            assert token in valid
+            assert token.token in valid
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ class TestProbeSlotContention:
         # Clean up: confirm OK to unblock
         gate.confirm_account_ok(acct.token)
         results = await asyncio.wait_for(asyncio.gather(*blocked_tasks), timeout=1.0)
-        assert all(r == acct.token for r in results)
+        assert all(r.token == acct.token for r in results)
 
     async def test_confirm_account_ok_unblocks_waiters(self):
         """After confirm_account_ok() clears probe_in_flight, blocked tasks proceed."""
@@ -222,7 +222,7 @@ class TestProbeSlotContention:
 
         results = await asyncio.wait_for(asyncio.gather(*blocked), timeout=1.0)
         assert len(results) == 3
-        assert all(r == acct.token for r in results)
+        assert all(r.token == acct.token for r in results)
         assert acct.probe_in_flight is False
         assert acct.probe_count == 0
 
@@ -333,7 +333,7 @@ class TestGateOpenCloseRaces:
 
         results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
         assert len(results) == 10
-        assert all(r == 'fake-token-acct' for r in results)
+        assert all(r.token == 'fake-token-acct' for r in results)
 
     async def test_recap_before_lock_acquired_retries(self):
         """Gate opens, task starts before_invoke, but account re-caps before lock acquired.
@@ -362,7 +362,7 @@ class TestGateOpenCloseRaces:
 
         result = await asyncio.wait_for(task, timeout=1.0)
         # Must have gotten a valid token — either 'a' if grabbed before re-cap, or 'b'
-        assert result in valid
+        assert result.token in valid
 
     async def test_rapid_open_close_open_tasks_eventually_proceed(self):
         """Rapid open/close/open: tasks eventually proceed."""
@@ -386,7 +386,7 @@ class TestGateOpenCloseRaces:
         gate._open.set()
 
         result = await asyncio.wait_for(task, timeout=1.0)
-        assert result == 'fake-token-acct'
+        assert result.token == 'fake-token-acct'
 
 
 # ---------------------------------------------------------------------------
@@ -804,7 +804,7 @@ class TestThunderingHerd:
 
         results = await asyncio.wait_for(asyncio.gather(*pending), timeout=2.0)
         assert len(results) == 9
-        assert all(r == acct_a.token for r in results)
+        assert all(r.token == acct_a.token for r in results)
 
     async def test_two_accounts_uncap_simultaneously(self):
         """Two accounts uncap simultaneously.
@@ -834,7 +834,7 @@ class TestThunderingHerd:
         # Two probe slots: two tasks should have completed
         assert len(done) == 2, f'Expected 2 done tasks (probe claimants), got {len(done)}'
 
-        claimed_tokens = {t.result() for t in done}
+        claimed_tokens = {t.result().token for t in done}
         assert claimed_tokens == {'fake-token-a', 'fake-token-b'}
 
         # Confirm both
@@ -846,7 +846,7 @@ class TestThunderingHerd:
         assert len(results) == 8
         valid = {'fake-token-a', 'fake-token-b'}
         for r in results:
-            assert r in valid
+            assert r.token in valid
 
 
 # ---------------------------------------------------------------------------
@@ -868,7 +868,7 @@ class TestSessionBudgetConcurrency:
 
         # First call succeeds (cost not yet over budget)
         token = await gate.before_invoke()
-        assert token == 'fake-token-acct'
+        assert token.token == 'fake-token-acct'
 
         # Push over budget
         gate.on_agent_complete(0.02)
@@ -933,7 +933,7 @@ class TestConcurrentCapAndBeforeInvoke:
         # All results must be valid tokens (b or c if a was capped before selection)
         valid = all_tokens(gate)
         for r in results:
-            assert r in valid
+            assert r.token in valid
 
 
 # ---------------------------------------------------------------------------
@@ -1026,7 +1026,7 @@ class TestStressBeforeInvoke:
             nonlocal completed, errors
             try:
                 token = await asyncio.wait_for(gate.before_invoke(), timeout=2.0)
-                assert token in valid
+                assert token.token in valid
                 completed += 1
             except (TimeoutError, RuntimeError):
                 errors += 1
@@ -1067,7 +1067,7 @@ class TestStressBeforeInvoke:
             results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
             assert len(results) == 10
             # All tasks got the token
-            assert all(r[1] == 'fake-token-acct' for r in results)
+            assert all(r[1].token == 'fake-token-acct' for r in results)
 
 
 # ---------------------------------------------------------------------------

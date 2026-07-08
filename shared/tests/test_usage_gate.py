@@ -107,7 +107,7 @@ class TestBeforeInvokeRaceCondition:
         with patch.object(gate, '_fire_cost_event', side_effect=capture_name):
             token = await gate.before_invoke()
 
-        assert token == 'fake-token-acct-B'
+        assert token.token == 'fake-token-acct-B'
         # _fire_cost_event must have been called once
         assert len(captured_name_at_call) == 1, (
             '_fire_cost_event was not called — before_invoke still uses _write_cost_event'
@@ -494,7 +494,7 @@ class TestBeforeInvokeGuardConsistency:
         ):
             token = await gate.before_invoke()
 
-        assert token == 'fake-token-acct-B'
+        assert token.token == 'fake-token-acct-B'
         mock_dumps.assert_not_called()
         mock_fire.assert_not_called()
 
@@ -513,7 +513,7 @@ class TestBeforeInvokeGuardConsistency:
         with patch.object(gate, '_fire_cost_event') as mock_fire:
             token = await gate.before_invoke()
 
-        assert token == 'fake-token-acct-B'
+        assert token.token == 'fake-token-acct-B'
         mock_fire.assert_called_once()
         call_args = mock_fire.call_args
         assert call_args[0][0] == 'acct-B'   # account_name
@@ -2087,7 +2087,7 @@ class TestProbeSlotViaTransition:
             token = await gate.before_invoke()
 
         mock_transition.assert_called_once_with(acct, AccountPhase.PROBE_IN_FLIGHT)
-        assert token == acct.token
+        assert token.token == acct.token
         assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
         assert gate._open.is_set() is False
 
