@@ -11,6 +11,7 @@ class TestTopLevelImports:
     def test_top_level_imports(self):
         from shared import (
             AccountConfig,
+            AccountPhase,
             AccountState,
             AgentFailureClass,
             AgentFailureKind,
@@ -18,6 +19,7 @@ class TestTopLevelImports:
             AgentVerdict,
             AllAccountsCappedException,
             CostStore,
+            IllegalTransitionError,
             SessionBudgetExhausted,
             UsageCapConfig,
             UsageGate,
@@ -45,7 +47,9 @@ class TestTopLevelImports:
         assert read_transcript_records is not None
         assert UsageGate is not None
         assert AccountState is not None
+        assert AccountPhase is not None
         assert SessionBudgetExhausted is not None
+        assert IllegalTransitionError is not None
         assert AccountConfig is not None
         assert UsageCapConfig is not None
         assert CostStore is not None
