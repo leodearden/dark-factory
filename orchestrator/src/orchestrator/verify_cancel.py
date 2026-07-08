@@ -544,3 +544,61 @@ def run_stdin_watchdog(
             on_fire()
             return
         # Non-empty data: a heartbeat arrived -- window resets, keep watching.
+
+
+def fire_watchdog_kill(
+    pgid: int,
+    *,
+    grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
+    ppid_map_provider=read_ppid_map,
+    kill=os.kill,
+    killpg=os.killpg,
+    sleep=time.sleep,
+    exit_fn=os._exit,
+    exit_code: int = 1,
+) -> None:
+    """Kill the build subtree rooted at *pgid* and unconditionally self-terminate.
+
+    Invoked by the stdin watchdog (:func:`run_stdin_watchdog` via
+    :func:`start_stdin_watchdog`) when the dispatch connection is judged dead.
+    Mirrors :func:`cancel_request`'s snapshot -> /proc descendant walk ->
+    signal approach (the same ``start_new_session`` escape problem applies:
+    ``verify.py`` ``_run_cmd`` spawns every build command with
+    ``start_new_session=True``, so cargo/rustc leave the verify-merge process
+    group and a bare ``killpg(pgid)`` would strand them), with two
+    differences required because *this* code runs **inside** the target
+    process group rather than as a separate process:
+
+    * It signals only **descendants** of *pgid* (``collect_descendants``
+      already excludes the root) -- never *pgid* itself / the calling
+      process.  A ``killpg(pgid, ...)`` here would signal the watchdog's own
+      process before it could finish the SIGTERM -> grace -> SIGKILL
+      escalation or reach a controlled exit, so *killpg* is accepted for
+      signature symmetry with :func:`cancel_request` but is intentionally
+      never called.
+    * It ends by unconditionally calling ``exit_fn(exit_code)`` -- a
+      controlled non-zero self-exit -- rather than returning, so the
+      abandoned verify-merge leader always terminates (freeing its flock and
+      letting sshd reap it) even if some descendant could not be killed.
+
+    Sequence: snapshot the ``/proc`` PPID map, ``SIGTERM`` every descendant
+    (``ProcessLookupError``/``PermissionError`` suppressed -- already dead or
+    a permission race is fine, this is a best-effort escalation), sleep
+    *grace_secs*, re-snapshot + ``SIGKILL`` every surviving descendant
+    (same suppression), then ``exit_fn(exit_code)`` as the final action.
+    """
+    ppid_map = ppid_map_provider()
+    descendants = collect_descendants(pgid, ppid_map)
+    for pid in descendants:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGTERM)
+
+    sleep(grace_secs)
+
+    ppid_map = ppid_map_provider()
+    survivors = collect_descendants(pgid, ppid_map)
+    for pid in survivors:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGKILL)
+
+    exit_fn(exit_code)
