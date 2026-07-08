@@ -30,7 +30,7 @@ _ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
 
-from orchestrator import session_registry  # noqa: E402
+from orchestrator import session_registry  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
 FOREGROUND_NAMES = ["gnome-terminal", "xterm", "kitty"]
@@ -773,21 +773,21 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
             "starting claude (no started-watchdog / unbounded await_sentinel "
             "not broken)"
         )
+    else:
+        stderr = proc.stderr.read().decode()  # type: ignore[union-attr]
+        assert rc == 144, (
+            f"Expected exit 144 (EXIT_FAILED_TO_START), got {rc}\nstderr: {stderr}"
+        )
+        assert "failed-to-start" in stderr.lower(), (
+            f"expected a loud failed-to-start line on stderr, got:\n{stderr}"
+        )
 
-    stderr = proc.stderr.read().decode()  # type: ignore[union-attr]
-    assert rc == 144, (
-        f"Expected exit 144 (EXIT_FAILED_TO_START), got {rc}\nstderr: {stderr}"
-    )
-    assert "failed-to-start" in stderr.lower(), (
-        f"expected a loud failed-to-start line on stderr, got:\n{stderr}"
-    )
-
-    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
-    record_path = _find_one_record(fleet_root)
-    record = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert record.status == session_registry.Status.FAILED_TO_START, (
-        f"expected registry status failed-to-start, got {record.status}"
-    )
+        fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+        record_path = _find_one_record(fleet_root)
+        record = session_registry.SessionRecord.from_json(record_path.read_text())
+        assert record.status == session_registry.Status.FAILED_TO_START, (
+            f"expected registry status failed-to-start, got {record.status}"
+        )
 
 
 def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
