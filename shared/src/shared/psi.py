@@ -136,19 +136,23 @@ def read_psi_sample(*, read: Callable[[str], str] = read_pressure) -> PsiSample:
     Maps cpu.some -> cpu_some10, mem.some -> mem_some10, mem.full ->
     mem_full10, and io.some -> io_some10.
 
-    Fail-open (DA-D6): if any source is unreadable (``read`` raises OSError)
-    or unparseable (``parse_pressure_file`` returns None), the WHOLE sample
-    degrades to the fail-open sentinel (all metrics 0.0, read_ok=False)
-    rather than gating on partial data — this must never wedge dispatch.
-    Loud, rate-limited logging on this condition is the caller's (DA3)
-    responsibility; this function stays side-effect-light (at most a single
-    debug line) to avoid per-tick log spam.
+    Fail-open (DA-D6): if any source is unreadable (``read`` raises ANY
+    exception -- e.g. ``OSError``, or a ``UnicodeDecodeError`` from non-UTF-8
+    content) or unparseable (``parse_pressure_file`` returns None), the WHOLE
+    sample degrades to the fail-open sentinel (all metrics 0.0,
+    read_ok=False) rather than gating on partial data — this must never
+    wedge dispatch. The except is deliberately broad rather than scoped to
+    ``OSError`` alone: a caller-injected ``read`` is untrusted, and "never
+    wedge dispatch" is an absolute guarantee, not one scoped to a single
+    exception type. Loud, rate-limited logging on this condition is the
+    caller's (DA3) responsibility; this function stays side-effect-light (at
+    most a single debug line) to avoid per-tick log spam.
     """
     try:
         cpu = parse_pressure_file(read('cpu'))
         mem = parse_pressure_file(read('memory'))
         io = parse_pressure_file(read('io'))
-    except OSError:
+    except Exception:
         logger.debug('PSI read failed; failing open', exc_info=True)
         return _FAIL_OPEN
 

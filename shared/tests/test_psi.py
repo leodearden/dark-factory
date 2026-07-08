@@ -254,3 +254,19 @@ class TestReadPsiSampleFailOpen:
             return PSI_CPU_TEXT if name == 'cpu' else PSI_MEM_TEXT
 
         self._assert_sentinel(read_psi_sample(read=read))
+
+    def test_reader_raises_non_os_error_fails_open(self):
+        """A reader can fail with a non-OSError exception too -- e.g. a real
+        Path.read_text() raises UnicodeDecodeError (a ValueError subclass,
+        not an OSError) on non-UTF-8 content, and a custom injected reader
+        could raise anything. DA-D6's "never wedge dispatch" guarantee is
+        absolute, so this must fail open exactly like an OSError.
+        """
+        from shared.psi import read_psi_sample
+
+        def read(name):
+            if name == 'cpu':
+                raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')
+            return PSI_MEM_TEXT if name == 'memory' else PSI_IO_TEXT
+
+        self._assert_sentinel(read_psi_sample(read=read))
