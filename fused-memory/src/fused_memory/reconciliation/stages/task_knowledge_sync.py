@@ -1439,8 +1439,7 @@ async def _sweep_stale_flag_markers(
 async def _sweep_terminal_task_flag_markers(
     memory_service,
     taskmaster,
-    project_root: str,
-    project_id: str,
+    scope: ProjectScope,
     run_id: str,
     *,
     scroll_limit: int = 1000,
@@ -1480,9 +1479,8 @@ async def _sweep_terminal_task_flag_markers(
     ``_resolve_live_status`` pattern — so markers sharing a task_id (the
     incident's 150x2/132x3 pattern) collapse to a single Taskmaster call.
 
-    Degrades to a no-op when ``taskmaster`` or ``project_root`` is falsy
-    (mirrors ``flag_dedup.filter_terminal_metadata_flags``'s degradation
-    posture).
+    Degrades to a no-op when ``taskmaster`` is falsy (mirrors
+    ``flag_dedup.filter_terminal_metadata_flags``'s degradation posture).
 
     Enumerates deterministically via ``memory_service.get_memories_by_metadata``
     (Qdrant payload-filter scroll) — NEVER semantic search, which silently
@@ -1497,9 +1495,10 @@ async def _sweep_terminal_task_flag_markers(
             ``delete_memory``.
         taskmaster: Object with an async ``get_task(task_id, project_root)``
             method. Falsy => no-op (returns 0).
-        project_root: Project root passed through to ``get_task``. Falsy =>
-            no-op (returns 0).
-        project_id: Project scope for enumeration and delete calls.
+        scope: ``ProjectScope`` supplying ``project_root`` (passed through
+            to ``get_task``) and ``project_id`` (used for enumeration and
+            delete calls). A constructed ``ProjectScope`` always carries a
+            validated, non-empty root.
         run_id: Current reconciliation run identifier used as
             ``causation_id`` in the audit journal.
         scroll_limit: Max records to enumerate in one scroll (default 1000).
@@ -1508,12 +1507,12 @@ async def _sweep_terminal_task_flag_markers(
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or when degraded to a no-op).
     """
-    if not taskmaster or not project_root:
+    if not taskmaster:
         return 0
 
     try:
         members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
+            project_id=scope.project_id,
             filters={'source': 'stage1_flag_marker'},
             limit=scroll_limit,
         )
@@ -1521,8 +1520,8 @@ async def _sweep_terminal_task_flag_markers(
         logger.warning(
             'reconciliation._sweep_terminal_task_flag_markers: '
             'get_memories_by_metadata failed for project_id=%s; skipping sweep',
-            project_id,
-            extra={'project_id': project_id, 'run_id': run_id},
+            scope.project_id,
+            extra={'project_id': scope.project_id, 'run_id': run_id},
         )
         return 0
 
@@ -1533,7 +1532,7 @@ async def _sweep_terminal_task_flag_markers(
             'older terminal-task markers may remain uncollected this cycle; '
             're-run with a higher scroll_limit.',
             len(members), scroll_limit,
-            extra={'project_id': project_id, 'run_id': run_id},
+            extra={'project_id': scope.project_id, 'run_id': run_id},
         )
 
     if not members:
@@ -1565,7 +1564,7 @@ async def _sweep_terminal_task_flag_markers(
 
     async def _safe_get_task(component: str):
         try:
-            return await taskmaster.get_task(component, project_root)
+            return await taskmaster.get_task(component, scope.project_root)
         except Exception as exc:
             # A TaskmasterError carrying the not-found phrase means the
             # referenced task_id no longer exists (e.g. hard-deleted) — an
@@ -1579,14 +1578,14 @@ async def _sweep_terminal_task_flag_markers(
                     'reconciliation._sweep_terminal_task_flag_markers: '
                     'task_id=%s not found (expected during GC sweep): %s',
                     component, exc,
-                    extra={'project_id': project_id, 'run_id': run_id},
+                    extra={'project_id': scope.project_id, 'run_id': run_id},
                 )
             else:
                 logger.warning(
                     'reconciliation._sweep_terminal_task_flag_markers: '
                     'get_task failed for task_id=%s: %s',
                     component, exc,
-                    extra={'project_id': project_id, 'run_id': run_id},
+                    extra={'project_id': scope.project_id, 'run_id': run_id},
                 )
             return None  # KEEP marker on error (fail-safe)
 
@@ -1619,7 +1618,7 @@ async def _sweep_terminal_task_flag_markers(
         memory_service.delete_memory(
             memory_id=mid,
             store='mem0',
-            project_id=project_id,
+            project_id=scope.project_id,
             causation_id=run_id,
             _source=_STAGE1_FLAG_MARKER_TERMINAL_GC_SWEEP_SOURCE,
         )
@@ -1632,7 +1631,7 @@ async def _sweep_terminal_task_flag_markers(
             logger.warning(
                 'reconciliation._sweep_terminal_task_flag_markers: delete failed for memory_id=%s; not counted',
                 mid,
-                extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
+                extra={'project_id': scope.project_id, 'memory_id': mid, 'run_id': run_id},
             )
         else:
             success_count += 1
@@ -2845,10 +2844,10 @@ class TaskKnowledgeSync(BaseStage):
         # confirmed root cause of the 2026-07-05 solar_challenge_platform
         # incident's 16-record manual bulk GC). Runs unconditionally on both
         # full and remediation paths; degrades to a no-op (0) when taskmaster
-        # or project_root is unset. Explicit zero so downstream consumers
-        # never need a .get(..., 0) fallback.
+        # is unset. Explicit zero so downstream consumers never need a
+        # .get(..., 0) fallback.
         terminal_gc_swept = await _sweep_terminal_task_flag_markers(
-            self.memory, self.taskmaster, self.project_root, self.project_id, run_id,
+            self.memory, self.taskmaster, self.scope, run_id,
         )
         report.stats['terminal_task_flag_markers_gc_swept'] = terminal_gc_swept
 
