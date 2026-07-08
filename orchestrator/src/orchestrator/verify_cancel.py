@@ -54,7 +54,9 @@ import contextlib
 import fcntl
 import os
 import re
+import select
 import signal
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -457,3 +459,188 @@ def read_lock_holder_pgid(worktree_base: Path) -> int | None:
 def remove_lock_holder_pgid(worktree_base: Path) -> None:
     """Remove the recorded flock-holder pgid file; idempotent when absent."""
     remove_pgid_file(pgid_file(worktree_base, LOCK_HOLDER_PGID_KEY))
+
+
+# ---------------------------------------------------------------------------
+# Connection-death stdin heartbeat-watchdog (task 2308 γ)
+#
+# PRD: plans/laptop-warm-verify-flock-orphan-prd.md, Change B, §4 B1/B2 + §8.1.
+# Ties a dispatched ``verify-merge --request-id`` process's lifetime to its
+# ssh dispatch connection: when the VerifyResult becomes undeliverable (the
+# orchestrator was killed, ssh dropped, or a hard network partition occurred)
+# the remote terminates itself AND its whole build subtree instead of
+# surviving as a setsid orphan (the exact failure mode ``cancel_request``
+# above cleans up *after the fact*; this watchdog prevents it from ever being
+# needed on the connection-death path).
+#
+# Protocol: the dispatcher (``verify_runner.RemoteRunner.run_merge_verify``)
+# opens the ssh child with ``stdin=PIPE`` and writes a heartbeat newline down
+# the channel every ``HEARTBEAT_INTERVAL_SECS`` for the full verify span. The
+# remote (``orchestrator verify-merge --request-id``) spawns a watchdog
+# thread owning fd 0 *before* the build starts (see :func:`start_stdin_watchdog`).
+# It fires on stdin EOF (the channel was cleanly closed) or when no heartbeat
+# arrives within ``WATCHDOG_HEARTBEAT_TIMEOUT_SECS`` (a hard partition, no
+# clean close).  ``setsid`` + the pgid file are unchanged by this protocol —
+# ``setsid`` does not close fd 0, so the watchdog reads stdin regardless of
+# session, and ``cancel_request`` keeps tree-killing by pgid with zero
+# contract churn.
+# ---------------------------------------------------------------------------
+
+#: Heartbeat cadence (seconds) the dispatcher writes down the ssh child's
+#: stdin for the full verify span.  A module constant rather than a config
+#: leaf (PRD §11 Q2: "small constant first"; promote later only if
+#: field-tuning is needed).  Both hosts run the same ``df`` checkout, so the
+#: dispatcher (which imports this one-way from here — see verify_runner.py)
+#: and this watchdog always agree on the cadence.
+HEARTBEAT_INTERVAL_SECS: float = 5.0
+
+#: The watchdog fires if no heartbeat (or EOF) arrives within this window.
+#: 2x the heartbeat cadence tolerates a single missed/delayed beat before
+#: declaring the dispatch channel dead.
+WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 2 * HEARTBEAT_INTERVAL_SECS
+
+#: Grace period between the SIGTERM and SIGKILL passes when the watchdog
+#: fires and kills the build subtree (see :func:`fire_watchdog_kill`).
+WATCHDOG_KILL_GRACE_SECS: float = 5.0
+
+
+def run_stdin_watchdog(
+    read_fd: int,
+    on_fire,
+    *,
+    heartbeat_timeout: float = WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+    select_fn=select.select,
+    read_fn=os.read,
+    read_size: int = 4096,
+) -> None:
+    """Blocking fd-0 trigger loop: calls *on_fire* once on stdin EOF or heartbeat starvation.
+
+    Intended to run in a dedicated daemon thread (see :func:`start_stdin_watchdog`)
+    with a *blocking* ``select`` loop — rather than an asyncio task sharing the
+    build's event loop — so it fires even if that loop is saturated or wedged.
+
+    Each iteration waits up to *heartbeat_timeout* seconds for *read_fd* to
+    become readable:
+
+    * Timeout (empty ready set) -> no heartbeat arrived in time (hard network
+      partition) -> call *on_fire* and return.
+    * Readable, but the read returns ``b''`` -> the writing end closed the
+      channel (orchestrator killed or ssh dropped) -> call *on_fire* and
+      return.
+    * Readable with non-empty data -> a heartbeat byte arrived; the window
+      resets and the loop continues watching.
+
+    *on_fire* is called at most once — the function returns immediately
+    afterward.  *select_fn* / *read_fn* are injectable (default
+    ``select.select`` / ``os.read``) so tests can script deterministic fd-0
+    behavior without a real pipe or wall-clock waits.
+    """
+    while True:
+        ready, _, _ = select_fn([read_fd], [], [], heartbeat_timeout)
+        if not ready:
+            on_fire()
+            return
+        data = read_fn(read_fd, read_size)
+        if data == b'':
+            on_fire()
+            return
+        # Non-empty data: a heartbeat arrived -- window resets, keep watching.
+
+
+def fire_watchdog_kill(
+    pgid: int,
+    *,
+    grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
+    ppid_map_provider=read_ppid_map,
+    kill=os.kill,
+    killpg=os.killpg,
+    sleep=time.sleep,
+    exit_fn=os._exit,
+    exit_code: int = 1,
+) -> None:
+    """Kill the build subtree rooted at *pgid* and unconditionally self-terminate.
+
+    Invoked by the stdin watchdog (:func:`run_stdin_watchdog` via
+    :func:`start_stdin_watchdog`) when the dispatch connection is judged dead.
+    Mirrors :func:`cancel_request`'s snapshot -> /proc descendant walk ->
+    signal approach (the same ``start_new_session`` escape problem applies:
+    ``verify.py`` ``_run_cmd`` spawns every build command with
+    ``start_new_session=True``, so cargo/rustc leave the verify-merge process
+    group and a bare ``killpg(pgid)`` would strand them), with two
+    differences required because *this* code runs **inside** the target
+    process group rather than as a separate process:
+
+    * It signals only **descendants** of *pgid* (``collect_descendants``
+      already excludes the root) -- never *pgid* itself / the calling
+      process.  A ``killpg(pgid, ...)`` here would signal the watchdog's own
+      process before it could finish the SIGTERM -> grace -> SIGKILL
+      escalation or reach a controlled exit, so *killpg* is accepted for
+      signature symmetry with :func:`cancel_request` but is intentionally
+      never called.
+    * It ends by unconditionally calling ``exit_fn(exit_code)`` -- a
+      controlled non-zero self-exit -- rather than returning, so the
+      abandoned verify-merge leader always terminates (freeing its flock and
+      letting sshd reap it) even if some descendant could not be killed.
+
+    Sequence: snapshot the ``/proc`` PPID map, ``SIGTERM`` every descendant
+    (``ProcessLookupError``/``PermissionError`` suppressed -- already dead or
+    a permission race is fine, this is a best-effort escalation), sleep
+    *grace_secs*, re-snapshot + ``SIGKILL`` every surviving descendant
+    (same suppression), then ``exit_fn(exit_code)`` as the final action.
+    """
+    ppid_map = ppid_map_provider()
+    descendants = collect_descendants(pgid, ppid_map)
+    for pid in descendants:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGTERM)
+
+    sleep(grace_secs)
+
+    ppid_map = ppid_map_provider()
+    survivors = collect_descendants(pgid, ppid_map)
+    for pid in survivors:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGKILL)
+
+    exit_fn(exit_code)
+
+
+def start_stdin_watchdog(
+    pgid: int,
+    *,
+    heartbeat_timeout: float = WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+    grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
+    read_fd: int = 0,
+    select_fn=select.select,
+    read_fn=os.read,
+    fire=None,
+) -> threading.Thread:
+    """Spawn a started daemon thread running :func:`run_stdin_watchdog` against *read_fd*.
+
+    On fire (stdin EOF or heartbeat starvation), the default *fire* callback
+    kills the build subtree rooted at *pgid* and self-terminates (see
+    :func:`fire_watchdog_kill`).  A dedicated OS thread with a blocking
+    ``select`` loop -- rather than an asyncio task -- fires even if the
+    build's own event loop is saturated or wedged; ``daemon=True`` so this
+    thread never blocks interpreter shutdown on its own.
+
+    *fire* is injectable for tests (default: a closure over
+    :func:`fire_watchdog_kill` bound to *pgid* and *grace_secs*).
+    *select_fn* / *read_fn* / *read_fd* pass through to
+    :func:`run_stdin_watchdog`.
+    """
+    on_fire = fire if fire is not None else (
+        lambda: fire_watchdog_kill(pgid, grace_secs=grace_secs)
+    )
+    thread = threading.Thread(
+        target=run_stdin_watchdog,
+        args=(read_fd, on_fire),
+        kwargs={
+            'heartbeat_timeout': heartbeat_timeout,
+            'select_fn': select_fn,
+            'read_fn': read_fn,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return thread

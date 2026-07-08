@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
+from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -672,6 +673,65 @@ async def _default_subprocess_run(
     )
 
 
+async def _default_ssh_heartbeat_run(
+    argv: list[str],
+    *,
+    cwd: str | Path | None = None,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL_SECS,
+) -> tuple[int, str, str]:
+    """Default ssh-dispatch subprocess helper — like :func:`_default_subprocess_run`,
+    plus a stdin heartbeat (connection-death protocol, PRD §8.1).
+
+    Opens *argv* with ``stdin=PIPE`` (unlike :func:`_default_subprocess_run`,
+    whose stdin is unset/inherited) and runs a concurrent writer task that
+    sends a heartbeat newline down the child's stdin every
+    *heartbeat_interval* seconds for the full duration of the call.  This is
+    the dispatcher half of the connection-death protocol: the remote
+    verify-merge watchdog (``verify_cancel.run_stdin_watchdog``) fires if
+    heartbeats stop arriving, tying the remote build's lifetime to this ssh
+    child's lifetime.
+
+    A heartbeat write failing with ``BrokenPipeError``/``ConnectionResetError``
+    means the child is already gone (EPIPE) — benign, since the existing
+    transport-failure handling (non-zero rc / unparseable stdout ->
+    RunnerUnavailable) already covers the dead-channel outcome.  Swallowed so
+    it never raises out of the writer nor alters the returned
+    ``(rc, stdout, stderr)``.  The writer task is cancelled once
+    ``communicate()`` completes.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+
+    async def _heartbeat() -> None:
+        assert proc.stdin is not None  # stdin=PIPE above guarantees this
+        while True:
+            await asyncio.sleep(heartbeat_interval)
+            try:
+                proc.stdin.write(b'\n')
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # child already gone -- benign, transport-failure path handles it
+
+    heartbeat_task = asyncio.ensure_future(_heartbeat())
+    try:
+        stdout_b, stderr_b = await proc.communicate()
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+    return (
+        proc.returncode or 0,
+        stdout_b.decode().strip(),
+        stderr_b.decode().strip(),
+    )
+
+
 class RemoteRunner:
     """Runs a merge-verify bundle on a remote host via git push + ssh.
 
@@ -700,6 +760,8 @@ class RemoteRunner:
         config_path: str | None = None,
         main_branch: str | None = None,
         run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
+        ssh_run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
+        heartbeat_interval: float | None = None,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
         self.name = name
@@ -709,6 +771,24 @@ class RemoteRunner:
         self._config_path = config_path
         self._main_branch = main_branch
         self._run = run if run is not None else _default_subprocess_run
+        # γ: connection-death heartbeat-watchdog (PRD §8.1). The ssh dispatch is
+        # load-bearing (it's the call that blocks for the whole remote build), so
+        # it is routed through a PARALLEL self._ssh_run seam rather than overloading
+        # self._run (shared by git push/rev-parse/delete, which return only after
+        # completion with no stdin hook). Resolution order: injected ssh_run ->
+        # injected run (back-compat: existing tests inject only `run` and expect
+        # it to serve ssh too) -> heartbeat default (production).
+        self._heartbeat_interval = heartbeat_interval or HEARTBEAT_INTERVAL_SECS
+        if ssh_run is not None:
+            self._ssh_run = ssh_run
+        elif run is not None:
+            self._ssh_run = run
+        else:
+            async def _heartbeat_ssh_run(argv, *, cwd=None):
+                return await _default_ssh_heartbeat_run(
+                    argv, cwd=cwd, heartbeat_interval=self._heartbeat_interval,
+                )
+            self._ssh_run = _heartbeat_ssh_run
         self._id_factory = id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
         # Optional test-instrumentation hook: tests may assign a list to this
         # attribute so they can inspect all subprocess argv lists after the fact.
@@ -853,7 +933,7 @@ class RemoteRunner:
                 remote_cmd = ' '.join(shlex.quote(a) for a in argv)
 
                 try:
-                    ssh_rc, ssh_stdout, ssh_stderr = await self._run(
+                    ssh_rc, ssh_stdout, ssh_stderr = await self._ssh_run(
                         ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                          self._ssh_host, remote_cmd],
                     )

@@ -588,3 +588,259 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
         f'These pids survived cancel_request (start_new_session escapes not reaped?): '
         f'{still_alive}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 2308 γ step-1: run_stdin_watchdog — fd-0 trigger loop
+#
+# Connection-death heartbeat-watchdog (PRD: plans/laptop-warm-verify-flock-
+# orphan-prd.md, Change B, §4 B1/B2 + §8.1). run_stdin_watchdog(read_fd,
+# on_fire, *, heartbeat_timeout, select_fn, read_fn) fires on_fire() exactly
+# once when either: (a) no heartbeat arrives within heartbeat_timeout
+# (starvation — empty select() ready set), or (b) read_fd hits EOF (a read
+# returns b'' — the writing end closed the channel).  A heartbeat (any
+# non-empty read) resets the window and the loop continues.  select_fn/
+# read_fn are injected so this is testable without a real pipe or wall-clock
+# waits.
+# ---------------------------------------------------------------------------
+
+
+class TestRunStdinWatchdog:
+    """run_stdin_watchdog(read_fd, on_fire, *, heartbeat_timeout, select_fn, read_fn)."""
+
+    def test_fires_on_eof(self):
+        """select_fn reports ready, read_fn returns b'' (EOF) -> on_fire fires once, loop returns."""
+        from orchestrator.verify_cancel import run_stdin_watchdog
+
+        select_calls = []
+        read_calls = []
+        fire_calls = []
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            select_calls.append((rlist, wlist, xlist, timeout))
+            return (rlist, [], [])  # fd ready
+
+        def fake_read(fd, size):
+            read_calls.append((fd, size))
+            return b''  # EOF
+
+        run_stdin_watchdog(
+            7,
+            lambda: fire_calls.append(True),
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert fire_calls == [True]
+        assert len(select_calls) == 1
+        assert select_calls[0] == ([7], [], [], 5.0)
+        assert len(read_calls) == 1
+
+    def test_fires_on_heartbeat_timeout(self):
+        """select_fn reports an empty ready set (timeout) -> on_fire fires once, without reading."""
+        from orchestrator.verify_cancel import run_stdin_watchdog
+
+        select_calls = []
+        read_calls = []
+        fire_calls = []
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            select_calls.append((rlist, wlist, xlist, timeout))
+            return ([], [], [])  # timeout -- nothing ready
+
+        def fake_read(fd, size):
+            read_calls.append((fd, size))
+            return b'\n'  # must never be reached
+
+        run_stdin_watchdog(
+            7,
+            lambda: fire_calls.append(True),
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert fire_calls == [True]
+        assert len(select_calls) == 1
+        assert read_calls == []  # starvation fires without ever reading
+
+    def test_survives_heartbeats_then_fires_on_eof(self):
+        """K heartbeats (non-empty reads) reset the window and do not fire; the (K+1)th EOF does."""
+        from orchestrator.verify_cancel import run_stdin_watchdog
+
+        K = 3
+        select_calls = []
+        read_calls = []
+        fire_calls = []
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            select_calls.append((rlist, wlist, xlist, timeout))
+            return (rlist, [], [])  # always "ready"
+
+        def fake_read(fd, size):
+            read_calls.append((fd, size))
+            if len(read_calls) <= K:
+                return b'\n'  # heartbeat -- resets the window, must not fire
+            return b''  # EOF on the (K+1)th read
+
+        run_stdin_watchdog(
+            7,
+            lambda: fire_calls.append(True),
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        # on_fire called exactly once, only after read_fn was called K+1 times
+        assert fire_calls == [True]
+        assert len(read_calls) == K + 1
+        assert len(select_calls) == K + 1
+
+
+# ---------------------------------------------------------------------------
+# Task 2308 γ step-3: fire_watchdog_kill — SIGTERM descendants, grace, SIGKILL
+# survivors, unconditional self-exit
+# ---------------------------------------------------------------------------
+
+
+class TestFireWatchdogKill:
+    """fire_watchdog_kill(pgid, ...) — SIGTERM descendants, grace, SIGKILL survivors, exit."""
+
+    def test_signals_only_descendants_grace_then_sigkill_then_exit(self):
+        """(a)-(d): descendants only, grace between passes, SIGKILL survivors, exit is final."""
+        import signal
+
+        from orchestrator.verify_cancel import fire_watchdog_kill
+
+        # ppid_map: P(100) -> A(200) -> B(300); unrelated 999 (ppid 1, not a descendant of P)
+        ppid_map = {200: 100, 300: 200, 999: 1}
+
+        events = []
+        term_pids = []
+        kill_pids = []
+        killpg_calls = []
+
+        def fake_kill(pid, sig):
+            if sig == signal.SIGTERM:
+                term_pids.append(pid)
+                events.append(('term', pid))
+            elif sig == signal.SIGKILL:
+                kill_pids.append(pid)
+                events.append(('kill', pid))
+
+        def fake_killpg(pgid, sig):
+            killpg_calls.append((pgid, sig))
+
+        def fake_sleep(secs):
+            events.append(('sleep', secs))
+
+        def fake_exit(code):
+            events.append(('exit', code))
+
+        fire_watchdog_kill(
+            100,
+            grace_secs=5.0,
+            ppid_map_provider=lambda: ppid_map,
+            kill=fake_kill,
+            killpg=fake_killpg,
+            sleep=fake_sleep,
+            exit_fn=fake_exit,
+        )
+
+        # (a) SIGTERM sent to exactly the descendants {200, 300} -- never root/self, never unrelated
+        assert set(term_pids) == {200, 300}
+
+        # (b) sleep(grace_secs) called between the SIGTERM pass and the SIGKILL pass
+        sleep_idx = events.index(('sleep', 5.0))
+        assert all(events.index(('term', pid)) < sleep_idx for pid in (200, 300))
+
+        # (c) SIGKILL sent to surviving descendants {200, 300}
+        assert set(kill_pids) == {200, 300}
+        assert all(events.index(('kill', pid)) > sleep_idx for pid in (200, 300))
+
+        # (d) exit_fn called once with a non-zero code, as the final action
+        exit_events = [e for e in events if e[0] == 'exit']
+        assert len(exit_events) == 1
+        assert exit_events[0][1] != 0
+        assert events[-1] == exit_events[0]
+
+        # Design decision: the watchdog signals only descendants and never
+        # killpg's its own group (it runs inside the target group, unlike
+        # cancel_request) -- killpg is accepted for signature symmetry only.
+        assert killpg_calls == []
+
+    def test_dead_descendant_process_lookup_error_tolerated(self):
+        """(e): a descendant already dead (ProcessLookupError) is tolerated; exit_fn still fires."""
+        from orchestrator.verify_cancel import fire_watchdog_kill
+
+        ppid_map = {200: 100}  # single descendant, already gone
+        exit_calls = []
+
+        def fake_kill(pid, sig):
+            raise ProcessLookupError()
+
+        def fake_killpg(pgid, sig):
+            raise AssertionError('fire_watchdog_kill must not killpg its own group')
+
+        def fake_sleep(secs):
+            pass
+
+        def fake_exit(code):
+            exit_calls.append(code)
+
+        # Must not raise despite kill() always raising ProcessLookupError.
+        fire_watchdog_kill(
+            100,
+            grace_secs=0.0,
+            ppid_map_provider=lambda: ppid_map,
+            kill=fake_kill,
+            killpg=fake_killpg,
+            sleep=fake_sleep,
+            exit_fn=fake_exit,
+        )
+
+        assert exit_calls == [1]
+
+
+# ---------------------------------------------------------------------------
+# Task 2308 γ step-5: start_stdin_watchdog — spawns a started daemon thread
+# running run_stdin_watchdog, wired to fire on stdin EOF/starvation
+# ---------------------------------------------------------------------------
+
+
+class TestStartStdinWatchdog:
+    """start_stdin_watchdog spawns a daemon thread running run_stdin_watchdog wired to fire."""
+
+    def test_spawns_started_daemon_thread_wired_to_fire(self):
+        """Returns a started daemon Thread; the injected fire callback runs exactly once."""
+        import threading
+
+        from orchestrator.verify_cancel import start_stdin_watchdog
+
+        fire_calls = []
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            return (rlist, [], [])  # immediately "ready"
+
+        def fake_read(fd, size):
+            return b''  # EOF
+
+        thread = start_stdin_watchdog(
+            12345,
+            heartbeat_timeout=5.0,
+            grace_secs=1.0,
+            read_fd=0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+            fire=lambda: fire_calls.append(True),
+        )
+
+        # (a) return value is a Thread with .daemon True; join() only succeeds if started
+        assert isinstance(thread, threading.Thread)
+        assert thread.daemon is True
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+        # (b) the injected fire was invoked exactly once (loop wired to on_fire)
+        assert fire_calls == [True]

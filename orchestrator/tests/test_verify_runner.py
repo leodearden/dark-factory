@@ -4670,3 +4670,135 @@ class TestRemoteRunnerStreamArchival:
         )
 
         assert result == fail_result
+
+
+# ---------------------------------------------------------------------------
+# γ step-7: _default_ssh_heartbeat_run — stdin heartbeat writer for the ssh
+# dispatch child (real tiny subprocesses; no ssh spawned)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDefaultSshHeartbeatRun:
+    """_default_ssh_heartbeat_run opens the child with stdin=PIPE and writes a
+    heartbeat newline every heartbeat_interval seconds while awaiting completion.
+    A heartbeat write against an already-closed child stdin (EPIPE) is swallowed
+    and never surfaces as an exception."""
+
+    async def test_delivers_heartbeats(self):
+        """A child blocked reading 2 stdin lines only prints its marker and exits
+        once the heartbeat writer has fed it 2 newlines — proving heartbeats are
+        actually written to the child's stdin=PIPE while the run is in flight."""
+        import sys
+
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        argv = [
+            sys.executable, '-c',
+            'import sys\n'
+            'sys.stdin.readline()\n'
+            'sys.stdin.readline()\n'
+            "print('HEARTBEAT_MARKER')\n",
+        ]
+        rc, stdout, stderr = await _default_ssh_heartbeat_run(argv, heartbeat_interval=0.05)
+        assert rc == 0
+        assert 'HEARTBEAT_MARKER' in stdout
+        assert stderr == ''
+
+    async def test_swallows_epipe_on_immediate_child_exit(self):
+        """A child that closes its own stdin (simulating the read end vanishing,
+        as happens once ssh/the child is gone) and keeps running briefly gives
+        the heartbeat writer several attempts against an already-closed pipe.
+        The resulting EPIPE/ConnectionResetError must be swallowed — the call
+        returns normally instead of raising.
+
+        A bare `['true']` (immediate exit) is deliberately NOT used here: `true`
+        exits so fast that the writer's first scheduled heartbeat routinely never
+        fires before `communicate()` completes and the writer is cancelled —
+        empirically confirmed to exercise the EPIPE path in 0/30 trials at this
+        heartbeat_interval — which would make this test pass without ever
+        touching the code it claims to cover. Closing stdin immediately but
+        exiting only after a short sleep decouples "channel already closed"
+        from "process already reaped", so several heartbeat attempts land on a
+        provably closed pipe while `communicate()` is still pending.
+        """
+        import sys
+
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        argv = [sys.executable, '-c', 'import os, time; os.close(0); time.sleep(0.15)']
+        rc, stdout, stderr = await _default_ssh_heartbeat_run(argv, heartbeat_interval=0.02)
+        assert rc == 0
+        assert stdout == ''
+        assert stderr == ''
+
+
+# ---------------------------------------------------------------------------
+# γ step-9: RemoteRunner ssh_run routing seam — the load-bearing ssh dispatch
+# goes through a distinct self._ssh_run, not self._run (git ops)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerSshRunSeam:
+    """The ssh dispatch in run_merge_verify is routed through self._ssh_run, a
+    seam parallel to self._run (git ops).  self._ssh_run resolves: injected
+    ssh_run -> injected run (back-compat) -> heartbeat default (production)."""
+
+    async def test_ssh_routed_through_ssh_run_happy_path_unchanged(self):
+        """run=fake_git only ever sees git argv; ssh_run=fake_ssh receives the
+        ['ssh', ..., host, remote_cmd] argv and its VerifyResult JSON is
+        returned unchanged — the happy path is byte-identical to today's."""
+        git_calls = []
+        ssh_calls = []
+
+        async def fake_git(argv, *, cwd=None):
+            assert argv[0] == 'git', f'self._run (git-only) received non-git argv: {argv!r}'
+            git_calls.append((argv, cwd))
+            return (0, '', '')
+
+        expected = VerifyResult(
+            passed=True, test_output='all green', lint_output='', type_output='',
+            summary='ok',
+        )
+
+        async def fake_ssh(argv, *, cwd=None):
+            assert argv[0] == 'ssh', f'self._ssh_run received non-ssh argv: {argv!r}'
+            ssh_calls.append((argv, cwd))
+            return (0, result_to_json(expected), '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_git,
+            ssh_run=fake_ssh,
+            id_factory=lambda: 'fixed-id',
+        )
+
+        result = await runner.run_merge_verify('abc123', _make_spec())
+
+        assert result == expected
+        # exactly one ssh dispatch, routed through ssh_run, host + remote_cmd shape intact
+        assert len(ssh_calls) == 1
+        ssh_argv, _ = ssh_calls[0]
+        assert ssh_argv[0] == 'ssh'
+        assert ssh_argv[-2] == 'laptop.local'
+        # git ops (merge-sha push + best-effort ref cleanup in the finally) went
+        # through run, never ssh_run
+        assert len(git_calls) == 2
+        assert git_calls[0][0] == ['git', 'push', 'origin', 'abc123:refs/merge-verify/fixed-id']
+        assert git_calls[1][0] == ['git', 'push', 'origin', '--delete', 'refs/merge-verify/fixed-id']
+
+    async def test_default_construction_wires_distinct_heartbeat_ssh_runner(self):
+        """With no run/ssh_run injected, self._ssh_run is a distinct callable
+        from self._run (the heartbeat default), asserted via identity only —
+        no ssh is ever spawned."""
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+        )
+        assert runner._ssh_run is not runner._run

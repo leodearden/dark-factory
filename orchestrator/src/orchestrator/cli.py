@@ -26,6 +26,7 @@ from orchestrator.verify_cancel import (
     remove_lock_holder_pgid,
     remove_pgid_file,
     start_own_process_group,
+    start_stdin_watchdog,
     write_lock_holder_pgid,
     write_pgid_file,
 )
@@ -434,6 +435,14 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         # treat this as RunnerUnavailable and beta never sees the discriminant.
         click.echo(result_to_json(contention_result))
         return
+
+    # Connection-death watchdog (task 2308 γ): ties this process's lifetime to
+    # the ssh dispatch channel on fd 0. Fires on stdin EOF (channel closed) or
+    # heartbeat starvation (hard partition), killing the build subtree and
+    # self-exiting instead of surviving as a setsid orphan. Same pgid as the
+    # pgid file, so a concurrent cancel-verify still tree-kills coherently.
+    if request_id is not None:
+        start_stdin_watchdog(pgid)
 
     try:
         result = asyncio.run(_run())
