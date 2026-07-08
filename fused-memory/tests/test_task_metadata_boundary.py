@@ -21,20 +21,21 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from orchestrator.deterministic_runner import (  # type: ignore[import-not-found]
+    _build_done_provenance,
+)
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome  # type: ignore[import-not-found]
 from pydantic import ValidationError
-
-from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
-from fused_memory.config.schema import TaskmasterConfig
-from orchestrator.deterministic_runner import _build_done_provenance
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from shared.task_metadata import (
-    DoneProvenance,
     MemoryHints,
     RetryLedger,
     TaskMetadata,
     apply_migrations,
     parse_metadata,
 )
+
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+from fused_memory.config.schema import TaskmasterConfig
 
 
 @pytest_asyncio.fixture
@@ -305,6 +306,7 @@ async def test_retry_ledger_persist_failure_escalates_to_human():
 
     assert outcome == WorkflowOutcome.BLOCKED
     mark_blocked.assert_awaited_once()
+    assert mark_blocked.await_args is not None
     _, kwargs = mark_blocked.await_args
     assert kwargs.get('escalate_to_human') is True
 
