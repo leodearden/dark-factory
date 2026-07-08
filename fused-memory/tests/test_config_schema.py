@@ -933,7 +933,13 @@ class TestTaskMetadataConfig:
     def test_defaults_to_warn_mode(self):
         assert TaskMetadataConfig().enforce is False
 
-    def test_fused_memory_config_attaches_disabled_by_default(self):
+    def test_fused_memory_config_attaches_disabled_by_default(self, tmp_path, monkeypatch):
+        # Point CONFIG_PATH at a non-existent file so YamlSettingsSource returns {}
+        # and we exercise the SCHEMA default (disabled) — not the shipped config.yaml,
+        # which sets task_metadata.enforce: true (the human-blessed W3-θ2 flip, task 2184).
+        # This test's distinct value is proving the sub-config ATTACHES to the parent;
+        # the schema default itself is covered by test_defaults_to_warn_mode above.
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
         cfg = FusedMemoryConfig().task_metadata
         assert isinstance(cfg, TaskMetadataConfig)
         assert cfg.enforce is False
