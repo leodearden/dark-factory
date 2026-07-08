@@ -5453,13 +5453,15 @@ class TestMultiProjectRoutingWiring:
         assert result['error_type'] == 'DarkFactoryPathScopeViolation'
 
     @pytest.mark.asyncio
-    async def test_stage2_no_hit_adjudicator_not_called(
+    async def test_no_hit_adjudicator_not_consulted(
         self,
         interceptor,
         monkeypatch,
         tmp_path,
     ):
-        """NO-HIT hot path: when Stage-1 returns OK, the adjudicator is never called."""
+        """NO-HIT path: when the PROSE check returns OK, a wired adjudicator
+        is never consulted (task 2206 retired the inline Stage-2 call
+        entirely; renamed from test_stage2_no_hit_adjudicator_not_called)."""
         from unittest.mock import AsyncMock
 
         from fused_memory.middleware.path_scope_guard import PathGuardVerdict
@@ -5495,14 +5497,30 @@ class TestMultiProjectRoutingWiring:
         fake_adj.adjudicate.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_stage2_hit_reject_returns_error_with_llm_reason(
+    async def test_hit_ignores_wired_adjudicator_and_is_advisory(
         self,
         interceptor,
         monkeypatch,
         tmp_path,
     ):
-        """HIT + REJECT: adjudicator confirms misroute → error dict returned,
-        escalator called once carrying the adjudicator's llm_reason."""
+        """Task 2206: the inline Stage-2 adjudicator is retired from this method.
+
+        Even when an adjudicator is wired and configured to return a
+        confident 'reject' verdict — which under the pre-2206 contract
+        would have produced a hard-reject error dict carrying the LLM's
+        reason — a PROSE-only hit is now a non-rejecting advisory: the
+        adjudicator is never consulted, ``_path_guard_or_skip`` returns
+        ``None``, the escalation still fires (with ``llm_reason=None``,
+        since no LLM ran), and ``possible_scope_mismatch`` is attached to
+        ``kwargs['metadata']``.
+
+        Replaces the old test_stage2_hit_reject_returns_error_with_llm_reason
+        / test_stage2_hit_failsafe_rejects_and_escalates_with_reason /
+        test_stage2_hit_allow_permits_creation_no_escalation trio, whose
+        shared premise — that the adjudicator's verdict gates the
+        reject/failsafe/allow decision — no longer holds now that PROSE
+        hits never reject in the first place.
+        """
         from unittest.mock import AsyncMock
 
         from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
@@ -5549,152 +5567,26 @@ class TestMultiProjectRoutingWiring:
             lambda self, c, k, p: verdict,
         )
 
+        kwargs = {'title': 'Edit fused-memory/X'}
         result = await interceptor._path_guard_or_skip(
-            {'title': 'Edit fused-memory/X'},
+            kwargs,
             str(tmp_path / 'reify'),
             'reify',
         )
-        # Rejection error dict returned.
-        assert result is not None
-        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
-        # Escalator called exactly once with the LLM reason.
+        # Advisory (None), not a rejection — the wired adjudicator is
+        # irrelevant to the outcome and must not be consulted.
+        assert result is None
+        fake_adj.adjudicate.assert_not_called()
+        # Escalator still fires exactly once, with no LLM reason (no LLM ran).
         assert len(escalator_calls) == 1
         call = escalator_calls[0]
-        assert call['llm_reason'] == 'genuine misroute — task edits orchestrator/harness.py'
-
-    @pytest.mark.asyncio
-    async def test_stage2_hit_failsafe_rejects_and_escalates_with_reason(
-        self,
-        interceptor,
-        monkeypatch,
-        tmp_path,
-    ):
-        """HIT + FAIL-SAFE (uncertain/failed): LLM outage never lets misroute through;
-        escalator is called with llm_reason from the fail-safe verdict."""
-        from unittest.mock import AsyncMock
-
-        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
-        from fused_memory.middleware.project_prefix_registry import (
-            ProjectPrefixRegistry,
-        )
-
-        (tmp_path / 'reify').mkdir()
-        (tmp_path / 'reify' / 'crates').mkdir()
-        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
-        interceptor._prefix_registry = registry
-
-        # Fail-safe verdict (uncertain + failed — simulates breaker-open / hang).
-        failsafe_verdict = AdjudicationVerdict(
-            verdict='uncertain',
-            reason='breaker-open',
-            failed=True,
-            llm_used=False,
-        )
-        fake_adj = AsyncMock()
-        fake_adj.adjudicate = AsyncMock(return_value=failsafe_verdict)
-        interceptor._path_scope_adjudicator = fake_adj
-
-        escalator_calls: list = []
-
-        class SpyEscalator:
-            def report_rejection(self, **kwargs):
-                escalator_calls.append(kwargs)
-
-        interceptor._scope_violation_escalator = SpyEscalator()
-
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='other',
-            matched_paths=('crates/',),
-            suggested_project='reify',
-        )
-        monkeypatch.setattr(
-            TaskInterceptor,
-            '_path_guard_check',
-            lambda self, c, k, p: verdict,
-        )
-
-        result = await interceptor._path_guard_or_skip(
-            {'title': 'crates/widget'},
-            '/foo',
-            'other',
-        )
-        # Guard preserved — misroute rejected even with LLM outage.
-        assert result is not None
-        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
-        # Escalated once, carrying the fail-safe reason.
-        assert len(escalator_calls) == 1
-        assert escalator_calls[0]['llm_reason'] == 'breaker-open'
-
-    @pytest.mark.asyncio
-    async def test_stage2_hit_allow_permits_creation_no_escalation(
-        self,
-        interceptor,
-        monkeypatch,
-        tmp_path,
-    ):
-        """HIT + ALLOW: adjudicator confident allow → creation permitted, no escalation."""
-        from unittest.mock import AsyncMock
-
-        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
-        from fused_memory.middleware.path_scope_guard import PathGuardVerdict
-        from fused_memory.middleware.project_prefix_registry import (
-            ProjectPrefixRegistry,
-        )
-
-        (tmp_path / 'reify').mkdir()
-        (tmp_path / 'reify' / 'crates').mkdir()
-        (tmp_path / 'dark-factory').mkdir()
-        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
-        registry = ProjectPrefixRegistry.from_roots(
-            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
-        )
-        interceptor._prefix_registry = registry
-
-        # Adjudicator returns confident allow.
-        allow_verdict = AdjudicationVerdict(
-            verdict='allow',
-            reason='incidental example mention in description',
-            llm_used=True,
-        )
-        fake_adj = AsyncMock()
-        fake_adj.adjudicate = AsyncMock(return_value=allow_verdict)
-        interceptor._path_scope_adjudicator = fake_adj
-
-        # Spy escalator — must NOT be called on allow.
-        escalator_calls: list = []
-
-        class SpyEscalator:
-            def report_rejection(self, **kwargs):
-                escalator_calls.append(kwargs)
-
-        interceptor._scope_violation_escalator = SpyEscalator()
-
-        # Force Stage-1 rejection.
-        verdict = PathGuardVerdict(
-            outcome='rejection',
-            project_id='reify',
-            matched_paths=('fused-memory/',),
-            suggested_project='dark_factory',
-        )
-        monkeypatch.setattr(
-            TaskInterceptor,
-            '_path_guard_check',
-            lambda self, c, k, p: verdict,
-        )
-
-        result = await interceptor._path_guard_or_skip(
-            {'title': 'Task mentioning fused-memory/ as example'},
-            str(tmp_path / 'reify'),
-            'reify',
-        )
-        # Adjudicator downgraded heuristic hit → creation permitted.
-        assert result is None
-        # Adjudicator was called exactly once.
-        fake_adj.adjudicate.assert_called_once()
-        # Escalator must NOT be called when adjudicator allows.
-        assert escalator_calls == []
+        assert call['llm_reason'] is None
+        assert call['matched_paths'] == ('fused-memory/',)
+        assert call['suggested_project'] == 'dark_factory'
+        # The advisory marker is attached to kwargs['metadata'].
+        marker = kwargs['metadata']['possible_scope_mismatch']
+        assert marker['matched_paths'] == ['fused-memory/']
+        assert marker['suggested_project'] == 'dark_factory'
 
 
 # ─────────────────────────────────────────────────────────────────────
