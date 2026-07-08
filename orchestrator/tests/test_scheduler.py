@@ -1222,6 +1222,67 @@ class TestGetModulesJsonStringMetadata:
         )
 
 
+class TestGetModulesWriteThroughCache:
+    """_get_modules must write-through into _module_cache on every successful
+    derive (task 2122 single-writer seam), while the deterministic short-circuit
+    and the task-<id> fallback stay UNCACHED — parity with the pre-migration
+    dual-writer defect's only correct branch.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_derive_write_through_caches_derived_modules(self, scheduler: Scheduler):
+        """After a real derive, _module_cache[task_id] equals the returned modules."""
+        task = {
+            'id': '50',
+            'metadata': {'files': ['backend/app.py', 'server/main.py']},
+        }
+        result = scheduler._get_modules(task)
+        assert result != ['task-50']
+        assert scheduler._module_cache['50'] == result
+
+    def test_cache_parity_across_metadata_update(self, scheduler: Scheduler):
+        """Derive v1 -> cache matches; evict (mirrors the terminal/redispatch
+        sweep at scheduler.py:3670) -> derive v2 -> cache tracks the new value,
+        never the stale one.
+        """
+        task_v1 = {'id': '51', 'metadata': {'files': ['backend/app.py']}}
+        result_v1 = scheduler._get_modules(task_v1)
+        assert scheduler._module_cache['51'] == result_v1
+
+        # Mirror the terminal/redispatch eviction sweep (.pop(), not an assignment).
+        scheduler._module_cache.pop('51', None)
+
+        task_v2 = {'id': '51', 'metadata': {'files': ['frontend/app.tsx']}}
+        result_v2 = scheduler._get_modules(task_v2)
+        assert result_v2 != result_v1, (
+            f'Expected the re-derive to reflect the updated metadata, got the '
+            f'same modules {result_v2} for both v1 and v2 files'
+        )
+        assert scheduler._module_cache['51'] == result_v2, (
+            'Cache must track the fresh derive, not the stale v1 value'
+        )
+
+    def test_deterministic_task_returns_empty_and_is_not_cached(
+        self, scheduler: Scheduler
+    ):
+        """Deterministic (gate) tasks short-circuit to [] and never enter the cache."""
+        task = {'id': '52', 'metadata': {'task_kind': 'deterministic'}}
+        result = scheduler._get_modules(task)
+        assert result == []
+        assert '52' not in scheduler._module_cache
+
+    def test_task_id_fallback_is_not_cached(self, scheduler: Scheduler):
+        """The task-<id> synthetic fallback is never written to the cache."""
+        task = {'id': '53', 'metadata': {}}
+        result = scheduler._get_modules(task)
+        assert result == ['task-53']
+        assert '53' not in scheduler._module_cache
+
+
 class TestUpdateTaskMetadataSerialization:
     """Regression tests for update_task dict->JSON string coercion."""
 
