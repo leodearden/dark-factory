@@ -27,13 +27,32 @@ class TestIsSnapshotWriteBlocked:
             "snapshot write paths are blocked-by-design for this project"
         )
 
-    def test_dark_factory_is_not_blocked(self):
-        """is_snapshot_write_blocked('dark_factory') must return False."""
+    def test_dark_factory_is_blocked(self):
+        """is_snapshot_write_blocked('dark_factory') must return True (task 2325).
+
+        dark_factory has never written a task_count_snapshot — the per-project
+        census is not in use for it, so the ABSENCE of a snapshot is
+        correct-by-design.
+        """
         from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 
-        assert is_snapshot_write_blocked('dark_factory') is False, (
-            "is_snapshot_write_blocked('dark_factory') must return False; "
-            "dark_factory is not in the blocked set"
+        assert is_snapshot_write_blocked('dark_factory') is True, (
+            "is_snapshot_write_blocked('dark_factory') must return True; "
+            "snapshot write paths are blocked-by-design for this project"
+        )
+
+    def test_solar_challenge_platform_is_blocked(self):
+        """is_snapshot_write_blocked('solar_challenge_platform') must return True (task 2325).
+
+        solar_challenge_platform has never written a task_count_snapshot — the
+        per-project census is not in use for it, so the ABSENCE of a snapshot
+        is correct-by-design.
+        """
+        from fused_memory.reconciliation.policies import is_snapshot_write_blocked
+
+        assert is_snapshot_write_blocked('solar_challenge_platform') is True, (
+            "is_snapshot_write_blocked('solar_challenge_platform') must return True; "
+            "snapshot write paths are blocked-by-design for this project"
         )
 
     def test_reify_is_not_blocked(self):
@@ -78,3 +97,25 @@ class TestIsSnapshotWriteBlocked:
         )
 
         assert KNOW_LIVE_PROJECT_ID == 'know_live'
+
+    def test_dark_factory_project_id_constant_value(self):
+        """DARK_FACTORY_PROJECT_ID must equal 'dark_factory' (task 2325)."""
+        from fused_memory.reconciliation.policies.dark_factory import (
+            DARK_FACTORY_PROJECT_ID,
+        )
+
+        assert DARK_FACTORY_PROJECT_ID == 'dark_factory'
+
+    def test_solar_challenge_platform_project_id_constant_value(self):
+        """SOLAR_CHALLENGE_PLATFORM_PROJECT_ID must equal 'solar_challenge_platform' (task 2325)."""
+        from fused_memory.reconciliation.policies.solar_challenge_platform import (
+            SOLAR_CHALLENGE_PLATFORM_PROJECT_ID,
+        )
+
+        assert SOLAR_CHALLENGE_PLATFORM_PROJECT_ID == 'solar_challenge_platform'
+
+    def test_snapshot_write_blocked_projects_registry_includes_new_exemptions(self):
+        """SNAPSHOT_WRITE_BLOCKED_PROJECTS must include both new exemptions (task 2325)."""
+        from fused_memory.reconciliation.policies import SNAPSHOT_WRITE_BLOCKED_PROJECTS
+
+        assert {'dark_factory', 'solar_challenge_platform'} <= SNAPSHOT_WRITE_BLOCKED_PROJECTS
