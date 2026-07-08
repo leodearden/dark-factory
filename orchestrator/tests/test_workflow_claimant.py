@@ -23,11 +23,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from shared.task_claimant import compose_claimant_run_id
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import WorktreeInfo
 from orchestrator.workflow import TaskWorkflow
-from shared.task_claimant import compose_claimant_run_id
 
 
 def _make_workflow(
@@ -100,7 +100,7 @@ async def test_dispatch_stamps_claimant_run_id_and_heartbeat(tmp_path: Path):
         await _setup(wf)
 
     expected_claimant = compose_claimant_run_id('run-abc123', wf.session_id, os.getpid())
-    wf.scheduler.set_task_status.assert_awaited_once_with(
+    wf.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
         '101', 'in-progress',
         claimant_run_id=expected_claimant,
         heartbeat_at=fixed_now.isoformat(),
@@ -114,7 +114,7 @@ async def test_dispatch_stamp_embeds_run_id_session_id_and_pid(tmp_path: Path):
 
     await _setup(wf)
 
-    kwargs = wf.scheduler.set_task_status.call_args.kwargs
+    kwargs = wf.scheduler.set_task_status.call_args.kwargs  # type: ignore[attr-defined]
     claimant_run_id = kwargs['claimant_run_id']
     assert 'run-xyz789' in claimant_run_id
     assert wf.session_id in claimant_run_id
@@ -150,8 +150,8 @@ async def test_heartbeat_loop_refreshes_heartbeat_only(tmp_path: Path):
     await asyncio.sleep(0.05)
     await wf._stop_claimant_heartbeat()
 
-    assert wf.scheduler.set_task_claimant.await_count >= 1
-    args, kwargs = wf.scheduler.set_task_claimant.call_args
+    assert wf.scheduler.set_task_claimant.await_count >= 1  # type: ignore[attr-defined]
+    args, kwargs = wf.scheduler.set_task_claimant.call_args  # type: ignore[attr-defined]
     assert args == ('303',)
     assert 'claimant_run_id' not in kwargs
     assert 'heartbeat_at' in kwargs
@@ -165,13 +165,13 @@ async def test_stop_claimant_heartbeat_halts_further_refreshes(tmp_path: Path):
     await _setup(wf)
     await asyncio.sleep(0.05)
     await wf._stop_claimant_heartbeat()
-    count_after_stop = wf.scheduler.set_task_claimant.await_count
+    count_after_stop = wf.scheduler.set_task_claimant.await_count  # type: ignore[attr-defined]
 
     # Give the (now-cancelled) loop plenty of time to have ticked again if it
     # were still alive.
     await asyncio.sleep(0.05)
 
-    assert wf.scheduler.set_task_claimant.await_count == count_after_stop
+    assert wf.scheduler.set_task_claimant.await_count == count_after_stop  # type: ignore[attr-defined]
     assert wf._claimant_heartbeat_task is None or wf._claimant_heartbeat_task.done()
 
 

@@ -35,6 +35,10 @@ class FakeScheduler:
         # Optional task data store for tests that exercise the bypass-detection
         # path, which calls get_task to read metadata.done_provenance.
         self.task_data: dict[str, dict] = {}
+        # PRD task-status-authority C4/D4 (task 2188, omega1): last-seen
+        # claimant fields, tracked the same way as provenance/reopen_reasons.
+        self.claimant_run_ids: dict[str, str | None] = {}
+        self.heartbeats: dict[str, str | None] = {}
 
     async def set_task_status(
         self,
@@ -43,12 +47,29 @@ class FakeScheduler:
         *,
         done_provenance: dict | None = None,
         reopen_reason: str | None = None,
+        claimant_run_id: str | None = None,
+        heartbeat_at: str | None = None,
     ) -> None:
         self.statuses.setdefault(task_id, []).append(status)
         if done_provenance is not None:
             self.provenance[task_id] = done_provenance
         if reopen_reason is not None:
             self.reopen_reasons[task_id] = reopen_reason
+        if claimant_run_id is not None:
+            self.claimant_run_ids[task_id] = claimant_run_id
+        if heartbeat_at is not None:
+            self.heartbeats[task_id] = heartbeat_at
+
+    async def set_task_claimant(
+        self,
+        task_id: str,
+        *,
+        claimant_run_id: str | None = None,
+        heartbeat_at: str | None = None,
+    ) -> None:
+        """Status-untouching claimant write — mirrors Scheduler.set_task_claimant."""
+        self.claimant_run_ids[task_id] = claimant_run_id
+        self.heartbeats[task_id] = heartbeat_at
 
     async def mark_done(
         self,
