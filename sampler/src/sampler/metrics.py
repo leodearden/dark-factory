@@ -34,10 +34,10 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import re
 from collections.abc import Callable, Iterable
-from pathlib import Path
 from typing import Any
+
+from shared.psi import parse_pressure_file, read_pressure
 
 logger = logging.getLogger(__name__)
 
@@ -51,67 +51,17 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# PSI helpers
+# PSI helpers — parse_pressure_file/read_pressure are re-homed to shared.psi
+# (DA-D9: reuse, do not reimplement) and re-exported below so this module's
+# public API is unchanged. See shared/src/shared/psi.py for the
+# implementation and TestParserRehomedToShared in this module's test suite
+# for the anti-drift object-identity guard.
 # ---------------------------------------------------------------------------
-
-_AVG10_RE = re.compile(r'avg10=([0-9]+(?:\.[0-9]+)?)')
-
-
-def parse_pressure_file(text: str) -> dict[str, float] | None:
-    """Parse a /proc/pressure/<name> text and return {some_avg10, full_avg10}.
-
-    If the ``full`` line is absent (e.g. CPU on some kernels), ``full_avg10``
-    defaults to 0.0.
-
-    Returns:
-        A dict with ``some_avg10`` and ``full_avg10`` on success, or ``None``
-        if no some/full avg10 value could be extracted (empty text, garbage
-        content, or truncated read).  A *partial* miss where ``some`` is
-        present but ``full`` is absent still returns a dict — that is a
-        legitimate kernel behaviour, not a fault.  Only a *total* miss (neither
-        key extracted) returns ``None`` so ``collect_psi`` can distinguish a
-        read/parse fault from genuine zero pressure.
-
-    Note on asymmetry:
-        The kernel **always** emits a ``some`` line for all PSI resources; the
-        ``full`` line is the one that may be omitted (e.g. CPU on some kernels).
-        Therefore the partial-miss case is always *some-present / full-absent*,
-        and a *full-present / some-absent* result is not a legitimate kernel
-        state.  If that impossible case were ever produced (e.g. by a
-        kernel change or filesystem stub), the current logic would fabricate
-        ``some_avg10=0.0``.  This is documented here as a known asymmetry; the
-        sentinel (``None``) is not triggered in that case because ``found``
-        becomes ``True`` via the ``full`` branch.  Should the kernel contract
-        shift, a separate ``found_some`` guard should be added mirroring the
-        ``full`` handling.
-    """
-    result: dict[str, float] = {'some_avg10': 0.0, 'full_avg10': 0.0}
-    found = False
-    for line in text.splitlines():
-        line = line.strip()
-        m = _AVG10_RE.search(line)
-        if m is None:
-            continue
-        value = float(m.group(1))
-        if line.startswith('some'):
-            result['some_avg10'] = value
-            found = True
-        elif line.startswith('full'):
-            result['full_avg10'] = value
-            found = True
-    if not found:
-        return None
-    return result
-
-
-def _default_psi_read(name: str) -> str:
-    """Read /proc/pressure/<name> from the live kernel."""
-    return Path(f'/proc/pressure/{name}').read_text()
 
 
 def collect_psi(
     *,
-    read: Callable[[str], str] = _default_psi_read,
+    read: Callable[[str], str] = read_pressure,
 ) -> dict[str, float]:
     """Return the 6 PSI avg10 values keyed as psi_{cpu,mem,io}_{some,full}_avg10.
 
