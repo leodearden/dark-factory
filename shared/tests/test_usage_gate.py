@@ -762,6 +762,24 @@ class TestProbeConfigDirIsolation:
             and pid in personal_env['CLAUDE_CONFIG_DIR']
         )
 
+    @pytest.mark.asyncio
+    async def test_shutdown_cleans_up_every_per_account_config_dir(self):
+        """shutdown() must clean up EVERY per-account dir, not just the alias.
+
+        RED on current code: shutdown() calls only self._probe_config_dir
+        .cleanup() (a single dir), so the 'personal' dir is never cleaned.
+        """
+        gate = make_gate(['work', 'personal'])
+        for name in ('work', 'personal'):
+            gate._probe_config_dirs[name] = MagicMock()
+        # Keep the back-compat alias consistent with the (mocked) dict.
+        gate._probe_config_dir = gate._probe_config_dirs['work']
+
+        await gate.shutdown()
+
+        gate._probe_config_dirs['work'].cleanup.assert_called_once()
+        gate._probe_config_dirs['personal'].cleanup.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # wait_for_open — used by curator worker for AllAccountsCappedException defer
