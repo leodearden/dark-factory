@@ -208,3 +208,41 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
         "count_memories_by_metadata(project_id, filters) -> {'count': N}"
     ),
 }
+
+# --------------------------------------------------------------------------- #
+# Rendered prompt sections
+# --------------------------------------------------------------------------- #
+
+
+def _kinds_with_deleter(deleter: str) -> tuple[str, ...]:
+    """Return the MARKER_KINDS entries whose MARKER_LIFECYCLE.deleter matches
+    *deleter*, in MARKER_KINDS order."""
+    return tuple(kind for kind in MARKER_KINDS if MARKER_LIFECYCLE[kind].deleter == deleter)
+
+
+def render_marker_lifecycle_section() -> str:
+    """Render the marker-lifecycle / run_id-fresh-per-cycle section, faithful
+    to reconciliation/prompts/stage1.py:562-592's Flag Deduplication and
+    Stage 2 Flag Relay prose."""
+    gc_kinds = _kinds_with_deleter(DELETER_GC)
+    kinds_str = ', '.join(f'`{kind}`' for kind in gc_kinds)
+    return (
+        '## Marker Lifecycle\n'
+        "Stage 1's flag emission is post-processed by an automatic deduplicator "
+        'that writes a `stage1_flag_marker` Mem0 memory per (task_id, flag_type), '
+        'and — for items carrying `metadata.flag_for_stage2=true` — a '
+        '`flag_for_stage2` marker so Stage 2 can pick it up; Stage 2 / '
+        'TaskKnowledgeSync likewise writes a `stage2_persistence_marker`. '
+        f'These per-task marker kinds ({kinds_str}) share one lifecycle rule: '
+        'GC deletes them once their task_id goes terminal, and nothing else '
+        '(not Stage 3 remediation, not the LLM) deletes them early.\n\n'
+        'Every marker write MUST include `metadata.run_id=<current_run_id>`. '
+        '`run_id` is minted fresh per run and is never persisted across cycles: '
+        'the Mem0 marker channel is intentionally single-cycle. Any marker whose '
+        'run_id does not match the current cycle — including one left over from '
+        'a prior cycle whose consumer crashed before processing it — is '
+        'unconditionally swept by Python and never reaches the LLM; it is not '
+        'retried. The `flagged_items` structured-output field is the durable '
+        'delivery channel that survives this sweep — the marker is only a '
+        'same-cycle relay.'
+    )
