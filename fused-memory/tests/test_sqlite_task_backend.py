@@ -1842,7 +1842,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
     assert 'parent_id' not in tasks_cols, f'tasks still has parent_id column: {tasks_cols}'
     assert 'parent_id' not in deps_cols, f'dependencies still has parent_id column: {deps_cols}'
     assert 'parent_id' not in counters_cols, f'id_counters still has parent_id column: {counters_cols}'
-    assert user_version == 3, f'Expected user_version=3 after migration; got {user_version}'
+    assert user_version == 4, f'Expected user_version=4 after migration; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns after full-rebuild migration; got {tasks_cols}'
     )
@@ -1860,7 +1860,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
 
 @pytest.mark.asyncio
 async def test_migration_idempotent_second_open(tmp_path):
-    """Opening an already-migrated DB a second time is a no-op: user_version stays 3."""
+    """Opening an already-migrated DB a second time is a no-op: user_version stays 4."""
     import sqlite3
 
     project_root = str(tmp_path / 'proj')
@@ -1887,13 +1887,13 @@ async def test_migration_idempotent_second_open(tmp_path):
     finally:
         conn.close()
 
-    assert user_version == 3
+    assert user_version == 4
     assert 'parent_id' not in tasks_cols
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_has_no_parent_id_and_user_version_3(tmp_path):
+async def test_fresh_db_has_no_parent_id_and_user_version_4(tmp_path):
     """A brand-new DB is created with the post-migration schema from the start."""
     import sqlite3
 
@@ -1919,7 +1919,7 @@ async def test_fresh_db_has_no_parent_id_and_user_version_3(tmp_path):
         conn.close()
 
     assert 'parent_id' not in tasks_cols, f'New DB should not have parent_id; got {tasks_cols}'
-    assert user_version == 3, f'Fresh DB should have user_version=3; got {user_version}'
+    assert user_version == 4, f'Fresh DB should have user_version=4; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns in fresh schema; got {tasks_cols}'
     )
@@ -1980,13 +1980,15 @@ def _make_v1_schema_db(db_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     """Opening an already-migrated v1 DB ALTERs in the claimant columns and
-    then chains the v2->v3 candidate_key step, landing at v3.
+    then chains the v2->v3 candidate_key step and the v3->v4 index step,
+    landing at v4.
 
     This is the common production case: parent_id is already gone (a prior
     deploy ran the v0->v1 rebuild), but claimant_run_id/heartbeat_at don't
     exist yet. Distinct from test_migration_drops_parent_id_column_and_straggler
     above, which exercises the v0->v3 full-rebuild-then-ALTER path for DBs that
-    still have parent_id.
+    still have parent_id. The single seed row is duplicate-free, so the
+    v3->v4 residual audit is clean and the migration reaches v4 uninterrupted.
     """
     import sqlite3
 
@@ -2015,7 +2017,7 @@ async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected ALTER TABLE to add claimant_run_id/heartbeat_at; got {tasks_cols}'
     )
-    assert user_version == 3, f'Expected user_version=3 after v1->v3 migration; got {user_version}'
+    assert user_version == 4, f'Expected user_version=4 after v1->v4 migration; got {user_version}'
 
 
 def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
@@ -2276,7 +2278,10 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     assert by_id[1] == compute_candidate_key('Fix the bug', ['a.py'])
     assert by_id[2] == compute_candidate_key('Add the feature', ['c.py'])
     assert by_id[3] == compute_candidate_key('Refactor the thing', [])
-    assert user_version == 3, f'Expected user_version=3 after migration; got {user_version}'
+    # The v2->v3 backfill's own audit is clean (3/3 unique), and the v3->v4
+    # residual audit over the same rows is trivially clean too, so the chain
+    # reaches v4 (index built) rather than stopping at v3.
+    assert user_version == 4, f'Expected user_version=4 after migration; got {user_version}'
 
     # Exactly one audit record, at INFO (not WARNING), naming duplicate_groups=0.
     audit_records = [r for r in caplog.records if 'duplicate_groups=' in r.message]

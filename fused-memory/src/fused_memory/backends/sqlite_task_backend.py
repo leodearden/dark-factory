@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,13 @@ logger = logging.getLogger(__name__)
 #   v3: + candidate_key column (fm-task-dedup W8 task A1) — computed on every
 #       insert going forward; backfilled for non-cancelled rows on migration.
 #       See ``_migrate_v2_to_v3``.
-_SCHEMA_VERSION = 3
+#   v4: + partial UNIQUE index ux_tasks_candidate_key over (tag,
+#       candidate_key) WHERE candidate_key IS NOT NULL AND status !=
+#       'cancelled' (fm-task-dedup W8 task A2) — self-gating: re-audits for
+#       residual non-cancelled duplicates at connection-open and SKIPS the
+#       index build (leaving user_version at 3) when any remain, so the next
+#       open lands it once residuals are cleaned up. See ``_migrate_v3_to_v4``.
+_SCHEMA_VERSION = 4
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
@@ -236,6 +243,8 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
       ``heartbeat_at`` (task 2182, PRD plans/task-status-authority-prd.md).
     * v2 → v3: see :func:`_migrate_v2_to_v3` — add + backfill
       ``candidate_key`` (fm-task-dedup W8 task A1).
+    * v3 → v4: see :func:`_migrate_v3_to_v4` — self-gating partial UNIQUE
+      index over ``candidate_key`` (fm-task-dedup W8 task A2).
 
     Each ALTER step is column-presence-guarded, so a fresh DB whose
     ``_SCHEMA_SQL`` already created every column runs all steps as no-op
@@ -318,6 +327,10 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
 
     if version < 3:
         await _migrate_v2_to_v3(conn)
+        version = 3
+
+    if version < 4:
+        await _migrate_v3_to_v4(conn)
 
 
 async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
@@ -409,6 +422,98 @@ async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
 
     await conn.execute('PRAGMA user_version = 3')
     await conn.commit()
+
+
+async def _migrate_v3_to_v4(conn: aiosqlite.Connection) -> None:
+    """v3 -> v4 (fm-task-dedup W8 task A2): self-gating partial UNIQUE index.
+
+    Re-runs the same residual non-cancelled duplicate ``candidate_key``
+    audit ``_migrate_v2_to_v3`` performed (report-only there), extended with
+    ``GROUP_CONCAT(id)`` to name the offending rows:
+
+    * **Residuals found** — log a loud ERROR naming the groups (via the
+      ``residual_group_count=`` token, deliberately distinct from v2->v3's
+      ``duplicate_groups=`` token so the two audits' log-scraping assertions
+      never collide) and SKIP the index build. ``user_version`` is left at 3
+      (NOT stamped to 4): a later connection-open — after an operator cleans
+      up the residuals — re-runs this step and lands the index then (PRD
+      decision #4: "the next deploy lands the index").
+    * **Clean** — build ``ux_tasks_candidate_key``, a PARTIAL UNIQUE index
+      over ``(tag, candidate_key)`` excluding NULL keys and cancelled rows,
+      then stamp ``user_version = 4``.
+
+    FAIL-SAFE: this step NEVER raises. ``_get_connection`` only caches the
+    connection AFTER ``_migrate`` returns, so a raising migration would
+    crash-loop fused-memory on every connection-open. The index CREATE is
+    additionally guarded against ``sqlite3.IntegrityError`` (a residual
+    duplicate slipping past the audit, e.g. a race) -- skip, don't raise --
+    and the whole step is wrapped so nothing unexpected propagates either.
+
+    Deliberately NOT added to ``_SCHEMA_SQL``: a fresh-schema ``executescript``
+    run at every connection-open would raise ``IntegrityError`` building the
+    index against a DB that still holds residual duplicates, defeating the
+    self-gating fail-safe. Fresh DBs still get the index via the full
+    v0->v1->v2->v3->v4 chain, where this audit is trivially clean.
+    """
+    try:
+        dup_cursor = await conn.execute(
+            """
+            SELECT tag, candidate_key, GROUP_CONCAT(id) AS ids, COUNT(*) AS n
+            FROM tasks
+            WHERE candidate_key IS NOT NULL AND status != 'cancelled'
+            GROUP BY tag, candidate_key
+            HAVING COUNT(*) > 1
+            """,
+        )
+        residual_rows = await dup_cursor.fetchall()
+
+        if residual_rows:
+            groups_desc = '; '.join(
+                f'tag={row["tag"]!r} candidate_key={row["candidate_key"]!r} '
+                f'ids=[{row["ids"]}]'
+                for row in residual_rows
+            )
+            logger.error(
+                'sqlite_task_backend: schema v3->v4 migration SKIPPED -- '
+                'residual_group_count=%d non-cancelled duplicate candidate_key '
+                'group(s) still present; UNIQUE index NOT created, '
+                'user_version stays at 3. Clean up the residual duplicates '
+                '(cancel or merge the extras) and the next connection-open '
+                'will land the index. Groups: %s',
+                len(residual_rows), groups_desc,
+            )
+            return
+
+        try:
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_candidate_key "
+                "ON tasks(tag, candidate_key) "
+                "WHERE candidate_key IS NOT NULL AND status != 'cancelled'",
+            )
+        except sqlite3.IntegrityError:
+            logger.error(
+                'sqlite_task_backend: schema v3->v4 migration -- CREATE UNIQUE '
+                'INDEX ux_tasks_candidate_key raised IntegrityError despite a '
+                'clean audit (race?); skipping index build, user_version '
+                'stays at 3.',
+            )
+            return
+
+        await conn.execute('PRAGMA user_version = 4')
+        await conn.commit()
+        logger.info(
+            'sqlite_task_backend: schema v3->v4 migration -- residual audit '
+            'clean; built partial UNIQUE index ux_tasks_candidate_key over '
+            '(tag, candidate_key) and advanced user_version to 4 '
+            '(fm-task-dedup task A2).',
+        )
+    except Exception:
+        # Defensive backstop -- this step must NEVER raise at connection-open
+        # (see docstring): a raising migration would crash-loop fused-memory.
+        logger.exception(
+            'sqlite_task_backend: schema v3->v4 migration failed unexpectedly; '
+            'skipping (user_version stays below 4, retried on next open)',
+        )
 
 
 async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
