@@ -8176,7 +8176,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         await self._resolve_and_release(
                             entry, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
-                            chain_failed=True, release_resources=False,
+                            chain_failed=True,
                         )
                     continue  # don't append to _inflight; fetch next item
 
@@ -8208,11 +8208,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         'Task %s: unexpected finalize error', head.item.request.task_id
                     )
                     # _finalize_inflight's finally already released the lease
-                    # and speculation slot; the chokepoint just resolves the
-                    # future and marks the chain as failed.
+                    # and speculation permit; the chokepoint's own release is
+                    # a no-op here (idempotent lease FREE-check + permit
+                    # .released guard) — it just resolves the future and
+                    # marks the chain as failed.
                     await self._resolve_and_release(
                         head, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
-                        chain_failed=True, release_resources=False,
+                        chain_failed=True,
                     )
 
                 # HEAD-FAILURE CASCADE (γ step-20): when the head fails, abort
@@ -8259,14 +8261,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # resolves as MergeOutcome('blocked', reason='Verifier
                     # cascade error: ...') and the loop continues to the next
                     # downstream entry.
-                    # Release discipline: lease+slot are released in-body at
-                    # cancel_and_release / _speculation_slot.release() BEFORE
-                    # _remerge is called; the _entry_released flag prevents a
-                    # double-release in the except handler on the
-                    # _remerge-raises path (which is the primary failure mode).
+                    # Release discipline: lease+permit are released in-body
+                    # at cancel_and_release / speculation_ledger.release()
+                    # BEFORE _remerge is called. The except handler below
+                    # also runs the chokepoint's release unconditionally on
+                    # the _remerge-raises path (the primary failure mode) —
+                    # safe because both releases are idempotent (task
+                    # 2160/η): no _entry_released guard needed.
                     for _entry in _downstream:
                         _entry_status: str | None = None
-                        _entry_released = False
                         try:
                             if _entry.verify_task is not None:
                                 # Fire remote cancel BEFORE task.cancel() so the
@@ -8317,9 +8320,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # threaded token rather than was_speculative.
                             if _entry.permit is not None:
                                 self._speculation_ledger.release(_entry.permit)
-                            # Past the in-body lease+slot release; the except
-                            # handler must not re-release on any path below.
-                            _entry_released = True
                             # REQUEUED: abort-poll already put req on _queue → skip.
                             if _entry_status == InflightStatus.REQUEUED:
                                 continue
@@ -8353,18 +8353,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 'Task %s: unexpected cascade error',
                                 _entry.item.request.task_id,
                             )
-                            # In-body release already ran (_entry_released=True)
-                            # UNLESS it raised before completing (e.g.
-                            # cancel_and_release itself raised) — in which case
-                            # the chokepoint performs the best-effort release
-                            # (lease/slot/merge-worktree) to avoid a leak.
+                            # The in-body release above may have already run
+                            # (lease/permit/merge-worktree), or may not have
+                            # completed if it raised (e.g. cancel_and_release
+                            # itself raised) — the chokepoint's release is
+                            # unconditional and idempotent (task 2160/η), so
+                            # it is safe either way: a no-op if already
+                            # released, a best-effort release otherwise.
                             await self._resolve_and_release(
                                 _entry, MergeOutcome(
                                     'blocked',
                                     reason=f'Verifier cascade error: {_cascade_exc}',
                                 ),
                                 chain_failed=True,
-                                release_resources=not _entry_released,
                                 cancel_lease=True,
                             )
                             continue
@@ -8431,7 +8432,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         await self._resolve_and_release(
                             entry, MergeOutcome('blocked', reason=f'Verifier error: {exc}'),
-                            chain_failed=True, release_resources=False,
+                            chain_failed=True,
                         )
                     continue  # restart outer loop → fill loop picks up next item
 
@@ -8676,7 +8677,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         outcome: MergeOutcome,
         *,
         chain_failed: bool,
-        release_resources: bool = True,
         cancel_lease: bool = False,
     ) -> None:
         """Single resolve-and-release chokepoint for the _verifier_loop
@@ -8685,23 +8685,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Unifies the six near-identical except-handler bodies that used to
         inline: resolve the caller's Future, release the host lease (release
         vs cancel_and_release), clean up an owned merge worktree, release the
-        speculation slot, and flag the chain as failed.  Each call site keeps
-        its own ``logger.exception`` message and its own
+        speculation permit, and flag the chain as failed.  Each call site
+        keeps its own ``logger.exception`` message and its own
         ``except (CancelledError, KeyboardInterrupt): raise`` clause; only the
         resolve-and-release tail is centralised here.
 
-        *entry_or_item* is normalised to (req, lease, merge_wt, slot_held):
-        an ``InflightEntry`` carries ``lease``/``merge_wt``/``was_speculative``
+        *entry_or_item* is normalised to (req, lease, merge_wt, permit): an
+        ``InflightEntry`` carries ``lease``/``merge_wt``/``permit``
         (post-dispatch state); a bare ``SpeculativeItem`` has no lease yet
-        (pre-dispatch state) and uses ``merge_wt``/``speculative`` directly.
-
-        *release_resources* controls whether this call performs any release
-        at all.  It must be ``False`` for the POST-finalize handlers
-        (passthrough-finalize x2, finalize-head): ``_finalize_inflight``'s own
-        ``finally`` clause already released the lease and speculation slot on
-        every exit path including exceptions, so releasing again here would
-        double-release.  It defaults to ``True`` for the PRE-finalize dispatch
-        handlers, which own the item's resources outright.
+        (pre-dispatch state) and uses ``merge_wt``/``permit`` directly.
 
         *cancel_lease* selects ``cancel_and_release`` over plain ``release``
         (mirrors ``_finalize_inflight``'s own ``_cancel_release`` switch) —
@@ -8720,7 +8712,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         detail (tracked only in ``_owned_merge_worktrees``) that is never
         exposed to the ``req.result`` waiter, so a waiter woken by the
         just-resolved Future cannot observe the not-yet-cleaned worktree or
-        not-yet-released lease/slot.  No consumer or test depends on
+        not-yet-released lease/permit.  No consumer or test depends on
         intra-handler await ordering between resolve and release.
 
         Abandoned-drop semantics: step 1 resolves via
@@ -8742,6 +8734,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         equivalence is intentional and holds uniformly across all six call
         sites now unified behind this chokepoint.
 
+        Releases are unconditional and idempotent (task 2160/η): every
+        resource this method touches tolerates a second release as a silent
+        no-op — ``HostAllocator.release``/``cancel_and_release`` FREE-check
+        the lease slot, ``_cleanup_owned_merge_worktree`` pops from
+        ``_owned_merge_worktrees``, and ``PermitLedger.release`` checks
+        ``permit.released`` first before touching the ledger. So a caller
+        whose own code path (``_finalize_inflight``'s ``finally``, or the
+        cascade handler's in-body release) already released these resources
+        can invoke this chokepoint unconditionally, with no
+        ``release_resources`` flag needed — removed along with the cascade
+        loop's now-redundant ``_entry_released`` guard.
+
         This is also the intended hook surface for task eta's liveness-ledger
         'resolved' transition: every _verifier_loop error-resolution path now
         funnels through this one coroutine.
@@ -8750,28 +8754,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             item = entry_or_item.item
             lease: Any | None = entry_or_item.lease
             merge_wt = entry_or_item.merge_wt
-            slot_held = entry_or_item.was_speculative
+            permit = entry_or_item.permit
         else:
             item = entry_or_item
             lease = None
             merge_wt = item_merge_wt(entry_or_item)
-            slot_held = entry_or_item.speculative
+            permit = entry_or_item.permit
         req = item.request
 
         self._resolve_or_drop_abandoned(req, outcome)
 
-        if release_resources:
-            if lease is not None and self._host_allocator is not None:
-                with contextlib.suppress(BaseException):
-                    if cancel_lease:
-                        await self._host_allocator.cancel_and_release(lease)
-                    else:
-                        await self._host_allocator.release(lease)
-            if merge_wt is not None:
-                with contextlib.suppress(BaseException):
-                    await self._cleanup_owned_merge_worktree(merge_wt)
-            if slot_held:
-                self._speculation_slot.release()
+        if lease is not None and self._host_allocator is not None:
+            with contextlib.suppress(BaseException):
+                if cancel_lease:
+                    await self._host_allocator.cancel_and_release(lease)
+                else:
+                    await self._host_allocator.release(lease)
+        if merge_wt is not None:
+            with contextlib.suppress(BaseException):
+                await self._cleanup_owned_merge_worktree(merge_wt)
+        if permit is not None:
+            self._speculation_ledger.release(permit)
 
         if chain_failed:
             self._n_failed = True
