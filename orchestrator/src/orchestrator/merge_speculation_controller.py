@@ -378,13 +378,16 @@ class SpeculationController:
         self.pending_spec_base = merge_commit
         self.pending_predecessor = predecessor
 
-    def on_transfer(self) -> None:
+    def on_transfer(self) -> SpecPermit | None:
         """The merger has handed a speculative item to the verifier.
 
         Clears ``held_by_merger`` WITHOUT releasing the permit through the
         ledger — the verifier now owns the permit and will release it
-        itself on drain (the zeta chokepoint). Mirrors
-        ``merge_queue.py:6926``.
+        itself on drain. RETURNS the detached token (still registered in
+        ``self._ledger.live``) so the caller (the merger loop, task eta) can
+        stamp it onto the enqueued item's ``.permit`` field; the verifier
+        later releases this SAME token via ``ledger.release(item.permit)``.
+        Mirrors ``merge_queue.py:6926``.
 
         Used ONLY at the single post-merge-success look-ahead site:
         ``spec_base`` is deliberately left as-is because the
@@ -396,21 +399,23 @@ class SpeculationController:
 
         The transferred token is NOT discarded from ``self._ledger.live`` —
         see :class:`PermitLedger`'s docstring ("Known interim cost") for why
-        this is intentional and what the accepted memory-growth cost is
-        until task eta migrates the verifier's release onto this same
-        token.
+        this is intentional: the caller (task eta) stamps the returned token
+        onto the item so the verifier can release this same token later.
         """
+        p = self._permit
         self._permit = None
+        return p
 
-    def on_transfer_terminal(self) -> None:
+    def on_transfer_terminal(self) -> SpecPermit | None:
         """The merger has handed a TERMINAL (early-continue) item to the verifier.
 
         Like ``on_transfer``, clears ``held_by_merger`` WITHOUT releasing the
-        permit through the ledger — the verifier now owns the permit. UNLIKE
-        ``on_transfer``, ALSO clears ``spec_base``: this is for the seven
-        early-continue sites (already_merged / conflict / merge-fail /
-        abandoned / revparse-fail / drop / branch-presence-guard) where the
-        loop ``continue``s
+        permit through the ledger and RETURNS the detached token (still
+        registered in ``self._ledger.live``) so the caller can stamp it onto
+        the enqueued item's ``.permit`` field. UNLIKE ``on_transfer``, ALSO
+        clears ``spec_base``: this is for the seven early-continue sites
+        (already_merged / conflict / merge-fail / abandoned / revparse-fail
+        / drop / branch-presence-guard) where the loop ``continue``s
         immediately afterward, so no subsequent look-ahead call will ever
         run to re-derive ``spec_base`` for this permit. Mirrors the original
         loop-locals, which set BOTH ``held_spec_permit = False`` AND
@@ -426,8 +431,10 @@ class SpeculationController:
         ``self._ledger.live`` — see :class:`PermitLedger`'s docstring
         ("Known interim cost") for why.
         """
+        p = self._permit
         self._permit = None
         self.spec_base = None
+        return p
 
     def on_abort(self) -> None:
         """A guard/failure/exception/train short-circuit before a put.
