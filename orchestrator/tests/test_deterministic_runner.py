@@ -5002,3 +5002,119 @@ class TestPredicateModeFailPath:
         await runner.run(assignment)
 
         unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Step-5: RED — B9 predicate timeout/unexpected-error -> infra_issue + blocked
+# (RED until step-6 wraps _run_predicate's asyncio.wait_for call in the
+# deploy path's except-TimeoutError / except-Exception outer-guard branches)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateModeTimeout:
+    """DeterministicRunner — predicate outer-guard timeout/error -> infra_issue + blocked (B9).
+
+    A hung or erroring script_runner produces NO exit code, so there is no
+    verdict to report — this is an INFRA fault (exactly like the deploy
+    path's outer-guard handling), never a milestone_check_failed verdict.
+    Routing to infra_issue (which does NOT stamp gate_escalated_at) means the
+    check is re-attempted on the next dispatch rather than latched into the
+    resolve-to-done path.
+    """
+
+    async def test_predicate_hang_files_infra_issue_and_blocks(self, tmp_path: Path):
+        """A script_runner that hangs forever must still produce BLOCKED and
+        exactly one L2 infra_issue escalation — NOT milestone_check_failed (B9).
+
+        RED today: _run_predicate has no outer-guard try/except around its
+        ``await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)`` —
+        the TimeoutError propagates uncaught.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='702', timeout_secs=0)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        # Hang tripwire: if the outer guard regresses, fail loudly instead of
+        # stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('702', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue', (
+            f'a hung seam is an infra fault, not a verdict — must not be '
+            f'milestone_check_failed: {esc.category!r}'
+        )
+
+        scheduler.set_task_status.assert_awaited_once_with('702', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+    async def test_predicate_unexpected_exception_files_infra_issue_and_blocks(
+        self, tmp_path: Path,
+    ):
+        """A script_runner that raises an unexpected exception must NOT
+        propagate — _run_predicate must route to _file_infra_issue_and_block
+        and return BLOCKED (B9).
+
+        RED today: _run_predicate propagates the RuntimeError uncaught.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='703')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _boom(_before_done):
+            raise RuntimeError('predicate script spawn exploded')
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_boom,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('703', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+
+        scheduler.set_task_status.assert_awaited_once_with('703', 'blocked')
+        unit_inspector.assert_not_awaited()
