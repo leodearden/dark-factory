@@ -460,6 +460,20 @@ def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
     return ts if ts is not None else (lambda: time.monotonic())
 
 
+def _resolve_wall_time_source(
+    ts: Callable[[], datetime] | None,
+) -> Callable[[], datetime]:
+    """Return *ts* if provided, else a real wall-clock ``datetime.now(UTC)``.
+
+    Distinct from :func:`_resolve_time_source` (``time.monotonic``, which
+    resets across process restarts): milestone anchors (task 2335 β) are
+    persisted wall-clock timestamps that must survive a restart, so callers
+    that need restart-safe, human-meaningful timestamps inject/resolve a
+    wall clock here instead.
+    """
+    return ts if ts is not None else (lambda: datetime.now(UTC))  # clock-exempt: single-capture writer
+
+
 class ModuleLockTable:
     """Hierarchical module locking — two modules conflict if one is a prefix
     of the other (parent/child), but siblings are independent.
@@ -1036,9 +1050,16 @@ class Scheduler:
         override_store: OverrideStore | None = None,
         monotonic_clock_source: Callable[[], float] | None = None,
         park_eviction_store: ParkEvictionRequestStore | None = None,
+        wall_time_source: Callable[[], datetime] | None = None,
     ):
         self.config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
+        # Wall-clock source (task 2335 β) for the milestone time-gate: unlike
+        # self._time_source (monotonic, resets across restarts), milestone
+        # anchors/deadlines are persisted wall-clock timestamps that must
+        # compare correctly after a process restart. Injectable so tests can
+        # drive deterministic dated/delayed milestone scenarios.
+        self._wall_now: Callable[[], datetime] = _resolve_wall_time_source(wall_time_source)
         # Monotonic clock source for the park-stop rolling-window transition
         # recorder.  time.monotonic avoids false-trip / stale-entry artefacts
         # from non-monotonic wall-clock skew (NTP steps, VM clock drift).
@@ -3085,6 +3106,8 @@ class Scheduler:
         if tid in self._dispatched:
             return False, None
         if self._deferred_watch_gated(task):
+            return False, None
+        if self._milestone_time_gated(task, self._wall_now()):
             return False, None
         cooldown_deadline = self._requeue_until.get(tid)
         if cooldown_deadline is not None and self._time_source() < cooldown_deadline:
