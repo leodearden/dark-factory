@@ -2506,7 +2506,7 @@ def _render_live_workflow_section(
         A Markdown section string (e.g. ``'### Live-Workflow Signals\\n...\\n'``),
         or ``''`` when no tasks are live.
     """
-    if not project_root or not tasks:
+    if not tasks:
         return ''
 
     # Hoist the project-level orchestrator check: it is constant for this
@@ -3134,12 +3134,12 @@ class TaskKnowledgeSync(BaseStage):
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
 
-        Silently skips if project_root or taskmaster is absent, or if project_id
-        is not in ``_BRIEFING_REFRESH_PROJECT_ALLOWLIST`` (reify-specific feature).
-        Any exception is caught and logged as a WARNING so a broken script can
+        Silently skips if taskmaster is absent, or if project_id is not in
+        ``_BRIEFING_REFRESH_PROJECT_ALLOWLIST`` (reify-specific feature). Any
+        exception is caught and logged as a WARNING so a broken script can
         never abort Stage 2.
         """
-        if not self.project_root or not self.taskmaster:
+        if not self.taskmaster:
             return
         if self.project_id not in _BRIEFING_REFRESH_PROJECT_ALLOWLIST:
             return
