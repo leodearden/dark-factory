@@ -53,6 +53,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import _all_project_roots, _project_label, collect_active_tasks
 from dashboard.data.mcp_fanout import TTLCache, first_success
 from dashboard.data.memory import mcp_tool_call
+from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,7 @@ async def get_scheduler_snapshot(
         # avoids re-running a multi-second fan-out that would just report the
         # same offline state again; ≤5 s of stale-offline is acceptable.
         six_tuple = await collect_scheduler_state(client, config)
-        snapshot_at = datetime.now(UTC).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+        snapshot_at = datetime.now(UTC).isoformat()  # clock-exempt: single-capture writer
         return six_tuple, snapshot_at
 
     return await _scheduler_cache.get_or_refresh(_SCHEDULER_CACHE_KEY, _refresh)
@@ -293,7 +294,7 @@ def _module_contention_counts(
     return sorted(result, key=lambda m: (-m['contention'], m['path']))
 
 
-def _park_age_seconds(installed_at) -> int:
+def _park_age_seconds(installed_at, *, now: datetime | None = None) -> int:
     """Compute elapsed seconds from an installed_at value (ISO-8601 string or empty).
 
     Mirrors the age-calculation logic in ``_compose_rows`` (including the
@@ -304,6 +305,11 @@ def _park_age_seconds(installed_at) -> int:
         installed_at: Raw value from a park-stack entry (str, int, None, …).
                       Non-string values are coerced via ``str(...)``; empty or
                       unparseable values fall back to 0.
+        now:          Reference timestamp resolved via
+                      :func:`dashboard.data.utils.resolve_now`; pass an
+                      explicit value for deterministic results or to share
+                      one instant across multiple rows in an aggregation.
+                      Defaults to the live clock.
 
     Returns:
         Non-negative integer seconds elapsed since *installed_at*, or 0 on
@@ -313,7 +319,7 @@ def _park_age_seconds(installed_at) -> int:
     installed_at_str = str(installed_at or '')
     try:
         ts = datetime.fromisoformat(installed_at_str.replace('Z', '+00:00'))
-        return max(0, int((datetime.now(UTC) - ts).total_seconds()))  # clock-exempt: deferred-consolidation (task 2281)
+        return max(0, int((resolve_now(now) - ts).total_seconds()))
     except (ValueError, TypeError):
         if installed_at_str:
             logger.warning(
@@ -328,6 +334,7 @@ def _stranded_park_rows(
     *,
     project: str | None = None,
     project_root: str | None = None,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Emit one synthetic row for each distinct park owner absent from live_task_ids.
 
@@ -350,6 +357,10 @@ def _stranded_park_rows(
                        set are live and are skipped.
         project:       Project display label (propagated verbatim to the row).
         project_root:  Absolute project path (propagated verbatim to the row).
+        now:           Reference timestamp threaded into ``_park_age_seconds``
+                       for every synthetic row; pass an explicit value to
+                       share one instant with the rest of the aggregation.
+                       Defaults to the live clock.
 
     Returns:
         One synthetic row dict per distinct dead owner, with the standard
@@ -389,7 +400,7 @@ def _stranded_park_rows(
             'priority_differs': False,
             'skip_count': 0,
             'park_state': {'modules': mods, 'installed_at': installed_at},
-            'age_seconds': _park_age_seconds(installed_at),
+            'age_seconds': _park_age_seconds(installed_at, now=now),
             'lock_set': mods,
             'pinned': False,
             'reserve_now': False,
@@ -408,6 +419,8 @@ def _compose_rows(
     active_tasks: list[dict],
     snapshot: dict,
     depth: int = 2,
+    *,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Join active-task metadata with a scheduler snapshot into displayable rows.
 
@@ -425,6 +438,11 @@ def _compose_rows(
 
     Snapshot keys consumed: ``skip_counts``, ``parks``, ``effective_priorities``,
     ``overrides``.
+
+    *now* is the reference timestamp for park-age computation, resolved via
+    :func:`dashboard.data.utils.resolve_now`; pass an explicit value to share
+    one instant across every row in the aggregation. Defaults to the live
+    clock.
 
     Returns one dict per task with all fields needed by the React scheduler tab.
     """
@@ -451,7 +469,7 @@ def _compose_rows(
                     installed_at_str.replace('Z', '+00:00')
                 )
                 age_seconds = int(
-                    (datetime.now(UTC) - installed_at).total_seconds()  # clock-exempt: deferred-consolidation (task 2281)
+                    (resolve_now(now) - installed_at).total_seconds()
                 )
                 age_seconds = max(age_seconds, 0)
             except (ValueError, TypeError):
@@ -500,8 +518,9 @@ def _skip_event_sparkline(
         events:      List of event dicts (may include events of any type).
                      Each dict must have ``event_type`` and ``timestamp`` fields.
         since:       Start of the time window (inclusive).
-        until:       End of the time window (exclusive).  Defaults to
-                     ``datetime.now(UTC)`` when omitted.
+        until:       End of the time window (exclusive), resolved via
+                     :func:`dashboard.data.utils.resolve_now`.  Defaults to
+                     the live clock when omitted.
         bin_seconds: Bucket width in seconds (default 5 minutes).
 
     Returns:
@@ -515,7 +534,7 @@ def _skip_event_sparkline(
     # Filter to task_skipped events only
     skipped = [e for e in events if e.get('event_type') == 'task_skipped']
 
-    now = until if until is not None else datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
+    now = resolve_now(until)
     # Normalise since to UTC
     if since.tzinfo is None:
         since = since.replace(tzinfo=UTC)
@@ -555,6 +574,8 @@ def _skip_event_sparkline(
 async def collect_scheduler_state(
     client: httpx.AsyncClient,
     config: DashboardConfig,
+    *,
+    now: datetime | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], dict[str, dict], list[str], list[dict]]:
     """Fan out over all configured project roots and aggregate scheduler state.
 
@@ -563,6 +584,12 @@ async def collect_scheduler_state(
         ``mcp_tool_call``.
       - Joins with ``collect_active_tasks`` output for task metadata and lock sets.
       - Composes rows, module contention list, and per-task event sparklines.
+
+    *now* is resolved ONCE (via :func:`dashboard.data.utils.resolve_now`) at
+    this aggregation boundary and threaded into ``collect_active_tasks``,
+    ``_compose_rows``, ``_stranded_park_rows``, and ``_skip_event_sparkline``
+    (as ``until``), plus the 1-hour event-history ``since`` window — so every
+    row and sparkline in one collection shares a single reference instant.
 
     Returns:
         ``(rows, modules, pin_queue, events_by_task, offline_projects, paused_projects)``
@@ -577,10 +604,11 @@ async def collect_scheduler_state(
                           Empty list when no project is paused or the snapshot
                           lacks ``is_paused`` (pre-upgrade on-disk degradation).
     """
-    since = datetime.now(UTC) - timedelta(hours=1)  # clock-exempt: deferred-consolidation (task 2281)
+    effective_now = resolve_now(now)
+    since = effective_now - timedelta(hours=1)
 
     # Fetch active tasks (for lock sets and titles)
-    all_active, active_offline = await collect_active_tasks(client, config)
+    all_active, active_offline = await collect_active_tasks(client, config, now=effective_now)
 
     offline_projects: list[str] = list(active_offline)
 
@@ -729,7 +757,7 @@ async def collect_scheduler_state(
         # row lock_set values match the snapshot's current_holders keys.  Older
         # snapshots without lock_depth degrade to the default depth of 2.
         depth = snapshot.get('lock_depth', 2)
-        rows = _compose_rows(enriched, snapshot, depth)
+        rows = _compose_rows(enriched, snapshot, depth, now=effective_now)
         all_rows.extend(rows)
 
         # live_task_ids: the exact set _compose_rows iterates — defines "live"
@@ -763,6 +791,7 @@ async def collect_scheduler_state(
             park_stacks, live_task_ids,
             project=label,
             project_root=str(root),
+            now=effective_now,
         ))
 
         # Pin queue — tag every pin entry with project/project_root before
@@ -790,7 +819,9 @@ async def collect_scheduler_state(
             by_task.setdefault(tid, []).append(ev)
         for tid, task_events in by_task.items():
             composite_key = f'{label}/{tid}'
-            all_events_by_task[composite_key] = _skip_event_sparkline(task_events, since=since)
+            all_events_by_task[composite_key] = _skip_event_sparkline(
+                task_events, since=since, until=effective_now
+            )
 
     return all_rows, all_modules, all_pin_queue, all_events_by_task, offline_projects, all_paused_projects
 
