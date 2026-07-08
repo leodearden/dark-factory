@@ -808,6 +808,7 @@ async def invoke_with_cap_retry(
                 # module is already in sys.modules).
                 from shared.invocation_outcome import (
                     AuthFailed,
+                    CapHit,
                     CliLocalError,
                     ZeroOutputWedge,
                     classify_invocation,
@@ -825,21 +826,19 @@ async def invoke_with_cap_retry(
                 # worker's cap-defer machinery silently never engages.
                 # classify_invocation mirrors this exact narrowing: AuthFailed
                 # is only returned for {401, 403} (see invocation_outcome.py).
+                # slot.report(outcome) applies the AUTH_FAILED transition and
+                # settles the slot atomically (task W4-ε) — always failover
+                # unconditionally; an unresolvable token means the account
+                # vanished/refreshed, so failing over is safe and
+                # self-terminating (no separate unattributed fall-through).
                 if isinstance(outcome, AuthFailed):
-                    auth_marked = usage_gate._handle_auth_failure(
-                        f'HTTP {result.api_error_status}: {result.output[:120]}',
-                        slot.token,
+                    slot.report(outcome)
+                    _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    logger.warning(
+                        f'{label}: account {account_name} auth-failed '
+                        f'(HTTP {result.api_error_status}) — failing over',
                     )
-                    if auth_marked:
-                        slot.settle()
-                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                        logger.warning(
-                            f'{label}: account {account_name} auth-failed '
-                            f'(HTTP {result.api_error_status}) — failing over',
-                        )
-                        continue
-                    # Couldn't attribute — fall through; downstream heuristic
-                    # or return handles it.
+                    continue
 
                 # Wedge guard: a full-timeout CLI call (timed_out=True with zero
                 # turns and zero cost) means the subprocess never executed any
@@ -952,19 +951,22 @@ async def invoke_with_cap_retry(
                             f'duration={result.duration_ms}ms) — treating as cap hit. '
                             f'Output: {result.output[:200]!r}',
                         )
-                        cap_marked = usage_gate._handle_cap_detected(
-                            f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
-                            None,
-                            slot.token,
+                        # attributed must be captured BEFORE slot.report(): report()
+                        # bumps the account's generation, which would make the lease
+                        # read as stale even for the very account it just mutated.
+                        attributed = usage_gate.lease_is_current(slot.lease)
+                        synthetic = CapHit(
+                            resets_at=None,
+                            reason=f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
                         )
-                        if not cap_marked:
+                        slot.report(synthetic)
+                        if not attributed:
                             logger.warning(
                                 f'{label}: heuristic cap suspected but no account could be marked '
                                 f'(token unresolved) — treating as normal failure',
                             )
                             unattributed_cap = True
                         else:
-                            slot.settle()  # _handle_cap_detected already cleared probe_in_flight
                             consecutive_cap_hits += 1
                             full_cycles = (consecutive_cap_hits - 1) // num_accounts
                             cooldown = min(
