@@ -671,6 +671,44 @@ class TestSpeculationControllerLedgerRouting:
         assert len(ledger.live) == 1
         assert ledger.slot_available == depth - 1
 
+    async def test_on_transfer_returns_the_detached_permit_token(self) -> None:
+        """task eta step-1: on_transfer() must RETURN the detached SpecPermit
+        token (not None) so the merger can stamp it onto the enqueued item's
+        `.permit` — the verifier later releases this SAME token via
+        `ledger.release(item.permit)`. The token stays registered in
+        `ledger.live` (only the controller's own reference is cleared).
+        """
+        depth = 2
+        ledger, controller = self._make_ledger_and_controller(depth)
+        await controller.acquire_for_lookahead()
+        next_req = _make_pending_request('next')
+        controller.on_lookahead_found(next_req, 'MERGE_SHA')
+        expected = controller._permit
+
+        returned = controller.on_transfer()
+
+        assert returned is expected
+        assert returned in ledger.live
+        assert controller.held_by_merger == 0
+
+    async def test_on_transfer_terminal_returns_the_detached_permit_token(self) -> None:
+        """Same return-the-token contract as on_transfer(), plus spec_base
+        clears (terminal early-continue site — no subsequent look-ahead call
+        ever re-derives it for this permit).
+        """
+        depth = 2
+        ledger, controller = self._make_ledger_and_controller(depth)
+        await controller.acquire_for_lookahead()
+        controller.spec_base = 'PRED_SHA'
+        expected = controller._permit
+
+        returned = controller.on_transfer_terminal()
+
+        assert returned is expected
+        assert returned in ledger.live
+        assert controller.held_by_merger == 0
+        assert controller.spec_base is None
+
     async def test_on_abort_releases_through_the_ledger(self) -> None:
         depth = 2
         ledger, controller = self._make_ledger_and_controller(depth)
