@@ -7394,7 +7394,7 @@ class TestParkStopTrip:
         async def recording_callback(reason: str) -> None:
             callback_args.append(reason)
 
-        scheduler._on_park_stop_trip = recording_callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
         mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
 
@@ -7426,7 +7426,7 @@ class TestParkStopTrip:
         async def counting_callback(reason: str) -> None:
             callback_count[0] += 1
 
-        scheduler._on_park_stop_trip = counting_callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=counting_callback)
         mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
 
@@ -7454,7 +7454,7 @@ class TestParkStopTrip:
         async def counting_callback(reason: str) -> None:
             callback_count[0] += 1
 
-        scheduler._on_park_stop_trip = counting_callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=counting_callback)
         mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
 
@@ -7492,7 +7492,7 @@ class TestParkStopTrip:
             scheduler.pause(reason)
             callback_args.append(reason)
 
-        scheduler._on_park_stop_trip = recording_callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
         mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
 
@@ -7540,7 +7540,7 @@ class TestParkStopTrip:
             # because the synchronous latch already set _paused=True.
             scheduler.pause(reason)
 
-        scheduler._on_park_stop_trip = trip_callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=trip_callback)
         mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
 
@@ -7590,7 +7590,7 @@ class TestParkStopDisabled:
         async def recording_callback(reason: str) -> None:
             callback_count[0] += 1
 
-        scheduler._on_park_stop_trip = recording_callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
         mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
 
@@ -8924,7 +8924,7 @@ class TestApplyExternalDepPolicyCancelled:
     async def test_cancelled_dep_fires_callback_once(self, scheduler: Scheduler):
         """_on_external_dep_block called exactly once when dep is 'cancelled'."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
 
         task = {
             'id': '10',
@@ -8958,7 +8958,7 @@ class TestApplyExternalDepPolicyCancelled:
         self, scheduler: Scheduler
     ):
         """Cancelled dep must NOT increment _external_unresolved_counts."""
-        scheduler._on_external_dep_block = AsyncMock()
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=AsyncMock())
 
         task = {
             'id': '10',
@@ -8981,7 +8981,7 @@ class TestApplyExternalDepPolicyCancelled:
     async def test_done_dep_no_callback(self, scheduler: Scheduler):
         """Done external dep must NOT invoke callback (satisfied — no action)."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
 
         task = {
             'id': '10',
@@ -9001,7 +9001,7 @@ class TestApplyExternalDepPolicyCancelled:
     async def test_live_dep_no_callback(self, scheduler: Scheduler):
         """A live (pending/in-progress) dep must wait silently — no callback."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
 
         task = {
             'id': '10',
@@ -9053,7 +9053,7 @@ class TestApplyExternalDepPolicyUnresolved:
     ):
         """First tick with a sentinel: counter increments, callback NOT called."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
 
         await scheduler._apply_external_dep_policy(
@@ -9067,7 +9067,7 @@ class TestApplyExternalDepPolicyUnresolved:
     async def test_sentinel_at_threshold_fires_callback(self, scheduler: Scheduler):
         """At threshold (2 ticks of unknown_task), callback IS called once."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
         cache = {'dark_factory:5': 'unknown_task'}
 
@@ -9091,7 +9091,7 @@ class TestApplyExternalDepPolicyUnresolved:
     ):
         """When dep later resolves to a non-sentinel, counter is reset to 0."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
 
         # Tick 1 — sentinel; counter goes to 1
@@ -9118,7 +9118,7 @@ class TestApplyExternalDepPolicyUnresolved:
     ):
         """When dep resolves to 'done', counter is reset (not just ignored)."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
 
         # Tick 1 — sentinel
@@ -9163,7 +9163,7 @@ class TestApplyExternalDepPolicyTransientErr:
     async def test_transient_err_no_callback(self, scheduler: Scheduler):
         """external_err set → _on_external_dep_block never called."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
 
         await scheduler._apply_external_dep_policy(
@@ -9177,7 +9177,7 @@ class TestApplyExternalDepPolicyTransientErr:
     @pytest.mark.asyncio
     async def test_transient_err_no_counter_increment(self, scheduler: Scheduler):
         """external_err set → _external_unresolved_counts stays empty (no increment)."""
-        scheduler._on_external_dep_block = AsyncMock()
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=AsyncMock())
         task = self._pending_task()
 
         await scheduler._apply_external_dep_policy(
@@ -9195,7 +9195,7 @@ class TestApplyExternalDepPolicyTransientErr:
         self, scheduler: Scheduler
     ):
         """A transient error must not reset a counter built up in prior ticks."""
-        scheduler._on_external_dep_block = AsyncMock()
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=AsyncMock())
         task = self._pending_task()
 
         # Tick 1 — sentinel, no err → counter = 1
@@ -9574,7 +9574,7 @@ class TestAcquireNextExternalDepGate:
     ):
         """Boundary row 2: external dep 'pending' → not dispatched, no escalation."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
 
         task = self._task('4', ext_deps=['dark_factory:5'])
         scheduler.get_tasks = AsyncMock(return_value=[task])
@@ -9595,7 +9595,7 @@ class TestAcquireNextExternalDepGate:
     ):
         """Boundary row 3: external dep 'cancelled' → not dispatched, block callback fires."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
 
         task = self._task('5', ext_deps=['dark_factory:5'])
         scheduler.get_tasks = AsyncMock(return_value=[task])
@@ -9705,7 +9705,7 @@ class TestSuppressBlockedWrite:
         scheduler.dispatch_tool = AsyncMock(return_value={})
         tid = 'task-suppress'
         # Install the suppression predicate: suppress only this specific tid.
-        scheduler._suppress_blocked_write = lambda t: t == tid
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, suppress_blocked_write=lambda t: t == tid)
 
         await scheduler.set_task_status(tid, 'blocked')
 
@@ -9726,7 +9726,7 @@ class TestSuppressBlockedWrite:
         scheduler.dispatch_tool = AsyncMock(return_value={})
         tid = 'task-pending-not-suppressed'
         # Suppress blocked writes for this tid.
-        scheduler._suppress_blocked_write = lambda t: t == tid
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, suppress_blocked_write=lambda t: t == tid)
 
         # A 'pending' write must still dispatch.
         await scheduler.set_task_status(tid, 'pending')
@@ -9742,7 +9742,7 @@ class TestSuppressBlockedWrite:
         """
         scheduler.dispatch_tool = AsyncMock(return_value={})
         # Only 'task-A' is suppressed.
-        scheduler._suppress_blocked_write = lambda t: t == 'task-A'
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, suppress_blocked_write=lambda t: t == 'task-A')
 
         await scheduler.set_task_status('task-B', 'blocked')
 
@@ -10454,7 +10454,7 @@ class TestExternalDepResolverDegradedEscalation:
     async def test_below_threshold_no_escalation(self, scheduler: Scheduler):
         """1 degraded tick (< threshold=2) must NOT invoke _on_external_dep_block."""
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
 
         await scheduler._apply_external_dep_policy(
@@ -10474,7 +10474,7 @@ class TestExternalDepResolverDegradedEscalation:
         - category='infra_issue'
         """
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
 
         # Tick 1 — below threshold
@@ -10525,7 +10525,7 @@ class TestExternalDepResolverDegradedEscalation:
         must NOT be called.
         """
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
 
         # Tick 1 — degraded (streak=1, below threshold=2)
@@ -10604,7 +10604,7 @@ class TestExternalDepResolverDegradedEscalation:
         dismissed without fixing the root cause.
         """
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
 
         # First crossing (ticks 1-2 with threshold=2) → escalates once.
@@ -10635,7 +10635,7 @@ class TestExternalDepResolverDegradedEscalation:
         spurious external_dep_gate_held event fires for the now-blocked task.
         """
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
         task = self._pending_task()
 
         # Pre-populate a hold streak to make the assertion meaningful.
@@ -10671,7 +10671,7 @@ class TestExternalDepResolverDegradedEscalation:
         call per task.
         """
         callback = AsyncMock()
-        scheduler._on_external_dep_block = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_external_dep_block=callback)
 
         task_a = {
             'id': 'A',
@@ -11158,7 +11158,7 @@ class TestStarvationWatchdog:
         """
         scheduler, t = self._make_scheduler()
         callback = AsyncMock()
-        scheduler._on_starvation_warn = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
 
         # Seed a held lock on a dispatched 'seed' task so 'starved' can never
         # acquire its module (loop-exhausted path → skip_count bumped each tick).
@@ -11227,8 +11227,8 @@ class TestStarvationWatchdog:
         scheduler, t = self._make_scheduler()
         warn_cb = AsyncMock()
         resolve_cb = AsyncMock()
-        scheduler._on_starvation_warn = warn_cb
-        scheduler._on_starvation_resolve = resolve_cb
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=warn_cb)
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_resolve=resolve_cb)
 
         # Seed a held lock on 'seed' so 'starved' can't acquire initially.
         scheduler.lock_table.try_acquire('seed', ['backend'])
@@ -11289,7 +11289,7 @@ class TestStarvationWatchdog:
         """
         scheduler, t = self._make_scheduler()
         callback = AsyncMock()
-        scheduler._on_starvation_warn = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
 
         scheduler.lock_table.try_acquire('seed', ['backend'])
         scheduler._dispatched.add('seed')
@@ -11315,7 +11315,7 @@ class TestStarvationWatchdog:
         """
         scheduler, t = self._make_scheduler()
         callback = AsyncMock()
-        scheduler._on_starvation_warn = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
 
         scheduler.lock_table.try_acquire('seed', ['backend'])
         scheduler._dispatched.add('seed')
@@ -11345,7 +11345,7 @@ class TestStarvationWatchdog:
         """
         scheduler, t = self._make_scheduler(enabled=False)
         callback = AsyncMock()
-        scheduler._on_starvation_warn = callback
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
 
         scheduler.lock_table.try_acquire('seed', ['backend'])
         scheduler._dispatched.add('seed')
@@ -11379,8 +11379,8 @@ class TestStarvationWatchdog:
         scheduler, t = self._make_scheduler()
         warn_cb = AsyncMock()
         resolve_cb = AsyncMock()
-        scheduler._on_starvation_warn = warn_cb
-        scheduler._on_starvation_resolve = resolve_cb
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=warn_cb)
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_resolve=resolve_cb)
 
         # Seed a held lock on 'seed' so 'starved' can never acquire.
         scheduler.lock_table.try_acquire('seed', ['backend'])
@@ -11445,8 +11445,8 @@ class TestStarvationWatchdog:
         scheduler, t = self._make_scheduler()
         warn_cb = AsyncMock()
         resolve_cb = AsyncMock()
-        scheduler._on_starvation_warn = warn_cb
-        scheduler._on_starvation_resolve = resolve_cb
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=warn_cb)
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_resolve=resolve_cb)
 
         # Seed a held lock on 'seed' so 'starved' can never acquire.
         scheduler.lock_table.try_acquire('seed', ['backend'])

@@ -57,10 +57,10 @@ class TestWarmBaseHardDownWatchdog:
         warn = AsyncMock()
         promote = AsyncMock()
         resolve = AsyncMock()
-        scheduler._warm_base_health_probe = probe
-        scheduler._on_warm_base_warn = warn
-        scheduler._on_warm_base_promote_l2 = promote
-        scheduler._on_warm_base_resolve = resolve
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, warm_base_health_probe=probe)
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_warm_base_warn=warn)
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_warm_base_promote_l2=promote)
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_warm_base_resolve=resolve)
         return probe, warn, promote, resolve
 
     @pytest.mark.asyncio
@@ -258,13 +258,13 @@ class TestWarmBaseHardDownWatchdog:
         """(8) The probe callback raising must not crash the tick, and must
         leave the latch state unchanged (fail-safe hold)."""
         scheduler, t = self._make_scheduler()
-        scheduler._warm_base_health_probe = AsyncMock(side_effect=RuntimeError('boom'))
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, warm_base_health_probe=AsyncMock(side_effect=RuntimeError('boom')))
         warn = AsyncMock()
         promote = AsyncMock()
         resolve = AsyncMock()
-        scheduler._on_warm_base_warn = warn
-        scheduler._on_warm_base_promote_l2 = promote
-        scheduler._on_warm_base_resolve = resolve
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_warm_base_warn=warn)
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_warm_base_promote_l2=promote)
+        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_warm_base_resolve=resolve)
 
         # Must not raise.
         await scheduler._apply_warm_base_hard_down_watchdog()
