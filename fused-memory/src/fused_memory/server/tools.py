@@ -558,6 +558,17 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
     }, True
 
 
+# ---------------------------------------------------------------------------
+# Claimant wire sentinel (task 2188, PRD task-status-authority C4/D4)
+# ---------------------------------------------------------------------------
+# MCP arguments are JSON — there is no wire-safe way to distinguish "argument
+# omitted" from "argument explicitly null" other than a real (non-None)
+# default. This string sentinel plays that role for claimant_run_id/
+# heartbeat_at: the wire default means "leave untouched" (mapped to the
+# interceptor's own _UNSET), while JSON null (Python None) means "clear".
+_CLAIMANT_WIRE_UNSET = '__unset__'
+
+
 def create_mcp_server(
     memory_service: MemoryService,
     task_interceptor: TaskInterceptor | None = None,
@@ -2832,6 +2843,8 @@ def create_mcp_server(
         tag: str | None = None,
         done_provenance: dict | None = None,
         reopen_reason: str | None = None,
+        claimant_run_id: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _CLAIMANT_WIRE_UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
@@ -2890,6 +2903,13 @@ def create_mcp_server(
                 'manual re-scope', 'reconciliation: re-implementation required'.
                 Persisted on the task as metadata.reopen_reason for audit.
                 Ignored for non-terminal transitions.
+            claimant_run_id: Orchestrator claimant identity (task 2188, PRD
+                task-status-authority C4/D4) to stamp atomically with this
+                status write — e.g. the dispatch-time pending->in-progress
+                transition. Omit (default) to leave the column untouched;
+                pass ``null`` explicitly to clear it.
+            heartbeat_at: Companion liveness timestamp for claimant_run_id,
+                same tri-state contract (omit = untouched, null = clear).
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Threaded into the transition-legality gate so it can
                 classify an actor (task 2175/rho1b).
@@ -2909,6 +2929,11 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        claimant_kwargs: dict[str, Any] = {}
+        if claimant_run_id is not _CLAIMANT_WIRE_UNSET:
+            claimant_kwargs['claimant_run_id'] = claimant_run_id
+        if heartbeat_at is not _CLAIMANT_WIRE_UNSET:
+            claimant_kwargs['heartbeat_at'] = heartbeat_at
         try:
             return await task_interceptor.set_task_status(
                 task_id=id,
@@ -2918,6 +2943,7 @@ def create_mcp_server(
                 done_provenance=done_provenance,
                 reopen_reason=reopen_reason,
                 agent_id=agent_id,
+                **claimant_kwargs,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
