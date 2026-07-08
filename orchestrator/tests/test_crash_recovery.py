@@ -1234,7 +1234,7 @@ class TestRecordDrivenRecovery:
             return 'done' if task_id == '42' else None
 
         harness.scheduler.get_status = AsyncMock(side_effect=_get_status)
-        harness.git_ops.cleanup_worktree.side_effect = (
+        harness.git_ops.cleanup_worktree.side_effect = (  # type: ignore[attr-defined]
             lambda entry, tid: harness.git_ops._lifecycle_note_released(entry)
         )
 

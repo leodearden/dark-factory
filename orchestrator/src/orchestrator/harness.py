@@ -2078,9 +2078,24 @@ Output JSON matching the schema. Every task must appear in the output.
                             entry.name, rec.task_id, term_status,
                         )
                         await self.git_ops.cleanup_worktree(entry, rec.task_id)
-                        self.git_ops._lane_lifecycle.transition(
-                            entry, DurableLaneState.RELEASED,
-                        )
+                        # Guarded, not unconditional (step-16 review-fix): for
+                        # a warm lane, cleanup_worktree already routed through
+                        # release_warm_lane -> _lifecycle_note_released, which
+                        # records the ASSIGNED/IN_USE -> RELEASED edge itself
+                        # (with the same guard). Re-issuing the transition
+                        # unconditionally would then attempt an illegal
+                        # RELEASED -> RELEASED edge and raise
+                        # IllegalLaneTransition uncaught, aborting recovery
+                        # for every remaining lane. Only finalize RELEASED
+                        # here when cleanup did NOT already write it (e.g. a
+                        # routing path other than release_warm_lane).
+                        rec2 = self.git_ops._lane_lifecycle.read(entry)
+                        if rec2 is not None and rec2.state in (
+                            DurableLaneState.ASSIGNED, DurableLaneState.IN_USE,
+                        ):
+                            self.git_ops._lane_lifecycle.transition(
+                                entry, DurableLaneState.RELEASED,
+                            )
                         cleaned += 1
                         continue
 
