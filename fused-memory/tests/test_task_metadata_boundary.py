@@ -307,3 +307,48 @@ async def test_retry_ledger_persist_failure_escalates_to_human():
     mark_blocked.assert_awaited_once()
     _, kwargs = mark_blocked.await_args
     assert kwargs.get('escalate_to_human') is True
+
+
+# ── Row 5 — staged rollout: same malformed write, warn vs enforce ────
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_malformed_write_warn_vs_enforce_staged_rollout(
+    make_backend, tmp_path, caplog,
+):
+    """The warn->enforce staged-rollout contract that the θ2 gate flips.
+
+    ONE malformed blob (``done_provenance.kind='bogus'``, a known field with
+    an invalid value) written through both backend modes: warn-mode does not
+    raise — the write proceeds and exactly one
+    ``task_metadata.schema_warning`` census line is emitted (``done_provenance``
+    is a known field, so no additional ``unknown_key`` warning) — while
+    enforce-mode raises ValidationError and rolls back.
+    """
+    malformed = {'done_provenance': {'kind': 'bogus'}}
+
+    # (a) Warn-mode: does not raise; write proceeds; exactly one census line.
+    warn_backend = await make_backend(enforce=False)
+    warn_root = str(tmp_path / 'warn')
+    dto = await warn_backend.add_task(project_root=warn_root, title='t')
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        await warn_backend.update_task(
+            dto['id'], project_root=warn_root, metadata=json.dumps(malformed),
+        )
+
+    census = _schema_warning_messages(caplog)
+    assert len(census) == 1, f'Expected exactly one census line; got {census}'
+
+    task = await warn_backend.get_task(dto['id'], project_root=warn_root)
+    assert task['metadata'] == malformed
+
+    # (b) Enforce-mode: raises; write rolled back.
+    enforce_backend = await make_backend(enforce=True)
+    enforce_root = str(tmp_path / 'enforce')
+    dto2 = await enforce_backend.add_task(project_root=enforce_root, title='t')
+
+    with pytest.raises(ValidationError):
+        await enforce_backend.update_task(
+            dto2['id'], project_root=enforce_root, metadata=json.dumps(malformed),
+        )
