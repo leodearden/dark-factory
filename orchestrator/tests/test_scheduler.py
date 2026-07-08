@@ -6614,6 +6614,132 @@ class TestMilestoneTimeGate:
         ) is False
 
 
+class TestMilestoneEligibilityGate:
+    """The milestone time-gate wired into Scheduler._eligible_for_dispatch,
+    plus the injectable ``wall_time_source`` DI (task 2335 β step-3/4).
+
+    Mirrors TestDeferredWatchDispatchGate's eligibility-altitude tests and
+    TestDispatchCooldownGate's injected-clock acquire_next() observable.
+    """
+
+    def _pending_task_with(
+        self, task_id: str, metadata: dict, dependencies: list | None = None
+    ) -> dict:
+        return {
+            'id': task_id,
+            'status': 'pending',
+            'dependencies': dependencies or [],
+            'metadata': metadata,
+        }
+
+    def test_dated_milestone_gates_eligibility_until_fired(self):
+        """B1 via eligibility: ineligible while fake_now < at; eligible once
+        fake_now >= at."""
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        fake_now = [at - timedelta(seconds=1)]
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: fake_now[0])
+
+        task = self._pending_task_with(
+            '4001', {'milestone': {'mode': 'dated', 'at': at.isoformat()}}
+        )
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '4001', status_map) == (False, None)
+
+        fake_now[0] = at
+        assert scheduler._eligible_for_dispatch(task, '4001', status_map) == (True, None)
+
+    def test_dated_milestone_gates_normal_task_kind_too(self):
+        """B12: the milestone gate is orthogonal to task_kind — a
+        task_kind='normal' milestone task is held/released identically."""
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        fake_now = [at - timedelta(seconds=1)]
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: fake_now[0])
+
+        task = self._pending_task_with('4002', {
+            'task_kind': 'normal',
+            'milestone': {'mode': 'dated', 'at': at.isoformat()},
+        })
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '4002', status_map) == (False, None)
+
+        fake_now[0] = at
+        assert scheduler._eligible_for_dispatch(task, '4002', status_map) == (True, None)
+
+    def test_delayed_milestone_dep_regression_still_withholds_after_elapse(self):
+        """B5: even after the delayed timer has elapsed, a live unsatisfied
+        dependency still blocks dispatch — _deps_satisfied is re-checked live
+        at eligibility time, not just the frozen-once anchor."""
+        anchor = datetime(2026, 7, 25, tzinfo=UTC)
+        after_secs = 100
+        fake_now = [anchor + timedelta(seconds=after_secs + 1)]  # timer elapsed
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: fake_now[0])
+
+        task = self._pending_task_with(
+            '4003',
+            {
+                'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+                'milestone_deps_satisfied_at': anchor.isoformat(),
+            },
+            dependencies=[{'id': 'X'}],
+        )
+        status_map = {'X': 'pending'}  # dep regressed back to pending
+
+        assert scheduler._eligible_for_dispatch(task, '4003', status_map) == (False, None)
+
+    def test_non_milestone_pending_task_is_unaffected(self):
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: datetime.now(UTC))
+
+        task = self._pending_task_with('4004', {'files': ['backend']})
+        status_map: dict[str, str] = {}
+
+        assert scheduler._eligible_for_dispatch(task, '4004', status_map) == (True, None)
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_withholds_dated_milestone_until_fired(self, monkeypatch):
+        """acquire_next()-level observable: returns None while fake_now < at,
+        returns the task once fake_now >= at."""
+        import json as _json
+
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        fake_now = [at - timedelta(seconds=1)]
+
+        task = {
+            'id': '4005',
+            'title': 'Dated milestone task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': {'milestone': {'mode': 'dated', 'at': at.isoformat()}},
+        }
+        task_response = {
+            'result': {
+                'content': [
+                    {'type': 'text', 'text': _json.dumps({'tasks': [task]})}
+                ]
+            }
+        }
+
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config, wall_time_source=lambda: fake_now[0])
+
+        mock = AsyncMock(return_value=task_response)
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
+
+        result_before = await scheduler.acquire_next()
+        assert result_before is None, 'Milestone must withhold dispatch before `at`'
+
+        fake_now[0] = at
+        result_after = await scheduler.acquire_next()
+        assert result_after is not None and result_after.task_id == '4005', (
+            'Milestone must dispatch once now_wall >= at'
+        )
+
+
 # ---------------------------------------------------------------------------
 # Park-and-stop pause mechanism (task 1322)
 # ---------------------------------------------------------------------------
