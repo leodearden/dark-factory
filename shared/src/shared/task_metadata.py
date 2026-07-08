@@ -53,6 +53,7 @@ class BeforeDone(BaseModel):
     cwd: str | None = None
     timeout_secs: int = Field(gt=0)
     target_unit: str | None = None
+    kind: Literal['deploy', 'predicate'] = 'deploy'
 
 
 class DoneProvenance(BaseModel):
