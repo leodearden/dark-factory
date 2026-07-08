@@ -41,7 +41,6 @@ from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
     find_conflicting_task_status_ids,
     is_batch_plan_framing,
-    is_conflicting_task_status_framing,
     is_count_snapshot,
     is_mixed_temporal_framing,
 )
