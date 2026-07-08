@@ -183,6 +183,23 @@ class TestDoneProvenance:
         assert dp.kind == 'deterministic-gate'
         assert dp.note == 'pure gate resolved'
 
+    def test_deterministic_milestone_ok_without_commit_or_note(self):
+        dp = DoneProvenance(kind='deterministic-milestone')
+        assert dp.kind == 'deterministic-milestone'
+        assert dp.commit is None
+        assert dp.note is None
+
+    def test_deterministic_milestone_retains_note(self):
+        dp = DoneProvenance(kind='deterministic-milestone', note='<stdout tail>')
+        assert dp.kind == 'deterministic-milestone'
+        assert dp.note == '<stdout tail>'
+
+    def test_deterministic_bogus_kind_still_rejected(self):
+        # Regression guard: adding 'deterministic-milestone' must not open
+        # the Literal up to arbitrary deterministic-* strings.
+        with pytest.raises(ValidationError):
+            DoneProvenance(kind='deterministic-bogus')  # type: ignore[arg-type]
+
 
 class TestMemoryHints:
     def test_constructs_with_values(self):
