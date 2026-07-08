@@ -4656,3 +4656,181 @@ class TestSharedDoneProvenance:
         built = _build_done_provenance('deterministic-deploy-scheduled', unit='u')
 
         DoneProvenance(**built)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Task 2336 (γ-predicate): predicate deterministic mode — a read-only
+# exit-code verdict check (before_done.kind == 'predicate'), NOT a systemd
+# deploy.  Boundary tests B7 (pass), B8 (fail), B9 (timeout/infra), B10
+# (resume).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateModePassPath:
+    """DeterministicRunner — predicate mode rc==0 -> done, read-only (B7)."""
+
+    async def test_predicate_pass_outcome_is_done(self, tmp_path: Path):
+        """rc==0 -> WorkflowOutcome.DONE (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+    async def test_predicate_pass_sets_done_with_milestone_provenance(self, tmp_path: Path):
+        """set_task_status awaited once with 'done' + provenance.kind='deterministic-milestone' (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[0] == '700'
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance is not None, 'done_provenance must be passed as a kwarg'
+        assert provenance['kind'] == 'deterministic-milestone'
+
+    async def test_predicate_pass_provenance_note_contains_stdout_tail(self, tmp_path: Path):
+        """done_provenance.note contains the check's stdout tail (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        call = scheduler.set_task_status.call_args
+        provenance = call.kwargs.get('done_provenance')
+        assert 'check ok' in provenance.get('note', ''), (
+            f'stdout tail must appear in provenance note: {provenance!r}'
+        )
+
+    async def test_predicate_pass_script_runner_called_once_with_before_done(self, tmp_path: Path):
+        """script_runner invoked exactly once with the full before_done dict (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        before_done = task['metadata']['before_done']
+        script_runner.assert_awaited_once_with(before_done)
+
+    async def test_predicate_pass_no_unit_inspect(self, tmp_path: Path):
+        """unit_inspector is NEVER awaited on the predicate path — no systemd inspect (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        unit_inspector.assert_not_awaited()
+
+    async def test_predicate_pass_no_before_done_ran_at_stamp(self, tmp_path: Path):
+        """update_task is NEVER awaited — a read-only predicate has no I1 stamp (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        scheduler.update_task.assert_not_awaited()
+
+    async def test_predicate_pass_no_escalation_filed(self, tmp_path: Path):
+        """No escalation is filed on a passing predicate check (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        assert queue.get_by_task('700', status='pending') == []
