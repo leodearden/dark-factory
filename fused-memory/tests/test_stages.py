@@ -6534,7 +6534,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 2
@@ -6587,7 +6587,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6628,7 +6628,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6655,7 +6655,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=RuntimeError('taskmaster down'))
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6699,7 +6699,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6725,7 +6725,7 @@ class TestSweepTerminalTaskFlagMarkers:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             result = await _sweep_terminal_task_flag_markers(
-                memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+                memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
             )
 
         assert result == 0
@@ -6746,7 +6746,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -6787,7 +6787,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 1
@@ -6826,7 +6826,7 @@ class TestSweepTerminalTaskFlagMarkers:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             result = await _sweep_terminal_task_flag_markers(
-                memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+                memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
             )
 
         assert result == 1
@@ -6863,17 +6863,17 @@ class TestSweepTerminalTaskFlagMarkers:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             await _sweep_terminal_task_flag_markers(
-                memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1', scroll_limit=3,
+                memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1', scroll_limit=3,
             )
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) >= 1
 
     @pytest.mark.asyncio
-    async def test_degrades_to_noop_when_taskmaster_or_project_root_falsy(self):
-        """No taskmaster and no project_root => returns 0 with NO enumeration
-        and NO get_task call (mirrors flag_dedup.filter_terminal_metadata_flags'
-        degradation posture)."""
+    async def test_degrades_to_noop_when_taskmaster_none(self):
+        """No taskmaster => returns 0 with NO enumeration and NO get_task call
+        (mirrors flag_dedup.filter_terminal_metadata_flags' degradation
+        posture)."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _sweep_terminal_task_flag_markers,
         )
@@ -6885,14 +6885,10 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result_no_taskmaster = await _sweep_terminal_task_flag_markers(
-            memory_service, None, '/home/leo/src/reify', 'reify', 'r1',
-        )
-        result_no_project_root = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '', 'reify', 'r1',
+            memory_service, None, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result_no_taskmaster == 0
-        assert result_no_project_root == 0
         memory_service.get_memories_by_metadata.assert_not_awaited()
         taskmaster.get_task.assert_not_awaited()
 
@@ -6925,7 +6921,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 2
@@ -6957,7 +6953,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 1
@@ -6992,7 +6988,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -7027,7 +7023,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(side_effect=_get_task)
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -7058,7 +7054,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 0
@@ -7094,7 +7090,7 @@ class TestSweepTerminalTaskFlagMarkers:
         taskmaster.get_task = AsyncMock(return_value={'status': 'done'})
 
         result = await _sweep_terminal_task_flag_markers(
-            memory_service, taskmaster, '/home/leo/src/reify', 'reify', 'r1',
+            memory_service, taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
         )
 
         assert result == 2
@@ -8560,8 +8556,7 @@ class TestTaskKnowledgeSyncTerminalTaskFlagMarkersGcSweptStat:
     @pytest.mark.asyncio
     async def test_terminal_task_flag_markers_gc_swept_stat_set_after_run(self, mock_deps):
         """run() calls _sweep_terminal_task_flag_markers(self.memory, self.taskmaster,
-        self.project_root, self.project_id, run_id) and injects its return value into
-        report.stats."""
+        self.scope, run_id) and injects its return value into report.stats."""
         from datetime import UTC, datetime
         from unittest.mock import AsyncMock as AM
         from unittest.mock import patch
@@ -8601,7 +8596,7 @@ class TestTaskKnowledgeSyncTerminalTaskFlagMarkersGcSweptStat:
         assert report.stats.get('terminal_task_flag_markers_gc_swept') == 2
         mock_sweep.assert_awaited_once_with(
             mock_deps['memory_service'], mock_deps['taskmaster'],
-            '/home/leo/src/reify', 'reify', 'test-run',
+            _scope('reify', '/home/leo/src/reify'), 'test-run',
         )
 
     @pytest.mark.asyncio
