@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
     from fused_memory.reconciliation.journal import ReconciliationJournal
+    from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
 
 # Logging
@@ -500,6 +501,7 @@ async def run_server():
     # Initialize reconciliation system
     harness_loop_task = None
     recon_journal = None
+    recon_ledger = None
     reconciliation_harness = None
     # Single curator escalator shared by both TaskInterceptor construction
     # paths — lazy per-project queue handles live inside it.
@@ -615,6 +617,9 @@ async def run_server():
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
         recon_journal.set_write_journal(write_journal)
+
+        if config.reconciliation.recon_ledger_enabled:
+            recon_ledger = await _build_recon_ledger_store(Path(config.reconciliation.data_dir))
 
         db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
         assert memory_service.durable_queue is not None  # set by initialize()
@@ -1077,6 +1082,7 @@ async def run_server():
             taskmaster=taskmaster,
             curator_cost_store=curator_cost_store,
             curator_usage_gate=curator_usage_gate,
+            recon_ledger=recon_ledger,
         )
 
 
@@ -1393,6 +1399,24 @@ async def _build_ticket_store(data_dir: Path) -> TicketStore:
     return store
 
 
+async def _build_recon_ledger_store(data_dir: Path) -> ReconLedgerStore:
+    """Construct and initialise a :class:`ReconLedgerStore` for the given data directory.
+
+    The store is backed by ``data_dir/'reconciliation.db'`` — the same file
+    :class:`~fused_memory.reconciliation.journal.ReconciliationJournal` owns,
+    opened via a second ``aiosqlite`` connection (WAL mode + busy timeout make
+    this safe). :meth:`~ReconLedgerStore.initialize` is called before
+    returning so the ``recon_ledger`` table and its indexes are created.
+
+    Mirrors :func:`_build_ticket_store`.
+    """
+    from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+    store = ReconLedgerStore(data_dir / 'reconciliation.db')
+    await store.initialize()
+    return store
+
+
 def _resolve_curator_cost_store_path(config: FusedMemoryConfig) -> Path:
     """Return the SQLite path for the curator CostStore.
 
@@ -1699,6 +1723,7 @@ async def _graceful_shutdown(
     taskmaster: Any = None,
     curator_cost_store: CostStore | None = None,
     curator_usage_gate: UsageGate | None = None,
+    recon_ledger: ReconLedgerStore | None = None,
 ) -> None:
     """Perform an ordered, exception-resilient server shutdown.
 
@@ -1721,6 +1746,8 @@ async def _graceful_shutdown(
        memory_service.close() because MemoryService still holds a reference.
     9. Close memory_service (backends, durable queue, write journal, event buffer).
     10. Close reconciliation journal (separate SQLite connection).
+    11. Close recon ledger (separate SQLite connection onto the same
+        reconciliation.db file; closed after recon_journal).
 
     Each step runs under asyncio.shield with a bounded timeout so cleanup
     makes progress even when this coroutine itself is being cancelled, and
@@ -1769,6 +1796,9 @@ async def _graceful_shutdown(
 
     if recon_journal is not None:
         await _run_shielded('recon_journal.close', recon_journal.close)
+
+    if recon_ledger is not None:
+        await _run_shielded('recon_ledger.close', recon_ledger.close)
 
 
 async def _shutdown_with_watchdog(**kwargs: Any) -> None:
