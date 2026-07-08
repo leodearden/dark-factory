@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
 
+import shared.cli_invoke as cli_invoke_module
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
     _MAX_CAP_COOLDOWN_SECS,
@@ -91,9 +92,11 @@ def _mock_gate(**overrides) -> MagicMock:
     ``slot`` is an :class:`~shared.usage_gate.InvokeSlot` instance that
     proxies to the gate.  This helper wires ``gate.invoke_slot()`` to an
     async-context-manager mock whose ``__aenter__`` yields a slot whose
-    ``detect_cap_hit`` / ``confirm`` / ``settle`` methods proxy to the
-    corresponding gate attributes — so tests can still assert on
+    ``detect_cap_hit`` / ``confirm`` / ``settle`` / ``report`` methods proxy
+    to the corresponding gate attributes — so tests can still assert on
     ``gate.detect_cap_hit.call_args``, ``gate.confirm_account_ok``, etc.
+    ``report(outcome)`` (task W4-ε, PRD §7.4) mirrors the production
+    dispatch-then-settle contract of :meth:`InvokeSlot.report`.
 
     ``__aexit__`` calls ``gate.release_probe_slot(slot.token)`` unless the
     slot was settled by ``detect_cap_hit(...)==True``, ``confirm(...)``,
@@ -150,13 +153,36 @@ def _mock_gate(**overrides) -> MagicMock:
             def _slot_settle():
                 slot._settled = True
 
+            def _slot_report(outcome):
+                """Mirrors production InvokeSlot.report(outcome) (task W4-ε,
+                PRD §7.4): dispatches to the gate's existing handlers by
+                outcome variant, then settles in a ``finally`` so every path
+                leaves the slot settled exactly once."""
+                token = slot.token
+                try:
+                    if isinstance(outcome, OK):
+                        gate.confirm_account_ok(token)
+                    elif isinstance(outcome, CapHit):
+                        gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+                    elif isinstance(outcome, AuthFailed):
+                        gate._handle_auth_failure(f'HTTP {outcome.status}', token)
+                    elif isinstance(outcome, NearCap):
+                        gate._handle_near_cap_warning(outcome.reason, token)
+                        gate.release_probe_slot(token)
+                    else:
+                        gate.release_probe_slot(token)
+                finally:
+                    slot._settled = True
+
             # Plain synchronous MagicMocks — InvokeSlot.detect_cap_hit /
-            # confirm / settle are plain methods, not coroutines.  Using
-            # MagicMock (not AsyncMock) is load-bearing: prod does
-            # ``if slot.detect_cap_hit(...):`` without ``await``.
+            # confirm / settle / report are plain methods, not coroutines.
+            # Using MagicMock (not AsyncMock) is load-bearing: prod does
+            # ``if slot.detect_cap_hit(...):`` / ``slot.report(outcome)``
+            # without ``await``.
             slot.detect_cap_hit = MagicMock(side_effect=_slot_detect_cap_hit)
             slot.confirm = MagicMock(side_effect=_slot_confirm)
             slot.settle = MagicMock(side_effect=_slot_settle)
+            slot.report = MagicMock(side_effect=_slot_report)
             holder['slot'] = slot
             return slot
 
@@ -1723,7 +1749,14 @@ class TestCapRetryHeuristicBranch:
             detect_cap_hit=MagicMock(return_value=False),
             active_account_name='acct',
         )
-        gate._handle_cap_detected = MagicMock()
+        # Post-W4-ε, cli_invoke derives cap-hit attribution from
+        # usage_gate.lease_is_current(slot.lease) (captured before
+        # slot.report() runs), not from _handle_cap_detected's return value.
+        # _handle_cap_detected is still mirrored here (via the report()
+        # proxy) so this test stays meaningful against the pre-rewrite code
+        # path too, which still reads _handle_cap_detected's return directly.
+        gate._handle_cap_detected = MagicMock(return_value=True)
+        gate.lease_is_current = MagicMock(return_value=True)
         heuristic_result = self._make_heuristic_result()
         ok_result = make_result()
         with (
@@ -1745,6 +1778,7 @@ class TestCapRetryHeuristicBranch:
             active_account_name='acct',
         )
         gate._handle_cap_detected = MagicMock(return_value=True)
+        gate.lease_is_current = MagicMock(return_value=True)
         heuristic_result = self._make_heuristic_result()
         # First call → 0.0 (retry_start), subsequent calls → 4000.0
         # elapsed = 4000.0 > cap_wait_sanity_secs=3600.0 → raise
@@ -2014,7 +2048,13 @@ class TestCapRetryUnattributedCapHit:
             account_count=1,
             detect_cap_hit=MagicMock(return_value=False),
         )
+        # Post-W4-ε, attribution comes from lease_is_current(slot.lease),
+        # captured before slot.report() runs — not from _handle_cap_detected's
+        # return.  _handle_cap_detected is kept mirrored to False too so this
+        # test is equally meaningful against the pre-rewrite code path, which
+        # still reads _handle_cap_detected's return directly.
         gate._handle_cap_detected = MagicMock(return_value=False)
+        gate.lease_is_current = MagicMock(return_value=False)
         heuristic_result = self._make_heuristic_result()
 
         with (
@@ -2039,6 +2079,7 @@ class TestCapRetryUnattributedCapHit:
             active_account_name='acct',
         )
         gate._handle_cap_detected = MagicMock(return_value=True)  # cap marked → retry
+        gate.lease_is_current = MagicMock(return_value=True)  # post-W4-ε attribution driver
 
         heuristic_result = self._make_heuristic_result()
         ok_result = make_result(cost_usd=1.23)
@@ -2065,6 +2106,7 @@ class TestCapRetryUnattributedCapHit:
             detect_cap_hit=MagicMock(return_value=False),
         )
         gate._handle_cap_detected = MagicMock(return_value=False)
+        gate.lease_is_current = MagicMock(return_value=False)  # post-W4-ε attribution driver
         heuristic_result = self._make_heuristic_result()
 
         cost_store = MagicMock()
@@ -2400,6 +2442,89 @@ class TestVestigialParamsRemoved:
         """_DEFAULT_CAP_RETRY_DEADLINE_SECS must NOT be importable from shared.cli_invoke."""
         with pytest.raises(ImportError):
             from shared.cli_invoke import _DEFAULT_CAP_RETRY_DEADLINE_SECS  # type: ignore[attr-defined]  # noqa: PLC0415, F401, I001
+
+
+# ===================================================================
+# TestNoGatePrivateReachIns  (task W4-ε, PRD §7.4, step 3 — B6 guard)
+# ===================================================================
+
+
+def _cli_invoke_source() -> str:
+    """Raw source text of shared.cli_invoke — used by structural reach-in guards."""
+    return inspect.getsource(cli_invoke_module)
+
+
+class TestNoGatePrivateReachIns:
+    """B6 structural guard: cli_invoke.py must not cross-module reach into
+    UsageGate privates, nor manually settle an InvokeSlot.
+
+    Before task W4-ε, invoke_with_cap_retry called ``UsageGate._handle_auth_failure``
+    / ``UsageGate._handle_cap_detected`` directly (crossing the module boundary
+    into gate-private methods) and paired that with a manual ``slot.settle()``.
+    ``InvokeSlot.report(outcome)`` now applies the transition AND settles the
+    slot atomically — the two-step reach-in-then-settle pattern must not exist
+    in cli_invoke.py at all. RED until step 4 deletes the last two reach-in
+    sites (the AuthFailed branch and the heuristic zero-cost-instant-exit
+    branch).
+    """
+
+    def test_no_handle_auth_failure_reach_in(self):
+        source = _cli_invoke_source()
+        assert '_handle_auth_failure' not in source, (
+            'cli_invoke.py must not reach into UsageGate._handle_auth_failure — '
+            'use slot.report(outcome) instead (task W4-ε)'
+        )
+
+    def test_no_handle_cap_detected_reach_in(self):
+        source = _cli_invoke_source()
+        assert '_handle_cap_detected' not in source, (
+            'cli_invoke.py must not reach into UsageGate._handle_cap_detected — '
+            'use slot.report(outcome) instead (task W4-ε)'
+        )
+
+    def test_no_manual_slot_settle_reach_in(self):
+        source = _cli_invoke_source()
+        assert 'slot.settle(' not in source, (
+            'cli_invoke.py must not manually call slot.settle() — '
+            'slot.report(outcome) settles atomically (task W4-ε)'
+        )
+
+
+# ===================================================================
+# TestProbeSlotLeakOnExceptionRegression  (task W4-ε, step 3 — B6 guard)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestProbeSlotLeakOnExceptionRegression:
+    """Regression lock (real UsageGate + real InvokeSlot): PROBE_IN_FLIGHT is
+    released via ``invoke_slot()``'s ``__aexit__`` safety net when the invoked
+    fn raises — BEFORE any ``slot.report(outcome)`` call can run (the
+    exception fires while awaiting ``invoke()``, upstream of
+    classify_invocation/report). Locks this exact behavior across the W4-ε
+    reach-in-deletion rewiring: an account must never be left wedged in
+    PROBE_IN_FLIGHT just because ``report()`` never got a chance to run.
+    """
+
+    async def test_probe_in_flight_released_when_invoke_raises(self):
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.probing = True  # before_invoke() claims PROBING -> PROBE_IN_FLIGHT
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=RuntimeError('boom')),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match='boom'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
+
+        assert acct.phase == AccountPhase.AVAILABLE, (
+            'PROBE_IN_FLIGHT must be released via __aexit__ even though '
+            'report() never ran — the invoke() call raised before '
+            'classify_invocation/report could execute'
+        )
+        assert acct.probe_in_flight is False
+        assert gate._open.is_set(), '_open event must be re-opened (gate not deadlocked)'
 
 
 # ===================================================================
