@@ -971,7 +971,41 @@ class DeterministicRunner:
                     f'outer guard): {exc!r}'
                 ) from exc
 
-        rc, out = await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)
+        try:
+            rc, out = await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)
+        except TimeoutError:
+            # A hung/unresponsive seam produced NO exit code, so there is no
+            # verdict to report — this is an INFRA fault (parity with the
+            # deploy path's outer-guard handling), not milestone_check_failed.
+            # infra_issue does NOT stamp gate_escalated_at, so the check is
+            # re-attempted on the next dispatch rather than latched into the
+            # resolve-to-done path.
+            timeout_detail = '\n'.join([
+                description,
+                f'Predicate check run_fn exceeded the outer guard timeout ({outer_timeout}s = '
+                f"before_done['timeout_secs'] + run_timeout_grace_secs).",
+                'The subprocess may be detached/unkillable — check out-of-band '
+                '(e.g. ps) before taking further action.',
+                'This is a read-only predicate — safe to re-run on the next '
+                'dispatch (no before_done_ran_at stamp to worry about).',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate check timed out (subprocess hung)',
+                detail=timeout_detail,
+            )
+        except Exception as exc:
+            # Likewise an infra fault, not a verdict — an unexpected error
+            # means the check never ran to completion.
+            error_detail = '\n'.join([
+                description,
+                f'Predicate check run_fn raised an unexpected error: {exc!r}',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate check run_fn failed (unexpected error)',
+                detail=error_detail,
+            )
 
         if rc != 0:
             # A non-zero exit is a milestone VERDICT ("invariant does not
