@@ -217,6 +217,18 @@ _claude_descendant_alive() {
 # descendant. The transcript probe is the primary, deterministically-tested
 # signal (the motivating incident is "no transcript ever appeared"); the
 # process probe is a guarded best-effort secondary.
+#
+# KNOWN LIMITATION (concurrent same-cwd spawns): the transcript directory is
+# keyed on cwd, not on this session -- Claude Code writes every session for a
+# given cwd into the same $CLAUDE_PROJECTS_DIR/<encoded-cwd>/ directory. If a
+# second, genuinely healthy spawn for the SAME cwd writes its own new
+# transcript file while THIS spawn is failing to start, that sibling's file
+# is indistinguishable here from this spawn's own evidence -- _started_evidence
+# returns true and this spawn is never flagged (a false negative). This
+# detector is therefore best-effort under a concurrent same-cwd fleet; it
+# remains exact for the common single-spawn-per-cwd case, including the
+# motivating 2026-07-06 incident. See SKILL.md's Verification section for the
+# caller-facing note.
 _started_evidence() {
   local d="$CLAUDE_PROJECTS_DIR/$(_encode_cwd "$cwd")"
   if [ -d "$d" ] && [ -n "$(find "$d" -type f -newer "$spawn_ref" -print -quit 2>/dev/null)" ]; then
@@ -237,6 +249,18 @@ _started_evidence() {
 # the session-registry record, emits a loud caller-visible stderr line, and
 # writes the fts_marker so await_sentinel/resolve_* can break out of what
 # would otherwise be an unbounded wait.
+#
+# KNOWN LIMITATION (detached slow-start false-failure): for a DETACHED
+# launcher (konsole, or a custom $CLAUDE_TERMINAL_CMD), _claude_descendant_alive
+# is always empty by construction (setsid reparents claude away from this
+# script), so the transcript probe is the ONLY positive evidence available. A
+# real claude that is merely slow to write its first transcript (heavy load,
+# cold cache) past SPAWN_STARTED_GRACE_SECS is flagged failed-to-start even
+# though it is alive and will keep running detached -- a wrong terminal
+# status (144 + registry failed-to-start), not merely a late one. There is no
+# way to retract the flag once the caller has observed it. Callers on slow or
+# loaded hosts should raise SPAWN_STARTED_GRACE_SECS accordingly; see
+# SKILL.md's Verification section for the caller-facing note.
 _started_watchdog() {
   # Clear inherited traps in this backgrounded copy -- without this, the
   # child would run the parent's _cleanup on its own return, which would be
@@ -270,9 +294,22 @@ resolve_foreground() {
   if [ -f "$sentinel" ] || _wait_sentinel_grace; then
     finish
   fi
-  if _failed_to_start_pending; then
-    finish_failed_to_start
-  fi
+  # Deliberately do NOT consult _failed_to_start_pending here. By this point
+  # the foreground launcher has already returned AND _wait_sentinel_grace
+  # (bounded by SPAWN_LAUNCH_GRACE_SECS, checked every 0.1s) has exhausted
+  # its own full wait with the sentinel still absent -- $inner's EXIT trap
+  # installs before claude ever runs, so this unambiguously means the
+  # payload never started: a genuine launcher failure (127) under the
+  # pre-existing exit-code contract (task 2285/T3), independent of the
+  # started-watchdog's own verdict. Unlike resolve_detached's await_sentinel()
+  # (unbounded, so it genuinely needs the fts_marker as its own break
+  # condition), nothing here is waiting on the marker, so a pending flag at
+  # this exact instant only ever reflects a caller-misconfigured
+  # SPAWN_STARTED_GRACE_SECS <= SPAWN_LAUNCH_GRACE_SECS racing the
+  # started-watchdog ahead of this check -- not a real distinction from the
+  # 127 case. Preferring 127 unconditionally keeps the foreground exit code
+  # stable regardless of how the two independently-tunable grace windows
+  # happen to be set.
   exit 127
 }
 

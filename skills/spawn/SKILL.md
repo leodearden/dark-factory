@@ -79,6 +79,10 @@ The background task's completion is a reliable signal that the spawned session h
 
 The transcript path used by the `144` check encodes the session's `cwd` by replacing every `/` and `.` with `-`, matching `session_registry.transcript_path_for_cwd` byte-for-byte — e.g. `/home/leo/src/dark-factory` → `~/.claude/projects/-home-leo-src-dark-factory/`. The started-grace window defaults to ~90s and is tunable via `$SPAWN_STARTED_GRACE_SECS`.
 
+**Known limitations of the `144` check:**
+- **Concurrent same-cwd spawns.** The transcript directory is keyed on `cwd`, not on the individual session — Claude Code writes every session for a given `cwd` into the same directory. If a second, genuinely healthy spawn for the same `cwd` writes its own new transcript while a sibling spawn is truly failing to start, the healthy sibling's file is indistinguishable from the failing spawn's own evidence, so the failing spawn is never flagged (a false negative). The detector is exact for the common single-spawn-per-cwd case, including the motivating 2026-07-06 incident, but treat coverage as reduced for a concurrent same-cwd fleet.
+- **Detached launchers can false-flag a live-but-slow session.** For a detached launcher (`konsole`, or a custom `$CLAUDE_TERMINAL_CMD`), the transcript probe is the *only* positive evidence — a live `claude` process can't be observed once its launcher detaches. A real session that is merely slow to write its first transcript (heavy load, cold cache) can still be flagged `144` even though it is alive and keeps running detached. Treat a `144` on a detached launcher as "no evidence seen within grace," not as confirmation the session is dead, and raise `$SPAWN_STARTED_GRACE_SECS` for callers on slow or loaded hosts.
+
 If you want to confirm the spawned session is alive mid-run, `ps -ef | grep claude` works. The background task itself is the canonical liveness signal — don't poll it via `TaskGet` in tight loops; just wait for its completion notification.
 
 ## When NOT to use
