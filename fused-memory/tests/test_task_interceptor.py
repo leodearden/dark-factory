@@ -5111,6 +5111,60 @@ class TestPathGuardOrSkip:
 
 
 # ---------------------------------------------------------------------------
+# FILES-certain scope check (task 2206) — exact registry lookup, hard reject
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFilesCertainScopeCheck:
+    """Task 2206: a metadata.files owner-mismatch is a CERTAIN, hard reject —
+    no LLM adjudication, unlike the heuristic prose scan."""
+
+    async def test_files_owner_mismatch_hard_rejects_and_escalates(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'Generic title, no prose hit',
+                'metadata': {'files': ['fused-memory/src/x.py']},
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is not None
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation'
+        assert 'fused-memory/src/x.py' in result.get('matched_paths', [])
+        assert result.get('suggested_project') == 'dark_factory'
+        assert len(escalator_calls) == 1, (
+            f'Expected escalator called exactly once, got {len(escalator_calls)}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Multi-project routing — registry + escalator wiring
 # ---------------------------------------------------------------------------
 
