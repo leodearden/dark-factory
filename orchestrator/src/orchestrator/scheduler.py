@@ -367,6 +367,30 @@ class RequeueRecord:
     timestamp: float
 
 
+@dataclass(frozen=True)
+class SchedulerCallbacks:
+    """Constructor-injected Harness→Scheduler callback bundle (task 2235).
+
+    Replaces nine post-construction ``scheduler._on_*``-style monkey-patches
+    with a single immutable bundle passed to ``Scheduler.__init__``.  Every
+    field defaults to ``None`` so a bare ``Scheduler(config)`` (no
+    ``callbacks=`` argument) collapses to an all-no-op bundle — the existing
+    bare-Scheduler unit-test contract is unaffected.  Frozen: the Harness
+    builds one bundle at construction time; there is no post-hoc mutation or
+    half-wired window.
+    """
+
+    on_park_stop_trip: Callable[[str], Any] | None = None
+    on_external_dep_block: Callable[..., Any] | None = None
+    on_starvation_warn: Callable[..., Any] | None = None
+    on_starvation_resolve: Callable[..., Any] | None = None
+    warm_base_health_probe: Callable[..., Any] | None = None
+    on_warm_base_warn: Callable[..., Any] | None = None
+    on_warm_base_promote_l2: Callable[..., Any] | None = None
+    on_warm_base_resolve: Callable[..., Any] | None = None
+    suppress_blocked_write: Callable[[str], bool] | None = None
+
+
 def _render_retry_cap_report(
     *,
     task_id: str,
@@ -1045,6 +1069,7 @@ class Scheduler:
         config: OrchestratorConfig,
         event_store: EventStore | None = None,
         *,
+        callbacks: SchedulerCallbacks | None = None,
         mcp_session: McpSessionLike | None = None,
         time_source: Callable[[], float] | None = None,
         override_store: OverrideStore | None = None,
@@ -1053,6 +1078,10 @@ class Scheduler:
         wall_time_source: Callable[[], datetime] | None = None,
     ):
         self.config = config
+        # Constructor-injected Harness callback bundle (task 2235).  Omitting
+        # callbacks= collapses to an all-None SchedulerCallbacks so bare-
+        # Scheduler unit tests are unaffected.
+        self._callbacks: SchedulerCallbacks = callbacks or SchedulerCallbacks()
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
         # Wall-clock source (task 2335 β) for the milestone time-gate: unlike
         # self._time_source (monotonic, resets across restarts), milestone
@@ -1139,22 +1168,6 @@ class Scheduler:
         # entries currently in _blocked_transitions.  Kept in sync with the
         # deque — entries are added/removed together.
         self._blocked_task_ids_in_window: set[str] = set()
-        # Callback installed by the Harness so trip → persistence + event.
-        self._on_park_stop_trip: Callable[[str], Any] | None = None
-        # --- Cross-project external-dep escalation (task 1580) ---
-        # Callback installed by the Harness: (task_id, *, summary, detail,
-        # category) → block the task + submit L1.  Default None so bare-Harness
-        # unit tests (and park_gc) are unaffected.
-        self._on_external_dep_block: Callable[..., Any] | None = None
-        # --- Action-teardown suppression (task 1620, β Pair E / C3.2) ---
-        # Predicate installed by the Harness: when set, set_task_status('blocked',
-        # ...) returns early (before dispatch_tool) if the predicate returns True
-        # for that task_id.  Absorbs racing 'blocked' writes emitted by a workflow
-        # being killed during action teardown (park→deferred / restart→pending) so
-        # the action's target status is not clobbered.  Mirrors the
-        # _on_park_stop_trip / _on_external_dep_block callback-install pattern:
-        # declared here, installed by Harness.__init__.
-        self._suppress_blocked_write: Callable[[str], bool] | None = None
         # --- Consecutive-tick streak counters (task 2124) ---
         # Backed by StreakCounter/StreakRegistry (orchestrator.streaks).  The
         # registry owns COUNTING + GC only; fire/escalate/block decisions stay
@@ -1236,15 +1249,6 @@ class Scheduler:
         # get_by_task dedup).  Cleared when the task dispatches or is GC'd.
         # ALIASED to _streak_starvation.escalated (task 2124).
         self._starvation_escalated = self._streak_starvation.escalated
-        # Callback installed by the Harness to file an INFO escalation when a
-        # starved task crosses both thresholds.  Signature:
-        #   (task_id: str, *, summary: str, detail: str) -> None (async)
-        # Default None so bare-Scheduler unit tests are unaffected.
-        self._on_starvation_warn: Callable[..., Any] | None = None
-        # Callback installed by the Harness to resolve the open INFO escalation
-        # when the task finally dispatches.  Signature: (task_id: str) -> None (async)
-        # Default None so bare-Scheduler unit tests are unaffected.
-        self._on_starvation_resolve: Callable[..., Any] | None = None
         # --- Warm-base hard-down watchdog state (task 2061) ---
         # SINGLETON latch — one host-scoped warm-lane CoW seed base, so exactly
         # one signal/window/L2 (unlike the starvation watchdog's per-task dict/
@@ -1260,25 +1264,6 @@ class Scheduler:
         # for the CURRENT latch engagement.  Reset to False whenever the latch
         # re-engages after a resolve.
         self._warm_base_l2_promoted: bool = False
-        # Injected async probe installed by the Harness — calls
-        # GitOps._warm_lane_base_resolvable() and returns its WarmBaseHealth
-        # .value ('ok' | 'absent' | 'indeterminate').  Signature: () -> str
-        # (async).  Default None so bare-Scheduler unit tests are unaffected
-        # and the watchdog is a no-op until the Harness wires it up.
-        self._warm_base_health_probe: Callable[..., Any] | None = None
-        # Callback installed by the Harness to file the ONE INFO notice when
-        # the latch engages.  Signature: (*, summary: str, detail: str) -> None
-        # (async).  Default None so bare-Scheduler unit tests are unaffected.
-        self._on_warm_base_warn: Callable[..., Any] | None = None
-        # Callback installed by the Harness to promote the ONE born-at-L2
-        # escalation when the base is still absent past l2_window_secs.
-        # Signature: (*, summary: str, detail: str) -> None (async).  Default
-        # None so bare-Scheduler unit tests are unaffected.
-        self._on_warm_base_promote_l2: Callable[..., Any] | None = None
-        # Callback installed by the Harness to resolve BOTH the notice and any
-        # promoted L2 when the probe reports 'ok' again.  Signature: () -> None
-        # (async).  Default None so bare-Scheduler unit tests are unaffected.
-        self._on_warm_base_resolve: Callable[..., Any] | None = None
         # Injected async hook installed by the Harness — the landed-outbox
         # consult-before-dispatch gate (task 2156, W1 δ — PRD
         # merge-queue-reliability §8.2 SD-1, boundary B5).  Signature:
@@ -1454,7 +1439,7 @@ class Scheduler:
             return
         if not self.config.park_stop_enabled:
             return
-        if self._on_park_stop_trip is None:
+        if self._callbacks.on_park_stop_trip is None:
             return
         n = len(self._blocked_transitions)
         threshold = self.config.park_stop_parked_threshold
@@ -1472,7 +1457,7 @@ class Scheduler:
         self.pause(reason)
         logger.warning('Park-stop trip: %s — pausing scheduler', reason)
         try:
-            t = asyncio.ensure_future(self._on_park_stop_trip(reason))
+            t = asyncio.ensure_future(self._callbacks.on_park_stop_trip(reason))
             # Attach a done-callback so exceptions inside harness.pause_scheduler
             # (e.g. RunStore write failure, EventStore emit failure) are logged
             # immediately rather than surfacing as GC-collected Task warnings
