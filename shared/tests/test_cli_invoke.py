@@ -1766,6 +1766,12 @@ def _make_gate(
         active_account_name=active_account_name,
     )
     gate._handle_cap_detected = MagicMock(return_value=handle_cap_detected)
+    # Post-W4-ε, cli_invoke derives heuristic-cap attribution from
+    # usage_gate.lease_is_current(slot.lease) (captured before slot.report()
+    # runs), not from _handle_cap_detected's return value. Mirror the two so
+    # the ``handle_cap_detected`` knob drives retry-gating either way — and so
+    # _handle_cap_detected stays meaningful against the pre-rewrite path.
+    gate.lease_is_current = MagicMock(return_value=handle_cap_detected)
     return gate
 
 
