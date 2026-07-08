@@ -780,6 +780,34 @@ async def _write_and_confirm_marker(
     )
 
 
+def _is_completion_flag(flag: dict[str, Any]) -> bool:
+    """Return True iff *flag* explicitly marks itself as ONE-TIME completed work.
+
+    A flag is a completion marker iff ``flag['flag_for_stage2']`` is present
+    AND explicitly false: the bool ``False``, or a string equal to ``'false'``
+    case-insensitively (e.g. ``'false'``, ``'False'``, ``'FALSE'``).
+
+    Absence of the key is DELIBERATELY excluded from this predicate — it must
+    NOT be treated as a completion marker. The dedup MISS-branch markers
+    ``_write_and_confirm_marker`` writes for recurring findings never set
+    ``flag_for_stage2`` at all, and recurring-finding flags either omit the
+    key or set it truthy. Treating absence as "false" would misclassify every
+    ordinary recurring flag as a one-time completion, deleting the very
+    marker cross-cycle dedup depends on and turning every cycle into a fresh
+    MISS (infinite re-flagging). Only an EXPLICIT false value is a safe,
+    unambiguous signal that the producer intends this finding to be a
+    same-cycle completion marker rather than a recurring finding.
+
+    Pure, sync, no I/O.
+    """
+    if 'flag_for_stage2' not in flag:
+        return False
+    value = flag['flag_for_stage2']
+    if value is False:
+        return True
+    return isinstance(value, str) and value.strip().casefold() == 'false'
+
+
 async def dedup_flags(
     memory_service: Any,
     project_id: str,
