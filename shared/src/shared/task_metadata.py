@@ -317,6 +317,12 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
     _SUBMODEL_REGISTRY[key] = model
 
 
+# Milestone is the first real W10 registrant: registering at module-import
+# time (rather than lazily) guarantees the 'milestone' slice is validated
+# and typed before any of parse_metadata's many callers across packages run.
+register_metadata_submodel('milestone', Milestone)
+
+
 def _normalize_legacy_memory_hints(value: object) -> object:
     """Coerce a legacy list-of-dicts ``memory_hints`` value to canonical dict shape.
 
