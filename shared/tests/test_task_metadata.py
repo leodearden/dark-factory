@@ -435,18 +435,10 @@ class TestMilestone:
         'kwargs',
         [
             pytest.param({'mode': 'dated', 'at': None}, id='dated_missing_at'),
-            pytest.param(
-                {'mode': 'dated', 'at': 'not-a-date'}, id='dated_unparseable_at'
-            ),
-            pytest.param(
-                {'mode': 'delayed', 'after_secs': None}, id='delayed_missing_after_secs'
-            ),
-            pytest.param(
-                {'mode': 'delayed', 'after_secs': 0}, id='delayed_after_secs_zero'
-            ),
-            pytest.param(
-                {'mode': 'delayed', 'after_secs': -1}, id='delayed_after_secs_negative'
-            ),
+            pytest.param({'mode': 'dated', 'at': 'not-a-date'}, id='dated_unparseable_at'),
+            pytest.param({'mode': 'delayed', 'after_secs': None}, id='delayed_missing_after_secs'),
+            pytest.param({'mode': 'delayed', 'after_secs': 0}, id='delayed_after_secs_zero'),
+            pytest.param({'mode': 'delayed', 'after_secs': -1}, id='delayed_after_secs_negative'),
             pytest.param(
                 {'mode': 'dated', 'at': '2026-08-01T00:00:00+00:00', 'after_secs': 604800},
                 id='dated_with_after_secs_also_set',

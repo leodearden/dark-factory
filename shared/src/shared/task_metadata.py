@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -27,6 +28,7 @@ __all__ = [
     'DoneProvenance',
     'ExternalDep',
     'MemoryHints',
+    'Milestone',
     'RetryLedger',
     'SchemaWarning',
     'TaskMetadata',
@@ -215,6 +217,46 @@ class RetryLedger(BaseModel):
         else:
             basis = RetryLedger.normalize_cause_hint(fallback_reason or '').encode('utf-8')
         return hashlib.sha256(basis).hexdigest()[:16]
+
+
+class Milestone(BaseModel):
+    """``metadata.milestone`` — a dated or delayed milestone spec (PRD §6.1).
+
+    ``mode`` discriminates between the two mutually exclusive shapes: a
+    ``'dated'`` milestone fires at an explicit ISO-8601 timestamp (``at``);
+    a ``'delayed'`` milestone fires ``after_secs`` seconds after some
+    reference point. The two field sets are an *iff* — a ``'dated'``
+    milestone must not also carry ``after_secs``, and a ``'delayed'``
+    milestone must not also carry ``at``.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    mode: Literal['dated', 'delayed']
+    at: str | None = None
+    after_secs: int | None = None
+
+    @model_validator(mode='after')
+    def _check_mode_fields(self) -> Milestone:
+        if self.mode == 'dated':
+            if self.at is None:
+                raise ValueError("Milestone: at is required when mode='dated'.")
+            try:
+                datetime.fromisoformat(self.at)
+            except ValueError as exc:
+                raise ValueError(
+                    f'Milestone: at={self.at!r} is not a valid ISO-8601 datetime: {exc}'
+                ) from exc
+            if self.after_secs is not None:
+                raise ValueError("Milestone: after_secs must not be set when mode='dated'.")
+        else:
+            if self.after_secs is None or self.after_secs <= 0:
+                raise ValueError(
+                    "Milestone: after_secs is required and must be > 0 when mode='delayed'."
+                )
+            if self.at is not None:
+                raise ValueError("Milestone: at must not be set when mode='delayed'.")
+        return self
 
 
 class TaskMetadata(BaseModel):
