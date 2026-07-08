@@ -592,6 +592,45 @@ class TestSubmodelRegistry:
             register_metadata_submodel('deploy_state', _OtherDeployStateStub)
 
 
+class TestMilestoneRegistration:
+    """Milestone's registration with the W10 extension point + parse_metadata integration."""
+
+    def test_registered_at_import(self):
+        assert task_metadata_module._SUBMODEL_REGISTRY['milestone'] is Milestone
+
+    def test_round_trip_no_warnings(self):
+        model, warnings = parse_metadata(
+            {
+                'task_kind': 'deterministic',
+                'milestone': {'mode': 'delayed', 'after_secs': 604800},
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': 'scripts/check_merge_flakiness.sh',
+                    'timeout_secs': 120,
+                },
+            },
+            direction='write',
+        )
+        assert warnings == []
+        assert model.before_done is not None
+        assert model.before_done.kind == 'predicate'
+        assert isinstance(model.milestone, Milestone)  # type: ignore[attr-defined]
+        dumped_milestone = model.model_dump()['milestone']
+        assert not isinstance(dumped_milestone, BaseModel)
+        assert dumped_milestone == {'mode': 'delayed', 'at': None, 'after_secs': 604800}
+
+    def test_malformed_slice_read_warns_and_retains_raw(self):
+        model, warnings = parse_metadata({'milestone': {'mode': 'delayed'}}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'milestone'
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()['milestone'] == {'mode': 'delayed'}
+
+    def test_malformed_slice_write_enforce_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata({'milestone': {'mode': 'delayed'}}, direction='write', enforce=True)
+
+
 class TestMigrations:
     """The versioned v0->v1 migration registry (PRD §3/§5).
 
