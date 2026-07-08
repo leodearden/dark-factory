@@ -540,6 +540,7 @@ class GraphitiBackend:
             raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
         return self.client
 
+    @_canonicalize_group_args
     async def add_episode(
         self,
         name: str,
