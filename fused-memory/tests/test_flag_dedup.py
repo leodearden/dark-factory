@@ -8179,32 +8179,33 @@ class TestIsCompletionFlag:
 
 
 @pytest.mark.asyncio
-async def test_dedup_flags_completion_flag_self_deletes_marker_same_cycle():
+async def test_dedup_flags_completion_flag_sweeps_prior_without_writing_new_marker():
     """flag_for_stage2=False marks a ONE-TIME completed-work finding: dedup_flags
-    emits its stage1_flag_marker (add_memory) via _write_and_confirm_marker, then
-    reclaims it in the SAME call via acknowledge_flag_marker(mode='delete')
-    (delete_memory) — bypassing the persist-for-dedup MISS/HIT path entirely.
+    does NOT write a new stage1_flag_marker for it (task-2312 review amendment —
+    an emit-then-self-delete design raced Mem0 read-after-write indexing lag and
+    could leave a fresh orphan). Instead it only sweeps any PRIOR marker for the
+    signature via acknowledge_flag_marker(mode='delete') — bypassing the
+    persist-for-dedup MISS/HIT path entirely.
 
-    No prior markers exist before this call; the marker search finds (and
-    deletes) exactly the one just written, proving no persistent marker
-    survives the cycle.
+    A prior marker (simulating one left over from an earlier cycle) is found
+    and deleted; no marker is (re-)written.
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
-    written_marker = _make_memory_result({
+    prior_marker = _make_memory_result({
         'source': 'stage1_flag_marker',
         'kind': 'stage1_flag_marker',
         'task_id': '77',
         'flag_type': 'duplicate_flag_marker_cleanup',
-        'run_id': 'r1',
-        'last_seen_run_id': 'r1',
+        'run_id': 'r0',
+        'last_seen_run_id': 'r0',
     })
-    written_marker.id = 'written-77'
+    prior_marker.id = 'prior-77'
 
     memory_service = AsyncMock()
     memory_service.search = AsyncMock(side_effect=_make_search_stub(
         suppression=[[]],
-        marker={('77', 'duplicate_flag_marker_cleanup'): [[written_marker], [written_marker]]},
+        marker={('77', 'duplicate_flag_marker_cleanup'): [[prior_marker]]},
     ))
     memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
     memory_service.delete_memory = AsyncMock(return_value=None)
@@ -8223,24 +8224,118 @@ async def test_dedup_flags_completion_flag_self_deletes_marker_same_cycle():
         flags=flags,
     )
 
-    # (a) Marker emitted via the canonical write-and-confirm path.
-    memory_service.add_memory.assert_called_once()
-    _assert_valid_stage1_marker(
-        memory_service.add_memory.call_args.kwargs,
-        task_id='77', flag_type='duplicate_flag_marker_cleanup', run_id='r1',
-    )
+    # (a) No marker is (re-)written for a completion flag — only one search
+    # (acknowledge_flag_marker's own find_prior_memories) is issued for the
+    # marker query; the search stub would raise on a second, unconfigured pop.
+    memory_service.add_memory.assert_not_called()
 
-    # (b) ... then self-deleted within the SAME dedup_flags call.
+    # (b) The pre-existing prior is swept.
     memory_service.delete_memory.assert_called_once()
-    assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'written-77', (
-        'the just-written marker (found by search) must be the one deleted'
-    )
+    assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'prior-77'
 
     # (c) Flag annotated; persist-for-dedup fields are NOT set (bypassed).
     assert len(result) == 1
     assert result[0]['completion_marker_self_deleted'] is True
     assert result[0]['last_seen_run_id'] == 'r1'
     assert 'persisted_from_run' not in result[0]
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_completion_flag_with_no_priors_is_noop_sweep():
+    """A completion flag whose signature has no prior marker at all (the common
+    case: nothing was ever persisted for it) is a clean no-op sweep — no
+    add_memory, no delete_memory — and is still annotated
+    completion_marker_self_deleted=True.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        marker={('77', 'duplicate_flag_marker_cleanup'): [[]]},
+    ))
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [{
+        'task_id': 77,
+        'flag_type': 'duplicate_flag_marker_cleanup',
+        'description': 'cleaned up an orphaned duplicate flag marker',
+        'flag_for_stage2': False,
+    }]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    memory_service.add_memory.assert_not_called()
+    memory_service.delete_memory.assert_not_called()
+
+    assert len(result) == 1
+    assert result[0]['completion_marker_self_deleted'] is True
+    assert result[0]['last_seen_run_id'] == 'r1'
+    assert 'persisted_from_run' not in result[0]
+
+
+@pytest.mark.asyncio
+async def test_dedup_flags_completion_flag_duplicate_signature_in_batch_swept_once():
+    """Idempotency (task-2312 review amendment): when the SAME (task_id,
+    flag_type) completion signature is emitted twice in one items_flagged
+    batch, only the FIRST occurrence runs the acknowledge_flag_marker sweep —
+    the second is caught by the in-batch seen_signatures memo (task-1978)
+    because the completion branch now registers its signature there too,
+    instead of independently re-running a second sweep.
+    """
+    from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+    memory_service = AsyncMock()
+    memory_service.search = AsyncMock(side_effect=_make_search_stub(
+        suppression=[[]],
+        # Only ONE entry configured: a second, unmemoized sweep would exhaust
+        # the queue and raise inside the search stub, failing the test.
+        marker={('77', 'duplicate_flag_marker_cleanup'): [[]]},
+    ))
+    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
+    memory_service.delete_memory = AsyncMock(return_value=None)
+
+    flags = [
+        {
+            'task_id': 77,
+            'flag_type': 'duplicate_flag_marker_cleanup',
+            'description': 'cleaned up an orphaned duplicate flag marker',
+            'flag_for_stage2': False,
+        },
+        {
+            'task_id': 77,
+            'flag_type': 'duplicate_flag_marker_cleanup',
+            'description': 'same signature, re-evaluated within this run',
+            'flag_for_stage2': False,
+        },
+    ]
+
+    result = await dedup_flags(
+        memory_service=memory_service,
+        project_id='p',
+        run_id='r1',
+        flags=flags,
+    )
+
+    memory_service.add_memory.assert_not_called()
+    memory_service.delete_memory.assert_not_called()
+
+    assert len(result) == 2
+    # First occurrence: resolved directly by the completion branch.
+    assert result[0]['completion_marker_self_deleted'] is True
+    assert result[0]['last_seen_run_id'] == 'r1'
+    assert 'persisted_from_run' not in result[0]
+    # Second occurrence: short-circuited by the in-batch memo instead of
+    # re-running the sweep.
+    assert result[1].get('persisted_from_run') == 'r1'
+    assert result[1]['last_seen_run_id'] == 'r1'
+    assert 'completion_marker_self_deleted' not in result[1]
 
 
 @pytest.mark.asyncio
