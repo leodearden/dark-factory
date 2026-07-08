@@ -125,6 +125,35 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
 }
 
 # --------------------------------------------------------------------------- #
+# Fingerprint identity — single-sourced against the LIVE logic in
+# harness._derive_affected_ids (harness.py:191) and flag_dedup's
+# content-fingerprint fallback (compute_content_fingerprint_signature /
+# _content_fingerprint, flag_dedup.py:1442-1498). This module does not
+# import either (see the import-light rationale in the module docstring);
+# test_recon_self_model.py cross-checks this tuple against both functions
+# directly so drift between this description and the live code fails a test.
+# --------------------------------------------------------------------------- #
+
+FINGERPRINT_IDENTITY_FIELDS = (
+    # Legacy field: takes precedence over the four typed citation containers
+    # below when present (pre-recon_report-cutover journal rows).
+    'affected_ids',
+    # Typed citation containers _derive_affected_ids flattens, in read order:
+    # cited_tasks.task_id, cited_entities.canonical_name|entity_uuid,
+    # cited_edges.edge_uuid, cited_memories.memory_id.
+    'cited_tasks',
+    'cited_entities',
+    'cited_edges',
+    'cited_memories',
+    # Content-fingerprint fallback inputs (compute_content_fingerprint_signature),
+    # used only when no task anchor exists (task_id is None and cited_tasks
+    # yields no task_id): the normalized description, and flag_type (or the
+    # _CONTENT_FP_FLAG_TYPE sentinel when flag_type is absent).
+    'description',
+    'flag_type',
+)
+
+# --------------------------------------------------------------------------- #
 # §8.5 execution_class contract
 # --------------------------------------------------------------------------- #
 
