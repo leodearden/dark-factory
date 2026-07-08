@@ -1545,6 +1545,29 @@ def scope_module_config(
     )
 
 
+def _single_subproject_prefix(files: list[str], worktree: Path | None) -> str | None:
+    """Return the sole top-level subproject directory shared by *files*, else ``None``.
+
+    A "subproject" is a top-level directory of *worktree* that carries its own
+    ``pyproject.toml`` — the same ``(worktree / prefix / 'pyproject.toml').exists()``
+    check ``workflow._sync_worktree_venvs`` already uses to decide which task
+    modules need their own ``uv sync``.  This distinguishes a real subproject
+    (e.g. ``cockpit/``) from a bare repo-root directory like ``tests/`` or
+    ``src/`` that has no ``pyproject.toml`` of its own.
+
+    Returns ``None`` when *worktree* is ``None``, *files* is empty, the files
+    span more than one top-level directory, or the sole top-level directory
+    lacks its own ``pyproject.toml``.
+    """
+    if worktree is None or not files:
+        return None
+    components = {f.split('/', 1)[0] for f in files if '/' in f}
+    if len(components) != 1:
+        return None
+    (prefix,) = components
+    return prefix if (worktree / prefix / 'pyproject.toml').is_file() else None
+
+
 def _build_fallback_config(
     task_files: list[str],
     config: OrchestratorConfig | None = None,
