@@ -303,3 +303,31 @@ def render_cycle_summary_section() -> str:
         'Stage 2 write a cycle_summary sharing the same run_id, so a '
         "stage-less filter would conflate the two stages' summaries."
     )
+
+
+def render_execution_class_section() -> str:
+    """Render the execution_class contract section (PRD §8.5). Unlike the
+    other render_* functions, this is NEW canonical text with no current
+    prompt precedent — execution_class is net-new — authored here for task
+    η (which threads it into the recon-stage prompts' submit_task
+    guidance)."""
+    classes_str = ', '.join(f'`{c}`' for c in EXECUTION_CLASSES)
+    return (
+        '## Execution Class\n'
+        f'Every recon-stage `submit_task` call MUST declare '
+        f'`metadata.execution_class` as one of {classes_str}. A submit_task '
+        'whose execution_class is absent or not one of these three values is '
+        'rejected at the middleware boundary with a structured '
+        'ValidationError before the task is created — this is a hard '
+        'rejection invariant, not a lint warning.\n\n'
+        '`code_tdd` is the default engineering path: the task is unchanged '
+        'and runs through the architect+TDD pipeline (plan, red test, green '
+        'implementation) as normal.\n\n'
+        '`operational` and `decision` asks are NOT engineering work and are '
+        'routed off the architect+TDD pipeline: at the submit_task boundary '
+        "they are coerced to `task_kind='deterministic'` with "
+        '`metadata.always_escalates=true` — a pure human-gated escalation '
+        'gate — instead of dispatching an architect/implementer pair. (This '
+        'routing coercion is owned by task 2085; this section only owns the '
+        'execution_class declaration/rejection contract.)'
+    )
