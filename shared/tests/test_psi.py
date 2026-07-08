@@ -205,3 +205,52 @@ class TestReadPsiSampleHappyPath:
             io_some_avg10=999.0,
         )
         assert sample.saturated(all_high_cfg) is False
+
+
+class TestReadPsiSampleFailOpen:
+    def _zero_threshold_cfg(self):
+        """A maximally saturating cfg (all thresholds 0.0) — proves fail-open still wins."""
+        return types.SimpleNamespace(
+            cpu_some_avg10=0.0,
+            mem_some_avg10=0.0,
+            mem_full_avg10=0.0,
+            io_some_avg10=0.0,
+        )
+
+    def _assert_sentinel(self, sample):
+        assert sample.read_ok is False
+        assert sample.cpu_some10 == 0.0
+        assert sample.mem_some10 == 0.0
+        assert sample.mem_full10 == 0.0
+        assert sample.io_some10 == 0.0
+        assert sample.saturated(self._zero_threshold_cfg()) is False
+
+    def test_reader_raises_file_not_found_fails_open(self):
+        from shared.psi import read_psi_sample
+
+        def read(name):
+            if name == 'cpu':
+                raise FileNotFoundError('/proc/pressure/cpu')
+            return PSI_MEM_TEXT if name == 'memory' else PSI_IO_TEXT
+
+        self._assert_sentinel(read_psi_sample(read=read))
+
+    def test_reader_raises_generic_oserror_fails_open(self):
+        from shared.psi import read_psi_sample
+
+        def read(name):
+            if name == 'memory':
+                raise PermissionError('/proc/pressure/memory')
+            return PSI_CPU_TEXT if name == 'cpu' else PSI_IO_TEXT
+
+        self._assert_sentinel(read_psi_sample(read=read))
+
+    def test_unparseable_source_fails_open(self):
+        from shared.psi import read_psi_sample
+
+        def read(name):
+            if name == 'io':
+                return 'garbage line with no avg fields\n'
+            return PSI_CPU_TEXT if name == 'cpu' else PSI_MEM_TEXT
+
+        self._assert_sentinel(read_psi_sample(read=read))
