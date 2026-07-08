@@ -94,6 +94,7 @@ from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     IllegalTransition,
     WorkflowOutcome,
     WorkflowState,
+    WorkflowStateMachine,
 )
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for

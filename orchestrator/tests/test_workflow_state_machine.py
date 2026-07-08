@@ -8,6 +8,10 @@ W9-β (PRD ``plans/workflow-state-machine-prd.md`` §10 β; Contract §8.1/§8.2
 from __future__ import annotations
 
 import pytest
+from shared.task_statuses import TaskStatus
+from shared.task_transitions import ActorClass
+from shared.task_transitions import is_legal_transition as shared_is_legal_transition
+from shared.task_transitions import outcome_allows_status as shared_outcome_allows_status
 
 import orchestrator.workflow as workflow_mod
 import orchestrator.workflow_types as workflow_types_mod
@@ -17,10 +21,6 @@ from orchestrator.workflow_types import (
     WorkflowState,
     WorkflowStateMachine,
 )
-from shared.task_statuses import TaskStatus
-from shared.task_transitions import ActorClass
-from shared.task_transitions import is_legal_transition as shared_is_legal_transition
-from shared.task_transitions import outcome_allows_status as shared_outcome_allows_status
 
 # Mirrors the WorkflowState -> TaskStatus projection WorkflowStateMachine.transition
 # consumes (step-4's ``_STATE_TO_STATUS``). Defined independently here so this
