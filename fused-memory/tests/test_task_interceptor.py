@@ -4636,6 +4636,119 @@ class TestSubmitTaskGuardrail:
 
 
 # ---------------------------------------------------------------------------
+# Task 2206: submit_task end-to-end with a real multi-project registry wired
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitTaskGuardrailMultiProject:
+    """End-to-end coverage of the FILES-certain / PROSE-advisory split
+    through the real ``submit_task`` persistence path (not just
+    ``_path_guard_or_skip`` in isolation).
+    """
+
+    @staticmethod
+    def _two_project_registry(tmp_path):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        return ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+
+    @pytest.mark.asyncio
+    async def test_prose_hit_with_registry_persists_ticket_with_advisory_metadata(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """PROSE mentions another project's dir; metadata.files are all
+        in-project. The hit is a non-rejecting advisory: the ticket is
+        still created, and the persisted blob's metadata carries
+        possible_scope_mismatch (matched_paths + suggested_project)."""
+        interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'reify'),
+                title='Investigate fused-memory/harness deadlock',
+                description='See fused-memory/ for context',
+                metadata={'files': ['crates/widget.rs']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, f'Expected no error, got: {result}'
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, (
+            f'Expected possible_scope_mismatch in blob metadata: {blob!r}'
+        )
+        assert marker['matched_paths'] == ['fused-memory/']
+        assert marker['suggested_project'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_files_owner_mismatch_with_registry_rejects_and_persists_nothing(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """metadata.files point at another project's tree — FILES-certain is
+        a hard reject even though the prose is clean: no ticket row is
+        persisted and taskmaster.add_task is never called."""
+        interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'reify'),
+                title='Generic title, no prose hit',
+                description='nothing project-specific here',
+                metadata={'files': ['fused-memory/src/x.py']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected DarkFactoryPathScopeViolation, got: {result}'
+        )
+        assert 'fused-memory/src/x.py' in result.get('matched_paths', []), (
+            f'Expected the offending file in matched_paths: {result}'
+        )
+        assert result.get('suggested_project') == 'dark_factory'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute('SELECT COUNT(*) FROM tickets')
+        row = await cursor.fetchone()
+        assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
+
+        taskmaster.add_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Unit tests for TaskInterceptor._extract_meta_files
 # ---------------------------------------------------------------------------
 
