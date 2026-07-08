@@ -642,6 +642,29 @@ class LocalRunner:
 # the same task; the format is still lexicographically sortable.
 _STDERR_ARCHIVE_TS_FMT = '%Y%m%dT%H%M%S_%fZ'
 
+# task-2362: ssh keepalive tuning. ConnectTimeout bounds only the initial TCP
+# connect, not a mid-session stall — if the TCP session goes silently dead
+# (NAT/conntrack timeout, network partition, wedged remote process producing
+# no output), an ssh child with no keepalive can block indefinitely. These
+# ServerAlive probes ride the live TCP session (independent of stdout cadence),
+# so ssh itself detects a dead peer and exits non-zero within
+# SSH_SERVER_ALIVE_INTERVAL * SSH_SERVER_ALIVE_COUNT_MAX seconds ->
+# RunnerUnavailable -> existing re-dispatch / local-fallback path (incident
+# 5111). A long-but-progressing remote verify keeps the session alive and is
+# unaffected. Values are chosen well inside the remote verify timeout budget.
+SSH_SERVER_ALIVE_INTERVAL = 15
+SSH_SERVER_ALIVE_COUNT_MAX = 4
+
+# Shared base ssh options for all four RemoteRunner ssh argv sites (health,
+# run_merge_verify dispatch, cancel_verify, probe_clean) — kept in one place
+# so the keepalive flags can't drift apart across sites.
+_SSH_BASE_OPTS = [
+    '-o', 'BatchMode=yes',
+    '-o', 'ConnectTimeout=10',
+    '-o', f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}',
+    '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
+]
+
 
 def _sanitize_runner_name(name: str) -> str:
     """Sanitize a runner name for filesystem use in archive filenames.
@@ -849,11 +872,12 @@ class RemoteRunner:
 
         Returns True when rc == 0, False otherwise.  Never raises.
         BatchMode=yes prevents interactive password prompts; ConnectTimeout=10
-        bounds the TCP-connect wait so a down host is detected quickly.
+        bounds the TCP-connect wait so a down host is detected quickly; the
+        ServerAlive keepalive options (task 2362) bound a mid-session stall too.
         """
         try:
             rc, _, _ = await self._run(
-                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', self._ssh_host, 'true']
+                ['ssh', *_SSH_BASE_OPTS, self._ssh_host, 'true']
             )
             return rc == 0
         except Exception:
@@ -968,8 +992,7 @@ class RemoteRunner:
 
                 try:
                     ssh_rc, ssh_stdout, ssh_stderr = await self._ssh_run(
-                        ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                         self._ssh_host, remote_cmd],
+                        ['ssh', *_SSH_BASE_OPTS, self._ssh_host, remote_cmd],
                     )
                 except OSError as exc:
                     raise RunnerUnavailable(f'ssh spawn failed: {exc}') from exc
@@ -1137,7 +1160,7 @@ class RemoteRunner:
         matches α's contract: cancel an unknown/finished id exits 0.
 
         Otherwise issues:
-            ssh -o BatchMode=yes -o ConnectTimeout=10 <host>
+            ssh <_SSH_BASE_OPTS> <host>
                 orchestrator cancel-verify --request-id <id> [--config <path>]
 
         Returns the ssh return code.  An OSError (host unreachable) returns a
@@ -1154,8 +1177,7 @@ class RemoteRunner:
         remote_cmd = ' '.join(shlex.quote(a) for a in cmd_parts)
         try:
             rc, _, _ = await self._run(
-                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                 self._ssh_host, remote_cmd]
+                ['ssh', *_SSH_BASE_OPTS, self._ssh_host, remote_cmd]
             )
             return rc
         except OSError:
@@ -1164,7 +1186,7 @@ class RemoteRunner:
     async def probe_clean(self) -> bool:
         """Probe whether any verify-merge is still running on the remote host.
 
-        Issues: ssh -o BatchMode=yes -o ConnectTimeout=10 <host> pgrep -f verify-merge
+        Issues: ssh <_SSH_BASE_OPTS> <host> pgrep -f verify-merge
 
         Returns:
             True  — rc == 1 (pgrep found no match; host is clean)
@@ -1173,8 +1195,7 @@ class RemoteRunner:
         """
         try:
             rc, _, _ = await self._run(
-                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                 self._ssh_host, 'pgrep -f verify-merge']
+                ['ssh', *_SSH_BASE_OPTS, self._ssh_host, 'pgrep -f verify-merge']
             )
             return rc == 1
         except Exception:

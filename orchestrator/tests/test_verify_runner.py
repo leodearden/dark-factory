@@ -1354,9 +1354,10 @@ class TestRemoteRunnerConstruction:
         )
         result = await runner.health()
         assert result is True
-        # health issues `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true`
+        # health issues `ssh <_SSH_BASE_OPTS> <host> true` (task 2362: keepalive flags included)
+        from orchestrator.verify_runner import _SSH_BASE_OPTS
         assert fake_run.calls == [
-            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'laptop.local', 'true']
+            ['ssh', *_SSH_BASE_OPTS, 'laptop.local', 'true']
         ]
 
     async def test_health_false_when_ssh_rc_nonzero(self):
@@ -3909,6 +3910,97 @@ class TestRemoteRunnerCancelVerify:
         )
         result = await runner.probe_clean()
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# task-2362: ssh ServerAliveInterval/ServerAliveCountMax keepalive hardening
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerSshKeepalive:
+    """All four ssh argv sites (health, run_merge_verify, cancel_verify,
+    probe_clean) must carry the ServerAlive keepalive options, and must stay
+    identical across sites (shared const, task 2362 / incident 5111)."""
+
+    def _make_runner(self, expected_result):
+        calls = []
+
+        async def fake_run(argv, *, cwd=None):
+            calls.append(argv[:])
+            if argv[0] == 'git':
+                return (0, '', '')
+            if argv[0] == 'ssh':
+                if 'pgrep' in argv[-1]:
+                    return (1, '', '')
+                if 'cancel-verify' in argv[-1]:
+                    return (0, '', '')
+                # ssh dispatch / health probe
+                return (0, result_to_json(expected_result), '')
+            return (0, '', '')
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'fixed-id',
+        )
+        return runner, calls
+
+    async def test_all_four_sites_carry_keepalive_flags(self):
+        from orchestrator.verify_runner import SSH_SERVER_ALIVE_COUNT_MAX, SSH_SERVER_ALIVE_INTERVAL
+
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner(expected)
+
+        # Site 1: health()
+        await runner.health()
+        # Site 2: run_merge_verify() dispatch
+        await runner.run_merge_verify('abc123', _make_spec())
+        # Site 3: cancel_verify()
+        runner._inflight_request_id = 'req-42'
+        await runner.cancel_verify()
+        # Site 4: probe_clean()
+        await runner.probe_clean()
+
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
+        assert len(ssh_calls) == 4
+
+        alive_interval_opt = f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}'
+        alive_count_opt = f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}'
+        for argv in ssh_calls:
+            assert alive_interval_opt in argv, argv
+            assert alive_count_opt in argv, argv
+            # ConnectTimeout is still present (bounds initial connect; unrelated
+            # to the mid-session-stall gap keepalive closes).
+            assert 'ConnectTimeout=10' in argv, argv
+            assert 'BatchMode=yes' in argv, argv
+
+    async def test_ssh_option_prefix_identical_across_all_four_sites(self):
+        """Regression: the shared _SSH_BASE_OPTS const keeps the option block
+        byte-identical across sites so they cannot drift apart."""
+        from orchestrator.verify_runner import _SSH_BASE_OPTS
+
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+        runner, calls = self._make_runner(expected)
+
+        await runner.health()
+        await runner.run_merge_verify('abc123', _make_spec())
+        runner._inflight_request_id = 'req-42'
+        await runner.cancel_verify()
+        await runner.probe_clean()
+
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
+        assert len(ssh_calls) == 4
+
+        expected_prefix = ['ssh', *_SSH_BASE_OPTS]
+        for argv in ssh_calls:
+            # Every site's argv starts with 'ssh' + the shared option block,
+            # followed by <host> <remote_cmd_or_literal>.
+            assert argv[:len(expected_prefix)] == expected_prefix, argv
+            assert argv[len(expected_prefix)] == 'laptop.local'
 
 
 # ---------------------------------------------------------------------------
