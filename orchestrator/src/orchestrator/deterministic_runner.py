@@ -95,6 +95,33 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      BLOCKED instead of silently stranding the task with an empty queue.
    - If ``always_escalates=True``: fall through to gate (act-then-ask).
 
+   Phase γ **predicate** sub-path (``before_done['kind'] == 'predicate'``):
+   - A read-only exit-code VERDICT check — NOT a deploy.  Dispatched at the
+     very top of section 2, above the deploy-only ``target_unit``/I1/baseline
+     machinery, so a predicate NEVER touches systemd (no ``unit_inspector``,
+     no fresh-PID verify) and NEVER stamps ``before_done_ran_at`` (re-running
+     a read-only check on crash-resume is harmless — there is no I1 side
+     effect to double-apply).
+   - Runs the check script under the same outer wall-clock guard pattern as
+     the deploy path (``script_runner``/``_default_run_script`` +
+     ``asyncio.wait_for(timeout_secs + run_timeout_grace_secs)``).
+   - ``rc == 0`` (invariant holds): set task ``done`` with
+     ``done_provenance.kind='deterministic-milestone'`` (never
+     ``'deterministic-deploy'`` — no deploy happened).
+   - ``rc != 0`` (invariant violated — a VERDICT, not an infra fault): file a
+     born-at-L2 ``milestone_check_failed`` escalation, stamp
+     ``gate_escalated_at`` (reusing the gate resume machinery so a human
+     resolving the escalation on the next dispatch routes through section 1's
+     quiescence/resolve-to-done fork), and block.
+   - Timeout or an unexpected ``run_fn`` error (no verdict was produced — an
+     infra fault, not a check failure): file born-at-L2 ``infra_issue`` (the
+     existing timeout→escalate path) and block — NO ``gate_escalated_at``
+     stamp, so the check is simply re-attempted on the next dispatch.
+   - Section-1 resume: when ``gate_escalated_at`` is set and the
+     ``milestone_check_failed`` escalation is resolved, drives to ``done``
+     with ``deterministic-milestone`` provenance — short-circuiting BEFORE
+     the ``before_done_ran_at`` proof-check (a predicate never stamps it).
+
 3. **Pure gate** (``before_done=None``, ``always_escalates=True``):
    - File one born-at-L2 escalation (I3: in-process submit, sentinel role
      ``orchestrator-deterministic`` keeps level=2 past the server downgrade gate).
@@ -833,6 +860,60 @@ class DeterministicRunner:
 
         return WorkflowOutcome.BLOCKED
 
+    async def _run_predicate(
+        self, task_id: str, before_done: dict, description: str,
+    ) -> WorkflowOutcome:
+        """Run a read-only predicate check and map its exit code to a verdict (γ-predicate).
+
+        Unlike the ``before_done`` deploy path, a predicate is a READ-ONLY
+        exit-code verdict check — NOT a systemd deploy.  There is no unit to
+        inspect, no baseline/fresh-PID verify, and no ``before_done_ran_at``
+        I1 stamp (re-running a read-only check on crash-resume is harmless;
+        see the module docstring's γ-predicate subsection).
+
+        Maps the outcome:
+        - ``rc == 0`` -> ``WorkflowOutcome.DONE``, with
+          ``done_provenance.kind='deterministic-milestone'``.
+        - ``rc != 0`` -> a milestone VERDICT failure: born-at-L2
+          ``milestone_check_failed`` escalation + ``gate_escalated_at`` stamp
+          + blocked (routes through section-1's resume/quiescence machinery
+          on the next dispatch).
+        - Timeout / unexpected error -> an INFRA fault (no verdict was
+          produced): born-at-L2 ``infra_issue`` escalation + blocked
+          (re-attempted on the next dispatch, no ``gate_escalated_at`` stamp).
+
+        Returns:
+            WorkflowOutcome.DONE or WorkflowOutcome.BLOCKED.
+        """
+        run_fn = self._script_runner or self._default_run_script
+        outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
+
+        async def _invoke_run_fn():
+            # See run()'s identical inner wrapper: translate a seam-internal
+            # TimeoutError into a distinct exception type here so `except
+            # TimeoutError` below can only ever mean "the outer wall-clock
+            # guard itself fired" — never a misattributed application error.
+            try:
+                return await run_fn(before_done)
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f'run_fn raised TimeoutError internally (not the '
+                    f'outer guard): {exc!r}'
+                ) from exc
+
+        rc, out = await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)
+
+        logger.info(
+            'DeterministicRunner: task %s predicate check passed (rc=0) — setting done',
+            task_id,
+        )
+        await self.scheduler.set_task_status(
+            task_id,
+            'done',
+            done_provenance=_build_done_provenance('deterministic-milestone', note=out),
+        )
+        return WorkflowOutcome.DONE
+
     # ------------------------------------------------------------------
     # Main runner
     # ------------------------------------------------------------------
@@ -928,6 +1009,12 @@ class DeterministicRunner:
         # Cross-unit blocking deploy: stamp → baseline → run script → verify → done.
         # Self-target detection + detached systemd-run is deferred to ε.
         if before_done is not None:
+            # γ-predicate: a read-only exit-code verdict check — NOT a deploy.
+            # Dispatched FIRST, above target_unit/I1/baseline, so a predicate
+            # never touches systemd and never stamps before_done_ran_at.
+            if before_done.get('kind') == 'predicate':
+                return await self._run_predicate(task_id, before_done, description)
+
             target_unit: str = before_done.get('target_unit', '')
             before_done_ran_at = metadata.get('before_done_ran_at')
 
