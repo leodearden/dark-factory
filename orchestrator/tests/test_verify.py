@@ -4341,6 +4341,72 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         )
 
 
+class TestBuildFallbackConfigSubprojectScoped:
+    """`_build_fallback_config` scopes TEST to the task's own subproject (task 2344).
+
+    When every touched ``.py`` file lives under a single top-level directory
+    that is itself a real subproject (its own ``pyproject.toml`` in
+    *worktree*), the TEST command must be derived from that subproject alone
+    — NOT ``config.test_command``'s fleet-wide chain verbatim, which would
+    drag every OTHER fleet subproject's suite (and its unrelated red-main
+    state) into this task's verify.  Regression guard for esc-2293-13 (task
+    2293/cockpit was green in isolation but false-blocked by the fleet-wide
+    fallback picking up unrelated fused-memory failures).
+    """
+
+    #: The real dark_factory root-level fleet chain (orchestrator/config.yaml).
+    _FLEET_TEST_COMMAND = (
+        'cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ '
+        '&& cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ '
+        '&& cd ../dashboard && uv run pytest tests/'
+    )
+    _FLEET_LINT_COMMAND = 'uv run ruff check shared escalation fused-memory orchestrator dashboard'
+
+    def _make_config(self, tmp_path: Path, **kwargs) -> OrchestratorConfig:
+        kwargs.setdefault('test_command', self._FLEET_TEST_COMMAND)
+        kwargs.setdefault('lint_command', self._FLEET_LINT_COMMAND)
+        return OrchestratorConfig(project_root=tmp_path, **kwargs)
+
+    def _make_cockpit_worktree(self, tmp_path: Path) -> Path:
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+        return tmp_path
+
+    def test_test_command_scoped_to_cockpit_not_fleet(self, tmp_path: Path) -> None:
+        """cockpit source + test file → test_command targets only cockpit, never the fleet."""
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'cd cockpit && uv run pytest tests/test_c3.py'
+        # False-block guard: no OTHER fleet subproject may appear in the scoped command.
+        assert 'shared' not in result.test_command
+        assert 'fused-memory' not in result.test_command
+        assert 'escalation' not in result.test_command
+        assert 'dashboard' not in result.test_command
+        # Lint scoping is unaffected — still the existing file-scoped behavior.
+        assert result.lint_command is not None
+        assert 'cockpit/src/cockpit/c3.py' in result.lint_command
+        assert 'cockpit/tests/test_c3.py' in result.lint_command
+
+    def test_source_only_change_yields_no_test_command(self, tmp_path: Path) -> None:
+        """A cockpit source-only diff (no test files touched) → test_command is None."""
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command is None
+
+
 class TestBuildFallbackConfigDataModule:
     """``_build_fallback_config`` must not pass non-test data modules to pytest.
 
