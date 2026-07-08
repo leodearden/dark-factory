@@ -122,3 +122,43 @@ def test_legacy_blob_roundtrip_preserves_unknown_keys_and_upgrades_memory_hints(
     unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
     assert 'legacy_only_key' in unknown_key_fields
     assert 'x_private' not in unknown_key_fields
+
+
+# ── Row 2 — consumer/write, I2: all four kinds accepted ──────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'kind,fields',
+    [
+        ('merged', {'commit': 'abc123'}),
+        ('found_on_main', {'commit': 'abc123', 'note': 'found it'}),
+        ('deterministic-deploy', {'pid': 4242, 'unit': 'fused-memory.service'}),
+        ('deterministic-deploy-scheduled', {'unit': 'fused-memory.service'}),
+    ],
+)
+async def test_orchestrator_done_provenance_all_kinds_accepted_by_backend(
+    make_backend, tmp_path, kind, fields,
+):
+    """Every kind the orchestrator can construct is accepted by the validator.
+
+    Builds ``done_provenance`` via the REAL orchestrator seam
+    (``_build_done_provenance`` — task 2167 W3-δ SEAM B) for each of the four
+    ``DoneProvenance.kind`` values, then writes it through an enforce-mode
+    backend. I2: the orchestrator and fused-memory share ONE valid-kinds
+    enum, so nothing the producer can legitimately build is ever rejected by
+    the consumer (structurally prevents the 1902/1976/1982 class of bug).
+    """
+    backend = await make_backend(enforce=True)
+    project_root = str(tmp_path / 'proj')
+
+    built = _build_done_provenance(kind, **fields)
+
+    dto = await backend.add_task(project_root=project_root, title='t')
+    await backend.update_task(
+        dto['id'], project_root=project_root,
+        metadata=json.dumps({'done_provenance': built}),
+    )
+
+    task = await backend.get_task(dto['id'], project_root=project_root)
+    assert task['metadata']['done_provenance']['kind'] == kind
