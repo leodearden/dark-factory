@@ -162,6 +162,11 @@ class TestDoneProvenance:
     def test_deterministic_deploy_scheduled_ok_without_commit_or_note(self):
         DoneProvenance(kind='deterministic-deploy-scheduled')
 
+    def test_deterministic_gate_ok_without_commit_or_note(self):
+        dp = DoneProvenance(kind='deterministic-gate', note='pure gate resolved')
+        assert dp.kind == 'deterministic-gate'
+        assert dp.note == 'pure gate resolved'
+
 
 class TestMemoryHints:
     def test_constructs_with_values(self):
