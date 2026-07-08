@@ -954,7 +954,14 @@ async def invoke_with_cap_retry(
                         # attributed must be captured BEFORE slot.report(): report()
                         # bumps the account's generation, which would make the lease
                         # read as stale even for the very account it just mutated.
-                        attributed = usage_gate.lease_is_current(slot.lease)
+                        # slot.lease is None when the token was never resolved to an
+                        # account (mirrors InvokeSlot.report()'s own guard at the
+                        # lease_is_current call site) — treat that as unattributed
+                        # rather than passing None into lease_is_current.
+                        attributed = (
+                            slot.lease is not None
+                            and usage_gate.lease_is_current(slot.lease)
+                        )
                         synthetic = CapHit(
                             resets_at=None,
                             reason=f'Heuristic cap: zero-cost instant exit — {result.output[:120]}',
