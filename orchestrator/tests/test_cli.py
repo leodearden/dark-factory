@@ -1782,3 +1782,131 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
         if child.poll() is None:
             child.kill()
             child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 2308 step-11 — verify-merge watchdog wiring: start_stdin_watchdog spawn
+# ---------------------------------------------------------------------------
+
+
+def test_verify_merge_spawns_watchdog_when_request_id_set(tmp_path, monkeypatch):
+    """--request-id set: verify-merge spawns the stdin watchdog with the pgid.
+
+    Mirrors task 1732's pgid-lifecycle scaffolding (mocked GitOps/config/
+    verify_runner helpers, no real git/build work). Spies on
+    start_own_process_group (known pgid) and monkeypatches
+    orchestrator.cli.start_stdin_watchdog to a recorder. Asserts the
+    recorder is called exactly once with the SAME pgid written to the
+    pgid file.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    FAKE_PGID = 55555
+    FAKE_REQUEST_ID = 'test-req-2308'
+    known_json = '{"passed": true, "results": []}'
+
+    fake_worktree_base = tmp_path / '.worktrees'
+
+    # --- Mock GitOps ---
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = fake_worktree_base
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    # --- Mock config ---
+    from orchestrator.config import OrchestratorConfig
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # --- Spy on start_own_process_group (known pgid) ---
+    monkeypatch.setattr(cli_module, 'start_own_process_group', lambda: FAKE_PGID)
+
+    # --- Recorder for start_stdin_watchdog ---
+    watchdog_calls = []
+
+    def fake_start_stdin_watchdog(pgid, *args, **kwargs):
+        watchdog_calls.append(pgid)
+        return MagicMock()
+
+    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
+
+    # --- Mock verify_runner helpers ---
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.run_merge_verify_on_worktree',
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+        '--request-id', FAKE_REQUEST_ID,
+    ])
+
+    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+    assert watchdog_calls == [FAKE_PGID], (
+        f'start_stdin_watchdog must be called exactly once with pgid={FAKE_PGID}; '
+        f'got {watchdog_calls!r}'
+    )
+
+
+def test_verify_merge_no_watchdog_when_request_id_absent(tmp_path, monkeypatch):
+    """Without --request-id, start_stdin_watchdog is NOT spawned (back-compat)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    # --- Mock GitOps ---
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    # --- Mock config ---
+    from orchestrator.config import OrchestratorConfig
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+
+    # --- Recorder for start_stdin_watchdog ---
+    watchdog_calls = []
+
+    def fake_start_stdin_watchdog(pgid, *args, **kwargs):
+        watchdog_calls.append(pgid)
+        return MagicMock()
+
+    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
+
+    # --- Mock verify_runner helpers ---
+    known_json = '{"passed": false, "results": []}'
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.run_merge_verify_on_worktree',
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+    ])
+
+    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+    assert watchdog_calls == [], (
+        f'start_stdin_watchdog must NOT be called without --request-id; got {watchdog_calls!r}'
+    )
