@@ -3,7 +3,7 @@
 
 import asyncio
 import time
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -6487,6 +6487,131 @@ class TestDeferredWatchDispatchGate:
             f'2217 (it never enters the candidate pool, so it must file no '
             f'dispatch/lock/starvation event); got: {events_for_deferred_task}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Milestone time-gate (task 2335 β — docs/prds/milestone-tasks.md §6.2)
+# ---------------------------------------------------------------------------
+
+class TestMilestoneTimeGate:
+    """Unit tests for the pure predicate Scheduler._milestone_time_gated.
+
+    Mirrors TestDeferredWatchDispatchGate: _milestone_time_gated takes
+    now_wall as an explicit argument, so these tests pass datetime values
+    directly — no clock injection is needed to exercise the predicate.
+    """
+
+    def _task_with(self, metadata: dict) -> dict:
+        return {
+            'id': '3001',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': metadata,
+        }
+
+    def test_no_milestone_is_not_gated(self):
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        task = self._task_with({'files': ['backend']})
+
+        assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is False
+
+    def test_dated_withheld_before_at_and_released_at_or_after(self):
+        """B1: withhold while now_wall < at; release once now_wall >= at."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        at = datetime(2026, 8, 1, tzinfo=UTC)
+        task = self._task_with(
+            {'milestone': {'mode': 'dated', 'at': at.isoformat()}}
+        )
+
+        assert scheduler._milestone_time_gated(task, at - timedelta(seconds=1)) is True
+        assert scheduler._milestone_time_gated(task, at) is False
+        assert scheduler._milestone_time_gated(task, at + timedelta(seconds=1)) is False
+
+    def test_delayed_without_anchor_is_withheld(self):
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        task = self._task_with(
+            {'milestone': {'mode': 'delayed', 'after_secs': 604800}}
+        )
+
+        assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+    def test_delayed_timer_from_anchor(self):
+        """B3: withheld while now_wall < anchor+after_secs; released at/after."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        anchor = datetime(2026, 7, 25, 9, 14, 3, tzinfo=UTC)
+        after_secs = 604800
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+            'milestone_deps_satisfied_at': anchor.isoformat(),
+        })
+        fire_at = anchor + timedelta(seconds=after_secs)
+
+        assert scheduler._milestone_time_gated(task, fire_at - timedelta(seconds=1)) is True
+        assert scheduler._milestone_time_gated(task, fire_at) is False
+
+    def test_restart_survival_fresh_scheduler_gates_identically(self):
+        """B6: a FRESH Scheduler (no prior in-memory state) evaluating the same
+        persisted-anchor task dict gates identically — the predicate carries no
+        state of its own; only the passed-in task dict and now_wall matter."""
+        anchor = datetime(2026, 7, 25, 9, 14, 3, tzinfo=UTC)
+        after_secs = 604800
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+            'milestone_deps_satisfied_at': anchor.isoformat(),
+        })
+        fire_at = anchor + timedelta(seconds=after_secs)
+
+        pre_restart = Scheduler(OrchestratorConfig(max_per_module=1))
+        assert pre_restart._milestone_time_gated(
+            task, fire_at - timedelta(seconds=1)
+        ) is True
+
+        # Simulate a process restart: a brand-new Scheduler instance, never
+        # having seen this task before, evaluating the SAME persisted dict.
+        fresh_scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        assert fresh_scheduler._milestone_time_gated(task, fire_at) is False
+
+    @pytest.mark.parametrize('milestone,description', [
+        ('not-a-dict', 'non-dict milestone'),
+        ({'mode': 'unknown-mode'}, 'unknown mode'),
+        ({'mode': 'dated', 'at': 'not-a-timestamp'}, 'unparseable at'),
+        ({'mode': 'delayed', 'after_secs': 'a-week'}, 'non-int after_secs'),
+    ])
+    def test_malformed_milestone_fails_safe_withheld(self, milestone, description):
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        metadata: dict = {'milestone': milestone}
+        if isinstance(milestone, dict) and milestone.get('mode') == 'delayed':
+            # Give it a valid-looking anchor so the malformed after_secs check
+            # itself is under test, not the "anchor unset" branch.
+            metadata['milestone_deps_satisfied_at'] = datetime.now(UTC).isoformat()
+        task = self._task_with(metadata)
+
+        assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True, (
+            f'Expected fail-safe withhold for {description}: {milestone!r}'
+        )
+
+    def test_tz_naive_at_is_treated_as_utc_not_permanent_withhold(self):
+        """A tz-naive `at` (the α Milestone model only requires
+        fromisoformat-parseable, not tz-aware) must be normalized to UTC and
+        eventually release the gate — not crash, and not withhold forever."""
+        config = OrchestratorConfig(max_per_module=1)
+        scheduler = Scheduler(config)
+        naive_at = datetime(2026, 8, 1)  # no tzinfo
+        task = self._task_with(
+            {'milestone': {'mode': 'dated', 'at': naive_at.isoformat()}}
+        )
+
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 1, tzinfo=UTC)
+        ) is True
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 9, 1, tzinfo=UTC)
+        ) is False
 
 
 # ---------------------------------------------------------------------------
