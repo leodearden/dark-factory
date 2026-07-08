@@ -243,20 +243,36 @@ def extract_batch_plan_task_ids(text: str) -> set[int]:
 # without an actual contradiction; the impact is bounded — a rejected recon
 # write is simply rephrased and retried, the same tolerance documented for the
 # sibling detectors in this module.
+#
+# NOTE (amendment, reviewer_comprehensive precision finding): a few candidate
+# markers are generic enough on their own to co-occur with a task id and the
+# OTHER marker class in the same clause without describing that task's status
+# at all, e.g. "Task 4802 landed and the tests still pass." (bare 'still' has
+# nothing to do with task 4802's status). 'still' and 'actively' are tightened
+# below to require a following status-bearing word so they only fire on actual
+# status phrases ("still pending", "actively being worked"). Bare
+# 'closed'/'resolved'/'finished' are dropped from TERMINAL_OUTCOME_RE entirely
+# rather than tightened — they describe non-task things just as often (an
+# office closed, a disagreement resolved, a meeting finished) and there is no
+# cheap phrase-level qualifier that reliably disambiguates; the resulting
+# recall loss is acceptable under the fail-open-on-under-firing philosophy
+# documented above.
 TASK_REF_RE: re.Pattern[str] = re.compile(
     r'(?:\btask\b|\bdf\b|#)\s*#?\s*(\d+)\b',
     re.IGNORECASE,
 )
 
 NON_TERMINAL_STATUS_RE: re.Pattern[str] = re.compile(
-    r'\b(?:pending|in[-\s]progress|still|actively|being\s+worked|awaiting|not\s+yet|'
-    r'unmerged|outstanding|wip)\b',
+    r'\b(?:pending|in[-\s]progress|'
+    r'still\s+(?:pending|open|outstanding|unresolved|active|ongoing)|'
+    r'actively\s+(?:being\s+worked|working|in[-\s]progress)|'
+    r'(?:still|remains?|left)\s+outstanding|'
+    r'being\s+worked|awaiting|not\s+yet|unmerged|wip)\b',
     re.IGNORECASE,
 )
 
 TERMINAL_OUTCOME_RE: re.Pattern[str] = re.compile(
-    r'\b(?:merged|landed|merge\s+commit|done|cancell?ed|completed|shipped|closed|'
-    r'resolved|finished)\b',
+    r'\b(?:merged|landed|merge\s+commit|done|cancell?ed|completed|shipped)\b',
     re.IGNORECASE,
 )
 
@@ -266,7 +282,7 @@ TERMINAL_OUTCOME_RE: re.Pattern[str] = re.compile(
 # so a task described only as "not yet merged" isn't mis-tagged terminal.
 NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
     r"\b(?:not|never|hasn't|has\s+not|yet\s+to\s+be)\s+(?:yet\s+|been\s+)*"
-    r'(?:merged|landed|done|cancell?ed|completed|shipped|closed|resolved|finished)\b',
+    r'(?:merged|landed|done|cancell?ed|completed|shipped)\b',
     re.IGNORECASE,
 )
 

@@ -702,6 +702,14 @@ def create_mcp_server(
     _VALID_TASK_STATUSES = ACTIVE_TASK_STATUSES | TERMINAL_STATUSES
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)
+    # Remediation hint returned alongside conflicting_task_status_framing_write_blocked
+    # (task 2276 amendment) so a blocked recon-stage agent can self-correct instead of
+    # guessing why an accurate before/after summary was rejected.
+    _CONFLICTING_TASK_STATUS_HINT = (
+        'split the before/after narration into two separate writes with distinct '
+        'valid_at timestamps instead of one write describing both the prior and '
+        'resulting task status'
+    )
 
     @mcp.tool()
     async def add_episode(
@@ -789,18 +797,17 @@ def create_mcp_server(
                 'agent_id': agent_id,
                 'content_excerpt': content[:200],
             }
-        if (
-            isinstance(agent_id, str)
-            and agent_id.startswith('recon-stage-')
-            and is_conflicting_task_status_framing(content)
-        ):
-            return {
-                'error': 'conflicting_task_status_framing_write_blocked',
-                'error_type': 'ReconConflictingTaskStatusWriteRejected',
-                'agent_id': agent_id,
-                'content_excerpt': content[:200],
-                'conflicting_task_ids': sorted(find_conflicting_task_status_ids(content)),
-            }
+        if isinstance(agent_id, str) and agent_id.startswith('recon-stage-'):
+            conflicting_task_ids = find_conflicting_task_status_ids(content)
+            if conflicting_task_ids:
+                return {
+                    'error': 'conflicting_task_status_framing_write_blocked',
+                    'error_type': 'ReconConflictingTaskStatusWriteRejected',
+                    'agent_id': agent_id,
+                    'content_excerpt': content[:200],
+                    'conflicting_task_ids': sorted(conflicting_task_ids),
+                    'hint': _CONFLICTING_TASK_STATUS_HINT,
+                }
         try:
             causation_id, op_source, _ = _extract_causation(metadata, agent_id)
             result = await memory_service.add_episode(
@@ -893,15 +900,17 @@ def create_mcp_server(
             category == 'temporal_facts'
             and isinstance(agent_id, str)
             and agent_id.startswith('recon-stage-')
-            and is_conflicting_task_status_framing(content)
         ):
-            return {
-                'error': 'conflicting_task_status_framing_write_blocked',
-                'error_type': 'ReconConflictingTaskStatusWriteRejected',
-                'agent_id': agent_id,
-                'content_excerpt': content[:200],
-                'conflicting_task_ids': sorted(find_conflicting_task_status_ids(content)),
-            }
+            conflicting_task_ids = find_conflicting_task_status_ids(content)
+            if conflicting_task_ids:
+                return {
+                    'error': 'conflicting_task_status_framing_write_blocked',
+                    'error_type': 'ReconConflictingTaskStatusWriteRejected',
+                    'agent_id': agent_id,
+                    'content_excerpt': content[:200],
+                    'conflicting_task_ids': sorted(conflicting_task_ids),
+                    'hint': _CONFLICTING_TASK_STATUS_HINT,
+                }
         try:
             causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
             result = await memory_service.add_memory(
