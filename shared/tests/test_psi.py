@@ -163,6 +163,31 @@ class TestPsiSampleSaturated:
         )
         assert sample.saturated(_saturation_cfg()) is False
 
+    def test_read_ok_false_gates_saturation_even_with_high_metrics(self):
+        """The read_ok guard -- not the metric values -- must suppress
+        saturation. Every other fail-open assertion in this suite uses the
+        all-zero sentinel, which would read as not-saturated even if the
+        read_ok guard were accidentally removed; this test pegs every metric
+        at 99.0 against an all-zero-threshold (maximally saturating) cfg, so
+        only the read_ok gate itself can explain a False result.
+        """
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=99.0,
+            mem_some10=99.0,
+            mem_full10=99.0,
+            io_some10=99.0,
+            read_ok=False,
+        )
+        zero_threshold_cfg = types.SimpleNamespace(
+            cpu_some_avg10=0.0,
+            mem_some_avg10=0.0,
+            mem_full_avg10=0.0,
+            io_some_avg10=0.0,
+        )
+        assert sample.saturated(zero_threshold_cfg) is False
+
 
 class TestReadPsiSampleHappyPath:
     def _fake_read(self):
