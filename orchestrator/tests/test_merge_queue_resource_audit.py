@@ -17,10 +17,23 @@ Steps covered:
 
 Both audits (speculation_accounting_violations, worktree_ledger_violations)
 and _check_resource_audit/_maybe_log_queue_heartbeat are pure/synchronous —
-no ``await`` is needed anywhere in this module, so every test here is a
-plain ``def test_...`` (never ``async def`` / ``@pytest.mark.asyncio``; this
-suite's pyproject.toml turns a sync-def-inside-an-asyncio-marked-class into a
-collection ERROR, so mixing would break collection).
+no ``await`` is needed to exercise them directly, so most tests here are
+plain ``def test_...``. The exception is the ledger-based census tests in
+TestRedispatchSpeculativeAccounting / TestFinalizeHeadSpeculativeAccounting /
+TestDispatchGapSpeculativeAccounting (task 2160/η): they acquire real
+permits via ``await worker._speculation_ledger.acquire()``, so those are
+``async def test_...``, each decorated individually with
+``@pytest.mark.asyncio`` (this project's pyproject.toml does NOT set
+``asyncio_mode = "auto"``, so pytest-asyncio's default "strict" mode
+applies here — every coroutine test needs an explicit marker; mirrors the
+per-function-marker convention in test_merge_speculation_controller.py /
+test_merge_queue_permit_conservation.py). The marker is applied PER TEST,
+never at class or module level: this suite's pyproject.toml turns a sync
+``def test_...`` collected under an ``@pytest.mark.asyncio`` mark into a
+collection-time ERROR (filterwarnings escalates pytest-asyncio's mismatch
+warning) — exactly what a class-level marker would do to the sync
+``test_nonspeculative_*``/``test_detector_not_blinded_*`` methods that share
+these same classes.
 
 This module reuses the bare-worker git_repo/git_config/git_ops fixtures and
 _FakeEscalationQueue from test_merge_queue_request_liveness.py (per-file
@@ -196,19 +209,30 @@ class TestSpeculationAccountingViolations:
 
 
 # ---------------------------------------------------------------------------
-# task 2063: _redispatch-parked speculative permit accounting
+# task 2063 / task 2096 / task 2160 (η): speculative-permit accounting
 #
-# _inflight_speculative_count() is the single source of truth feeding both
-# snapshot()['speculation']['inflight_speculative'] and
-# speculation_accounting_violations(). Before the fix it scanned only
-# self._inflight (was_speculative) and self._verifier_queue (.speculative),
-# missing a speculative item parked on self._redispatch while it waits for a
-# free verify host (DISPATCH-FILL / blocking-get paths in _verifier_loop when
-# _dispatch_item returns None because verify hosts < speculation_depth). That
-# gap produced the observed multi-heartbeat, self-clearing skew:
-# 'slot_available(0) + held_by_merger(0) + inflight_speculative(1) == 1,
-# expected depth=2' — one speculative permit countable in _verifier_queue,
-# one uncounted on _redispatch.
+# _inflight_speculative_count() used to be the single source of truth
+# feeding both snapshot()['speculation']['inflight_speculative'] and
+# speculation_accounting_violations() by scanning FIVE separate worker-
+# internal locations (self._inflight, self._verifier_queue,
+# self._redispatch, self._finalizing_head, self._dispatching_item) — task
+# 2063 closed the _redispatch gap, task 2096 closed the _finalizing_head and
+# _dispatching_item gaps (each an under-count window that produced a
+# spurious 'speculation-slot conservation violated' finding).
+#
+# Task 2160 (η) threads the SpecPermit token itself onto the pipeline item
+# (RealMergeItem/DecidedItem/InflightEntry.permit) and routes every release
+# through the shared PermitLedger. Conservation is now enforced
+# structurally: WHERE an item sits no longer matters, only whether its
+# permit is still registered in ``ledger.live``. The three classes below are
+# kept separate (rather than merged into one) to preserve the historical
+# per-gap narrative, but their "counted" tests now pin the replacement
+# ledger-only invariant directly — deliberately WITHOUT placing the
+# permit-carrying item into any of the five old census locations, since a
+# permit acquired through the ledger must be counted regardless of
+# location. Their "not counted" tests are unchanged: an item/entry with no
+# permit must never be counted, in the old census locations or anywhere
+# else.
 # ---------------------------------------------------------------------------
 
 
@@ -238,60 +262,44 @@ def _make_spec_item(tmp_path: Path, *, speculative: bool):
 
 
 class TestRedispatchSpeculativeAccounting:
-    """Unit tests for the task-2063 _redispatch under-count fix.
+    """Ledger-based accounting for a speculative item's permit.
 
-    RED pre-fix: a speculative item parked on _redispatch is invisible to
-    _inflight_speculative_count(), so the count comes up one short and
-    speculation_accounting_violations() reports a spurious conservation
-    violation. GREEN post-fix: the count includes it and the identity holds.
+    Task 2063 originally closed the _redispatch-parked gap in the location-
+    scanning census this class exercised; task 2160/η deletes that scan
+    entirely, so this now pins the replacement ledger-only invariant: a
+    permit acquired through the ledger is counted no matter where its item
+    sits (including nowhere at all, i.e. off every worker-internal deque).
+
+    RED (pre-η GREEN): _inflight_speculative_count() still scans only the
+    five old locations, so a permit that lives solely in
+    ``worker._speculation_ledger.live`` reads as 0 — see step-6 GREEN.
     """
 
-    def test_speculative_item_parked_on_redispatch_is_counted(
+    @pytest.mark.asyncio
+    async def test_speculative_items_are_counted_via_the_ledger_alone(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
-        # Drain both speculation permits: slot_available=0, held_by_merger=0
-        # on a bare worker (nothing else touches the semaphore).
-        worker._speculation_slot._value = 0
-
-        # One speculative permit is countable via the existing
-        # _verifier_queue scan...
-        worker._verifier_queue.put_nowait(_make_spec_item(tmp_path, speculative=True))
-        # ...and one is parked on _redispatch awaiting a free host — the gap
-        # this task closes.
-        worker._redispatch.append(_make_spec_item(tmp_path, speculative=True))
+        # Acquire both permits THROUGH the ledger (no raw semaphore poking)
+        # and attach each token to its item. Deliberately NOT placed on
+        # worker._verifier_queue/_redispatch/etc — post-η the count must not
+        # depend on structural location, only on ledger membership.
+        item_a = _make_spec_item(tmp_path, speculative=True)
+        item_a.permit = await worker._speculation_ledger.acquire()
+        item_b = _make_spec_item(tmp_path, speculative=True)
+        item_b.permit = await worker._speculation_ledger.acquire()
 
         assert worker._inflight_speculative_count() == 2
         assert worker.speculation_accounting_violations() == []
         assert worker.snapshot()['resource_audit']['speculation_accounting'] == []
         # Pin the OTHER consumer of _inflight_speculative_count() too: the
-        # snapshot's 'speculation' key documents (merge_queue.py ~5534-5541)
-        # that inflight_speculative includes _redispatch items, so assert it
-        # directly rather than only exercising it transitively via the
-        # resource_audit key above.
+        # snapshot's 'speculation' key reads the same ledger-derived count,
+        # so assert it directly rather than only exercising it transitively
+        # via the resource_audit key above.
         assert worker.snapshot()['speculation']['inflight_speculative'] == 2
-
-    def test_redispatch_undercount_produces_the_observed_violation_message(
-        self, git_ops: GitOps, tmp_path: Path,
-    ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
-
-        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
-
-        # Same drain, but ONLY the verifier-queue item is present: a genuine
-        # 1-permit-vs-2-drained imbalance that holds both pre- and post-fix —
-        # pins the identity/message semantics of the exact skew being closed.
-        worker._speculation_slot._value = 0
-        worker._verifier_queue.put_nowait(_make_spec_item(tmp_path, speculative=True))
-
-        violations = worker.speculation_accounting_violations()
-
-        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
-        assert 'speculation-slot conservation violated' in violations[0]
-        assert 'expected depth=2' in violations[0]
 
     def test_nonspeculative_redispatch_item_not_counted(
         self, git_ops: GitOps, tmp_path: Path,
@@ -301,9 +309,10 @@ class TestRedispatchSpeculativeAccounting:
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
         # A cascade-remerged item parked on _redispatch is non-speculative
-        # (_remerge returns speculative=False; its slot was already released
-        # before remerge) and must never be counted — else the fix would
-        # over-count and could mask a genuine imbalance.
+        # (_remerge returns speculative=False; its permit was already
+        # released before remerge, so .permit is None too) and must never be
+        # counted — else the ledger-only invariant would be broken and could
+        # mask a genuine imbalance.
         worker._redispatch.append(_make_spec_item(tmp_path, speculative=False))
 
         assert worker._inflight_speculative_count() == 0
@@ -311,33 +320,28 @@ class TestRedispatchSpeculativeAccounting:
 
 
 # ---------------------------------------------------------------------------
-# task 2096: _finalizing_head-held speculative permit accounting
+# task 2096: _finalizing_head-held speculative permit accounting (superseded
+# by task 2160/η — see the combined header comment above
+# TestRedispatchSpeculativeAccounting).
 #
-# _inflight_speculative_count() (post task-2063) scans self._inflight,
-# self._verifier_queue and self._redispatch, but never self._finalizing_head.
 # _finalize_inflight sets self._finalizing_head at the top of its try, awaits
 # the ENTIRE `await entry.verify_task`, and only releases the speculation
-# permit (if was_speculative) in its finally — so for the full verify
-# duration (20-60 min observed on reify) a speculative head's permit is held
-# solely by _finalizing_head, invisible to this count. That produces a
-# spurious 'speculation-slot conservation violated' finding for the whole
-# window (the dominant, longest-lived instance of this class of bug — task
-# 2063 fixed the shorter _redispatch-parked case above).
+# permit in its finally — so for the full verify duration (20-60 min
+# observed on reify) a speculative head's permit was, pre-η, held solely by
+# _finalizing_head and invisible to a location-scanning census. η replaces
+# location-scanning with the ledger, so this window is now covered
+# regardless of where the entry sits.
 # ---------------------------------------------------------------------------
 
 
 class TestFinalizeHeadSpeculativeAccounting:
-    """Unit tests for the task-2096 _finalizing_head under-count fix.
-
-    RED pre-fix: a speculative item held solely by _finalizing_head (for the
-    entire `await entry.verify_task` duration inside _finalize_inflight) is
-    invisible to _inflight_speculative_count(), so the count comes up one (or
-    more) short and speculation_accounting_violations() reports a spurious
-    conservation violation. GREEN post-fix: the count includes it and the
-    identity holds.
+    """Ledger-based accounting for a speculative permit held by a finalizing
+    head — see the combined header comment above
+    TestRedispatchSpeculativeAccounting for the task 2096 → task 2160/η
+    context.
     """
 
-    def _make_finalizing_entry(self, tmp_path: Path, *, speculative: bool):
+    def _make_finalizing_entry(self, tmp_path: Path, *, speculative: bool, permit=None):
         from orchestrator.merge_queue import InflightEntry
 
         return InflightEntry(
@@ -347,31 +351,35 @@ class TestFinalizeHeadSpeculativeAccounting:
             merge_wt=None,
             was_speculative=speculative,
             phase='finalizing',
+            permit=permit,
         )
 
-    def test_two_host_finalizing_head_plus_inflight_both_counted(
+    @pytest.mark.asyncio
+    async def test_finalizing_head_permit_is_counted_via_the_ledger_alone(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
         from orchestrator.merge_queue import InflightEntry, SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
-        # Drain both speculation permits: slot_available=0, held_by_merger=0
-        # on a bare worker (nothing else touches the semaphore).
-        worker._speculation_slot._value = 0
-
-        # One speculative permit is countable via the existing _inflight scan...
-        worker._inflight.append(InflightEntry(
+        # Acquire both permits THROUGH the ledger and attach each token to
+        # its entry. Deliberately NOT placed on worker._inflight /
+        # worker._finalizing_head — post-η the count must not depend on
+        # structural location, only on ledger membership. The entries
+        # themselves are never read again — leading underscores mark them as
+        # intentionally unused beyond triggering the ledger acquisition.
+        _inflight_entry = InflightEntry(
             item=_make_spec_item(tmp_path, speculative=True),
             lease=None,
             verify_task=None,
             merge_wt=None,
             was_speculative=True,
             phase='verifying',
-        ))
-        # ...and one is held solely by the finalize-head for the entire
-        # `await entry.verify_task` window — the gap this task closes.
-        worker._finalizing_head = self._make_finalizing_entry(tmp_path, speculative=True)
+            permit=await worker._speculation_ledger.acquire(),
+        )
+        _finalizing_entry = self._make_finalizing_entry(
+            tmp_path, speculative=True, permit=await worker._speculation_ledger.acquire(),
+        )
 
         assert worker._inflight_speculative_count() == 2
         assert worker.speculation_accounting_violations() == []
@@ -380,27 +388,12 @@ class TestFinalizeHeadSpeculativeAccounting:
         # the equivalent pin in TestRedispatchSpeculativeAccounting above).
         assert worker.snapshot()['speculation']['inflight_speculative'] == 2
 
-    def test_single_host_finalizing_head_alone_counted(
-        self, git_ops: GitOps, tmp_path: Path,
-    ) -> None:
-        from orchestrator.merge_queue import SpeculativeMergeWorker
-
-        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=1)
-
-        # Drain the single speculation permit; the finalizing head is the
-        # ONLY place a speculative item can be during its verify window.
-        worker._speculation_slot._value = 0
-        worker._finalizing_head = self._make_finalizing_entry(tmp_path, speculative=True)
-
-        assert worker._inflight_speculative_count() == 1
-        assert worker.speculation_accounting_violations() == []
-        assert worker.snapshot()['resource_audit']['speculation_accounting'] == []
-
     def test_nonspeculative_finalizing_head_not_counted(
         self, git_ops: GitOps, tmp_path: Path,
     ) -> None:
-        """A non-speculative finalizing head (the common case) contributes 0 —
-        else the fix would over-count and could mask a genuine imbalance.
+        """A non-speculative finalizing head (the common case) carries no
+        permit and contributes 0 — else the ledger-only invariant would be
+        broken and could mask a genuine imbalance.
         """
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
@@ -411,20 +404,19 @@ class TestFinalizeHeadSpeculativeAccounting:
         assert worker._inflight_speculative_count() == 0
         assert worker.speculation_accounting_violations() == []
 
-    def test_detector_not_blinded_by_widened_census(self, git_ops: GitOps) -> None:
-        """A genuinely dropped permit with an EMPTY census (no _inflight,
-        _verifier_queue, _redispatch, or _finalizing_head entry to account for
-        it) must still trip exactly one violation — the census widening in
-        this task must not mask the real leak class the audit exists to catch.
+    def test_detector_not_blinded_by_ledger_based_census(self, git_ops: GitOps) -> None:
+        """A genuinely dropped permit — the shared semaphore decremented
+        directly, bypassing the ledger entirely, with the ledger left empty —
+        must still trip exactly one violation: the ledger-only invariant must
+        not mask the real leak class the audit exists to catch.
         """
         from orchestrator.merge_queue import SpeculativeMergeWorker
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
         # Force a leak: a permit vanished from the shared semaphore without
-        # being recorded as held-by-merger, transferred to the verifier, or
-        # genuinely still available — breaks identity (a). _finalizing_head
-        # stays None (its __init__ default) — no census location covers it.
+        # being recorded as held-by-merger, acquired through the ledger, or
+        # genuinely still available — breaks identity (a).
         worker._speculation_slot._value -= 1
 
         violations = worker.speculation_accounting_violations()
