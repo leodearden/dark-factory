@@ -13151,6 +13151,59 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         )
 
 
+class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
+    """_render_live_workflow_section retains its empty-``tasks`` no-op (task
+    2150 step-3/4): the falsy-``project_root`` half of its guard is dead code
+    under a required ProjectScope and is deleted in step-4, but the
+    empty-``tasks`` half survives — this pins that surviving behavior so the
+    deletion has a characterization test to break if it regresses.
+    """
+
+    def test_empty_tasks_returns_empty_string(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        result = _render_live_workflow_section(tasks=[], project_root=ProjectRoot('/p'))
+
+        assert result == ''
+
+
+class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
+    """TaskKnowledgeSync._maybe_queue_briefing_refresh_tasks retains its
+    taskmaster-None no-op (task 2150 step-3/4): the falsy-``project_root``
+    half of its guard is dead code under a required ProjectScope and is
+    deleted in step-4, but the taskmaster-None half survives (a stage
+    legitimately runs without a task backend) — this pins that surviving
+    behavior so the deletion has a characterization test to break if it
+    regresses.
+    """
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_taskmaster_no_ops_without_invoking_briefing_script(self, mock_deps):
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.taskmaster = None
+
+        with patch(
+            'fused_memory.reconciliation.stages.task_knowledge_sync'
+            '._run_briefing_known_gaps_script',
+        ) as mock_script:
+            await stage._maybe_queue_briefing_refresh_tasks(run_id='r1')
+
+        mock_script.assert_not_called()
+
+
 class TestEnforceStage2SummaryPoolCap:
     """_enforce_stage2_summary_pool_cap trims oldest pool members to cap=2."""
 
