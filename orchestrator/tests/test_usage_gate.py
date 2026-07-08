@@ -181,6 +181,7 @@ class TestGateLifecycle:
         assert not gate.is_paused
         # before_invoke should return immediately
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.1)
+        assert token is not None
         assert token.token == 'token-a'
 
     @pytest.mark.asyncio
@@ -220,6 +221,7 @@ class TestGateLifecycle:
 
         asyncio.create_task(uncap_after_delay())
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        assert token is not None
         assert token.token == 'token-a'
 
     @pytest.mark.asyncio
@@ -268,6 +270,7 @@ class TestBeforeInvoke:
     async def test_returns_first_available_token(self):
         gate = _make_gate()
         token = await gate.before_invoke()
+        assert token is not None
         assert token.token == 'token-a'
 
     @pytest.mark.asyncio
@@ -275,6 +278,7 @@ class TestBeforeInvoke:
         gate = _make_gate()
         gate._accounts[0].capped = True
         token = await gate.before_invoke()
+        assert token is not None
         assert token.token == 'token-b'
 
     @pytest.mark.asyncio
@@ -292,6 +296,7 @@ class TestBeforeInvoke:
 
         asyncio.create_task(uncap_after_delay())
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
+        assert token is not None
         assert token.token == 'token-b'
 
     @pytest.mark.asyncio
@@ -307,6 +312,7 @@ class TestBeforeInvoke:
 
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
 
+        assert token is not None
         assert token.token == 'token-a'
         assert gate._accounts[0].capped is False
         assert gate._accounts[1].capped is True
@@ -425,14 +431,17 @@ class TestThreeAccountFailover:
         gate = _make_gate(num_accounts=3)
 
         token = await gate.before_invoke()
+        assert token is not None
         assert token.token == 'token-a'
 
         gate.detect_cap_hit("You've hit your usage limit resets in 3h", '', 'claude', 'token-a')
         token = await gate.before_invoke()
+        assert token is not None
         assert token.token == 'token-b'
 
         gate.detect_cap_hit("You've hit your usage limit resets in 3h", '', 'claude', 'token-b')
         token = await gate.before_invoke()
+        assert token is not None
         assert token.token == 'token-c'
 
     @pytest.mark.asyncio
@@ -441,6 +450,7 @@ class TestThreeAccountFailover:
         gate._accounts[0].capped = True
         gate._accounts[1].capped = True
         token = await gate.before_invoke()
+        assert token is not None
         assert token.token == 'token-c'
 
 
@@ -571,6 +581,7 @@ class TestRefreshCappedAccounts:
 
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
 
+        assert token is not None
         assert token.token == 'token-b'
         assert gate._accounts[1].capped is False
 
@@ -683,6 +694,7 @@ class TestCapRetryRotation:
         gate = _make_gate(num_accounts=3)
 
         token1 = await gate.before_invoke()
+        assert token1 is not None
         assert token1.token == 'token-a'
 
         gate.detect_cap_hit("You've hit your limit · resets 5pm",
@@ -691,6 +703,7 @@ class TestCapRetryRotation:
         assert gate._open.is_set()
 
         token2 = await gate.before_invoke()
+        assert token2 is not None
         assert token2.token == 'token-b'
 
         gate.detect_cap_hit("You've hit your limit · resets 6am",
@@ -699,6 +712,7 @@ class TestCapRetryRotation:
         assert gate._open.is_set()
 
         token3 = await gate.before_invoke()
+        assert token3 is not None
         assert token3.token == 'token-c'
 
     @pytest.mark.asyncio
@@ -719,6 +733,7 @@ class TestCapRetryRotation:
         asyncio.create_task(uncap_b_after_delay())
         token = await asyncio.wait_for(gate.before_invoke(), timeout=0.5)
 
+        assert token is not None
         assert token.token == 'token-b'
 
 
@@ -734,6 +749,7 @@ class TestSingleAccountUnifiedPath:
     async def test_returns_single_token(self):
         gate = _make_gate(num_accounts=1)
         token = await gate.before_invoke()
+        assert token is not None
         assert token.token == 'token-a'
 
     @pytest.mark.asyncio
@@ -1159,6 +1175,7 @@ class TestCostStoreFailoverEvent:
 
         # First call — establishes max-a as last_account_name, no failover
         token1 = await gate.before_invoke()
+        assert token1 is not None
         assert token1.token == 'token-a'
         assert gate._last_account_name == 'max-a'
         mock_cs.save_account_event.assert_not_called()
@@ -1166,6 +1183,7 @@ class TestCostStoreFailoverEvent:
         # Cap max-a, second call should pick max-b and emit failover
         gate._accounts[0].capped = True
         token2 = await gate.before_invoke()
+        assert token2 is not None
         assert token2.token == 'token-b'
         assert gate._last_account_name == 'max-b'
 
@@ -1232,6 +1250,7 @@ class TestCostStoreFailoverEvent:
         await gate.before_invoke()
         gate._accounts[0].capped = True
         token = await gate.before_invoke()
+        assert token is not None
         assert token.token == 'token-b'  # failover happened silently
 
 
@@ -1266,9 +1285,11 @@ class TestNoCostStore:
         gate = _make_gate(num_accounts=2)
         assert gate._cost_store is None
         token1 = await gate.before_invoke()
+        assert token1 is not None
         assert token1.token == 'token-a'
         gate._accounts[0].capped = True
         token2 = await gate.before_invoke()
+        assert token2 is not None
         assert token2.token == 'token-b'  # failover worked silently
 
     @pytest.mark.asyncio
@@ -1284,6 +1305,7 @@ class TestNoCostStore:
 
         # Failover to B
         token = await gate.before_invoke()
+        assert token is not None
         assert token.token == 'token-b'
 
         # Uncap A via probe loop (resumed path)

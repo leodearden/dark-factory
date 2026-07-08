@@ -406,6 +406,7 @@ class TestAllCappedThenResume:
 
         # before_invoke claims the probe slot
         lease = await gate.before_invoke()
+        assert lease is not None
         assert lease.token == 'fake-token-A'
         assert gate._accounts[0].probe_in_flight is True
         assert gate._accounts[0].probing is False

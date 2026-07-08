@@ -194,6 +194,7 @@ class TestBeforeInvokeSkipsAuthFailed:
         gate._accounts[0].auth_failed_at = datetime.now(UTC)
 
         lease = await gate.before_invoke()
+        assert lease is not None
         assert lease.token == 'fake-token-b'
 
     async def test_before_invoke_blocks_when_all_auth_failed(self):
