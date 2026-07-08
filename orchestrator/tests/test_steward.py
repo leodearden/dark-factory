@@ -295,6 +295,205 @@ class TestStewardSessionPersistence:
 
 
 # ---------------------------------------------------------------------------
+# Wiring contract: _invoke_with_session routes through invoke_with_cap_retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardInvokeWithCapRetryWiring:
+    """_invoke_with_session must delegate the main session to the shared
+    ``invoke_with_cap_retry`` loop (task W4-eta), passing the ``rebuild_prompt``
+    and ``max_cap_retries`` hooks and doing ONLY session-id bookkeeping itself.
+
+    These tests patch ``invoke_with_cap_retry`` directly so the wiring contract
+    is asserted independent of the retry loop's own behavior (that behavior —
+    the B7 wedge guard inherited from the real loop — is covered separately by
+    ``TestStewardWedgeGuardInheritance``).
+
+    FAILS RED against the current fork: today's ``_invoke_with_session`` calls
+    ``orchestrator.steward.invoke_agent`` directly in a hand-rolled loop and
+    never calls ``invoke_with_cap_retry`` from the main-session path (that
+    helper is only used by ``_pre_triage_suggestions``).
+    """
+
+    async def test_forwards_kwargs_no_prior_session(
+        self, steward, worktree, mock_mcp, mock_config,
+    ):
+        """No prior session: resume_session_id must be absent from the call."""
+        from orchestrator.agents.invoke import invoke_agent
+        from orchestrator.agents.roles import STEWARD
+        from orchestrator.steward import _MAX_CAP_RETRIES
+
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        mock_iwcr.assert_awaited_once()
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['invoke_fn'] is invoke_agent
+        assert kwargs['max_cap_retries'] == _MAX_CAP_RETRIES
+        assert kwargs['backend'] == 'claude'
+        assert kwargs['config_dir'] == steward._config_dir
+        assert callable(kwargs['rebuild_prompt'])
+        assert asyncio.iscoroutinefunction(kwargs['rebuild_prompt'])
+        assert kwargs['prompt'] == 'handle this escalation'
+        assert kwargs['system_prompt'] == STEWARD.system_prompt
+        assert kwargs['cwd'] == worktree
+        assert kwargs['model'] == mock_config.models.steward
+        assert kwargs['max_turns'] == mock_config.max_turns.steward
+        assert kwargs['max_budget_usd'] == pytest.approx(3.0)
+        assert kwargs['timeout_seconds'] == mock_config.timeouts.steward
+        assert kwargs['allowed_tools'] == (STEWARD.allowed_tools or None)
+        assert kwargs['mcp_config'] == mcp_config
+        assert kwargs['effort'] == mock_config.effort.steward
+        assert 'resume_session_id' not in kwargs
+
+    async def test_forwards_resume_session_id_when_prior_session_exists(
+        self, steward, worktree, mock_mcp,
+    ):
+        """A prior session_id is forwarded as resume_session_id."""
+        steward._session_id = 'sess-prev'
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-y')
+            await steward._invoke_with_session(
+                prompt='continue this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        assert mock_iwcr.call_args.kwargs['resume_session_id'] == 'sess-prev'
+
+    async def test_session_id_updated_from_result(self, steward, worktree, mock_mcp):
+        """self._session_id is updated to the result's session_id after the call."""
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        assert steward._session_id == 'sess-x'
+
+    async def test_rebuild_prompt_hook_regathers_pending_and_rebuilds_initial(
+        self, steward, worktree, mock_mcp, mock_briefing,
+    ):
+        """The rebuild_prompt closure re-queries pending escalations and calls
+        build_steward_initial_prompt with the freshly-gathered list."""
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+        fresh_pending = [_make_escalation(id='esc-42-9')]
+        steward.escalation_queue.get_by_task.return_value = fresh_pending
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        rebuild_prompt = mock_iwcr.call_args.kwargs['rebuild_prompt']
+        result = await rebuild_prompt(True)
+
+        steward.escalation_queue.get_by_task.assert_called_with(
+            steward.task_id, status='pending',
+        )
+        mock_briefing.build_steward_initial_prompt.assert_called_once_with(
+            task=steward.task,
+            escalation=esc.to_dict(),
+            pending_escalations=[e.to_dict() for e in fresh_pending],
+            worktree=steward.worktree,
+        )
+        assert result == 'Full steward briefing.'
+
+
+# ---------------------------------------------------------------------------
+# B7 wedge-guard inheritance (exercises the REAL invoke_with_cap_retry)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardWedgeGuardInheritance:
+    """_invoke_with_session must inherit the shared loop's zero-output wedge
+    guard (shared/cli_invoke.py:936-947) now that it routes through the real
+    ``invoke_with_cap_retry`` instead of a hand-rolled loop.
+
+    Uses the real-InvokeSlot harness (``_make_pre_triage_gate`` /
+    ``_attach_invoke_slot``) so the actual ``classify_invocation`` /
+    ``detect_cap_hit`` machinery runs, rather than patching
+    ``invoke_with_cap_retry`` itself.
+
+    FAILS RED against the current fork: the hand-rolled loop only branches on
+    ``slot.detect_cap_hit`` (False for a wedge — a full-timeout, zero-turn,
+    zero-cost result carries no cap-hit stderr pattern), so it returns the
+    wedge result after a single invocation instead of clearing the wedged
+    ``resume_session_id`` and retrying fresh.
+    """
+
+    async def test_wedged_resume_retries_fresh_instead_of_one_shot_return(
+        self, steward, worktree,
+    ):
+        steward._session_id = 'sess-wedged'
+        steward.usage_gate = _make_pre_triage_gate()
+
+        wedge_result = _make_result(
+            success=False, cost=0, turns=0, duration_ms=1_800_000,
+            session_id='sess-wedged', timed_out=True, subtype='error_empty_output',
+        )
+        success_result = _make_result(session_id='sess-fresh')
+
+        with (
+            patch(
+                'orchestrator.steward.invoke_agent', new_callable=AsyncMock,
+                side_effect=[wedge_result, success_result],
+            ) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            result = await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config={},
+                per_invocation_budget=5.0,
+                escalation=_make_escalation(),
+            )
+
+        assert mock_invoke.call_count == 2
+        second_call = mock_invoke.call_args_list[1]
+        assert 'resume_session_id' not in second_call.kwargs
+        assert result is success_result
+
+
+# ---------------------------------------------------------------------------
 # Cap-Hit Backoff
 # ---------------------------------------------------------------------------
 
