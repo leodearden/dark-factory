@@ -4763,14 +4763,24 @@ class TestRunCmdStreaming:
         assert log_path.read_text() == 'a\nb\n'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(30)
+    @pytest.mark.xdist_group('run_cmd_partial_log_timeout')
     async def test_run_cmd_preserves_partial_log_on_timeout(self, tmp_path: Path):
-        """The fix's core invariant: partial output survives the SIGKILL."""
+        """The fix's core invariant: partial output survives the SIGKILL.
+
+        The inner timeout is intentionally generous (not a tight race against
+        SIGKILL): under heavy ``-n auto`` xdist parallelism a starved child
+        can take longer than a hair-trigger timeout to even get scheduled and
+        flush its first print, producing a false-negative empty log. The
+        xdist_group pin keeps this test off a worker that's mid-spawn on 31
+        siblings' own subprocess-heavy tests. See task 2320 (same class as
+        1836/1841/1851/1925).
+        """
         log_path = tmp_path / 'partial.log'
         # PYTHONUNBUFFERED is auto-injected; force python to flush its prints.
         cmd = 'python3 -c "import time, sys; print(\\"START\\", flush=True); time.sleep(60)"'
         rc, stdout, timed_out = await _run_cmd(
-            cmd, tmp_path, timeout=1.0, log_path=log_path,
+            cmd, tmp_path, timeout=5.0, log_path=log_path,
         )
         assert timed_out is True
         assert log_path.exists(), 'log file must persist after kill'
