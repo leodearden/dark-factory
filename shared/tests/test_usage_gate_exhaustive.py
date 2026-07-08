@@ -1810,6 +1810,41 @@ class TestShutdownExhaustive:
         assert acct.resume_task.done()
         await gate.shutdown()
 
+    # --- B10: shutdown-refuses-new-probe gate invariant (task W4-ι) ---
+    #
+    # The gate itself (not harness caller-ordering) must refuse to START a
+    # new resume/auth-reprobe background task once shutdown() has begun.
+    # wait_for_reset=True is mandatory here: with wait_for_reset=False,
+    # _start_account_resume_probe early-returns regardless of
+    # _shutting_down, which would make the resume-path assertion vacuous
+    # and guard-insensitive.
+
+    async def test_shutdown_then_caphit_spawns_no_resume_probe(self):
+        gate = make_gate(['a'], wait_for_reset=True)
+        await gate.shutdown()
+        assert gate._shutting_down is True
+        acct = gate._accounts[0]
+
+        hit = gate._handle_cap_detected(
+            'cap', datetime.now(UTC) + timedelta(hours=1), acct.token
+        )
+
+        assert hit is True
+        assert acct.phase == AccountPhase.CAPPED
+        # Gate refused to spawn a new resume probe after shutdown.
+        assert acct.resume_task is None
+
+    async def test_shutdown_then_authfail_spawns_no_auth_reprobe(self):
+        gate = make_gate(['a'], wait_for_reset=True)
+        await gate.shutdown()
+        acct = gate._accounts[0]
+
+        gate._handle_auth_failure('403 forbidden', acct.token)
+
+        assert acct.phase == AccountPhase.AUTH_FAILED
+        # Gate refused to spawn a new auth reprobe after shutdown.
+        assert acct.auth_reprobe_task is None
+
 
 # ---------------------------------------------------------------------------
 # Coverage gap: _init_accounts fallback paths
