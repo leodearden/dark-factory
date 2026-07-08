@@ -10,6 +10,8 @@ switch reads to the ledger under a later write-both/read-new cutover.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import pytest_asyncio
 
@@ -375,3 +377,58 @@ async def test_gc_with_empty_terminal_task_ids_deletes_only_expired(store):
         is not None
     )
     assert await store.get_by_identity('proj-p', 'cycle_summary', task_id='task-never') is not None
+
+
+@pytest.mark.asyncio
+async def test_mark_addressed_sets_state_and_stamps_payload(store):
+    """mark_addressed() flips state to 'addressed' and stamps addressed_by /
+    addressed_run_id into payload_json (read-modify-write)."""
+    identity = dict(
+        project_id='proj-a',
+        record_kind='stage1_flag_marker',
+        task_id='task-1',
+        flag_type='drift_flag',
+        run_id='run-1',
+    )
+    record = ReconLedgerRecord(
+        **identity,
+        payload_json='{"flag": "drift"}',
+        state='active',
+        created_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-07-15T00:00:00+00:00',
+    )
+    await store.upsert(record)
+
+    await store.mark_addressed(
+        **identity,
+        addressed_by='recon-stage-task_knowledge_sync',
+        addressed_run_id='run-9',
+    )
+
+    fetched = await store.get_by_identity(**identity)
+    assert fetched is not None
+    assert fetched.state == 'addressed'
+    payload = json.loads(fetched.payload_json)
+    assert payload['flag'] == 'drift'
+    assert payload['addressed_by'] == 'recon-stage-task_knowledge_sync'
+    assert payload['addressed_run_id'] == 'run-9'
+
+
+@pytest.mark.asyncio
+async def test_mark_addressed_on_missing_identity_is_noop(store):
+    """mark_addressed() against an identity with no row must not raise and
+    must not create a row."""
+    await store.mark_addressed(
+        'proj-missing',
+        'stage1_flag_marker',
+        task_id='task-none',
+        flag_type='drift_flag',
+        run_id='run-none',
+        addressed_by='recon-stage-task_knowledge_sync',
+        addressed_run_id='run-9',
+    )
+
+    fetched = await store.get_by_identity(
+        'proj-missing', 'stage1_flag_marker', task_id='task-none', flag_type='drift_flag', run_id='run-none'
+    )
+    assert fetched is None
