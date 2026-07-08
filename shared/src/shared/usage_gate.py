@@ -32,7 +32,14 @@ from dotenv import load_dotenv
 from shared.cli_invoke import AgentResult
 from shared.config_dir import TaskConfigDir
 from shared.config_models import UsageCapConfig
-from shared.invocation_outcome import CapHit, NearCap, classify_invocation
+from shared.invocation_outcome import (
+    OK,
+    AuthFailed,
+    CapHit,
+    InvocationOutcome,
+    NearCap,
+    classify_invocation,
+)
 from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:
@@ -305,6 +312,49 @@ class InvokeSlot:
         cap detection).
         """
         self._settled = True
+
+    def report(self, outcome: InvocationOutcome) -> None:
+        """Apply *outcome*'s gate transition and settle the slot, atomically.
+
+        Enforces "slot settled iff gate informed" as an invariant rather than
+        caller discipline (PRD §7.4, task W4-ε): ``_settled`` is set in a
+        ``finally`` so every variant leaves the slot settled exactly once.
+        The PROBE_IN_FLIGHT claim taken by ``before_invoke()`` is released on
+        every path — OK/CapHit/AuthFailed release it as a side effect of
+        their phase transition; NearCap and the no-phase-change variants
+        (ZeroOutputWedge/CliLocalError/Failure) release it explicitly via
+        ``release_probe_slot`` since they don't otherwise touch phase.
+
+        Dispatches to the gate's existing handlers — this method owns no
+        transition logic of its own:
+
+        - OK -> ``confirm_account_ok`` (PROBE_IN_FLIGHT -> AVAILABLE; clears
+          ``near_cap``). Does not accumulate cost — ``OK`` carries none; cost
+          stays a caller concern (``confirm()`` / ``on_agent_complete``).
+        - CapHit -> ``_handle_cap_detected`` (-> CAPPED).
+        - AuthFailed -> ``_handle_auth_failure`` (-> AUTH_FAILED; a no-op if
+          already CAPPED — CAPPED takes precedence, per that handler's own
+          guard).
+        - NearCap -> ``_handle_near_cap_warning`` (annotation only), then
+          ``release_probe_slot``.
+        - Anything else (ZeroOutputWedge/CliLocalError/Failure) ->
+          ``release_probe_slot`` only; no phase change.
+        """
+        token = self.token
+        try:
+            if isinstance(outcome, OK):
+                self._gate.confirm_account_ok(token)
+            elif isinstance(outcome, CapHit):
+                self._gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+            elif isinstance(outcome, AuthFailed):
+                self._gate._handle_auth_failure(f'HTTP {outcome.status}', token)
+            elif isinstance(outcome, NearCap):
+                self._gate._handle_near_cap_warning(outcome.reason, token)
+                self._gate.release_probe_slot(token)
+            else:
+                self._gate.release_probe_slot(token)
+        finally:
+            self._settled = True
 
 
 class UsageGate:
