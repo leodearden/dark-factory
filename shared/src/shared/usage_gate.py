@@ -1467,7 +1467,16 @@ class UsageGate:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        self._probe_config_dir.cleanup()
+        # Clean up every per-account probe dir, deduped by object identity so
+        # the common single-account case (where the alias IS the sole dict
+        # entry) still calls cleanup() exactly once. getattr defaults keep
+        # this working on __new__-built fixtures that set only the alias.
+        dirs = set(getattr(self, '_probe_config_dirs', {}).values())
+        alias = getattr(self, '_probe_config_dir', None)
+        if alias is not None:
+            dirs.add(alias)
+        for d in dirs:
+            d.cleanup()
 
     @property
     def is_paused(self) -> bool:
