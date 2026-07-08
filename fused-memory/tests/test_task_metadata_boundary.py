@@ -1,0 +1,79 @@
+"""W3-ζ two-way boundary/integration-gate suite for the TaskMetadata contract (PRD §6).
+
+Unlike the rest of ``fused-memory/tests``, this suite is deliberately an
+INTEGRATION gate, not a synthetic-input unit test: it drives the REAL
+orchestrator producer (``orchestrator.deterministic_runner._build_done_provenance``,
+``orchestrator.workflow.TaskWorkflow``) across the package boundary into the
+REAL fused-memory consumer (:class:`SqliteTaskBackend`), via the cross-package
+``pythonpath = ["src", "../orchestrator/src"]`` entry in ``pyproject.toml``.
+Each row exercises one invariant from ``plans/task-metadata-schema-prd.md``
+§5/§6 (I1 round-trip, I2 single-enum symmetry, I3 post-merge validation) and
+must be green against the already-landed producer+consumer stack (α/2158,
+β/2162, γ/2166, δ/2167, ε/2172) — a RED result here is a genuine integration
+gap, not a synthetic-input failure.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import pytest_asyncio
+from pydantic import ValidationError
+
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+from fused_memory.config.schema import TaskmasterConfig
+from orchestrator.deterministic_runner import _build_done_provenance
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from shared.task_metadata import (
+    DoneProvenance,
+    MemoryHints,
+    RetryLedger,
+    TaskMetadata,
+    apply_migrations,
+    parse_metadata,
+)
+
+
+@pytest_asyncio.fixture
+async def make_backend(tmp_path):
+    """Factory fixture: ``make_backend(enforce=False)`` -> a started :class:`SqliteTaskBackend`.
+
+    A callable factory (rather than a single fixture instance) so one test
+    can construct BOTH a warn-mode and an enforce-mode backend to exercise
+    the staged-rollout contract (rows 5-6) against the same malformed write.
+    Mirrors test_sqlite_task_backend.py's ``backend`` fixture; every backend
+    the factory creates is closed at teardown.
+    """
+    created: list[SqliteTaskBackend] = []
+
+    async def _make(enforce: bool = False) -> SqliteTaskBackend:
+        cfg = TaskmasterConfig(project_root=str(tmp_path))
+        backend = SqliteTaskBackend(cfg, task_metadata_enforce=enforce)
+        await backend.start()
+        created.append(backend)
+        return backend
+
+    yield _make
+
+    for backend in created:
+        await backend.close()
+
+
+def _schema_warning_messages(caplog) -> list[str]:
+    """Return WARNING+ log messages carrying the write-boundary census token.
+
+    Mirrors the exact recipe in test_sqlite_task_backend.py: records on the
+    ``fused_memory.backends.sqlite_task_backend`` logger whose message
+    contains the literal ``task_metadata.schema_warning`` token (task 2162).
+    Call within a ``caplog.at_level(logging.WARNING,
+    logger='fused_memory.backends.sqlite_task_backend')`` block.
+    """
+    return [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and r.name == 'fused_memory.backends.sqlite_task_backend'
+        and 'task_metadata.schema_warning' in r.message
+    ]
