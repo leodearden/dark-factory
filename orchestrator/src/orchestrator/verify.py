@@ -1688,18 +1688,16 @@ def _build_fallback_config(
         # path the scoper just inserted. _reproject_bare_uv_run then reprojects
         # a bare ``uv run <tool>`` into a tool-bearing member uv context (task
         # 2036): the depless workspace-root project cannot spawn ruff/pyright.
-        lint_cmd = _reproject_bare_uv_run(
-            _strip_leading_cd(
-                _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
-            ),
-            'ruff check',
+        lint_scoped = _strip_leading_cd(
+            _scope_command(config.lint_command, 'ruff check', py_files) or config.lint_command
         )
+        lint_cmd = _reproject_bare_uv_run(lint_scoped, 'ruff check')
         type_scoped = _strip_leading_cd(
             _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
         )
         type_cmd = _reproject_bare_uv_run(type_scoped, 'pyright')
     else:
-        lint_cmd = 'ruff check ' + ' '.join(py_files)
+        lint_scoped = lint_cmd = 'ruff check ' + ' '.join(py_files)
         type_scoped = type_cmd = 'pyright ' + ' '.join(py_files)
 
     # Subproject-scoped TEST command (task 2344): when every touched file
@@ -1763,12 +1761,13 @@ def _build_fallback_config(
             'cd ' + sub + ' && uv run pytest ' + ' '.join(rel_targets)
             if rel_targets else None
         )
-        # Cold-verify dev-dep race (task 2355): rescope TYPE into *sub*'s own
-        # uv context so `uv run --project <sub>` syncs its dev-group deps
-        # (e.g. hypothesis) before pyright runs, rather than racing the
+        # Cold-verify dev-dep race (task 2355): rescope TYPE/LINT into *sub*'s
+        # own uv context so `uv run --project <sub>` syncs its dev-group deps
+        # (e.g. hypothesis) before the tool runs, rather than racing the
         # concurrently-run TEST command's `uv run` sync on a cold shared
         # .venv (esc-2293-20).
         type_cmd = _scope_fallback_tool_to_subproject(type_scoped, 'pyright', sub)
+        lint_cmd = _scope_fallback_tool_to_subproject(lint_scoped, 'ruff check', sub)
         return ModuleConfig(
             prefix=sub,
             lint_command=lint_cmd,
