@@ -834,6 +834,132 @@ class MemoryService:
             )
         return restored
 
+    async def _invalidate_stale_superseded_ttl_edges(
+        self, result: Any, *, group_id: str
+    ) -> int:
+        """Invalidate pre-existing stale priority-override/TTL edges left
+        behind when Graphiti's upstream LLM edge-resolver under-invalidates.
+
+        Mirror-image (under-invalidation direction) counterpart of
+        ``_restore_falsely_superseded_sibling_edges`` (task 2111), which
+        fixes the OVER-invalidation direction and documents this exact gap
+        in its "Known limitation" note. Graphiti's ``dedupe_edges``/
+        ``resolve_edge_contradictions`` pipeline can fail to set
+        ``invalid_at`` on a pre-existing edge that a freshly-written edge
+        contradicts, leaving two-or-more ``invalid_at is None`` edges
+        asserting contradictory values for the same single-valued scalar
+        (task 2265's TTL incident: 10800 and 86400 both valid for ~2h10m).
+
+        Unlike the sibling hook, which scans only ``result``'s edges (because
+        graphiti TOUCHES the edges it falsely invalidates, so they carry the
+        fresh ``invalid_at`` and appear in the result), this hook must
+        re-query live graph state: the pre-existing stale edge was NOT
+        touched by this episode, so it is generally absent from
+        ``result.edges``. It therefore:
+
+        1. Scans *result* for the "authoritative fresh" set — valid
+           (``invalid_at is None``) edges whose fact matches
+           ``_is_priority_override_ttl_fact``. If none, returns 0 without
+           any graph query — this scopes the hook to fire only when the
+           current episode actually wrote a priority-override/TTL fact.
+        2. For each distinct node touched (source or target) by an
+           authoritative-fresh edge, queries
+           ``graphiti.get_valid_edges_for_node`` for every currently-valid
+           edge on that node — including pre-existing stale edges this
+           episode never touched.
+        3. Invalidates every returned edge that also matches
+           ``_is_priority_override_ttl_fact`` and is not itself one of the
+           authoritative-fresh edges: it is a same-subject, single-valued
+           contradiction of the fact just written. The invalidation
+           timestamp is the newest ``valid_at`` among the authoritative-fresh
+           edges (falling back to ``datetime.now(UTC)`` when unavailable),
+           so the stale fact's supersession is stamped as of the moment the
+           new fact became valid.
+
+        This enforces the invariant that the newest write for a given
+        (entity, predicate)-shape is the only ``invalid_at is None`` edge of
+        that shape. It is idempotent: a re-run sees only the single
+        surviving fresh edge and no-ops. It structurally cannot invalidate
+        the fresh edge itself, since authoritative-fresh uuids are excluded
+        from the invalidation candidates.
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                    AddEpisodeResults object with an ``edges`` attribute).
+                    Handles ``None`` and objects with empty/missing edges
+                    gracefully.
+            group_id: The project graph to query/write.
+
+        Returns:
+            Number of stale priority-override/TTL edges invalidated (0 when
+            nothing to do).
+        """
+        if result is None:
+            return 0
+
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
+        if not edges:
+            return 0
+
+        keep_uuids: set[str] = set()
+        touched_node_uuids: set[str] = set()
+        supersession_stamp: datetime | None = None
+        for edge in edges:
+            if getattr(edge, 'invalid_at', None) is not None:
+                continue
+            if not _is_priority_override_ttl_fact(getattr(edge, 'fact', '') or ''):
+                continue
+            edge_uuid = getattr(edge, 'uuid', '') or ''
+            if edge_uuid:
+                keep_uuids.add(edge_uuid)
+            src = getattr(edge, 'source_node_uuid', '') or ''
+            tgt = getattr(edge, 'target_node_uuid', '') or ''
+            if src:
+                touched_node_uuids.add(src)
+            if tgt:
+                touched_node_uuids.add(tgt)
+            valid_at = getattr(edge, 'valid_at', None)
+            if valid_at is not None and (
+                supersession_stamp is None or valid_at > supersession_stamp
+            ):
+                supersession_stamp = valid_at
+
+        if not keep_uuids:
+            # This episode did not write a fresh priority-override/TTL fact —
+            # nothing to supersede, and no graph query needed.
+            return 0
+
+        if supersession_stamp is None:
+            supersession_stamp = datetime.now(UTC)
+
+        invalidated = 0
+        for node_uuid in touched_node_uuids:
+            candidates = await self.graphiti.get_valid_edges_for_node(
+                node_uuid, group_id=group_id,
+            )
+            for candidate in candidates:
+                candidate_uuid = candidate.get('uuid', '') or ''
+                if not candidate_uuid or candidate_uuid in keep_uuids:
+                    continue
+                if not _is_priority_override_ttl_fact(candidate.get('fact', '') or ''):
+                    continue
+                await self.graphiti.update_edge(
+                    candidate_uuid, group_id=group_id, invalid_at=supersession_stamp,
+                )
+                invalidated += 1
+
+        if invalidated > 0:
+            logger.info(
+                'Invalidated %d stale superseded priority-override/TTL edge(s) '
+                'after add_episode',
+                invalidated,
+            )
+        return invalidated
+
     async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
         """Canonicalize non-canonical task-entity node names to 'Task N'.
 
