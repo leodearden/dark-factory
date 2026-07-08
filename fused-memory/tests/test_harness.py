@@ -3297,15 +3297,36 @@ async def test_run_loop_fast_restart_releases_recent_claims(
     harness._recover_stale_runs = AsyncMock(return_value=None)
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
+    # judge.initialize() does a real SQLite query; mock it to avoid timing
+    # flakiness in slow environments (freethreaded Python, heavy parallel runs).
+    if harness.judge is not None:
+        harness.judge.initialize = AsyncMock()
 
-    # Run the loop just long enough to execute the startup sweep, then let it
-    # time out in the main loop body.
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+    # run_loop() awaits a real (unmocked) release_stale_claims(0) SQLite
+    # write/read round-trip *before* it enters its main while-loop, so a fixed
+    # wait_for() timeout races that write under full-suite CPU/disk contention
+    # (De-flake precedent: tasks 1836/1851/2320/2350 — same starvation class).
+    # Run run_loop() as a background task and poll claim_deferred_writes()
+    # until the row reappears (or a generous deadline elapses) rather than
+    # blocking for a single fixed window — this eliminates the race instead
+    # of just widening it.
+    task = asyncio.create_task(harness.run_loop())
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        reclaimed = []
+        while loop.time() < deadline:
+            reclaimed = await event_buffer.claim_deferred_writes('test-project')
+            if reclaimed:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     # The startup sweep must have released the freshly-claimed row so a new
     # claim_deferred_writes call returns it.
-    reclaimed = await event_buffer.claim_deferred_writes('test-project')
     assert len(reclaimed) == 1, (
         'run_loop startup sweep should have re-queued the freshly-claimed row'
     )
