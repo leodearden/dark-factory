@@ -25,6 +25,7 @@ from orchestrator.scheduler import (
     ModuleLockTable,
     Scheduler,
     files_to_modules,
+    normalize_lock,
 )
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
@@ -4509,6 +4510,102 @@ class TestBlastRadiusRefinement:
         assert result != [f'task-{tid}'], (
             f'_get_modules must NOT fall back to task-<id> when file-level '
             f'metadata is present; got {result!r}'
+        )
+
+
+class TestBlastRadiusModuleCacheSeam:
+    """The acquire-failure path's cache write and metadata persist must route
+    through the single-writer seam / sanitize contract (task 2122 step-5/6),
+    not the pre-migration direct assignment + raw strip_directory_locks call.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        event_store = _RecordingEventStore()
+        sched = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        return sched
+
+    @pytest.mark.asyncio
+    async def test_acquire_failure_routes_through_write_module_cache_seam(
+        self, scheduler: Scheduler
+    ):
+        """On acquire failure, the in-memory cache write must go through
+        _write_module_cache (spied here), not a direct
+        self._module_cache[task_id] = ... assignment — fails today because
+        the failure branch assigns directly instead of calling the seam.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        # Another task grabs the module 936 would expand into, forcing failure.
+        assert lt.try_acquire(
+            'other', ['crates/reify-compiler/src/conformance.rs']
+        )
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        calls: list[tuple[str, list[str]]] = []
+        original_write = scheduler._write_module_cache
+
+        def spy(task_id: str, modules: list[str]) -> list[str]:
+            calls.append((task_id, modules))
+            return original_write(task_id, modules)
+
+        scheduler._write_module_cache = spy  # type: ignore[method-assign]
+
+        needed = ['crates/reify-compiler/src/conformance.rs']
+        depth = scheduler.config.lock_depth
+        expected = sorted({normalize_lock(m, depth) for m in needed})
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=needed,
+        )
+
+        assert ok is False
+        assert calls == [('936', expected)], (
+            f'Expected exactly one _write_module_cache(936, {expected}) call; '
+            f'got {calls}'
+        )
+        assert scheduler._module_cache['936'] == expected
+
+    @pytest.mark.asyncio
+    async def test_acquire_failure_persists_sanitized_files(
+        self, scheduler: Scheduler
+    ):
+        """A dir-bearing persist_files list must be stripped to file-level-only
+        entries before update_task sees it (the _persist_files_metadata
+        sanitize contract, now routed through sanitize_files_for_persist).
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        assert lt.try_acquire(
+            'other', ['crates/reify-compiler/src/conformance.rs']
+        )
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        update_task = AsyncMock(return_value=True)
+        scheduler.update_task = update_task  # type: ignore[method-assign]
+        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+            persist_files=['pkg/dir', 'pkg/mod/real.py'],
+        )
+
+        assert ok is False
+        assert update_task.await_args is not None
+        persisted = update_task.await_args.args[1]
+        assert persisted == {'files': ['pkg/mod/real.py']}, (
+            f'Expected the directory entry stripped, file-level entry kept; '
+            f'got {persisted}'
         )
 
 
