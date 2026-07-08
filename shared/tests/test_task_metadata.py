@@ -25,6 +25,7 @@ from shared.task_metadata import (
     DoneProvenance,
     ExternalDep,
     MemoryHints,
+    Milestone,
     RetryLedger,
     TaskMetadata,
     apply_migrations,
@@ -413,6 +414,62 @@ class TestRetryLedger:
             '', '', fallback_reason='some fallback reason'
         )
         assert sig_category_only != sig_fallback
+
+
+class TestMilestone:
+    """``metadata.milestone`` — the dated/delayed milestone sub-model (PRD §6.1)."""
+
+    def test_dated_constructs(self):
+        m = Milestone(mode='dated', at='2026-08-01T00:00:00+00:00')
+        assert m.mode == 'dated'
+        assert m.at == '2026-08-01T00:00:00+00:00'
+        assert m.after_secs is None
+
+    def test_delayed_constructs(self):
+        m = Milestone(mode='delayed', after_secs=604800)
+        assert m.mode == 'delayed'
+        assert m.after_secs == 604800
+        assert m.at is None
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            pytest.param({'mode': 'dated', 'at': None}, id='dated_missing_at'),
+            pytest.param(
+                {'mode': 'dated', 'at': 'not-a-date'}, id='dated_unparseable_at'
+            ),
+            pytest.param(
+                {'mode': 'delayed', 'after_secs': None}, id='delayed_missing_after_secs'
+            ),
+            pytest.param(
+                {'mode': 'delayed', 'after_secs': 0}, id='delayed_after_secs_zero'
+            ),
+            pytest.param(
+                {'mode': 'delayed', 'after_secs': -1}, id='delayed_after_secs_negative'
+            ),
+            pytest.param(
+                {'mode': 'dated', 'at': '2026-08-01T00:00:00+00:00', 'after_secs': 604800},
+                id='dated_with_after_secs_also_set',
+            ),
+            pytest.param(
+                {
+                    'mode': 'delayed',
+                    'after_secs': 604800,
+                    'at': '2026-08-01T00:00:00+00:00',
+                },
+                id='delayed_with_at_also_set',
+            ),
+            pytest.param({'mode': 'weird'}, id='mode_weird'),
+        ],
+    )
+    def test_invalid_specs_rejected(self, kwargs):
+        with pytest.raises(ValidationError):
+            Milestone(**kwargs)  # type: ignore[arg-type]
+
+    def test_unknown_subfield_retained_and_reemitted(self):
+        m = Milestone(mode='delayed', after_secs=604800, x_extra='keep')  # type: ignore[call-arg]
+        dumped = m.model_dump()
+        assert dumped['x_extra'] == 'keep'
 
 
 class TestTaskMetadataFields:
