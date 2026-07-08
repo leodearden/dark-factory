@@ -238,3 +238,43 @@ class TestRenderCycleSummarySection:
         text = m.render_cycle_summary_section()
         assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL in text
         assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL == 'stage2_cycle_summary'
+
+
+# --------------------------------------------------------------------------- #
+# render_execution_class_section (step-13/14)
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderExecutionClassSection:
+    """render_execution_class_section() renders the NEW execution_class
+    contract text (PRD §8.5) — there is no current prompt precedent for this
+    text (execution_class is net-new); this section is consumed by η."""
+
+    def test_returns_non_empty_str(self):
+        assert isinstance(m.render_execution_class_section(), str)
+        assert m.render_execution_class_section()
+
+    def test_names_every_execution_class(self):
+        """Iterates EXECUTION_CLASSES so the section stays single-sourced
+        from the constant rather than re-hardcoding the class names."""
+        text = m.render_execution_class_section()
+        for execution_class in m.EXECUTION_CLASSES:
+            assert execution_class in text, (
+                f'render_execution_class_section() must name {execution_class!r}'
+            )
+
+    def test_states_declaration_is_required_and_rejected_otherwise(self):
+        """A recon-stage submit_task must set metadata.execution_class;
+        omitting it (or an unknown value) is rejected."""
+        text = m.render_execution_class_section()
+        assert 'metadata.execution_class' in text
+        assert 'submit_task' in text
+        assert 'rejected' in text
+
+    def test_states_operational_and_decision_route_off_the_tdd_pipeline(self):
+        """operational/decision asks are routed off the architect+TDD
+        pipeline; code_tdd stays on it."""
+        text = m.render_execution_class_section()
+        assert 'architect' in text
+        assert 'TDD' in text
+        assert 'routed off' in text
