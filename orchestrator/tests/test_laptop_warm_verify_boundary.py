@@ -25,6 +25,7 @@ ad-hoc process-tree parsing.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 import subprocess
 import sys
@@ -32,8 +33,12 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
 
+from orchestrator.config import OrchestratorConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
     collect_descendants,
     merge_verify_lock_path,
@@ -43,9 +48,11 @@ from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
     write_lock_holder_pgid,
 )
 from orchestrator.verify_runner import (
+    FLOCK_CONTENTION_CATEGORY,
     MergeVerifySpec,
     UnscopedTypecheckSpec,
     VerifyCommand,
+    result_from_json,
     spec_to_json,
 )
 
@@ -317,3 +324,117 @@ def wait_subtree_gone(pgid: int, *, timeout: float, interval: float = 0.1) -> bo
             return True
         time.sleep(interval)
     return subtree_and_leader_gone(pgid)
+
+
+def worktree_base_for(repo: Path) -> Path:
+    """Derive worktree_base exactly as the spawned CLI does: GitOps(config.git, repo).worktree_base."""
+    config = OrchestratorConfig(project_root=repo)
+    return GitOps(config.git, repo).worktree_base
+
+
+# ---------------------------------------------------------------------------
+# Task 2309 step-1 RED -- env-var test seams for remote-side timing constants
+# (PRD SS11 Q1/Q2 tunability).  Production defaults are byte-identical when
+# unset; these overrides exist ONLY so the SS9 boundary rows below can run
+# fast and deterministically instead of being wall-clock-bound on the 10s
+# flock wait / 10s+5s watchdog window.  RED until step-2 wires them into
+# cli.py.
+# ---------------------------------------------------------------------------
+
+
+def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
+    """ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS overrides the flock bounded wait.
+
+    Holds the real flock (+ writes the holder pgid) exactly as
+    test_cli.py:1419 does, then spawns a real knob-on verify-merge with the
+    override set small.  Today (RED) verify-merge ignores the env var and
+    waits the full 10.0s production window; asserting completion in well
+    under that (< 3s) fails until cli.py reads the override.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    worktree_base = worktree_base_for(repo)
+    worktree_base.mkdir(parents=True, exist_ok=True)
+
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=True)
+
+    write_lock_holder_pgid(worktree_base, 999999)
+    lock_path = merge_verify_lock_path(worktree_base)
+    held_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+    fcntl.flock(held_fd, fcntl.LOCK_EX)
+    try:
+        started = time.monotonic()
+        proc = spawn_verify_merge(
+            sha=head_sha,
+            spec=fast_spec(),
+            cfg_file=cfg_file,
+            extra_env={'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS': '0.5'},
+        )
+        stdout, stderr = proc.communicate(timeout=15)
+        elapsed = time.monotonic() - started
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(held_fd, fcntl.LOCK_UN)
+        os.close(held_fd)
+
+    assert proc.returncode == 0, (
+        f'expected exit 0 (contention result on stdout), got {proc.returncode}; '
+        f'stderr={stderr.decode()[:2000]!r}'
+    )
+    result = result_from_json(stdout.decode())
+    assert result.category == FLOCK_CONTENTION_CATEGORY, (
+        f'expected flock-contention result, got category={result.category!r} '
+        f'stdout={stdout.decode()[:2000]!r}'
+    )
+    assert elapsed < 3.0, (
+        f'expected contention result well under the 10s production wait '
+        f'(env override=0.5s) -- took {elapsed:.2f}s; the env override is '
+        f'not wired up yet'
+    )
+
+
+def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
+    """ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS/_KILL_GRACE_SECS override the watchdog window.
+
+    Spawns a real verify-merge --request-id with stdin=PIPE and NEVER writes
+    a heartbeat.  Today (RED) the watchdog uses the 10s+5s production window;
+    asserting the process self-exits non-zero within a few seconds fails
+    until cli.py threads the overrides into start_stdin_watchdog.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
+
+    proc = spawn_verify_merge(
+        sha=head_sha,
+        spec=sleeper_spec(300.0),
+        cfg_file=cfg_file,
+        request_id='env-seam-watchdog-test',
+        extra_env={
+            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '0.5',
+            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.2',
+        },
+    )
+    try:
+        # No heartbeat is ever written -- stdin stays open but silent, which
+        # is sufficient to exercise the heartbeat-starvation timing path
+        # (Rows 1-3 later distinguish EOF vs. timeout precisely).
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                'verify-merge did not self-exit within 5s of no heartbeats -- '
+                'watchdog env overrides are not wired up yet (production '
+                'window is 10s timeout + 5s grace = 15s)'
+            )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if proc.stdin is not None:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
+
+    assert proc.returncode != 0, (
+        f'expected non-zero exit (watchdog self-kill), got {proc.returncode}'
+    )
