@@ -1515,7 +1515,7 @@ class TestAlarmVerifyWorktreeContention:
     RED until step-4 GREEN adds the function and sentinel to merge_queue.py.
     """
 
-    def _call(self, eq, *, host='leo-laptop', holder_pgid=4242, waiter_pgid=4343):
+    def _call(self, eq, *, host='leo-laptop', holder_pgid: int | None = 4242, waiter_pgid: int | None = 4343):
         from orchestrator.merge_queue import _alarm_verify_worktree_contention
         _alarm_verify_worktree_contention(
             eq, host=host, holder_pgid=holder_pgid, waiter_pgid=waiter_pgid,
