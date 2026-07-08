@@ -76,7 +76,15 @@ class TestSetTaskStatusClaimantForwarding:
     @pytest.mark.asyncio
     async def test_claimant_kwargs_resent_on_transient_retry(self, scheduler: Scheduler):
         """Injected before the retry loop -> every retry attempt resends them."""
-        transient = {'error': 'TimeoutError(mcp down)', 'error_type': 'TimeoutError'}
+        import json as _json
+        transient = {
+            'result': {
+                'content': [{
+                    'type': 'text',
+                    'text': _json.dumps({'error': 'TimeoutError(mcp down)', 'error_type': 'TimeoutError'}),
+                }],
+            },
+        }
         scheduler.dispatch_tool = AsyncMock(side_effect=[transient, {}])
         tid = 'task-claimant-retry'
 
