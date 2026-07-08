@@ -1929,6 +1929,35 @@ Output JSON matching the schema. Every task must appear in the output.
             sample = dict(list(self.scheduler._module_cache.items())[:3])
             logger.info(f'Module cache sample: {sample}')
 
+    def _resolve_recovery_artifact(self, entry: Path, name: str) -> Path:
+        """Resolve a `.task` artifact path new-then-old (W11 delta relocation).
+
+        Prefers ``TaskArtifacts.meta_root_for(worktree_base, entry.name) /
+        name`` (the new ``.task-meta`` sibling location, W11 beta), falling
+        back to the legacy ``entry / '.task' / name`` when the new path is
+        absent.  Mirrors ``TaskArtifacts._read_path``'s new-then-old
+        contract and ``GitOps._find_lane_by_plan_task_id``'s plan.json scan,
+        for the ``_recover_crashed_tasks`` reads that don't go through a
+        ``TaskArtifacts`` instance.
+        """
+        new_path = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name
+        if new_path.exists():
+            return new_path
+        return entry / '.task' / name
+
+    def _clear_recovery_artifact(self, entry: Path, name: str) -> None:
+        """Remove a `.task` artifact from BOTH the new and legacy roots.
+
+        The write-side mirror of :meth:`_resolve_recovery_artifact` — mirrors
+        ``TaskArtifacts._clear_path``: clearing only the resolved path risks
+        the OTHER root resurrecting it via the new-then-old read fallback on
+        a later call.  Idempotent (``missing_ok=True``); never raises.
+        """
+        (TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name).unlink(
+            missing_ok=True
+        )
+        (entry / '.task' / name).unlink(missing_ok=True)
+
     async def _recover_crashed_tasks(self) -> None:
         """Scan surviving worktrees and recover plans with completed work.
 
@@ -2017,6 +2046,15 @@ Output JSON matching the schema. Every task must appear in the output.
             # through unchanged to the existing heuristic path below.
             if is_lane and pool is not None:
                 rec = self.git_ops._lane_lifecycle.read(entry)
+                if rec is not None and rec.state == DurableLaneState.QUARANTINED:
+                    # Already quarantined (e.g. a previous quarantine move
+                    # failed partway and left the dir behind) — skip
+                    # entirely: no plan recovery, no cleanup, no re-adopt.
+                    logger.info(
+                        'Recovery: lane %s already QUARANTINED — skipping',
+                        entry.name,
+                    )
+                    continue
                 if (
                     rec is not None
                     and rec.state in (DurableLaneState.ASSIGNED, DurableLaneState.IN_USE)
@@ -2066,10 +2104,9 @@ Output JSON matching the schema. Every task must appear in the output.
                     branch_ok = rec.branch is None or registered_branch == rec.branch
                     if is_registered and branch_ok:
                         pool.restore_assignment(rec.task_id, entry)
-                        meta_dir = TaskArtifacts.meta_root_for(worktree_base, entry.name)
-                        rec_plan_path = meta_dir / 'plan.json'
-                        if not rec_plan_path.exists():
-                            rec_plan_path = entry / '.task' / 'plan.json'
+                        rec_plan_path = self._resolve_recovery_artifact(
+                            entry, 'plan.json',
+                        )
                         if rec_plan_path.exists():
                             try:
                                 self._recovered_plans[rec.task_id] = json.loads(
@@ -2081,9 +2118,9 @@ Output JSON matching the schema. Every task must appear in the output.
                                     '%s but plan.json unreadable (%s)',
                                     entry.name, rec.task_id, e,
                                 )
-                        rec_lock_path = meta_dir / 'plan.lock'
-                        if not rec_lock_path.exists():
-                            rec_lock_path = entry / '.task' / 'plan.lock'
+                        rec_lock_path = self._resolve_recovery_artifact(
+                            entry, 'plan.lock',
+                        )
                         if rec_lock_path.exists():
                             rec_lock_path.unlink()
                             logger.info(
@@ -2136,7 +2173,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         cleaned += 1
                         continue
 
-            plan_path = entry / '.task' / 'plan.json'
+            plan_path = self._resolve_recovery_artifact(entry, 'plan.json')
 
             if not plan_path.exists():
                 # Mid-invocation crash: an agent subprocess was in flight when
@@ -2162,7 +2199,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     cleaned += 1
                     continue
 
-                sidecar_path = entry / '.task' / 'agent_session.json'
+                sidecar_path = self._resolve_recovery_artifact(entry, 'agent_session.json')
                 if sidecar_path.exists():
                     try:
                         session_data = json.loads(sidecar_path.read_text())
@@ -2299,53 +2336,25 @@ Output JSON matching the schema. Every task must appear in the output.
                     await self.git_ops.cleanup_worktree(entry, recovery_id)
                     cleaned += 1
                     continue
-                # Registration guard (reify 4655/4947): only re-pin the lane
-                # if it is STILL a registered git worktree.  A stale plan.json
-                # can survive in an ORPHANED lane (dir present on disk, but its
-                # '.git/worktrees' admin entry is gone) — pinning it
-                # unconditionally re-ASSIGNs the broken lane on every restart,
-                # which (a) forces the next dispatch down the reuse fast-path
-                # (which faults on the missing worktree) and (b) shields the
-                # lane from the create-once self-heal forever, since that
-                # self-heal only ever sees FREE lanes.  Skipping the pin
-                # leaves the lane FREE so the next acquire_for() self-heals it
-                # (rmtree + fresh 'git worktree add'); the plan is still
-                # recovered below via _recovered_plans independent of the pin.
-                #
-                # Note on fail-safe direction: _is_registered_worktree()
-                # itself collapses a git command failure (rc != 0) to False —
-                # correct for its OTHER caller (git_ops.py's create-once
-                # self-heal gate, where a downstream destroy-gate absorbs a
-                # false negative) but that swallow is invisible from here, so
-                # this call site cannot currently tell "positively orphaned"
-                # apart from "git was transiently unreachable" — fully fixing
-                # that needs a contract change (tri-state return, or raise on
-                # command failure) in git_ops.py, which is out of scope for
-                # this task (no lock on that file); tracked as a follow-up.
-                # What we CAN fail safe on from here is an outright exception
-                # (e.g. a raised WorktreeMissing/OSError) escaping the check —
-                # treat that like the transient-None term_status case above
-                # and fall through to the old unconditional-pin behavior
-                # rather than let it abort recovery for every other worktree.
-                try:
-                    is_registered = await self.git_ops._is_registered_worktree(entry)
-                except OSError as e:
-                    logger.warning(
-                        'Recovery: registration check raised for lane %s '
-                        'task %s (%s) — restoring pin as safe default',
-                        entry.name, recovery_id, e,
-                    )
-                    is_registered = True
-                if is_registered:
-                    pool.restore_assignment(recovery_id, entry)
-                else:
-                    logger.warning(
-                        'Recovery: lane %s for task %s is NOT a registered '
-                        'git worktree (orphaned .git/worktrees admin entry) — '
-                        'leaving FREE for create-once self-heal; plan is '
-                        'still recovered under task id %s',
-                        entry.name, recovery_id, recovery_id,
-                    )
+                # W11 delta compat (PRD dec.5): by construction, any lane
+                # reaching this point has already been proven NOT to carry a
+                # live ASSIGNED/IN_USE durable record — the record-driven
+                # block above exhaustively handles that case (adopt /
+                # terminal-release / quarantine) and always `continue`s
+                # before falling through here.  So this lane is either a
+                # pre-W11 record-less lane or one whose record is
+                # SEED/REGISTERED/RELEASED.  Never silently re-pin from a
+                # stale plan.json heuristic — that was the old
+                # restore-from-any-plan.json default that re-poisoned lanes
+                # every restart (2097/2098).  Leave the lane FREE for the
+                # create-once self-heal; the plan is still recovered below
+                # via _recovered_plans, independent of the (skipped) pin.
+                logger.info(
+                    'Recovery: lane %s task %s has no live durable record — '
+                    'plan recovered but lane left FREE (never silently '
+                    're-pin a record-less lane)',
+                    entry.name, recovery_id,
+                )
 
             # Check if plan has any completed steps
             # Note: some plans have prerequisites as plain strings (not dicts)
@@ -2373,7 +2382,7 @@ Output JSON matching the schema. Every task must appear in the output.
                         f'Recovery: worktree {recovery_id} has stamped plan with '
                         f'no completed steps — preserving for revalidation'
                     )
-                    lock_path = entry / '.task' / 'plan.lock'
+                    lock_path = self._resolve_recovery_artifact(entry, 'plan.lock')
                     if lock_path.exists():
                         lock_path.unlink()
                         logger.info(
@@ -2384,7 +2393,7 @@ Output JSON matching the schema. Every task must appear in the output.
                     # sidecar present is from a later (post-plan) invocation
                     # that crashed and isn't meaningful here — clear it to
                     # avoid confusing the next workflow on this task.
-                    (entry / '.task' / 'agent_session.json').unlink(missing_ok=True)
+                    self._clear_recovery_artifact(entry, 'agent_session.json')
                     self._preserved_worktrees.add(recovery_id)
                     recovered += 1
                     continue
@@ -2409,7 +2418,7 @@ Output JSON matching the schema. Every task must appear in the output.
             )
             self._recovered_plans[recovery_id] = plan
             # Clear stale plan.lock so the new session doesn't immediately requeue
-            lock_path = entry / '.task' / 'plan.lock'
+            lock_path = self._resolve_recovery_artifact(entry, 'plan.lock')
             if lock_path.exists():
                 lock_path.unlink()
                 logger.info(f'Recovery: cleared stale plan.lock for task {recovery_id}')
