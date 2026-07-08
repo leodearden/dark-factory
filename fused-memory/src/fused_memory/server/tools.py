@@ -39,7 +39,9 @@ from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
+    find_conflicting_task_status_ids,
     is_batch_plan_framing,
+    is_conflicting_task_status_framing,
     is_count_snapshot,
     is_mixed_temporal_framing,
 )
@@ -786,6 +788,18 @@ def create_mcp_server(
                 'error_type': 'ReconMixedFramingWriteRejected',
                 'agent_id': agent_id,
                 'content_excerpt': content[:200],
+            }
+        if (
+            isinstance(agent_id, str)
+            and agent_id.startswith('recon-stage-')
+            and is_conflicting_task_status_framing(content)
+        ):
+            return {
+                'error': 'conflicting_task_status_framing_write_blocked',
+                'error_type': 'ReconConflictingTaskStatusWriteRejected',
+                'agent_id': agent_id,
+                'content_excerpt': content[:200],
+                'conflicting_task_ids': sorted(find_conflicting_task_status_ids(content)),
             }
         try:
             causation_id, op_source, _ = _extract_causation(metadata, agent_id)
