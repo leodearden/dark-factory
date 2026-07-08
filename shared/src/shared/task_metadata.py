@@ -72,6 +72,7 @@ class DoneProvenance(BaseModel):
         'deterministic-deploy',
         'deterministic-deploy-scheduled',
         'deterministic-gate',
+        'deterministic-milestone',
     ]
     commit: str | None = None
     note: str | None = None
