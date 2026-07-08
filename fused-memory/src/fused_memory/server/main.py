@@ -630,6 +630,7 @@ async def run_server():
 
         if config.reconciliation.recon_ledger_enabled:
             recon_ledger = await _build_recon_ledger_store(Path(config.reconciliation.data_dir))
+            memory_service.set_recon_ledger(recon_ledger)
 
         db_path = Path(config.reconciliation.data_dir) / 'reconciliation.db'
         assert memory_service.durable_queue is not None  # set by initialize()
