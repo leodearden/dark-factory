@@ -4476,10 +4476,32 @@ class TestBuildFallbackConfigSubprojectScoped:
         assert 'fused-memory' not in result.test_command
         assert 'escalation' not in result.test_command
         assert 'dashboard' not in result.test_command
-        # Lint scoping is unaffected — still the existing file-scoped behavior.
-        assert result.lint_command is not None
-        assert 'cockpit/src/cockpit/c3.py' in result.lint_command
-        assert 'cockpit/tests/test_c3.py' in result.lint_command
+        # Lint is rescoped into cockpit's own uv context (task 2355), not the
+        # fleet's hardcoded `--project shared` fallback (task 2036).
+        assert result.lint_command == (
+            'uv run --project cockpit ruff check cockpit/src/cockpit/c3.py cockpit/tests/test_c3.py'
+        )
+
+    def test_lint_command_scoped_to_cockpit_uv_context(self, tmp_path: Path) -> None:
+        """cockpit source + test file → lint_command runs in cockpit's own uv context.
+
+        Cold-verify dev-dep race (task 2355): the fleet-configured lint chain,
+        once scoped to the touched files, reprojects to the hardcoded
+        ``--project shared`` fallback (task 2036) — the wrong member's venv
+        for a cockpit-only diff, and one that races cockpit's own TEST-command
+        sync for cockpit's dev-group deps on a cold shared ``.venv``.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.lint_command == (
+            'uv run --project cockpit ruff check cockpit/src/cockpit/c3.py cockpit/tests/test_c3.py'
+        )
 
     def test_type_command_scoped_to_cockpit_uv_context(self, tmp_path: Path) -> None:
         """cockpit source + test file → type_check_command runs in cockpit's own uv context.
@@ -4509,7 +4531,11 @@ class TestBuildFallbackConfigSubprojectScoped:
         assert 'dashboard' not in result.type_check_command
 
     def test_source_only_change_yields_no_test_command(self, tmp_path: Path) -> None:
-        """A cockpit source-only diff (no test files touched) → test_command is None."""
+        """A cockpit source-only diff (no test files touched) → test_command is None.
+
+        lint/type scoping is not gated on test files: both must still target
+        cockpit's own uv context even though there is no test_command at all.
+        """
         worktree = self._make_cockpit_worktree(tmp_path)
         cfg = self._make_config(tmp_path)
 
@@ -4519,6 +4545,30 @@ class TestBuildFallbackConfigSubprojectScoped:
 
         assert result is not None
         assert result.test_command is None
+        assert result.lint_command == 'uv run --project cockpit ruff check cockpit/src/cockpit/c3.py'
+        assert result.type_check_command == (
+            'uv run --project cockpit npx pyright cockpit/src/cockpit/c3.py'
+        )
+
+    def test_noop_lint_and_type_commands_unchanged_in_subproject_branch(
+        self, tmp_path: Path,
+    ) -> None:
+        """`lint_command='true'` / `type_check_command='true'` stay `'true'` in the sub branch.
+
+        `_scope_fallback_tool_to_subproject` no-ops when the tool keyword is
+        absent — a no-op config must not be corrupted into
+        `uv run --project cockpit true`.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path, lint_command='true', type_check_command='true')
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.lint_command == 'true'
+        assert result.type_check_command == 'true'
 
     def test_repo_root_tests_dir_without_pyproject_uses_fleet_chain_verbatim(
         self, tmp_path: Path,
