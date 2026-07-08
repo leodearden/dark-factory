@@ -39,6 +39,7 @@ import httpx
 from dashboard.config import DashboardConfig
 from dashboard.data.orchestrator import _scan_worktrees
 from dashboard.data.tasks import fetch_external_statuses, fetch_statuses, fetch_tasks
+from dashboard.data.utils import resolve_now
 
 _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred', 'deferred'}
 
@@ -70,8 +71,13 @@ def _task_uid(project: str, task_id: int) -> str:
     return f'{project}/T-{task_id}'
 
 
-def _minutes_since(iso: str | None) -> int:
-    """Whole minutes between *iso* and now (UTC). 0 on parse failure / future."""
+def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int:
+    """Whole minutes between *iso* and *now* (UTC). 0 on parse failure / future.
+
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
+    pass an explicit value for deterministic results or to share one instant
+    across multiple rows in an aggregation.
+    """
     if not iso:
         return 0
     try:
@@ -80,7 +86,7 @@ def _minutes_since(iso: str | None) -> int:
         return 0
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
-    delta = datetime.now(UTC) - ts  # clock-exempt: deferred-consolidation (task 2281)
+    delta = resolve_now(now) - ts
     minutes = int(delta.total_seconds() // 60)
     return max(minutes, 0)
 
@@ -148,6 +154,7 @@ async def _shape_one_project(
     *,
     max_done_per_project: int = 0,
     max_cancelled_per_project: int = 0,
+    now: datetime | None = None,
 ) -> tuple[list[dict], bool, int]:
     """Build ``(active_tasks, offline, done_count)`` for a single project root.
 
@@ -212,7 +219,7 @@ async def _shape_one_project(
         uid = _task_uid(project, task_id)
         row = _build_task_row(project, task, task_id, wt, uid)
         # active rows: started from worktree creation time; deps from task tree.
-        row['started'] = _minutes_since(meta.get('created_at'))
+        row['started'] = _minutes_since(meta.get('created_at'), now=now)
         row['deps'] = deps
         active.append(row)
 
@@ -251,6 +258,7 @@ async def collect_tasks_with_counts(
     max_done_per_project: int = 0,
     max_cancelled_per_project: int = 0,
     resolve_external: bool = False,
+    now: datetime | None = None,
 ) -> tuple[list[dict], list[str], dict[str, int]]:
     """Aggregate active tasks and per-project done counts in a single MCP pass.
 
@@ -267,11 +275,17 @@ async def collect_tasks_with_counts(
     ``'unknown'`` sentinel.  Defaults to ``False`` so the scheduler-page path
     (``collect_active_tasks``) issues no extra MCP round-trip.
 
+    *now* is resolved ONCE (via :func:`dashboard.data.utils.resolve_now`) at
+    this aggregation boundary and threaded into every project's
+    ``_shape_one_project`` call, so every returned row's ``started`` shares
+    the same instant regardless of which project it came from.
+
     Prefer this over calling ``collect_active_tasks`` and
     ``collect_done_counts`` concurrently: it halves per-project MCP
     round-trips and guarantees that DONE_COUNTS matches the same snapshot
     as the ACTIVE_TASKS rows.
     """
+    effective_now = resolve_now(now)
     all_active: list[dict] = []
     offline_projects: list[str] = []
     done_counts: dict[str, int] = {}
@@ -280,6 +294,7 @@ async def collect_tasks_with_counts(
             client, config, root,
             max_done_per_project=max_done_per_project,
             max_cancelled_per_project=max_cancelled_per_project,
+            now=effective_now,
         )
         label = _project_label(root)
         if offline:
@@ -322,6 +337,7 @@ async def collect_active_tasks(
     *,
     max_done_per_project: int = 0,
     max_cancelled_per_project: int = 0,
+    now: datetime | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Collect active tasks across all known projects.
 
@@ -333,6 +349,10 @@ async def collect_active_tasks(
     are appended to the returned list (each with a ``completed`` field).
     Default 0 leaves the return shape unchanged — scheduler.py is unaffected.
 
+    *now* is forwarded to ``collect_tasks_with_counts`` so every row's
+    ``started`` derives from a single shared instant; see that function's
+    docstring for details. Defaults to the live clock.
+
     Lock state is surfaced via the scheduler endpoint — see
     /api/v2/dashboard/scheduler.
 
@@ -343,6 +363,7 @@ async def collect_active_tasks(
         client, config,
         max_done_per_project=max_done_per_project,
         max_cancelled_per_project=max_cancelled_per_project,
+        now=now,
     )
     return active, offline
 

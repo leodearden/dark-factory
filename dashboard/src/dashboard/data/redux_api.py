@@ -10,6 +10,7 @@ through the matching ``shape_*`` function before serialising as JSON.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from shared.timestamps import parse_timestamp_or_warn
 from dashboard.data.escalations import resolve_owning_project
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.stats_utils import percentile
+from dashboard.data.utils import resolve_now
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATORS + PROJECTS
@@ -214,7 +216,9 @@ _WAL_STALE_SECONDS = 3600
 _WAL_LOG_FRAMES_WARN = 5000
 
 
-def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
+def _shape_wal_status(
+    wal: Mapping[str, Any] | None, *, now: datetime | None = None,
+) -> dict[str, Any]:
     """Shape the get_wal_status payload into a redux-ready block.
 
     Returns ``{'status': 'ok' | 'warn' | 'red' | 'offline',
@@ -222,9 +226,12 @@ def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
     what the UI badges off of; ``rows`` carries per-store detail for an
     expanded panel. ``offline`` indicates we couldn't reach any
     fused-memory server.
-    """
-    from datetime import UTC, datetime
 
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
+    callers computing ages for multiple rows in one request should resolve it
+    once and pass the concrete value through so every row's age shares the
+    same reference instant.
+    """
     if not wal or wal.get('offline'):
         return {
             'status': 'offline',
@@ -235,7 +242,7 @@ def _shape_wal_status(wal: Mapping[str, Any] | None) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     worst_status: str = 'ok'
     worst_reason: str | None = None
-    now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
+    now = resolve_now(now)
 
     for server_url, stores in (wal.get('stores') or {}).items():
         if not isinstance(stores, Mapping):

@@ -44,7 +44,7 @@ from dashboard.data.orchestrator import (
 )
 from dashboard.data.reconciliation import get_buffer_stats, get_burst_state, partition_burst_state
 from dashboard.data.stats_utils import percentile
-from dashboard.data.utils import safe_gather_result
+from dashboard.data.utils import resolve_now, safe_gather_result
 
 logger = logging.getLogger(__name__)
 
@@ -341,7 +341,7 @@ async def _sample_curator(
         are swallowed and treated as 0/None — the function never propagates
         a top-level exception to the caller.
     """
-    effective_now = now if now is not None else datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
+    effective_now = resolve_now(now)
 
     # 1. HTTP pending count via fan_out_list_tickets (de-duped roots, first-success-per-root).
     _, pending_total = await fan_out_list_tickets(
@@ -472,7 +472,7 @@ async def collect_metrics_snapshot(
             sampling. Optional — when None the curator block records None
             centiles but still captures pending_total and capped_now.
     """
-    now_dt = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
+    now_dt = datetime.now(UTC)  # clock-exempt: single-capture writer
     now = now_dt.isoformat()
 
     # Orchestrators (synchronous; subprocess in to_thread).
@@ -527,9 +527,9 @@ async def collect_metrics_snapshot(
 
     # Reconciliation (read-only SQLite — get_buffer_stats + active-agent count).
     try:
-        buf = await get_buffer_stats(recon_db)
-        burst = await get_burst_state(recon_db)
-        active, _idle = partition_burst_state(burst)
+        buf = await get_buffer_stats(recon_db, now=now_dt)
+        burst = await get_burst_state(recon_db, now=now_dt)
+        active, _idle = partition_burst_state(burst, now=now_dt)
         await conn.execute(
             'INSERT OR REPLACE INTO recon_snapshots (ts, buffered_count, active_agents) '
             'VALUES (?, ?, ?)',
@@ -610,7 +610,7 @@ async def downsample_metrics(conn: aiosqlite.Connection) -> None:
     For per-project tables, partition key is (project_id, hour); for
     system-wide tables, partition key is just hour.
     """
-    now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
+    now = datetime.now(UTC)  # clock-exempt: single-capture retention cutoff
     cutoff_7d = (now - timedelta(days=7)).isoformat()
     cutoff_90d = (now - timedelta(days=90)).isoformat()
 
@@ -663,6 +663,7 @@ async def get_orchestrators_running_series(
     *,
     days: int = 1,
     project_id: str | None = None,
+    now: datetime | None = None,
 ) -> dict[str, list]:
     """Return total running-orchestrator count over time.
 
@@ -671,7 +672,7 @@ async def get_orchestrators_running_series(
     """
     if db is None:
         return dict(_EMPTY_SERIES)
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+    since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
         if project_id is None:
             sql = (
@@ -697,6 +698,7 @@ async def get_memory_sparks(
     db: aiosqlite.Connection | None,
     *,
     days: int = 1,
+    now: datetime | None = None,
 ) -> dict[str, dict[str, list]]:
     """Return system-wide Graphiti node + Mem0 memory sparks.
 
@@ -706,7 +708,7 @@ async def get_memory_sparks(
     empty = {'graphiti_nodes': dict(_EMPTY_SERIES), 'mem0_memories': dict(_EMPTY_SERIES)}
     if db is None:
         return empty
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+    since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
         async with db.execute(
             'SELECT ts, SUM(graphiti_nodes), SUM(mem0_memories) '
@@ -728,6 +730,8 @@ _24H_TOLERANCE_SECONDS = 2 * 3600  # accept rows within ±2h of the target
 
 async def get_memory_24h_ago(
     db: aiosqlite.Connection | None,
+    *,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Return {project_id: {graphiti_nodes, mem0_memories}} from ~24h ago.
 
@@ -738,7 +742,7 @@ async def get_memory_24h_ago(
     """
     if db is None:
         return {}
-    target = (datetime.now(UTC) - timedelta(hours=24)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+    target = (resolve_now(now) - timedelta(hours=24)).isoformat()
     try:
         async with db.execute(
             """
@@ -765,11 +769,12 @@ async def get_queue_pending_series(
     db: aiosqlite.Connection | None,
     *,
     days: int = 1,
+    now: datetime | None = None,
 ) -> dict[str, list]:
     """Return write-queue pending depth over time."""
     if db is None:
         return dict(_EMPTY_SERIES)
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+    since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
         async with db.execute(
             'SELECT ts, pending FROM queue_snapshots WHERE ts >= ? ORDER BY ts',
@@ -786,12 +791,13 @@ async def get_recon_sparks(
     db: aiosqlite.Connection | None,
     *,
     days: int = 1,
+    now: datetime | None = None,
 ) -> dict[str, dict[str, list]]:
     """Return reconciliation buffered_count and active_agents over time."""
     empty = {'buffered_count': dict(_EMPTY_SERIES), 'active_agents': dict(_EMPTY_SERIES)}
     if db is None:
         return empty
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+    since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
         async with db.execute(
             'SELECT ts, buffered_count, active_agents FROM recon_snapshots '
@@ -812,6 +818,7 @@ async def get_curator_sparks(
     db: aiosqlite.Connection | None,
     *,
     days: int = 1,
+    now: datetime | None = None,
 ) -> dict[str, dict[str, list]]:
     """Return curator pending-count and active-latency centile sparks.
 
@@ -827,7 +834,7 @@ async def get_curator_sparks(
     }
     if db is None:
         return empty
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+    since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
         async with db.execute(
             'SELECT ts, pending_total, p50_active_ms, p90_active_ms, p99_active_ms '
@@ -851,6 +858,7 @@ async def get_merge_active_series(
     *,
     project_id: str | None = None,
     days: int = 1,
+    now: datetime | None = None,
 ) -> dict[str, list]:
     """Return active merge-queue depth over time.
 
@@ -859,7 +867,7 @@ async def get_merge_active_series(
     """
     if db is None:
         return dict(_EMPTY_SERIES)
-    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+    since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
         if project_id is None:
             sql = (

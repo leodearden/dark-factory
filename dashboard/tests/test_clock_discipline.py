@@ -40,6 +40,7 @@ import ast
 from pathlib import Path
 
 _EXEMPT_MARKER = '# clock-exempt:'
+_DEFERRED_CONSOLIDATION_TAG = f'{_EXEMPT_MARKER} deferred-consolidation'
 
 
 def find_clock_violations(source: str) -> list[tuple[int, str]]:
@@ -167,6 +168,31 @@ def test_no_bare_clock_reads_in_data_modules():
     assert not violations, (
         'Bare datetime.now() reads found (missing resolve_now() or a '
         '`# clock-exempt:` tag):\n' + '\n'.join(violations)
+    )
+
+
+def test_no_deferred_consolidation_markers_remain():
+    """No data module carries the `deferred-consolidation` grandfather tag (task 2281).
+
+    Task 2192 grandfather-tagged 24 pre-existing bare clock reads across the 7
+    data modules with `# clock-exempt: deferred-consolidation (task 2281)` to
+    unblock the guard without doing the real work. Task 2281 retires every one
+    of those markers by converting each site to either real `resolve_now(now)`
+    threading or a genuine `# clock-exempt: single-capture ...` justification
+    tag. This is the outer double-loop acceptance test: RED until the final
+    module's marker is removed.
+    """
+    violations: list[str] = []
+    for path in sorted(_DATA_DIR.glob('*.py')):
+        rel = path.relative_to(_DATA_DIR.parent.parent)
+        for lineno, text in enumerate(path.read_text().splitlines(), start=1):
+            if _DEFERRED_CONSOLIDATION_TAG in text:
+                violations.append(f'{rel}:{lineno}: {text.strip()}')
+
+    assert not violations, (
+        'deferred-consolidation clock-exempt markers still present (task 2281 '
+        'must convert each to resolve_now() threading or a genuine '
+        'single-capture justification tag):\n' + '\n'.join(violations)
     )
 
 

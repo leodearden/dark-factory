@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 import aiosqlite
 
 from dashboard.data.db import with_db
-from dashboard.data.utils import parse_utc
+from dashboard.data.utils import parse_utc, resolve_now
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +38,17 @@ def partition_burst_state(
     burst_state: list[dict],
     *,
     active_threshold_seconds: int = _ACTIVE_THRESHOLD_SECONDS,
+    now: datetime | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Split burst agents into active and idle lists.
 
     Active means ``state != 'idle'`` **or** ``last_write_at`` within
     *active_threshold_seconds*.  Everything else is idle/stale.
+
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
+    pass an explicit value for deterministic results.
     """
-    now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
+    now = resolve_now(now)
     active: list[dict] = []
     idle: list[dict] = []
     for agent in burst_state:
@@ -229,11 +233,16 @@ async def get_last_attempted_run(db: aiosqlite.Connection | None) -> dict[str, d
 _BUFFER_STATS_DEFAULT = {'buffered_count': 0, 'oldest_event_age_seconds': None}
 
 
-async def get_buffer_stats(db: aiosqlite.Connection | None) -> dict:
+async def get_buffer_stats(db: aiosqlite.Connection | None, *, now: datetime | None = None) -> dict:
     """Return event buffer statistics: count and oldest event age.
 
     Returns dict with buffered_count (int) and oldest_event_age_seconds (float|None).
+
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
+    pass an explicit value for deterministic results.
     """
+    effective_now = resolve_now(now)
+
     async def _query(db: aiosqlite.Connection) -> dict:
         async with db.execute(
             "SELECT COUNT(*) FROM event_buffer WHERE status = 'buffered'",
@@ -250,7 +259,7 @@ async def get_buffer_stats(db: aiosqlite.Connection | None) -> dict:
         age = None
         if oldest_ts is not None:
             oldest_dt = parse_utc(oldest_ts).astimezone(UTC)
-            age = (datetime.now(UTC) - oldest_dt).total_seconds()  # clock-exempt: deferred-consolidation (task 2281)
+            age = (effective_now - oldest_dt).total_seconds()
 
         return {'buffered_count': count, 'oldest_event_age_seconds': age}
 
@@ -258,7 +267,10 @@ async def get_buffer_stats(db: aiosqlite.Connection | None) -> dict:
 
 
 async def get_burst_state(
-    db: aiosqlite.Connection | None, *, burst_cooldown_seconds: int = _DEFAULT_BURST_COOLDOWN,
+    db: aiosqlite.Connection | None,
+    *,
+    burst_cooldown_seconds: int = _DEFAULT_BURST_COOLDOWN,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Return current burst state for all agents with cooldown applied.
 
@@ -268,7 +280,12 @@ async def get_burst_state(
     must compute effective state at read time.
 
     Each dict contains: agent_id, state, last_write_at, burst_started_at.
+
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
+    pass an explicit value for deterministic results.
     """
+    effective_now = resolve_now(now)
+
     async def _query(db: aiosqlite.Connection) -> list[dict]:
         async with db.execute(
             'SELECT agent_id, state, last_write_at, burst_started_at'
@@ -277,7 +294,6 @@ async def get_burst_state(
         ) as cursor:
             rows = await cursor.fetchall()
 
-        now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
         results = []
         for row in rows:
             state = row['state']
@@ -287,7 +303,7 @@ async def get_burst_state(
             if state == 'bursting':
                 try:
                     last_write = parse_utc(row['last_write_at']).astimezone(UTC)
-                    if (now - last_write).total_seconds() > burst_cooldown_seconds:
+                    if (effective_now - last_write).total_seconds() > burst_cooldown_seconds:
                         state = 'idle'
                         burst_started = None
                 except (ValueError, TypeError) as exc:

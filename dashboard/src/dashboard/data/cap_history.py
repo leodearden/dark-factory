@@ -42,6 +42,7 @@ import aiosqlite
 
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.db import with_db
+from dashboard.data.utils import resolve_now
 
 # ---------------------------------------------------------------------------
 # CapInterval dataclass
@@ -73,11 +74,11 @@ def _to_utc(dt: datetime | None) -> datetime:
     current instant") and for arbitrary event timestamps parsed from the
     database (always a concrete ``datetime``):
 
-    - ``None`` → ``datetime.now(UTC)``
+    - ``None`` → the live clock, via :func:`dashboard.data.utils.resolve_now`
     - naive (no ``tzinfo``) → assumed UTC, attached via ``replace(tzinfo=UTC)``
     - tz-aware but non-UTC → converted via ``astimezone(UTC)``
     """
-    effective = dt if dt is not None else datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
+    effective = resolve_now(dt)
     if effective.tzinfo is None:
         return effective.replace(tzinfo=UTC)
     return effective.astimezone(UTC)

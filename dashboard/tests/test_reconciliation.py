@@ -418,6 +418,32 @@ class TestGetBufferStats:
 
         assert result == {'buffered_count': 0, 'oldest_event_age_seconds': None}
 
+    async def test_uses_provided_now_for_oldest_event_age(self, tmp_path):
+        """get_buffer_stats(now=fixed) computes oldest_event_age_seconds against fixed, not the live clock.
+
+        fixed is an arbitrary historical instant unrelated to the real current
+        time, so this only passes if the function actually threads `now` through
+        to the age computation.
+        """
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_buffer_stats
+
+        fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        oldest_ts = fixed - timedelta(hours=2)
+        inserts = [
+            (
+                "INSERT INTO event_buffer (id, project_id, event_type, event_source,"
+                " timestamp, status) VALUES (?, ?, ?, ?, ?, 'buffered')",
+                ('ev-1', 'dark_factory', 'memory_write', 'test', oldest_ts.isoformat()),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='buffer_fixed_now.db') as db:
+            result = await get_buffer_stats(db, now=fixed)
+
+        assert result['buffered_count'] == 1
+        assert result['oldest_event_age_seconds'] == pytest.approx(7200.0, abs=1.0)
+
 
 class TestGetBurstState:
     """Tests for get_burst_state."""
@@ -536,6 +562,57 @@ class TestGetBurstState:
             'bad last_write_at' in r.getMessage() and 'bad-agent' in r.getMessage()
             for r in debug_records
         ), f"Expected debug log with 'bad last_write_at' and 'bad-agent', got: {[r.getMessage() for r in debug_records]}"
+
+    async def test_uses_provided_now_cooldown_past_is_idle(self, tmp_path):
+        """get_burst_state(now=fixed): a bursting agent past cooldown relative to fixed is idle.
+
+        fixed is an arbitrary historical instant unrelated to the real current
+        time; if the cooldown check read the live clock instead of the passed
+        `now`, this seeded timestamp would misclassify (either direction),
+        so this only passes if `now` is genuinely threaded through.
+        """
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_burst_state
+
+        fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        # Default cooldown is 150s; 200s before fixed is past it.
+        stale_ts = (fixed - timedelta(seconds=200)).isoformat()
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+                " VALUES (?, 'bursting', ?, ?)",
+                ('stale-agent', stale_ts, (fixed - timedelta(seconds=300)).isoformat()),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='burst_fixed_now_idle.db') as db:
+            result = await get_burst_state(db, now=fixed)
+
+        assert len(result) == 1
+        assert result[0]['state'] == 'idle'
+        assert result[0]['burst_started_at'] is None
+
+    async def test_uses_provided_now_cooldown_active_stays_bursting(self, tmp_path):
+        """get_burst_state(now=fixed): a bursting agent within cooldown relative to fixed stays bursting."""
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_burst_state
+
+        fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        recent_ts = (fixed - timedelta(seconds=30)).isoformat()
+        inserts = [
+            (
+                "INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)"
+                " VALUES (?, 'bursting', ?, ?)",
+                ('active-agent', recent_ts, (fixed - timedelta(seconds=60)).isoformat()),
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='burst_fixed_now_active.db') as db:
+            result = await get_burst_state(db, now=fixed)
+
+        assert len(result) == 1
+        assert result[0]['state'] == 'bursting'
+        assert result[0]['burst_started_at'] is not None
 
 
 class TestGetLatestVerdict:
@@ -901,6 +978,26 @@ class TestPartitionBurstState:
             f'Expected no DEBUG logs for valid stale timestamp, got: '
             f'{[r.getMessage() for r in debug_records]}'
         )
+
+    def test_uses_provided_now_for_active_threshold(self):
+        """partition_burst_state(now=fixed) classifies idle agents against fixed, not the live clock.
+
+        Default active_threshold_seconds is 3600 (1 hour). last_write_at at
+        fixed-59min is inside the threshold (active); fixed-61min is outside
+        it (idle) — deterministic against the passed `now`, not real time.
+        """
+        from dashboard.data.reconciliation import partition_burst_state
+
+        fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        just_inside = (fixed - timedelta(minutes=59)).isoformat()
+        just_outside = (fixed - timedelta(minutes=61)).isoformat()
+        agents = [
+            {'agent_id': 'inside', 'state': 'idle', 'last_write_at': just_inside},
+            {'agent_id': 'outside', 'state': 'idle', 'last_write_at': just_outside},
+        ]
+        active, idle = partition_burst_state(agents, now=fixed)
+        assert [a['agent_id'] for a in active] == ['inside']
+        assert [a['agent_id'] for a in idle] == ['outside']
 
 
 class TestWithDb:

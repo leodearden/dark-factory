@@ -16,22 +16,28 @@ whether multi-DB aggregation applied here and concluded it is moot.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import aiosqlite
 
 from dashboard.data.db import with_db
+from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
 
-async def get_memory_timeseries(db: aiosqlite.Connection | None, *, hours: int = 24) -> dict:
+async def get_memory_timeseries(
+    db: aiosqlite.Connection | None, *, hours: int = 24, now: datetime | None = None,
+) -> dict:
     """Hourly read/write counts for the last *hours* hours.
 
     Returns ``{labels: ["HH:00", ...], reads: [int, ...], writes: [int, ...]}``.
     Labels cover every hour in the window, with zeros for gaps.
+
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
+    pass an explicit value for deterministic results.
     """
-    now = datetime.now(UTC)  # clock-exempt: deferred-consolidation (task 2281)
+    now = resolve_now(now)
     since = now - timedelta(hours=hours)
 
     # Pre-fill all hour buckets
@@ -66,12 +72,17 @@ async def get_memory_timeseries(db: aiosqlite.Connection | None, *, hours: int =
     }
 
 
-async def get_operations_breakdown(db: aiosqlite.Connection | None, *, hours: int = 24) -> dict:
+async def get_operations_breakdown(
+    db: aiosqlite.Connection | None, *, hours: int = 24, now: datetime | None = None,
+) -> dict:
     """Operation type distribution for the last *hours* hours.
 
     Returns ``{labels: [str, ...], values: [int, ...]}``.
+
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
+    pass an explicit value for deterministic results.
     """
-    since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+    since = (resolve_now(now) - timedelta(hours=hours)).isoformat()
 
     async def _query(db: aiosqlite.Connection) -> dict:
         async with db.execute(
@@ -88,12 +99,17 @@ async def get_operations_breakdown(db: aiosqlite.Connection | None, *, hours: in
     return await with_db(db, _query, {'labels': [], 'values': []})
 
 
-async def get_agent_breakdown(db: aiosqlite.Connection | None, *, hours: int = 24) -> dict:
+async def get_agent_breakdown(
+    db: aiosqlite.Connection | None, *, hours: int = 24, now: datetime | None = None,
+) -> dict:
     """Agent distribution for the last *hours* hours.
 
     Returns ``{labels: [str, ...], values: [int, ...]}``.
+
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
+    pass an explicit value for deterministic results.
     """
-    since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()  # clock-exempt: deferred-consolidation (task 2281)
+    since = (resolve_now(now) - timedelta(hours=hours)).isoformat()
 
     async def _query(db: aiosqlite.Connection) -> dict:
         async with db.execute(
