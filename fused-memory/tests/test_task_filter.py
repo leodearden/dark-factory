@@ -3220,3 +3220,152 @@ class TestDiffStatusCorrection:
         assert result_tuple['diverged'] is False
         assert result_set['active_mismatch'] is False
         assert result_set['diverged'] is False
+
+
+# ---------------------------------------------------------------------------
+# Conflicting task-status framing detection (task 2276)
+# ---------------------------------------------------------------------------
+
+
+class TestConflictingTaskStatusFraming:
+    """Tests for find_conflicting_task_status_ids() / is_conflicting_task_status_framing()
+    in task_filter.py.
+
+    Detects a single write that frames the SAME task_id as both non-terminal
+    (pending/in-progress/still/...) and terminal (merged/landed/done/...) — the
+    before/after narration shape that causes Graphiti extraction to emit two
+    co-current, self-contradictory edges for that task_id (Reify Stage-2 finding
+    40aec136: episode valid_at 2026-06-28T21:23:41Z, edges e1fb68cc stale
+    non-terminal + 10ceb4b9 accurate terminal, both naming task 4802).
+
+    Distinct from is_mixed_temporal_framing (task 1950): that detector checks
+    whole-text co-occurrence of generic prior/resulting-state prose markers with
+    no task_id anchoring, so two DIFFERENT tasks with different statuses would
+    false-positive there but must NOT fire here — this detector requires the
+    SAME task_id to be tagged both ways.
+    """
+
+    # ------------------------------------------------------------------ #
+    # positive fixtures (conflicting framing -> True / non-empty set)
+    # ------------------------------------------------------------------ #
+
+    def test_positive_incident_cross_sentence_shape(self):
+        """The exact Reify Stage-2 incident shape (cross-sentence, same id) must fire."""
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = (
+            '...still-pending Task 4802 stale. Task 4802 had already landed as '
+            'merge commit eb7f5d6437.'
+        )
+        assert find_conflicting_task_status_ids(text) == {4802}, (
+            f'Expected find_conflicting_task_status_ids to return {{4802}} for the '
+            f'incident cross-sentence shape.\ntext={text!r}'
+        )
+
+    def test_positive_intra_sentence_shape(self):
+        """A single-sentence 'was pending but has now landed' shape (same id) must fire."""
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'Task 512 was pending but has now landed.'
+        assert find_conflicting_task_status_ids(text) == {512}, (
+            f'Expected find_conflicting_task_status_ids to return {{512}} for the '
+            f'intra-sentence pending+landed shape.\ntext={text!r}'
+        )
+
+    def test_positive_case_insensitive(self):
+        """Uppercase TASK/DONE and lowercase task/pending must both be recognized."""
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = (
+            'TASK 77 DONE as of the deploy. Unrelated update happened. Meanwhile '
+            'task 77 still pending in the queue.'
+        )
+        assert find_conflicting_task_status_ids(text) == {77}, (
+            f'Expected find_conflicting_task_status_ids to return {{77}} '
+            f'case-insensitively.\ntext={text!r}'
+        )
+
+    def test_is_conflicting_task_status_framing_true_for_incident_shape(self):
+        """is_conflicting_task_status_framing must mirror find_...ids() as a bool."""
+        from fused_memory.reconciliation.task_filter import is_conflicting_task_status_framing
+
+        text = (
+            '...still-pending Task 4802 stale. Task 4802 had already landed as '
+            'merge commit eb7f5d6437.'
+        )
+        assert is_conflicting_task_status_framing(text) is True, (
+            f'Expected is_conflicting_task_status_framing to return True for the '
+            f'incident shape, got False.\ntext={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # negative fixtures (must return False / empty set)
+    # ------------------------------------------------------------------ #
+
+    def test_negative_two_different_task_ids(self):
+        """Two DIFFERENT ids, each singly-framed, must NOT fire — precision check.
+
+        This is the key differentiator from is_mixed_temporal_framing (task 1950),
+        which checks whole-text marker co-occurrence with no task_id anchoring and
+        would false-positive on this extremely common, legitimate shape.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'Task 100 is done. Task 200 is still pending.'
+        assert find_conflicting_task_status_ids(text) == set(), (
+            f'Expected empty set for two different ids with different statuses, '
+            f'got a non-empty set.\ntext={text!r}'
+        )
+
+    def test_negative_terminal_only(self):
+        """Terminal-only framing for one id must NOT fire."""
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'Task 4802 has landed as merge commit eb7f5d6437.'
+        assert find_conflicting_task_status_ids(text) == set(), (
+            f'Expected empty set for terminal-only framing.\ntext={text!r}'
+        )
+
+    def test_negative_non_terminal_only(self):
+        """Non-terminal-only framing for one id must NOT fire."""
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'Task 4802 is still pending.'
+        assert find_conflicting_task_status_ids(text) == set(), (
+            f'Expected empty set for non-terminal-only framing.\ntext={text!r}'
+        )
+
+    def test_negative_negated_terminal_is_not_mistagged(self):
+        """'not yet merged' is a consistent non-terminal statement — the negated-
+        terminal span must be stripped before terminal detection so this does NOT
+        fire.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'Task 4802 is not yet merged.'
+        assert find_conflicting_task_status_ids(text) == set(), (
+            f'Expected empty set — negated-terminal ("not yet merged") must not be '
+            f'mis-tagged as a terminal outcome.\ntext={text!r}'
+        )
+
+    def test_negative_no_task_reference(self):
+        """Contradiction-shaped prose with NO explicit task reference must NOT fire —
+        the detector is anchored on explicit 'task N'/'df N'/'#N' references, not
+        bare status vocabulary.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'the build is done but tests are still pending'
+        assert find_conflicting_task_status_ids(text) == set(), (
+            f'Expected empty set when no explicit task reference is present.\ntext={text!r}'
+        )
+
+    def test_is_conflicting_task_status_framing_false_for_different_ids(self):
+        """is_conflicting_task_status_framing must mirror find_...ids() as a bool."""
+        from fused_memory.reconciliation.task_filter import is_conflicting_task_status_framing
+
+        text = 'Task 100 is done. Task 200 is still pending.'
+        assert is_conflicting_task_status_framing(text) is False, (
+            f'Expected is_conflicting_task_status_framing to return False for two '
+            f'different ids, got True.\ntext={text!r}'
+        )

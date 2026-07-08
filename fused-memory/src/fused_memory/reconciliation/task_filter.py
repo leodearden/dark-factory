@@ -213,6 +213,124 @@ def extract_batch_plan_task_ids(text: str) -> set[int]:
 
 
 # --------------------------------------------------------------------------- #
+# Conflicting task-status framing detection (task 2276)
+# --------------------------------------------------------------------------- #
+#
+# Reify Stage-2 finding 40aec136 found a single source episode (valid_at
+# 2026-06-28T21:23:41Z) that produced TWO co-current edges on reify's
+# 'orchestrator' entity naming the SAME task_id 4802: a stale non-terminal
+# fragment (edge e1fb68cc, "...still-pending Task 4802 stale.") and an
+# accurate terminal fragment (edge 10ceb4b9, "Task 4802 had already landed as
+# merge commit eb7f5d6437."). Before/after narration in ONE write is atomized
+# by Graphiti extraction into two self-contradictory edges, and nothing
+# reconciles them at write time.
+#
+# This is distinct from is_mixed_temporal_framing (task 1950) above: that
+# detector checks whole-text co-occurrence of two generic prose-transition
+# markers with NO task_id anchoring, so it cannot distinguish a same-task
+# contradiction from the extremely common, legitimate shape of two DIFFERENT
+# tasks with different statuses ("Task 100 is done. Task 200 is still
+# pending."). Anchoring on the SAME explicit task reference ('task N'/'df
+# N'/'#N', not bare digits — avoids false ids from dates/commit hashes/ports)
+# appearing with both a non-terminal and a terminal marker is what makes this
+# detector precise enough to safely reject rather than merely warn.
+#
+# Detection is deterministic lexical matching (word-boundary alternation over
+# fixed marker lists, clause-scoped), mirroring is_count_snapshot and
+# is_mixed_temporal_framing above rather than semantic/LLM classification: no
+# fragile thresholds, fully unit-testable. This may occasionally false-positive
+# on prose that coincidentally pairs both marker classes with the same id
+# without an actual contradiction; the impact is bounded — a rejected recon
+# write is simply rephrased and retried, the same tolerance documented for the
+# sibling detectors in this module.
+#
+# NOTE (amendment, reviewer_comprehensive precision finding): a few candidate
+# markers are generic enough on their own to co-occur with a task id and the
+# OTHER marker class in the same clause without describing that task's status
+# at all, e.g. "Task 4802 landed and the tests still pass." (bare 'still' has
+# nothing to do with task 4802's status). 'still' and 'actively' are tightened
+# below to require a following status-bearing word so they only fire on actual
+# status phrases ("still pending", "actively being worked"). Bare
+# 'closed'/'resolved'/'finished' are dropped from TERMINAL_OUTCOME_RE entirely
+# rather than tightened — they describe non-task things just as often (an
+# office closed, a disagreement resolved, a meeting finished) and there is no
+# cheap phrase-level qualifier that reliably disambiguates; the resulting
+# recall loss is acceptable under the fail-open-on-under-firing philosophy
+# documented above.
+TASK_REF_RE: re.Pattern[str] = re.compile(
+    r'(?:\btask\b|\bdf\b|#)\s*#?\s*(\d+)\b',
+    re.IGNORECASE,
+)
+
+NON_TERMINAL_STATUS_RE: re.Pattern[str] = re.compile(
+    r'\b(?:pending|in[-\s]progress|'
+    r'still\s+(?:pending|open|outstanding|unresolved|active|ongoing)|'
+    r'actively\s+(?:being\s+worked|working|in[-\s]progress)|'
+    r'(?:still|remains?|left)\s+outstanding|'
+    r'being\s+worked|awaiting|not\s+yet|unmerged|wip)\b',
+    re.IGNORECASE,
+)
+
+TERMINAL_OUTCOME_RE: re.Pattern[str] = re.compile(
+    r'\b(?:merged|landed|merge\s+commit|done|cancell?ed|completed|shipped)\b',
+    re.IGNORECASE,
+)
+
+# Negation guard: a negated terminal outcome ("not yet merged", "hasn't landed")
+# is a consistent NON-terminal statement, not a contradiction. Spans matching
+# this are stripped from a clause before running TERMINAL_OUTCOME_RE against it,
+# so a task described only as "not yet merged" isn't mis-tagged terminal.
+NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
+    r"\b(?:not|never|hasn't|has\s+not|yet\s+to\s+be)\s+(?:yet\s+|been\s+)*"
+    r'(?:merged|landed|done|cancell?ed|completed|shipped)\b',
+    re.IGNORECASE,
+)
+
+# Sentence-ish clause boundary: '.', ';', newline, '!', '?'.
+_CLAUSE_SPLIT_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
+
+
+def find_conflicting_task_status_ids(text: str) -> set[int]:
+    """Return task ids that are framed as BOTH non-terminal and terminal in `text`.
+
+    Splits text into clauses on sentence terminators ([.;\\n!?]). Within each
+    clause, extracts explicit task references via TASK_REF_RE ('task N'/'df
+    N'/'#N', not bare digits) and tags each referenced id as non-terminal when
+    the clause matches NON_TERMINAL_STATUS_RE and/or terminal when a
+    negation-stripped copy of the clause matches TERMINAL_OUTCOME_RE. Returns
+    the set of ids tagged both ways across the whole text (not necessarily in
+    the same clause — the incident shape spans two sentences).
+
+    Pure: no I/O, no side effects.
+    """
+    non_terminal_ids: set[int] = set()
+    terminal_ids: set[int] = set()
+
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        if not clause:
+            continue
+        ids_in_clause = {int(m) for m in TASK_REF_RE.findall(clause)}
+        if not ids_in_clause:
+            continue
+
+        if NON_TERMINAL_STATUS_RE.search(clause):
+            non_terminal_ids.update(ids_in_clause)
+
+        de_negated_clause = NEGATED_TERMINAL_RE.sub('', clause)
+        if TERMINAL_OUTCOME_RE.search(de_negated_clause):
+            terminal_ids.update(ids_in_clause)
+
+    return non_terminal_ids & terminal_ids
+
+
+def is_conflicting_task_status_framing(text: str) -> bool:
+    """Return True when `text` frames the same task_id as both non-terminal and
+    terminal — see find_conflicting_task_status_ids for the full algorithm.
+    """
+    return bool(find_conflicting_task_status_ids(text))
+
+
+# --------------------------------------------------------------------------- #
 # Status constants
 # --------------------------------------------------------------------------- #
 
