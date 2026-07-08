@@ -3113,6 +3113,98 @@ class TestReconcileEpisodeIdentity:
 
         service._normalize_task_node_names.assert_not_awaited()
 
+    # ------------------------------------------------------------------
+    # Task 2319 step-7: _invalidate_stale_superseded_ttl_edges wiring
+    # ------------------------------------------------------------------
+
+    def test_reconcile_stats_stale_ttl_edges_invalidated_defaults_to_zero(self):
+        """ReconcileStats.stale_ttl_edges_invalidated defaults to 0."""
+        from fused_memory.services.memory_service import ReconcileStats
+
+        assert ReconcileStats().stale_ttl_edges_invalidated == 0
+
+    @pytest.mark.asyncio
+    async def test_invokes_invalidate_stale_ttl_edges_sub_pass(self, service):
+        """The sixth sub-pass, _invalidate_stale_superseded_ttl_edges, is
+        awaited exactly once with (result, group_id='proj'), its count lands
+        in ReconcileStats.stale_ttl_edges_invalidated, and it runs after
+        _restore_falsely_superseded_sibling_edges and before
+        _dedup_episode_nodes (grouping the edge-temporal passes together)."""
+        from unittest.mock import Mock
+
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=0)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=0)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=0)
+        service._invalidate_stale_superseded_ttl_edges = AsyncMock(return_value=2)
+        service._dedup_episode_nodes = AsyncMock(return_value=0)
+        service._normalize_task_node_names = AsyncMock(return_value=0)
+
+        manager = Mock()
+        manager.attach_mock(
+            service._restore_falsely_superseded_sibling_edges,
+            '_restore_falsely_superseded_sibling_edges',
+        )
+        manager.attach_mock(
+            service._invalidate_stale_superseded_ttl_edges,
+            '_invalidate_stale_superseded_ttl_edges',
+        )
+        manager.attach_mock(service._dedup_episode_nodes, '_dedup_episode_nodes')
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='proj')
+
+        service._invalidate_stale_superseded_ttl_edges.assert_awaited_once_with(
+            mock_result, group_id='proj'
+        )
+        assert stats.stale_ttl_edges_invalidated == 2
+
+        expected_order = [
+            '_restore_falsely_superseded_sibling_edges',
+            '_invalidate_stale_superseded_ttl_edges',
+            '_dedup_episode_nodes',
+        ]
+        call_order = [c[0] for c in manager.mock_calls if c[0] in expected_order]
+        assert call_order == expected_order, (
+            'new sub-pass must run after sibling-restore and before node-dedup, '
+            f'got {call_order!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalidate_stale_ttl_edges_failure_is_best_effort(self, service):
+        """A generic Exception raised by _invalidate_stale_superseded_ttl_edges
+        does not propagate: the count stays at the ReconcileStats default (0),
+        its label lands in stats.errors, and the other sub-passes (including
+        those after it in the chain) are unaffected — mirroring the existing
+        per-sub-pass best-effort guard test."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._restore_superseded_dependency_edges = AsyncMock(return_value=2)
+        service._restore_falsely_superseded_sibling_edges = AsyncMock(return_value=3)
+        service._invalidate_stale_superseded_ttl_edges = AsyncMock(
+            side_effect=RuntimeError('lock contention')
+        )
+        service._dedup_episode_nodes = AsyncMock(return_value=4)
+        service._normalize_task_node_names = AsyncMock(return_value=5)
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='proj')
+
+        service._dedup_episode_nodes.assert_awaited_once_with(mock_result, group_id='proj')
+        assert stats.stale_ttl_edges_invalidated == 0, (
+            'the failed sub-pass must leave its count at the default'
+        )
+        assert '_invalidate_stale_superseded_ttl_edges' in stats.errors
+        assert stats.edges_deduped == 1
+        assert stats.dependency_edges_restored == 2
+        assert stats.sibling_edges_restored == 3
+        assert stats.nodes_resolved == 4, 'sub-passes after the failure must still run'
+        assert stats.task_names_normalized == 5
+
 
 # ---------------------------------------------------------------------------
 # Tests for _execute_graphiti_write integration with dedup  (steps 8, 10)
