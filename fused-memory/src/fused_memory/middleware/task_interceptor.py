@@ -1037,6 +1037,36 @@ class TaskInterceptor:
 
         return result
 
+    # ── Claimant-only writes (no status-FSM gate) ───────────────────────
+
+    async def set_task_claimant(
+        self,
+        task_id: str,
+        project_root: str,
+        *,
+        claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
+        heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+        tag: str | None = None,
+    ) -> dict:
+        """Stamp/refresh/clear claimant_run_id/heartbeat_at without touching status.
+
+        Thin delegate to the backend's dedicated ``set_task_claimant`` (task 2182)
+        — mirrors ``get_statuses``: no write-lock, no event emission, no
+        reconciliation. Tri-state preserved across the boundary: a string
+        stamps the column, explicit ``None`` clears it to NULL (release), and
+        the default ``_UNSET`` is omitted from the backend call entirely so
+        its own default takes over and the column is left untouched.
+        """
+        tm = await self._ensure_taskmaster()
+        claimant_kwargs: dict[str, Any] = {}
+        if claimant_run_id is not _UNSET:
+            claimant_kwargs['claimant_run_id'] = claimant_run_id
+        if heartbeat_at is not _UNSET:
+            claimant_kwargs['heartbeat_at'] = heartbeat_at
+        return await tm.set_task_claimant(
+            task_id=task_id, project_root=project_root, tag=tag, **claimant_kwargs,
+        )
+
     # ── Curator helpers ────────────────────────────────────────────────
 
     async def _get_curator(self) -> TaskCurator | None:
