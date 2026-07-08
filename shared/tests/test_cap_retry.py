@@ -2753,3 +2753,66 @@ class TestCapRetryMaxCapRetries:
                 gate, 'unbounded', prompt='hi',
             )
         assert got.success is True
+
+
+# ===================================================================
+# TestCapRetryRebuildPrompt  (task W4-zeta step-3)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryRebuildPrompt:
+    """rebuild_prompt: optional hook invoked on an unresumable cap retry.
+
+    Fires only on the two FRESH (unresumable) cap-retry paths, with
+    session_lost=True, so the caller can rebuild its prompt (e.g. with fresh
+    pending escalations) instead of reusing the stale original_prompt. The
+    resumable path (session_id present) is untouched — it keeps
+    CAP_HIT_RESUME_PROMPT and resumes, never calling rebuild_prompt.
+    """
+
+    async def test_rebuild_prompt_invoked_on_unresumable_cap(self):
+        """On a cap hit with no session_id, rebuild_prompt(True) replaces the prompt."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct',
+        )
+        capped = make_result(session_id='')  # unresumable
+        ok = make_result()
+        rebuild = AsyncMock(return_value='FRESH ESCALATIONS PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
+            )
+        rebuild.assert_awaited_once_with(True)
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'FRESH ESCALATIONS PROMPT'
+        assert 'resume_session_id' not in second.kwargs
+
+    async def test_rebuild_prompt_not_called_on_resumable_cap(self):
+        """On a cap hit WITH a session_id, the resume path is untouched — no rebuild."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct',
+        )
+        capped = make_result(session_id='sess-1')  # resumable
+        ok = make_result()
+        rebuild = AsyncMock(return_value='FRESH ESCALATIONS PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
+            )
+        rebuild.assert_not_awaited()
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') == 'sess-1'
+        assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
