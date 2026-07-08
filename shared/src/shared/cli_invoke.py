@@ -139,7 +139,13 @@ __all__ = [
 
 
 class AllAccountsCappedException(Exception):
-    """Raised when the cap-hit retry loop exceeds the sanity-bound wall-clock deadline.
+    """Raised when the cap-hit retry loop exceeds its patience bound.
+
+    Two independent bounds share this exception, both raised from the same
+    ``_check_cap_wait`` choke point inside ``invoke_with_cap_retry``:
+    - the wall-clock ``cap_wait_sanity_secs`` sanity deadline (default 14
+      days), and
+    - the count-based ``max_cap_retries`` bound, when the caller opts in.
 
     Attributes:
     - ``retries``: number of consecutive cap hits before giving up
@@ -711,6 +717,14 @@ async def invoke_with_cap_retry(
     ``None``, which preserves the existing fresh-retry behaviour (reuse the
     original prompt unchanged).
 
+    The ``session_lost`` argument is currently always ``True`` — every wired
+    call site is an unresumable cap retry.  It is kept as an explicit
+    parameter (rather than a no-arg callable) as a forward-compat placeholder
+    matching the caller contract in PRD §7.4, so a future resumable-path call
+    (if ever wired) needs no signature change.  If the hook itself raises,
+    the failure is caught and logged, and the retry falls back to the
+    already-restored original prompt rather than aborting the retry loop.
+
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
 
@@ -790,10 +804,27 @@ async def invoke_with_cap_retry(
         session_lost is always True at both call sites (exact-detect and
         heuristic FRESH cap paths) — this helper only runs where the capped
         session cannot be resumed, per the rebuild_prompt hook contract
-        (PRD §7.4 / task W4-zeta). Closes over: rebuild_prompt, invoke_kwargs.
+        (PRD §7.4 / task W4-zeta). Closes over: rebuild_prompt, invoke_kwargs,
+        label.
+
+        A failure raised by the caller's hook (e.g. a transient I/O/MCP error
+        while re-gathering pending escalations) is caught and logged rather
+        than propagated: propagating would abort the entire patient cap-retry
+        loop over a transient hook failure.  ``invoke_kwargs['prompt']`` was
+        already restored to ``original_prompt`` by the preceding
+        ``_reset_for_fresh_retry`` call, so on failure it is simply left as
+        that already-restored value — the retry degrades to the stale
+        original prompt instead of dying.
         """
-        if rebuild_prompt is not None:
+        if rebuild_prompt is None:
+            return
+        try:
             invoke_kwargs['prompt'] = await rebuild_prompt(True)
+        except Exception:
+            logger.warning(
+                f'{label}: rebuild_prompt hook raised — falling back to original prompt',
+                exc_info=True,
+            )
 
     account_name = ''
     unattributed_cap = False  # True when heuristic fires but token is unresolvable;
