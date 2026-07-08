@@ -5118,3 +5118,86 @@ class TestPredicateModeTimeout:
 
         scheduler.set_task_status.assert_awaited_once_with('703', 'blocked')
         unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Step-7: RED — B10 predicate resume: gate_escalated_at set + escalation
+# resolved -> done with deterministic-milestone provenance (NOT
+# deterministic-deploy). (RED until step-8 adds the predicate-aware resume
+# branch in section 1, before the before_done_ran_at NotImplementedError check)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateModeResume:
+    """DeterministicRunner — predicate resume/quiescence via gate_escalated_at (B10).
+
+    A predicate never stamps before_done_ran_at (read-only, I1 doesn't
+    apply), so the section-1 resolved-escalation branch must short-circuit
+    for a predicate BEFORE the before_done_ran_at proof-check that the deploy
+    path relies on — otherwise resume would wrongly raise NotImplementedError.
+    """
+
+    async def test_predicate_resume_no_open_escalation_drives_to_done(self, tmp_path: Path):
+        """gate_escalated_at set + no pending escalation + NO before_done_ran_at
+        -> must NOT raise NotImplementedError; drives to DONE with
+        deterministic-milestone provenance (not deterministic-deploy) (B10)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        # gate already escalated (milestone_check_failed); escalation resolved
+        # (no pending); before_done_ran_at is intentionally NEVER set for a
+        # read-only predicate.
+        task = _predicate_task(task_id='703', gate_escalated_at='2026-07-08T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty queue — escalation resolved
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        # Must NOT raise NotImplementedError — a predicate never stamps
+        # before_done_ran_at, so the proof-check must not apply to it.
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with(
+            '703',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-milestone',
+                'note': 'resumed after milestone_check_failed resolution',
+            },
+        )
+        assert scheduler.set_task_status.call_args.kwargs['done_provenance']['kind'] != (
+            'deterministic-deploy'
+        ), 'predicate resume must not claim a systemd deploy happened'
+
+    async def test_predicate_resume_quiescence_open_escalation_returns_blocked(
+        self, tmp_path: Path,
+    ):
+        """gate_escalated_at set + still-open milestone_check_failed escalation
+        -> BLOCKED, no second escalation filed, no done write (B10 quiescence).
+
+        Already green via the unchanged section-1 pending branch — this test
+        locks the contract rather than driving new behaviour.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='703', gate_escalated_at='2026-07-08T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+
+        # Pre-seed one pending milestone_check_failed escalation (as B8 would file)
+        _seed_escalation(
+            queue, '703', 'orchestrator-deterministic', category='milestone_check_failed',
+        )
+
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('703', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+
+        scheduler.set_task_status.assert_not_awaited()
