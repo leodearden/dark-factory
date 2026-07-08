@@ -5562,6 +5562,310 @@ class TestInvalidateStaleSupersededTtlEdges:
         assert count == 1
         assert service.graphiti.update_edge.await_count == 2
 
+    # -- Task 2351: reserve_now-shaped priority-override facts ------------
+
+    @pytest.mark.asyncio
+    async def test_invalidates_stale_reserve_now_edge_after_fresh_write(self, service):
+        """Same-subject repro for the reserve_now scalar (task 2351): a
+        fresh reserve_now=false write leaves a pre-existing stale
+        reserve_now=true edge on the SAME subject un-invalidated by
+        Graphiti's upstream resolver; the guard must invalidate it."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_new = MockEdge(
+            fact='Task 3001 priority override reserve_now set to false',
+            uuid='fresh-reserve-false',
+            source_node_uuid='Task3001', target_node_uuid='reserve_now',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_new]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task3001':
+                return [
+                    {'uuid': 'fresh-reserve-false',
+                     'fact': 'Task 3001 priority override reserve_now set to false',
+                     'name': ''},
+                    {'uuid': 'stale-reserve-true',
+                     'fact': 'Task 3001 has priority override reserve_now enabled',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'stale-reserve-true', 'fact': 'y', 'refreshed_nodes': []}
+        )
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        assert count == 1
+        service.graphiti.update_edge.assert_awaited_once_with(
+            'stale-reserve-true', group_id='proj', invalid_at=ts,
+        )
+
+    @pytest.mark.asyncio
+    async def test_does_not_invalidate_other_subject_reserve_now_edge(self, service):
+        """CROSS-ENTITY GUARD for reserve_now: a valid priority-override
+        reserve_now edge belonging to a DIFFERENT subject must never be
+        invalidated, even though it shares the generic 'reserve_now' target
+        node with the fresh edge. Because the hook queries only the
+        subject/source node (Task3001), the other subject's edge (reachable
+        only via the shared target node) is never seen."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_new = MockEdge(
+            fact='Task 3001 priority override reserve_now set to false',
+            uuid='fresh-reserve-false',
+            source_node_uuid='Task3001', target_node_uuid='reserve_now',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_new]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task3001':
+                return [
+                    {'uuid': 'fresh-reserve-false',
+                     'fact': 'Task 3001 priority override reserve_now set to false',
+                     'name': ''},
+                    {'uuid': 'stale-reserve-true',
+                     'fact': 'Task 3001 has priority override reserve_now enabled',
+                     'name': ''},
+                ]
+            if node_uuid == 'reserve_now':
+                # Undirected query on the SHARED target node also surfaces a
+                # DIFFERENT subject's valid, current reserve_now edge.
+                return [
+                    {'uuid': 'fresh-reserve-false',
+                     'fact': 'Task 3001 priority override reserve_now set to false',
+                     'name': ''},
+                    {'uuid': 'other-task-reserve-now',
+                     'fact': 'Task 3002 has priority override reserve_now enabled',
+                     'name': ''},
+                    {'uuid': 'stale-reserve-true',
+                     'fact': 'Task 3001 has priority override reserve_now enabled',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'stale-reserve-true', 'fact': 'y', 'refreshed_nodes': []}
+        )
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        invalidated_uuids = {c.args[0] for c in service.graphiti.update_edge.await_args_list}
+        assert 'other-task-reserve-now' not in invalidated_uuids, (
+            'cross-entity over-invalidation: a different subject has had its '
+            f'valid reserve_now edge invalidated; invalidated={invalidated_uuids!r}'
+        )
+        assert invalidated_uuids == {'stale-reserve-true'}
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_leaves_non_reserve_now_override_edge_untouched(self, service):
+        """A non-reserve_now override edge (e.g. boost_tier) on the same
+        subject is a distinct, legitimately-coexisting predicate — it must
+        never be invalidated alongside a fresh reserve_now fact."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_new = MockEdge(
+            fact='Task 3001 priority override reserve_now set to false',
+            uuid='fresh-reserve-false',
+            source_node_uuid='Task3001', target_node_uuid='reserve_now',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_new]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task3001':
+                return [
+                    {'uuid': 'fresh-reserve-false',
+                     'fact': 'Task 3001 priority override reserve_now set to false',
+                     'name': ''},
+                    {'uuid': 'boost-1',
+                     'fact': 'Task 3001 priority override boost_tier set to high',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock()
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        assert count == 0
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fresh_reserve_now_does_not_invalidate_valid_ttl_edge(self, service):
+        """CROSS-PREDICATE GUARD (esc-2351-1): a fresh reserve_now write on a
+        subject that ALSO has a still-valid priority-override TTL edge must
+        NOT invalidate that TTL edge. TTL and reserve_now are distinct,
+        legitimately-coexisting single-valued scalars; a reserve_now write
+        does not contradict a TTL value. The union scalar matcher would have
+        collapsed them and wrongly invalidated the valid TTL edge."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_new = MockEdge(
+            fact='Task 3001 priority override reserve_now set to false',
+            uuid='fresh-reserve-false',
+            source_node_uuid='Task3001', target_node_uuid='reserve_now',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_new]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task3001':
+                return [
+                    {'uuid': 'fresh-reserve-false',
+                     'fact': 'Task 3001 priority override reserve_now set to false',
+                     'name': ''},
+                    # A DISTINCT, still-valid TTL scalar on the same subject.
+                    {'uuid': 'valid-ttl-edge',
+                     'fact': 'Task 3001 priority override TTL of 600 seconds',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock()
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        assert count == 0, (
+            'cross-predicate over-invalidation: a fresh reserve_now write '
+            'invalidated a still-valid TTL override edge on the same subject'
+        )
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fresh_ttl_does_not_invalidate_valid_reserve_now_edge(self, service):
+        """Symmetric CROSS-PREDICATE GUARD (esc-2351-1): a fresh TTL write on a
+        subject that ALSO has a still-valid reserve_now edge must NOT
+        invalidate that reserve_now edge."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_new = MockEdge(
+            fact='Task 3001 priority override TTL of 600 seconds',
+            uuid='fresh-ttl-edge',
+            source_node_uuid='Task3001', target_node_uuid='TTL',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_new]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task3001':
+                return [
+                    {'uuid': 'fresh-ttl-edge',
+                     'fact': 'Task 3001 priority override TTL of 600 seconds',
+                     'name': ''},
+                    # A DISTINCT, still-valid reserve_now scalar on the same subject.
+                    {'uuid': 'valid-reserve-now-edge',
+                     'fact': 'Task 3001 has priority override reserve_now enabled',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock()
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        assert count == 0, (
+            'cross-predicate over-invalidation: a fresh TTL write invalidated '
+            'a still-valid reserve_now override edge on the same subject'
+        )
+        service.graphiti.update_edge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fresh_ttl_and_reserve_now_each_supersede_own_predicate(self, service):
+        """When an episode writes BOTH a fresh TTL and a fresh reserve_now
+        fact for the same subject, each fresh scalar supersedes only its own
+        stale same-predicate edge — the stale TTL and stale reserve_now edges
+        are BOTH invalidated, but neither fresh edge reaches across predicates."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_ttl = MockEdge(
+            fact='Task 3001 priority override TTL of 600 seconds',
+            uuid='fresh-ttl-edge',
+            source_node_uuid='Task3001', target_node_uuid='TTL',
+            invalid_at=None, valid_at=ts,
+        )
+        fresh_reserve = MockEdge(
+            fact='Task 3001 priority override reserve_now set to false',
+            uuid='fresh-reserve-false',
+            source_node_uuid='Task3001', target_node_uuid='reserve_now',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_ttl, fresh_reserve]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task3001':
+                return [
+                    {'uuid': 'fresh-ttl-edge',
+                     'fact': 'Task 3001 priority override TTL of 600 seconds',
+                     'name': ''},
+                    {'uuid': 'fresh-reserve-false',
+                     'fact': 'Task 3001 priority override reserve_now set to false',
+                     'name': ''},
+                    {'uuid': 'stale-ttl-edge',
+                     'fact': 'Task 3001 priority override TTL of 30 seconds',
+                     'name': ''},
+                    {'uuid': 'stale-reserve-true',
+                     'fact': 'Task 3001 has priority override reserve_now enabled',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'x', 'fact': 'y', 'refreshed_nodes': []}
+        )
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        invalidated_uuids = {c.args[0] for c in service.graphiti.update_edge.await_args_list}
+        assert invalidated_uuids == {'stale-ttl-edge', 'stale-reserve-true'}
+        assert count == 2
+
 
 # ---------------------------------------------------------------------------
 # Step 7: TRACK B.2 _is_dependency_fact helper RED tests
@@ -5667,6 +5971,123 @@ class TestIsPriorityOverrideTtlFact:
     def test_none_value(self):
         from fused_memory.services.memory_service import _is_priority_override_ttl_fact
         assert _is_priority_override_ttl_fact(None) is False  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Task 2351: _is_priority_override_reserve_now_fact helper tests (follow-up
+# to task 2319 / esc-2319-8, sibling of TestIsPriorityOverrideTtlFact)
+# ---------------------------------------------------------------------------
+
+class TestIsPriorityOverrideReserveNowFact:
+    """Module-level _is_priority_override_reserve_now_fact helper: True only
+    when a fact expresses BOTH a priority-override phrase AND a reserve_now
+    token — mirrors _is_priority_override_ttl_fact's shape/rationale for the
+    reserve_now boolean scalar."""
+
+    def test_canonical_priority_override_reserve_now_fact(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'Task 3001 has priority override reserve_now enabled'
+        ) is True
+
+    def test_hyphenated_priority_override_reserve_now_fact(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            "Task 3001's priority-override reserve-now was set to true"
+        ) is True
+
+    def test_spaced_reserve_now_fact(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'Task 3001 priority override reserve now set to false'
+        ) is True
+
+    def test_case_insensitive(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'TASK 3001 PRIORITY OVERRIDE RESERVE_NOW SET TO TRUE'
+        ) is True
+
+    def test_priority_override_without_reserve_now_is_false(self):
+        """A TTL/boost_tier override sub-attribute (no reserve_now token) is
+        a distinct, legitimately-coexisting predicate — must not collapse."""
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'Task 3001 priority override boost_tier set to high'
+        ) is False
+
+    def test_bare_reserve_now_without_priority_override_is_false(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'reserve_now is set to true'
+        ) is False
+
+    def test_dependency_fact_is_false(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact('Task 562 depends on Task 557') is False
+
+    def test_unrelated_fact_is_false(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact('Task 562 reached status done') is False
+
+    def test_empty_string(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact('') is False
+
+    def test_none_value(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(None) is False  # type: ignore[arg-type]
+
+
+class TestIsPriorityOverrideScalarFact:
+    """Module-level _is_priority_override_scalar_fact combinator: True when
+    either the TTL or reserve_now sibling matcher matches (task 2351)."""
+
+    def test_ttl_fact_matches(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact(
+            'Task 2265 has priority override TTL of 10800 seconds'
+        ) is True
+
+    def test_reserve_now_fact_matches(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact(
+            'Task 3001 has priority override reserve_now enabled'
+        ) is True
+
+    def test_other_override_sub_attribute_is_false(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact(
+            'Task 3001 priority override boost_tier set to high'
+        ) is False
+
+    def test_unrelated_fact_is_false(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact('Task 562 reached status done') is False
+
+    def test_none_value(self):
+        from fused_memory.services.memory_service import _is_priority_override_scalar_fact
+        assert _is_priority_override_scalar_fact(None) is False  # type: ignore[arg-type]
 
 
 class TestReconPoolAutoTag:
