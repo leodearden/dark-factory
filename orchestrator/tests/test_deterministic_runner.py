@@ -526,6 +526,39 @@ class TestIdempotentResumeAndQuiescence:
             },
         )
 
+    async def test_resume_pure_gate_drives_to_done_with_gate_provenance(self, tmp_path: Path):
+        """Pure gate resume (before_done=None): gate resolved → done, carrying
+        done_provenance.kind='deterministic-gate' (task 2331).
+
+        Bug trace: pre-fix, the pure-gate leg called
+        ``set_task_status(task_id, 'done')`` with no done_provenance. With
+        ``reconciliation.require_done_provenance=true`` the fused-memory
+        done-gate rejects the write with 'done_provenance_required' and the
+        scheduler re-dispatches indefinitely (infinite churn). Post-fix, the
+        leg mirrors the act-then-ask leg and passes gate provenance so the
+        done write is accepted on the first resumed dispatch.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — gate escalation resolved
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with(
+            '99',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+            },
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-1: cross-unit deploy success (B6)
