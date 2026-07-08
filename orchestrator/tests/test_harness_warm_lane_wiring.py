@@ -22,6 +22,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
+from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.warm_lane_pool import WarmLanePool
 
 # ---------------------------------------------------------------------------
@@ -1224,6 +1225,15 @@ class TestRecoveryTerminalTaskLaneRelease:
         plan.json carrying a completed step — the minimum _recover_crashed_tasks
         needs to reach the restore_assignment branch.
 
+        Record-driven (W11 delta): also seeds a durable ``.lane-state``
+        ASSIGNED:*task_id* record (branchless — these lanes are plain
+        ``mkdir``'d, never a real ``git worktree add``, so there is no real
+        checked-out branch for ``lane_branch_checkouts()`` to match; a
+        branchless record trivially satisfies the branch-match check
+        regardless), so the adopt/quarantine/terminal-release decision below
+        is reached via the record-driven path rather than the record-less
+        compat path (which never pins).
+
         Returns: (harness, git_ops, pool, lane_entry)
         """
         repo = tmp_path / 'repo'
@@ -1265,6 +1275,15 @@ class TestRecoveryTerminalTaskLaneRelease:
             ],
         }
         (task_dir / 'plan.json').write_text(json.dumps(plan))
+
+        # Record-driven (W11 delta): seed the durable record to ASSIGNED so
+        # recovery consults it as the source of truth instead of falling
+        # through to the record-less compat path (which never pins).
+        git_ops._lane_lifecycle.transition(lane_entry, DurableLaneState.SEED)
+        git_ops._lane_lifecycle.transition(lane_entry, DurableLaneState.REGISTERED)
+        git_ops._lane_lifecycle.transition(
+            lane_entry, DurableLaneState.ASSIGNED, task_id=task_id,
+        )
 
         # Registration guard (reify 4655/4947): default to "still registered"
         # so the T10 restore-path tests (this lane is plain mkdir'd, never
@@ -1335,11 +1354,14 @@ class TestRecoveryTerminalTaskLaneRelease:
         )
 
     async def test_recovery_skips_pin_for_unregistered_lane(self, tmp_path: Path):
-        """(24) reify 4655/4947: an ORPHANED lane (mkdir'd, never `git worktree
-        add`ed) must NOT be re-pinned even for a non-terminal task:
-        restore_assignment is skipped, cleanup_worktree is not called either,
-        the plan is still recovered, and the lane is left FREE so the
-        create-once self-heal path repairs it on the next acquire.
+        """(24) reify 4655/4947 (record-driven, W11 delta): an ORPHANED lane
+        (durable record ASSIGNED, but no longer a registered git worktree,
+        e.g. mkdir'd and never `git worktree add`ed) must be QUARANTINED even
+        for a non-terminal task: restore_assignment is skipped, cleanup_worktree
+        is not called (that's the terminal-release cell, not this one), the
+        plan is NOT recovered (quarantine never adopts-on-doubt), and the lane
+        is left FREE so the create-once self-heal path repairs it on the next
+        acquire.
 
         Sibling coverage: test_crash_recovery.py::TestRecoverCrashedTasksWarmLane::
         test_warm_lane_orphaned_registration_not_pinned exercises the same
@@ -1352,6 +1374,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         harness.scheduler.get_status = AsyncMock(return_value='in-progress')
 
         with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
+             patch.object(git_ops, 'quarantine_worktree', new_callable=AsyncMock) as mock_quarantine, \
              patch.object(pool, 'restore_assignment') as mock_restore:
             await harness._recover_crashed_tasks()
 
@@ -1359,14 +1382,20 @@ class TestRecoveryTerminalTaskLaneRelease:
 
         # Unregistered lane: restore_assignment must NOT be called
         mock_restore.assert_not_called()
-        # Plan is still recovered — independent of the pin
-        assert '3459' in harness._recovered_plans, (
-            'plan must still be recovered even when the lane is left unpinned'
+        # Plan is NOT recovered — quarantine never adopts-on-doubt
+        assert '3459' not in harness._recovered_plans, (
+            'a quarantined lane must not have its plan recovered'
         )
-        # Lane is not torn down either — left for create-once self-heal
+        # Quarantined (relocates the worktree), not cleaned up (a different cell)
+        mock_quarantine.assert_called_once_with(
+            lane_entry, '3459', 'recovery-record-divergence',
+        )
         mock_cleanup.assert_not_called()
-        # Lane must remain FREE (never pinned)
+        # Lane must remain FREE (never pinned) and its durable record QUARANTINED
         assert pool.state(lane_entry) == LaneState.FREE
+        record = git_ops._lane_lifecycle.read(lane_entry)
+        assert record is not None
+        assert record.state == DurableLaneState.QUARANTINED
 
 
 # ===========================================================================
