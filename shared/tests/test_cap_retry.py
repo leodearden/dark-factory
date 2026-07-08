@@ -2816,3 +2816,39 @@ class TestCapRetryRebuildPrompt:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-1'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+
+    async def test_rebuild_prompt_invoked_on_heuristic_cap(self):
+        """On the heuristic (zero-cost instant-exit) unresumable cap path,
+        rebuild_prompt(True) also replaces the prompt.
+
+        Covers the second FRESH cap-retry site — the exact-detect branch
+        (test_rebuild_prompt_invoked_on_unresumable_cap) and this heuristic
+        branch are the two places _reset_for_fresh_retry runs on a cap hit.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(side_effect=[False, False]),
+            active_account_name='acct',
+        )
+        gate.lease_is_current = MagicMock(return_value=True)  # attributed
+        heuristic = AgentResult(
+            success=False,
+            output='weird-unrecognised',
+            cost_usd=0.0,
+            turns=0,
+            duration_ms=100,
+            session_id='',
+        )
+        ok = make_result()
+        rebuild = AsyncMock(return_value='HEUR REBUILD')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[heuristic, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
+            )
+        rebuild.assert_awaited_once_with(True)
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'HEUR REBUILD'
