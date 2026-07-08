@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import enum
 import json
 import logging
 import os
@@ -91,6 +90,11 @@ from orchestrator.verify import (
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES, FailureCategory
+from orchestrator.workflow_types import (  # noqa: F401  re-export shim
+    IllegalTransition,
+    WorkflowOutcome,
+    WorkflowState,
+)
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
@@ -341,30 +345,6 @@ logger = logging.getLogger(__name__)
 # Mirrors the _inherited_break_info pattern: set by _execute_iterations, consumed
 # at the BLOCKED route in _execute_verify_review_loop (task 1739).
 ZERO_OUTPUT_HANG_REASON = 'infra: zero-output CLI hang (consecutive fresh-invocation timeouts)'
-
-
-class WorkflowState(enum.Enum):
-    PLAN = 'plan'
-    EXECUTE = 'execute'
-    VERIFY = 'verify'
-    REVIEW = 'review'
-    MERGE = 'merge'
-    MERGE_DEFERRED = 'merge-deferred'
-    DONE = 'done'
-    BLOCKED = 'blocked'
-    ESCALATED = 'escalated'
-    CANCELLED = 'cancelled'
-
-
-class WorkflowOutcome(enum.Enum):
-    DONE = 'done'
-    PLANNED = 'planned'
-    BLOCKED = 'blocked'
-    REQUEUED = 'requeued'
-    ESCALATED = 'escalated'
-    CANCELLED = 'cancelled'
-    MERGE_DEFERRED = 'merge-deferred'
-    SOFT_CANCELLED = 'soft-cancelled'
 
 
 # Matches the wrapper string ``_run_cmd`` injects when its own asyncio.wait_for
