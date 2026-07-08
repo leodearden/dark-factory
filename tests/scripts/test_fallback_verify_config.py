@@ -41,6 +41,10 @@ def _fleet_test_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["test_command"]
 
 
+def _pytest_segments(cmd: str) -> list[str]:
+    return [seg for seg in cmd.split("&&") if "pytest" in seg]
+
+
 def test_fallback_verify_runs_tests_scripts() -> None:
     """The fallback fleet chain must also run the repo-root tests/scripts/ suite.
 
@@ -49,11 +53,18 @@ def test_fallback_verify_runs_tests_scripts() -> None:
     ``tests/`` dirs. Without this, a task scoped only to tests/scripts/ is
     gated on unrelated subprojects' flakes while its own tests never run in
     the FALLBACK gating path.
+
+    Checked on the pytest-bearing segments (not the raw string) so the
+    assertion proves tests/scripts/ is actually invoked by a pytest
+    command — not merely mentioned somewhere else in the chain (e.g. inside
+    an --ignore flag or an unrelated path fragment).
     """
     cmd = _fleet_test_command()
-    assert "tests/scripts" in cmd, (
+    segments = _pytest_segments(cmd)
+    assert any("tests/scripts" in seg for seg in segments), (
         "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
-        f"must run the repo-root tests/scripts/ suite (task 2361); got: {cmd!r}"
+        "must have a pytest segment that runs the repo-root tests/scripts/ "
+        f"suite (task 2361), not merely mention it elsewhere; got: {cmd!r}"
     )
 
 
@@ -68,7 +79,7 @@ def test_fallback_verify_raises_per_test_timeout() -> None:
     (which overrides the pyproject default) above 60s removes the trigger.
     """
     cmd = _fleet_test_command()
-    segments = [seg for seg in cmd.split("&&") if "pytest" in seg]
+    segments = _pytest_segments(cmd)
     assert segments, (
         "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
         f"has no pytest segments to check (task 2361); got: {cmd!r}"
