@@ -496,6 +496,7 @@ class PsiAdmissionConfig(BaseModel):
     )
     min_inflight_floor: int = Field(
         default=1,
+        ge=1,
         description=(
             'DA-D3 anti-deadlock floor: the gate never holds when fewer than '
             'this many tasks are in flight on this orchestrator. Must be >= 1.'
