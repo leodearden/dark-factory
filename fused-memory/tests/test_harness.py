@@ -3297,6 +3297,10 @@ async def test_run_loop_fast_restart_releases_recent_claims(
     harness._recover_stale_runs = AsyncMock(return_value=None)
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
+    # judge.initialize() does a real SQLite query; mock it to avoid timing
+    # flakiness in slow environments (freethreaded Python, heavy parallel runs).
+    if harness.judge is not None:
+        harness.judge.initialize = AsyncMock()
 
     # run_loop() awaits a real (unmocked) release_stale_claims(0) SQLite
     # write/read round-trip *before* it enters its main while-loop, so a fixed
