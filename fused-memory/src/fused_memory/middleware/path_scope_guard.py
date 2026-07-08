@@ -219,6 +219,55 @@ def check_candidate_for_scope(
     return PathGuardVerdict(outcome='ok', project_id=project_id)
 
 
+def check_files_for_scope(
+    files: list[str] | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry,
+) -> PathGuardVerdict:
+    """Reject when any of *files* is owned by a project other than *project_id*.
+
+    CERTAIN counterpart to :func:`check_candidate_for_scope` /
+    :func:`check_text_for_scope`: classifies each concrete file path via
+    :meth:`ProjectPrefixRegistry.project_for_path` (exact leading-path-
+    component match) instead of the heuristic regex-over-prose
+    :func:`find_paths`.  Used by the interceptor's FILES-certain check
+    (task 2206) to hard-reject a submission whose ``metadata.files`` name a
+    path under a KNOWN other project's tree — no LLM adjudication, since an
+    exact owner lookup leaves nothing to adjudicate.
+
+    Returns ``ok`` when the registry is empty/falsy, *files* is empty/falsy,
+    or every file is either unowned or owned by *project_id*.  On a
+    mismatch, ``matched_paths`` carries the offending file paths (not
+    prefixes) and ``suggested_project`` is the single owner when all
+    mismatches share one, else ``None``.
+    """
+    if not registry or not files:
+        return PathGuardVerdict(outcome='ok', project_id=project_id)
+
+    mismatched: list[str] = []
+    owners: set[str] = set()
+    first_owner: str | None = None
+    for f in files:
+        owner = registry.project_for_path(f)
+        if owner is None or owner == project_id:
+            continue
+        mismatched.append(f)
+        if first_owner is None:
+            first_owner = owner
+        owners.add(owner)
+
+    if not mismatched:
+        return PathGuardVerdict(outcome='ok', project_id=project_id)
+
+    suggested = first_owner if len(owners) == 1 else None
+    return PathGuardVerdict(
+        outcome='rejection',
+        project_id=project_id,
+        matched_paths=tuple(mismatched),
+        suggested_project=suggested,
+    )
+
+
 def is_routing_override(routing_override_reason: str | None) -> bool:
     """Return True when *routing_override_reason* constitutes a deliberate bypass.
 
