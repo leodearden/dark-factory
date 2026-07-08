@@ -2692,3 +2692,62 @@ class TestReportStaleLease:
         slot.report(OK())
 
         gate._fire_cost_event.assert_not_called()
+
+
+# ===================================================================
+# TestCapRetryMaxCapRetries  (task W4-zeta step-1)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryMaxCapRetries:
+    """max_cap_retries: optional count-based bound on consecutive cap hits.
+
+    A count-based sibling of the time-based cap_wait_sanity_secs bound —
+    both are enforced by the same _check_cap_wait choke point and both raise
+    the same AllAccountsCappedException. None (default) preserves today's
+    patient, count-unbounded behaviour for every existing caller.
+    """
+
+    async def test_max_cap_retries_raises_after_n(self):
+        """Raises AllAccountsCappedException on the Nth cap hit, before its sleep."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(side_effect=[True, True, True, False]),
+            active_account_name='acct',
+        )
+        capped = make_result(session_id='')
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, capped, capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(AllAccountsCappedException) as exc_info,
+        ):
+            await invoke_with_cap_retry(
+                gate, 'bounded', prompt='hi', max_cap_retries=3,
+            )
+        assert mock_inv.await_count == 3
+        assert mock_sleep.await_count == 2
+        assert exc_info.value.retries == 3
+        assert exc_info.value.label == 'bounded'
+
+    async def test_max_cap_retries_none_does_not_bound_by_count(self):
+        """Default (None) preserves the existing patient, count-unbounded wait."""
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(side_effect=[True, True, True, True, False]),
+            active_account_name='acct',
+        )
+        capped = make_result(session_id='')
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, capped, capped, capped, ok]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            patch('shared.cli_invoke.time.monotonic', return_value=0.0),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'unbounded', prompt='hi',
+            )
+        assert got.success is True
