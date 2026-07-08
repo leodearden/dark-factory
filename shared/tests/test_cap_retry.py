@@ -2754,6 +2754,47 @@ class TestCapRetryMaxCapRetries:
             )
         assert got.success is True
 
+    async def test_max_cap_retries_raises_after_n_on_heuristic_branch(self):
+        """The count bound is also enforced on the heuristic (zero-cost
+        instant-exit) cap path, not just the exact-detect path.
+
+        Mirrors test_max_cap_retries_raises_after_n but drives detect_cap_hit
+        to False so every cap hit routes through the second _check_cap_wait
+        call site (the heuristic branch) instead of the exact-detect one —
+        guarding against a regression that drops or alters that call site.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok'] * 5),
+            detect_cap_hit=MagicMock(side_effect=[False, False, False, False]),
+            active_account_name='acct',
+        )
+        gate.lease_is_current = MagicMock(return_value=True)  # attributed
+        heuristic = AgentResult(
+            success=False,
+            output='weird-unrecognised',
+            cost_usd=0.0,
+            turns=0,
+            duration_ms=100,
+            session_id='',
+        )
+        ok = make_result()
+        with (
+            patch(
+                _INVOKE_PATCH, new_callable=AsyncMock,
+                side_effect=[heuristic, heuristic, heuristic, ok],
+            ) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(AllAccountsCappedException) as exc_info,
+        ):
+            await invoke_with_cap_retry(
+                gate, 'bounded-heuristic', prompt='hi', max_cap_retries=3,
+            )
+        assert mock_inv.await_count == 3
+        assert mock_sleep.await_count == 2
+        assert exc_info.value.retries == 3
+        assert exc_info.value.label == 'bounded-heuristic'
+
 
 # ===================================================================
 # TestCapRetryRebuildPrompt  (task W4-zeta step-3)
@@ -2852,3 +2893,34 @@ class TestCapRetryRebuildPrompt:
         rebuild.assert_awaited_once_with(True)
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'HEUR REBUILD'
+
+    async def test_rebuild_prompt_failure_falls_back_to_original_prompt(self):
+        """A rebuild_prompt hook that raises degrades gracefully.
+
+        The retry loop must not die from a transient hook failure (e.g. an
+        I/O/MCP error while re-gathering pending escalations) — it should log
+        and fall back to the original prompt already restored by
+        _reset_for_fresh_retry, instead of propagating the exception out of
+        the cap-retry loop.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct',
+        )
+        capped = make_result(session_id='')  # unresumable
+        ok = make_result()
+        rebuild = AsyncMock(side_effect=RuntimeError('transient MCP failure'))
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', prompt='original', rebuild_prompt=rebuild,
+            )
+        rebuild.assert_awaited_once_with(True)
+        assert got.success is True
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'original'
+        assert 'resume_session_id' not in second.kwargs
