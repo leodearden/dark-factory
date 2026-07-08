@@ -303,6 +303,54 @@ def _reproject_bare_uv_run(
     return pattern.sub(f'uv run --project {member} ', cmd, count=1)
 
 
+def _scope_fallback_tool_to_subproject(cmd: str | None, tool_keyword: str, sub: str) -> str | None:
+    """Rescope a fallback TYPE/LINT command into subpackage *sub*'s own uv context.
+
+    Cold-verify dev-dep race (task 2355): on a cold throwaway merge-verify
+    worktree (:func:`create_throwaway_verify_worktree`) the shared ``.venv``
+    starts empty. When a diff lives entirely under a single real subpackage
+    (see :func:`_single_subproject_prefix`), the TEST command is already
+    scoped to run *inside* that subpackage via ``uv run`` (task 2344), which
+    syncs the subpackage's deps — including its dev group (e.g.
+    ``hypothesis``) — as a side effect. TYPE and LINT, however, were left
+    running in the worktree-root uv context (``_reproject_bare_uv_run``'s
+    hardcoded ``_FALLBACK_UV_PROJECT``, or no uv context at all for a
+    non-uv-run runner like ``npx pyright``). Because verify runs test/lint/type
+    concurrently via one ``asyncio.gather``, TYPE/LINT would race the TEST
+    command's sync and could deterministically fail to resolve a dev-only
+    import (esc-2293-20). Rescoping TYPE/LINT to ``uv run --project <sub>``
+    makes each self-sync *sub*'s deps before the tool runs, closing that race
+    regardless of a warm or cold venv.
+
+    *cmd* is expected to already be scoped to the touched files and stripped
+    of any leading ``cd`` (i.e. :func:`_scope_command` + :func:`_strip_leading_cd`
+    have already run) — this helper only adds/adjusts the uv context.
+
+    Returns:
+        ``None`` when *cmd* is ``None``.
+        *cmd* unchanged when *tool_keyword* is not present (no-op ``true``,
+        an unrelated tool like ``mypy``).
+        The :func:`_reproject_bare_uv_run` result when it changed *cmd* (a
+        bare ``uv run <tool_keyword>`` is reprojected to
+        ``uv run --project <sub> <tool_keyword>``).
+        *cmd* unchanged when it already carries ``--project`` or
+        ``--directory`` (an explicit uv context is already set; don't
+        second-guess it).
+        Otherwise, *cmd* with ``uv run --project <sub> `` prepended (a
+        non-uv runner like ``npx pyright``, or a bare tool invocation).
+    """
+    if cmd is None:
+        return None
+    if tool_keyword not in cmd:
+        return cmd
+    reprojected = _reproject_bare_uv_run(cmd, tool_keyword, sub)
+    if reprojected != cmd:
+        return reprojected
+    if '--project' in cmd or '--directory' in cmd:
+        return cmd
+    return f'uv run --project {sub} ' + cmd
+
+
 # Cargo subcommands whose ``--workspace`` flag we know how to rewrite.  Other
 # cargo subcommands (doc, bench, ...) are left alone to avoid semantic drift.
 _CARGO_SUBCMDS = ('test', 'clippy', 'check', 'build', 'run')
