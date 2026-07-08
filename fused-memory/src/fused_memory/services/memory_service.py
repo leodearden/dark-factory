@@ -151,14 +151,18 @@ def _is_priority_override_scalar_fact(fact: str | None) -> bool:
     """Return True when *fact* matches any recognized single-valued
     priority-override scalar shape (TTL or reserve_now).
 
-    ``_invalidate_stale_superseded_ttl_edges`` (task 2319, extended by task
-    2351) uses this combined matcher ONLY as a cheap pre-filter for whether
-    the hook should fire at all — NOT for deciding which stale edge
-    contradicts which fresh edge. Cross-predicate discrimination (a reserve_now
-    write must never invalidate a still-valid TTL edge on the same subject, and
-    vice versa) is done by ``_priority_override_scalar_predicates`` instead;
-    see that helper and the hook body for why the union matcher is unsafe for
-    candidate matching.
+    Convenience combinator for callers that only need a single "is this fact
+    SOME priority-override scalar shape" boolean, with no need to know which
+    one. ``_invalidate_stale_superseded_ttl_edges`` (task 2319, extended by
+    task 2351) does NOT call this function — it always needs to know WHICH
+    class(es) a fact matches, to keep TTL and reserve_now from being
+    collapsed into one predicate, so it calls
+    ``_priority_override_scalar_predicates`` directly for both the fire
+    pre-filter and candidate matching. Using this union matcher for either of
+    those would be unsafe: it cannot distinguish a fresh reserve_now write
+    from a still-valid TTL edge on the same subject, which would
+    re-invalidate the TTL edge (and vice versa) — see
+    ``_priority_override_scalar_predicates`` and the hook body.
     """
     return _is_priority_override_ttl_fact(fact) or _is_priority_override_reserve_now_fact(fact)
 
@@ -939,13 +943,18 @@ class MemoryService:
         """Invalidate pre-existing stale priority-override scalar edges left
         behind when Graphiti's upstream LLM edge-resolver under-invalidates.
 
-        Covers every fact shape recognized by ``_is_priority_override_scalar_fact``
-        — the TTL scalar (task 2319) and the reserve_now boolean scalar (task
-        2351, follow-up to 2319 via esc-2319-8) — since both are genuinely
-        single-valued-per-subject fields on the scheduler override model and
-        share the identical under-invalidation risk. The rest of this
-        docstring refers to "priority-override/TTL" for historical continuity
-        with task 2319, but every step applies equally to reserve_now facts.
+        Covers every predicate class recognized by
+        ``_priority_override_scalar_predicates`` — the TTL scalar (task 2319)
+        and the reserve_now boolean scalar (task 2351, follow-up to 2319 via
+        esc-2319-8) — since both are genuinely single-valued-per-subject
+        fields on the scheduler override model and share the identical
+        under-invalidation risk. The two classes are tracked and matched
+        SEPARATELY throughout (see steps 1 and 3 below); this hook never
+        collapses them via the ``_is_priority_override_scalar_fact`` union
+        matcher, which would re-invalidate a still-valid TTL edge on a fresh
+        reserve_now write (or vice versa). The rest of this docstring refers
+        to "priority-override/TTL" for historical continuity with task 2319,
+        but every step applies equally to reserve_now facts.
 
         Mirror-image (under-invalidation direction) counterpart of
         ``_restore_falsely_superseded_sibling_edges`` (task 2111), which
@@ -965,10 +974,12 @@ class MemoryService:
         ``result.edges``. It therefore:
 
         1. Scans *result* for the "authoritative fresh" set — valid
-           (``invalid_at is None``) edges whose fact matches
-           ``_is_priority_override_scalar_fact``. If none, returns 0 without
-           any graph query — this scopes the hook to fire only when the
-           current episode actually wrote a priority-override/TTL fact.
+           (``invalid_at is None``) edges whose
+           ``_priority_override_scalar_predicates`` predicate-class set is
+           non-empty — and records, per subject, which classes it wrote. If
+           no edge yields a non-empty set, returns 0 without any graph query
+           — this scopes the hook to fire only when the current episode
+           actually wrote a priority-override/TTL or reserve_now fact.
         2. For each distinct SUBJECT (``source_node_uuid``) of an
            authoritative-fresh edge — never the object/target node — queries
            ``graphiti.get_valid_edges_for_node`` for every currently-valid
@@ -986,25 +997,32 @@ class MemoryService:
            same-subject stale edge; the target query is both harmful and
            unnecessary. This is what enforces the docstring invariant that
            only *same-subject* single-valued scalars are superseded.
-        3. Invalidates every returned edge that also matches
-           ``_is_priority_override_scalar_fact`` and is not itself one of the
-           authoritative-fresh edges: it is a same-subject, single-valued
-           contradiction of the fact just written. The invalidation
-           timestamp is computed PER SUBJECT — the newest ``valid_at`` among
-           *that subject's own* authoritative-fresh edges (falling back to
-           ``datetime.now(UTC)`` only when that subject's fresh edge(s)
-           carried no ``valid_at``), so the stale fact's supersession is
-           stamped as of the moment that subject's own new fact became
-           valid. A single episode may write fresh TTL facts for two
-           different subjects at different ``valid_at`` times; using a
-           single global max across every subject instead would stamp an
-           earlier subject's stale edge with a later subject's timestamp,
-           reopening a same-subject overlap window between the two — the
-           exact defect this hook exists to close. A processed-uuid set
-           deduplicates edges reachable from more than one subject node (an
-           undirected per-node query returns an edge spanning two queried
-           subjects under both endpoints), so each stale edge is
-           invalidated at most once. Each invalidation attempt is
+        3. Invalidates every returned edge that is not itself one of the
+           authoritative-fresh edges AND whose own
+           ``_priority_override_scalar_predicates`` classes INTERSECT the
+           fresh classes recorded for that same subject in step 1: it is a
+           same-subject, SAME-PREDICATE contradiction of the fact just
+           written. A candidate of a DIFFERENT scalar class — e.g. a
+           still-valid TTL edge on a subject whose fresh write this episode
+           was reserve_now — does not intersect and is left untouched, even
+           though both are "priority-override scalar" facts; this
+           intersection check is what keeps the two classes from being
+           collapsed into one (see ``_priority_override_scalar_predicates``).
+           The invalidation timestamp is computed PER SUBJECT — the newest
+           ``valid_at`` among *that subject's own* authoritative-fresh
+           edges (falling back to ``datetime.now(UTC)`` only when that
+           subject's fresh edge(s) carried no ``valid_at``), so the stale
+           fact's supersession is stamped as of the moment that subject's
+           own new fact became valid. A single episode may write fresh TTL
+           facts for two different subjects at different ``valid_at``
+           times; using a single global max across every subject instead
+           would stamp an earlier subject's stale edge with a later
+           subject's timestamp, reopening a same-subject overlap window
+           between the two — the exact defect this hook exists to close.
+           A processed-uuid set deduplicates edges reachable from more than
+           one subject node (an undirected per-node query returns an edge
+           spanning two queried subjects under both endpoints), so each
+           stale edge is invalidated at most once. Each invalidation attempt is
            individually best-effort — mirroring the sibling hook's per-edge
            guard — so a transient backend failure for one stale edge is
            logged and counted but does not stop the remaining edges from
