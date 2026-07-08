@@ -759,6 +759,8 @@ class RemoteRunner:
         config_path: str | None = None,
         main_branch: str | None = None,
         run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
+        ssh_run: Callable[..., Awaitable[tuple[int, str, str]]] | None = None,
+        heartbeat_interval: float | None = None,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
         self.name = name
@@ -768,6 +770,24 @@ class RemoteRunner:
         self._config_path = config_path
         self._main_branch = main_branch
         self._run = run if run is not None else _default_subprocess_run
+        # γ: connection-death heartbeat-watchdog (PRD §8.1). The ssh dispatch is
+        # load-bearing (it's the call that blocks for the whole remote build), so
+        # it is routed through a PARALLEL self._ssh_run seam rather than overloading
+        # self._run (shared by git push/rev-parse/delete, which return only after
+        # completion with no stdin hook). Resolution order: injected ssh_run ->
+        # injected run (back-compat: existing tests inject only `run` and expect
+        # it to serve ssh too) -> heartbeat default (production).
+        self._heartbeat_interval = heartbeat_interval or HEARTBEAT_INTERVAL_SECS
+        if ssh_run is not None:
+            self._ssh_run = ssh_run
+        elif run is not None:
+            self._ssh_run = run
+        else:
+            async def _heartbeat_ssh_run(argv, *, cwd=None):
+                return await _default_ssh_heartbeat_run(
+                    argv, cwd=cwd, heartbeat_interval=self._heartbeat_interval,
+                )
+            self._ssh_run = _heartbeat_ssh_run
         self._id_factory = id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
         # Optional test-instrumentation hook: tests may assign a list to this
         # attribute so they can inspect all subprocess argv lists after the fact.
@@ -912,7 +932,7 @@ class RemoteRunner:
                 remote_cmd = ' '.join(shlex.quote(a) for a in argv)
 
                 try:
-                    ssh_rc, ssh_stdout, ssh_stderr = await self._run(
+                    ssh_rc, ssh_stdout, ssh_stderr = await self._ssh_run(
                         ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                          self._ssh_host, remote_cmd],
                     )
