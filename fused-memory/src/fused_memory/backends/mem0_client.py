@@ -111,6 +111,47 @@ class Mem0Backend:
             timeout=self._write_timeout,
         )
 
+    async def add_system_record(
+        self,
+        content: str,
+        scope: Scope,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Dedup-exempt system-write path (task 2222 / W5-δ).
+
+        This is the dedup-exempt system-write path used by deterministic
+        recon-stage mirrors (e.g. the cycle-summary Mem0 mirror). ``infer=False``
+        is pinned LOCALLY in this dedicated method — NOT inherited from
+        :meth:`add` — so the dedup-exempt guarantee this method exists to
+        provide survives any future change to the general ``add()`` (task
+        decision #2: "so a future re-enabling of Mem0 dedup can't silently
+        re-break recon"). Sharing :meth:`add`'s ``infer=False`` pin instead of
+        having its own would mean the day someone flips that pin (or makes it
+        config-driven), this path silently re-breaks along with it.
+
+        ``infer=False`` reaches mem0's fresh-uuid ``_create_memory``
+        direct-insert primitive and never the update-vs-add branch — dedup
+        (similarity search + update-vs-add choice) only exists in mem0's
+        ``infer=True`` path, so ``infer=False`` structurally cannot dedup:
+        every call unconditionally mints a new id and inserts a fresh point.
+        Task 2221 (W5-γ) empirically confirmed this against a real Qdrant.
+
+        MUST NEVER pass ``infer=True`` — doing so would reintroduce the
+        similarity-based dedup this method exists to be exempt from.
+        """
+        instance = await self._get_instance(scope)
+        return await asyncio.wait_for(
+            instance.add(
+                messages=content,
+                user_id=scope.mem0_user_id,
+                agent_id=scope.agent_id,
+                run_id=scope.session_id,
+                metadata=metadata,
+                infer=False,
+            ),
+            timeout=self._write_timeout,
+        )
+
     async def search(
         self,
         query: str,
