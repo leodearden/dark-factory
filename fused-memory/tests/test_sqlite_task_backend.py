@@ -2293,6 +2293,49 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     )
 
 
+@pytest.mark.asyncio
+async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
+    backend, project_root,
+):
+    """A fresh DB chains through v0->v4: the v3->v4 step's residual-duplicate
+    audit is trivially clean on an empty table, so it builds the partial
+    UNIQUE index over (tag, candidate_key) and stamps user_version=4.
+    """
+    import sqlite3
+
+    await backend.add_task(project_root=project_root, title='fresh task')
+
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    conn = sqlite3.connect(str(db_path))
+    try:
+        index_rows = {row[1]: row for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='ux_tasks_candidate_key'",
+        ).fetchone()
+    finally:
+        conn.close()
+
+    # (a) the partial UNIQUE index is present.
+    assert 'ux_tasks_candidate_key' in index_rows, (
+        f'Expected ux_tasks_candidate_key index; got: {sorted(index_rows)}'
+    )
+    # (b) it is UNIQUE — index_list column 2 is the `unique` flag.
+    assert index_rows['ux_tasks_candidate_key'][2] == 1, (
+        f'Expected ux_tasks_candidate_key to be UNIQUE; got {index_rows["ux_tasks_candidate_key"]}'
+    )
+    # (c) the stored SQL carries the partial predicate over (tag, candidate_key).
+    assert sql_row is not None, 'Expected ux_tasks_candidate_key SQL in sqlite_master'
+    index_sql = sql_row[0]
+    assert 'candidate_key IS NOT NULL' in index_sql, index_sql
+    assert "status != 'cancelled'" in index_sql, index_sql
+    assert 'tag' in index_sql and 'candidate_key' in index_sql, index_sql
+    # (d) user_version advances to 4 on a clean build.
+    assert user_version == 4, (
+        f'Expected user_version=4 after clean v3->v4 migration; got {user_version}'
+    )
+
+
 # ── Concurrency ────────────────────────────────────────────────────
 
 
