@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -27,6 +28,7 @@ __all__ = [
     'DoneProvenance',
     'ExternalDep',
     'MemoryHints',
+    'Milestone',
     'RetryLedger',
     'SchemaWarning',
     'TaskMetadata',
@@ -53,6 +55,7 @@ class BeforeDone(BaseModel):
     cwd: str | None = None
     timeout_secs: int = Field(gt=0)
     target_unit: str | None = None
+    kind: Literal['deploy', 'predicate'] = 'deploy'
 
 
 class DoneProvenance(BaseModel):
@@ -71,6 +74,7 @@ class DoneProvenance(BaseModel):
         'deterministic-deploy',
         'deterministic-deploy-scheduled',
         'deterministic-gate',
+        'deterministic-milestone',
     ]
     commit: str | None = None
     note: str | None = None
@@ -215,6 +219,46 @@ class RetryLedger(BaseModel):
         return hashlib.sha256(basis).hexdigest()[:16]
 
 
+class Milestone(BaseModel):
+    """``metadata.milestone`` — a dated or delayed milestone spec (PRD §6.1).
+
+    ``mode`` discriminates between the two mutually exclusive shapes: a
+    ``'dated'`` milestone fires at an explicit ISO-8601 timestamp (``at``);
+    a ``'delayed'`` milestone fires ``after_secs`` seconds after some
+    reference point. The two field sets are an *iff* — a ``'dated'``
+    milestone must not also carry ``after_secs``, and a ``'delayed'``
+    milestone must not also carry ``at``.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    mode: Literal['dated', 'delayed']
+    at: str | None = None
+    after_secs: int | None = None
+
+    @model_validator(mode='after')
+    def _check_mode_fields(self) -> Milestone:
+        if self.mode == 'dated':
+            if self.at is None:
+                raise ValueError("Milestone: at is required when mode='dated'.")
+            try:
+                datetime.fromisoformat(self.at)
+            except ValueError as exc:
+                raise ValueError(
+                    f'Milestone: at={self.at!r} is not a valid ISO-8601 datetime: {exc}'
+                ) from exc
+            if self.after_secs is not None:
+                raise ValueError("Milestone: after_secs must not be set when mode='dated'.")
+        else:
+            if self.after_secs is None or self.after_secs <= 0:
+                raise ValueError(
+                    "Milestone: after_secs is required and must be > 0 when mode='delayed'."
+                )
+            if self.at is not None:
+                raise ValueError("Milestone: at must not be set when mode='delayed'.")
+        return self
+
+
 class TaskMetadata(BaseModel):
     """The versioned ``metadata`` JSON blob carried on every task (PRD §5).
 
@@ -271,6 +315,12 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
     if existing is not None and existing is not model:
         raise ValueError(f'metadata sub-model already registered for {key!r}')
     _SUBMODEL_REGISTRY[key] = model
+
+
+# Milestone is the first real W10 registrant: registering at module-import
+# time (rather than lazily) guarantees the 'milestone' slice is validated
+# and typed before any of parse_metadata's many callers across packages run.
+register_metadata_submodel('milestone', Milestone)
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:

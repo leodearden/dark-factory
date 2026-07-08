@@ -25,6 +25,7 @@ from shared.task_metadata import (
     DoneProvenance,
     ExternalDep,
     MemoryHints,
+    Milestone,
     RetryLedger,
     TaskMetadata,
     apply_migrations,
@@ -73,6 +74,7 @@ class TestBeforeDone:
         assert bd.cwd == '.'
         assert bd.timeout_secs == 120
         assert bd.target_unit == 'u.service'
+        assert bd.kind == 'deploy'
 
     def test_defaults_when_omitted(self):
         bd = BeforeDone(script='scripts/x.sh', timeout_secs=60)
@@ -102,6 +104,21 @@ class TestBeforeDone:
         bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, x_extra='keep-me')  # type: ignore[call-arg]
         dumped = bd.model_dump()
         assert dumped['x_extra'] == 'keep-me'
+
+    def test_kind_defaults_to_deploy(self):
+        # Default preserves every existing deterministic task byte-identically
+        # — no existing blob carries `kind`, so the default equals the prior
+        # implicit deploy behavior.
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60)
+        assert bd.kind == 'deploy'
+
+    def test_kind_predicate_accepted(self):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, kind='predicate')
+        assert bd.kind == 'predicate'
+
+    def test_kind_bogus_rejected(self):
+        with pytest.raises(ValidationError):
+            BeforeDone(script='scripts/x.sh', timeout_secs=60, kind='bogus')  # type: ignore[arg-type]
 
 
 class TestDoneProvenance:
@@ -166,6 +183,23 @@ class TestDoneProvenance:
         dp = DoneProvenance(kind='deterministic-gate', note='pure gate resolved')
         assert dp.kind == 'deterministic-gate'
         assert dp.note == 'pure gate resolved'
+
+    def test_deterministic_milestone_ok_without_commit_or_note(self):
+        dp = DoneProvenance(kind='deterministic-milestone')
+        assert dp.kind == 'deterministic-milestone'
+        assert dp.commit is None
+        assert dp.note is None
+
+    def test_deterministic_milestone_retains_note(self):
+        dp = DoneProvenance(kind='deterministic-milestone', note='<stdout tail>')
+        assert dp.kind == 'deterministic-milestone'
+        assert dp.note == '<stdout tail>'
+
+    def test_deterministic_bogus_kind_still_rejected(self):
+        # Regression guard: adding 'deterministic-milestone' must not open
+        # the Literal up to arbitrary deterministic-* strings.
+        with pytest.raises(ValidationError):
+            DoneProvenance(kind='deterministic-bogus')  # type: ignore[arg-type]
 
 
 class TestMemoryHints:
@@ -382,6 +416,54 @@ class TestRetryLedger:
         assert sig_category_only != sig_fallback
 
 
+class TestMilestone:
+    """``metadata.milestone`` — the dated/delayed milestone sub-model (PRD §6.1)."""
+
+    def test_dated_constructs(self):
+        m = Milestone(mode='dated', at='2026-08-01T00:00:00+00:00')
+        assert m.mode == 'dated'
+        assert m.at == '2026-08-01T00:00:00+00:00'
+        assert m.after_secs is None
+
+    def test_delayed_constructs(self):
+        m = Milestone(mode='delayed', after_secs=604800)
+        assert m.mode == 'delayed'
+        assert m.after_secs == 604800
+        assert m.at is None
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            pytest.param({'mode': 'dated', 'at': None}, id='dated_missing_at'),
+            pytest.param({'mode': 'dated', 'at': 'not-a-date'}, id='dated_unparseable_at'),
+            pytest.param({'mode': 'delayed', 'after_secs': None}, id='delayed_missing_after_secs'),
+            pytest.param({'mode': 'delayed', 'after_secs': 0}, id='delayed_after_secs_zero'),
+            pytest.param({'mode': 'delayed', 'after_secs': -1}, id='delayed_after_secs_negative'),
+            pytest.param(
+                {'mode': 'dated', 'at': '2026-08-01T00:00:00+00:00', 'after_secs': 604800},
+                id='dated_with_after_secs_also_set',
+            ),
+            pytest.param(
+                {
+                    'mode': 'delayed',
+                    'after_secs': 604800,
+                    'at': '2026-08-01T00:00:00+00:00',
+                },
+                id='delayed_with_at_also_set',
+            ),
+            pytest.param({'mode': 'weird'}, id='mode_weird'),
+        ],
+    )
+    def test_invalid_specs_rejected(self, kwargs):
+        with pytest.raises(ValidationError):
+            Milestone(**kwargs)  # type: ignore[arg-type]
+
+    def test_unknown_subfield_retained_and_reemitted(self):
+        m = Milestone(mode='delayed', after_secs=604800, x_extra='keep')  # type: ignore[call-arg]
+        dumped = m.model_dump()
+        assert dumped['x_extra'] == 'keep'
+
+
 class TestTaskMetadataFields:
     def test_empty_defaults(self):
         tm = TaskMetadata()
@@ -508,6 +590,45 @@ class TestSubmodelRegistry:
         register_metadata_submodel('deploy_state', _DeployStateStub)
         with pytest.raises(ValueError):
             register_metadata_submodel('deploy_state', _OtherDeployStateStub)
+
+
+class TestMilestoneRegistration:
+    """Milestone's registration with the W10 extension point + parse_metadata integration."""
+
+    def test_registered_at_import(self):
+        assert task_metadata_module._SUBMODEL_REGISTRY['milestone'] is Milestone
+
+    def test_round_trip_no_warnings(self):
+        model, warnings = parse_metadata(
+            {
+                'task_kind': 'deterministic',
+                'milestone': {'mode': 'delayed', 'after_secs': 604800},
+                'before_done': {
+                    'kind': 'predicate',
+                    'script': 'scripts/check_merge_flakiness.sh',
+                    'timeout_secs': 120,
+                },
+            },
+            direction='write',
+        )
+        assert warnings == []
+        assert model.before_done is not None
+        assert model.before_done.kind == 'predicate'
+        assert isinstance(model.milestone, Milestone)  # type: ignore[attr-defined]
+        dumped_milestone = model.model_dump()['milestone']
+        assert not isinstance(dumped_milestone, BaseModel)
+        assert dumped_milestone == {'mode': 'delayed', 'at': None, 'after_secs': 604800}
+
+    def test_malformed_slice_read_warns_and_retains_raw(self):
+        model, warnings = parse_metadata({'milestone': {'mode': 'delayed'}}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'milestone'
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()['milestone'] == {'mode': 'delayed'}
+
+    def test_malformed_slice_write_enforce_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata({'milestone': {'mode': 'delayed'}}, direction='write', enforce=True)
 
 
 class TestMigrations:
