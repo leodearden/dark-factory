@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shared.cli_invoke import AgentResult
+from shared.config_dir import TaskConfigDir
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 from shared.usage_gate import (
@@ -779,6 +781,142 @@ class TestProbeConfigDirIsolation:
 
         gate._probe_config_dirs['work'].cleanup.assert_called_once()
         gate._probe_config_dirs['personal'].cleanup.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Env-token precedence regression guard (task 2139 step 7, PRD §6 finding 5 /
+# B9). The isolation fix above (steps 2/4) writes a per-account credential
+# into the per-(account,pid) config dir AND sets CLAUDE_CODE_OAUTH_TOKEN in
+# env for every probe — _run_probe silently assumes the real Claude CLI
+# prefers the env token over whatever is sitting in the config-dir
+# credential file. That precedence is a live-CLI behavior that cannot be
+# observed via mocks, so this is a real-CLI @pytest.mark.integration test,
+# deselected by default (see shared/pyproject.toml addopts="-m 'not
+# integration'") and only exercised with `-m integration` plus a real OAuth
+# account in env. Mirrors test_cli_invoke_integration.py::TestConfigDirCredentials
+# ("MUST use real agents") — token discovery/skip and capacity-skip pattern
+# replicated minimally here rather than imported (same rationale as that
+# file's own _looks_like_capacity_failure: a purpose-built substring list is
+# the correct shape for a skip-guard, not the stricter combined
+# prefix+confirm-keyword production detector).
+# ---------------------------------------------------------------------------
+
+_TOKEN_ENV_VARS = [f'CLAUDE_OAUTH_TOKEN_{c}' for c in 'BCDEF']
+_AVAILABLE_TOKENS: list[tuple[str, str]] = [
+    (var, os.environ[var])
+    for var in _TOKEN_ENV_VARS
+    if os.environ.get(var)
+]
+
+_need_one_account = pytest.mark.skipif(
+    len(_AVAILABLE_TOKENS) < 1,
+    reason='Requires at least 1 OAuth account in env',
+)
+_need_claude_cli = pytest.mark.skipif(
+    shutil.which('claude') is None,
+    reason='Requires the real claude CLI on PATH',
+)
+
+_CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
+    ' capped',
+    'rate limit',
+    'account unavailable',
+    'out of extra usage',
+    'usage limit',
+    "you've hit your usage",
+    "you've used all",
+)
+
+
+def _looks_like_capacity_failure(combined_output: str) -> bool:
+    """Conservative substring check — see module docstring above this class."""
+    haystack = combined_output.lower()
+    return any(marker in haystack for marker in _CAPACITY_FAILURE_MARKERS)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+class TestProbeEnvTokenPrecedenceGuard:
+    """MUST-OBSERVE: env CLAUDE_CODE_OAUTH_TOKEN must outrank a config-dir
+    credential file, exactly as ``_run_probe``'s env layering silently
+    assumes.
+
+    This test has no paired impl step: steps 2/4 already set both the env
+    token and the config-dir credential for every probe. This guard pins
+    down the external CLI's precedence behavior between the two, so a
+    regression (e.g. a future Claude CLI release that reverses precedence,
+    or a config-dir credential that shadows the env override) is caught
+    loudly instead of silently producing an auth_failed misclassification
+    for a perfectly healthy account.
+    """
+
+    @_need_one_account
+    @_need_claude_cli
+    async def test_env_token_wins_over_garbage_config_dir_credential(self):
+        _name, token = _AVAILABLE_TOKENS[0]
+        pid = os.getpid()
+        config_dir = TaskConfigDir(f'usage-gate-probe-envprec-{pid}')
+        try:
+            # A DIFFERING garbage credential sits in the config dir. If the
+            # CLI ever preferred this over the env token, every real probe
+            # (which layers both, mirroring _run_probe) would silently
+            # authenticate with a bogus token instead of the account's own.
+            config_dir.write_credentials('sk-ant-oat01-GARBAGE-does-not-authenticate')
+
+            # Mirrors _run_probe's exact cmd + env layering (usage_gate.py).
+            cmd = [
+                'claude', '--print', '--output-format', 'json',
+                '--model', 'haiku',
+                '--max-turns', '1',
+                '--max-budget-usd', '0.01',
+                '--permission-mode', 'bypassPermissions',
+                '--', 'Say ok',
+            ]
+            env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
+            env['CLAUDE_CODE_OAUTH_TOKEN'] = token
+            env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=30,
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                pytest.skip('claude CLI invocation timed out (infra flake, not a precedence signal)')
+        finally:
+            config_dir.cleanup()
+
+        stdout_text = stdout_bytes.decode(errors='replace') if stdout_bytes else ''
+        stderr_text = stderr_bytes.decode(errors='replace') if stderr_bytes else ''
+        combined = f'{stdout_text}\n{stderr_text}'
+
+        if _looks_like_capacity_failure(combined):
+            pytest.skip(f'Capacity failure, not a precedence signal: {combined!r}')
+
+        combined_lower = combined.lower()
+        # If either assertion below fails, the env token did NOT win over the
+        # garbage config-dir credential — a larger latent bug (finding 5):
+        # the real CLI prefers the config-dir credential, so every
+        # _run_probe invocation is silently authenticating with whatever
+        # stale/garbage token happens to be sitting in that account's
+        # per-(account,pid) dir instead of its live env token. Do NOT weaken
+        # these assertions — a failure here must escalate (surfaced to the κ
+        # integration gate / a human), not silently pass.
+        assert 'invalid api key' not in combined_lower, (
+            f'Env token was rejected as invalid — config-dir credential won '
+            f'precedence over the env token: {combined!r}'
+        )
+        assert 'not logged in' not in combined_lower, (
+            f'Env token not recognized — config-dir credential won '
+            f'precedence over the env token: {combined!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
