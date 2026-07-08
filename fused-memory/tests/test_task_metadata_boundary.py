@@ -352,3 +352,61 @@ async def test_done_provenance_malformed_write_warn_vs_enforce_staged_rollout(
         await enforce_backend.update_task(
             dto2['id'], project_root=enforce_root, metadata=json.dumps(malformed),
         )
+
+
+# ── Row 6 — update-path invariant: post-merge (I3) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_task_kind_deterministic_on_normal_task_rejected_post_merge(
+    make_backend, tmp_path, caplog,
+):
+    """update_task validates the MERGED whole, not just the incoming delta.
+
+    Seeds a normal task with benign existing metadata so the default
+    shallow-merge is non-trivial, then updates with only
+    ``task_kind='deterministic'``. The POST-MERGE blob
+    (``{'files': [...], 'task_kind': 'deterministic'}``) violates the
+    deterministic invariant (requires ``before_done`` or
+    ``always_escalates``) even though neither half violates it alone —
+    proving I3 is caught on update, not only on submit.
+    """
+    seed_metadata = json.dumps({'files': ['a.py']})
+
+    # (a) Enforce-mode: raises; rolled back — metadata stays at the seed.
+    enforce_backend = await make_backend(enforce=True)
+    enforce_root = str(tmp_path / 'enforce')
+    dto = await enforce_backend.add_task(
+        project_root=enforce_root, title='t', metadata=seed_metadata,
+    )
+
+    with pytest.raises(ValidationError):
+        await enforce_backend.update_task(
+            dto['id'], project_root=enforce_root,
+            metadata=json.dumps({'task_kind': 'deterministic'}),
+        )
+
+    task = await enforce_backend.get_task(dto['id'], project_root=enforce_root)
+    assert task['metadata'] == {'files': ['a.py']}
+
+    # (b) Warn-mode: does not raise; exactly one whole-metadata census line;
+    # the merged write proceeds.
+    warn_backend = await make_backend(enforce=False)
+    warn_root = str(tmp_path / 'warn')
+    dto2 = await warn_backend.add_task(
+        project_root=warn_root, title='t', metadata=seed_metadata,
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        await warn_backend.update_task(
+            dto2['id'], project_root=warn_root,
+            metadata=json.dumps({'task_kind': 'deterministic'}),
+        )
+
+    census = _schema_warning_messages(caplog)
+    assert len(census) == 1, f'Expected exactly one census line; got {census}'
+    assert '<metadata>' in census[0]
+    assert 'before_done' in census[0]
+
+    task2 = await warn_backend.get_task(dto2['id'], project_root=warn_root)
+    assert task2['metadata'] == {'files': ['a.py'], 'task_kind': 'deterministic'}
