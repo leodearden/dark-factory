@@ -26,6 +26,7 @@ from orchestrator.verify import (
     _resolve_verify_env,
     _run_cmd,
     _scope_cargo_workspace,
+    _scope_fallback_tool_to_subproject,
     _single_subproject_prefix,
     run_full_verification,
     run_scoped_verification,
@@ -4119,6 +4120,66 @@ class TestReprojectBareUvRun:
             'uv run --project shared pytest tests/ '
             '&& uv run --project shared ruff check tests/scripts/foo.py'
         )
+
+
+class TestScopeFallbackToolToSubproject:
+    """`_scope_fallback_tool_to_subproject` rescopes a fallback TYPE/LINT command
+    into the touched subpackage's own uv context (task 2355).
+
+    Cold-verify dev-dep race: on a cold throwaway merge-verify worktree the
+    shared ``.venv`` starts empty, and a subpackage's dev-group dependency
+    (e.g. ``hypothesis``) only reaches the venv as a side effect of the
+    concurrently-run TEST command's ``uv run`` sync (verify runs
+    test/lint/type via one ``asyncio.gather``). TYPE/LINT running outside that
+    subpackage's uv context race that sync and can deterministically fail to
+    resolve a dev-only import (esc-2293-20). ``uv run --project <sub>``
+    self-syncs the subpackage's deps (including its dev group) *before* the
+    tool runs, closing that race regardless of a warm or cold venv.
+    """
+
+    def test_non_uv_runner_prepends_uv_run_project(self):
+        """A non-uv runner (`npx pyright <file>`) is prepended with `uv run --project <sub>`."""
+        result = _scope_fallback_tool_to_subproject(
+            'npx pyright cockpit/tests/test_c3.py', 'pyright', 'cockpit',
+        )
+        assert result == 'uv run --project cockpit npx pyright cockpit/tests/test_c3.py'
+
+    def test_bare_uv_run_tool_reprojects_to_subproject(self):
+        """A bare `uv run ruff check <file>` is reprojected to `--project <sub>`."""
+        result = _scope_fallback_tool_to_subproject(
+            'uv run ruff check cockpit/src/c3.py', 'ruff check', 'cockpit',
+        )
+        assert result == 'uv run --project cockpit ruff check cockpit/src/c3.py'
+
+    def test_bare_tool_no_config_shape_prepends_uv_run_project(self):
+        """A bare `pyright <file>` (the config=None fallback shape) is prepended."""
+        result = _scope_fallback_tool_to_subproject(
+            'pyright cockpit/tests/test_c3.py', 'pyright', 'cockpit',
+        )
+        assert result == 'uv run --project cockpit pyright cockpit/tests/test_c3.py'
+
+    def test_noop_true_command_unchanged(self):
+        """`true` (no tool keyword present) is returned unchanged."""
+        assert _scope_fallback_tool_to_subproject('true', 'pyright', 'cockpit') == 'true'
+
+    def test_mypy_command_lacking_tool_keyword_unchanged(self):
+        """A mypy type command (no 'pyright' keyword) is returned unchanged."""
+        cmd = 'uv run --extra dev mypy src'
+        assert _scope_fallback_tool_to_subproject(cmd, 'pyright', 'cockpit') == cmd
+
+    def test_command_with_existing_project_flag_unchanged(self):
+        """A command already carrying `--project` is left alone (no re-target)."""
+        cmd = 'uv run --project foo pyright cockpit/tests/test_c3.py'
+        assert _scope_fallback_tool_to_subproject(cmd, 'pyright', 'cockpit') == cmd
+
+    def test_command_with_existing_directory_flag_unchanged(self):
+        """A command already carrying `--directory` is left alone (no double-wrap)."""
+        cmd = 'uv run --directory foo pyright cockpit/tests/test_c3.py'
+        assert _scope_fallback_tool_to_subproject(cmd, 'pyright', 'cockpit') == cmd
+
+    def test_none_command_returns_none(self):
+        """`None` is returned unchanged (propagates absent commands)."""
+        assert _scope_fallback_tool_to_subproject(None, 'pyright', 'cockpit') is None
 
 
 class TestSingleSubprojectPrefix:
