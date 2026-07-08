@@ -68,7 +68,7 @@ class TestMinInflightFloorValidation:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
-            OrchestratorConfig(psi_admission={'min_inflight_floor': 0})
+            OrchestratorConfig(psi_admission={'min_inflight_floor': 0})  # type: ignore[arg-type]
 
 
 class TestPsiAdmissionReloadDisposition:
