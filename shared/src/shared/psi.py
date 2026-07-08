@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'parse_pressure_file',
     'read_pressure',
+    'PsiSample',
 ]
 
 _AVG10_RE = re.compile(r'avg10=([0-9]+(?:\.[0-9]+)?)')
@@ -83,3 +85,35 @@ def parse_pressure_file(text: str) -> dict[str, float] | None:
 def read_pressure(name: str) -> str:
     """Read /proc/pressure/<name> from the live kernel."""
     return Path(f'/proc/pressure/{name}').read_text()
+
+
+@dataclass(frozen=True)
+class PsiSample:
+    """Immutable PSI snapshot consumed by the orchestrator's dispatch-admission gate.
+
+    ``read_ok=False`` is the DA-D6 fail-open sentinel (see ``read_psi_sample``):
+    an unreadable or unparseable /proc/pressure/* file degrades the whole
+    sample rather than partially gating on incomplete data.
+    """
+
+    cpu_some10: float
+    mem_some10: float
+    mem_full10: float
+    io_some10: float
+    read_ok: bool
+
+    def saturated(self, cfg) -> bool:
+        """Return True if any PSI metric is at/over its configured avg10 threshold.
+
+        ``cfg`` is duck-typed (only ``cpu_some_avg10``, ``mem_some_avg10``,
+        ``mem_full_avg10``, and ``io_some_avg10`` are read) so this has no
+        dependency on DA2's ``PsiAdmissionConfig`` submodel. Always False when
+        ``read_ok`` is False (fail-open — a degraded sample must never trip
+        the gate, regardless of the threshold values).
+        """
+        return self.read_ok and (
+            self.cpu_some10 >= cfg.cpu_some_avg10
+            or self.mem_some10 >= cfg.mem_some_avg10
+            or self.mem_full10 >= cfg.mem_full_avg10
+            or self.io_some10 >= cfg.io_some_avg10
+        )
