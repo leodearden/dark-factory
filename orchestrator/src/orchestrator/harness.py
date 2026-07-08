@@ -5612,6 +5612,24 @@ Output JSON matching the schema. Every task must appear in the output.
                         'Task %s: auto-eval hook failed (non-fatal): %s',
                         assignment.task_id, exc,
                     )
+            # PRD task-status-authority C4/D4 (task 2188, omega1): clear the
+            # claimant to NULL at slot release — unconditionally, for every
+            # outcome (this runs even when report is None, e.g. the
+            # deterministic-gate early return above, so a claimant is never
+            # left stamped for a slot this process no longer owns). Placed
+            # BEFORE scheduler.release so a concurrent re-dispatch racing in
+            # right after release cannot have its fresh restamp clobbered by
+            # this clear; the residual race is closed by
+            # requeue_cooldown_secs (design doc). Best-effort + suppressed —
+            # scheduler.set_task_claimant already swallows its own errors,
+            # but this belt-and-suspenders suppress guarantees a missing
+            # tool/param, absent column, or transient error here can never
+            # block scheduler.release/sem.release below. plan.lock forensics
+            # are left untouched.
+            with contextlib.suppress(Exception):
+                await self.scheduler.set_task_claimant(
+                    assignment.task_id, claimant_run_id=None, heartbeat_at=None,
+                )
             # arm_requeue_cooldown=True (any unhandled workflow-slot exception) arms
             # the existing requeue_cooldown_secs grace window so a freshly-unblocked
             # task is not immediately re-dispatched and re-blocked in a tight loop.
