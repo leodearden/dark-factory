@@ -22,6 +22,7 @@ own table.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -289,6 +290,50 @@ class ReconLedgerStore:
                     (project_id, now),
                 )
         return cursor.rowcount
+
+    async def mark_addressed(
+        self,
+        project_id: str,
+        record_kind: str,
+        task_id: str = '',
+        flag_type: str = '',
+        run_id: str = '',
+        *,
+        addressed_by: str,
+        addressed_run_id: str,
+    ) -> None:
+        """Flip a record's state to 'addressed' and stamp acknowledgement
+        metadata into payload_json.
+
+        The §8.1 schema has no ``addressed_by``/``addressed_run_id`` columns,
+        so this metadata rides in the ``payload_json`` blob via a
+        read-modify-write. A call against an identity with no matching row is
+        a silent no-op — it must not raise and must not create a row (avoids
+        resurrecting a GC'd marker).
+        """
+        async with self._txn() as db:
+            cursor = await db.execute(
+                """
+                SELECT payload_json FROM recon_ledger
+                WHERE project_id = ? AND record_kind = ? AND task_id = ?
+                  AND flag_type = ? AND run_id = ?
+                """,
+                (project_id, record_kind, task_id, flag_type, run_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return
+            payload = json.loads(row['payload_json'])
+            payload['addressed_by'] = addressed_by
+            payload['addressed_run_id'] = addressed_run_id
+            await db.execute(
+                """
+                UPDATE recon_ledger SET state = 'addressed', payload_json = ?
+                WHERE project_id = ? AND record_kind = ? AND task_id = ?
+                  AND flag_type = ? AND run_id = ?
+                """,
+                (json.dumps(payload), project_id, record_kind, task_id, flag_type, run_id),
+            )
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
