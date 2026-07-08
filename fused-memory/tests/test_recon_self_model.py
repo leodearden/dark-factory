@@ -110,3 +110,54 @@ class TestMarkerLifecycle:
         )
         assert 'stage1_flag_suppression' not in gc_kinds
         assert 'cycle_summary' not in gc_kinds
+
+
+# --------------------------------------------------------------------------- #
+# FINGERPRINT_IDENTITY_FIELDS + harness._derive_affected_ids cross-check (step-5/6)
+# --------------------------------------------------------------------------- #
+
+
+class TestFingerprintIdentityFields:
+    """FINGERPRINT_IDENTITY_FIELDS single-sources the fingerprint identity
+    against the live harness._derive_affected_ids logic and flag_dedup's
+    content-fingerprint fallback."""
+
+    def test_fingerprint_identity_fields_names_expected_containers(self):
+        """Names the four typed citation containers, the legacy affected_ids
+        field, and the content-fp fallback inputs (description, flag_type)."""
+        assert set(m.FINGERPRINT_IDENTITY_FIELDS) == {
+            'affected_ids',
+            'cited_tasks',
+            'cited_entities',
+            'cited_edges',
+            'cited_memories',
+            'flag_type',
+            'description',
+        }
+
+    def test_derive_affected_ids_reads_exactly_the_named_citation_containers(self):
+        """harness._derive_affected_ids flattens exactly the four typed
+        citation containers named in FINGERPRINT_IDENTITY_FIELDS."""
+        from fused_memory.reconciliation.harness import _derive_affected_ids
+
+        assert {'cited_tasks', 'cited_entities', 'cited_edges', 'cited_memories'} <= set(
+            m.FINGERPRINT_IDENTITY_FIELDS
+        )
+        finding = {
+            'cited_tasks': [{'task_id': '7'}],
+            'cited_entities': [{'canonical_name': 'Foo'}],
+            'cited_edges': [{'edge_uuid': 'e1'}],
+            'cited_memories': [{'memory_id': 'm1'}],
+        }
+        result = _derive_affected_ids(finding)
+        assert result == ['7', 'Foo', 'e1', 'm1'], (
+            f'_derive_affected_ids must flatten the four typed citation containers '
+            f'named in FINGERPRINT_IDENTITY_FIELDS; got {result!r}'
+        )
+
+    def test_content_fingerprint_fallback_fields_present(self):
+        """description/flag_type are named — the content-fingerprint fallback
+        inputs read by flag_dedup.compute_content_fingerprint_signature when
+        no task anchor exists."""
+        assert 'description' in m.FINGERPRINT_IDENTITY_FIELDS
+        assert 'flag_type' in m.FINGERPRINT_IDENTITY_FIELDS
