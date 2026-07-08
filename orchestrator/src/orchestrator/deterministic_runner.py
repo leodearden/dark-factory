@@ -101,7 +101,16 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      machinery, so a predicate NEVER touches systemd (no ``unit_inspector``,
      no fresh-PID verify) and NEVER stamps ``before_done_ran_at`` (re-running
      a read-only check on crash-resume is harmless — there is no I1 side
-     effect to double-apply).
+     effect to double-apply).  This dispatch also happens BEFORE
+     ``always_escalates`` is ever consulted, so a predicate task's
+     ``always_escalates`` value is simply ignored — it is meaningful only on
+     the deploy/gate paths' act-then-ask semantics.  A ``kind='predicate'``
+     task with ``always_escalates=True`` set still goes straight to
+     ``done``/``milestone_check_failed`` from the check's exit code alone,
+     with no gate ever filed.  Rejecting (or normalizing) that combination,
+     if ever desired, belongs in fused-memory's ``submit_task``/
+     ``deterministic_task_guard`` validation, not here (out of this runner's
+     scope).
    - Runs the check script under the same outer wall-clock guard pattern as
      the deploy path (``script_runner``/``_default_run_script`` +
      ``asyncio.wait_for(timeout_secs + run_timeout_grace_secs)``).
@@ -118,9 +127,17 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      existing timeout→escalate path) and block — NO ``gate_escalated_at``
      stamp, so the check is simply re-attempted on the next dispatch.
    - Section-1 resume: when ``gate_escalated_at`` is set and the
-     ``milestone_check_failed`` escalation is resolved, drives to ``done``
-     with ``deterministic-milestone`` provenance — short-circuiting BEFORE
-     the ``before_done_ran_at`` proof-check (a predicate never stamps it).
+     ``milestone_check_failed`` escalation is resolved, RE-RUNS the predicate
+     check (delegating back to ``_run_predicate`` — read-only, so repeating it
+     is harmless) rather than trusting the resolution blindly: resolving an
+     escalation is not proof the invariant now holds (a human may resolve it
+     prematurely or in error).  ``rc == 0`` drives to ``done`` with
+     ``deterministic-milestone`` provenance; ``rc != 0`` re-files
+     ``milestone_check_failed`` (the dedup guard sees no pending escalation,
+     since it was just resolved) and stays blocked; a timeout/error routes to
+     ``infra_issue``, identical to the first-dispatch path.  This
+     short-circuits BEFORE the ``before_done_ran_at`` proof-check (a
+     predicate never stamps it).
 
 3. **Pure gate** (``before_done=None``, ``always_escalates=True``):
    - File one born-at-L2 escalation (I3: in-process submit, sentinel role
@@ -852,11 +869,24 @@ class DeterministicRunner:
             metadata_mode='merge',
         )
 
-        # Set status to blocked — gate awaits human decision.
-        await self.scheduler.set_task_status(task_id, 'blocked')
-        logger.info(
-            'DeterministicRunner: task %s blocked at deterministic gate', task_id,
-        )
+        # Set status to blocked — gate awaits human decision.  Best-effort, same
+        # as _file_infra_issue_and_block (reviewer amendment): the escalation +
+        # gate_escalated_at stamp above are already durable, so a severed
+        # connection on this trailing write must not propagate and mask them
+        # behind a raw exception.
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+            logger.info(
+                'DeterministicRunner: task %s blocked at deterministic gate', task_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                'DeterministicRunner: task %s blocked-status writeback failed '
+                '(connection may still be severed): %s: %s — the milestone_gate '
+                'escalation is already durable on local disk, so returning '
+                'BLOCKED regardless',
+                task_id, type(exc).__name__, exc,
+            )
 
         return WorkflowOutcome.BLOCKED
 
@@ -923,10 +953,23 @@ class DeterministicRunner:
             metadata_mode='merge',
         )
 
-        await self.scheduler.set_task_status(task_id, 'blocked')
-        logger.info(
-            'DeterministicRunner: task %s blocked — milestone_check_failed', task_id,
-        )
+        # Best-effort, same as _file_infra_issue_and_block (reviewer amendment):
+        # the escalation + gate_escalated_at stamp above are already durable, so
+        # a severed connection on this trailing write must not propagate and
+        # mask them behind a raw exception.
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+            logger.info(
+                'DeterministicRunner: task %s blocked — milestone_check_failed', task_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                'DeterministicRunner: task %s blocked-status writeback failed '
+                '(connection may still be severed): %s: %s — the '
+                'milestone_check_failed escalation is already durable on local '
+                'disk, so returning BLOCKED regardless',
+                task_id, type(exc).__name__, exc,
+            )
 
         return WorkflowOutcome.BLOCKED
 
@@ -940,6 +983,15 @@ class DeterministicRunner:
         inspect, no baseline/fresh-PID verify, and no ``before_done_ran_at``
         I1 stamp (re-running a read-only check on crash-resume is harmless;
         see the module docstring's γ-predicate subsection).
+
+        Called from two sites: the first dispatch (section 2), and section 1's
+        resume branch once a ``milestone_check_failed`` escalation is
+        resolved — resume re-invokes this method to re-verify the invariant
+        rather than trusting the resolution blindly (a human may resolve the
+        escalation without the underlying check now passing).
+
+        ``metadata.always_escalates`` is never consulted here — see the
+        module docstring's γ-predicate subsection.
 
         Maps the outcome:
         - ``rc == 0`` -> ``WorkflowOutcome.DONE``, with
@@ -1078,24 +1130,28 @@ class DeterministicRunner:
                 # (no I1 side effect to prove), so it must short-circuit here, BEFORE
                 # the before_done_ran_at proof-check below — otherwise a resolved
                 # milestone_check_failed escalation would wrongly raise
-                # NotImplementedError.  Provenance is 'deterministic-milestone', not
-                # the deploy leg's 'deterministic-deploy', so the audit trail never
-                # claims a systemd deploy happened.
+                # NotImplementedError.
+                #
+                # Unlike a deploy (where the human's out-of-band fix IS the
+                # resolution, and re-running risks a double-apply), a predicate
+                # is a cheap, idempotent, READ-ONLY exit-code check — resolving
+                # the escalation alone is NOT proof the invariant now holds (a
+                # human may resolve it prematurely or in error).  So resume
+                # RE-RUNS the check via _run_predicate rather than trusting the
+                # resolution blindly (reviewer amendment): rc==0 drives to done
+                # (deterministic-milestone, never 'deterministic-deploy' — no
+                # deploy happened); rc!=0 re-files milestone_check_failed (the
+                # dedup guard sees no pending escalation, since it was just
+                # resolved) and stays blocked; a timeout/error routes to
+                # infra_issue — identical to the first-dispatch path.
                 if before_done is not None and before_done.get('kind') == 'predicate':
                     logger.info(
-                        'DeterministicRunner: task %s predicate resume — '
-                        'gate resolved — setting done (deterministic-milestone)',
+                        'DeterministicRunner: task %s predicate resume — gate '
+                        'resolved — re-running predicate check (read-only, '
+                        'safe to repeat) before trusting the resolution',
                         task_id,
                     )
-                    await self.scheduler.set_task_status(
-                        task_id,
-                        'done',
-                        done_provenance=_build_done_provenance(
-                            'deterministic-milestone',
-                            note='resumed after milestone_check_failed resolution',
-                        ),
-                    )
-                    return WorkflowOutcome.DONE
+                    return await self._run_predicate(task_id, before_done, description)
 
                 # γ: if before_done is set, the action must have already ran (I1) for us
                 # to safely drive to done here.  Check before_done_ran_at as proof.
@@ -1154,7 +1210,12 @@ class DeterministicRunner:
         if before_done is not None:
             # γ-predicate: a read-only exit-code verdict check — NOT a deploy.
             # Dispatched FIRST, above target_unit/I1/baseline, so a predicate
-            # never touches systemd and never stamps before_done_ran_at.
+            # never touches systemd and never stamps before_done_ran_at.  This
+            # is also BEFORE `always_escalates` is read below — a predicate
+            # task's always_escalates is intentionally never consulted (see
+            # module docstring's γ-predicate subsection); a
+            # kind='predicate' + always_escalates=True task is not rejected
+            # here and simply behaves as a plain predicate.
             if before_done.get('kind') == 'predicate':
                 return await self._run_predicate(task_id, before_done, description)
 
