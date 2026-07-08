@@ -107,6 +107,49 @@ def _deploy_task(
     }
 
 
+def _predicate_task(
+    task_id: str = '700',
+    title: str = 'Milestone predicate check',
+    description: str = 'Predicate that verifies the milestone invariant',
+    script: str = '/tmp/test-predicate.sh',
+    args: list | None = None,
+    env: dict | None = None,
+    cwd: str = '/tmp',
+    timeout_secs: int | float = 30,
+    gate_escalated_at: str | None = None,
+) -> dict:
+    """Build a deterministic PREDICATE task dict (before_done.kind='predicate', γ-predicate).
+
+    A predicate is a READ-ONLY exit-code verdict check — never a systemd
+    deploy — so ``target_unit`` is always None (mirrors ``_deploy_task``'s
+    shape, minus the unit to deploy against).  ``gate_escalated_at``, when
+    given, seeds ``metadata['gate_escalated_at']`` for the resume/quiescence
+    tests (mirrors ``_gate_task``'s same-named parameter).
+    """
+    before_done: dict = {
+        'script': script,
+        'args': args if args is not None else [],
+        'env': env if env is not None else {},
+        'cwd': cwd,
+        'timeout_secs': timeout_secs,
+        'target_unit': None,
+        'kind': 'predicate',
+    }
+    metadata: dict = {
+        'task_kind': 'deterministic',
+        'always_escalates': False,
+        'before_done': before_done,
+    }
+    if gate_escalated_at is not None:
+        metadata['gate_escalated_at'] = gate_escalated_at
+    return {
+        'id': task_id,
+        'title': title,
+        'description': description,
+        'metadata': metadata,
+    }
+
+
 # Unit states used across B6/B7 deploy tests
 _BASELINE_UNIT_STATE: dict = {
     'MainPID': 100,
@@ -4613,3 +4656,738 @@ class TestSharedDoneProvenance:
         built = _build_done_provenance('deterministic-deploy-scheduled', unit='u')
 
         DoneProvenance(**built)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Task 2336 (γ-predicate): predicate deterministic mode — a read-only
+# exit-code verdict check (before_done.kind == 'predicate'), NOT a systemd
+# deploy.  Boundary tests B7 (pass), B8 (fail), B9 (timeout/infra), B10
+# (resume).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateModePassPath:
+    """DeterministicRunner — predicate mode rc==0 -> done, read-only (B7)."""
+
+    async def test_predicate_pass_outcome_is_done(self, tmp_path: Path):
+        """rc==0 -> WorkflowOutcome.DONE (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+    async def test_predicate_pass_sets_done_with_milestone_provenance(self, tmp_path: Path):
+        """set_task_status awaited once with 'done' + provenance.kind='deterministic-milestone' (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[0] == '700'
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance is not None, 'done_provenance must be passed as a kwarg'
+        assert provenance['kind'] == 'deterministic-milestone'
+
+    async def test_predicate_pass_provenance_note_contains_stdout_tail(self, tmp_path: Path):
+        """done_provenance.note contains the check's stdout tail (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        call = scheduler.set_task_status.call_args
+        provenance = call.kwargs.get('done_provenance')
+        assert 'check ok' in provenance.get('note', ''), (
+            f'stdout tail must appear in provenance note: {provenance!r}'
+        )
+
+    async def test_predicate_pass_script_runner_called_once_with_before_done(self, tmp_path: Path):
+        """script_runner invoked exactly once with the full before_done dict (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        before_done = task['metadata']['before_done']
+        script_runner.assert_awaited_once_with(before_done)
+
+    async def test_predicate_pass_no_unit_inspect(self, tmp_path: Path):
+        """unit_inspector is NEVER awaited on the predicate path — no systemd inspect (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        unit_inspector.assert_not_awaited()
+
+    async def test_predicate_pass_no_before_done_ran_at_stamp(self, tmp_path: Path):
+        """update_task is NEVER awaited — a read-only predicate has no I1 stamp (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        scheduler.update_task.assert_not_awaited()
+
+    async def test_predicate_pass_no_escalation_filed(self, tmp_path: Path):
+        """No escalation is filed on a passing predicate check (B7)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        assert queue.get_by_task('700', status='pending') == []
+
+    async def test_predicate_pass_ignores_always_escalates_true(self, tmp_path: Path):
+        """A kind='predicate' task with always_escalates=True still drives
+        straight to done from the check's exit code alone — always_escalates
+        is never consulted on the predicate path (documented contract;
+        reviewer amendment).  No milestone_gate escalation is filed and the
+        act-then-ask gate machinery is never entered."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='700')
+        task['metadata']['always_escalates'] = True
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: 0 flakes'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        call = scheduler.set_task_status.call_args
+        assert call.args[1] == 'done'
+        assert call.kwargs['done_provenance']['kind'] == 'deterministic-milestone'
+        assert queue.get_by_task('700', status='pending') == [], (
+            'always_escalates=True must not cause a gate escalation to be '
+            'filed on the predicate path — it is simply ignored'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-3: RED — B8 predicate rc!=0 -> milestone_check_failed born-at-L2 +
+# gate_escalated_at + blocked
+# (RED until step-4 adds the rc!=0 branch + _file_milestone_check_failed_and_block)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateModeFailPath:
+    """DeterministicRunner — predicate mode rc!=0 -> milestone_check_failed L2 + blocked (B8)."""
+
+    async def test_predicate_fail_outcome_is_blocked(self, tmp_path: Path):
+        """rc!=0 -> WorkflowOutcome.BLOCKED (B8)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='701')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(1, 'FAIL: 3 merge flakes detected'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+    async def test_predicate_fail_files_one_milestone_check_failed_escalation(self, tmp_path: Path):
+        """Exactly one pending escalation: category='milestone_check_failed',
+        level==2, severity=='critical', agent_role sentinel (B8)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='701')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(1, 'FAIL: 3 merge flakes detected'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        pending = queue.get_by_task('701', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed'
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+
+    async def test_predicate_fail_escalation_detail_contains_rc_and_stdout_tail(self, tmp_path: Path):
+        """Escalation detail must contain both the rc (e.g. 'rc=1') and the
+        stdout tail (B8)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='701')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(1, 'FAIL: 3 merge flakes detected'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        esc = queue.get_by_task('701', status='pending')[0]
+        assert 'rc=1' in esc.detail, f'rc must appear in detail: {esc.detail!r}'
+        assert 'FAIL: 3 merge flakes detected' in esc.detail, (
+            f'stdout tail must appear in detail: {esc.detail!r}'
+        )
+
+    async def test_predicate_fail_stamps_gate_escalated_at_not_before_done_ran_at(
+        self, tmp_path: Path,
+    ):
+        """update_task awaited with a truthy gate_escalated_at; before_done_ran_at
+        is NEVER stamped on a read-only predicate (B8)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='701')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(1, 'FAIL: 3 merge flakes detected'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        scheduler.update_task.assert_awaited_once()
+        call_args = scheduler.update_task.call_args
+        metadata_update = call_args.args[1] if call_args.args else call_args.kwargs.get('metadata', {})
+        assert metadata_update.get('gate_escalated_at'), (
+            'gate_escalated_at should be a truthy ISO timestamp'
+        )
+        assert 'before_done_ran_at' not in metadata_update, (
+            f'a read-only predicate must never stamp before_done_ran_at: {metadata_update!r}'
+        )
+
+    async def test_predicate_fail_sets_blocked_never_done(self, tmp_path: Path):
+        """set_task_status awaited with '701','blocked' and NEVER with 'done' (B8)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='701')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(1, 'FAIL: 3 merge flakes detected'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        scheduler.set_task_status.assert_awaited_once_with('701', 'blocked')
+
+    async def test_predicate_fail_no_unit_inspect(self, tmp_path: Path):
+        """unit_inspector is NEVER awaited on the predicate path — no systemd
+        inspect, even on a check failure (B8)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='701')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(1, 'FAIL: 3 merge flakes detected'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        unit_inspector.assert_not_awaited()
+
+    async def test_predicate_fail_dedup_guard_skips_refile_when_pending_exists(
+        self, tmp_path: Path,
+    ):
+        """If a pending milestone_check_failed escalation already exists for
+        the task (e.g. the gate_escalated_at stamp failed on a prior
+        crash-safe dispatch, leaving the escalation filed but un-stamped), a
+        second rc!=0 dispatch must NOT file a duplicate.  The dedup guard in
+        _file_milestone_check_failed_and_block skips re-filing, but still
+        (re-)stamps gate_escalated_at and blocks (test_coverage amendment —
+        this crash window is otherwise unreachable via the normal quiescence
+        path, which returns BLOCKED before _run_predicate ever re-runs)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='701')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+
+        # Pre-seed one pending milestone_check_failed escalation, simulating a
+        # prior dispatch where filing succeeded but the gate_escalated_at
+        # stamp did not land.
+        _seed_escalation(
+            queue, '701', 'orchestrator-deterministic', category='milestone_check_failed',
+        )
+
+        scheduler = _mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(1, 'FAIL: 3 merge flakes detected'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('701', status='pending')
+        assert len(pending) == 1, (
+            f'dedup guard must skip re-filing — expected still exactly 1 '
+            f'pending escalation, got {len(pending)}'
+        )
+
+        # gate_escalated_at is still (re-)stamped even though no new
+        # escalation was filed.
+        scheduler.update_task.assert_awaited_once()
+        call_args = scheduler.update_task.call_args
+        metadata_update = call_args.args[1] if call_args.args else call_args.kwargs.get('metadata', {})
+        assert metadata_update.get('gate_escalated_at')
+
+        scheduler.set_task_status.assert_awaited_once_with('701', 'blocked')
+
+    async def test_predicate_fail_blocked_write_failure_still_returns_blocked(
+        self, tmp_path: Path,
+    ):
+        """A severed connection on the trailing set_task_status('blocked')
+        call must not mask the already-durable milestone_check_failed
+        escalation — run() must still return BLOCKED, never propagate
+        (mirrors _file_infra_issue_and_block's best-effort guard; reviewer
+        amendment)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='701')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        scheduler.set_task_status = AsyncMock(
+            side_effect=RuntimeError('transient: fused-memory unavailable')
+        )
+
+        script_runner = AsyncMock(return_value=(1, 'FAIL: invariant violated'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('701', status='pending')
+        assert len(pending) == 1, (
+            'the escalation must still be filed even when the fallback '
+            'blocked-status write also fails'
+        )
+        assert pending[0].category == 'milestone_check_failed'
+
+
+# ---------------------------------------------------------------------------
+# Step-5: RED — B9 predicate timeout/unexpected-error -> infra_issue + blocked
+# (RED until step-6 wraps _run_predicate's asyncio.wait_for call in the
+# deploy path's except-TimeoutError / except-Exception outer-guard branches)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateModeTimeout:
+    """DeterministicRunner — predicate outer-guard timeout/error -> infra_issue + blocked (B9).
+
+    A hung or erroring script_runner produces NO exit code, so there is no
+    verdict to report — this is an INFRA fault (exactly like the deploy
+    path's outer-guard handling), never a milestone_check_failed verdict.
+    Routing to infra_issue (which does NOT stamp gate_escalated_at) means the
+    check is re-attempted on the next dispatch rather than latched into the
+    resolve-to-done path.
+    """
+
+    async def test_predicate_hang_files_infra_issue_and_blocks(self, tmp_path: Path):
+        """A script_runner that hangs forever must still produce BLOCKED and
+        exactly one L2 infra_issue escalation — NOT milestone_check_failed (B9).
+
+        RED today: _run_predicate has no outer-guard try/except around its
+        ``await asyncio.wait_for(_invoke_run_fn(), timeout=outer_timeout)`` —
+        the TimeoutError propagates uncaught.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='702', timeout_secs=0)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        # Hang tripwire: if the outer guard regresses, fail loudly instead of
+        # stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('702', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue', (
+            f'a hung seam is an infra fault, not a verdict — must not be '
+            f'milestone_check_failed: {esc.category!r}'
+        )
+
+        scheduler.set_task_status.assert_awaited_once_with('702', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+    async def test_predicate_unexpected_exception_files_infra_issue_and_blocks(
+        self, tmp_path: Path,
+    ):
+        """A script_runner that raises an unexpected exception must NOT
+        propagate — _run_predicate must route to _file_infra_issue_and_block
+        and return BLOCKED (B9).
+
+        RED today: _run_predicate propagates the RuntimeError uncaught.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='703')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _boom(_before_done):
+            raise RuntimeError('predicate script spawn exploded')
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_boom,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('703', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+
+        scheduler.set_task_status.assert_awaited_once_with('703', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Step-7: RED — B10 predicate resume: gate_escalated_at set + escalation
+# resolved -> done with deterministic-milestone provenance (NOT
+# deterministic-deploy). (RED until step-8 adds the predicate-aware resume
+# branch in section 1, before the before_done_ran_at NotImplementedError check)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateModeResume:
+    """DeterministicRunner — predicate resume/quiescence via gate_escalated_at (B10).
+
+    A predicate never stamps before_done_ran_at (read-only, I1 doesn't
+    apply), so the section-1 resolved-escalation branch must short-circuit
+    for a predicate BEFORE the before_done_ran_at proof-check that the deploy
+    path relies on — otherwise resume would wrongly raise NotImplementedError.
+    """
+
+    async def test_predicate_resume_no_open_escalation_drives_to_done(self, tmp_path: Path):
+        """gate_escalated_at set + no pending escalation + NO before_done_ran_at
+        -> must NOT raise NotImplementedError; RE-RUNS the predicate check and,
+        on a passing re-check (rc==0), drives to DONE with deterministic-milestone
+        provenance (not deterministic-deploy) (B10; reviewer amendment: resume
+        re-verifies the invariant rather than trusting the resolution blindly)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        # gate already escalated (milestone_check_failed); escalation resolved
+        # (no pending); before_done_ran_at is intentionally NEVER set for a
+        # read-only predicate.
+        task = _predicate_task(task_id='703', gate_escalated_at='2026-07-08T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty queue — escalation resolved
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, 'check ok: invariant now holds'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        # Must NOT raise NotImplementedError — a predicate never stamps
+        # before_done_ran_at, so the proof-check must not apply to it.
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+
+        # The check is genuinely RE-RUN on resume — not skipped/trusted blindly.
+        script_runner.assert_awaited_once_with(task['metadata']['before_done'])
+        unit_inspector.assert_not_awaited()
+
+        scheduler.set_task_status.assert_awaited_once()
+        call = scheduler.set_task_status.call_args
+        assert call.args[0] == '703'
+        assert call.args[1] == 'done'
+        provenance = call.kwargs.get('done_provenance')
+        assert provenance is not None, 'done_provenance must be passed as a kwarg'
+        assert provenance['kind'] == 'deterministic-milestone'
+        assert provenance['kind'] != 'deterministic-deploy', (
+            'predicate resume must not claim a systemd deploy happened'
+        )
+        assert 'check ok' in provenance.get('note', ''), (
+            f"the re-run's stdout tail must appear in provenance note: {provenance!r}"
+        )
+
+    async def test_predicate_resume_recheck_still_failing_refiles_and_stays_blocked(
+        self, tmp_path: Path,
+    ):
+        """gate_escalated_at set + no pending escalation (prior escalation was
+        resolved), but the RE-CHECK still fails (rc!=0) -> must NOT drive to
+        done; re-files a NEW milestone_check_failed escalation and stays
+        BLOCKED (reviewer amendment: resolving the escalation is not proof the
+        invariant now holds — e.g. a human resolved prematurely or in error —
+        so resume re-verifies instead of latching a false 'milestone done')."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='704', gate_escalated_at='2026-07-08T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty queue — prior escalation resolved
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(1, 'still failing: 2 flakes remain'))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        script_runner.assert_awaited_once_with(task['metadata']['before_done'])
+        unit_inspector.assert_not_awaited()
+
+        pending = queue.get_by_task('704', status='pending')
+        assert len(pending) == 1, (
+            f'Expected exactly 1 re-filed pending escalation, got {len(pending)}'
+        )
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed'
+        assert 'rc=1' in esc.detail, f'rc must appear in detail: {esc.detail!r}'
+        assert 'still failing' in esc.detail, (
+            f'stdout tail must appear in detail: {esc.detail!r}'
+        )
+
+        scheduler.set_task_status.assert_awaited_once_with('704', 'blocked')
+
+    async def test_predicate_resume_quiescence_open_escalation_returns_blocked(
+        self, tmp_path: Path,
+    ):
+        """gate_escalated_at set + still-open milestone_check_failed escalation
+        -> BLOCKED, no second escalation filed, no done write (B10 quiescence).
+
+        Already green via the unchanged section-1 pending branch — this test
+        locks the contract rather than driving new behaviour.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='703', gate_escalated_at='2026-07-08T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+
+        # Pre-seed one pending milestone_check_failed escalation (as B8 would file)
+        _seed_escalation(
+            queue, '703', 'orchestrator-deterministic', category='milestone_check_failed',
+        )
+
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('703', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+
+        scheduler.set_task_status.assert_not_awaited()
