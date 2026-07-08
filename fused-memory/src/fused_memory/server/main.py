@@ -891,10 +891,10 @@ async def run_server():
         write_journal=write_journal,
         memory_service=memory_service,
         known_projects=_known_projects_map,
-        # Guarded like event_buffer/ticket_store above: recon_ledger's
-        # unconditional pre-init lands in a later step (task 2219 step-20);
-        # this guard is safe both before and after that pre-init exists.
-        recon_ledger=recon_ledger if 'recon_ledger' in locals() else None,
+        # Unlike event_buffer/ticket_store above, recon_ledger is
+        # unconditionally pre-initialized to None near the top of
+        # run_server(), so it's always bound here — no locals() guard needed.
+        recon_ledger=recon_ledger,
     )
     if _checkpoint_targets:
         checkpoint_task = asyncio.create_task(
