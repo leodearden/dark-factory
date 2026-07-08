@@ -2341,6 +2341,75 @@ async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     )
 
 
+# ── candidate_key collision (fm-task-dedup W8 task A2) ───────────────
+
+
+@pytest.mark.asyncio
+async def test_add_task_duplicate_candidate_key_raises_and_no_orphan(backend, project_root):
+    """A second add_task whose normalized (title, files) collides with an
+    existing non-cancelled row raises DuplicateCandidateKeyError naming the
+    survivor, and creates NO orphan row — the partial UNIQUE index rejects
+    the INSERT, ``_txn`` rolls it back, and get_tasks still shows exactly
+    one non-cancelled row.
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+
+    # Same normalized title (case + extra internal whitespace) and the same
+    # files (order swapped) — compute_candidate_key is case/whitespace
+    # insensitive on title and order-insensitive on files, so this collides.
+    with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+        await backend.add_task(
+            project_root=project_root,
+            title='fix  parser',
+            metadata=json.dumps({'files': ['b.py', 'a.py']}),
+        )
+
+    exc = exc_info.value
+    assert exc.existing_id == 1, f'Expected the collision to name survivor id=1; got {exc.existing_id!r}'
+    assert exc.existing_status == 'pending', (
+        f'Expected the survivor status to be pending; got {exc.existing_status!r}'
+    )
+
+    listing = await backend.get_tasks(project_root=project_root)
+    non_cancelled = [t for t in listing['tasks'] if t['status'] != 'cancelled']
+    assert len(non_cancelled) == 1, (
+        f'Expected exactly one non-cancelled row (no orphan from the '
+        f'rejected insert); got {len(non_cancelled)}: {listing["tasks"]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_task_cancelled_row_allows_refile(backend, project_root):
+    """BT-A5: cancelling the surviving row then re-filing the identical
+    (title, files) SUCCEEDS — the partial UNIQUE index excludes cancelled
+    rows (``WHERE ... status != 'cancelled'``), so a legitimate refile after
+    cancellation is never falsely blocked as a collision.
+    """
+    first = await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    await backend.set_task_status(first['id'], 'cancelled', project_root=project_root)
+
+    second = await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    assert second['id'] == '2', f'Expected the refile to land as a new id=2; got {second["id"]!r}'
+
+    listing = await backend.get_tasks(project_root=project_root)
+    statuses_by_id = {t['id']: t['status'] for t in listing['tasks']}
+    assert statuses_by_id == {'1': 'cancelled', '2': 'pending'}, statuses_by_id
+
+
 # ── Concurrency ────────────────────────────────────────────────────
 
 
