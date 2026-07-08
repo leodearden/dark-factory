@@ -5228,6 +5228,74 @@ class TestPathGuardCheckProseOnly:
 
 
 # ---------------------------------------------------------------------------
+# PROSE-ADVISORY (task 2206) — a heuristic-only hit no longer rejects
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPathGuardOrSkipProseAdvisory:
+    """Task 2206: a PROSE-only heuristic hit (no metadata.files mismatch) is
+    a non-rejecting advisory — the task is still created, but
+    kwargs['metadata']['possible_scope_mismatch'] is attached and a
+    scope_violation escalation still fires (loud, non-blocking)."""
+
+    async def test_prose_hit_is_advisory_not_rejection(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        fake_adjudicator = AsyncMock()
+        fake_adjudicator.adjudicate = AsyncMock()
+        interceptor._path_scope_adjudicator = fake_adjudicator
+
+        kwargs = {
+            'title': 'Investigate fused-memory/harness deadlock',
+            'description': 'See fused-memory/ for context',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs,
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is None, f'Expected advisory (None), got error: {result!r}'
+        assert len(escalator_calls) == 1, (
+            f'Expected escalator called exactly once, got {len(escalator_calls)}'
+        )
+        assert escalator_calls[0]['matched_paths'] == ('fused-memory/',)
+        assert escalator_calls[0]['suggested_project'] == 'dark_factory'
+
+        meta = kwargs.get('metadata') or {}
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, f'Expected possible_scope_mismatch in metadata: {kwargs!r}'
+        assert marker['matched_paths'] == ['fused-memory/']
+        assert marker['suggested_project'] == 'dark_factory'
+
+        fake_adjudicator.adjudicate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Multi-project routing — registry + escalator wiring
 # ---------------------------------------------------------------------------
 
