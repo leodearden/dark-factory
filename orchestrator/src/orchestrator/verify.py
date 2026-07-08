@@ -1694,15 +1694,13 @@ def _build_fallback_config(
             ),
             'ruff check',
         )
-        type_cmd = _reproject_bare_uv_run(
-            _strip_leading_cd(
-                _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
-            ),
-            'pyright',
+        type_scoped = _strip_leading_cd(
+            _scope_command(config.type_check_command, 'pyright', py_files) or config.type_check_command
         )
+        type_cmd = _reproject_bare_uv_run(type_scoped, 'pyright')
     else:
         lint_cmd = 'ruff check ' + ' '.join(py_files)
-        type_cmd = 'pyright ' + ' '.join(py_files)
+        type_scoped = type_cmd = 'pyright ' + ' '.join(py_files)
 
     # Subproject-scoped TEST command (task 2344): when every touched file
     # lives under a single top-level directory that is itself a real
@@ -1765,6 +1763,12 @@ def _build_fallback_config(
             'cd ' + sub + ' && uv run pytest ' + ' '.join(rel_targets)
             if rel_targets else None
         )
+        # Cold-verify dev-dep race (task 2355): rescope TYPE into *sub*'s own
+        # uv context so `uv run --project <sub>` syncs its dev-group deps
+        # (e.g. hypothesis) before pyright runs, rather than racing the
+        # concurrently-run TEST command's `uv run` sync on a cold shared
+        # .venv (esc-2293-20).
+        type_cmd = _scope_fallback_tool_to_subproject(type_scoped, 'pyright', sub)
         return ModuleConfig(
             prefix=sub,
             lint_command=lint_cmd,
