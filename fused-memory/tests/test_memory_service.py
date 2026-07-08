@@ -4835,6 +4835,80 @@ class TestRestoreFalselySupersededSiblingEdges:
 
 
 # ---------------------------------------------------------------------------
+# Task 2319 step-3: _invalidate_stale_superseded_ttl_edges hook RED tests
+# ---------------------------------------------------------------------------
+
+class TestInvalidateStaleSupersededTtlEdges:
+    """_invalidate_stale_superseded_ttl_edges is the mirror-image
+    (under-invalidation direction) counterpart of
+    _restore_falsely_superseded_sibling_edges (task 2111). When the current
+    episode writes a fresh, valid priority-override/TTL fact for an entity,
+    any OTHER currently-valid priority-override/TTL edge on that entity is a
+    stale, same-subject single-valued-scalar contradiction that Graphiti's
+    upstream LLM edge-resolver failed to invalidate. Unlike the sibling hook
+    (which scans only result.edges, since graphiti touches the edges it
+    falsely invalidates), this hook must re-query live graph state: the
+    pre-existing stale edge was NOT touched by this episode, so it is
+    generally absent from result.edges.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalidates_stale_ttl_edge_after_fresh_write(self, service):
+        """CORE repro: Task 2265's TTL is rewritten 10800 -> 86400. The fresh
+        edge is valid (invalid_at=None) in result.edges; the pre-existing
+        stale 10800 edge was never touched by this episode, so it is only
+        discoverable via a live get_valid_edges_for_node query on the
+        touched node."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_new = MockEdge(
+            fact='Task 2265 priority override TTL updated to 86400 seconds',
+            uuid='fresh-86400',
+            source_node_uuid='Task2265', target_node_uuid='TTL',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_new]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task2265':
+                return [
+                    {'uuid': 'fresh-86400',
+                     'fact': 'Task 2265 priority override TTL updated to 86400 seconds',
+                     'name': ''},
+                    {'uuid': 'stale-10800',
+                     'fact': 'Task 2265 has priority override TTL of 10800 seconds',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'stale-10800', 'fact': 'y', 'refreshed_nodes': []}
+        )
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        assert count == 1
+        queried_uuids = {
+            c.args[0] for c in service.graphiti.get_valid_edges_for_node.await_args_list
+        }
+        assert 'Task2265' in queried_uuids, (
+            f'expected the touched node to be queried, got {queried_uuids!r}'
+        )
+        service.graphiti.update_edge.assert_awaited_once_with(
+            'stale-10800', group_id='proj', invalid_at=ts,
+        )
+        invalidated_uuids = {c.args[0] for c in service.graphiti.update_edge.await_args_list}
+        assert 'fresh-86400' not in invalidated_uuids
+
+
+# ---------------------------------------------------------------------------
 # Step 7: TRACK B.2 _is_dependency_fact helper RED tests
 # ---------------------------------------------------------------------------
 
