@@ -8088,3 +8088,87 @@ class TestAcknowledgeResolvedFlags:
         )
         assert result == 2
 
+
+# ---------------------------------------------------------------------------
+# _is_completion_flag pure predicate tests (task-2312 step-1)
+# ---------------------------------------------------------------------------
+
+
+class TestIsCompletionFlag:
+    """Unit tests for _is_completion_flag(flag: dict) -> bool.
+
+    The helper must return True ONLY when flag['flag_for_stage2'] is
+    present AND explicitly false (bool False, or a case-insensitive 'false'
+    string) — never on mere absence of the key. Absence is the shape every
+    dedup MISS/HIT marker and every ordinary recurring flag has, so treating
+    absence as "false" would misclassify recurring findings as one-time
+    completions.
+    """
+
+    # ----- ACCEPT cases: present-and-explicitly-false -----
+
+    def test_bool_false_is_completion_flag(self):
+        """flag_for_stage2=False (bool) — the canonical completion signal."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': False}
+        assert _is_completion_flag(flag) is True
+
+    def test_string_false_lowercase_is_completion_flag(self):
+        """flag_for_stage2='false' (str) is accepted case-insensitively."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': 'false'}
+        assert _is_completion_flag(flag) is True
+
+    def test_string_false_titlecase_is_completion_flag(self):
+        """flag_for_stage2='False' (str, title-case) is accepted case-insensitively."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': 'False'}
+        assert _is_completion_flag(flag) is True
+
+    # ----- REJECT cases -----
+
+    def test_absent_key_is_not_completion_flag(self):
+        """Key absent entirely — MUST NOT be treated as a completion flag.
+
+        Dedup-safety-critical case: dedup MISS markers never set
+        flag_for_stage2, so gating on absence would delete markers that
+        cross-cycle dedup depends on.
+        """
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x'}
+        assert _is_completion_flag(flag) is False
+
+    def test_bool_true_is_not_completion_flag(self):
+        """flag_for_stage2=True (bool) is a normal Stage-2-bound flag, not a completion marker."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': True}
+        assert _is_completion_flag(flag) is False
+
+    def test_string_true_is_not_completion_flag(self):
+        """flag_for_stage2='true' (truthy string) is not a completion marker."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': 'true'}
+        assert _is_completion_flag(flag) is False
+
+    def test_none_value_is_not_completion_flag(self):
+        """flag_for_stage2=None is not an explicit false — not a completion marker."""
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'task_id': 1, 'flag_type': 'x', 'flag_for_stage2': None}
+        assert _is_completion_flag(flag) is False
+
+    def test_non_flag_shaped_dict_is_not_completion_flag(self):
+        """A dict with none of the usual flag fields (no task_id/flag_type/
+        flag_for_stage2) must not crash and must return False.
+        """
+        from fused_memory.reconciliation.flag_dedup import _is_completion_flag
+
+        flag = {'unexpected_key': 'unexpected_value'}
+        assert _is_completion_flag(flag) is False
+
