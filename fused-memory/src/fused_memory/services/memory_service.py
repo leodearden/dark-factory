@@ -870,11 +870,23 @@ class MemoryService:
            ``_is_priority_override_ttl_fact``. If none, returns 0 without
            any graph query — this scopes the hook to fire only when the
            current episode actually wrote a priority-override/TTL fact.
-        2. For each distinct node touched (source or target) by an
-           authoritative-fresh edge, queries
+        2. For each distinct SUBJECT (``source_node_uuid``) of an
+           authoritative-fresh edge — never the object/target node — queries
            ``graphiti.get_valid_edges_for_node`` for every currently-valid
            edge on that node — including pre-existing stale edges this
-           episode never touched.
+           episode never touched. The target/object of a TTL fact is a
+           generic value/concept node ("TTL", "X seconds") shared across
+           every task that ever mentioned a TTL; because
+           ``get_valid_edges_for_node`` is UNDIRECTED, querying that shared
+           node would return — and this hook would then invalidate — the
+           priority-override/TTL edges of OTHER subjects, silently destroying
+           valid, current facts belonging to unrelated entities (the
+           cross-entity over-invalidation failure mode this hook must NOT
+           reintroduce). The subject Task node is on BOTH the stale and the
+           fresh edge, so querying it alone still catches the genuine
+           same-subject stale edge; the target query is both harmful and
+           unnecessary. This is what enforces the docstring invariant that
+           only *same-subject* single-valued scalars are superseded.
         3. Invalidates every returned edge that also matches
            ``_is_priority_override_ttl_fact`` and is not itself one of the
            authoritative-fresh edges: it is a same-subject, single-valued
@@ -883,9 +895,10 @@ class MemoryService:
            edges (falling back to ``datetime.now(UTC)`` when unavailable),
            so the stale fact's supersession is stamped as of the moment the
            new fact became valid. A processed-uuid set deduplicates edges
-           reachable from more than one touched node (an undirected
-           per-node query returns a shared edge under both endpoints), so
-           each stale edge is invalidated at most once. Each invalidation
+           reachable from more than one subject node (an undirected
+           per-node query returns an edge spanning two queried subjects under
+           both endpoints), so each stale edge is invalidated at most once.
+           Each invalidation
            attempt is individually best-effort — mirroring the sibling
            hook's per-edge guard — so a transient backend failure for one
            stale edge is logged and counted but does not stop the remaining
@@ -921,7 +934,7 @@ class MemoryService:
             return 0
 
         keep_uuids: set[str] = set()
-        touched_node_uuids: set[str] = set()
+        subject_node_uuids: set[str] = set()
         supersession_stamp: datetime | None = None
         for edge in edges:
             if getattr(edge, 'invalid_at', None) is not None:
@@ -931,12 +944,20 @@ class MemoryService:
             edge_uuid = getattr(edge, 'uuid', '') or ''
             if edge_uuid:
                 keep_uuids.add(edge_uuid)
+            # SUBJECT-SCOPED: collect ONLY the subject/source node, never the
+            # object/target. For a fact "Task N priority override TTL of X
+            # seconds" the source is the subject Task node and the target is a
+            # generic value/concept node ("TTL", "X seconds") shared across
+            # every task that ever mentioned a TTL. get_valid_edges_for_node is
+            # UNDIRECTED, so querying that shared target node would return the
+            # priority-override/TTL edges of OTHER subjects and invalidate their
+            # valid, current facts — the cross-entity over-invalidation failure
+            # mode. The subject Task node is on BOTH the stale and the fresh
+            # edge, so querying it alone still catches the genuine same-subject
+            # stale edge; the target query is both harmful and unnecessary.
             src = getattr(edge, 'source_node_uuid', '') or ''
-            tgt = getattr(edge, 'target_node_uuid', '') or ''
             if src:
-                touched_node_uuids.add(src)
-            if tgt:
-                touched_node_uuids.add(tgt)
+                subject_node_uuids.add(src)
             valid_at = getattr(edge, 'valid_at', None)
             if valid_at is not None and (
                 supersession_stamp is None or valid_at > supersession_stamp
@@ -954,7 +975,7 @@ class MemoryService:
         invalidated = 0
         failed = 0
         processed_uuids: set[str] = set()
-        for node_uuid in touched_node_uuids:
+        for node_uuid in subject_node_uuids:
             candidates = await self.graphiti.get_valid_edges_for_node(
                 node_uuid, group_id=group_id,
             )

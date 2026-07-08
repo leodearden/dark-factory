@@ -5219,10 +5219,12 @@ class TestInvalidateStaleSupersededTtlEdges:
         service.graphiti.update_edge.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_dedups_edge_reachable_from_both_endpoints(self, service):
-        """A stale edge visible from BOTH the source and target node queries
-        (an undirected lookup naturally returns it under either endpoint) is
-        invalidated only ONCE."""
+    async def test_only_subject_source_node_is_queried_never_target(self, service):
+        """SUBJECT-SCOPED: the hook queries ONLY the subject/source node of a
+        fresh priority-override/TTL edge, never the object/target node. The
+        target of a TTL fact is a generic shared value/concept node ('TTL')
+        and an undirected query on it would leak into other subjects' edges
+        (see test_does_not_invalidate_other_subject_ttl_edge)."""
         from datetime import UTC, datetime
 
         from _fm_helpers import MockEdge
@@ -5239,20 +5241,17 @@ class TestInvalidateStaleSupersededTtlEdges:
         result = MagicMock()
         result.edges = [fresh_new]
 
-        shared_candidates = [
-            {'uuid': 'fresh-86400',
-             'fact': 'Task 2265 priority override TTL updated to 86400 seconds',
-             'name': ''},
-            {'uuid': 'stale-10800',
-             'fact': 'Task 2265 has priority override TTL of 10800 seconds',
-             'name': ''},
-        ]
-
-        async def _valid_edges(node_uuid, *, group_id):
-            # Both endpoints of the fresh edge see the same stale sibling —
-            # exactly what an undirected per-node query returns when the
-            # stale edge shares both endpoints with the fresh edge.
-            return list(shared_candidates)
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task2265':
+                return [
+                    {'uuid': 'fresh-86400',
+                     'fact': 'Task 2265 priority override TTL updated to 86400 seconds',
+                     'name': ''},
+                    {'uuid': 'stale-10800',
+                     'fact': 'Task 2265 has priority override TTL of 10800 seconds',
+                     'name': ''},
+                ]
+            return []
 
         service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
         service.graphiti.update_edge = AsyncMock(
@@ -5261,10 +5260,143 @@ class TestInvalidateStaleSupersededTtlEdges:
 
         count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
 
-        assert service.graphiti.get_valid_edges_for_node.await_count == 2
+        # Only the subject/source node was queried — the target 'TTL' node was
+        # NOT (undirected query on it would leak across subjects).
+        queried_uuids = {
+            c.args[0] for c in service.graphiti.get_valid_edges_for_node.await_args_list
+        }
+        assert queried_uuids == {'Task2265'}, (
+            f'expected only the subject node to be queried, got {queried_uuids!r}'
+        )
         assert count == 1
         service.graphiti.update_edge.assert_awaited_once_with(
             'stale-10800', group_id='proj', invalid_at=ts,
+        )
+
+    @pytest.mark.asyncio
+    async def test_does_not_invalidate_other_subject_ttl_edge(self, service):
+        """CROSS-ENTITY GUARD: a valid priority-override/TTL edge belonging to
+        a DIFFERENT subject must never be invalidated, even though it shares
+        the generic 'TTL' target node with the fresh edge. Because the hook
+        queries only the subject/source node (Task2265), the other subject's
+        edge (returned only by the shared 'TTL' target) is never seen. The
+        genuine same-subject stale edge is still invalidated.
+
+        This test FAILS against the prior both-endpoints implementation (which
+        queried 'TTL' and invalidated the other subject's edge) and PASSES
+        against the subject-scoped fix."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_new = MockEdge(
+            fact='Task 2265 priority override TTL updated to 86400 seconds',
+            uuid='fresh-86400',
+            source_node_uuid='Task2265', target_node_uuid='TTL',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_new]
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid == 'Task2265':
+                # Subject query: the fresh edge + the genuine same-subject stale edge.
+                return [
+                    {'uuid': 'fresh-86400',
+                     'fact': 'Task 2265 priority override TTL updated to 86400 seconds',
+                     'name': ''},
+                    {'uuid': 'stale-10800',
+                     'fact': 'Task 2265 has priority override TTL of 10800 seconds',
+                     'name': ''},
+                ]
+            if node_uuid == 'TTL':
+                # Undirected query on the SHARED target node also surfaces a
+                # DIFFERENT subject's valid, current TTL edge. The old
+                # both-endpoints impl would query this and destroy it.
+                return [
+                    {'uuid': 'fresh-86400',
+                     'fact': 'Task 2265 priority override TTL updated to 86400 seconds',
+                     'name': ''},
+                    {'uuid': 'other-task-ttl',
+                     'fact': 'Task 999 has priority override TTL of 3600 seconds',
+                     'name': ''},
+                    {'uuid': 'stale-10800',
+                     'fact': 'Task 2265 has priority override TTL of 10800 seconds',
+                     'name': ''},
+                ]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'stale-10800', 'fact': 'y', 'refreshed_nodes': []}
+        )
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        invalidated_uuids = {c.args[0] for c in service.graphiti.update_edge.await_args_list}
+        # The other subject's valid edge is NEVER invalidated (no cross-entity leak).
+        assert 'other-task-ttl' not in invalidated_uuids, (
+            'cross-entity over-invalidation: a different subject has had its '
+            f'valid TTL edge invalidated; invalidated={invalidated_uuids!r}'
+        )
+        # The genuine same-subject stale edge IS still invalidated.
+        assert invalidated_uuids == {'stale-10800'}
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_dedups_edge_reachable_from_two_subject_nodes(self, service):
+        """A stale edge spanning TWO distinct subject nodes that this episode
+        both wrote fresh facts for is returned by each subject's undirected
+        query, but invalidated only ONCE via the processed-uuid dedup."""
+        from datetime import UTC, datetime
+
+        from _fm_helpers import MockEdge
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+
+        fresh_a = MockEdge(
+            fact='Task 2265 priority override TTL updated to 86400 seconds',
+            uuid='fresh-a',
+            source_node_uuid='NodeA', target_node_uuid='TTL',
+            invalid_at=None, valid_at=ts,
+        )
+        fresh_b = MockEdge(
+            fact='Task 2266 priority override TTL updated to 86400 seconds',
+            uuid='fresh-b',
+            source_node_uuid='NodeB', target_node_uuid='TTL',
+            invalid_at=None, valid_at=ts,
+        )
+
+        result = MagicMock()
+        result.edges = [fresh_a, fresh_b]
+
+        # A stale edge whose endpoints are BOTH queried subject nodes — an
+        # undirected per-node query returns it under either endpoint.
+        shared_stale = {
+            'uuid': 'stale-shared',
+            'fact': 'Task 2265 has priority override TTL of 10800 seconds',
+            'name': '',
+        }
+
+        def _valid_edges(node_uuid, *, group_id):
+            if node_uuid in ('NodeA', 'NodeB'):
+                return [dict(shared_stale)]
+            return []
+
+        service.graphiti.get_valid_edges_for_node = AsyncMock(side_effect=_valid_edges)
+        service.graphiti.update_edge = AsyncMock(
+            return_value={'uuid': 'stale-shared', 'fact': 'y', 'refreshed_nodes': []}
+        )
+
+        count = await service._invalidate_stale_superseded_ttl_edges(result, group_id='proj')
+
+        assert service.graphiti.get_valid_edges_for_node.await_count == 2
+        assert count == 1
+        service.graphiti.update_edge.assert_awaited_once_with(
+            'stale-shared', group_id='proj', invalid_at=ts,
         )
 
     @pytest.mark.asyncio
