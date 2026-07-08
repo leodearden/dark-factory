@@ -3295,7 +3295,7 @@ async def run_scoped_verification(
                     return _trivial_pass(
                         'No source files changed — verify trivially passes',
                     )
-            fallback = _build_fallback_config(existing_files, config)
+            fallback = _build_fallback_config(existing_files, config, worktree=worktree)
             if fallback is not None:
                 fallback = _apply_cargo_scope(
                     fallback, existing_files, worktree, scope_cargo_enabled,
