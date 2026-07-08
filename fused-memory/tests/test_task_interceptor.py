@@ -5162,6 +5162,72 @@ class TestFilesCertainScopeCheck:
 
 
 # ---------------------------------------------------------------------------
+# _path_guard_check is PROSE-ONLY (task 2206) — files are the certain
+# check's job; the heuristic prose scanner must never re-scan them.
+# ---------------------------------------------------------------------------
+
+
+class TestPathGuardCheckProseOnly:
+    """Task 2206: _path_guard_check scans title/description/details ONLY.
+
+    Concrete metadata.files entries are the FILES-certain check's job
+    (_files_scope_check / check_files_for_scope) — the prose helper must
+    never re-scan files_to_modify, or a file would be double-classified by
+    both the exact lookup and the regex-over-prose heuristic.
+    """
+
+    def test_files_to_modify_not_scanned_by_prose_check(self, interceptor, tmp_path):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        candidate = CandidateTask(
+            title='Generic refactor',
+            description='',
+            details='',
+            files_to_modify=['fused-memory/src/x.py'],
+            priority='medium',
+        )
+        verdict = interceptor._path_guard_check(candidate, {}, 'reify')
+        assert verdict.outcome == 'ok'
+
+    def test_title_mention_still_scanned_by_prose_check(self, interceptor, tmp_path):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+        interceptor._prefix_registry = registry
+
+        candidate = CandidateTask(
+            title='Edit fused-memory/X',
+            description='',
+            details='',
+            files_to_modify=[],
+            priority='medium',
+        )
+        verdict = interceptor._path_guard_check(candidate, {}, 'reify')
+        assert verdict.outcome == 'rejection'
+
+
+# ---------------------------------------------------------------------------
 # Multi-project routing — registry + escalator wiring
 # ---------------------------------------------------------------------------
 
