@@ -2086,11 +2086,16 @@ Output JSON matching the schema. Every task must appear in the output.
 
                     try:
                         is_registered = await self.git_ops._is_registered_worktree(entry)
-                    except OSError:
+                    except OSError as e:
                         # Fail-safe: an unreachable git command must not be
                         # read as conclusively "orphaned" (mirrors the
                         # transient-safe default used elsewhere in this
                         # method).
+                        logger.warning(
+                            'Recovery: registration check raised for lane %s '
+                            'task %s (%s) — restoring pin as safe default',
+                            entry.name, rec.task_id, e,
+                        )
                         is_registered = True
                     registered_branch = None
                     checkouts = await self.git_ops.lane_branch_checkouts()
