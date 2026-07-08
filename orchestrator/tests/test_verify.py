@@ -4443,10 +4443,15 @@ class TestBuildFallbackConfigSubprojectScoped:
         '&& cd ../dashboard && uv run pytest tests/'
     )
     _FLEET_LINT_COMMAND = 'uv run ruff check shared escalation fused-memory orchestrator dashboard'
+    _FLEET_TYPE_COMMAND = (
+        'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright '
+        '&& cd ../dashboard && npx pyright'
+    )
 
     def _make_config(self, tmp_path: Path, **kwargs) -> OrchestratorConfig:
         kwargs.setdefault('test_command', self._FLEET_TEST_COMMAND)
         kwargs.setdefault('lint_command', self._FLEET_LINT_COMMAND)
+        kwargs.setdefault('type_check_command', self._FLEET_TYPE_COMMAND)
         return OrchestratorConfig(project_root=tmp_path, **kwargs)
 
     def _make_cockpit_worktree(self, tmp_path: Path) -> Path:
@@ -4475,6 +4480,33 @@ class TestBuildFallbackConfigSubprojectScoped:
         assert result.lint_command is not None
         assert 'cockpit/src/cockpit/c3.py' in result.lint_command
         assert 'cockpit/tests/test_c3.py' in result.lint_command
+
+    def test_type_command_scoped_to_cockpit_uv_context(self, tmp_path: Path) -> None:
+        """cockpit source + test file → type_check_command runs in cockpit's own uv context.
+
+        Cold-verify dev-dep race (task 2355): the fleet-configured
+        ``npx pyright`` chain, once scoped to the touched files, carries no uv
+        context at all. On a cold throwaway verify worktree the shared
+        ``.venv`` starts empty, so pyright would race the concurrently-run
+        TEST command's ``uv run`` sync instead of deterministically resolving
+        cockpit's own (possibly dev-only) dependencies. `uv run --project
+        cockpit` self-syncs cockpit's deps before pyright runs.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.type_check_command == (
+            'uv run --project cockpit npx pyright cockpit/src/cockpit/c3.py cockpit/tests/test_c3.py'
+        )
+        # False-block guard: no OTHER fleet subproject may appear in the scoped command.
+        assert 'fused-memory' not in result.type_check_command
+        assert 'orchestrator' not in result.type_check_command
+        assert 'dashboard' not in result.type_check_command
 
     def test_source_only_change_yields_no_test_command(self, tmp_path: Path) -> None:
         """A cockpit source-only diff (no test files touched) → test_command is None."""
