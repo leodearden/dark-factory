@@ -60,6 +60,13 @@ _TRANSIENT_BACKOFF_BASE: float = 1.5
 # journald while the per-tick dispatch_deferred event still fires every tick.
 _DISPATCH_DEFERRED_LOG_SECS: float = 180.0
 
+# Sentinel distinguishing "caller omitted this claimant kwarg" (default,
+# leave the wire argument absent) from "caller explicitly passed None"
+# (clear) on Scheduler.set_task_claimant (task 2188, PRD
+# task-status-authority C4/D4). A bare ``None`` default could not
+# distinguish these two cases since ``None`` IS the clear value.
+_CLAIMANT_ABSENT = object()
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
