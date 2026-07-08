@@ -541,95 +541,68 @@ async def filter_suppressed(
     project_id: str,
     flags: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Drop flags matched by an active ``stage1_flag_suppression`` record.
+    """Drop flags matched by an active ``stage1_flag_suppression`` ledger record.
 
-    Performs one project-scoped Mem0 search per call to retrieve all active
-    suppression records, then builds a ``task_id -> (wildcard | flag_types)``
-    map:
+    Reads ``memory_service.recon_ledger.list_suppressions(project_id)`` -- an
+    indexed ``(project_id, record_kind, state)`` query on the
+    ``recon_ledger`` table (no Mem0 search) -- then builds a
+    ``task_id -> (wildcard | flag_types)`` map from the returned rows'
+    ``task_id``/``flag_type`` columns:
 
-    - A record WITHOUT a non-empty ``metadata.flag_types`` (the legacy shape)
-      is a WILDCARD — it blanket-suppresses every flag_type for that task_id.
-    - A record WITH a non-empty ``metadata.flag_types`` is SCOPED — it
-      suppresses only those (task_id, flag_type) pairs.
-    - When both a scoped and a wildcard record exist for the same task_id
-      (in either search order), the wildcard wins — union semantics, since a
+    - A row with ``flag_type == ''`` is a WILDCARD -- it blanket-suppresses
+      every flag_type for that task_id.
+    - A row with a non-empty ``flag_type`` is SCOPED -- it suppresses only
+      that (task_id, flag_type) pair.
+    - When both a scoped and a wildcard row exist for the same task_id
+      (in either row order), the wildcard wins -- union semantics, since a
       blanket suppression cannot be narrowed by a more specific record.
 
     A flag is dropped iff its ``task_id`` has a wildcard entry, or has a
     scoped entry whose set contains the flag's (str-coerced) ``flag_type``.
     A flag with no ``flag_type`` (``None``/absent) can never match a scoped
-    entry — it is kept unless the task_id entry is a wildcard.  The remaining
-    flags are returned unchanged so they can proceed through the
+    entry -- it is kept unless the task_id entry is a wildcard. The
+    remaining flags are returned unchanged so they can proceed through the
     signature-dedup loop.
 
-    Canonical suppression record schema (owned by the producer task):
-    - ``metadata.kind == "stage1_flag_suppression"``
-    - ``metadata.task_id == <N>`` (int or str; coerced to str on both sides)
-    - ``metadata.flag_types == [<str>, ...]`` (optional scoping allowlist)
+    Rows with ``task_id == ''`` are skipped when building the map (a
+    degenerate/malformed suppression with no task target) -- this mirrors
+    the old producer-side guard that rejected a missing/empty ``task_id``.
 
-    Both ``kind`` and ``task_id`` must be present and correct for a record to
-    be treated as a suppression — this rejects vector-search near-misses that
-    only match on semantic proximity.  ``task_id`` values that are ``None``
-    or ``''`` in a suppression record are skipped (invalid; not added to the
-    map), preventing a malformed record from accidentally suppressing flags
-    that have no task_id.
-
-    The search uses ``limit=501`` internally so that genuine overflow can be
-    detected without false positives.  When exactly 500 results are returned
-    Mem0 may have returned the entire set (no truncation); when 501 are
-    returned it confirms more than 500 records exist and the excess is
-    silently dropped.  A WARNING is logged in the overflow case so dashboards
-    can alert on incomplete suppression coverage.  In practice suppression
-    records are a small operator-managed set and 500 provides ample headroom.
-
-    On search exception: logs a WARNING and returns *flags* unchanged
-    (conservative pass-through — treats as "no suppression in effect").
+    Conservative pass-through (zero I/O beyond the attribute check itself):
+    when *flags* is empty, or ``memory_service.recon_ledger`` is unset/
+    ``None`` (ledger disabled or not yet wired), *flags* is returned
+    unchanged -- the same "no suppression in effect" contract the old
+    Mem0-search-exception path provided.
     """
     if not flags:
         return []
 
-    # Bulk fetch: bare query + filter by metadata post-hoc. See docstring re: limit=501.
-    try:
-        results = await memory_service.search(
-            query='stage1_flag_suppression',
-            project_id=project_id,
-            categories=['observations_and_summaries'],
-            stores=['mem0'],
-            limit=501,
-        )
-    except Exception as e:
-        logger.warning(
-            'filter_suppressed search failed for project %s: %s', project_id, e
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        logger.debug(
+            'filter_suppressed: no recon_ledger on memory_service for project %s; '
+            'passing %d flag(s) through unfiltered',
+            project_id,
+            len(flags),
         )
         return flags
 
-    if len(results) > 500:
-        logger.warning(
-            'filter_suppressed: result count exceeded 500 for project %s; '
-            'suppression set truncated to 500',
-            project_id,
-        )
-        results = results[:500]
+    rows = await ledger.list_suppressions(project_id)
 
     # task_id (str) -> None (wildcard/blanket) | set[str] (scoped flag_types
     # allowlist).  See docstring for wildcard-wins union semantics.
     suppressed: dict[str, set[str] | None] = {}
-    for r in results:
-        meta = r.metadata or {}
-        if meta.get('kind') != 'stage1_flag_suppression':
-            continue
-        task_id = meta.get('task_id')
-        if task_id is None or task_id == '':
-            continue
-        tid_str = str(task_id)  # required: legacy records may carry task_id as int or str; coerce both sides for compat
+    for row in rows:
+        tid_str = row.task_id
+        if not tid_str:
+            continue  # degenerate row with no task target; can never match a kept flag
 
         if tid_str in suppressed and suppressed[tid_str] is None:
             continue  # already wildcard for this task_id; cannot be narrowed further
 
-        flag_types = meta.get('flag_types')
-        if not flag_types:
-            # Unscoped/legacy record -> wildcard; overrides any scoped entry
-            # accumulated so far for this task_id (union semantics: wildcard wins).
+        if not row.flag_type:
+            # Wildcard/blanket row -> overrides any scoped entry accumulated
+            # so far for this task_id (union semantics: wildcard wins).
             suppressed[tid_str] = None
             continue
 
@@ -637,7 +610,7 @@ async def filter_suppressed(
         if not isinstance(scoped, set):
             scoped = set()
             suppressed[tid_str] = scoped
-        scoped.update(str(ft) for ft in flag_types)
+        scoped.add(row.flag_type)
 
     def _keep(f: dict[str, Any]) -> bool:
         flag_tid = f.get('task_id')
