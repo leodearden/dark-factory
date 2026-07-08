@@ -6950,8 +6950,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if _ie.lease is not None and self._host_allocator is not None:
                 with contextlib.suppress(BaseException):
                     await self._host_allocator.cancel_and_release(_ie.lease)
-            if _ie.was_speculative:
-                self._speculation_slot.release()
+            # η: release THROUGH the ledger (idempotent + discards the token
+            # from ledger.live), guarded by the threaded token rather than
+            # was_speculative — ledger.release(None) would AttributeError.
+            if _ie.permit is not None:
+                self._speculation_ledger.release(_ie.permit)
         # Intentionally mutates _inflight directly (not via _inflight_clear())
         # from the stop coroutine — a legitimate non-owner drain covered by
         # _assert_single_writer's not-self._running gate (task 1999 I7), not
@@ -7721,14 +7724,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         )
                         _abandon = self._abandon_outcome(req.task_id, prior_timeouts)
                         _already = self._oob_deliver(req, _abandon, speculative=speculative)
-                        await self._verifier_queue.put(DecidedItem(
+                        _decided_item = DecidedItem(
                             request=req,
                             base_sha=actual_main, speculative=speculative,
                             immediate_outcome=_abandon,
                             already_delivered=_already,
                             started_monotonic=t0,
-                        ))
-                        self._speculation_controller.on_transfer_terminal()
+                        )
+                        await self._verifier_queue.put(_decided_item)
+                        # η: stamp the detached token onto the enqueued item so
+                        # the verifier can release this SAME token on drain.
+                        _decided_item.permit = self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -7763,15 +7769,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # _warn_if_verify_base_not_frozen_tip returns
                         # immediately when item.merge_result is None (:5228).
                         # So this divergence has no observable effect.
-                        await self._verifier_queue.put(DecidedItem(
+                        _decided_item = DecidedItem(
                             request=req,
                             base_sha=base_for_merge, speculative=speculative,
                             immediate_outcome=result.outcome,
                             already_delivered=_already,
                             failure_diagnostic=result.outcome.failure_diagnostic,
                             started_monotonic=t0,
-                        ))
-                        self._speculation_controller.on_transfer_terminal()
+                        )
+                        await self._verifier_queue.put(_decided_item)
+                        # η: stamp the detached token onto the enqueued item so
+                        # the verifier can release this SAME token on drain.
+                        _decided_item.permit = self._speculation_controller.on_transfer_terminal()
                         self._inflight_req = None
                         continue
 
@@ -7794,14 +7803,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         await self._merge_ahead_cap.acquire()
                     try:
                         self._register_owned_merge_worktree(merge_result.merge_worktree)
-                        await self._verifier_queue.put(RealMergeItem(
+                        _real_item = RealMergeItem(
                             request=req, merge_result=merge_result,
                             merge_wt=merge_result.merge_worktree,
                             base_sha=base_for_merge, speculative=speculative,
                             started_monotonic=t0,
                             merged_branch_tip=branch_head,  # γ2: branch tip at merge time
                             counts_against_cap=counts_against_cap,
-                        ))
+                        )
+                        await self._verifier_queue.put(_real_item)
                     except BaseException:
                         # put() failed — the verifier will never drain this item
                         # and release the cap.  Release it here to prevent the
@@ -7838,7 +7848,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # (on_lookahead_pending) leaves spec_base as-is (a
                     # pre-existing, harmless staleness window — never read
                     # again before the next on_dequeue overwrites it).
-                    self._speculation_controller.on_transfer()
+                    # η: stamp the detached token onto the enqueued item so
+                    # the verifier can release this SAME token on drain.
+                    _real_item.permit = self._speculation_controller.on_transfer()
                     self._inflight_req = None  # item is now owned by verifier
 
                     # ── Speculative look-ahead (depth-K cap) ──────────────────
@@ -8342,15 +8354,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # LATE-ARRIVAL ATTACH SYMMETRY (task 1862 step-6):
                             # A late arrival B attached via pending_spec_base is
                             # dispatched with speculative=True and held_spec_permit
-                            # retained (step-2), so B's InflightEntry carries
-                            # was_speculative=True.  The release below fires here
-                            # (predecessor failed → B is a downstream entry), and
-                            # _remerge returns speculative=False → re-dispatched B
-                            # has item_was_speculative=False → no duplicate release.
+                            # retained (step-2), so B's InflightEntry carries a
+                            # permit. The release below fires here (predecessor
+                            # failed → B is a downstream entry), and _remerge
+                            # returns speculative=False → re-dispatched B carries
+                            # permit=None → no duplicate release.
                             # Slot symmetry is maintained on the late-arrival path
                             # identically to the standard prefetch path.
-                            if _entry.was_speculative:
-                                self._speculation_slot.release()
+                            # η: release THROUGH the ledger, guarded by the
+                            # threaded token rather than was_speculative.
+                            if _entry.permit is not None:
+                                self._speculation_ledger.release(_entry.permit)
                             # Past the in-body lease+slot release; the except
                             # handler must not re-release on any path below.
                             _entry_released = True
@@ -9461,14 +9475,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         finally:
             # Always: release the host lease (unless passthrough / already skipped),
-            # release the speculation slot iff speculative, and update _n_failed.
+            # release the speculation permit iff one was threaded, and update
+            # _n_failed.
             if not _skip_release and entry.lease is not None and self._host_allocator is not None:
                 if _cancel_release:
                     await self._host_allocator.cancel_and_release(entry.lease)
                 else:
                     await self._host_allocator.release(entry.lease)
-            if entry.was_speculative:
-                self._speculation_slot.release()
+            # η: release THROUGH the ledger, guarded by the threaded token
+            # rather than was_speculative — ledger.release(None) would
+            # AttributeError on `.released`.
+            if entry.permit is not None:
+                self._speculation_ledger.release(entry.permit)
             # _n_failed_val is set by non-PASS branches; None means use 'not advanced'
             # (the PASS-path semantics: True when CAS failed, False when advanced).
             self._n_failed = _n_failed_val if _n_failed_val is not None else not advanced
@@ -9539,6 +9557,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 was_speculative=item.speculative,
                 phase='abandoned',
                 status=InflightStatus.ABANDONED_PREDISPATCH,
+                permit=item.permit,
             )
 
         # ── Pre-dispatch operator-halt ──────────────────────────────────────
@@ -9563,6 +9582,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 was_speculative=item.speculative,
                 phase='halted',
                 status=InflightStatus.REQUEUED_PREDISPATCH,
+                permit=item.permit,
             )
 
         # ── Immediate outcome (conflict / already_merged / blocked) ────────
@@ -9576,6 +9596,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 was_speculative=item.speculative,
                 phase='passthrough',
                 passthrough_outcome=item.immediate_outcome,
+                permit=item.permit,
             )
         # item: RealMergeItem from here on (DecidedItem always returns above; task ο).
 
@@ -9592,7 +9613,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Capture the speculative flag BEFORE any _remerge reassignment so
         # the InflightEntry carries the ORIGINAL speculative state for slot
         # release (same pattern as old loop's item_was_speculative).
+        # item_permit travels alongside it (η) — _remerge always returns a
+        # non-speculative item (see the LATE-ARRIVAL ATTACH SYMMETRY note in
+        # the cascade handler above), so the ORIGINAL item's permit is the
+        # one this dispatch must release.
         item_was_speculative = item.speculative
+        item_permit = item.permit
         iteration_did_remerge = False
 
         # ── Chain re-merge (Mechanism 2 + chain-invalidation) ──────────────
@@ -9701,6 +9727,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         phase='passthrough',
                         passthrough_outcome=item.immediate_outcome,
                         started_at=time.time(),
+                        permit=item_permit,
                     )
                 # item: RealMergeItem again (post-remerge fallthrough; task ο).
 
@@ -9763,6 +9790,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             was_speculative=item_was_speculative,
             phase='verifying',
             started_at=time.time(),
+            permit=item_permit,
         )
 
     async def _verify_and_advance(self, item: RealMergeItem) -> bool:

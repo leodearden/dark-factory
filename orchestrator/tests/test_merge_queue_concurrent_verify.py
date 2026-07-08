@@ -1070,7 +1070,12 @@ class TestFinalizeInflightPass:
     async def test_finalize_pass_releases_speculation_slot_iff_speculative(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """was_speculative=True → _speculation_slot.release() called."""
+        """was_speculative=True → the threaded permit is released via the ledger.
+
+        η: _finalize_inflight's release guard is `entry.permit is not None`
+        (not the raw was_speculative flag), so the entry must carry a real
+        ledger-issued token for the release to fire.
+        """
         from orchestrator.verify_runner import HostLease
 
         req, item = await self._make_merged_item(
@@ -1081,12 +1086,14 @@ class TestFinalizeInflightPass:
         worker._host_allocator = self._make_mock_allocator()
         worker._register_owned_merge_worktree(item.merge_wt)
 
-        # Acquire one slot to simulate that a speculative item is in-flight
-        await worker._speculation_slot.acquire()
+        # Acquire one permit through the ledger to simulate that a
+        # speculative item is in-flight.
+        permit = await worker._speculation_ledger.acquire()
         slot_value_before = worker._speculation_slot._value
 
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
         entry = self._make_pass_entry(item, lease, was_speculative=True)
+        entry.permit = permit
 
         with patch(
             'orchestrator.merge_queue.run_scoped_verification',
