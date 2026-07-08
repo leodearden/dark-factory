@@ -451,6 +451,59 @@ class WarmBaseHardDownConfig(BaseModel):
     )
 
 
+class PsiAdmissionConfig(BaseModel):
+    """L3b dispatch-admission load-cap gate configuration (task 2327, PRD
+    docs/prds/dispatch-admission-load-cap.md, task DA2).
+
+    The dispatch-admission gate (DA3) reads these thresholds live each tick
+    to decide whether the host is saturated enough to hold new dispatch.
+    Memory ranks above io (DA-D1): ``mem_some_avg10`` is deliberately
+    TIGHTER than ``io_some_avg10``, and ``mem_full_avg10`` is a separate
+    memory `full` hard-trip. ``min_inflight_floor`` (DA-D3) is an
+    anti-deadlock floor — the gate must never hold when fewer than this many
+    tasks are in flight on this orchestrator, so a value < 1 (which could
+    wedge the queue with nothing running) is rejected at load.
+
+    All fields are green-tier hot-tunable via RELOADABLE_FIELDS — an
+    operator may adjust thresholds post-observation via
+    ``mcp__escalation__reload_config`` without a process restart.
+
+    Set ``enabled: false`` in orchestrator.yaml to disable the gate entirely.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description='Set to false to disable the dispatch-admission gate entirely.',
+    )
+    cpu_some_avg10: float = Field(
+        default=85.0,
+        description='PSI cpu "some" avg10 (%) threshold — primary CPU saturation signal.',
+    )
+    mem_some_avg10: float = Field(
+        default=15.0,
+        description=(
+            'PSI memory "some" avg10 (%) threshold. Deliberately tighter than '
+            'io_some_avg10 — memory ranks above io per DA-D1.'
+        ),
+    )
+    mem_full_avg10: float = Field(
+        default=3.0,
+        description='PSI memory "full" avg10 (%) threshold — memory hard-trip.',
+    )
+    io_some_avg10: float = Field(
+        default=40.0,
+        description='PSI io "some" avg10 (%) threshold — looser than mem_some_avg10.',
+    )
+    min_inflight_floor: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            'DA-D3 anti-deadlock floor: the gate never holds when fewer than '
+            'this many tasks are in flight on this orchestrator. Must be >= 1.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseModel):
     """Fused-memory HTTP server connection."""
 
@@ -2211,6 +2264,10 @@ class OrchestratorConfig(BaseSettings):
         default_factory=WarmBaseHardDownConfig,
     )
 
+    # L3b dispatch-admission load-cap gate (task 2327, DA2). An absent stanza
+    # in orchestrator.yaml yields the DA-D7 enabled-by-default instance.
+    psi_admission: PsiAdmissionConfig = Field(default_factory=PsiAdmissionConfig)
+
     # Value/h scheduler scoring (P2/P3 — age boost, CPM weighting).
     age_alpha: float = Field(
         default=10.0,
@@ -2626,6 +2683,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     _submodel_leaf_paths('timeouts', TimeoutsConfig),
     _submodel_leaf_paths('backends', BackendsConfig),
     _submodel_leaf_paths('unblock_auto', UnblockAutoConfig),
+    # L3b dispatch-admission gate (task 2327, DA2) — mirrors the
+    # fairness/starvation_watchdog submodel-group pattern: every threshold
+    # is green-tier hot-reloadable.
+    _submodel_leaf_paths('psi_admission', PsiAdmissionConfig),
     {
         # Steward grace
         'steward_completion_timeout',
