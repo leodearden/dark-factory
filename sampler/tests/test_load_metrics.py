@@ -363,3 +363,51 @@ class TestCollectProcessMetricsDegrade:
 
         with pytest.raises(RuntimeError):
             collect_process_metrics(proc_iter=raising, fd9_exists=lambda _pid: False)
+
+
+# ---------------------------------------------------------------------------
+# Task 2326 (DA1) step-9: anti-drift guard — parser re-homed to shared.psi
+# ---------------------------------------------------------------------------
+
+
+class TestParserRehomedToShared:
+    def test_parse_pressure_file_is_shared_psi_object(self):
+        """sampler.metrics.parse_pressure_file must be the SAME object as
+        shared.psi.parse_pressure_file -- a re-export, not a duplicate copy
+        that could drift and re-derive the kernel-asymmetry bug (DA-D9).
+        """
+        import shared.psi
+
+        import sampler.metrics
+
+        assert sampler.metrics.parse_pressure_file is shared.psi.parse_pressure_file
+
+    def test_collect_psi_default_reader_is_shared_read_pressure(self):
+        import inspect
+
+        import shared.psi
+
+        from sampler.metrics import collect_psi
+
+        sig = inspect.signature(collect_psi)
+        assert sig.parameters['read'].default is shared.psi.read_pressure
+
+    def test_collect_psi_still_returns_six_key_dict(self):
+        """Behavior-identical: collect_psi's public contract is unaffected by the re-home."""
+        from sampler.metrics import collect_psi
+
+        mapping = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+
+        def read(name: str) -> str:
+            return mapping[name]
+
+        result = collect_psi(read=read)
+        expected_keys = {
+            'psi_cpu_some_avg10',
+            'psi_cpu_full_avg10',
+            'psi_mem_some_avg10',
+            'psi_mem_full_avg10',
+            'psi_io_some_avg10',
+            'psi_io_full_avg10',
+        }
+        assert set(result.keys()) == expected_keys
