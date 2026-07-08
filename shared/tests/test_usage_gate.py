@@ -717,6 +717,45 @@ class TestProbeConfigDirIsolation:
         gate = make_gate(['work', 'personal'])
         assert set(gate._probe_config_dirs.keys()) == {'work', 'personal'}
 
+    @pytest.mark.asyncio
+    async def test_run_probe_uses_per_account_config_dir(self):
+        """_run_probe must resolve CLAUDE_CONFIG_DIR via _config_dir_for(acct).
+
+        RED on current code: _run_probe reads the single self._probe_config_dir,
+        so both accounts' probes get an identical CLAUDE_CONFIG_DIR.
+        """
+        gate = make_gate(['work', 'personal'])
+        del gate._run_probe  # remove instance-level mock; fall back to class method
+        work, personal = gate._accounts
+
+        captured_envs: list[dict] = []
+
+        async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+            captured_envs.append(kwargs.get('env'))
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b'{"ok":true}', b''))
+            return proc
+
+        with patch('shared.usage_gate.asyncio.create_subprocess_exec',
+                   side_effect=fake_exec):
+            await gate._run_probe(work)
+            await gate._run_probe(personal)
+
+        work_env, personal_env = captured_envs
+        work_dir = str(gate._config_dir_for(work).path)
+        personal_dir = str(gate._config_dir_for(personal).path)
+        pid = str(os.getpid())
+
+        assert work_env['CLAUDE_CONFIG_DIR'] != personal_env['CLAUDE_CONFIG_DIR']
+        assert work_env['CLAUDE_CONFIG_DIR'] == work_dir
+        assert personal_env['CLAUDE_CONFIG_DIR'] == personal_dir
+        assert work.name in work_env['CLAUDE_CONFIG_DIR'] and pid in work_env['CLAUDE_CONFIG_DIR']
+        assert (
+            personal.name in personal_env['CLAUDE_CONFIG_DIR']
+            and pid in personal_env['CLAUDE_CONFIG_DIR']
+        )
+
 
 # ---------------------------------------------------------------------------
 # wait_for_open — used by curator worker for AllAccountsCappedException defer
