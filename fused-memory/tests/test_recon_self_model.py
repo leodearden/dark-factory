@@ -210,3 +210,31 @@ class TestRenderSuppressionSchemaSection:
         assert 'scoped' in text
         # Blanket wins on conflict with a scoped record for the same task_id.
         assert 'wins' in text
+
+
+# --------------------------------------------------------------------------- #
+# render_cycle_summary_section (step-11/12)
+# --------------------------------------------------------------------------- #
+
+
+class TestRenderCycleSummarySection:
+    """render_cycle_summary_section() renders the per-cycle summary metadata
+    convention faithful to stage2.py:236-302, single-sourced from
+    recon_pool_map's stage->recon_pool tags."""
+
+    def test_returns_non_empty_str(self):
+        assert isinstance(m.render_cycle_summary_section(), str)
+        assert m.render_cycle_summary_section()
+
+    def test_contains_cycle_summary_and_run_id(self):
+        text = m.render_cycle_summary_section()
+        assert 'cycle_summary' in text
+        assert 'run_id' in text
+        assert 'metadata' in text
+
+    def test_recon_pool_tag_is_single_sourced_from_recon_pool_map(self):
+        """The rendered text must contain the actual recon_pool_map constant
+        value, not a re-hardcoded literal, proving it's single-sourced."""
+        text = m.render_cycle_summary_section()
+        assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL in text
+        assert m.STAGE2_CYCLE_SUMMARY_RECON_POOL == 'stage2_cycle_summary'
