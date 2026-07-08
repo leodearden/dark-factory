@@ -9,6 +9,8 @@ shapes so both suites pin the same parsing contract.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -73,3 +75,90 @@ class TestParsePressureFileRehome:
         from shared.psi import parse_pressure_file
 
         assert parse_pressure_file(PSI_MEM_TEXT) is not None
+
+
+def _saturation_cfg():
+    """Duck-typed cfg stub shaped like DA2's PsiAdmissionConfig (sibling task, not landed)."""
+    return types.SimpleNamespace(
+        cpu_some_avg10=85.0,
+        mem_some_avg10=15.0,
+        mem_full_avg10=3.0,
+        io_some_avg10=40.0,
+    )
+
+
+class TestPsiSampleSaturated:
+    def test_frozen(self):
+        import dataclasses
+
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=10.0,
+            mem_some10=5.0,
+            mem_full10=1.0,
+            io_some10=5.0,
+            read_ok=True,
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            sample.cpu_some10 = 99.0
+
+    def test_cpu_some_only_trips_saturation(self):
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=85.0,
+            mem_some10=10.0,
+            mem_full10=2.0,
+            io_some10=30.0,
+            read_ok=True,
+        )
+        assert sample.saturated(_saturation_cfg()) is True
+
+    def test_mem_some_only_trips_saturation(self):
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=50.0,
+            mem_some10=15.0,
+            mem_full10=2.0,
+            io_some10=30.0,
+            read_ok=True,
+        )
+        assert sample.saturated(_saturation_cfg()) is True
+
+    def test_mem_full_only_trips_saturation(self):
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=50.0,
+            mem_some10=10.0,
+            mem_full10=3.0,
+            io_some10=30.0,
+            read_ok=True,
+        )
+        assert sample.saturated(_saturation_cfg()) is True
+
+    def test_io_some_only_trips_saturation(self):
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=50.0,
+            mem_some10=10.0,
+            mem_full10=2.0,
+            io_some10=40.0,
+            read_ok=True,
+        )
+        assert sample.saturated(_saturation_cfg()) is True
+
+    def test_all_under_threshold_not_saturated(self):
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=50.0,
+            mem_some10=10.0,
+            mem_full10=2.0,
+            io_some10=30.0,
+            read_ok=True,
+        )
+        assert sample.saturated(_saturation_cfg()) is False
