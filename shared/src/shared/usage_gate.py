@@ -1567,6 +1567,23 @@ class UsageGate:
             # this is an exception path, orthogonal to cap status.
             self._transition(acct, AccountPhase.AVAILABLE, clear_near_cap=False)
 
+    def lease_is_current(self, lease: AccountLease) -> bool:
+        """Whether ``lease`` still reflects the live state of its account (task W4-δ).
+
+        Resolves the account by ``lease.name`` and compares its live
+        ``generation`` against the snapshot captured in the lease. A
+        mismatch — or the account no longer existing (e.g. removed on
+        SIGHUP reload) — means the account has transitioned (or vanished)
+        since the lease was taken, so the lease is stale.
+
+        This is a pure detectability primitive: it makes no decision about
+        what to do with a stale lease. Consumer task W4-ε's
+        ``InvokeSlot.report()`` uses this to implement the Q4 log-and-proceed
+        fail-safe policy.
+        """
+        acct = next((a for a in self._accounts if a.name == lease.name), None)
+        return acct is not None and acct.generation == lease.generation
+
     @property
     def project_id(self) -> str | None:
         """Project identifier set by the harness at run start."""
