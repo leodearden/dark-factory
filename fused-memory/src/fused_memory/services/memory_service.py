@@ -340,15 +340,18 @@ class ReconcileStats:
     Returned to the caller and logged for observability — NOT wired into the
     durable write-journal schema (extending that schema is out of scope for
     task 2202 / W6-β). Each field mirrors the int return of the
-    correspondingly-named post-write sweep. ``errors`` collects the label of
-    any sub-pass that raised (task 2202 step-4's best-effort guard); an
-    all-zeros, empty-errors instance signals a fully-converged, idempotent
-    reconcile.
+    correspondingly-named post-write sweep — including
+    ``stale_ttl_edges_invalidated`` (task 2319), the under-invalidation-
+    direction counterpart of ``sibling_edges_restored``. ``errors`` collects
+    the label of any sub-pass that raised (task 2202 step-4's best-effort
+    guard); an all-zeros, empty-errors instance signals a fully-converged,
+    idempotent reconcile.
     """
 
     edges_deduped: int = 0
     dependency_edges_restored: int = 0
     sibling_edges_restored: int = 0
+    stale_ttl_edges_invalidated: int = 0
     nodes_resolved: int = 0
     task_names_normalized: int = 0
     errors: list[str] = field(default_factory=list)
@@ -744,7 +747,12 @@ class MemoryService:
         a surviving valid edge (a same-node-pair invalidation) is left
         untouched, since it may be a legitimate contradiction the LLM
         correctly resolved — that case is left to the LLM's judgment
-        (documented follow-up, not handled here).
+        (documented follow-up, not handled here). The opposite-direction
+        gap — a pre-existing edge the LLM failed to invalidate at all,
+        left coexisting with a fresh contradictory edge — is handled for
+        the narrow priority-override/TTL fact-shape by
+        ``_invalidate_stale_superseded_ttl_edges`` (task 2319); it remains
+        unhandled here for other fact shapes.
 
         Modelled on ``_restore_superseded_dependency_edges``; handles None /
         empty result the same way. Dependency-fact edges (``_is_dependency_fact``)
@@ -1116,7 +1124,7 @@ class MemoryService:
     async def _reconcile_episode_identity(
         self, result: Any, *, group_id: str
     ) -> ReconcileStats:
-        """Fold the five post-write identity/dedup sweeps into one call.
+        """Fold the six post-write identity/dedup sweeps into one call.
 
         Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
         runs immediately after ``add_episode``, inside α's (task 2198)
@@ -1128,13 +1136,18 @@ class MemoryService:
         lock and could race with a concurrent same-group write; folding them
         into one locked reconcile closes that race.
 
-        Runs the five sub-passes in their pre-existing chain order —
+        Runs the six sub-passes in their pre-existing chain order —
         dependency-restore before sibling-restore, matching the ordering
         this replaces at the ``_execute_graphiti_write`` call site (a
         dependency edge must be un-superseded before the sibling-restore
         pass considers it, so it is correctly skipped there rather than
         double-processed) — and aggregates each sub-pass's int return into
-        the matching ``ReconcileStats`` field.
+        the matching ``ReconcileStats`` field. ``_invalidate_stale_superseded_
+        ttl_edges`` (task 2319) runs immediately after
+        ``_restore_falsely_superseded_sibling_edges``, grouping the two
+        edge-temporal passes together, and before ``_dedup_episode_nodes``:
+        it is the mirror-image, under-invalidation-direction counterpart of
+        the sibling-restore pass.
 
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
@@ -1184,6 +1197,10 @@ class MemoryService:
         stats.sibling_edges_restored = await _run_pass(
             '_restore_falsely_superseded_sibling_edges',
             self._restore_falsely_superseded_sibling_edges(result, group_id=group_id),
+        )
+        stats.stale_ttl_edges_invalidated = await _run_pass(
+            '_invalidate_stale_superseded_ttl_edges',
+            self._invalidate_stale_superseded_ttl_edges(result, group_id=group_id),
         )
         stats.nodes_resolved = await _run_pass(
             '_dedup_episode_nodes',
