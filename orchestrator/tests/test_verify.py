@@ -26,6 +26,7 @@ from orchestrator.verify import (
     _resolve_verify_env,
     _run_cmd,
     _scope_cargo_workspace,
+    _single_subproject_prefix,
     run_full_verification,
     run_scoped_verification,
     run_verification,
@@ -4118,6 +4119,56 @@ class TestReprojectBareUvRun:
             'uv run --project shared pytest tests/ '
             '&& uv run --project shared ruff check tests/scripts/foo.py'
         )
+
+
+class TestSingleSubprojectPrefix:
+    """`_single_subproject_prefix` identifies a single real subproject touched by files.
+
+    A "subproject" is a top-level directory that carries its own
+    ``pyproject.toml`` — the same discriminator ``workflow._sync_worktree_venvs``
+    already uses to decide which task modules need their own ``uv sync``. This
+    distinguishes a real subproject (e.g. ``cockpit/``) from a bare repo-root
+    directory like ``tests/`` that has no ``pyproject.toml`` of its own.
+    """
+
+    def test_single_subproject_with_pyproject_returns_prefix(self, tmp_path: Path) -> None:
+        """All files under cockpit/, and cockpit/pyproject.toml exists → 'cockpit'."""
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _single_subproject_prefix(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], tmp_path,
+        )
+        assert result == 'cockpit'
+
+    def test_files_spanning_two_top_level_dirs_returns_none(self, tmp_path: Path) -> None:
+        """Files touching two different top-level dirs → None (not a single subproject)."""
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+        shared = tmp_path / 'shared'
+        shared.mkdir()
+        (shared / 'pyproject.toml').write_text('[project]\nname = "shared"\n')
+
+        result = _single_subproject_prefix(
+            ['cockpit/tests/test_a.py', 'shared/tests/test_b.py'], tmp_path,
+        )
+        assert result is None
+
+    def test_worktree_none_returns_none(self) -> None:
+        """No worktree to check pyproject.toml against → None."""
+        result = _single_subproject_prefix(['cockpit/tests/test_c3.py'], None)
+        assert result is None
+
+    def test_single_top_level_dir_without_pyproject_returns_none(self, tmp_path: Path) -> None:
+        """A single top-level dir ('tests') lacking its own pyproject.toml → None.
+
+        Distinguishes repo-root ``tests/`` (not an independent subproject) from
+        a real subproject like ``cockpit/``.
+        """
+        result = _single_subproject_prefix(['tests/scripts/test_x.py'], tmp_path)
+        assert result is None
 
 
 class TestBuildFallbackConfigWithNonDefaultCommands:
