@@ -5669,6 +5669,92 @@ class TestIsPriorityOverrideTtlFact:
         assert _is_priority_override_ttl_fact(None) is False  # type: ignore[arg-type]
 
 
+# ---------------------------------------------------------------------------
+# Task 2351: _is_priority_override_reserve_now_fact helper tests (follow-up
+# to task 2319 / esc-2319-8, sibling of TestIsPriorityOverrideTtlFact)
+# ---------------------------------------------------------------------------
+
+class TestIsPriorityOverrideReserveNowFact:
+    """Module-level _is_priority_override_reserve_now_fact helper: True only
+    when a fact expresses BOTH a priority-override phrase AND a reserve_now
+    token — mirrors _is_priority_override_ttl_fact's shape/rationale for the
+    reserve_now boolean scalar."""
+
+    def test_canonical_priority_override_reserve_now_fact(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'Task 3001 has priority override reserve_now enabled'
+        ) is True
+
+    def test_hyphenated_priority_override_reserve_now_fact(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            "Task 3001's priority-override reserve-now was set to true"
+        ) is True
+
+    def test_spaced_reserve_now_fact(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'Task 3001 priority override reserve now set to false'
+        ) is True
+
+    def test_case_insensitive(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'TASK 3001 PRIORITY OVERRIDE RESERVE_NOW SET TO TRUE'
+        ) is True
+
+    def test_priority_override_without_reserve_now_is_false(self):
+        """A TTL/boost_tier override sub-attribute (no reserve_now token) is
+        a distinct, legitimately-coexisting predicate — must not collapse."""
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'Task 3001 priority override boost_tier set to high'
+        ) is False
+
+    def test_bare_reserve_now_without_priority_override_is_false(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(
+            'reserve_now is set to true'
+        ) is False
+
+    def test_dependency_fact_is_false(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact('Task 562 depends on Task 557') is False
+
+    def test_unrelated_fact_is_false(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact('Task 562 reached status done') is False
+
+    def test_empty_string(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact('') is False
+
+    def test_none_value(self):
+        from fused_memory.services.memory_service import (
+            _is_priority_override_reserve_now_fact,
+        )
+        assert _is_priority_override_reserve_now_fact(None) is False  # type: ignore[arg-type]
+
+
 class TestReconPoolAutoTag:
     """Module-level _infer_recon_pool helper + _CYCLE_SUMMARY_STAGE_TO_RECON_POOL map.
 
