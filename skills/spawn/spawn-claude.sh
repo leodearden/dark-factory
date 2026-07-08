@@ -64,6 +64,26 @@ fts_marker="$(mktemp -u -t spawn-claude-XXXXXX.fts)"
 SPAWN_STARTED_GRACE_SECS="${SPAWN_STARTED_GRACE_SECS:-90}"
 CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 
+# Kill the started-watchdog on EVERY exit path -- MANDATORY. A backgrounded
+# child left running past this script's exit would hold the caller-captured
+# stdout/stderr pipe open (blocking /spawn's background task, and any test
+# harness's subprocess.wait()) until the full started-grace elapsed.
+# Installed here, immediately after the mktemp calls above and before ANY
+# possible exit path (including `exit 126` below if no terminal emulator is
+# found) -- otherwise spawn_ref would leak on that path. watchdog_pid stays
+# unset until right before the fork (further below); the `${watchdog_pid:-}`
+# guard makes an early exit's kill attempt a safe no-op. Empirically verified
+# that neither command substitutions (the registry-write subshell just below)
+# nor backgrounded function calls (the watchdog fork below) independently
+# re-fire an inherited EXIT trap in bash -- it fires exactly once, when this
+# top-level script itself exits -- so installing it this early cannot cause
+# spawn_ref to be removed prematurely.
+_cleanup() {
+  [ -n "${watchdog_pid:-}" ] && kill "$watchdog_pid" 2>/dev/null
+  rm -f "$spawn_ref" "$fts_marker"
+}
+trap _cleanup EXIT
+
 # Session-registry: record this spawn as LAUNCHING (task 2285, Attention Rail
 # T3). Best-effort and fully additive -- a missing python3 or any registry
 # fault must never change this script's exit-code contract. Only stdout (the
@@ -187,6 +207,16 @@ _encode_cwd() {
 # elsewhere on a busy host.
 _claude_descendant_alive() {
   command -v ps >/dev/null 2>&1 || return 1
+  # Associative arrays (bash 4+) are required below. Stock macOS ships
+  # /bin/bash 3.2 (this script explicitly supports macOS via the
+  # mac-terminal branch), where `local -A` is a hard parse/option error, not
+  # a soft failure -- and this function is polled every ~0.25s for up to
+  # SPAWN_STARTED_GRACE_SECS (default 90s) whenever no transcript is yet
+  # present, so an unguarded error here would spam the caller-captured
+  # stderr with hundreds of lines. Fail-soft: skip this best-effort probe on
+  # bash <4 and rely on the transcript probe (_started_evidence's other
+  # branch) instead.
+  [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || return 1
 
   local -A ppid_of=()
   local -a claude_pids=()
@@ -293,7 +323,12 @@ _started_watchdog() {
   if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
     python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status failed-to-start || true
   fi
-  echo "spawn-claude.sh: FAILED-TO-START — claude never started within ${SPAWN_STARTED_GRACE_SECS}s (no transcript, no claude process); registry marked failed-to-start; exiting ${EXIT_FAILED_TO_START}." >&2
+  # Deliberately do NOT assert a specific final exit code here: resolve_foreground
+  # and resolve_detached's launch_rc!=0 branch both prefer the more specific,
+  # pre-existing 127 launcher-failure verdict over this flag when both fire for
+  # the same underlying cause (see _reconcile_started_flag_with_launcher_failure
+  # below), so this process may ultimately exit 127, not EXIT_FAILED_TO_START.
+  echo "spawn-claude.sh: FAILED-TO-START — claude never started within ${SPAWN_STARTED_GRACE_SECS}s (no transcript, no claude process); registry marked failed-to-start (a more specific launcher-failure verdict may still override this)." >&2
   echo "$EXIT_FAILED_TO_START" > "$fts_marker"
   return 0
 }
@@ -374,17 +409,10 @@ fi
 # still hits the gnome-terminal branch.
 first_word="${emulator%% *}"
 
-# Kill the started-watchdog on EVERY exit path -- MANDATORY. A backgrounded
-# child left running past this script's exit would hold the caller-captured
-# stdout/stderr pipe open (blocking /spawn's background task, and any test
-# harness's subprocess.wait()) until the full started-grace elapsed. Set
-# before the fork so no exit between here and the fork can leak the child.
-_cleanup() {
-  [ -n "${watchdog_pid:-}" ] && kill "$watchdog_pid" 2>/dev/null
-  rm -f "$spawn_ref" "$fts_marker"
-}
-trap _cleanup EXIT
-
+# _cleanup + trap installed earlier (right after the mktemp calls near the
+# top of the script), so spawn_ref can never leak -- including on the
+# `exit 126` (no emulator found) path just above. Only the fork itself
+# happens here, immediately before the emulator case dispatch.
 watchdog_pid=""
 _started_watchdog &
 watchdog_pid=$!
