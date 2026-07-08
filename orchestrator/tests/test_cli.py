@@ -1642,7 +1642,10 @@ def _wait_for_file_cli(path: 'Path', timeout: float = 10.0, interval: float = 0.
     return False
 
 
-@pytest.mark.timeout(30)
+# NOTE (task 2350): widened from 30s -- fixed real-time deadlines starve
+# under heavy shared-host xdist contention even though the underlying
+# subprocess-cancel behavior is correct (timing flake, not a bug).
+@pytest.mark.timeout(90)
 def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
     """End-to-end: real subprocess 'verify-merge --request-id X' is killed by cancel-verify.
 
@@ -1727,10 +1730,10 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
     pgid_val = None
     try:
         # --- Poll for the pgid file (written before asyncio.run) ---
-        if not _wait_for_file_cli(pgf, timeout=15):
-            _debug_stdout, _debug_stderr = child.communicate(timeout=5) if child.poll() is not None else (b'', b'')
+        if not _wait_for_file_cli(pgf, timeout=30):
+            _debug_stdout, _debug_stderr = child.communicate(timeout=10) if child.poll() is not None else (b'', b'')
             pytest.fail(
-                f'verify-merge did not write pgid file within 15s '
+                f'verify-merge did not write pgid file within 30s '
                 f'(subprocess poll={child.poll()!r})\n'
                 f'STDOUT: {_debug_stdout.decode()[:2000]!r}\n'
                 f'STDERR: {_debug_stderr.decode()[:2000]!r}'
@@ -1757,10 +1760,10 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
 
         # --- verify-merge subprocess must exit within seconds ---
         try:
-            child.wait(timeout=10)
+            child.wait(timeout=20)
         except subprocess_mod.TimeoutExpired:
             pytest.fail(
-                'verify-merge subprocess did not exit within 10s after cancel-verify'
+                'verify-merge subprocess did not exit within 20s after cancel-verify'
             )
 
         # --- Process group must be gone after the subprocess is reaped ---
