@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+from shared.invocation_outcome import OK, AuthFailed, CapHit, NearCap
 from shared.usage_gate import InvokeSlot, UsageGate
 
 __all__ = ['make_gate_mock']
@@ -46,11 +47,17 @@ def make_gate_mock(**overrides) -> MagicMock:
 
     The returned mock's ``invoke_slot()`` is a callable that produces a fresh
     async-context-manager per call. ``__aenter__`` yields a slot whose
-    ``detect_cap_hit``, ``confirm``, ``settle`` methods proxy back to the gate
-    — so tests can still assert on ``gate.detect_cap_hit.call_args``,
-    ``gate.confirm_account_ok.assert_called_with(...)``, etc. ``__aexit__``
-    calls ``gate.release_probe_slot(slot.token)`` unless the slot was
-    settled, matching the real ``UsageGate.invoke_slot`` behaviour.
+    ``detect_cap_hit``, ``confirm``, ``settle``, ``report`` methods proxy back
+    to the gate — so tests can still assert on ``gate.detect_cap_hit.call_args``,
+    ``gate.confirm_account_ok.assert_called_with(...)``, etc. ``report(outcome)``
+    (task W4-ε, PRD §7.4) mirrors production :meth:`InvokeSlot.report`'s
+    dispatch-then-settle contract: OK→``confirm_account_ok``,
+    CapHit→``_handle_cap_detected``, AuthFailed→``_handle_auth_failure``,
+    NearCap→``_handle_near_cap_warning``+``release_probe_slot``, everything
+    else→``release_probe_slot``; always settling in a ``finally``. Kept in step
+    with the sister proxy in ``tests/test_cap_retry.py::_mock_gate``.
+    ``__aexit__`` calls ``gate.release_probe_slot(slot.token)`` unless the slot
+    was settled, matching the real ``UsageGate.invoke_slot`` behaviour.
     """
     gate = MagicMock(spec=UsageGate)
     gate.account_count = overrides.pop('account_count', 1)
@@ -92,12 +99,37 @@ def make_gate_mock(**overrides) -> MagicMock:
             def _slot_settle():
                 slot._settled = True
 
+            def _slot_report(outcome):
+                """Mirror production ``InvokeSlot.report(outcome)`` (task
+                W4-ε, PRD §7.4): dispatch to the gate's existing handlers by
+                outcome variant, then settle in a ``finally`` so every path
+                leaves the slot settled exactly once. Kept byte-for-byte in
+                step with the sister proxy in
+                ``tests/test_cap_retry.py::_mock_gate``."""
+                token = slot.token
+                try:
+                    if isinstance(outcome, OK):
+                        gate.confirm_account_ok(token)
+                    elif isinstance(outcome, CapHit):
+                        gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+                    elif isinstance(outcome, AuthFailed):
+                        gate._handle_auth_failure(f'HTTP {outcome.status}', token)
+                    elif isinstance(outcome, NearCap):
+                        gate._handle_near_cap_warning(outcome.reason, token)
+                        gate.release_probe_slot(token)
+                    else:
+                        gate.release_probe_slot(token)
+                finally:
+                    slot._settled = True
+
             # Plain (sync) MagicMocks — InvokeSlot.detect_cap_hit/confirm/
-            # settle are plain methods. Using AsyncMock here would break
-            # prod's unawaited `if slot.detect_cap_hit(...):` call.
+            # settle/report are plain methods. Using AsyncMock here would
+            # break prod's unawaited `if slot.detect_cap_hit(...):` /
+            # `slot.report(outcome)` calls.
             slot.detect_cap_hit = MagicMock(side_effect=_slot_detect_cap_hit)
             slot.confirm = MagicMock(side_effect=_slot_confirm)
             slot.settle = MagicMock(side_effect=_slot_settle)
+            slot.report = MagicMock(side_effect=_slot_report)
             holder['slot'] = slot
             return slot
 
