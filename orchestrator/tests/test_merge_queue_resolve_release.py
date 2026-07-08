@@ -1303,3 +1303,62 @@ class TestCascadeErrorChokepoint:
             f'cascade entry (it `continue`s on the normal path), but got '
             f'{len(calls)} call(s): {calls!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2160/η step-7 RED / step-8 GREEN: _resolve_and_release's OWN release
+# migrates to the ledger — idempotent on a double call, no release_resources
+# guard needed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestResolveAndReleaseLedgerIdempotency:
+    """task 2160/η: _resolve_and_release's own speculation-slot release must
+    route through ``self._speculation_ledger.release(entry.permit)`` (keyed
+    on the ζ/η-threaded token) instead of the raw, ``was_speculative``-gated
+    ``self._speculation_slot.release()``.
+
+    RED until η step-8 GREEN migrates that release and removes the
+    ``release_resources``/``_entry_released`` double-release guards — now
+    redundant, since the ledger's own ``permit.released`` flag already makes
+    a second release of the SAME token a silent no-op (``PermitLedger.release``,
+    merge_speculation_controller.py). Calling the chokepoint TWICE on the same
+    entry with no ``release_resources`` kwarg (the new always-release
+    contract) must leave the conservation identity ``slot_available +
+    len(live) == depth`` intact.
+
+    RED today because the raw semaphore release is unconditional-per-call
+    (gated only on the immutable ``was_speculative`` flag, never marked
+    "already released"): the second call over-releases the wrapped
+    semaphore (``slot_available`` grows by 2, not 1) while ``live`` never
+    discards the still-registered permit (task eta hasn't migrated this
+    release site yet) — so the sum overshoots ``depth`` by 2.
+    """
+
+    async def test_double_call_releases_permit_exactly_once(
+        self, git_ops: GitOps, git_repo: Path, config: OrchestratorConfig,
+    ) -> None:
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        permit = await worker._speculation_ledger.acquire()
+
+        req = _make_request('rr-idem', 'task/rr-idem', git_repo, config)
+        _item, entry = _make_decided_item_and_entry(req, was_speculative=True)
+        entry.permit = permit
+
+        outcome = MergeOutcome('blocked', reason='x')
+
+        await worker._resolve_and_release(entry, outcome, chain_failed=True)
+        await worker._resolve_and_release(entry, outcome, chain_failed=True)
+
+        assert req.result.done()
+        assert req.result.result() is outcome
+        assert (
+            worker._speculation_ledger.slot_available
+            + len(worker._speculation_ledger.live)
+            == worker._speculation_depth
+        ), (
+            'permit must be released exactly once across both '
+            '_resolve_and_release calls (idempotent second call)'
+        )
