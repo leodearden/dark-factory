@@ -28,9 +28,17 @@ from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_PROJECT_ID,
     AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED,
 )
+from fused_memory.reconciliation.policies.dark_factory import (
+    DARK_FACTORY_PROJECT_ID,
+    DARK_FACTORY_SNAPSHOT_WRITES_BLOCKED,
+)
 from fused_memory.reconciliation.policies.know_live import (
     KNOW_LIVE_PROJECT_ID,
     KNOW_LIVE_SNAPSHOT_WRITES_BLOCKED,
+)
+from fused_memory.reconciliation.policies.solar_challenge_platform import (
+    SOLAR_CHALLENGE_PLATFORM_PROJECT_ID,
+    SOLAR_CHALLENGE_PLATFORM_SNAPSHOT_WRITES_BLOCKED,
 )
 
 # ---------------------------------------------------------------------------
@@ -44,6 +52,8 @@ from fused_memory.reconciliation.policies.know_live import (
 _PROJECT_SNAPSHOT_FLAGS: list[tuple[str, bool]] = [
     (AUTOPILOT_VIDEO_PROJECT_ID, AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED),
     (KNOW_LIVE_PROJECT_ID, KNOW_LIVE_SNAPSHOT_WRITES_BLOCKED),
+    (DARK_FACTORY_PROJECT_ID, DARK_FACTORY_SNAPSHOT_WRITES_BLOCKED),
+    (SOLAR_CHALLENGE_PLATFORM_PROJECT_ID, SOLAR_CHALLENGE_PLATFORM_SNAPSHOT_WRITES_BLOCKED),
 ]
 
 #: frozenset of project_ids whose task-count snapshot write paths are
