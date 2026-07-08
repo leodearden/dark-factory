@@ -1839,8 +1839,9 @@ class TestShutdownExhaustive:
         await gate.shutdown()
         acct = gate._accounts[0]
 
-        gate._handle_auth_failure('403 forbidden', acct.token)
+        ok = gate._handle_auth_failure('403 forbidden', acct.token)
 
+        assert ok is True
         assert acct.phase == AccountPhase.AUTH_FAILED
         # Gate refused to spawn a new auth reprobe after shutdown.
         assert acct.auth_reprobe_task is None
