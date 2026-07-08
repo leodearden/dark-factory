@@ -58,14 +58,21 @@ hand-editing the real file.
 These hooks run on **every** SessionStart/Notification/Stop event across
 every project. A bug here must never block a session start or a turn:
 
-- Every bash entrypoint runs under `set +e` and always `exit 0`, mirroring
-  `~/.claude/hooks/worktree-hookspath-capture.sh` / `worktree-hookspath-restore.sh`.
-- The Python side's `main()` wraps its dispatch in `try/except Exception`,
-  logs loudly (`logger.error(..., exc_info=True)`), and always returns `0` —
-  mirroring `session_registry.main()`.
+- `session-start.sh`/`notification.sh`/`stop.sh` run under `set +e` and
+  always `exit 0`, mirroring `~/.claude/hooks/worktree-hookspath-capture.sh` /
+  `worktree-hookspath-restore.sh`.
+- For the `session-start`/`notification`/`stop` verbs, the Python side's
+  `main()` wraps its dispatch in `try/except Exception`, logs loudly
+  (`logger.error(..., exc_info=True)`), and always returns `0` — mirroring
+  `session_registry.main()`.
 - A missing `python3`, a corrupt registry record, or a registry-write failure
   degrades to "no retitle / no record this event" — never a hang or a
   non-zero exit propagated back to Claude Code.
+
+`install-hooks.sh`/the `install` verb are the deliberate exception: that is a
+human-invoked one-shot command, not a per-event hook, so `main()` instead
+propagates exit code `1` on failure (see "Installing" below) — a failed
+install must never be silently reported as a success.
 
 ## Installing
 
@@ -77,3 +84,6 @@ Idempotent: safe to re-run. Takes a timestamped backup of the current
 `~/.claude/settings.json` (`settings.json.<UTC-timestamp>.bak`) next to it
 before writing, and writes atomically (tmp file + `os.replace`) so a crash
 mid-write can never leave `~/.claude/settings.json` truncated or corrupt.
+
+Exits `0` on a successful merge, `1` if the install itself failed (e.g. a
+permission error) — check `$?` in a non-interactive caller.

@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -64,7 +65,14 @@ def test_resolve_hook_identity_uses_os_getcwd_when_cwd_absent(
 def test_hook_session_slug_keyed_on_session_id_hand_launched() -> None:
     hook_input = {'session_id': 'abc-123', 'cwd': '/home/leo/src/dark-factory'}
     slug = sh.hook_session_slug(hook_input, env={})
-    assert slug == sr.build_session_slug('session', 'dark-factory', None, 'abc-123')
+    # session_id ('abc-123', a str) fills the launcher_pid slot deliberately;
+    # see session_hooks.hook_session_slug's docstring.
+    assert slug == sr.build_session_slug(
+        'session',
+        'dark-factory',
+        None,
+        'abc-123',  # type: ignore[arg-type]
+    )
 
 
 def test_hook_session_slug_keyed_on_session_id_spawned() -> None:
@@ -75,7 +83,12 @@ def test_hook_session_slug_keyed_on_session_id_spawned() -> None:
         'CLAUDE_SPAWN_TASK_ID': '2085',
     }
     slug = sh.hook_session_slug(hook_input, env=env)
-    assert slug == sr.build_session_slug('unblock', 'df', '2085', 'abc-123')
+    assert slug == sr.build_session_slug(
+        'unblock',
+        'df',
+        '2085',
+        'abc-123',  # type: ignore[arg-type]
+    )
 
 
 def test_hook_session_slug_is_deterministic() -> None:
@@ -97,7 +110,12 @@ def test_hook_session_slug_uses_cwd_fallback_when_absent(
     monkeypatch.chdir(tmp_path)
     hook_input = {'session_id': 'sess-3'}
     slug = sh.hook_session_slug(hook_input, env={})
-    assert slug == sr.build_session_slug('session', tmp_path.name, None, 'sess-3')
+    assert slug == sr.build_session_slug(
+        'session',
+        tmp_path.name,
+        None,
+        'sess-3',  # type: ignore[arg-type]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +234,39 @@ def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path:
     assert record_path.stat().st_mtime > old_ts
 
 
+def test_run_session_start_hand_launched_uses_session_leader_as_liveness_pid(
+    tmp_path: Path,
+) -> None:
+    # os.getppid() would resolve to this hook's own short-lived bash
+    # entrypoint (dead within seconds) -- reap_stale_records' stale_pid rule
+    # would then reclaim a long-idle hand-launched session's record even
+    # though its terminal is still alive. os.getsid(0) resolves to the
+    # durable POSIX session leader instead (see _hand_launched_liveness_pid).
+    hook_input = {'session_id': 'sess-pid', 'cwd': '/home/leo/src/dark-factory'}
+    env: dict[str, str] = {}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.launcher_pid == os.getsid(0)
+
+
+def test_run_session_start_spawned_still_prefers_explicit_launcher_pid_env(
+    tmp_path: Path,
+) -> None:
+    # CLAUDE_SPAWN_LAUNCHER_PID (when present) wins outright -- the liveness-
+    # pid fallback only ever applies to the hand-launched (no env) case.
+    hook_input = {'session_id': 'sess-pid-2', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_LAUNCHER_PID': '4242'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.launcher_pid == 4242
+
+
 # ---------------------------------------------------------------------------
 # Step-7: run_notification / run_stop (status flip + OSC return)
 # ---------------------------------------------------------------------------
@@ -275,7 +326,7 @@ def test_run_notification_prefers_persisted_record_title(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
-def _stdin_json(monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]) -> None:
+def _stdin_json(monkeypatch: pytest.MonkeyPatch, payload: Mapping[str, object]) -> None:
     monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(payload)))
 
 
@@ -514,13 +565,108 @@ def test_merge_hook_settings_creates_hooks_key_when_absent(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# _run_install: missing-file create, backup-on-existing, atomic JSON write
+# ---------------------------------------------------------------------------
+
+
+def test_run_install_creates_settings_file_when_missing(tmp_path: Path) -> None:
+    settings_path = tmp_path / 'settings.json'
+
+    sh._run_install(settings_path=settings_path)
+
+    assert settings_path.is_file()
+    written = json.loads(settings_path.read_text())
+    assert set(written['hooks']) == {'SessionStart', 'Notification', 'Stop'}
+    assert list(tmp_path.glob('settings.json.*.bak')) == []
+
+
+def test_run_install_backs_up_pre_merge_bytes_when_file_exists(tmp_path: Path) -> None:
+    settings_path = tmp_path / 'settings.json'
+    before = {'env': {'SOME_VAR': '1'}, 'hooks': {'PreToolUse': []}}
+    before_raw = json.dumps(before)
+    settings_path.write_text(before_raw)
+
+    sh._run_install(settings_path=settings_path)
+
+    backups = list(tmp_path.glob('settings.json.*.bak'))
+    assert len(backups) == 1
+    assert backups[0].read_text() == before_raw
+
+    merged = json.loads(settings_path.read_text())
+    assert merged['env'] == before['env']
+    assert set(merged['hooks']) == {'PreToolUse', 'SessionStart', 'Notification', 'Stop'}
+
+
+def test_run_install_result_is_valid_json(tmp_path: Path) -> None:
+    settings_path = tmp_path / 'settings.json'
+    settings_path.write_text(json.dumps({'env': {}}))
+
+    sh._run_install(settings_path=settings_path)
+
+    # json.loads raises on malformed content -- reaching the assertion below
+    # at all is the real assertion here.
+    reloaded = json.loads(settings_path.read_text())
+    assert reloaded['env'] == {}
+
+
+# ---------------------------------------------------------------------------
+# main(['install', ...]): exit-code propagation (install is NOT fail-soft)
+# ---------------------------------------------------------------------------
+
+
+def test_main_install_succeeds_and_returns_zero(tmp_path: Path) -> None:
+    settings_path = tmp_path / 'settings.json'
+
+    rc = sh.main(['install', '--settings-path', str(settings_path)])
+
+    assert rc == 0
+    assert settings_path.is_file()
+
+
+def test_main_install_returns_nonzero_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings_path = tmp_path / 'settings.json'
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(sh, '_run_install', _boom)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sh.main(['install', '--settings-path', str(settings_path)])
+
+    assert rc == 1
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_main_session_start_failure_still_returns_zero_not_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Contrast case for the install-only exit-code change above: the
+    # session-start/notification/stop verbs remain fail-soft (always 0).
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _stdin_json(monkeypatch, {'session_id': 'sess-rc', 'cwd': '/home/leo/src/dark-factory'})
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(sr, 'write_record', _boom)
+
+    assert sh.main(['session-start']) == 0
+
+
+# ---------------------------------------------------------------------------
 # Step-13: bash-level integration test (skills/spawn/hooks/*.sh entrypoints)
 # ---------------------------------------------------------------------------
 
 
 def _run_hook_script(
     script_name: str,
-    hook_input: dict[str, object],
+    hook_input: Mapping[str, object],
     root: Path,
 ) -> subprocess.CompletedProcess[bytes]:
     env = dict(os.environ)

@@ -10,6 +10,12 @@
 # and writes atomically (tmp file + os.replace) so a crash mid-write can
 # never leave settings.json truncated or corrupt. See
 # skills/spawn/hooks/README.md.
+#
+# Unlike the per-event hook entrypoints (session-start.sh/notification.sh/
+# stop.sh), this is a human-invoked one-shot command, not a fail-soft hook:
+# it propagates session_hooks.py's own exit code (0 on success, 1 if the
+# install itself failed) so a failed install is never silently reported as
+# a success.
 
 set +e
 
@@ -25,5 +31,4 @@ command -v python3 >/dev/null 2>&1 || exit 0
 
 PY="$REPO_ROOT/orchestrator/src/orchestrator/session_hooks.py"
 python3 "$PY" install
-
-exit 0
+exit $?

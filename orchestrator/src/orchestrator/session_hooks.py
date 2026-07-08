@@ -13,6 +13,12 @@ consumers import the shared record contract, they never re-derive it). All
 three hook handlers key their registry record on the Claude Code
 ``session_id`` delivered on each hook's stdin JSON — the only identity that
 is present in, and stable across, all three events for one session.
+
+KNOWN LIMITATION for spawned sessions: this trio's records are keyed on
+``session_id``, while ``spawn-claude.sh``'s own ``launching`` write keys its
+record on the integer ``launcher_pid`` — a different uniqueness token that
+can never converge with ``session_id`` (see ``run_session_start``'s
+docstring). Reconciling the two is deferred to a future task.
 """
 
 from __future__ import annotations
@@ -93,8 +99,15 @@ def hook_session_slug(
     """
     identity = resolve_hook_identity(hook_input, env)
     session_id = str(hook_input.get('session_id') or 'unknown')
+    # session_id (str) deliberately fills the launcher_pid slot as the
+    # uniqueness token (see module docstring); build_session_slug only ever
+    # str()s this argument, so the int annotation is not a real runtime
+    # constraint here.
     return session_registry.build_session_slug(
-        identity.role, identity.project, identity.task_id, session_id
+        identity.role,
+        identity.project,
+        identity.task_id,
+        session_id,  # type: ignore[arg-type]
     )
 
 
@@ -151,6 +164,32 @@ def hook_display_title(
 # ---------------------------------------------------------------------------
 
 
+def _hand_launched_liveness_pid() -> int:
+    """A durable pid-liveness proxy for a hand-launched session's new record.
+
+    ``os.getppid()`` would resolve to THIS hook invocation's own bash
+    entrypoint (session-start.sh), which exits within seconds of this call
+    returning. ``reap_stale_records``'s ``stale_pid`` rule reclaims a
+    non-terminal record once its ``launcher_pid`` is dead AND
+    ``NON_TERMINAL_HEARTBEAT_TTL`` has elapsed since its last write -- so a
+    hand-launched session that goes idle for over an hour with no further
+    hook write would be reaped even though its terminal is still open,
+    defeating T6's registry-visibility goal.
+
+    ``os.getsid(0)`` instead resolves to THIS process's POSIX *session
+    leader* -- ordinarily the interactive shell (or ``claude`` itself) that
+    owns the controlling terminal. Claude Code does not ``setsid`` the hook
+    subprocesses it spawns, so they inherit that same session id; the leader
+    lives for the terminal's whole lifetime, which is the liveness signal T6
+    actually wants. Falls back to ``os.getppid()`` on the rare
+    platform/sandbox where ``getsid`` raises.
+    """
+    try:
+        return os.getsid(0)
+    except OSError:
+        return os.getppid()
+
+
 def run_session_start(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
@@ -160,13 +199,28 @@ def run_session_start(
 
     When no record exists yet at this session's slug, this IS the session's
     first sight (PRD hand-launched-capture signal -- true for every hand-
-    launched session, and also for a spawned one if this hook somehow runs
-    before a future spawn-claude.sh write), so a RICH record is written:
+    launched session), so a RICH record is written:
     role/project/task_id/escalation_id/title/cwd/transcript_path all
     populated from the resolved identity, status=RUNNING. When a record
     already exists under this slug, it is refreshed to RUNNING in place via
     ``refresh_record`` -- every other already-populated field survives
     untouched, and the write bumps the record's mtime heartbeat.
+
+    KNOWN dual-record split for SPAWNED sessions: this slug is keyed on the
+    Claude Code ``session_id`` (module docstring), while spawn-claude.sh's
+    own ``launching`` write keys ITS record on the integer ``launcher_pid`` --
+    a different uniqueness token that ``session_id`` can never converge with,
+    since spawn-claude.sh cannot know the session_id Claude Code will assign
+    at launch time. A spawned session therefore gets TWO registry records
+    today: spawn-claude.sh's pid-keyed LAUNCHING/RUNNING/EXITED record, and
+    this hook trio's session_id-keyed RUNNING/AWAITING_INPUT/IDLE record --
+    they do NOT merge into one, regardless of hook-vs-spawn-claude.sh timing.
+    Per the PRD addendum, reconciling the two is DEFERRED to a future task
+    that exports a shared identity token (e.g. CLAUDE_SPAWN_SESSION_ID or
+    CLAUDE_SPAWN_LAUNCHER_PID) into the spawned session's own environment;
+    until then, a downstream consumer (e.g. a future fleet-cockpit renderer)
+    must correlate/dedupe the two records itself (e.g. by matching cwd and
+    task_id) rather than assuming one record per session.
     """
     identity = resolve_hook_identity(hook_input, env)
     slug = hook_session_slug(hook_input, env)
@@ -175,7 +229,7 @@ def run_session_start(
     except FileNotFoundError:
         cwd = str(hook_input.get('cwd') or os.getcwd())
         launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
-        launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else os.getppid()
+        launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else _hand_launched_liveness_pid()
         record = session_registry.SessionRecord(
             session_slug=slug,
             status=session_registry.Status.RUNNING,
@@ -346,10 +400,18 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
-    ALWAYS returns 0: a fault in any subcommand's core logic is logged
-    loudly (stderr, via the standard logging machinery) and swallowed here
-    rather than raised, so a hook fault can never block a Claude Code
-    session or turn (mirrors session_registry.main's fail-soft contract).
+    The three hook verbs (``session-start``/``notification``/``stop``)
+    ALWAYS return 0: a fault in their core logic is logged loudly (stderr,
+    via the standard logging machinery) and swallowed here rather than
+    raised, so a hook fault can never block a Claude Code session or turn
+    (mirrors session_registry.main's fail-soft contract).
+
+    ``install`` is different: it is a human-invoked one-shot command, not a
+    per-event hook, so a fault is logged AND propagated as exit code 1 --
+    otherwise a failed install (e.g. a permission error writing
+    settings.json) would report success via exit 0 while having written
+    nothing, and a non-interactive caller (install-hooks.sh) could never
+    detect it.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -368,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
             _run_install(args.settings_path)
     except Exception:
         logger.error('session_hooks %s failed', args.verb, exc_info=True)
-        return 0
+        return 1 if args.verb == 'install' else 0
 
     return 0
 
