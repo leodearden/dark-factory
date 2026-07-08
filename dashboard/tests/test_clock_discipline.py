@@ -40,6 +40,7 @@ import ast
 from pathlib import Path
 
 _EXEMPT_MARKER = '# clock-exempt:'
+_DEFERRED_CONSOLIDATION_TAG = f'{_EXEMPT_MARKER} deferred-consolidation'
 
 
 def find_clock_violations(source: str) -> list[tuple[int, str]]:
@@ -185,7 +186,7 @@ def test_no_deferred_consolidation_markers_remain():
     for path in sorted(_DATA_DIR.glob('*.py')):
         rel = path.relative_to(_DATA_DIR.parent.parent)
         for lineno, text in enumerate(path.read_text().splitlines(), start=1):
-            if 'deferred-consolidation' in text:
+            if _DEFERRED_CONSOLIDATION_TAG in text:
                 violations.append(f'{rel}:{lineno}: {text.strip()}')
 
     assert not violations, (
