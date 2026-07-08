@@ -4406,6 +4406,91 @@ class TestBuildFallbackConfigSubprojectScoped:
         assert result is not None
         assert result.test_command is None
 
+    def test_repo_root_tests_dir_without_pyproject_uses_fleet_chain_verbatim(
+        self, tmp_path: Path,
+    ) -> None:
+        """A repo-root tests/ file, with no tests/pyproject.toml, keeps the verbatim fleet chain.
+
+        Regression guard: the pyproject.toml discriminator must not mis-scope a
+        bare repo-root directory like tests/ (no pyproject.toml of its own,
+        unlike a real subproject) into a bogus ``cd tests && ...`` command.
+        """
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['tests/scripts/test_spawn_claude.py'], cfg, worktree=tmp_path,
+        )
+
+        assert result is not None
+        assert result.test_command == self._FLEET_TEST_COMMAND
+        assert not result.test_command.startswith('cd tests ')
+
+    def test_conftest_under_subproject_scopes_to_subproject_tests_dir(
+        self, tmp_path: Path,
+    ) -> None:
+        """A conftest.py inside cockpit/tests/ scopes to the subproject's tests dir."""
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/tests/conftest.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'cd cockpit && uv run pytest tests'
+
+
+class TestRunScopedVerificationForwardsWorktreeToFallback:
+    """`run_scoped_verification` forwards *worktree* into `_build_fallback_config` (task 2344).
+
+    Without this wiring the subproject-scoped fallback fix is dead code: the
+    production call site would never pass `worktree`, so
+    `_single_subproject_prefix` always sees `worktree=None` and returns None,
+    leaving the stale fleet-wide fallback in place for every real task.
+    """
+
+    def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=(
+                'cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ '
+                '&& cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ '
+                '&& cd ../dashboard && uv run pytest tests/'
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_worktree_forwarded_to_build_fallback_config(self, tmp_path: Path) -> None:
+        """The worktree argument passed to run_scoped_verification reaches _build_fallback_config."""
+        cockpit = tmp_path / 'cockpit'
+        (cockpit / 'tests').mkdir(parents=True)
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+        (cockpit / 'tests' / 'test_c3.py').write_text('def test_x():\n    pass\n')
+
+        captured: dict = {}
+
+        def fake_fallback(task_files, config=None, worktree=None):
+            captured['worktree'] = worktree
+            return None
+
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        with patch('orchestrator.verify._build_fallback_config', side_effect=fake_fallback), \
+             patch('orchestrator.verify.run_verification', new=AsyncMock(return_value=passing)):
+            await run_scoped_verification(
+                tmp_path,
+                self._make_config(tmp_path),
+                [],
+                task_files=['cockpit/tests/test_c3.py'],
+                role='task',
+            )
+
+        assert captured.get('worktree') == tmp_path, (
+            f'Expected _build_fallback_config to be called with worktree={tmp_path!r}; '
+            f'got {captured.get("worktree")!r}'
+        )
+
 
 class TestBuildFallbackConfigDataModule:
     """``_build_fallback_config`` must not pass non-test data modules to pytest.
