@@ -89,7 +89,7 @@ def _is_dependency_fact(fact: str | None) -> bool:
 # ``_invalidate_stale_superseded_ttl_edges`` to identify same-subject
 # contradictions that Graphiti's upstream edge-resolver under-invalidated.
 _PRIORITY_OVERRIDE_TTL_FACT_RE = re.compile(
-    r'\bpriority[- ]override\b.*\bTTL\b|\bTTL\b.*\bpriority[- ]override\b',
+    r'\bpriority[-\s]+override\b.*\bTTL\b|\bTTL\b.*\bpriority[-\s]+override\b',
     re.I | re.S,
 )
 
@@ -97,9 +97,13 @@ _PRIORITY_OVERRIDE_TTL_FACT_RE = re.compile(
 def _is_priority_override_ttl_fact(fact: str | None) -> bool:
     """Return True when *fact* expresses a priority-override TTL value.
 
-    Requires BOTH a ``priority[- ]override`` phrase AND a ``TTL`` token
+    Requires BOTH a ``priority[-\\s]+override`` phrase AND a ``TTL`` token
     (case-insensitive, in either order) — see
-    ``_PRIORITY_OVERRIDE_TTL_FACT_RE`` for why both are required.
+    ``_PRIORITY_OVERRIDE_TTL_FACT_RE`` for why both are required. The
+    separator allows one-or-more hyphen/whitespace characters (not just a
+    single hyphen or ASCII space) so LLM-generated free text with double
+    spaces, newlines, or other Unicode whitespace between the two words is
+    still classified correctly.
     """
     return (
         bool(fact) and _PRIORITY_OVERRIDE_TTL_FACT_RE.search(fact) is not None  # type: ignore[arg-type]
@@ -891,18 +895,25 @@ class MemoryService:
            ``_is_priority_override_ttl_fact`` and is not itself one of the
            authoritative-fresh edges: it is a same-subject, single-valued
            contradiction of the fact just written. The invalidation
-           timestamp is the newest ``valid_at`` among the authoritative-fresh
-           edges (falling back to ``datetime.now(UTC)`` when unavailable),
-           so the stale fact's supersession is stamped as of the moment the
-           new fact became valid. A processed-uuid set deduplicates edges
-           reachable from more than one subject node (an undirected
-           per-node query returns an edge spanning two queried subjects under
-           both endpoints), so each stale edge is invalidated at most once.
-           Each invalidation
-           attempt is individually best-effort — mirroring the sibling
-           hook's per-edge guard — so a transient backend failure for one
-           stale edge is logged and counted but does not stop the remaining
-           edges from being processed or fail the already-committed episode.
+           timestamp is computed PER SUBJECT — the newest ``valid_at`` among
+           *that subject's own* authoritative-fresh edges (falling back to
+           ``datetime.now(UTC)`` only when that subject's fresh edge(s)
+           carried no ``valid_at``), so the stale fact's supersession is
+           stamped as of the moment that subject's own new fact became
+           valid. A single episode may write fresh TTL facts for two
+           different subjects at different ``valid_at`` times; using a
+           single global max across every subject instead would stamp an
+           earlier subject's stale edge with a later subject's timestamp,
+           reopening a same-subject overlap window between the two — the
+           exact defect this hook exists to close. A processed-uuid set
+           deduplicates edges reachable from more than one subject node (an
+           undirected per-node query returns an edge spanning two queried
+           subjects under both endpoints), so each stale edge is
+           invalidated at most once. Each invalidation attempt is
+           individually best-effort — mirroring the sibling hook's per-edge
+           guard — so a transient backend failure for one stale edge is
+           logged and counted but does not stop the remaining edges from
+           being processed or fail the already-committed episode.
 
         This enforces the invariant that the newest write for a given
         (entity, predicate)-shape is the only ``invalid_at is None`` edge of
@@ -935,7 +946,12 @@ class MemoryService:
 
         keep_uuids: set[str] = set()
         subject_node_uuids: set[str] = set()
-        supersession_stamp: datetime | None = None
+        # PER-SUBJECT supersession stamps, not a single global max: see the
+        # docstring's step 3 for why using one global max across every
+        # subject touched by this episode would be imprecise when the
+        # episode writes fresh TTL facts for multiple distinct subjects at
+        # different valid_at times.
+        subject_stamps: dict[str, datetime] = {}
         for edge in edges:
             if getattr(edge, 'invalid_at', None) is not None:
                 continue
@@ -956,21 +972,18 @@ class MemoryService:
             # edge, so querying it alone still catches the genuine same-subject
             # stale edge; the target query is both harmful and unnecessary.
             src = getattr(edge, 'source_node_uuid', '') or ''
+            valid_at = getattr(edge, 'valid_at', None)
             if src:
                 subject_node_uuids.add(src)
-            valid_at = getattr(edge, 'valid_at', None)
-            if valid_at is not None and (
-                supersession_stamp is None or valid_at > supersession_stamp
-            ):
-                supersession_stamp = valid_at
+                if valid_at is not None and (
+                    src not in subject_stamps or valid_at > subject_stamps[src]
+                ):
+                    subject_stamps[src] = valid_at
 
         if not keep_uuids:
             # This episode did not write a fresh priority-override/TTL fact —
             # nothing to supersede, and no graph query needed.
             return 0
-
-        if supersession_stamp is None:
-            supersession_stamp = datetime.now(UTC)
 
         invalidated = 0
         failed = 0
@@ -979,6 +992,10 @@ class MemoryService:
             candidates = await self.graphiti.get_valid_edges_for_node(
                 node_uuid, group_id=group_id,
             )
+            # This subject's own stamp — the newest valid_at among its
+            # authoritative-fresh edges, falling back to now(UTC) only when
+            # unavailable for THIS subject (never another subject's stamp).
+            stamp = subject_stamps.get(node_uuid) or datetime.now(UTC)
             for candidate in candidates:
                 candidate_uuid = candidate.get('uuid', '') or ''
                 if not candidate_uuid or candidate_uuid in keep_uuids:
@@ -993,7 +1010,7 @@ class MemoryService:
                 processed_uuids.add(candidate_uuid)
                 try:
                     await self.graphiti.update_edge(
-                        candidate_uuid, group_id=group_id, invalid_at=supersession_stamp,
+                        candidate_uuid, group_id=group_id, invalid_at=stamp,
                     )
                     invalidated += 1
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
