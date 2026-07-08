@@ -71,7 +71,7 @@ async def test_initialize_creates_schema_with_expected_columns_and_indexes(tmp_p
         index_cursor = await db.execute('PRAGMA index_list(recon_ledger)')
         index_rows = await index_cursor.fetchall()
         index_names = {row[1] for row in index_rows}
-        assert EXPECTED_INDEXES <= index_names, (
+        assert index_names >= EXPECTED_INDEXES, (
             f'Missing indexes: {EXPECTED_INDEXES - index_names}; found: {index_names}'
         )
     finally:
