@@ -45,7 +45,22 @@ def _fixture_laptop_config(state="unflipped"):
       "unflipped" - git.persistent_merge_worktree: false present (default;
                     mirrors defaults.yaml's shipped default).
       "flipped"   - git.persistent_merge_worktree: true already present.
+      "malformed" - deliberately-malformed YAML (unterminated flow
+                    sequence under git:); must not parse.
     """
+    if state == "malformed":
+        return (
+            "concurrent_verify: false\n"
+            "\n"
+            "# Git\n"
+            "git:\n"
+            '  main_branch: "main"\n'
+            f"  {KEY}: false\n"
+            "  bad_value: [1, 2\n"
+            "\n"
+            "other_top_level_key: true\n"
+        )
+
     key_line = {
         "unflipped": f"  {KEY}: false\n",
         "flipped": f"  {KEY}: true\n",
@@ -264,3 +279,33 @@ def test_check_mode_on_already_enabled_reports_noop(tmp_path):
     )
     assert _read_config(config_path) == before_text, "--check must never mutate the config"
     assert _backup_files(config_path) == [], "--check must never create a backup"
+
+
+# ---------------------------------------------------------------------------
+# step-7: RED -- a malformed target YAML must fail loudly in both modes
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("args", [(), ("--check",)], ids=["apply", "--check"])
+def test_malformed_yaml_exits_nonzero_without_mutating(tmp_path, args):
+    """A deliberately-malformed target YAML makes the script exit non-zero
+    in both apply and --check modes, mutating nothing and creating no
+    backup."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    before_text = _fixture_laptop_config("malformed")
+    config_path.write_text(before_text)
+
+    result = _run_script(config_path, *args)
+
+    assert result.returncode != 0, (
+        f"Expected non-zero exit on malformed YAML (args={args!r}); got 0\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stderr.strip(), (
+        f"Expected an error message on stderr; got stderr={result.stderr!r}"
+    )
+    assert _read_config(config_path) == before_text, (
+        f"malformed YAML must not be mutated (args={args!r})"
+    )
+    assert _backup_files(config_path) == [], (
+        f"malformed YAML must not produce a backup (args={args!r})"
+    )
