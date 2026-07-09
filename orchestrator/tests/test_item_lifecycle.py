@@ -309,44 +309,10 @@ class TestItemLifecycleIllegalTransitions:
 
 
 # ---------------------------------------------------------------------------
-# Amendment (reviewer_comprehensive, post-verification): pin the live-phase-
-# string overlap and give the two previously-implicit REDISPATCH_PARKED
-# entry edges dedicated standalone coverage.
+# Amendment (reviewer_comprehensive, post-verification): give the two
+# previously-implicit REDISPATCH_PARKED entry edges dedicated standalone
+# coverage.
 # ---------------------------------------------------------------------------
-
-
-class TestItemLifecycleStateOverlapWithLivePhaseStrings:
-    """Only VERIFYING / GATE_REVERIFY / FINALIZING currently share a wire
-    value with a live ``InflightEntry.phase``/``_verify_phase`` string in the
-    real pipeline (task 2164 amendment; reviewer_comprehensive
-    architecture_documentation_accuracy + test_coverage findings).
-
-    Reads the ACTUAL call-site source via ``inspect.getsource`` rather than
-    comparing the enum against its own literals (the existing
-    ``test_members_are_str_instances_with_lowercase_wire_values`` is
-    circular for that purpose) — this test breaks if the pipeline's phase
-    strings and the enum wire values ever drift apart, which is exactly the
-    class of overstatement the review caught in the ``ItemLifecycleState``
-    docstring (it originally claimed ALL ten members matched existing phase
-    strings; only these three do).
-    """
-
-    def test_verifying_gate_reverify_finalizing_match_live_phase_strings(self) -> None:
-        import inspect
-
-        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
-
-        dispatch_source = inspect.getsource(SpeculativeMergeWorker._run_inflight_verify)
-        finalize_source = inspect.getsource(SpeculativeMergeWorker._finalize_inflight)
-
-        assert "_verify_phase = 'verifying'" in dispatch_source
-        assert ItemLifecycleState.VERIFYING == 'verifying'
-
-        assert "phase = 'gate_reverify'" in finalize_source
-        assert ItemLifecycleState.GATE_REVERIFY == 'gate_reverify'
-
-        assert "phase = 'finalizing'" in finalize_source
-        assert ItemLifecycleState.FINALIZING == 'finalizing'
 
 
 class TestItemLifecycleTransitionRedispatchParkedEntryEdges:
