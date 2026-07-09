@@ -189,6 +189,29 @@ class TestItemLifecycleTransitionHappyPath:
         )
         assert registry.current(rid) == ItemLifecycleState.DISPATCHING
 
+    def test_cascade_remerge_from_gate_reverify_is_a_legal_in_place_retry(self) -> None:
+        """The documented cascade remerge: a downstream entry parked at
+        GATE_REVERIFY when a head verify fails is remerged (-> MERGING) and
+        then appended to ``_redispatch`` (-> REDISPATCH_PARKED). Mirrors
+        ``test_redispatch_bounce_is_a_legal_in_place_retry`` (task 2164
+        step-9; fixes the GATE_REVERIFY out-set asymmetry with VERIFYING/
+        FINALIZING, both of which already legally reach MERGING)."""
+        from orchestrator.merge_queue import ItemLifecycle, ItemLifecycleState
+
+        registry = ItemLifecycle()
+        rid = 'mr-cccccccc'
+        registry.register(rid, initial=ItemLifecycleState.GATE_REVERIFY)
+
+        registry.transition(
+            rid, ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.MERGING,
+        )
+        assert registry.current(rid) == ItemLifecycleState.MERGING
+
+        registry.transition(
+            rid, ItemLifecycleState.MERGING, ItemLifecycleState.REDISPATCH_PARKED,
+        )
+        assert registry.current(rid) == ItemLifecycleState.REDISPATCH_PARKED
+
 
 # ---------------------------------------------------------------------------
 # step-7 RED / step-8 GREEN: illegal transitions raise IllegalLifecycleTransition
