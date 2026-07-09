@@ -30,15 +30,14 @@ import contextlib
 import json
 import os
 import random
-from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from shared.cli_invoke import (
     AgentResult,
-    AllAccountsCappedException,
     invoke_with_cap_retry,
 )
 from shared.config_models import AccountConfig, UsageCapConfig
@@ -56,11 +55,9 @@ from shared.invocation_outcome import (
 )
 from shared.usage_gate import (
     _LEGAL_TRANSITIONS,
-    AccountLease,
     AccountPhase,
     AccountState,
     IllegalTransitionError,
-    InvokeSlot,
     UsageGate,
 )
 
@@ -112,7 +109,39 @@ def make_boundary_gate(
     return gate
 
 
-def scripted_cli(*results_or_excs):
+class _ScriptedCli:
+    """Callable ``invoke_fn`` stand-in returned by :func:`scripted_cli`.
+
+    A small class rather than a closure with a monkey-patched attribute, so
+    its ``.calls`` log has a real static type -- consumer-side assertions
+    read ``cli.calls`` after the fact (B5, B7).
+    """
+
+    def __init__(
+        self,
+        results_or_excs: tuple[AgentResult | BaseException | type[BaseException], ...],
+    ) -> None:
+        self._remaining = list(results_or_excs)
+        self.calls: list[dict[str, object]] = []
+
+    async def __call__(self, **kwargs: object) -> AgentResult:
+        self.calls.append(kwargs)
+        if not self._remaining:
+            raise AssertionError(
+                f'scripted_cli exhausted after {len(self.calls)} call(s) -- the retry '
+                'loop invoked the fake CLI more times than scripted (unbounded retry?)'
+            )
+        item = self._remaining.pop(0)
+        if isinstance(item, BaseException) or (
+            isinstance(item, type) and issubclass(item, BaseException)
+        ):
+            raise item
+        return item
+
+
+def scripted_cli(
+    *results_or_excs: AgentResult | BaseException | type[BaseException],
+) -> _ScriptedCli:
     """Build an async ``invoke_fn`` standing in for ``invoke_claude_agent``.
 
     Returns each item from *results_or_excs* in order on successive calls;
@@ -129,25 +158,7 @@ def scripted_cli(*results_or_excs):
     asyncio would swallow/mis-report) if invoked more times than scripted --
     this doubles as the "no infinite retry" bounded-invocation signal (B4).
     """
-    remaining = list(results_or_excs)
-    calls: list[dict] = []
-
-    async def _invoke(**kwargs):
-        calls.append(kwargs)
-        if not remaining:
-            raise AssertionError(
-                f'scripted_cli exhausted after {len(calls)} call(s) -- the retry '
-                'loop invoked the fake CLI more times than scripted (unbounded retry?)'
-            )
-        item = remaining.pop(0)
-        if isinstance(item, BaseException) or (
-            isinstance(item, type) and issubclass(item, BaseException)
-        ):
-            raise item
-        return item
-
-    _invoke.calls = calls
-    return _invoke
+    return _ScriptedCli(results_or_excs)
 
 
 class RecordingCostStore:
@@ -578,7 +589,7 @@ async def _assert_probe_in_flight_skew_does_not_skew_attribution(gate: UsageGate
         result = await invoke_with_cap_retry(
             gate, 'B5[attribution]',
             invoke_fn=scripted_cli(ok_result),
-            cost_store=cost_store,
+            cost_store=cast(CostStore, cost_store),
             backend='claude',
             prompt='hi',
         )
@@ -653,14 +664,16 @@ class TestB6ReportAtomicity:
         gate._transition(probing_acct, AccountPhase.CAPPED)
         gate._transition(probing_acct, AccountPhase.PROBING)
 
-        with pytest.raises(RuntimeError, match='boom'):
-            with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
-                await invoke_with_cap_retry(
-                    gate, 'B6[exception]',
-                    invoke_fn=scripted_cli(RuntimeError('boom')),
-                    backend='claude',
-                    prompt='hi',
-                )
+        with (
+            pytest.raises(RuntimeError, match='boom'),
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'B6[exception]',
+                invoke_fn=scripted_cli(RuntimeError('boom')),
+                backend='claude',
+                prompt='hi',
+            )
 
         # Consumer side: the exception propagated (not swallowed), and the
         # account is not left stuck in PROBE_IN_FLIGHT.
@@ -816,7 +829,9 @@ async def _capture_probe_envs(gate: UsageGate, accts: list[AccountState]) -> lis
     captured: list[dict] = []
 
     async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
-        captured.append(kwargs.get('env'))
+        env = kwargs.get('env')
+        assert isinstance(env, dict)
+        captured.append(env)
         proc = MagicMock()
         proc.returncode = 0
         proc.communicate = AsyncMock(return_value=(b'{"ok":true}', b''))
