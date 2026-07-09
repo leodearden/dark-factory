@@ -710,3 +710,23 @@ class TestHostAllocatorCancelReleaseIdempotent:
         result = await alloc.cancel_and_release(None)
         assert result is True
         assert remote_a.cancel_verify_called == 0
+
+    async def test_double_release_local_lease_is_noop(self):
+        """A second cancel_and_release on an already-released LOCAL lease is
+        also a no-op: the FREE-slot guard sits above the is_local branch, so
+        a repeat call on a FREE local slot returns True without raising.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([], quarantine=set())
+        local_lease = await alloc.acquire(self._local_factory)
+        assert local_lease is not None and local_lease.is_local
+
+        first = await alloc.cancel_and_release(local_lease)
+        assert first is True
+        assert alloc.is_busy('local') is False
+
+        # Second call on the same (now-stale) local lease — slot already FREE.
+        second = await alloc.cancel_and_release(local_lease)
+        assert second is True
+        assert alloc.is_busy('local') is False
