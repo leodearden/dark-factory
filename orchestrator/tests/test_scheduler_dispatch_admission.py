@@ -8,11 +8,21 @@ Covers:
                   tick still dispatches; exactly one ``dispatch_deferred``
                   event fires with the ``{metric, value, in_flight, floor}``
                   payload.
+  step-3  (GUARD) Work-conserving (idle PSI never throttles) + floor/deadlock
+                  -freedom (0 in-flight, or in-flight below a configured
+                  floor, always dispatches) + DA-D1 metric-ranking order.
+  step-4  (GUARD) Disabled gate (no PSI read at all), fail-open on
+                  unreadable PSI (DA-D6), once-per-tick event dedup, and
+                  rate-limited deferral logging.
+  step-5  (RED)   Pinned-loop parity (DA-D5) — a pinned HEAVY candidate is
+                  deferred the same as a scored one; a pinned DETERMINISTIC
+                  candidate remains exempt.
 
 Mirrors test_scheduler_landed_dispatch_gate.py / test_scheduler_deterministic.py
 conventions: module-local task-dict helpers, ``scheduler.get_tasks =
-AsyncMock(return_value=[...])``, driving ``acquire_next()`` directly, and
-``_RecordingEventStore`` for event assertions.
+AsyncMock(return_value=[...])``, driving ``acquire_next()`` directly,
+``_RecordingEventStore`` for event assertions, and ``OverrideStore`` +
+``tmp_path`` for pin parity.
 """
 
 from __future__ import annotations
@@ -369,3 +379,67 @@ class TestDispatchAdmissionOnceDedupAndRateLimit:
             if r.levelname == 'WARNING' and 'deferring heavy' in r.getMessage()
         ]
         assert len(deferral_warnings) == 1, 'the WARNING log stream is rate-limited across ticks'
+
+
+# ---------------------------------------------------------------------------
+# step-5 — Pinned-loop parity (DA-D5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDispatchAdmissionPinnedLoopParity:
+    """A pin doesn't reduce host load — the pinned loop must honor the same
+    psi_hold decision as the scored loop (DA-D5).  Deterministic pinned
+    candidates remain exempt."""
+
+    async def test_pinned_heavy_deferred_nonpinned_deterministic_dispatches(
+        self, tmp_path
+    ) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        event_store = _RecordingEventStore()
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        store.set_override('/proj', 'Z', pinned=True)
+
+        scheduler = Scheduler(config, event_store=event_store, override_store=store)
+        scheduler._project_root = '/proj'
+        scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
+        scheduler._dispatched = {'inflight1'}
+
+        task_z = _heavy_task('Z', files=['z/src.py'])
+        task_y = _det_task('Y', files=['y/src.py'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_z, task_y])
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'Y', (
+            'Y (deterministic, unpinned) should dispatch; Z (pinned heavy) must not'
+        )
+        assert 'Z' not in scheduler._dispatched
+        assert 'Y' in scheduler._dispatched
+        deferred_events = [e for e in event_store.events if e[0] == 'dispatch_deferred']
+        assert len(deferred_events) == 1
+
+    async def test_pinned_deterministic_dispatches_under_saturation(self, tmp_path) -> None:
+        from orchestrator.overrides import OverrideStore
+
+        event_store = _RecordingEventStore()
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        store.set_override('/proj', 'W', pinned=True)
+
+        scheduler = Scheduler(config, event_store=event_store, override_store=store)
+        scheduler._project_root = '/proj'
+        scheduler._read_psi_sample = lambda: _psi(cpu_some10=90.0, read_ok=True)
+        scheduler._dispatched = {'inflight1'}
+
+        task_w = _det_task('W', files=['w/src.py'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_w])
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'W', 'deterministic exemption applies in the pin loop too'
+        assert 'W' in scheduler._dispatched
