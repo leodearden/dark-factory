@@ -4383,6 +4383,15 @@ class ItemLifecycle:
     ``current``/``transition``. The sibling task kappa wires ``transition()``
     at every put/pop call site across the five queues and repoints
     ``snapshot()`` / the permit audit / liveness checks onto this registry.
+
+    Concurrency model: storage is a plain ``dict`` with no locking. That is
+    safe only because ``register``/``current``/``transition`` contain no
+    ``await`` points, so each call runs atomically to completion under the
+    single merge-queue asyncio event loop before another coroutine can
+    interleave. This class is NOT thread-safe — the ``from_state``
+    cross-check in :meth:`transition` defends against mis-wiring/logic
+    races between coroutines sharing that one loop, not against concurrent
+    access from a thread pool or a second event loop.
     """
 
     def __init__(self) -> None:

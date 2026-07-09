@@ -233,6 +233,19 @@ class TestItemLifecycleIllegalTransitions:
     ItemLifecycle.transition() to raise it for all three guard classes.
     """
 
+    def test_is_a_runtime_error_subclass(self) -> None:
+        """The class docstring promises this is a RuntimeError — an explicit
+        raise, never a bare assert — so callers can ``except
+        IllegalLifecycleTransition`` precisely. Pin that contract directly
+        (mirrors TestItemLifecycleStateEnum.test_is_a_strenum) so a future
+        refactor cannot silently rebase it onto a bare Exception/ValueError
+        and break broader `except RuntimeError` handlers at kappa's wired
+        call sites (task 2164 amendment; reviewer_comprehensive
+        test_coverage finding)."""
+        from orchestrator.merge_queue import IllegalLifecycleTransition
+
+        assert issubclass(IllegalLifecycleTransition, RuntimeError)
+
     def test_skip_stage_move_raises(self) -> None:
         from orchestrator.merge_queue import (
             IllegalLifecycleTransition,
