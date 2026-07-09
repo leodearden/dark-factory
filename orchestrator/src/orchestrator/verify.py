@@ -2981,6 +2981,32 @@ async def run_verification(
             # would misdescribe it.
             summary = 'Verification timed out during env-recovery retry'
 
+    # Bare pytest-xdist worker-crash retry (task 2365): under host overload a
+    # starved xdist worker is os._exit()'d by pytest-timeout's thread method,
+    # and --max-worker-restart=0 (task 1907, kept intentionally at 0) turns
+    # that into a bare "node down: Not properly terminated" / "worker gwN
+    # crashed" failure attributed to whatever test happened to be running —
+    # not a real code regression (esc-2286-21). _is_bare_xdist_worker_crash
+    # is the conservative discriminator: it returns False (no reclassify)
+    # whenever a genuine pytest failure marker is also present, so a real
+    # failure is never masked. Gated on `not is_merge_verify` — mirrors the
+    # _mark_verify_warm precedent below — because the merge path
+    # (merge_queue.py) has no VerifyInfraError handler and an uncaught raise
+    # there would stall the merge queue. Raising here (rather than returning
+    # a failure category) routes through the EXISTING bounded
+    # exponential-backoff retry (_run_scoped_verification_with_infra_retry in
+    # workflow.py) instead of the debugfix loop's DEBUGGER invocation — the
+    # task-path's only auto-retry-without-debugging mechanism.
+    if not is_merge_verify and test_rc != 0 and _is_bare_xdist_worker_crash(test_out):
+        logger.warning(
+            'Task %s: bare pytest-xdist worker crash detected (module_prefix=%r) '
+            'with no real failure marker in test output — reclassifying as '
+            'transient infra (xdist_worker_crash) and raising VerifyInfraError '
+            'for the bounded whole-suite retry instead of invoking the debugger',
+            task_id, module_prefix,
+        )
+        raise VerifyInfraError(phase='xdist_worker_crash', errno=None)
+
     # Hoist runs list so both the merge-path and task-path branches can use it.
     runs = [
         {
