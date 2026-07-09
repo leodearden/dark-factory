@@ -3528,6 +3528,43 @@ class TestCuratorReconPremiseRegistryConfig:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# task-2085 step-3 RED: TestCuratorOperationalAskRegistryConfig
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCuratorOperationalAskRegistryConfig:
+    """Tests that CuratorConfig has operational_ask_registry_path field
+    and that FusedMemoryConfig round-trips it via YAML.
+
+    Mirrors TestCuratorConfigBlocklistPath / TestCuratorReconPremiseRegistryConfig
+    above — same shape, new field.
+    """
+
+    def test_curator_config_has_field_default_none(self):
+        """CuratorConfig has operational_ask_registry_path field, default None."""
+        cfg = CuratorConfig()
+        assert hasattr(cfg, "operational_ask_registry_path")
+        assert cfg.operational_ask_registry_path is None
+
+    def test_curator_config_accepts_string_path(self):
+        """CuratorConfig accepts a string path for operational_ask_registry_path."""
+        cfg = CuratorConfig(operational_ask_registry_path="/tmp/operational_ask_registry.yaml")
+        assert cfg.operational_ask_registry_path == "/tmp/operational_ask_registry.yaml"
+
+    def test_fused_memory_config_roundtrips_via_yaml(self, tmp_path, monkeypatch):
+        """FusedMemoryConfig round-trips operational_ask_registry_path via YAML."""
+        import yaml
+
+        raw = {"curator": {"operational_ask_registry_path": "config/operational_ask_registry.yaml"}}
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text(yaml.dump(raw), encoding="utf-8")
+
+        monkeypatch.setenv("CONFIG_PATH", str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.curator.operational_ask_registry_path == "config/operational_ask_registry.yaml"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # step-7 RED: TestCuratorBlocklistShortCircuit
 # ──────────────────────────────────────────────────────────────────────────────
 
