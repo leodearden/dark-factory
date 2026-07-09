@@ -173,3 +173,74 @@ class TestConstructorInjectedHooksFire:
         spy.assert_called_once()
         call_args = spy.call_args
         assert call_args.args[0] == 'starved'
+
+
+class TestLivenessAccessors:
+    """Public liveness accessors (task 2235 step-3/4): ``is_dispatched(tid)``
+    and ``requeue_history(tid)``.
+
+    Replace the harness's direct reach-ins into ``scheduler._dispatched`` /
+    ``scheduler._requeue_history`` with a stable public surface.
+    """
+
+    def test_is_dispatched_false_when_absent(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        assert scheduler.is_dispatched('T1') is False
+
+    def test_is_dispatched_true_when_in_dispatched_set(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler._dispatched.add('T1')
+        assert scheduler.is_dispatched('T1') is True
+
+    def test_is_dispatched_false_after_discard(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler._dispatched.add('T1')
+        scheduler._dispatched.discard('T1')
+        assert scheduler.is_dispatched('T1') is False
+
+    def test_requeue_history_empty_list_when_absent(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        assert scheduler.requeue_history('T1') == []
+
+    def test_requeue_history_returns_recorded_entries(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.record_requeue(
+            'T1',
+            phase='impl',
+            reason='boom',
+            detail='detail text',
+            run_id='run-1',
+            cost_usd=0.5,
+        )
+
+        history = scheduler.requeue_history('T1')
+
+        assert len(history) == 1
+        record = history[0]
+        assert record.attempt == 1
+        assert record.phase == 'impl'
+        assert record.reason == 'boom'
+        assert record.detail == 'detail text'
+        assert record.run_id == 'run-1'
+        assert record.cost_usd == 0.5
+
+    def test_requeue_history_mutating_returned_list_does_not_affect_internal_state(
+        self,
+    ):
+        """``requeue_history`` must return a copy — mutating it must not leak
+        into the scheduler's internal bookkeeping."""
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.record_requeue(
+            'T1',
+            phase='impl',
+            reason='boom',
+            detail='detail text',
+            run_id='run-1',
+            cost_usd=0.0,
+        )
+
+        history = scheduler.requeue_history('T1')
+        history.append('not-a-real-record')
+        history.clear()
+
+        assert len(scheduler.requeue_history('T1')) == 1
