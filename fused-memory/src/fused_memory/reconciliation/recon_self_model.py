@@ -25,6 +25,18 @@ This task builds ONLY this module + its unit tests. The prompt cutover
 (stage1.py/stage2.py importing these rendered sections) and the
 premise-lint wiring at the recon submit path are task ξ; this module
 therefore does not modify, and is not yet imported by, any prompt file.
+
+CAVEAT — transcription fidelity: MARKER_KINDS, MARKER_LIFECYCLE,
+FINGERPRINT_IDENTITY_FIELDS, and EXECUTION_CLASSES are genuinely
+single-sourced — tests cross-check them directly against the live code in
+recon_ledger/harness/flag_dedup. MCP_CALL_SIGNATURES and the render_*
+prose are different: they are hand-transcribed from the current stage
+prompts / server tool definitions (see the MCP_CALL_SIGNATURES section
+comment below), not derived from that source. Until ξ's prompt cutover
+imports the rendered text and a test asserts the prompt string contains
+it (PRD §8.4's stated drift invariant), treat these two areas as a
+canonical description pending ξ cross-check — the best current
+transcription, not yet a verified single source of truth.
 """
 
 from __future__ import annotations
@@ -163,9 +175,14 @@ EXECUTION_CLASSES = ('code_tdd', 'operational', 'decision')
 # --------------------------------------------------------------------------- #
 # Recon tool-surface call shapes (hand-transcribed from the stage prompts —
 # reconciliation/prompts/stage1.py, stage2.py, stage3.py, __init__.py — and
-# from the MCP tool definitions in server/tools.py). Kept here so the exact
-# call shape recon relies on is single-sourced instead of re-transcribed
-# ad hoc wherever it's discussed (e.g. by a premise-lint consumer at ξ).
+# from the MCP tool definitions in server/tools.py). CANONICAL DESCRIPTION
+# PENDING ξ CROSS-CHECK: this is a hand-transcribed copy, not derived from
+# that source code, so treat it as the best current transcription rather
+# than an already-verified single source of truth (see the module
+# docstring's transcription-fidelity caveat) until ξ wires a fidelity
+# check. Kept here so the call shape recon relies on has ONE transcription
+# to maintain instead of being re-transcribed ad hoc wherever it's
+# discussed (e.g. by a premise-lint consumer at ξ).
 # --------------------------------------------------------------------------- #
 
 MCP_CALL_SIGNATURES: dict[str, str] = {
@@ -381,6 +398,16 @@ class Violation:
     detail: str
 
 
+# Tempered-dot gap that refuses to cross a negation cue (not/never/n't)
+# between a rule's subject and verb — used in place of a bare `[^.]*`
+# wildcard so a CORRECTLY negated statement (e.g. "Stage 3 remediation
+# does NOT delete the flag marker") does not match as a false-premise
+# violation. premise_lint exists to flag FALSE premises; a true statement
+# of the invariant — even phrased as a negation — is not one, and matching
+# it anyway would be a false positive that rejects a correct task
+# description once wired at task ξ.
+_GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b).)*"
+
 # Module-level rule table for premise_lint: (compiled case-insensitive
 # regex, invariant_name, detail). Each rule encodes one known-false premise
 # from the 2083/2092/2093 false-premise batch, which mis-modeled run_id and
@@ -402,8 +429,9 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     ),
     (
         re.compile(
-            r'(?:stage\s*3|remediation|the\s+llm)[^.]*\bdeletes?\b[^.]*'
-            r'\b(?:flag_for_stage2|flag\s+marker|stage1_flag_marker|marker)\b',
+            r'(?:stage\s*3|remediation|the\s+llm)' + _GAP_NO_NEGATION + r'\bdeletes?\b'
+            r'' + _GAP_NO_NEGATION + r'\b(?:flag_for_stage2|flag\s+marker|'
+            r'stage1_flag_marker|marker)\b',
             re.IGNORECASE,
         ),
         'markers_deleted_only_by_gc',
