@@ -14416,6 +14416,82 @@ class TestGcReconMarkers:
         ) is not None
 
     @pytest.mark.asyncio
+    async def test_comma_joined_task_id_marker_is_ttl_only_not_terminal_matched(self, ledger_store):
+        """A marker whose ``task_id`` is a comma-joined multi-task string (the
+        shape produced by flag_dedup's ``cited_tasks`` fallback, e.g. '12,15')
+        must NOT be deleted by the terminal-referenced clause even when every
+        cited task is terminal — gc()'s ``task_id IN (...)`` match is an
+        EXACT string comparison, so '12,15' never equals '12' or '15'
+        individually (task 2228 W5-κ, review finding test_coverage; see
+        ReconLedgerStore.gc()'s docstring for the documented rationale). It
+        is reaped only once its own ``expires_at`` TTL elapses.
+
+        A control single-task terminal marker (task_id='12') is seeded
+        alongside and asserted deleted, proving gc() actually exercised the
+        terminal-match branch this cycle — not that bounding/intersection
+        zeroed out terminal_task_ids and left gc() a no-op expiry-only pass
+        for an unrelated reason.
+        """
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+
+        comma_joined = ReconLedgerRecord(
+            project_id='reify',
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-06-01T00:00:00+00:00',
+            task_id='12,15',
+            flag_type='flag_comma',
+            expires_at='2026-12-01T00:00:00+00:00',
+        )
+        control_terminal = ReconLedgerRecord(
+            project_id='reify',
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-06-01T00:00:00+00:00',
+            task_id='12',
+            flag_type='flag_single',
+            expires_at='2026-12-01T00:00:00+00:00',
+        )
+        await ledger_store.upsert(comma_joined)
+        await ledger_store.upsert(control_terminal)
+
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = ledger_store
+        taskmaster = AsyncMock()
+        # Both component tasks cited by the comma-joined marker are terminal.
+        taskmaster.get_statuses = AsyncMock(
+            return_value={'12': 'done', '15': 'cancelled'},
+        )
+        scope = _scope('reify', '/home/leo/src/reify')
+
+        deleted_count = await _gc_recon_markers(
+            memory_service, taskmaster, scope, 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+        )
+
+        assert deleted_count == 1
+        assert await ledger_store.get_by_identity(
+            'reify', 'stage1_flag_marker', task_id='12,15', flag_type='flag_comma',
+        ) is not None
+        assert await ledger_store.get_by_identity(
+            'reify', 'stage1_flag_marker', task_id='12', flag_type='flag_single',
+        ) is None
+
+        # Only TTL expiry reaps it — re-run gc() with `now` past expires_at.
+        deleted_after_ttl = await _gc_recon_markers(
+            memory_service, taskmaster, scope, 'r2',
+            now=datetime(2026, 12, 2, 0, 0, 0, tzinfo=UTC),
+        )
+
+        assert deleted_after_ttl == 1
+        assert await ledger_store.get_by_identity(
+            'reify', 'stage1_flag_marker', task_id='12,15', flag_type='flag_comma',
+        ) is None
+
+    @pytest.mark.asyncio
     async def test_no_ledger_returns_zero_without_raising(self):
         """memory_service with no recon_ledger wired (None) degrades to 0 —
         no taskmaster I/O, no raise (ledger disabled/unwired is a steady-state
