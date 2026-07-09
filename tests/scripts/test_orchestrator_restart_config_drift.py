@@ -131,3 +131,10 @@ def test_orchestrator_restart_config_round_trips_through_config_model(
         "round-trip the committed value — check for a field rename/typo in "
         "config.py"
     )
+    # Self-redeploy rate cap (task 2371). The committed YAML does not set this
+    # key, so it must round-trip to the field's default (8h). A rename/typo in
+    # config.py would surface here as the attribute vanishing (AttributeError).
+    assert config.orchestrator_restart_min_interval_secs == pytest.approx(28800.0), (
+        "OrchestratorConfig.orchestrator_restart_min_interval_secs did not "
+        "resolve to its 8h default — check for a field rename/typo in config.py"
+    )

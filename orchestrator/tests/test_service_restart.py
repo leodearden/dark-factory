@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1230,3 +1232,243 @@ async def test_restart_precondition_default_none_preserves_existing_behavior() -
     assert result is True
     executor.assert_awaited_once()
     assert coord.is_pending is False
+
+
+# ---------------------------------------------------------------------------
+# Min-interval rate cap (restart-safe self-redeploy throttle — task 2371)
+# ---------------------------------------------------------------------------
+
+
+def _make_rate_capped_coordinator(
+    *,
+    min_interval_secs: float,
+    wall_now: list[float],
+    state_path: Path | None = None,
+    debounce_secs: float = 0.0,
+    restart_executor: AsyncMock | None = None,
+) -> tuple[StaleServiceRestartCoordinator, AsyncMock, MagicMock]:
+    """Build a coordinator wired with the wall-clock rate cap.
+
+    ``wall_now`` is a single-element mutable list so a test can advance
+    wall-clock time independently of the (monotonic) debounce ``clock``.
+    ``clock`` is pinned to a constant so the monotonic debounce never gates
+    (debounce_secs=0.0), isolating the min-interval behaviour under test.
+    """
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['orchestrator/src/orchestrator/harness.py'], None)
+    )
+    event_store = MagicMock()
+    executor = restart_executor or AsyncMock()
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=event_store,
+        watch_prefixes=['orchestrator/src/'],
+        debounce_secs=debounce_secs,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: 0.0,  # monotonic debounce pinned — isolate the wall cap
+        service_name='orchestrator',
+        min_interval_secs=min_interval_secs,
+        wall_clock=lambda: wall_now[0],
+        state_path=state_path,
+    )
+    return coord, executor, event_store
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_defers_when_recent_fire_within_window() -> None:
+    """(a) A recent last-fire within the cap defers an otherwise-ready restart.
+
+    The fire is skipped, the executor is NOT awaited, and pending is RETAINED
+    (so it fires as soon as the window elapses).
+    """
+    wall_now = [10_000.0]
+    coord, executor, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0, wall_now=wall_now
+    )
+    # Simulate a fire 1 hour ago (well inside the 8h cap).
+    coord._last_fire_wall = wall_now[0] - 3600.0
+
+    await coord.note_merge('task-1', 'base', 'head')
+    assert coord.is_pending is True
+
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is False
+    executor.assert_not_awaited()
+    assert coord.is_pending is True  # retained — will fire once the window opens
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_fires_once_window_elapses() -> None:
+    """(b) Once wall-clock advances past the window, the deferred restart fires."""
+    wall_now = [10_000.0]
+    coord, executor, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0, wall_now=wall_now
+    )
+    coord._last_fire_wall = wall_now[0] - 3600.0
+
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # Still inside the window → deferred.
+    assert await coord.maybe_restart(agents_idle=True) is False
+    assert coord.is_pending is True
+
+    # Advance wall-clock past the 8h cap (measured from the last fire).
+    wall_now[0] = coord._last_fire_wall + 28800.0 + 1.0
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+    # The successful fire re-stamps the cap to "now".
+    assert coord._last_fire_wall == wall_now[0]
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_disabled_by_default_never_gates() -> None:
+    """(c) Default min_interval_secs=0.0 never gates — regression guard.
+
+    This is what keeps the fused-memory/dashboard coordinators byte-identical:
+    even with a very recent (in fact, equal-to-now) last-fire timestamp, a 0.0
+    cap fires immediately.
+    """
+    wall_now = [10_000.0]
+    coord, executor, _ = _make_rate_capped_coordinator(
+        min_interval_secs=0.0, wall_now=wall_now
+    )
+    # Even an absurdly recent fire must not gate when the cap is disabled.
+    coord._last_fire_wall = wall_now[0]
+
+    await coord.note_merge('task-1', 'base', 'head')
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_first_fire_not_gated_when_no_prior_timestamp() -> None:
+    """A cap with no prior fire (_last_fire_wall is None) fires immediately."""
+    wall_now = [10_000.0]
+    coord, executor, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0, wall_now=wall_now
+    )
+    assert coord._last_fire_wall is None
+
+    await coord.note_merge('task-1', 'base', 'head')
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    assert coord._last_fire_wall == wall_now[0]
+
+
+def test_rate_cap_seeds_last_fire_from_existing_state_file(tmp_path: Path) -> None:
+    """(d-1) _last_fire_wall is seeded from an existing state file at construction."""
+    state_path = tmp_path / 'data' / 'orchestrator' / 'last_redeploy_orchestrator.json'
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({'ts': 12345.5, 'iso': 'whatever'}), encoding='utf-8')
+
+    coord, _, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0, wall_now=[0.0], state_path=state_path
+    )
+
+    assert coord._last_fire_wall == 12345.5
+
+
+def test_rate_cap_missing_state_file_seeds_none(tmp_path: Path) -> None:
+    """A missing state file → _last_fire_wall is None (never raises)."""
+    state_path = tmp_path / 'data' / 'orchestrator' / 'last_redeploy_orchestrator.json'
+
+    coord, _, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0, wall_now=[0.0], state_path=state_path
+    )
+
+    assert coord._last_fire_wall is None
+
+
+def test_rate_cap_corrupt_state_file_seeds_none(tmp_path: Path) -> None:
+    """A corrupt / unparseable state file → _last_fire_wall is None (fail-open, no raise)."""
+    state_path = tmp_path / 'data' / 'orchestrator' / 'last_redeploy_orchestrator.json'
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text('}{ not json', encoding='utf-8')
+
+    coord, _, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0, wall_now=[0.0], state_path=state_path
+    )
+
+    assert coord._last_fire_wall is None
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_persists_timestamp_after_successful_fire(tmp_path: Path) -> None:
+    """(d-2) After a successful fire the correct epoch is persisted to state_path."""
+    state_path = tmp_path / 'data' / 'orchestrator' / 'last_redeploy_orchestrator.json'
+    wall_now = [55_555.0]
+    coord, executor, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0, wall_now=wall_now, state_path=state_path
+    )
+
+    await coord.note_merge('task-1', 'base', 'head')
+    result = await coord.maybe_restart(agents_idle=True)
+
+    assert result is True
+    executor.assert_awaited_once()
+    # State file was created (parent mkdir'd lazily) with the correct epoch.
+    assert state_path.exists()
+    persisted = json.loads(state_path.read_text(encoding='utf-8'))
+    assert persisted['ts'] == 55_555.0
+    assert 'iso' in persisted
+
+    # A fresh coordinator over the same file recovers the persisted timestamp —
+    # the restart-safe property the cap exists for.
+    coord2, _, _ = _make_rate_capped_coordinator(
+        min_interval_secs=28800.0, wall_now=[55_555.0], state_path=state_path
+    )
+    assert coord2._last_fire_wall == 55_555.0
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_evaluated_after_precondition_gate() -> None:
+    """The cap is only consulted for an otherwise-ready fire (gates ordering).
+
+    When restart_precondition is unsatisfied the fire is deferred by the
+    precondition, and the rate cap never even records a fire — so once the
+    precondition clears, the (never-fired) cap doesn't spuriously block.
+    """
+    wall_now = [10_000.0]
+    git_ops = MagicMock()
+    git_ops.get_merge_diff_files = AsyncMock(
+        return_value=(['orchestrator/src/orchestrator/harness.py'], None)
+    )
+    executor = AsyncMock()
+    precondition_ok = [False]
+    coord = StaleServiceRestartCoordinator(
+        git_ops=git_ops,
+        event_store=MagicMock(),
+        watch_prefixes=['orchestrator/src/'],
+        debounce_secs=0.0,
+        enabled=True,
+        restart_executor=executor,
+        clock=lambda: 0.0,
+        service_name='orchestrator',
+        min_interval_secs=28800.0,
+        wall_clock=lambda: wall_now[0],
+        restart_precondition=lambda: precondition_ok[0],
+    )
+
+    await coord.note_merge('task-1', 'base', 'head')
+
+    # Precondition blocks — no fire, cap untouched.
+    assert await coord.maybe_restart(agents_idle=True) is False
+    executor.assert_not_awaited()
+    assert coord._last_fire_wall is None
+
+    # Precondition clears → the never-fired cap does not block the first fire.
+    precondition_ok[0] = True
+    assert await coord.maybe_restart(agents_idle=True) is True
+    executor.assert_awaited_once()
+    assert coord._last_fire_wall == wall_now[0]
