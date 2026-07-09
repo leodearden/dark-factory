@@ -401,3 +401,73 @@ class TestPsiSaturationTransition:
             'in-flight heavy must never be left below the floor while heavy work '
             'and a free slot remain'
         )
+
+    # -----------------------------------------------------------------------
+    # Scenario 3 — work-conserving restore up to max_concurrent_tasks
+    #
+    # RED (step-5): recovers via ``_Driver.run_until_quiescent()`` and reads
+    # ``deferred_events_since()`` — neither exists yet.  AttributeError on
+    # run_until_quiescent is the RED failure; step-6 builds exactly the
+    # cap-enforcement + event-window-partition capabilities this test
+    # exercises.
+    # -----------------------------------------------------------------------
+
+    async def test_recovery_restores_full_dispatch_up_to_cap(self, tmp_path) -> None:
+        """Scenario 3: work-conserving restore up to max_concurrent_tasks,
+        with NO residual PSI hold after recovery.
+
+        6 heavies (cap=4) + 1 deterministic.  1 heavy dispatches while idle,
+        then PSI flips to saturated (in-flight=1 >= default floor=1) so the
+        remaining heavies are held while D1 still dispatches.  On recovery,
+        run_until_quiescent fills heavy in-flight up to the max_concurrent_
+        tasks cap (harness-modeled -- acquire_next itself does not enforce
+        it) -- the 2 leftover heavies wait on the CAP, not on PSI.  No
+        dispatch_deferred event may occur after the recovery flip.
+        """
+        event_store = EventStore(db_path=tmp_path / 'psi.db', run_id='da4-s3')
+        clock = _FakeClock()
+        config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=4)
+
+        heavy_tasks = [
+            _heavy_task(f'H{i}', priority='high', files=[f'src/h{i}.py'])
+            for i in range(1, 7)
+        ]
+        heavy_ids = {t['id'] for t in heavy_tasks}
+        tasks = [*heavy_tasks, _det_task('D1', files=['src/d1.py'])]
+
+        feed = _PsiFeed()  # starts idle
+        driver = _Driver.build(
+            config, tasks, event_store=event_store, time_source=clock, psi_feed=feed,
+        )
+
+        # 1 heavy already in flight before saturation begins.
+        await driver.tick()
+        assert driver.heavy_in_flight() == 1
+
+        # --- Saturated phase: new heavy dispatch held, in-flight stays 1 ---
+        feed.set_saturated(cpu_some10=90.0)
+        await driver.run_ticks(3)
+
+        assert driver.heavy_in_flight() == 1, 'saturation must hold all further heavy dispatch'
+        deferred_during_saturation = driver.deferred_events()
+        assert len(deferred_during_saturation) >= 1, (
+            'saturation must defer at least one heavy dispatch'
+        )
+        high_water_id = deferred_during_saturation[-1]['id']
+
+        # --- Recovery: fill up to the max_concurrent_tasks cap, no more ---
+        feed.set_idle()
+        await driver.run_until_quiescent(max_in_flight=config.max_concurrent_tasks)
+
+        assert driver.heavy_in_flight() == 4, (
+            'recovery must be work-conserving up to the lane cap'
+        )
+        still_waiting = heavy_ids - driver.dispatched_ids()
+        assert len(still_waiting) == 2, (
+            f'the 2 leftover heavies must wait on the CAP, not on PSI: {still_waiting!r}'
+        )
+
+        # --- No residual hold: zero dispatch_deferred events after recovery ---
+        assert driver.deferred_events_since(high_water_id) == [], (
+            'no dispatch_deferred event may occur after the recovery flip'
+        )
