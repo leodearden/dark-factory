@@ -5064,6 +5064,65 @@ class GitOps:
         )
         return rc == 0
 
+    async def branch_content_in_main(self, branch: str) -> bool:
+        """Return True iff every file *branch* touched is byte-identical on main.
+
+        Companion check to :meth:`is_ancestor` for landings that are NOT
+        ancestors of main — squashed, rebased, or manually-applied commits
+        whose content nonetheless matches what *branch* set out to change.
+        Computes ``changed = git diff --name-only <merge-base> <branch>``
+        (the branch's own changed files vs its base) and returns whether
+        ``git diff --quiet <main> <branch> -- <changed...>`` reports no
+        difference — i.e. main already carries identical content for every
+        one of those paths.
+
+        Returns False (never raises) when:
+        - the merge-base cannot be resolved (git error);
+        - *branch* has zero commits beyond its base (``changed`` is empty —
+          the degenerate/no-work guard; an empty pathspec diff would
+          trivially report "no difference" and false-positive); or
+        - any changed file differs between main and *branch*.
+
+        Fail-safe by construction: only an rc==0 ``git diff --quiet`` counts
+        as "content already landed" — any other git error also falls through
+        to False, so this primitive never claims a landing on doubt.
+
+        **Accepted risk — coincidental match on incomplete work**: this
+        primitive only compares the files *branch* has touched so far
+        against its own merge-base, not the task's full intended scope.  A
+        branch that is genuinely mid-task (e.g. it has only gotten around to
+        one of several files it will eventually touch) can still return True
+        here if that one file happens to already match main's independent
+        content — main receiving the same change for unrelated reasons, or
+        the branch itself having reverted the file back to match main.  This
+        is a deliberate tradeoff so this primitive can catch real
+        squash/rebase/manually-applied landings that are NOT ancestors of
+        main; callers that need stronger evidence before treating a landing
+        as authoritative should additionally require a task-citing commit on
+        main (see ``Harness._already_landed_dispatch_gate``, which anchors on
+        such a citation when one is present).
+        """
+        rc, merge_base, _ = await _run(
+            ['git', 'merge-base', self.config.main_branch, branch],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not merge_base:
+            return False
+        rc, changed_out, _ = await _run(
+            ['git', 'diff', '--name-only', merge_base, branch],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return False
+        changed = [f for f in changed_out.strip().splitlines() if f.strip()]
+        if not changed:
+            return False
+        rc, _, _ = await _run(
+            ['git', 'diff', '--quiet', self.config.main_branch, branch, '--', *changed],
+            cwd=self.project_root,
+        )
+        return rc == 0
+
     async def worktree_head_beyond_main(self, worktree: Path) -> str | None:
         """Return the HEAD SHA when *worktree* carries commits beyond main, else None.
 

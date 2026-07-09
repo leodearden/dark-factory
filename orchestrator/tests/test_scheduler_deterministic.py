@@ -7,6 +7,7 @@ Step-3: RED — _get_modules no-lock invariant (I4/B12) + eligibility unchanged 
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -155,3 +156,28 @@ class TestDepsSatisfiedDeterministicTask:
         status_map = {'10': 'done'}
         result = real_scheduler._deps_satisfied(task, status_map)
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Already-landed gate (task 2313) must SKIP deterministic candidates — they
+# carry no task branch / declared diff for the ancestry/content check.
+# (RED until a later step adds the is_deterministic short-circuit in
+# _consult_already_landed)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestConsultAlreadyLandedSkipsDeterministic:
+    """Deterministic candidates must never reach the already-landed gate hook."""
+
+    async def test_deterministic_candidate_not_consulted_or_gated(self, real_scheduler):
+        real_scheduler._already_landed_gate = AsyncMock(return_value=True)
+        det_task = _det_task('42')
+        normal_task = _normal_task('43')
+
+        gated = await real_scheduler._consult_already_landed([det_task, normal_task])
+
+        assert '42' not in gated, 'deterministic tasks have no branch/diff to gate on'
+        awaited_ids = {call.args[0] for call in real_scheduler._already_landed_gate.await_args_list}
+        assert '42' not in awaited_ids, 'the hook must never be awaited for a deterministic task'
+        assert '43' in awaited_ids, 'the normal task must still be consulted'
+        assert '43' in gated
