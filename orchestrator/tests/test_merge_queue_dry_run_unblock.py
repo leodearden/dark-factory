@@ -23,18 +23,30 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from test_merge_queue_main_health import (
     COMPILE_ERROR_RESULT,
+    INFRA_TIMEOUT_RESULT,
     _make_config,
     _make_git_ops,
     _make_req,
 )
 
 from orchestrator.merge_queue import (
+    TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
     _DryRunInvestigationHandles,
     _run_post_merge_verify,
 )
 from orchestrator.unblock_types import BlockClass
+from orchestrator.verify import VerifyResult
+
+PERSISTENT_ENOSPC_RESULT = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='no space left on device',
+    category='',
+)
 
 
 def _make_handles(
@@ -176,4 +188,126 @@ class TestGenericMergeVerifyRedSpawnsDryRun:
 
         assert outcome is not None
         assert outcome.status == 'blocked'
+        run_dry_run_mock.assert_not_awaited()
+
+
+class TestTimeoutAndTransientInfraDoNotSpawn:
+    """Step-3 (RED for the timeout case): a pure verify timeout is not a
+    mechanically-fixable diff, so the generic task-fault site must NOT spawn
+    an investigation for it.  Transient-infra outcomes (disk-guard-skip,
+    persistent ENOSPC) already never reach the generic site by construction
+    (separate early-return branches) — pinned here so a future refactor that
+    moved the spawn call earlier would be caught.
+    """
+
+    def test_pure_timeout_generic_red_does_not_spawn(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        handles = _make_handles()
+        run_dry_run_mock = AsyncMock(return_value=None)
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=INFRA_TIMEOUT_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.run_dry_run_unblock',
+                    new=run_dry_run_mock,
+                ),
+            ):
+                outcome = await _drive_verify_with_handles(
+                    req, merge_wt, git_ops, dry_run_handles=handles,
+                )
+                await asyncio.sleep(0)
+                if handles.background_tasks:
+                    await asyncio.gather(
+                        *handles.background_tasks, return_exceptions=True,
+                    )
+                return outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        run_dry_run_mock.assert_not_awaited()
+
+    def test_disk_guard_skip_does_not_spawn(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        handles = _make_handles()
+        run_dry_run_mock = AsyncMock(return_value=None)
+        disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: pre-verify disk guard found only 0.10 GiB free'
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue._ensure_verify_disk_space',
+                    new=AsyncMock(return_value=disk_reason),
+                ),
+                patch(
+                    'orchestrator.merge_queue.run_dry_run_unblock',
+                    new=run_dry_run_mock,
+                ),
+            ):
+                outcome = await _drive_verify_with_handles(
+                    req, merge_wt, git_ops, dry_run_handles=handles,
+                )
+                await asyncio.sleep(0)
+                return outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        assert outcome.verify_skipped is True
+        run_dry_run_mock.assert_not_awaited()
+
+    def test_persistent_enospc_does_not_spawn(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        handles = _make_handles()
+        run_dry_run_mock = AsyncMock(return_value=None)
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=PERSISTENT_ENOSPC_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.run_dry_run_unblock',
+                    new=run_dry_run_mock,
+                ),
+            ):
+                outcome = await _drive_verify_with_handles(
+                    req, merge_wt, git_ops, dry_run_handles=handles,
+                )
+                await asyncio.sleep(0)
+                return outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
+            f'Expected reason to start with TRANSIENT_INFRA_REASON_PREFIX; '
+            f'got {outcome.reason!r}'
+        )
         run_dry_run_mock.assert_not_awaited()
