@@ -57,7 +57,9 @@ from fused_memory.reconciliation.summary_pool import (
     pretrim_summary_pool,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
+    build_task_count_snapshot_content,
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
@@ -1156,6 +1158,13 @@ _STAGE2_SUMMARY_STAGE_REPAIR_SOURCE = 'stage2_summary_stage_repair'
 # automating the manual reconstruction performed for run 6467daca.
 _STAGE2_SUMMARY_RECONSTRUCTION_SOURCE = 'stage2_summary_reconstruction'
 
+# Audit tag for _write_task_count_snapshot's deterministic write (task 2325)
+# — makes the Mem0 task_count_snapshot write structural (a plain Python
+# add_memory call at the end of run()) instead of depending on the Stage-2
+# LLM remembering the memory-stored Snapshot Discipline norm. Mirrors
+# _STAGE2_SUMMARY_STAGE_REPAIR_SOURCE's internal-service idiom above.
+_TASK_COUNT_SNAPSHOT_WRITE_SOURCE = 'stage2_task_count_snapshot_write'
+
 # Age-based GC for orphaned stage1_flag_marker records (task 1944).
 # flag_dedup._write_and_confirm_marker rewrites a stage1_flag_marker with a
 # fresh created_at on every dedup HIT (a finding that keeps recurring); a
@@ -2004,6 +2013,94 @@ async def _verify_task_count_snapshot_written(
         )
         return None
     return False
+
+
+async def _write_task_count_snapshot(
+    memory_service,
+    taskmaster,
+    project_root: str,
+    project_id: str,
+    run_id: str,
+    run_window_start: datetime | None,
+) -> bool | None:
+    """Deterministically write this cycle's task_count_snapshot Mem0 record.
+
+    Makes the Mem0 ``task_count_snapshot`` write structural (task 2325): a
+    plain Python ``add_memory`` call performed unconditionally at the end of
+    ``run()`` for non-blocked projects, rather than depending on the Stage-2
+    LLM remembering the memory-stored "Snapshot Discipline" norm.
+
+    Counts are derived by self-fetching via ``taskmaster.get_tasks`` and
+    filtering with :func:`filter_task_tree` — mirroring
+    ``assemble_payload``'s own self-fetch fallback idiom — rather than
+    reusing any tree stashed by ``assemble_payload``, which can be
+    short-circuited or skipped and would then be stale.
+
+    Uses the internal ``memory_service.add_memory`` idiom (like
+    :func:`_repair_stage2_summary_stage_metadata`), NOT the MCP layer, so the
+    ``ReconSnapshotWriteRejected`` temporal_facts guard never applies here.
+
+    Best-effort: never raises. Returns ``True`` (wrote) or ``None``
+    (skipped — no taskmaster — or failed); NEVER ``False``, so a failed
+    best-effort write stays "inconclusive" for the caller rather than being
+    recorded as a confirmed miss (which would spuriously grow the
+    consecutive-miss streak that drives the stale-snapshot escalation).
+
+    Args:
+        memory_service: Service with ``add_memory``.
+        taskmaster: Service with ``get_tasks``, or ``None``.
+        project_root: Project root for the ``get_tasks`` call.
+        project_id: Project scope for the write.
+        run_id: Current reconciliation run identifier — both the write's
+            ``metadata.run_id`` and its ``causation_id``.
+        run_window_start: Start of the current run window, or ``None`` when
+            unknown — used only to derive the content's ``as_of`` date.
+
+    Returns:
+        ``True`` on a successful write; ``None`` when *taskmaster* is
+        ``None`` or any step of the fetch/filter/write fails.
+    """
+    if taskmaster is None:
+        return None
+    try:
+        tasks_data = await taskmaster.get_tasks(project_root=project_root)
+        tree = filter_task_tree(tasks_data)
+        as_of = (
+            run_window_start.date().isoformat()
+            if isinstance(run_window_start, datetime)
+            else None
+        )
+        content = build_task_count_snapshot_content(
+            project_id,
+            total=tree.total_count,
+            done=tree.done_count,
+            cancelled=tree.cancelled_count,
+            active=len(tree.active_tasks),
+            other=tree.other_count,
+            highest_task_id=tree.max_task_id,
+            as_of=as_of,
+        )
+        await memory_service.add_memory(
+            content=content,
+            category=TASK_COUNT_SNAPSHOT_CATEGORY,
+            project_id=project_id,
+            metadata={
+                'kind': TASK_COUNT_SNAPSHOT_KIND,
+                'stage': 'task_knowledge_sync',
+                'run_id': run_id,
+            },
+            causation_id=run_id,
+            _source=_TASK_COUNT_SNAPSHOT_WRITE_SOURCE,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._write_task_count_snapshot: '
+            'deterministic write failed for project_id=%s run_id=%s',
+            project_id, run_id,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return None
+    return True
 
 
 async def _repair_stage2_summary_stage_metadata(
