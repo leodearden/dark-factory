@@ -136,9 +136,12 @@ def _canonicalize_group_args(func):
     - if a ``group_id`` argument is bound and is a ``str``, replaces it with
       ``canonicalize_project_id(group_id)``;
     - if a ``group_ids`` argument is bound and is not ``None``, replaces it
-      with ``[canonicalize_project_id(g) for g in group_ids]`` (each element
-      canonicalized independently; ``None`` — meaning global/no-scope —
-      passes through untouched).
+      with a list where each ``str`` element is independently canonicalized
+      via ``canonicalize_project_id`` and any non-``str`` element passes
+      through untouched — mirroring the ``group_id`` scalar guard so a
+      malformed element (e.g. an accidental ``None``) doesn't crash inside
+      ``canonicalize_project_id`` itself. ``group_ids=None`` — meaning
+      global/no-scope — passes through untouched.
 
     Method BODIES are never touched by this decorator — it only normalizes
     the two argument names above, before delegating to *func* unchanged.
@@ -155,7 +158,9 @@ def _canonicalize_group_args(func):
         if 'group_ids' in bound.arguments:
             value = bound.arguments['group_ids']
             if value is not None:
-                bound.arguments['group_ids'] = [canonicalize_project_id(g) for g in value]
+                bound.arguments['group_ids'] = [
+                    canonicalize_project_id(g) if isinstance(g, str) else g for g in value
+                ]
 
     if inspect.iscoroutinefunction(func):
 
