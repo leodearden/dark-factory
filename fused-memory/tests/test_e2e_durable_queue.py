@@ -629,7 +629,14 @@ class TestQueueStats:
         # snapshot is meaningful under any host load. The conservation
         # assertion below holds at any sampling point regardless of timing —
         # every row is in exactly one status bucket — so this only needs to
-        # wait long enough to exercise a real mid-flight state.
+        # wait long enough to exercise a real mid-flight state. Note: the
+        # hard guarantee this test makes is conservation (total == 10); a
+        # genuinely mid-flight (non-terminal) snapshot is the overwhelmingly
+        # common case since each item's simulated 0.2s latency makes
+        # early completion of all 10 items unlikely, but it is not
+        # separately asserted here — doing so would risk reintroducing a
+        # load-sensitive flake (failing on an unusually fast/idle run)
+        # instead of the load-sensitive flake this task removes.
         async def _processing_started():
             s = await svc.durable_queue.get_stats()
             return s if s['counts'].get('pending', 0) < 10 else None
