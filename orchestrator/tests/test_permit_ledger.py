@@ -162,6 +162,142 @@ class TestPermitLedgerRelease:
 
 
 # ---------------------------------------------------------------------------
+# step-1 RED / step-2 GREEN (task 2161, merge-queue-reliability PRD scope-3
+# theta -- distinct from the older MQ-refactor theta/task 1993
+# SpeculationController): CapPermit + PermitLedger's token_factory param
+# ---------------------------------------------------------------------------
+
+
+class TestCapPermit:
+    """CapPermit is a distinct token type, byte-for-byte mirroring SpecPermit's
+    identity semantics (task 2161 step-1).
+
+    RED until step-2 GREEN adds CapPermit to merge_types.py.
+    """
+
+    def test_cap_permit_released_defaults_false(self) -> None:
+        from orchestrator.merge_types import CapPermit
+
+        p = CapPermit()
+
+        assert p.released is False
+
+    def test_two_cap_permits_compare_unequal(self) -> None:
+        """eq=False -> identity, not field-value, comparison (mirrors
+        SpecPermit): a PermitLedger's ``live`` set must treat every acquired
+        CapPermit as a distinct member."""
+        from orchestrator.merge_types import CapPermit
+
+        p1 = CapPermit()
+        p2 = CapPermit()
+
+        assert p1 != p2
+        assert p1 == p1
+
+
+@pytest.mark.asyncio
+class TestPermitLedgerTokenFactory:
+    """PermitLedger generalized over its token type via a ``token_factory``
+    constructor param (task 2161 step-1), so a second ledger instance can own
+    ``_merge_ahead_cap`` and issue :class:`CapPermit` tokens through the
+    identical acquire/release/conservation machinery
+    ``_speculation_ledger`` uses for :class:`SpecPermit`.
+
+    RED until step-2 GREEN adds the ``token_factory`` parameter to
+    ``PermitLedger.__init__``.
+    """
+
+    @pytest.mark.parametrize('depth', [1, 2, 3])
+    async def test_acquire_returns_a_fresh_unreleased_cap_permit_registered_live(
+        self, depth: int,
+    ) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_types import CapPermit
+
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth, token_factory=CapPermit)
+
+        p = await ledger.acquire()
+
+        assert isinstance(p, CapPermit)
+        assert p.released is False
+        assert p in ledger.live
+
+    @pytest.mark.parametrize('depth', [1, 2, 3])
+    async def test_n_acquire_release_cycles_conserve_the_identity(
+        self, depth: int,
+    ) -> None:
+        """Mirrors TestPermitLedgerAcquire/TestPermitLedgerRelease's identity
+        assertions, but for a CapPermit-backed ledger -- proves the
+        generalization didn't special-case SpecPermit anywhere in the
+        acquire/release/conservation path."""
+        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_types import CapPermit
+
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth, token_factory=CapPermit)
+
+        def _assert_identity() -> None:
+            assert ledger.slot_available + len(ledger.live) == ledger.depth
+
+        _assert_identity()
+        permits = []
+        for n in range(1, depth + 1):
+            permit = await ledger.acquire()
+            assert isinstance(permit, CapPermit)
+            assert permit.released is False
+            assert permit in ledger.live
+            assert len(ledger.live) == n
+            assert ledger.slot_available == depth - n
+            _assert_identity()
+            permits.append(permit)
+
+        for permit in permits:
+            ledger.release(permit)
+            _assert_identity()
+
+        assert ledger.slot_available == depth
+        assert ledger.live == frozenset()
+
+    async def test_release_is_idempotent_for_cap_permits_too(self) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_types import CapPermit
+
+        ledger = PermitLedger(asyncio.Semaphore(1), 1, token_factory=CapPermit)
+        p = await ledger.acquire()
+
+        ledger.release(p)
+        ledger.release(p)  # second release -- must not raise or over-release
+
+        assert p.released is True
+        assert p not in ledger.live
+        assert ledger.slot_available == 1
+        assert ledger.slot_available + len(ledger.live) == ledger.depth
+
+    async def test_release_of_a_never_acquired_cap_permit_raises(self) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_types import CapPermit
+
+        ledger = PermitLedger(asyncio.Semaphore(1), 1, token_factory=CapPermit)
+        stranger = CapPermit()
+
+        with pytest.raises(AssertionError):
+            ledger.release(stranger)
+
+    async def test_default_token_factory_still_issues_spec_permits(self) -> None:
+        """The existing ``PermitLedger(slot, depth)`` call (no token_factory)
+        must keep issuing SpecPermit unchanged -- the default factory is
+        additive, not a behaviour change for the existing
+        ``_speculation_ledger`` construction."""
+        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_types import SpecPermit
+
+        ledger = PermitLedger(asyncio.Semaphore(1), 1)
+
+        p = await ledger.acquire()
+
+        assert isinstance(p, SpecPermit)
+
+
+# ---------------------------------------------------------------------------
 # step-7 RED / step-8 GREEN: permit storage slot on RealMergeItem / DecidedItem
 # / InflightEntry
 # ---------------------------------------------------------------------------
