@@ -923,10 +923,10 @@ def _spawn_merge_verify_dry_run(
     under this task's name (mirrors ``workflow._spawn_dry_run_unblock``'s
     enablement and in-flight-dedup guards).
 
-    *event_store* is accepted but intentionally NOT yet forwarded to
-    ``run_dry_run_unblock`` — wired in a later step.
+    *event_store* is forwarded to ``run_dry_run_unblock`` so the
+    investigation emits the same ``invocation_end``/``'blocked'`` telemetry
+    event the agent-block path emits (observability parity).
     """
-    _ = event_store
     if handles is None or handles.scheduler is None:
         return
     ua = getattr(req.config, 'unblock_auto', None)
@@ -958,6 +958,7 @@ def _spawn_merge_verify_dry_run(
                 scheduler=handles.scheduler,
                 mcp=handles.mcp,
                 config=req.config,
+                event_store=event_store,
                 usage_gate=handles.usage_gate,
                 cost_store=handles.cost_store,
                 block_class=BlockClass.MERGE_VERIFY_RED,
