@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -916,3 +918,92 @@ class TestMergeVerifyRedProducesGateableProposal:
         )
         assert invocation_end_calls[-1].kwargs.get('phase') == 'blocked'
         assert invocation_end_calls[-1].kwargs.get('role') == 'unblock_auto'
+
+
+class TestInvestigationWorktreeSurvivesCleanup:
+    """Step-17 (RED): regression for the blocking review finding
+    (robustness_worktree_lifecycle).
+
+    The reviewer's mandated 'at minimum' test: with a REAL
+    ``cleanup_merge_worktree`` (not the test suite's usual no-op AsyncMock,
+    which is exactly what hid this bug), *merge_wt* is actually removed
+    before the fire-and-forget investigation task runs. The investigation
+    must be pointed at the task's OWN retained worktree (``req.worktree`` —
+    which is never touched by ``_run_post_merge_verify`` and survives while
+    the task stays blocked), not the ephemeral merge worktree that has
+    already been deleted by the time the spawned task reads it.
+    """
+
+    def test_investigation_uses_retained_task_worktree_surviving_real_cleanup(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        task_wt = tmp_path / 'task-wt'
+        task_wt.mkdir()
+        req = _make_req('99', task_wt, config)
+
+        # Faithfully simulate the real ephemeral `git worktree remove
+        # --force` at merge_queue.py:1156 — the no-op mock installed by
+        # _make_git_ops is exactly what hid this bug (merge_wt silently
+        # "survived" for the whole test even though production removes it).
+        async def _real_cleanup(wt: Path) -> None:
+            shutil.rmtree(wt)
+
+        git_ops.cleanup_merge_worktree = AsyncMock(side_effect=_real_cleanup)
+
+        handles = _make_handles()
+        captured: dict[str, object] = {}
+
+        def _record_investigation(**kwargs: object) -> None:
+            wt = kwargs.get('worktree')
+            captured['worktree'] = wt
+            captured['isdir'] = isinstance(wt, str) and os.path.isdir(wt)
+
+        run_dry_run_mock = AsyncMock(side_effect=_record_investigation)
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+                patch(
+                    'orchestrator.merge_queue.run_dry_run_unblock',
+                    new=run_dry_run_mock,
+                ),
+            ):
+                outcome = await _drive_verify_with_handles(
+                    req, merge_wt, git_ops, dry_run_handles=handles,
+                )
+                # Let the fire-and-forget create_task run to completion
+                # inside this SAME loop before asyncio.run() tears it down.
+                await asyncio.sleep(0)
+                if handles.background_tasks:
+                    await asyncio.gather(
+                        *handles.background_tasks, return_exceptions=True,
+                    )
+                return outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        assert not merge_wt.exists(), (
+            'Expected the real cleanup_merge_worktree to have removed merge_wt'
+        )
+        run_dry_run_mock.assert_awaited_once()
+        assert captured.get('worktree') == str(task_wt), (
+            f"Expected worktree={str(task_wt)!r} (the task's own retained "
+            f"worktree, req.worktree); got {captured.get('worktree')!r}"
+        )
+        assert captured.get('isdir') is True, (
+            'Expected the path handed to the investigation to still exist '
+            'on disk when the investigation read it'
+        )
