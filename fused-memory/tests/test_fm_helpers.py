@@ -545,3 +545,128 @@ class TestQdrantHelpers:
 
         monkeypatch.setattr(_fm_helpers, '_qdrant_available', lambda: True)
         assert _fm_helpers.qdrant_skipif().args[0] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared poll_until() helper (task 2377)
+# ---------------------------------------------------------------------------
+# Converts fixed "sleep(N) then assert background work is done" sites (fragile
+# under host CPU oversubscription) into a bounded poll on the same
+# post-condition. These tests pin the contract using ONLY predicate-call-count
+# assertions and raise assertions — never wall-clock-elapsed assertions — so
+# this suite stays load-independent and does not reintroduce the very
+# fragility class poll_until exists to remove.
+
+class TestPollUntil:
+    """Unit tests for the shared poll_until(predicate, *, timeout, interval, message) helper."""
+
+    @pytest.mark.asyncio
+    async def test_already_true_sync_predicate_returns_after_one_call(self):
+        """An already-true sync predicate returns immediately after exactly 1 call (check-before-sleep)."""
+        from _fm_helpers import poll_until
+
+        calls = 0
+
+        def predicate():
+            nonlocal calls
+            calls += 1
+            return True
+
+        result = await poll_until(predicate, timeout=5.0)
+
+        assert result is True
+        assert calls == 1, f'expected exactly 1 call, got {calls}'
+
+    @pytest.mark.asyncio
+    async def test_sync_predicate_flips_true_on_nth_call(self):
+        """A sync predicate that flips true on the Nth call returns after exactly N calls.
+
+        Proves check-before-sleep and that polling stops as soon as the
+        post-condition holds, rather than over-polling or racing ahead.
+        """
+        from _fm_helpers import poll_until
+
+        calls = 0
+        n = 4
+
+        def predicate():
+            nonlocal calls
+            calls += 1
+            return calls >= n
+
+        result = await poll_until(predicate, timeout=5.0, interval=0.001)
+
+        assert result is True
+        assert calls == n, f'expected exactly {n} calls, got {calls}'
+
+    @pytest.mark.asyncio
+    async def test_async_predicate_is_awaited_and_flips_true_on_nth_call(self):
+        """An async/coroutine predicate is awaited and behaves identically to the sync case.
+
+        If poll_until failed to await the coroutine, the (always-truthy)
+        coroutine object itself would satisfy the truthiness check on the
+        first call and `calls` would remain 0 — so this also proves the
+        coroutine body actually ran.
+        """
+        from _fm_helpers import poll_until
+
+        calls = 0
+        n = 3
+
+        async def predicate():
+            nonlocal calls
+            calls += 1
+            return calls >= n
+
+        result = await poll_until(predicate, timeout=5.0, interval=0.001)
+
+        assert result is True
+        assert calls == n, f'expected exactly {n} calls, got {calls}'
+
+    @pytest.mark.asyncio
+    async def test_return_value_is_truthy_predicate_result_verbatim(self):
+        """poll_until returns the predicate's truthy result verbatim, not coerced to True.
+
+        Lets callers chain on the returned value (e.g. a stats dict) instead
+        of re-fetching state after the poll succeeds.
+        """
+        from _fm_helpers import poll_until
+
+        payload = {'done': True, 'value': 42}
+
+        def predicate():
+            return payload
+
+        result = await poll_until(predicate, timeout=5.0)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_never_true_predicate_raises_assertion_error_at_deadline(self):
+        """A never-true predicate raises AssertionError once the deadline passes.
+
+        Uses a tiny timeout and asserts only the raise (never elapsed time) —
+        a slow host makes this test slower, never falsely passing or failing.
+        """
+        from _fm_helpers import poll_until
+
+        with pytest.raises(AssertionError):
+            await poll_until(lambda: False, timeout=0.05, interval=0.01)
+
+    @pytest.mark.asyncio
+    async def test_caller_message_appears_in_raised_assertion_error(self):
+        """A caller-supplied `message` appears verbatim in the raised AssertionError."""
+        from _fm_helpers import poll_until
+
+        with pytest.raises(AssertionError, match='custom diagnostic xyz'):
+            await poll_until(
+                lambda: False, timeout=0.05, interval=0.01, message='custom diagnostic xyz',
+            )
+
+    @pytest.mark.asyncio
+    async def test_default_message_names_the_timeout(self):
+        """When message=None, the default AssertionError message names the timeout value."""
+        from _fm_helpers import poll_until
+
+        with pytest.raises(AssertionError, match='0.05'):
+            await poll_until(lambda: False, timeout=0.05, interval=0.01)
