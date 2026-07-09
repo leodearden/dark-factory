@@ -859,6 +859,25 @@ class CuratorConfig(BaseModel):
         ),
     )
 
+    # Operational-ask registry: path (absolute, or relative to server cwd) of a
+    # YAML registry of recurring operational live-data/live-mutation asks —
+    # deliverables that are already-built+unit-tested scripts whose remaining
+    # work is dry-run -> human-review -> apply against live external stores,
+    # modifying ZERO repo files. The TDD architect cannot author a RED->GREEN
+    # plan for that shape of work, so matching candidates are routed BEFORE any
+    # LLM call to a deterministic PURE-GATE instead of reaching the architect.
+    # None disables the gate. See
+    # fused-memory/config/operational_ask_registry.yaml for the schema.
+    operational_ask_registry_path: str | None = Field(
+        default=None,
+        description=(
+            "Path (absolute or relative to server cwd) of a YAML registry of "
+            "recurring operational live-data/live-mutation asks; matching "
+            "candidates are routed BEFORE any LLM call to a deterministic "
+            "PURE-GATE instead of the TDD architect. None disables the gate."
+        ),
+    )
+
 
 class PathScopeAdjudicatorConfig(BaseModel):
     """LLM adjudicator config for Stage-2 path-scope guard filtering.
