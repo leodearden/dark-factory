@@ -485,7 +485,9 @@ async def _migrate_v3_to_v4(
             HAVING COUNT(*) > 1
             """,
         )
-        residual_rows = await dup_cursor.fetchall()
+        # aiosqlite types fetchall() as Iterable[Row] (not Sized); materialize
+        # to a list so len() below type-checks (it's already a list at runtime).
+        residual_rows = list(await dup_cursor.fetchall())
 
         if residual_rows:
             groups_desc = '; '.join(
