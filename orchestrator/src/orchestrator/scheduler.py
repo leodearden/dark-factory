@@ -1162,6 +1162,11 @@ class Scheduler:
         self._overrides_initialized: bool = False
         # --- Park-eviction store (task 1871) ---
         self._park_eviction_store: ParkEvictionRequestStore | None = park_eviction_store
+        # --- Startup gate (task 2235, W10-α) ---
+        # False until finish_startup() is called.  acquire_next() asserts
+        # this — a runtime check for the "startup reconcile sweeps run
+        # before the first dispatch tick" invariant (previously comment-only).
+        self._started: bool = False
         # --- Park-and-stop pause state (task 1322) ---
         self._paused: bool = False
         self._pause_reason: str | None = None
@@ -3844,6 +3849,11 @@ class Scheduler:
         No MCP round-trips, no GC, no override snapshots are performed while
         paused — all resume cleanly on the first unpaused tick.
         """
+        assert self._started, (
+            'acquire_next() called before finish_startup() — startup '
+            'reconcile sweeps must run before the first dispatch tick '
+            '(task 2235)'
+        )
         if self._paused:
             logger.debug(
                 'acquire_next() short-circuit: scheduler is paused (reason=%r)',
@@ -5167,6 +5177,27 @@ class Scheduler:
             or self.lock_table.is_held(tid)
             or self.workflow_cancel_recent(tid)
         )
+
+    # --- Startup gate (task 2235, W10-α) ---
+
+    @property
+    def started(self) -> bool:
+        """True once ``finish_startup()`` has been called.
+
+        ``acquire_next()`` asserts this before doing any work — a runtime
+        check for the "startup reconcile sweeps run before the first
+        dispatch tick" invariant.
+        """
+        return self._started
+
+    def finish_startup(self) -> None:
+        """Mark startup complete, allowing ``acquire_next()`` to run.
+
+        Callers (the Harness main-loop bootstrap, and Scheduler-only test
+        factories that drive ``acquire_next()`` directly) must call this
+        once their startup reconcile sweeps have finished.  Idempotent.
+        """
+        self._started = True
 
     # --- Retry cap (per-task REQUEUED counter) ---
 
