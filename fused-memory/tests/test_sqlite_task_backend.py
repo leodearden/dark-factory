@@ -27,6 +27,7 @@ from fused_memory.backends.task_backend_errors import (
     done_provenance_via_update_task_error,
     status_via_update_task_error,
 )
+from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
 
@@ -920,6 +921,83 @@ async def test_update_task_candidate_key_unchanged_when_neither_title_nor_metada
     after = await backend.get_task('1', project_root=project_root)
     assert after['candidate_key'] == before['candidate_key']
     assert after['candidate_key'] == compute_candidate_key('Fix parser', ['a.py'])
+
+
+# ── stamp_audit_metadata: privileged, non-protocol audit-field seam ─
+
+
+@pytest.mark.asyncio
+async def test_stamp_audit_metadata_persists_and_preserves_sibling_keys(backend, project_root):
+    """Direct call (NOT via set_task_status — the interceptor rewire is task C2)
+    persists done_provenance and leaves untouched sibling metadata keys intact —
+    the read-modify-write 'preserve omitted keys' contract."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'memory_hints': {'entities': ['A'], 'queries': ['q1']},
+            'files': ['src/a.py'],
+            'external_deps': ['dark_factory:42'],
+        }),
+    )
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == {'kind': 'merged', 'commit': 'abc123'}
+    assert task['metadata']['memory_hints'] == {'entities': ['A'], 'queries': ['q1']}
+    assert task['metadata']['files'] == ['src/a.py']
+    assert task['metadata']['external_deps'] == ['dark_factory:42']
+
+
+@pytest.mark.asyncio
+async def test_stamp_audit_metadata_second_stamp_merges_without_dropping_earlier(backend, project_root):
+    """A second stamp (e.g. reopen_* fields) merges in without erasing the
+    done_provenance a prior stamp wrote."""
+    await backend.add_task(project_root=project_root, title='x')
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+    )
+    await backend.stamp_audit_metadata(
+        '1', project_root,
+        {
+            'reopen_reason': 'regression found',
+            'reopen_from': 'done',
+            'reopen_at': '2026-07-09T00:00:00+00:00',
+        },
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == {'kind': 'merged', 'commit': 'abc123'}
+    assert task['metadata']['reopen_reason'] == 'regression found'
+    assert task['metadata']['reopen_from'] == 'done'
+    assert task['metadata']['reopen_at'] == '2026-07-09T00:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_stamp_audit_metadata_missing_task_id_raises(backend, project_root):
+    """A missing task_id raises the same 'No tasks found for ID(s): …' shape
+    used by update_task/set_task_claimant."""
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.stamp_audit_metadata(
+            '999', project_root,
+            {'done_provenance': {'kind': 'merged', 'commit': 'abc123'}},
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'No tasks found for ID(s): 999' in exc.value.message
+
+
+def test_stamp_audit_metadata_is_privileged_non_protocol_seam():
+    """API-surface contract: stamp_audit_metadata is a privileged seam on
+    SqliteTaskBackend that must NOT be declared on TaskBackendProtocol — only
+    TaskInterceptor may hold a reference to it (PRD C-C)."""
+    assert hasattr(SqliteTaskBackend, 'stamp_audit_metadata'), (
+        'SqliteTaskBackend.stamp_audit_metadata must exist.'
+    )
+    assert not hasattr(TaskBackendProtocol, 'stamp_audit_metadata'), (
+        'stamp_audit_metadata must NOT be part of TaskBackendProtocol — '
+        'it is a privileged seam reachable only from TaskInterceptor.'
+    )
 
 
 # ── _merge_metadata: new additive-merge semantics ─────────────────
