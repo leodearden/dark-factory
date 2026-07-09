@@ -717,3 +717,80 @@ class TestRunInflightVerifyPassesHandles:
             'into _run_post_merge_verify — the worker holds the bundled handles '
             'but never threaded them through'
         )
+
+
+class TestHarnessWiresDryRunHandlesIntoWorker:
+    """Step-13 (RED): _start_merge_worker forwards harness.scheduler/mcp/
+    usage_gate/cost_store into SpeculativeMergeWorker.
+
+    Mirrors test_harness_train_callbacks.py's TestHarnessWiring, which pins
+    the same _start_merge_worker construction-site-threading shape for
+    train_callback_factory.
+    """
+
+    def test_harness_wires_dry_run_handles_into_worker(self, tmp_path: Path) -> None:
+        import asyncio as _asyncio
+
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.event_store import EventStore
+        from orchestrator.harness import Harness
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        harness = Harness(config)
+        harness.event_store = EventStore(tmp_path / 'events.db', 'run-wiring-0001')
+
+        sentinel_scheduler = MagicMock()
+        sentinel_mcp = MagicMock()
+        sentinel_usage_gate = MagicMock()
+        sentinel_cost_store = MagicMock()
+        harness.scheduler = sentinel_scheduler
+        harness.mcp = sentinel_mcp
+        harness.usage_gate = sentinel_usage_gate
+        harness.cost_store = sentinel_cost_store
+
+        harness.git_ops = MagicMock()
+        harness.git_ops.project_root = None
+
+        captured: dict[str, object] = {}
+
+        class CapturingWorker:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+            async def run(self) -> None:
+                await _asyncio.sleep(0)
+
+            async def stop(self) -> None:
+                pass
+
+        async def _run() -> None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.SpeculativeMergeWorker',
+                    CapturingWorker,
+                ),
+                patch('orchestrator.merge_queue.enforce_merge_liveness_margin'),
+                patch('orchestrator.merge_queue.enforce_persistent_worktree_serial_lane'),
+                patch.object(
+                    harness,
+                    '_build_service_restart_coordinator',
+                    return_value=MagicMock(note_merge=AsyncMock()),
+                ),
+            ):
+                await harness._start_merge_worker()
+            await harness._stop_merge_worker()
+
+        asyncio.run(_run())
+
+        assert captured.get('scheduler') is sentinel_scheduler, (
+            f'Expected scheduler=harness.scheduler; got captured={captured!r}'
+        )
+        assert captured.get('mcp') is sentinel_mcp, (
+            f'Expected mcp=harness.mcp; got captured={captured!r}'
+        )
+        assert captured.get('usage_gate') is sentinel_usage_gate, (
+            f'Expected usage_gate=harness.usage_gate; got captured={captured!r}'
+        )
+        assert captured.get('cost_store') is sentinel_cost_store, (
+            f'Expected cost_store=harness.cost_store; got captured={captured!r}'
+        )
