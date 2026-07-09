@@ -11190,3 +11190,82 @@ class TestConsultAlreadyLanded:
         assert any(record.levelname == 'WARNING' for record in caplog.records), (
             'a raising gate hook should be logged, not silently swallowed'
         )
+
+
+# ---------------------------------------------------------------------------
+# acquire_next() honors the already-landed gate (task 2313).
+#
+# Mirrors test_scheduler_landed_dispatch_gate.py's structure exactly: gate
+# True withholds dispatch, gate False dispatches normally, a gated PINNED
+# candidate is skipped by the pin loop too (single gated_ids source honored
+# by both dispatch paths), and a raising gate fails open in-tick without
+# aborting the rest of the tick's consult.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAcquireNextAlreadyLandedGate:
+    """acquire_next() consults _already_landed_gate before either dispatch loop commits."""
+
+    async def test_gate_true_withholds_dispatch(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = _pending_task('Z')
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler._already_landed_gate = AsyncMock(return_value=True)
+
+        result = await scheduler.acquire_next()
+
+        assert result is None, 'a gated task must not be dispatched this tick'
+        assert 'Z' not in scheduler._dispatched
+        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+
+    async def test_gate_false_dispatches_normally(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = _pending_task('Z')
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler._already_landed_gate = AsyncMock(return_value=False)
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'Z'
+        assert 'Z' in scheduler._dispatched
+        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+
+    async def test_gated_pinned_candidate_is_not_dispatched(self, tmp_path):
+        """Pin-loop parity: a gated PINNED candidate must also be skipped."""
+        from orchestrator.overrides import OverrideStore
+
+        config = OrchestratorConfig(max_per_module=1)
+        store = OverrideStore(tmp_path / 'o.db')
+        store.set_override('/proj', 'Z', pinned=True)
+
+        scheduler = Scheduler(config, override_store=store)
+        scheduler._project_root = '/proj'
+        scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id: task_id == 'Z')
+
+        task_z = _pending_task('Z', files=['z/src'])
+        task_y = _pending_task('Y', files=['y/src'])
+        scheduler.get_tasks = AsyncMock(return_value=[task_z, task_y])
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None
+        assert result.task_id == 'Y', 'Y (not gated) should dispatch; Z (gated+pinned) must not'
+        assert 'Z' not in scheduler._dispatched
+        assert 'Y' in scheduler._dispatched
+        awaited_ids = {call.args[0] for call in scheduler._already_landed_gate.await_args_list}
+        assert awaited_ids == {'Z', 'Y'}, 'the gate must be consulted for every candidate'
+
+    async def test_gate_raises_fails_open_in_tick_and_dispatches(self, caplog):
+        caplog.set_level('WARNING')
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = _pending_task('Z')
+        scheduler.get_tasks = AsyncMock(return_value=[task])
+        scheduler._already_landed_gate = AsyncMock(side_effect=RuntimeError('git hiccup'))
+
+        result = await scheduler.acquire_next()
+
+        assert result is not None, 'a raising consult must fail open, not withhold dispatch'
+        assert result.task_id == 'Z'
+        assert 'Z' in scheduler._dispatched
