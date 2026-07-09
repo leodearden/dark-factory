@@ -952,6 +952,7 @@ def create_mcp_server(
         return result.model_dump()
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def add_system_record(
         content: str,
         project_id: str,
@@ -1020,24 +1021,18 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
-        try:
-            causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
-            result = await memory_service.add_system_record(
-                content=content,
-                project_id=project_id,
-                agent_id=agent_id,
-                category=category,
-                session_id=session_id,
-                metadata=cleaned_meta,
-                causation_id=causation_id,
-                _source=source,
-            )
-            return result.model_dump()
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'add_system_record error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
+        result = await memory_service.add_system_record(
+            content=content,
+            project_id=project_id,
+            agent_id=agent_id,
+            category=category,
+            session_id=session_id,
+            metadata=cleaned_meta,
+            causation_id=causation_id,
+            _source=source,
+        )
+        return result.model_dump()
 
     # ------------------------------------------------------------------
     # Read tools
