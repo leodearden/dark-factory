@@ -10,7 +10,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from _orch_helpers import pydantic_spec
 from escalation import archive
@@ -200,22 +199,6 @@ def _assert_cap_fire_pops_counters(steward, esc_id, mock_invoke):  # type: ignor
     return submitted
 
 
-def _make_slot(*, token='token-a', account_name='acct-a', cap_hit=False):
-    """Build a MagicMock shaped like shared.usage_gate.InvokeSlot.
-
-    Production calls slot.detect_cap_hit / slot.confirm / slot.token /
-    slot.account_name — all are mockable here.  Each slot represents ONE
-    iteration of the cap-retry loop in steward._invoke_with_session.
-    """
-    slot = MagicMock()
-    slot.token = token
-    slot.account_name = account_name
-    slot.detect_cap_hit = MagicMock(return_value=cap_hit)
-    slot.confirm = MagicMock()
-    slot.settle = MagicMock()
-    return slot
-
-
 def _make_pre_triage_gate(token: str = 'tok-a', cap_effects=None) -> MagicMock:
     """Build a pre-triage-flavoured mock gate wired with a real InvokeSlot.
 
@@ -295,33 +278,299 @@ class TestStewardSessionPersistence:
 
 
 # ---------------------------------------------------------------------------
+# Live-continuation resume must deliver the real prompt (task W4-eta step-4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardResumeDeliversContinuationPrompt:
+    """A live-continuation resume must deliver `_handle_escalation`'s actual
+    continuation prompt to the agent, not `invoke_with_cap_retry`'s
+    crash-recovery placeholder (CRASH_RECOVERY_RESUME_PROMPT = 'continue').
+
+    Mirrors TestStewardSessionPersistence::test_second_invocation_uses_resume
+    but additionally asserts the delivered prompt CONTENT — the gap that let
+    the regression slip through review (that test only asserts
+    resume_session_id, never the prompt). Exercises the real
+    invoke_with_cap_retry via the no-gate fast path (steward.usage_gate
+    defaults to None).
+
+    FAILS RED: invoke_with_cap_retry unconditionally overwrites the prompt to
+    CRASH_RECOVERY_RESUME_PROMPT whenever the caller pre-sets
+    resume_session_id, so the steward's real continuation prompt (carrying
+    the new escalation's content) never reaches the agent on resume.
+    """
+
+    async def test_resumed_invocation_delivers_continuation_prompt(
+        self, steward, mock_briefing,
+    ):
+        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT
+
+        steward._session_id = 'sess-first'
+        mock_briefing.build_steward_continuation_prompt.return_value = (
+            'New escalation details.'
+        )
+        esc = _make_escalation(id='esc-42-2')
+        steward.escalation_queue.get.return_value = _make_escalation(
+            id='esc-42-2', status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = _make_result(session_id='sess-second')
+            await steward._handle_escalation(esc)
+
+        assert mock_invoke.call_args.kwargs['resume_session_id'] == 'sess-first'
+        assert mock_invoke.call_args.kwargs['prompt'] == 'New escalation details.'
+        assert mock_invoke.call_args.kwargs['prompt'] != CRASH_RECOVERY_RESUME_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Wiring contract: _invoke_with_session routes through invoke_with_cap_retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardInvokeWithCapRetryWiring:
+    """_invoke_with_session must delegate the main session to the shared
+    ``invoke_with_cap_retry`` loop (task W4-eta), passing the ``rebuild_prompt``
+    and ``max_cap_retries`` hooks and doing ONLY session-id bookkeeping itself.
+
+    These tests patch ``invoke_with_cap_retry`` directly so the wiring contract
+    is asserted independent of the retry loop's own behavior (that behavior —
+    the B7 wedge guard inherited from the real loop — is covered separately by
+    ``TestStewardWedgeGuardInheritance``).
+
+    FAILS RED against the current fork: today's ``_invoke_with_session`` calls
+    ``orchestrator.steward.invoke_agent`` directly in a hand-rolled loop and
+    never calls ``invoke_with_cap_retry`` from the main-session path (that
+    helper is only used by ``_pre_triage_suggestions``).
+    """
+
+    async def test_forwards_kwargs_no_prior_session(
+        self, steward, worktree, mock_mcp, mock_config,
+    ):
+        """No prior session: resume_session_id must be absent from the call."""
+        from orchestrator.agents.invoke import invoke_agent
+        from orchestrator.agents.roles import STEWARD
+        from orchestrator.steward import _MAX_CAP_RETRIES
+
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        mock_iwcr.assert_awaited_once()
+        kwargs = mock_iwcr.call_args.kwargs
+        assert kwargs['invoke_fn'] is invoke_agent
+        assert kwargs['max_cap_retries'] == _MAX_CAP_RETRIES
+        assert kwargs['backend'] == 'claude'
+        assert kwargs['config_dir'] == steward._config_dir
+        assert callable(kwargs['rebuild_prompt'])
+        assert asyncio.iscoroutinefunction(kwargs['rebuild_prompt'])
+        assert kwargs['prompt'] == 'handle this escalation'
+        assert kwargs['system_prompt'] == STEWARD.system_prompt
+        assert kwargs['cwd'] == worktree
+        assert kwargs['model'] == mock_config.models.steward
+        assert kwargs['max_turns'] == mock_config.max_turns.steward
+        assert kwargs['max_budget_usd'] == pytest.approx(3.0)
+        assert kwargs['timeout_seconds'] == mock_config.timeouts.steward
+        assert kwargs['allowed_tools'] == (STEWARD.allowed_tools or None)
+        assert kwargs['mcp_config'] == mcp_config
+        assert kwargs['effort'] == mock_config.effort.steward
+        assert 'resume_session_id' not in kwargs
+
+    async def test_forwards_resume_session_id_when_prior_session_exists(
+        self, steward, worktree, mock_mcp,
+    ):
+        """A prior session_id is forwarded as resume_session_id."""
+        steward._session_id = 'sess-prev'
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-y')
+            await steward._invoke_with_session(
+                prompt='continue this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        assert mock_iwcr.call_args.kwargs['resume_session_id'] == 'sess-prev'
+
+    async def test_session_id_updated_from_result(self, steward, worktree, mock_mcp):
+        """self._session_id is updated to the result's session_id after the call."""
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        assert steward._session_id == 'sess-x'
+
+    async def test_rebuild_prompt_hook_regathers_pending_and_rebuilds_initial(
+        self, steward, worktree, mock_mcp, mock_briefing,
+    ):
+        """The rebuild_prompt closure re-queries pending escalations and calls
+        build_steward_initial_prompt with the freshly-gathered list."""
+        esc = _make_escalation()
+        mcp_config = mock_mcp.mcp_config_json()
+        fresh_pending = [_make_escalation(id='esc-42-9')]
+        steward.escalation_queue.get_by_task.return_value = fresh_pending
+
+        with patch(
+            'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
+        ) as mock_iwcr:
+            mock_iwcr.return_value = _make_result(session_id='sess-x')
+            await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config=mcp_config,
+                per_invocation_budget=3.0,
+                escalation=esc,
+            )
+
+        rebuild_prompt = mock_iwcr.call_args.kwargs['rebuild_prompt']
+        result = await rebuild_prompt(True)
+
+        steward.escalation_queue.get_by_task.assert_called_with(
+            steward.task_id, status='pending',
+        )
+        mock_briefing.build_steward_initial_prompt.assert_called_once_with(
+            task=steward.task,
+            escalation=esc.to_dict(),
+            pending_escalations=[e.to_dict() for e in fresh_pending],
+            worktree=steward.worktree,
+        )
+        assert result == 'Full steward briefing.'
+
+
+# ---------------------------------------------------------------------------
+# B7 wedge-guard inheritance (exercises the REAL invoke_with_cap_retry)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStewardWedgeGuardInheritance:
+    """_invoke_with_session must inherit the shared loop's zero-output wedge
+    guard (shared/cli_invoke.py:936-947) now that it routes through the real
+    ``invoke_with_cap_retry`` instead of a hand-rolled loop.
+
+    Uses the real-InvokeSlot harness (``_make_pre_triage_gate`` /
+    ``_attach_invoke_slot``) so the actual ``classify_invocation`` /
+    ``detect_cap_hit`` machinery runs, rather than patching
+    ``invoke_with_cap_retry`` itself.
+
+    FAILS RED against the current fork: the hand-rolled loop only branches on
+    ``slot.detect_cap_hit`` (False for a wedge — a full-timeout, zero-turn,
+    zero-cost result carries no cap-hit stderr pattern), so it returns the
+    wedge result after a single invocation instead of clearing the wedged
+    ``resume_session_id`` and retrying fresh.
+    """
+
+    async def test_wedged_resume_retries_fresh_instead_of_one_shot_return(
+        self, steward, worktree, mock_briefing,
+    ):
+        steward._session_id = 'sess-wedged'
+        steward.usage_gate = _make_pre_triage_gate()
+        mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
+
+        wedge_result = _make_result(
+            success=False, cost=0, turns=0, duration_ms=1_800_000,
+            session_id='sess-wedged', timed_out=True, subtype='error_empty_output',
+        )
+        success_result = _make_result(session_id='sess-fresh')
+
+        with (
+            patch(
+                'orchestrator.steward.invoke_agent', new_callable=AsyncMock,
+                side_effect=[wedge_result, success_result],
+            ) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            result = await steward._invoke_with_session(
+                prompt='handle this escalation',
+                cwd=worktree,
+                mcp_config={},
+                per_invocation_budget=5.0,
+                escalation=_make_escalation(),
+            )
+
+        assert mock_invoke.call_count == 2
+        second_call = mock_invoke.call_args_list[1]
+        assert 'resume_session_id' not in second_call.kwargs
+        # The fresh retry must rebuild full context via the steward's
+        # rebuild_prompt closure — NOT reuse the stale continuation prompt
+        # ('handle this escalation') that is only valid inside the wedged
+        # session (reviewer_comprehensive: robustness_context_loss).
+        assert second_call.kwargs.get('prompt') == 'REBUILT-INITIAL'
+        assert result is success_result
+
+
+# ---------------------------------------------------------------------------
 # Cap-Hit Backoff
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestStewardCapHitBackoff:
+    """Cap-hit backoff, now exercised through the real invoke_with_cap_retry loop.
+
+    Migrated (task W4-eta) from the fork-era fake `_make_slot`/`make_gate_yielding`
+    + `patch('orchestrator.steward.asyncio.sleep', ...)` to the real-InvokeSlot
+    `_make_pre_triage_gate`/`_attach_invoke_slot` pattern (proven by
+    `TestPreTriageUsageGateCleanup`) + a global `asyncio.sleep` patch: the
+    cap-retry loop (and its cooldown sleep) now lives in `shared.cli_invoke`,
+    so patching `orchestrator.steward.asyncio.sleep` no longer intercepts it
+    (that patch target would let the real cooldown sleep execute instead).
+    """
 
     async def test_sleeps_before_retry_on_cap_hit(self, steward, mock_briefing):
-        """Steward sleeps _CAP_HIT_COOLDOWN_SECS before retrying on cap hit."""
-        from orchestrator.steward import _CAP_HIT_COOLDOWN_SECS
+        """Steward sleeps before retrying on cap hit (shared loop's cooldown)."""
+        from shared.cli_invoke import _CAP_HIT_COOLDOWN_SECS
 
         esc = _make_escalation()
         steward.escalation_queue.get.return_value = _make_escalation(
             status='resolved', resolution='fixed',
         )
 
-        slots = [_make_slot(cap_hit=True), _make_slot(cap_hit=False)]
-        steward.usage_gate = _make_gate_yielding(slots)
+        steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
-            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
         ):
             mock_invoke.return_value = _make_result(session_id='sess-new')
             await steward._handle_escalation(esc)
 
-            mock_sleep.assert_called_once_with(_CAP_HIT_COOLDOWN_SECS)
+            # Value-level check on the single cap hit's cooldown (first cycle,
+            # no backoff yet): pins the actual duration reaching asyncio.sleep,
+            # not just that a sleep happened. The cooldown's growth/cap
+            # behavior across repeated cycles is covered by
+            # shared/tests/test_cap_retry.py, which owns the backoff formula.
+            mock_sleep.assert_awaited_once_with(_CAP_HIT_COOLDOWN_SECS)
             assert mock_invoke.call_count == 2
             assert steward._session_id == 'sess-new'
 
@@ -334,15 +583,11 @@ class TestStewardCapHitBackoff:
             status='resolved', resolution='fixed',
         )
 
-        slots = [
-            _make_slot(token='token-a', cap_hit=True),
-            _make_slot(token='token-b', cap_hit=False),
-        ]
-        steward.usage_gate = _make_gate_yielding(slots)
+        steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
-            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+            patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             mock_invoke.return_value = _make_result(session_id='sess-capped')
             await steward._handle_escalation(esc)
@@ -360,15 +605,11 @@ class TestStewardCapHitBackoff:
             status='resolved', resolution='fixed',
         )
 
-        slots = [
-            _make_slot(token='token-a', cap_hit=True),
-            _make_slot(token='token-b', cap_hit=False),
-        ]
-        steward.usage_gate = _make_gate_yielding(slots)
+        steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
-            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+            patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             # First call: cap hit with no session_id
             mock_invoke.side_effect = [
@@ -378,7 +619,7 @@ class TestStewardCapHitBackoff:
             await steward._handle_escalation(esc)
 
             # Called twice: once in _handle_escalation (initial prompt, _session_id=None)
-            # and once in _invoke_with_session (cap hit rebuild, no session to resume)
+            # and once in the rebuild_prompt hook (cap hit rebuild, no session to resume)
             assert mock_briefing.build_steward_initial_prompt.call_count == 2
             # Second invoke call should NOT have resume_session_id
             second_call = mock_invoke.call_args_list[1]
@@ -391,11 +632,11 @@ class TestStewardCapHitBackoff:
             status='resolved', resolution='fixed',
         )
 
-        steward.usage_gate = _make_gate_yielding([_make_slot(cap_hit=False)])
+        steward.usage_gate = _make_pre_triage_gate(cap_effects=[False])
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
-            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
         ):
             mock_invoke.return_value = _make_result()
             await steward._handle_escalation(esc)
@@ -410,12 +651,20 @@ class TestStewardCapHitBackoff:
 
 @pytest.mark.asyncio
 class TestStewardAccountName:
+    """Account-name stamping, exercised through the real invoke_with_cap_retry loop.
+
+    Migrated (task W4-eta) to the real-InvokeSlot pattern: account_name now
+    comes from the AccountLease invoke_with_cap_retry captured for the
+    invocation (shared/cli_invoke.py), not from a fake slot attribute.
+    """
 
     async def test_account_name_set_on_result(self, steward, worktree, mock_mcp):
-        """_invoke_with_session stamps account_name from slot.account_name on the result."""
-        steward.usage_gate = _make_gate_yielding(
-            [_make_slot(account_name='max-d', cap_hit=False)],
-        )
+        """_invoke_with_session stamps account_name from the leased account."""
+        steward.usage_gate = _attach_invoke_slot(_make_gate(
+            before_invoke=AsyncMock(return_value='tok-a'),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='max-d',
+        ))
 
         esc = _make_escalation()
         mcp_config = mock_mcp.mcp_config_json()
@@ -437,23 +686,25 @@ class TestStewardAccountName:
     ):
         """After cap hit + session reset, account_name reflects the retry account.
 
-        Production code (_invoke_with_session) stamps result.account_name from
-        slot.account_name on the success path (not from gate.active_account_name).
-        Each async-with iteration yields a fresh slot, so per-iteration account
-        names come from per-slot configuration.
+        invoke_with_cap_retry (shared/cli_invoke.py) stamps result.account_name
+        from the account leased on the LAST loop iteration. Each iteration
+        re-derives its lease from `before_invoke()`, so returning a distinct
+        AccountLease per call simulates failover to a different account.
         """
-        slots = [
-            _make_slot(account_name='max-d', cap_hit=True),
-            _make_slot(account_name='max-c', cap_hit=False),
-        ]
-        steward.usage_gate = _make_gate_yielding(slots)
+        steward.usage_gate = _attach_invoke_slot(_make_gate(
+            before_invoke=AsyncMock(side_effect=[
+                AccountLease(name='max-d', token='token-a', generation=0),
+                AccountLease(name='max-c', token='token-b', generation=0),
+            ]),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+        ))
 
         esc = _make_escalation()
         mcp_config = mock_mcp.mcp_config_json()
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
-            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+            patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             mock_invoke.return_value = _make_result(session_id='sess-new')
             result = await steward._invoke_with_session(
@@ -656,15 +907,20 @@ class TestStewardTimeoutPassthrough:
     async def test_timeout_seconds_forwarded_across_cap_hit_retry(
         self, steward, mock_config,
     ):
-        """Both the initial and cap-hit-recovery invocations must carry timeout_seconds."""
+        """Both the initial and cap-hit-recovery invocations must carry timeout_seconds.
+
+        Migrated (task W4-eta) to the real-InvokeSlot pattern: the cap-retry
+        loop (and its cooldown sleep) now lives in shared.cli_invoke, so the
+        gate must exercise the real `slot.detect_cap_hit` path and the sleep
+        patch must target the global `asyncio.sleep`.
+        """
         mock_config.timeouts.steward = 900.0
 
-        slots = [_make_slot(cap_hit=True), _make_slot(cap_hit=False)]
-        steward.usage_gate = _make_gate_yielding(slots)
+        steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
-            patch('orchestrator.steward.asyncio.sleep', new_callable=AsyncMock),
+            patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             mock_invoke.return_value = _make_result(session_id='sess-t')
             await steward._invoke_with_session(

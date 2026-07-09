@@ -46,7 +46,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_CAP_HIT_COOLDOWN_SECS = 5.0
 # Hard cap on consecutive cap-hit retries in _invoke_with_session.  Legitimate
 # retries are bounded by the failover-account count plus a few same-account
 # resumes; anything past this indicates a misconfigured gate or a loop bug
@@ -505,106 +504,85 @@ class TaskSteward:
     ):
         """Invoke the steward agent, resuming the session if one exists.
 
-        On usage-cap hit: resets the session and rebuilds the full initial
-        prompt (context is lost across account switches).
+        Delegates the account-failover cap-retry loop (usage-gate slot
+        management, cap-hit detection, the zero-output wedge guard, 401/403
+        auth routing) to the shared ``invoke_with_cap_retry``.  This method
+        does only session-id bookkeeping: it forwards ``self._session_id``
+        as ``resume_session_id`` when a prior session exists, and captures
+        the result's ``session_id`` for the next call.
+
+        The steward is always a LIVE continuation, never a crash-recovery
+        resume: ``prompt`` (built by ``_handle_escalation``) carries the new
+        escalation's content, which the resumed session has not seen yet.
+        This passes ``resume_delivers_prompt=True`` so the shared loop
+        delivers that real prompt to the agent on resume, instead of its
+        crash-recovery placeholder ('continue').
+
+        On an unresumable cap hit (no session_id survives the capped call),
+        the shared loop calls back into ``rebuild_prompt`` below to rebuild
+        the full initial prompt with freshly-gathered pending escalations —
+        context is lost across account switches.
         """
-        from shared.cli_invoke import AgentResult
-
-        if not self.usage_gate:
-            kwargs: dict = dict(
-                prompt=prompt,
-                system_prompt=STEWARD.system_prompt,
-                cwd=cwd,
-                model=self.config.models.steward,
-                max_turns=self.config.max_turns.steward,
-                max_budget_usd=per_invocation_budget,
-                timeout_seconds=self.config.timeouts.steward,
-                allowed_tools=STEWARD.allowed_tools or None,
-                mcp_config=mcp_config,
-                effort=self.config.effort.steward,
-                backend=self.config.backends.steward,
-                config_dir=self._config_dir.path if self._config_dir else None,
-            )
-            if self._session_id is not None:
-                kwargs['resume_session_id'] = self._session_id
-            result: AgentResult = await invoke_agent(**kwargs)
-            if result.session_id:
-                self._session_id = result.session_id
-            result.account_name = ''
-            return result
-
-        for _ in range(_MAX_CAP_RETRIES):
-            async with self.usage_gate.invoke_slot() as slot:
-                if self._config_dir and slot.token:
-                    self._config_dir.write_credentials(slot.token)
-
-                kwargs = dict(
-                    prompt=prompt,
-                    system_prompt=STEWARD.system_prompt,
-                    cwd=cwd,
-                    model=self.config.models.steward,
-                    max_turns=self.config.max_turns.steward,
-                    max_budget_usd=per_invocation_budget,
-                    timeout_seconds=self.config.timeouts.steward,
-                    allowed_tools=STEWARD.allowed_tools or None,
-                    mcp_config=mcp_config,
-                    effort=self.config.effort.steward,
-                    backend=self.config.backends.steward,
-                    oauth_token=slot.token,
-                    config_dir=self._config_dir.path if self._config_dir else None,
+        async def rebuild_prompt(session_lost: bool) -> str:
+            pending_dicts = [
+                e.to_dict()
+                for e in self.escalation_queue.get_by_task(
+                    self.task_id, status='pending',
                 )
+            ]
+            return await self.briefing.build_steward_initial_prompt(
+                task=self.task,
+                escalation=escalation.to_dict(),
+                pending_escalations=pending_dicts,
+                worktree=self.worktree,
+            )
 
-                if self._session_id is not None:
-                    kwargs['resume_session_id'] = self._session_id
-
-                result = await invoke_agent(**kwargs)
-
-                # Cap-hit: sleep, then resume session on next account if possible
-                if slot.detect_cap_hit(result.stderr, result.output):
-                    await asyncio.sleep(_CAP_HIT_COOLDOWN_SECS)
-                    if result.session_id:
-                        self._session_id = result.session_id
-                        prompt = (
-                            'Your previous run was interrupted by a usage limit. '
-                            'Continue where you left off and complete your task.'
-                        )
-                        logger.warning(
-                            f'Steward for task {self.task_id}: cap hit, '
-                            f'resuming session {result.session_id} on next account',
-                        )
-                    else:
-                        self._session_id = None
-                        pending_dicts = [
-                            e.to_dict()
-                            for e in self.escalation_queue.get_by_task(
-                                self.task_id, status='pending',
-                            )
-                        ]
-                        prompt = await self.briefing.build_steward_initial_prompt(
-                            task=self.task,
-                            escalation=escalation.to_dict(),
-                            pending_escalations=pending_dicts,
-                            worktree=self.worktree,
-                        )
-                        logger.warning(
-                            f'Steward for task {self.task_id}: cap hit, '
-                            f'no session to resume — rebuilding prompt',
-                        )
-                    continue
-
-                slot.confirm(result.cost_usd)
-
-            # Capture session ID for subsequent --resume calls
-            if result.session_id:
-                self._session_id = result.session_id
-
-            result.account_name = slot.account_name
-            return result
-
-        raise RuntimeError(
-            f'Steward for task {self.task_id}: cap-retry loop exceeded '
-            f'{_MAX_CAP_RETRIES} attempts — usage_gate may be misconfigured',
+        kwargs: dict = dict(
+            prompt=prompt,
+            system_prompt=STEWARD.system_prompt,
+            cwd=cwd,
+            model=self.config.models.steward,
+            max_turns=self.config.max_turns.steward,
+            max_budget_usd=per_invocation_budget,
+            timeout_seconds=self.config.timeouts.steward,
+            allowed_tools=STEWARD.allowed_tools or None,
+            mcp_config=mcp_config,
+            effort=self.config.effort.steward,
         )
+        if self._session_id is not None:
+            kwargs['resume_session_id'] = self._session_id
+
+        # NOTE (reviewer_comprehensive, task W4-eta amendment): the `backend`
+        # kwarg below only feeds invoke_with_cap_retry's own
+        # classify_invocation / detect_cap_hit calls — it is never forwarded
+        # into `invoke_kwargs` before `invoke_fn` (invoke_agent) is called,
+        # so invoke_agent always runs with its own default (backend='claude')
+        # regardless of this value. This matches every other
+        # invoke_with_cap_retry caller (workflow._invoke,
+        # _pre_triage_suggestions below), and is a no-op today because the
+        # steward only ever runs backend='claude' in practice. If
+        # `config.backends.steward` is ever set to a non-claude backend, the
+        # steward would silently keep invoking Claude. The real fix
+        # (forwarding `backend` into `invoke_kwargs` inside
+        # shared/cli_invoke.py before it calls `invoke_fn`) touches a file
+        # outside this task's locked scope (steward.py / test_steward.py
+        # only) — left for a follow-up task rather than fixed here.
+        result = await invoke_with_cap_retry(
+            self.usage_gate,
+            f'Steward for task {self.task_id}',
+            invoke_fn=invoke_agent,
+            config_dir=self._config_dir,
+            backend=self.config.backends.steward,
+            max_cap_retries=_MAX_CAP_RETRIES,
+            rebuild_prompt=rebuild_prompt,
+            resume_delivers_prompt=True,
+            **kwargs,
+        )
+
+        if result.session_id:
+            self._session_id = result.session_id
+
+        return result
 
     # ------------------------------------------------------------------
     # Pre-triage for large suggestion sets

@@ -2924,3 +2924,208 @@ class TestCapRetryRebuildPrompt:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('prompt') == 'original'
         assert 'resume_session_id' not in second.kwargs
+
+
+# ===================================================================
+# TestCapRetryResumeDeliversPrompt  (task W4-eta step-4)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryResumeDeliversPrompt:
+    """resume_delivers_prompt: opt-out flag for a caller-initiated resume to
+    deliver its real prompt instead of the crash-recovery placeholder.
+
+    Default (False) preserves the existing workflow._invoke crash-recovery
+    contract: the prompt is overwritten to CRASH_RECOVERY_RESUME_PROMPT
+    whenever the caller pre-sets resume_session_id. When True (the steward's
+    live continuation — the resumed session must receive NEW content not yet
+    present in the session), the caller's real prompt is delivered unchanged.
+
+    FAILS RED: resume_delivers_prompt is not yet wired to the prompt-swap
+    guard, so the flagged call's prompt is still unconditionally overwritten.
+    """
+
+    async def test_resume_delivers_real_prompt_when_flag_set(self):
+        """resume_delivers_prompt=True: the real prompt reaches invoke_fn unmodified."""
+        gate = _mock_gate(
+            account_count=1,
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='real-continuation',
+                resume_session_id='sess-x',
+                resume_delivers_prompt=True,
+            )
+        first = mock_inv.call_args_list[0]
+        assert first.kwargs.get('prompt') == 'real-continuation'
+        assert first.kwargs.get('resume_session_id') == 'sess-x'
+
+    async def test_resume_still_overwrites_prompt_by_default(self):
+        """Default (resume_delivers_prompt omitted) keeps the crash-recovery swap.
+
+        Guards the workflow._invoke contract: a crash-recovered session
+        already holds full task context, so it must keep receiving 'continue'
+        rather than the caller's stale original prompt.
+        """
+        gate = _mock_gate(
+            account_count=1,
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='real-continuation',
+                resume_session_id='sess-x',
+            )
+        first = mock_inv.call_args_list[0]
+        assert first.kwargs.get('prompt') == CRASH_RECOVERY_RESUME_PROMPT
+        assert first.kwargs.get('resume_session_id') == 'sess-x'
+
+
+# ===================================================================
+# TestCapRetryResumeFailureRebuildsPrompt  (task W4-eta step-6)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryResumeFailureRebuildsPrompt:
+    """When a live-continuation resume (resume_delivers_prompt=True) fails
+    with a non-cap error, the fresh-fallback retry must rebuild context via
+    the caller's rebuild_prompt hook rather than reusing the stale
+    continuation original_prompt.
+
+    With resume_delivers_prompt=True, original_prompt IS the continuation
+    prompt (valid only inside the resumed session) — handing it back
+    unchanged to a brand-new session is context-less. This mirrors the two
+    existing fresh-fallback rebuild call sites (TestCapRetryRebuildPrompt)
+    for the third, non-cap-hit resume-failure site.
+
+    FAILS RED: the non-cap resume-failure branch (cli_invoke.py ~1087-1094)
+    calls _reset_for_fresh_retry(invoke_kwargs, original_prompt) and never
+    awaits _rebuild_fresh_prompt(), so the second call's prompt is still
+    'continuation'.
+    """
+
+    async def test_non_cap_resume_failure_rebuilds_prompt(self):
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(side_effect=[False, False]),
+            active_account_name='acct',
+        )
+        # cost_usd defaults to 0.5 in make_result, so this does NOT trip the
+        # zero-cost heuristic — it routes through the non-cap resume-failure
+        # branch.
+        resume_fail = make_result(success=False, output='resume broke')
+        ok = make_result()
+        rebuild = AsyncMock(return_value='REBUILT-FULL-PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[resume_fail, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='continuation',
+                resume_session_id='sess-1',
+                resume_delivers_prompt=True,
+                rebuild_prompt=rebuild,
+            )
+        rebuild.assert_awaited_once_with(True)
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
+        assert 'resume_session_id' not in second.kwargs
+
+
+# ===================================================================
+# TestCapRetryWedgeAndAuthRebuildPrompt  (task W4-eta step-8)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+class TestCapRetryWedgeAndAuthRebuildPrompt:
+    """The two remaining reset-to-fresh branches — zero-output-wedge
+    (cli_invoke.py ~961) and auth-failure (~923) — must ALSO rebuild context
+    via the caller's ``rebuild_prompt`` hook, mirroring the fix step-7 applied
+    to the non-cap resume-failure branch (``TestCapRetryResumeFailureRebuildsPrompt``).
+
+    With ``resume_delivers_prompt=True`` (the steward), ``original_prompt`` IS
+    the per-escalation continuation prompt — valid only inside the resumed
+    session. A live-continuation resume that wedges or auth-fails must not
+    hand that context-less prompt to the fresh retry.
+
+    FAILS RED: neither branch calls ``_rebuild_fresh_prompt()`` today — both
+    call ``_reset_for_fresh_retry(invoke_kwargs, original_prompt)`` and
+    ``continue`` directly, so the second call's prompt is still 'continuation'
+    and ``rebuild`` is never awaited.
+    """
+
+    async def test_wedge_branch_rebuilds_prompt(self):
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        wedge = AgentResult(
+            success=False, output='', cost_usd=0.0,
+            duration_ms=300_000, turns=0, session_id='sess-1',
+            timed_out=True,
+        )
+        ok = make_result()
+        rebuild = AsyncMock(return_value='REBUILT-FULL-PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[wedge, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='continuation',
+                resume_session_id='sess-1',
+                resume_delivers_prompt=True,
+                rebuild_prompt=rebuild,
+            )
+        rebuild.assert_awaited_once_with(True)
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
+        assert 'resume_session_id' not in second.kwargs
+
+    async def test_auth_failure_branch_rebuilds_prompt(self):
+        gate = _mock_gate(
+            account_count=1,
+            before_invoke=AsyncMock(side_effect=['tok', 'tok']),
+            detect_cap_hit=MagicMock(return_value=False),
+            active_account_name='acct',
+        )
+        auth_fail = make_result(
+            success=False, output='', api_error_status=401, cost_usd=0.0,
+        )
+        ok = make_result()
+        rebuild = AsyncMock(return_value='REBUILT-FULL-PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[auth_fail, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl',
+                prompt='continuation',
+                resume_session_id='sess-1',
+                resume_delivers_prompt=True,
+                rebuild_prompt=rebuild,
+            )
+        rebuild.assert_awaited_once_with(True)
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('prompt') == 'REBUILT-FULL-PROMPT'
+        assert 'resume_session_id' not in second.kwargs

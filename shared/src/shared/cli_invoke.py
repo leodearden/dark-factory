@@ -677,6 +677,7 @@ async def invoke_with_cap_retry(
     cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
     max_cap_retries: int | None = None,
     rebuild_prompt: Callable[[bool], Awaitable[str]] | None = None,
+    resume_delivers_prompt: bool = False,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     **invoke_kwargs,
@@ -717,6 +718,17 @@ async def invoke_with_cap_retry(
     ``None``, which preserves the existing fresh-retry behaviour (reuse the
     original prompt unchanged).
 
+    *resume_delivers_prompt*, when ``True``, delivers the caller's real
+    ``prompt`` on a caller-initiated resume (``resume_session_id`` pre-set
+    before the first invocation) instead of overwriting it with
+    ``CRASH_RECOVERY_RESUME_PROMPT``.  This is for a *live continuation*,
+    where the resumed session must receive NEW content it has not seen yet
+    (e.g. the steward's per-escalation continuation prompt).  Defaults to
+    ``False``, which preserves the crash-recovery contract used by
+    ``workflow._invoke``: a crash-recovered session already holds the full
+    task context, so the short ``'continue'`` placeholder is sufficient and
+    the real prompt is kept only as ``original_prompt`` for fresh-fallback.
+
     The ``session_lost`` argument is currently always ``True`` — every wired
     call site is an unresumable cap retry.  It is kept as an explicit
     parameter (rather than a no-arg callable) as a forward-compat placeholder
@@ -742,6 +754,8 @@ async def invoke_with_cap_retry(
     # so the first subprocess invocation uses the short continuation string.  The
     # existing non-cap-hit resume-failure branch (below) then correctly restores
     # `original_prompt` (the real task prompt) for any subsequent fresh invocation.
+    # `resume_delivers_prompt` opts a live-continuation caller (the steward) out of
+    # this swap: its resumed session must receive the real prompt, not 'continue'.
     if invoke_kwargs.get('resume_session_id'):
         if not original_prompt:
             raise TypeError(
@@ -750,7 +764,8 @@ async def invoke_with_cap_retry(
                 "for fresh-fallback recovery if the resume invocation fails; passing an "
                 "empty or missing prompt silently corrupts that fallback."
             )
-        invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
+        if not resume_delivers_prompt:
+            invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
     consecutive_cap_hits = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     retry_start = time.monotonic()
@@ -903,9 +918,14 @@ async def invoke_with_cap_retry(
                 # unconditionally; an unresolvable token means the account
                 # vanished/refreshed, so failing over is safe and
                 # self-terminating (no separate unattributed fall-through).
+                # Rebuild via the caller's hook (no-op when rebuild_prompt is
+                # None): a live-continuation caller's original_prompt
+                # (resume_delivers_prompt=True) is only valid inside the
+                # resumed session, not the brand-new one this failover starts.
                 if isinstance(outcome, AuthFailed):
                     slot.report(outcome)
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    await _rebuild_fresh_prompt()
                     logger.warning(
                         f'{label}: account {account_name} auth-failed '
                         f'(HTTP {result.api_error_status}) — failing over',
@@ -933,6 +953,10 @@ async def invoke_with_cap_retry(
                 # response whose cap-pattern IS detectable, so cap accounting resumes
                 # on the very next iteration.  At most one extra full-timeout
                 # (~configured_timeout_ms) is incurred before the cap is re-detected.
+                # Rebuild via the caller's hook (no-op when rebuild_prompt is
+                # None): a live-continuation caller's original_prompt
+                # (resume_delivers_prompt=True) is only valid inside the
+                # wedged session, not the brand-new one this retry starts.
                 if (
                     isinstance(outcome, ZeroOutputWedge)
                     and invoke_kwargs.get('resume_session_id')
@@ -944,6 +968,7 @@ async def invoke_with_cap_retry(
                         f'before retry',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
                 if slot.detect_cap_hit(result.stderr, result.output, backend=backend):
@@ -1069,13 +1094,18 @@ async def invoke_with_cap_retry(
                             await asyncio.sleep(cooldown)
                             continue
 
-                # Non-cap-hit failure while resuming → fall back to fresh invocation
+                # Non-cap-hit failure while resuming → fall back to fresh invocation.
+                # Rebuild via the caller's hook (no-op when rebuild_prompt is None):
+                # mirrors the two cap-hit fresh-fallback paths above, since a
+                # live-continuation caller's original_prompt (resume_delivers_prompt=True)
+                # is only valid inside the resumed session, not a brand-new one.
                 if not result.success and invoke_kwargs.get('resume_session_id'):
                     logger.warning(
                         f'{label}: resume failed (session_id={invoke_kwargs["resume_session_id"]}), '
                         f'retrying fresh',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
                 if not unattributed_cap:
