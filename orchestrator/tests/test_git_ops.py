@@ -483,6 +483,70 @@ class TestWorktreeLifecycle:
         assert (holding / 'live_work.py').exists()
         assert (holding / 'live_work.py').read_text() == 'value = 7\n'
 
+    # ── Companion: retain-dir reuse preserves WIP + .task/ state ───────────
+    # The harness-side no-lock reconcile guard
+    # (harness._revert_in_progress_if_no_live_claimant) takes a DIFFERENT
+    # defense than the γ reattach tests above: instead of letting the dir
+    # get reaped and re-attaching a bare branch, it RETAINS the
+    # still-registered worktree directory when the branch carries WIP
+    # commits.  The next dispatch's create_worktree call then resumes it via
+    # the ordinary registered-worktree REUSE path (`if worktree_path.
+    # exists()`), NOT the γ reattach guard (which only fires once the dir is
+    # already gone).  This test covers that handoff: a registered worktree
+    # carrying both a WIP commit and a gitignored .task/plan.json survives a
+    # second create_worktree call intact — proving the two-defense design
+    # (retain-dir vs reaped-dir cold reattach) both resume correctly. A cold
+    # γ reattach could NOT have restored the .task/plan.json (a fresh `git
+    # worktree add` only restores the git tree; .task/ is gitignored and
+    # never part of it), so retain-and-reuse is a strict improvement where
+    # it applies.
+
+    async def test_create_worktree_reuse_preserves_wip_and_task_state(
+        self, git_ops: GitOps,
+    ):
+        """A registered worktree retained (not reaped) by the harness no-lock
+        guard — carrying a WIP commit AND a gitignored .task/plan.json — is
+        RESUMED by create_worktree's reuse path with both intact."""
+        info = await git_ops.create_worktree('lo-retain')
+        full_branch = 'task/lo-retain'
+
+        # Simulate the WIP an agent left behind before the worktree's lock
+        # was reaped (but the dir itself retained by the harness guard).
+        (info.path / 'wip_work.py').write_text('value = 99\n')
+        await _run(['git', 'add', '-A'], cwd=info.path)
+        await _run(['git', 'commit', '-m', 'agent WIP commit'], cwd=info.path)
+
+        # Simulate the harness/agent's gitignored .task/ state (plan.json) —
+        # written after create_worktree's _ensure_task_gitignore already
+        # ran, so it is untracked and excluded from commit()'s :!.task
+        # pathspec, exactly like a real retained worktree.
+        task_dir = info.path / '.task'
+        task_dir.mkdir(exist_ok=True)
+        (task_dir / 'plan.json').write_text('{"task_id": "lo-retain"}\n')
+
+        # Re-dispatch: create_worktree is called again against the RETAINED
+        # (still-registered) directory — the reuse path, not the γ reattach.
+        info2 = await git_ops.create_worktree('lo-retain')
+
+        assert info2.path == info.path
+        assert (info2.path / 'wip_work.py').exists(), 'WIP commit must survive reuse'
+        assert (info2.path / 'wip_work.py').read_text() == 'value = 99\n'
+        assert (info2.path / '.task' / 'plan.json').exists(), (
+            '.task/plan.json must survive reuse — a cold γ reattach could not '
+            'have restored it since .task/ is gitignored and untracked'
+        )
+        assert (
+            (info2.path / '.task' / 'plan.json').read_text()
+            == '{"task_id": "lo-retain"}\n'
+        )
+
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..{full_branch}'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) > 0, 'branch must still carry commits beyond main'
+
     # ── Fix: worktree-wipe race — canonical-path match + liveness gate ────
     # esc-4146-268: reify's `.worktrees` became a symlink → a 17 TB mount on
     # 2026-05-28.  Worktrees whose admin entry was recorded under the symlink

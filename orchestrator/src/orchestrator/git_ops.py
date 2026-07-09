@@ -1837,6 +1837,20 @@ class GitOps:
         warm-lane-pool-only seeding/route-recording calls, which do not apply
         to the cold (unpooled) path.
 
+        Base-ref divergence: unlike :meth:`create_worktree`'s fresh-create
+        tail — which computes its merge-base off the freshened ``start_ref``
+        (may be ``origin/main`` when local main lags, preserving the
+        freshen-from-remote semantic; see
+        ``test_create_worktree_freshens_from_remote``) — the resume tail
+        here (:meth:`_reuse_warm_lane`) rebases onto ``self.config.
+        main_branch`` (LOCAL main only). A resumed cold worktree may
+        therefore start from a staler base than a worktree freshly created
+        in the same dispatch tick. This matches :meth:`acquire_warm_lane`'s
+        γ reattach tail exactly (same tradeoff, same delegate), so cold and
+        warm re-attach stay consistent with each other — it just means a
+        cold re-attach is not guaranteed to reflect a same-tick remote
+        fetch the way a fresh create would.
+
         Raises:
             RuntimeError: ``git worktree add`` failed (e.g. *full_branch* is
                 still checked out in another live worktree). The branch is

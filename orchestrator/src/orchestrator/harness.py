@@ -3737,12 +3737,22 @@ Output JSON matching the schema. Every task must appear in the output.
             # leftover branch still carries commits beyond main (e.g. the
             # stale-lock branch below already reaped the dir on a prior cycle
             # and retained the branch) is a re-attach-eligible shape, not
-            # disposable orphan residue.  Reaping it here would just recreate
-            # the exact leftover-branch state that create_worktree's cold-path
-            # γ reattach guard now resumes from — so RETAIN the dir instead and
-            # let the next dispatch resume it.  `worktree_path.exists()` is
-            # checked first so the branch-WIP probe (a subprocess call) never
-            # runs when there is no dir to preserve.
+            # disposable orphan residue.  Reaping it here would destroy the
+            # still-registered worktree dir — including the gitignored
+            # .task/plan.json that git cannot restore — right before the next
+            # dispatch could resume it.  So RETAIN the dir instead: the next
+            # dispatch resumes it via create_worktree's registered-worktree
+            # REUSE path (git_ops.py:1557, `if worktree_path.exists()`), NOT
+            # the cold-path γ reattach guard — that guard only fires once the
+            # dir is ALREADY gone, which is precisely the shape this
+            # retention exists to avoid creating.  Reuse is also a strict
+            # improvement over a cold reattach here: it preserves
+            # .task/plan.json, which a fresh `git worktree add` (the γ
+            # reattach's mechanism) could never restore since .task/ is
+            # gitignored and never part of the git tree.
+            # `worktree_path.exists()` is checked first so the branch-WIP
+            # probe (a subprocess call) never runs when there is no dir to
+            # preserve.
             _no_lock_branch = f'{self.git_ops.config.branch_prefix}{tid}'
             _branch_has_wip = worktree_path.exists() and await self.git_ops._orphan_has_commits(
                 _no_lock_branch
