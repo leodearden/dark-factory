@@ -75,14 +75,16 @@ def _try_once(slots_dir: Path, n: int) -> int | None:
     Returns the open, locked fd of the first free slot found, or ``None`` if
     all ``n`` slots are currently held. Try-order is shuffled (herd-avoidance
     under concurrent waiters; a no-op at ``n == 1``) — this only affects
-    *which* free slot is taken, never whether one is found.
+    *which* free slot is taken, never whether one is found. A slot whose
+    non-inheritance marking or lock attempt raises ``OSError`` is closed and
+    skipped, same as a busy slot — no fd is ever leaked out of this loop.
     """
     order = list(range(1, n + 1))
     random.shuffle(order)
     for i in order:
         fd = os.open(slots_dir / f'slot-{i}', os.O_RDWR | os.O_CREAT, 0o644)
-        os.set_inheritable(fd, False)
         try:
+            os.set_inheritable(fd, False)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return fd
         except OSError:
