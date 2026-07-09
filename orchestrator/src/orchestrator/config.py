@@ -2767,6 +2767,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
         'git.offline_lane_red_advances_before_blocker',
+        # Verify admission control (task 2390 T2) — all six knobs are
+        # green-tier: an operator can retune slot counts / nice tiers /
+        # toggle the gate without a process restart.
+        'verify_admission_enabled',
+        'verify_admission_task_slots',
+        'verify_admission_slots_dir',
+        'verify_admission_nice_merge',
+        'verify_admission_nice_task',
+        'verify_admission_nice_background',
     },
 )
 
