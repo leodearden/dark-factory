@@ -313,3 +313,40 @@ class TestWorkflowCancelGraceAndActivelyHeld:
         scheduler.note_workflow_cancelled('other-cancelled-task')
 
         assert scheduler.is_actively_held('T1') is False
+
+
+class TestStartupGate:
+    """(step-7) ``acquire_next()`` must not run before ``finish_startup()``.
+
+    Turns the comment-only "sweeps run before the first tick" invariant into
+    a runtime check: a fresh Scheduler starts unstarted; ``acquire_next()``
+    asserts ``started`` before doing any work; ``finish_startup()`` flips the
+    latch and is idempotent.
+    """
+
+    def test_fresh_scheduler_is_not_started(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        assert scheduler.started is False
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_raises_before_finish_startup(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        with pytest.raises(AssertionError):
+            await scheduler.acquire_next()
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_runs_normally_after_finish_startup(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.get_tasks = AsyncMock(return_value=[])
+
+        scheduler.finish_startup()
+
+        assert scheduler.started is True
+        result = await scheduler.acquire_next()
+        assert result is None
+
+    def test_finish_startup_is_idempotent(self):
+        scheduler = Scheduler(OrchestratorConfig())
+        scheduler.finish_startup()
+        scheduler.finish_startup()
+        assert scheduler.started is True
