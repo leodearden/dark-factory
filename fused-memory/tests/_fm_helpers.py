@@ -631,7 +631,7 @@ async def poll_until(
             failure class the fixed-sleep asserts this helper replaces used
             to (accidentally) surface.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:
         result = predicate()
