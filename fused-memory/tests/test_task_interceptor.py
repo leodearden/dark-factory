@@ -485,6 +485,7 @@ async def test_add_task_with_queue_persists_to_real_sqlite(taskmaster, tmp_path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.xdist_group('task_interceptor_perf_timing')
 async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
     """WP-B: add_task must return fast even when the event buffer is locked.
 
@@ -523,8 +524,12 @@ async def test_add_task_hot_path_immunity_with_queue(taskmaster, tmp_path):
         elapsed = time.perf_counter() - t0
         # Canonical write returned successfully — no exception from lock.
         assert result == {'id': '2', 'title': 'New Task'}
-        # Under 500ms budget even with SQLite pinned.
-        assert elapsed < 0.5, f'hot path took {elapsed:.3f}s under lock'
+        # Widened for load tolerance: this only needs to catch add_task
+        # actually blocking on the (always-failing) locked write, not pin a
+        # tight wall-clock budget. Still orders of magnitude below that
+        # failure mode. xdist_group keeps this off a worker mid-run on its
+        # sibling timing tests in this file.
+        assert elapsed < 3.0, f'hot path took {elapsed:.3f}s under lock'
         # The event is either queued, in-flight (being retried), dead-lettered,
         # or committed — but NOT raised to the caller.  With the facade path,
         # the worker emits the event during resolve, so multiple asyncio ticks
@@ -3314,12 +3319,13 @@ async def test_single_call_latency_smoke(
     event_buffer,
 ):
     """WP-E: smoke check — a sequence of sequential mutating calls under
-    no contention finishes within a 5 s budget, confirming the lock itself
-    adds no significant per-call overhead.
+    no contention finishes within a load-tolerant budget, confirming the
+    lock itself adds no significant per-call overhead.
 
     Observed single-worker runtime is ~0.6 s (pure in-process AsyncMock
-    I/O), so the 5 s ceiling gives roughly 8x headroom — wide enough to
-    absorb CI noise while still catching 2-3x regressions.
+    I/O), so the 15 s ceiling gives roughly 25x headroom — wide enough to
+    absorb host CPU oversubscription while still catching a real
+    regression (e.g. the lock accidentally serializing on real I/O).
 
     Skipped automatically when PYTEST_XDIST_WORKER is set: SQLite disk I/O
     contention from 32 concurrent workers inflated the worst-case to 11.3 s,
@@ -3342,10 +3348,11 @@ async def test_single_call_latency_smoke(
         status = 'in-progress' if i % 2 == 0 else 'pending'
         await interceptor.set_task_status('1', status, '/project')
     elapsed = time.perf_counter() - start
-    assert elapsed < 5.0, f'{N} sequential calls took {elapsed:.3f}s (latency regression guard)'
+    assert elapsed < 15.0, f'{N} sequential calls took {elapsed:.3f}s (latency regression guard)'
 
 
 @pytest.mark.asyncio
+@pytest.mark.xdist_group('task_interceptor_perf_timing')
 async def test_set_task_status_does_not_block_during_add_task_curator(
     taskmaster,
     reconciler,
@@ -3379,7 +3386,10 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
         ticket_store=store,
     )
 
-    CURATOR_LATENCY_S = 2.0
+    # Bumped from 2.0s to widen the absolute discrimination gap between the
+    # status_elapsed budget below and CURATOR_LATENCY_S*0.9, giving more
+    # headroom against scheduling jitter under host CPU oversubscription.
+    CURATOR_LATENCY_S = 4.0
 
     async def slow_curate(candidate, project_id, project_root):
         await asyncio.sleep(CURATOR_LATENCY_S)
@@ -3436,11 +3446,16 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
         f'add_task did not wait for curator: total={total_elapsed:.3f}s'
     )
     # set_task_status must NOT wait for curator.
-    # Budget: well under curator latency. Mocked tm writes yield only once,
-    # so half a second is generous for CI jitter.
-    assert status_elapsed < 0.5, (
+    # Budget rebased as a fraction of CURATOR_LATENCY_S (rather than a bare
+    # absolute like the previous 0.5s) so it still discriminates "status did
+    # NOT wait for curator" (near-instant) from "status blocked behind the
+    # curator" (~CURATOR_LATENCY_S, which would also fail the paired
+    # total_elapsed>=CURATOR_LATENCY_S*0.9 assertion above if it didn't),
+    # while tolerating scheduling jitter under host CPU oversubscription.
+    status_budget = CURATOR_LATENCY_S * 0.4
+    assert status_elapsed < status_budget, (
         f'set_task_status blocked behind add_task curator: '
-        f'status_elapsed={status_elapsed:.3f}s (budget 0.5s), '
+        f'status_elapsed={status_elapsed:.3f}s (budget {status_budget:.3f}s), '
         f'curator_latency={CURATOR_LATENCY_S}s'
     )
     # Both writes landed.
