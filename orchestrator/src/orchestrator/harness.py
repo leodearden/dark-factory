@@ -19,7 +19,6 @@ from typing import IO, TYPE_CHECKING, Any, TypeGuard
 
 from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.cost_store import CostStore
-from shared.locking import directory_locks, strip_directory_locks
 from shared.mcp_envelope import resolver_failed
 from shared.safe_io import load_json_or_warn
 
@@ -42,6 +41,7 @@ from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.offline_lane import OfflineLaneWorker
 from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
@@ -50,7 +50,6 @@ from orchestrator.run_store import RunStore
 from orchestrator.scheduler import (
     Scheduler,
     SetTaskStatusRejected,
-    files_to_modules,
 )
 from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
@@ -1902,25 +1901,14 @@ Output JSON matching the schema. Every task must appear in the output.
                 # valid file-level entries too. Consistent with the strip in
                 # _persist_files_metadata / _reconcile_metadata_files_for_done.
                 await self.scheduler.update_task(
-                    task_id, json.dumps({'files': strip_directory_locks(files)})
+                    task_id, json.dumps({'files': sanitize_files_for_persist(files)})
                 )
-                # Also populate in-memory cache so modules are available
-                # immediately without re-fetching from taskmaster.
-                # α strip: directory entries are coerced to empty before
-                # lock derivation so they cannot poison the cache and bypass
-                # _get_modules' α strip on the next tick.
-                depth = self.config.lock_depth
-                dirs = directory_locks(files)
-                if dirs:
-                    logger.info(
-                        'Task %s: α strip at cache-write — rejected directory '
-                        'charter entries: %s',
-                        task_id,
-                        dirs,
-                    )
-                derived = files_to_modules(strip_directory_locks(files), depth)
-                if derived:
-                    self.scheduler._module_cache[task_id] = derived
+                # Populate in-memory cache via the single cache-writing seam.
+                # module_charter.derive_modules (called inside seed_modules)
+                # applies the α strip so a directory-only charter cannot
+                # poison the cache and bypass _get_modules' α strip on the
+                # next tick.
+                self.scheduler.seed_modules(task_id, files)
                 tagged_count += 1
 
         logger.info(f'Tagged {tagged_count}/{len(untagged)} tasks with file metadata')

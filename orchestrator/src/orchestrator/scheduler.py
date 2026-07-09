@@ -17,11 +17,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from shared.locking import (
-    directory_locks,
     files_to_modules,
     modules_conflict,
     normalize_lock,
-    strip_directory_locks,
 )
 from shared.mcp_envelope import parse_tool_result, resolver_failed
 from shared.psi import PsiSample, read_psi_sample
@@ -38,6 +36,7 @@ from orchestrator.config import (
 )
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.mcp_lifecycle import mcp_call
+from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.streaks import StreakCounter, StreakRegistry
@@ -4526,7 +4525,7 @@ class Scheduler:
         ``{**fresh_md, 'files': honest}`` — existing keys win except ``files``.
 
         ``files`` must be file-level paths (not depth-coarsened module paths).
-        Directory entries are stripped via ``strip_directory_locks`` so that the
+        Directory entries are stripped via ``sanitize_files_for_persist`` so that the
         persisted ``metadata.files`` field always holds genuine file paths —
         making it genuinely idempotent at all lock depths.  On restart
         ``_get_modules`` can re-derive the correct module lock from a file-level
@@ -4540,7 +4539,7 @@ class Scheduler:
         """
         fresh = await self.get_task(task_id)
         fresh_md = (fresh.get('metadata') or {}) if isinstance(fresh, dict) else {}
-        honest = strip_directory_locks(files)
+        honest = sanitize_files_for_persist(files)
         dropped = sorted(set(files) - set(honest))
         if dropped:
             logger.debug(
@@ -4649,6 +4648,17 @@ class Scheduler:
                             'persisted': bool(updated),
                         },
                     )
+            # Keep _module_cache in sync with the lock table on every
+            # successful refinement (widen, narrow, or shift) — not just the
+            # acquire-FAILURE branch below.  Without this, a successful
+            # NARROW (release_subset above frees `stale`) left a stale, wider
+            # cache entry in place; because _get_modules is cache-first, a
+            # later read could return modules this task no longer holds
+            # (the δ over-claim class) until the terminal/redispatch
+            # eviction sweep happened to clear the entry. Routes through the
+            # single-writer seam so cached and held module sets cannot
+            # diverge.
+            self._write_module_cache(task_id, sorted(needed_set))
             logger.info(f'Task {task_id} expanded to modules: {needed}')
             return True
 
@@ -4657,7 +4667,7 @@ class Scheduler:
             f'Task {task_id} needs modules {needed} but locks unavailable. Requeuing.'
         )
         # Cache expanded modules in memory so _get_modules uses them on retry
-        self._module_cache[task_id] = sorted(needed_set)
+        self._write_module_cache(task_id, sorted(needed_set))
         # Read-modify-write so memory_hints / _causation_id attached by Stage-2
         # reconciliation survive the blast-radius-failure files write (task 1511).
         # get_task already swallows MCP errors → None, so the isinstance guard
@@ -4901,6 +4911,22 @@ class Scheduler:
         self.clear_requeue_count(task_id)
         return report_path
 
+    def _write_module_cache(self, task_id: str, modules: list[str]) -> list[str]:
+        """The ONLY call site that assigns into ``self._module_cache``.
+
+        Every derive-and-cache path (``_get_modules``, both the success and
+        acquire-failure branches of ``handle_blast_radius_expansion``,
+        ``seed_modules``) routes through here so the cache has a single
+        writer.  Before task 2122, ``_get_modules`` derived
+        without caching while ``handle_blast_radius_expansion`` and
+        ``Harness._tag_task_modules`` each wrote ``_module_cache`` directly —
+        three independent writers that could diverge.  The terminal/redispatch
+        eviction sweep's ``self._module_cache.pop(tid_str, None)`` is a
+        delete, not a write, and does not violate this invariant.
+        """
+        self._module_cache[task_id] = modules
+        return modules
+
     def _get_modules(self, task: dict) -> list[str]:
         """Extract module list from task metadata, normalized for locking.
 
@@ -4927,25 +4953,9 @@ class Scheduler:
         if isinstance(metadata, dict):
             files = metadata.get('files', [])
             if isinstance(files, list) and files:
-                # α strip: remove directory-shaped entries before lock derivation.
-                # A directory entry (no recognised file extension) would produce a
-                # subtree-wide prefix lock that blocks every task touching any file
-                # under that subtree (reify-3468).  Strip them so only real file
-                # siblings derive locks.  When ALL entries are directories the
-                # stripped list is empty → files_to_modules returns [] → we fall
-                # through to the task-<id> synthetic fallback (conflicts with
-                # nothing).  Diagnostic names the stripped directories.
-                dirs = directory_locks(files)
-                if dirs:
-                    logger.info(
-                        'Task %s: α strip — rejected directory charter entries: %s',
-                        task_id,
-                        dirs,
-                    )
-                file_only = strip_directory_locks(files)
-                derived = files_to_modules(file_only, depth)
+                derived = derive_modules(files, depth, task_id=task_id)
                 if derived:
-                    return derived
+                    return self._write_module_cache(task_id, derived)
         # Fallback: use a generic module name based on task id
         if task_id not in self._fallback_warned:
             logger.warning(
@@ -4955,3 +4965,17 @@ class Scheduler:
             )
             self._fallback_warned.add(task_id)
         return [f'task-{task_id or "unknown"}']
+
+    def seed_modules(self, task_id: str, files: list[str]) -> list[str]:
+        """Public entry point for the harness module-tagger.
+
+        Derives modules from *files* via ``derive_modules`` (the α strip
+        applies) and, when non-empty, writes them through the single
+        cache-writing seam (``_write_module_cache``).  An empty derivation
+        (an all-directory charter) is NOT cached — parity with
+        ``_get_modules``'s fall-through to the task-<id> fallback.
+        """
+        derived = derive_modules(files, self.config.lock_depth, task_id=task_id)
+        if derived:
+            self._write_module_cache(task_id, derived)
+        return derived

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _recording_event_store import _RecordingEventStore
+from shared.locking import directory_locks
 
 from orchestrator.config import (
     TIER_BASE,
@@ -23,8 +24,8 @@ from orchestrator.scheduler import (
     ExternalResolverError,
     ModuleLockTable,
     Scheduler,
-    directory_locks,
     files_to_modules,
+    normalize_lock,
 )
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
@@ -1219,6 +1220,124 @@ class TestGetModulesJsonStringMetadata:
         assert len(matching) == 1, (
             f'Expected exactly 1 fallback warning for task 9, got {len(matching)}. '
             f'Messages: {[r.message for r in caplog.records]}'
+        )
+
+
+class TestGetModulesWriteThroughCache:
+    """_get_modules must write-through into _module_cache on every successful
+    derive (task 2122 single-writer seam), while the deterministic short-circuit
+    and the task-<id> fallback stay UNCACHED — parity with the pre-migration
+    dual-writer defect's only correct branch.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1)
+        return Scheduler(config)
+
+    def test_derive_write_through_caches_derived_modules(self, scheduler: Scheduler):
+        """After a real derive, _module_cache[task_id] equals the returned modules."""
+        task = {
+            'id': '50',
+            'metadata': {'files': ['backend/app.py', 'server/main.py']},
+        }
+        result = scheduler._get_modules(task)
+        assert result != ['task-50']
+        assert scheduler._module_cache['50'] == result
+
+    def test_cache_parity_across_metadata_update(self, scheduler: Scheduler):
+        """Derive v1 -> cache matches; evict (mirrors the terminal/redispatch
+        sweep at scheduler.py:3670) -> derive v2 -> cache tracks the new value,
+        never the stale one.
+        """
+        task_v1 = {'id': '51', 'metadata': {'files': ['backend/app.py']}}
+        result_v1 = scheduler._get_modules(task_v1)
+        assert scheduler._module_cache['51'] == result_v1
+
+        # Mirror the terminal/redispatch eviction sweep (.pop(), not an assignment).
+        scheduler._module_cache.pop('51', None)
+
+        task_v2 = {'id': '51', 'metadata': {'files': ['frontend/app.tsx']}}
+        result_v2 = scheduler._get_modules(task_v2)
+        assert result_v2 != result_v1, (
+            f'Expected the re-derive to reflect the updated metadata, got the '
+            f'same modules {result_v2} for both v1 and v2 files'
+        )
+        assert scheduler._module_cache['51'] == result_v2, (
+            'Cache must track the fresh derive, not the stale v1 value'
+        )
+
+    def test_deterministic_task_returns_empty_and_is_not_cached(
+        self, scheduler: Scheduler
+    ):
+        """Deterministic (gate) tasks short-circuit to [] and never enter the cache."""
+        task = {'id': '52', 'metadata': {'task_kind': 'deterministic'}}
+        result = scheduler._get_modules(task)
+        assert result == []
+        assert '52' not in scheduler._module_cache
+
+    def test_task_id_fallback_is_not_cached(self, scheduler: Scheduler):
+        """The task-<id> synthetic fallback is never written to the cache."""
+        task = {'id': '53', 'metadata': {}}
+        result = scheduler._get_modules(task)
+        assert result == ['task-53']
+        assert '53' not in scheduler._module_cache
+
+
+class TestSeedModules:
+    """Scheduler.seed_modules is the harness's public entry point for
+    deriving-and-caching modules from freshly-tagged files (task 2122
+    step-7/8) — it must route through derive_modules + the single
+    _write_module_cache seam, matching the harness's pre-migration
+    ``if derived:`` skip-when-empty guard.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        return Scheduler(config)
+
+    def test_seed_modules_caches_derived_modules_for_real_files(
+        self, scheduler: Scheduler
+    ):
+        """A real file-level charter derives and caches at the configured depth."""
+        result = scheduler.seed_modules('60', ['src/config/schema.py'])
+        assert result == ['src/config']
+        assert scheduler._module_cache['60'] == ['src/config']
+
+    def test_seed_modules_all_directory_returns_empty_and_is_not_cached(
+        self, scheduler: Scheduler
+    ):
+        """An all-directory charter derives to [] and must NOT enter the
+        cache (parity with the harness's pre-migration ``if derived:`` guard).
+        """
+        result = scheduler.seed_modules('61', ['crates/reify-eval/src'])
+        assert result == []
+        assert '61' not in scheduler._module_cache
+
+    def test_seed_modules_routes_through_write_module_cache_seam(
+        self, scheduler: Scheduler
+    ):
+        """The write must go through the single seam: called for the
+        real-file case, NOT called for the all-directory case.
+        """
+        calls: list[tuple[str, list[str]]] = []
+        original_write = scheduler._write_module_cache
+
+        def spy(task_id: str, modules: list[str]) -> list[str]:
+            calls.append((task_id, modules))
+            return original_write(task_id, modules)
+
+        scheduler._write_module_cache = spy  # type: ignore[method-assign]
+
+        scheduler.seed_modules('62', ['src/config/schema.py'])
+        assert calls == [('62', ['src/config'])]
+
+        calls.clear()
+        scheduler.seed_modules('63', ['crates/reify-eval/src'])
+        assert calls == [], (
+            f'Expected _write_module_cache NOT called for an all-directory '
+            f'charter; got {calls}'
         )
 
 
@@ -4448,6 +4567,165 @@ class TestBlastRadiusRefinement:
         assert result != [f'task-{tid}'], (
             f'_get_modules must NOT fall back to task-<id> when file-level '
             f'metadata is present; got {result!r}'
+        )
+
+
+class TestBlastRadiusModuleCacheSeam:
+    """The acquire-failure path's cache write and metadata persist must route
+    through the single-writer seam / sanitize contract (task 2122 step-5/6),
+    not the pre-migration direct assignment + raw strip_directory_locks call.
+    """
+
+    @pytest.fixture
+    def scheduler(self) -> Scheduler:
+        config = OrchestratorConfig(max_per_module=1, lock_depth=4)
+        event_store = _RecordingEventStore()
+        sched = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        return sched
+
+    @pytest.mark.asyncio
+    async def test_acquire_failure_routes_through_write_module_cache_seam(
+        self, scheduler: Scheduler
+    ):
+        """On acquire failure, the in-memory cache write must go through
+        _write_module_cache (spied here), not a direct
+        self._module_cache[task_id] = ... assignment — fails today because
+        the failure branch assigns directly instead of calling the seam.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        # Another task grabs the module 936 would expand into, forcing failure.
+        assert lt.try_acquire(
+            'other', ['crates/reify-compiler/src/conformance.rs']
+        )
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        calls: list[tuple[str, list[str]]] = []
+        original_write = scheduler._write_module_cache
+
+        def spy(task_id: str, modules: list[str]) -> list[str]:
+            calls.append((task_id, modules))
+            return original_write(task_id, modules)
+
+        scheduler._write_module_cache = spy  # type: ignore[method-assign]
+
+        needed = ['crates/reify-compiler/src/conformance.rs']
+        depth = scheduler.config.lock_depth
+        expected = sorted({normalize_lock(m, depth) for m in needed})
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=needed,
+        )
+
+        assert ok is False
+        assert calls == [('936', expected)], (
+            f'Expected exactly one _write_module_cache(936, {expected}) call; '
+            f'got {calls}'
+        )
+        assert scheduler._module_cache['936'] == expected
+
+    @pytest.mark.asyncio
+    async def test_acquire_failure_persists_sanitized_files(
+        self, scheduler: Scheduler
+    ):
+        """A dir-bearing persist_files list must be stripped to file-level-only
+        entries before update_task sees it (the _persist_files_metadata
+        sanitize contract, now routed through sanitize_files_for_persist).
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        assert lt.try_acquire(
+            'other', ['crates/reify-compiler/src/conformance.rs']
+        )
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        update_task = AsyncMock(return_value=True)
+        scheduler.update_task = update_task  # type: ignore[method-assign]
+        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+            persist_files=['pkg/dir', 'pkg/mod/real.py'],
+        )
+
+        assert ok is False
+        assert update_task.await_args is not None
+        persisted = update_task.await_args.args[1]
+        assert persisted == {'files': ['pkg/mod/real.py']}, (
+            f'Expected the directory entry stripped, file-level entry kept; '
+            f'got {persisted}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_narrow_updates_module_cache(
+        self, scheduler: Scheduler
+    ):
+        """A successful narrowing refinement must update _module_cache to the
+        narrowed set via the single-writer seam — not just the lock table.
+
+        Regression: _get_modules write-through populates the cache on every
+        scored/dispatched task, but only the acquire-FAILURE branch routed
+        through _write_module_cache. A successful narrow (release_subset +
+        _persist_files_metadata) left a stale, WIDER cache entry in place;
+        because _get_modules is cache-first, a later read could return
+        modules release_subset already freed (the δ over-claim class)
+        instead of re-deriving from the freshly narrowed metadata.files.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        # Seed the cache with the PRE-refinement (wider) module set, mirroring
+        # what _get_modules' write-through would already have populated on an
+        # earlier dispatch-scoring read.
+        scheduler._write_module_cache('936', ['crates/reify-compiler/src/lib.rs'])
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        calls: list[tuple[str, list[str]]] = []
+        original_write = scheduler._write_module_cache
+
+        def spy(task_id: str, modules: list[str]) -> list[str]:
+            calls.append((task_id, modules))
+            return original_write(task_id, modules)
+
+        scheduler._write_module_cache = spy  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+        )
+
+        assert ok is True
+        expected = ['crates/reify-compiler/src/conformance.rs']
+        assert ('936', expected) in calls, (
+            f'Expected _write_module_cache(936, {expected}) call on the '
+            f'success path; got {calls}'
+        )
+        assert scheduler._module_cache['936'] == expected, (
+            f'_module_cache must be updated to the narrowed set after a '
+            f"successful refinement; got {scheduler._module_cache.get('936')}"
+        )
+
+        # A later _get_modules read (cache-first) must return the narrowed
+        # set, not the stale wider set seeded before the refinement.
+        task = {
+            'id': '936',
+            'metadata': {'files': ['crates/reify-compiler/src/conformance.rs']},
+        }
+        assert scheduler._get_modules(task) == expected, (
+            'Cache-first _get_modules read must reflect the narrowed set, '
+            'not a stale pre-refinement cache entry'
         )
 
 
