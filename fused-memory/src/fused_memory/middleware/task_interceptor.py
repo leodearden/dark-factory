@@ -3217,7 +3217,14 @@ class TaskInterceptor:
                         project_id,
                         len(non_none_prepared),
                     )
-                    for rec in records:
+                    # Iterate curatable_records only — unprepared_records are
+                    # curated exactly once by the dedicated backfill loop
+                    # below; including them here too would curate() them
+                    # twice and the backfill's result would silently clobber
+                    # whatever this fallback just recorded.  The None-check
+                    # is defensive (curatable_records already guarantees a
+                    # candidate) and narrows the type for the curate() call.
+                    for rec in curatable_records:
                         if rec.ticket.candidate is None:
                             continue
                         try:
