@@ -146,7 +146,8 @@ class TestAddEpisodeRoutesThroughClientFor:
 
         result = await backend.add_episode(name='e', content='c', group_id='A')
 
-        backend._client_for.assert_called_once_with('A')
+        # task 2269 (CGL-γ): add_episode now canonicalizes group_id at entry.
+        backend._client_for.assert_called_once_with('a')
         per_group.add_episode.assert_awaited_once()
         backend.client.add_episode.assert_not_awaited()
         assert result is sentinel
@@ -196,7 +197,8 @@ class TestAddEpisodeConcurrencyIsolation:
             backend.add_episode(name='epB', content='y', group_id='B'),
         )
 
-        assert observed == {'epA': 'A', 'epB': 'B'}
+        # task 2269 (CGL-γ): add_episode now canonicalizes group_id at entry.
+        assert observed == {'epA': 'a', 'epB': 'b'}
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +218,16 @@ class TestBuildCommunitiesPassesDriver:
         backend = make_backend(mock_config)
         backend.client.build_communities = AsyncMock()
 
-        da = backend._driver_for('A')
+        # task 2269 (CGL-γ): build_communities now canonicalizes group_ids at
+        # entry, so the driver it looks up internally is keyed by the
+        # canonical 'a' — compute da with the same key this test verifies against.
+        da = backend._driver_for('a')
         await backend.build_communities(group_ids=['A'])
 
         backend.client.build_communities.assert_awaited_once()
         assert backend.client.build_communities.await_args is not None
         _, kwargs = backend.client.build_communities.await_args
-        assert kwargs.get('group_ids') == ['A']
+        assert kwargs.get('group_ids') == ['a']
         assert kwargs.get('driver') is da
 
     @pytest.mark.asyncio
@@ -252,8 +257,12 @@ class TestBuildCommunitiesPassesDriver:
         backend = make_backend(mock_config)
         backend.client.build_communities = AsyncMock()
 
-        da = backend._driver_for('A')
-        db = backend._driver_for('B')
+        # task 2269 (CGL-γ): build_communities now canonicalizes group_ids at
+        # entry, so the drivers it looks up internally are keyed by the
+        # canonical 'a'/'b' — compute da/db with the same keys this test
+        # verifies against.
+        da = backend._driver_for('a')
+        db = backend._driver_for('b')
         await backend.build_communities(group_ids=['A', 'B'])
 
         assert backend.client.build_communities.await_count == 2
@@ -262,8 +271,8 @@ class TestBuildCommunitiesPassesDriver:
             for call in backend.client.build_communities.await_args_list
         }
         assert calls_by_group == {
-            'A': {'group_ids': ['A'], 'driver': da},
-            'B': {'group_ids': ['B'], 'driver': db},
+            'a': {'group_ids': ['a'], 'driver': da},
+            'b': {'group_ids': ['b'], 'driver': db},
         }
 
 
