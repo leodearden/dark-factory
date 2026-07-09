@@ -29,6 +29,7 @@ from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import invoke_agent  # noqa: E402
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason
 
 logger = logging.getLogger(__name__)
 
@@ -253,12 +254,18 @@ async def run_dry_run_unblock(
     event_store: Any = None,
     usage_gate: Any = None,
     cost_store: Any = None,
+    block_class: BlockClass | None = None,
 ) -> None:
     """Investigate a blocked task and write a proposal to metadata.
 
     Fire-and-forget: called via asyncio.create_task from _mark_blocked.
     Any exception is caught and written as a fallback entry so failures
     are always visible in metadata.dry_run_proposals[].
+
+    *block_class* lets the caller supply the entry's typed BlockClass
+    explicitly (e.g. workflow._spawn_dry_run_unblock classifies `reason`
+    up front); when omitted (None), it is derived via
+    ``classify_block_reason(reason)`` as a defensive fallback.
     """
     import time
 
@@ -388,12 +395,26 @@ async def run_dry_run_unblock(
                         task_id, exc,
                     )
 
-    # Stamp the git anchor onto the entry at a single point so all four
-    # shapes (ok, investigation_failed, budget_exhausted, exception fallback)
-    # carry head_sha/main_sha. DRY_RUN_PROPOSAL_SCHEMA stays unchanged
-    # (additionalProperties:False, no sha keys) so the agent cannot forge these.
-    entry['head_sha'] = head_sha
-    entry['main_sha'] = main_sha
+    # Stamp the git anchor and typed block_class onto the entry at a single
+    # point so all six shapes (ok, investigation_failed, budget_exhausted,
+    # infra_failure, exception fallback, cap-exhausted) carry them.
+    # block_class joins head_sha/main_sha as an orchestrator-stamped,
+    # non-forgeable field: DRY_RUN_PROPOSAL_SCHEMA stays unchanged
+    # (additionalProperties:False, no block_class/sha keys) so the agent
+    # cannot forge any of these. entry.update(...) is additive — sibling
+    # keys (proposal_text/block_reason/timestamp/status/cost_usd/
+    # diagnostics) are left untouched; risk_label/files_referenced/
+    # investigated_at are idempotently re-set to the values already on entry.
+    resolved_class = block_class if block_class is not None else classify_block_reason(reason)
+    record = BlockRecord(
+        block_class=resolved_class,
+        risk_label=entry.get('risk_label', _HUMAN_REVIEW_REQUIRED),
+        head_sha=head_sha,
+        main_sha=main_sha,
+        files_referenced=entry.get('files_referenced', []),
+        investigated_at=entry.get('investigated_at', ''),
+    )
+    entry.update(record.to_dict())
 
     try:
         await scheduler.update_task(
