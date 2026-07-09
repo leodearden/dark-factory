@@ -6,6 +6,16 @@ FOUNDATIONS-FIRST: this test module covers only the store itself (schema,
 upsert/get_by_identity, list_suppressions, is_suppressed, gc, mark_addressed)
 plus the server/main.py build-helper wiring test (step-19). Consumers ι/κ/λ
 switch reads to the ledger under a later write-both/read-new cutover.
+
+Task 2227 (consumer ι) step-01 adds the MemoryService.recon_ledger
+construction-contract test: a fresh service has no ledger until
+set_recon_ledger() wires one on, mirroring set_write_journal(). The actual
+server/main.py call site (wiring the built store onto memory_service inside
+the recon_ledger_enabled branch, before the same local is passed to
+_collect_checkpoint_targets) is a one-line addition verified by code review,
+not by a source-inspection meta-test — see commit da8e5a4c96 (TDD-architect
+rule 5: grep-source meta-tests break on benign refactors with no real
+regression) for why this repo removed that pattern previously.
 """
 
 from __future__ import annotations
@@ -17,6 +27,7 @@ import pytest_asyncio
 
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.server import main as server_main
+from fused_memory.services.memory_service import MemoryService
 
 EXPECTED_COLUMNS = {
     'project_id',
@@ -499,3 +510,27 @@ async def test_build_recon_ledger_store_initializes_schema(tmp_path):
         assert row is not None
     finally:
         await built_store.close()
+
+
+# ---------------------------------------------------------------------------
+# task 2227 step-01: MemoryService exposes the ledger
+# ---------------------------------------------------------------------------
+
+
+def test_memory_service_recon_ledger_defaults_to_none(mock_config):
+    """A fresh MemoryService has no ledger wired until set_recon_ledger()
+    attaches one — mirrors the _write_journal/set_write_journal default."""
+    svc = MemoryService(mock_config)
+
+    assert svc.recon_ledger is None
+
+
+def test_memory_service_set_recon_ledger_wires_store(mock_config, tmp_path):
+    """set_recon_ledger(store) attaches the given store as .recon_ledger,
+    mirroring set_write_journal(journal) -> ._write_journal."""
+    svc = MemoryService(mock_config)
+    store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+
+    svc.set_recon_ledger(store)
+
+    assert svc.recon_ledger is store

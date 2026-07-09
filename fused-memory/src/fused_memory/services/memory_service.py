@@ -48,6 +48,7 @@ from fused_memory.utils.task_naming import canonicalize_task_node_name
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.event_buffer import EventBuffer
+    from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
 
@@ -466,6 +467,7 @@ class MemoryService:
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
+        self.recon_ledger: ReconLedgerStore | None = None
         # Process-start baselines for uptime reporting
         self._started_at: datetime = datetime.now(UTC)
         self._start_monotonic: float = time.monotonic()
@@ -481,6 +483,10 @@ class MemoryService:
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
         self.planned_episode_registry = registry
+
+    def set_recon_ledger(self, store: ReconLedgerStore) -> None:
+        """Wire the recon ledger store into the service."""
+        self.recon_ledger = store
 
     async def _emit_event(self, event: ReconciliationEvent) -> None:
         if self._event_buffer:
