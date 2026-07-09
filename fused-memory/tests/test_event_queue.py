@@ -90,12 +90,15 @@ async def test_enqueue_returns_immediately(queue):
     # 100 non-blocking puts should take well under 50ms in principle, but
     # under full-suite CPU oversubscription (many xdist workers contending
     # for cores) even non-blocking asyncio.Queue.put_nowait calls can be
-    # scheduled late. Widen to a load-tolerant ceiling that is still orders
-    # of magnitude below the failure mode this guards against: enqueue()
-    # accidentally awaiting the real write (100 sequential real writes would
-    # take single-digit seconds or more under lock contention). xdist_group
-    # keeps this off a worker mid-run on its sibling timing test below.
-    assert elapsed < 2.0, f'enqueue took {elapsed:.3f}s for 100 calls'
+    # scheduled late. xdist_group pins this test (and its sibling timing
+    # test below) to a single worker, so a tighter ceiling than a bare
+    # global widen still holds: 0.5s / 100 calls = 5ms/call, 10x the
+    # original 0.5ms/call expectation, but still tight enough to catch a
+    # meaningful per-call regression while staying well below the failure
+    # mode this guards against: enqueue() accidentally awaiting the real
+    # write (100 sequential real writes would take single-digit seconds or
+    # more under lock contention).
+    assert elapsed < 0.5, f'enqueue took {elapsed:.3f}s for 100 calls'
 
 
 # ── Failure injection ──────────────────────────────────────────────────
