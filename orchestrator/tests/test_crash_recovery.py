@@ -627,6 +627,7 @@ def _setup_lane_meta_plan(base: Path, lane_name: str, plan: dict) -> Path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
 class TestRecoverCrashedTasksWarmLane:
     """_recover_crashed_tasks must correctly recover warm-lane worktrees.
 
@@ -870,6 +871,7 @@ class TestRecoverCrashedTasksWarmLane:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
 class TestRecoverCrashedTasksWarmLaneEdgeCases:
     """Edge cases for warm-lane crash recovery."""
 
@@ -937,6 +939,7 @@ class TestRecoverCrashedTasksWarmLaneEdgeCases:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
 class TestRecoverCrashedTasksPoolStorageAbsentGuard:
     """_recover_crashed_tasks must defer — not clean up — when pool storage
     is absent (task 2099).
@@ -1040,6 +1043,7 @@ class TestRecoverCrashedTasksPoolStorageAbsentGuard:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
 class TestRecoverCrashedTasksNoPoolConfiguredNoOp:
     """_recover_crashed_tasks() must proceed normally on a pool-less default
     host even though `.pool-root` is absent (step-17 review-fix).
@@ -1084,6 +1088,7 @@ class TestRecoverCrashedTasksNoPoolConfiguredNoOp:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
 class TestRecordDrivenRecovery:
     """B1 adopt / B2 quarantine / terminal-release / branch-mismatch / compat
     / .task-meta-relocation contracts for the record-driven lane recovery
@@ -1386,6 +1391,7 @@ class TestRecordDrivenRecovery:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
 class TestRecordDrivenRecoveryCompatAndRelocation:
     """(a) compat: a record-less lane recovers its plan but is never pinned.
     (b) .task-meta-only artifacts are read/cleared on the ADOPT path.
