@@ -2476,3 +2476,233 @@ class TestDegenerateTaskNodeSweepGuards:
         assert 'degenerate_task_nodes_swept' not in report.stats, (
             'A raised sweep must not leave a partial/incorrect degenerate_task_nodes_swept stat'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 2366 step-5 (RED) / step-6 (GREEN): Stage 1 cycle_summary absence
+# self-heal wiring (verify_cycle_summary_written / reconstruct_cycle_summary_stub)
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorCycleSummaryFallback:
+    """MemoryConsolidator.run() must self-heal a missing per-cycle summary (task 2366).
+
+    The per-cycle cycle_summary memory is a PROMPT-DRIVEN final step of the LLM
+    session (prompts/stage1.py) — a session that exhausts its turn/token/context
+    budget can exit before writing one. On a full (non-remediation) cycle, run()
+    must call verify_cycle_summary_written after the agent write and, when it
+    CONFIRMS absence (count == 0), call reconstruct_cycle_summary_stub to write a
+    deterministic fallback stub — mirroring Stage 2's already-proven self-heal.
+
+    Every case mocks get_memories_by_metadata to return [] so the unconditional
+    pretrim_summary_pool call at the top of run() no-ops cleanly and never
+    interferes with these assertions.
+
+    RED until step-6 wires verify_cycle_summary_written / reconstruct_cycle_summary_stub
+    into MemoryConsolidator.run().
+    """
+
+    @staticmethod
+    def _reconstruction_calls(add_memory_mock) -> list:
+        """Return add_memory calls that look like a cycle_summary reconstruction write."""
+        return [
+            call
+            for call in add_memory_mock.await_args_list
+            if (call.kwargs.get('metadata') or {}).get('kind') == 'cycle_summary'
+            and (call.kwargs.get('metadata') or {}).get('reconstructed') is True
+        ]
+
+    @pytest.mark.asyncio
+    async def test_emits_reconstruction_when_summary_confirmed_absent(self):
+        """count_memories_by_metadata==0 (CONFIRMED absent) -> reconstruct_cycle_summary_stub fires."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+        stage.memory.count_memories_by_metadata = AsyncMock(return_value=0)
+        stage.memory.add_memory = AsyncMock(return_value={'memory_ids': ['stub-1']})
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='r-absent',
+            )
+
+        recon_calls = self._reconstruction_calls(stage.memory.add_memory)
+        assert len(recon_calls) == 1, (
+            'reconstruct_cycle_summary_stub must call add_memory exactly once when the '
+            f'summary is CONFIRMED absent; got add_memory calls={stage.memory.add_memory.await_args_list!r}. '
+            'RED: verify_cycle_summary_written/reconstruct_cycle_summary_stub not yet wired into run().'
+        )
+        metadata = recon_calls[0].kwargs['metadata']
+        assert metadata['kind'] == 'cycle_summary'
+        assert metadata['stage'] == 'memory_consolidator'
+        assert metadata['run_id'] == 'r-absent'
+        assert metadata['recon_pool'] == 'stage1_cycle_summary'
+        assert metadata['reconstructed'] is True
+
+        assert report.stats.get('stage1_cycle_summary_verified_count') == 0, (
+            f"Expected report.stats['stage1_cycle_summary_verified_count'] == 0; got stats={report.stats!r}"
+        )
+        assert report.stats.get('stage1_cycle_summary_reconstructed') == 1, (
+            f"Expected report.stats['stage1_cycle_summary_reconstructed'] == 1; got stats={report.stats!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_skips_reconstruction_when_summary_present(self):
+        """count_memories_by_metadata==1 (present) -> no reconstruction write."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+        stage.memory.count_memories_by_metadata = AsyncMock(return_value=1)
+        stage.memory.add_memory = AsyncMock(return_value={'memory_ids': ['real-1']})
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='r-present',
+            )
+
+        recon_calls = self._reconstruction_calls(stage.memory.add_memory)
+        assert recon_calls == [], (
+            'reconstruct_cycle_summary_stub must NOT write when the summary is already '
+            f'present (count==1); got reconstruction add_memory calls={recon_calls!r}'
+        )
+        assert report.stats.get('stage1_cycle_summary_verified_count') == 1, (
+            f"Expected report.stats['stage1_cycle_summary_verified_count'] == 1; got stats={report.stats!r}"
+        )
+        assert report.stats.get('stage1_cycle_summary_reconstructed') == 0, (
+            f"Expected report.stats['stage1_cycle_summary_reconstructed'] == 0; got stats={report.stats!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_skips_reconstruction_on_transient_verify_failure(self):
+        """count_memories_by_metadata raising -> None (NOT confirmed absent) -> no reconstruction."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+        stage.memory.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant down')
+        )
+        stage.memory.add_memory = AsyncMock(return_value={'memory_ids': ['real-1']})
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='r-transient',
+            )
+
+        recon_calls = self._reconstruction_calls(stage.memory.add_memory)
+        assert recon_calls == [], (
+            'A transient verify failure (count_memories_by_metadata raises) must NOT be '
+            f'treated as confirmed absence; got reconstruction add_memory calls={recon_calls!r}'
+        )
+        assert report.stats.get('stage1_cycle_summary_verified_count') is None, (
+            "Expected report.stats['stage1_cycle_summary_verified_count'] is None (transient, "
+            f'not confirmed absent); got stats={report.stats!r}'
+        )
+        assert report.stats.get('stage1_cycle_summary_reconstructed') == 0, (
+            f"Expected report.stats['stage1_cycle_summary_reconstructed'] == 0; got stats={report.stats!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_run_skips_verify_and_reconstruction(self):
+        """remediation_findings set -> run() returns before the verify/reconstruct block,
+        but the two stats keys are still present with their always-present defaults.
+
+        Uses plain (no side_effect) AsyncMocks + assert_not_awaited() rather than an
+        AssertionError side-effect canary: verify_cycle_summary_written and
+        reconstruct_cycle_summary_stub both catch broad Exception internally (their
+        transient-failure handling), so a raised AssertionError would be silently
+        swallowed and masked as a false pass if the wiring incorrectly invoked them
+        during a remediation run. Configuring real return values instead means an
+        incorrect invocation surfaces as a genuine, unambiguous assertion failure.
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.remediation_findings = [{'description': 'fix this'}]
+        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+        stage.memory.count_memories_by_metadata = AsyncMock(return_value=0)
+        stage.memory.add_memory = AsyncMock(return_value={'memory_ids': ['stub-1']})
+
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+        dedup_mock = AsyncMock(return_value=[])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='r-remediation',
+            )
+
+        stage.memory.count_memories_by_metadata.assert_not_awaited()
+        recon_calls = self._reconstruction_calls(stage.memory.add_memory)
+        assert recon_calls == [], (
+            f'A remediation run must never reconstruct a cycle summary; got calls={recon_calls!r}'
+        )
+        assert 'stage1_cycle_summary_verified_count' in report.stats, (
+            "report.stats['stage1_cycle_summary_verified_count'] must be present (always-present "
+            f'default) even on a remediation run; got stats={report.stats!r}'
+        )
+        assert report.stats.get('stage1_cycle_summary_reconstructed') == 0, (
+            f"Expected report.stats['stage1_cycle_summary_reconstructed'] == 0; got stats={report.stats!r}"
+        )
