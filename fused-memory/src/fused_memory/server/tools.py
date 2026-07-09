@@ -2832,6 +2832,8 @@ def create_mcp_server(
         tag: str | None = None,
         done_provenance: dict | None = None,
         reopen_reason: str | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
         done/blocked/cancelled/deferred transitions. Entering merge-deferred is
@@ -2888,7 +2890,11 @@ def create_mcp_server(
                 'manual re-scope', 'reconciliation: re-implementation required'.
                 Persisted on the task as metadata.reopen_reason for audit.
                 Ignored for non-terminal transitions.
+            agent_id: Which agent is writing (optional, auto-derived from MCP
+                context). Threaded into the transition-legality gate so it can
+                classify an actor (task 2175/rho1b).
         """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
             return err
         _normalized = _normalize_project_root(project_root)
@@ -2911,6 +2917,7 @@ def create_mcp_server(
                 tag=tag,
                 done_provenance=done_provenance,
                 reopen_reason=reopen_reason,
+                agent_id=agent_id,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
@@ -2933,6 +2940,8 @@ def create_mcp_server(
         planning_mode: bool = False,
         routing_override_reason: str = '',
         task_kind: str = 'normal',
+        agent_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Phase-1 of two-phase task creation: persist a ticket and return its id immediately.
 
@@ -2998,7 +3007,13 @@ def create_mcp_server(
                 creation time (B10): (1) enum; (2) deterministic without
                 before_done AND always_escalates is ill-formed no-op; (3)
                 before_done is only valid on deterministic tasks.
+            agent_id: Which agent is writing (optional, auto-derived from MCP
+                context). Resolved here for uniform caller-identity attribution
+                across the task write path (task 2175/rho1b); submit_task is a
+                create with no status transition, so it is not forwarded to
+                the interceptor.
         """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
@@ -3338,6 +3353,8 @@ def create_mcp_server(
         priority: str | None = None,
         status: str | None = None,
         dependencies: list[str] | None = None,
+        agent_id: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update an existing task.
 
@@ -3380,7 +3397,13 @@ def create_mcp_server(
             priority: New priority (e.g. "high"/"medium"/"low")
             status: New status (e.g. "pending"/"in-progress"/"done")
             dependencies: Replacement list of dependency task ids (top-level only)
+            agent_id: Which agent is writing (optional, auto-derived from MCP
+                context). Resolved here for uniform caller-identity attribution
+                across the task write path (task 2175/rho1b); MCP update_task
+                rejects status= writes, so there is no transition to forward
+                it to on the interceptor.
         """
+        agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
             return err
         _normalized = _normalize_project_root(project_root)

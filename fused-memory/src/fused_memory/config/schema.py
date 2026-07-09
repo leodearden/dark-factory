@@ -287,6 +287,29 @@ class TaskMetadataConfig(BaseModel):
     )
 
 
+# --- Task status transition authority (task 2175, rho1b) ---
+
+class TaskStatusConfig(BaseModel):
+    """Governs the ``TaskInterceptor`` transition-legality gate (Table A).
+
+    Backed by ``shared.task_transitions.is_legal_transition`` (the shared
+    (from, to, actor) legality table). This is a top-level config section —
+    NOT nested under ``taskmaster`` — because it governs a schema shared with
+    the orchestrator, mirroring ``TaskMetadataConfig``.
+    """
+
+    enforce_transitions: bool = Field(
+        default=False,
+        description=(
+            "RED-TIER/restart-only log-mode gate: False (default) => an "
+            "illegal (from,to,actor) transition emits an 'illegal_transition "
+            "would-reject' WARNING at the interceptor and the write "
+            "proceeds; True => a typed illegal_transition rejection. "
+            "Flipped only after the Gamma soak; not hot-reloadable."
+        ),
+    )
+
+
 # --- Reconciliation ---
 
 class ReconciliationConfig(BaseModel):
@@ -908,6 +931,7 @@ class FusedMemoryConfig(BaseSettings):
     queue: QueueConfig = Field(default_factory=QueueConfig)
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
+    task_status: TaskStatusConfig = Field(default_factory=TaskStatusConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
     summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)

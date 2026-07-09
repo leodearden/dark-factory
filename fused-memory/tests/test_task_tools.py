@@ -683,6 +683,104 @@ async def test_set_task_status_accepts_merge_deferred(
         tag=None,
         done_provenance=None,
         reopen_reason=None,
+        agent_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_forwards_agent_id_to_interceptor(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """set_task_status forwards caller identity (agent_id) to the interceptor
+    so the transition-legality gate (task 2175/rho1b) can classify an actor.
+    """
+    task_interceptor.set_task_status = AsyncMock(return_value={'success': True})
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'set_task_status',
+        {
+            'id': '1',
+            'project_root': '/project',
+            'status': 'blocked',
+            'agent_id': 'recon-stage-7',
+        },
+    )
+    task_interceptor.set_task_status.assert_awaited_once()
+    assert task_interceptor.set_task_status.call_args.kwargs.get('agent_id') == 'recon-stage-7', (
+        f'Expected agent_id to be forwarded to the interceptor; '
+        f'call_args={task_interceptor.set_task_status.call_args!r}'
+    )
+
+
+# ------------------------------------------------------------------
+# submit_task / update_task accept ctx+agent_id (task 2175 step-11/step-12)
+#
+# Neither tool forwards agent_id to the interceptor: submit_task is a create
+# (no from->to transition for the gate to classify) and MCP update_task
+# rejects status= writes, so only set_task_status threads identity through
+# to the transition-legality gate.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submit_task_accepts_agent_id_and_forwards_existing_kwargs_unchanged(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """submit_task accepts agent_id (caller identity) without disturbing its
+    existing forwarding of prompt/priority/etc. to the interceptor, and does
+    NOT forward agent_id itself (submit_task has no status transition)."""
+    task_interceptor.submit_task = AsyncMock(return_value={'ticket': 'tkt_x'})
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'Do the thing',
+            'priority': 'high',
+            'agent_id': 'recon-stage-7',
+        },
+    )
+    assert 'error' not in result
+    task_interceptor.submit_task.assert_awaited_once()
+    kwargs = task_interceptor.submit_task.call_args.kwargs
+    assert kwargs.get('prompt') == 'Do the thing', f'Expected prompt forwarded; got {kwargs!r}'
+    assert kwargs.get('priority') == 'high', f'Expected priority forwarded; got {kwargs!r}'
+    assert 'agent_id' not in kwargs, (
+        f'submit_task must not forward agent_id to the interceptor; got {kwargs!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_accepts_agent_id_and_forwards_existing_kwargs_unchanged(
+    mcp_server_with_tasks, task_interceptor,
+):
+    """update_task accepts agent_id (caller identity) without disturbing its
+    existing exact-kwarg forwarding to the interceptor, and does NOT forward
+    agent_id itself (MCP update_task rejects status= writes -- no transition
+    for the gate to classify)."""
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1',
+            'project_root': '/project',
+            'title': 'New title',
+            'priority': 'high',
+            'agent_id': 'recon-stage-7',
+        },
+    )
+    assert 'error' not in result
+    task_interceptor.update_task.assert_called_once_with(
+        task_id='1',
+        project_root='/project',
+        prompt=None,
+        metadata=None,
+        append=None,
+        metadata_mode=None,
+        tag=None,
+        title='New title',
+        description=None,
+        details=None,
+        priority='high',
+        status=None,
+        dependencies=None,
     )
 
 

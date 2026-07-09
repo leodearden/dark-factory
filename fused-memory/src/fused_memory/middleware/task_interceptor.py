@@ -33,6 +33,7 @@ except ImportError:
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+from shared.task_transitions import derive_actor_class, is_legal_transition
 
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware.dark_factory_path_guard import (
@@ -655,6 +656,7 @@ class TaskInterceptor:
         *,
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+        agent_id: str | None = None,
     ) -> dict:
         """Proxy to Taskmaster, then fire-and-forget targeted reconciliation if triggered.
 
@@ -669,6 +671,13 @@ class TaskInterceptor:
         default ``_UNSET`` keeps the backend call byte-identical to today's,
         so every existing caller is unaffected. Purely a pass-through: no
         gate logic, event payload, or reconciliation behavior is added here.
+
+        ``agent_id`` (task 2175/rho1b) classifies the caller into an
+        :class:`~shared.task_transitions.ActorClass` for the transition-
+        legality gate in ``_apply_status_transition``. Keyword-optional and
+        forwarded per-id through the CSV loop so a comma-separated call is
+        classified identically to a single-id call; every existing internal
+        caller omits it and is unaffected (``None`` -> HUMAN, safe-open).
         """
         if err := await self._backlog_gate(project_root):
             return err
@@ -687,6 +696,7 @@ class TaskInterceptor:
                     reopen_reason=reopen_reason,
                     claimant_run_id=claimant_run_id,
                     heartbeat_at=heartbeat_at,
+                    agent_id=agent_id,
                 )
                 results.append({'task_id': tid, 'result': per_result})
             all_ok = all(
@@ -704,6 +714,7 @@ class TaskInterceptor:
             reopen_reason=reopen_reason,
             claimant_run_id=claimant_run_id,
             heartbeat_at=heartbeat_at,
+            agent_id=agent_id,
         )
 
     async def _apply_status_transition(
@@ -717,6 +728,7 @@ class TaskInterceptor:
         reopen_reason: str | None,
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
+        agent_id: str | None = None,
     ) -> dict:
         """Single-id status transition with all gates + event emission.
 
@@ -894,6 +906,41 @@ class TaskInterceptor:
                 _hook_err = await _run_hook(task_id, project_root)
                 if _hook_err is not None:
                     return _hook_err
+
+            # 2e. Transition-legality gate (Table A, task 2175/rho1b).
+            # Classifies the caller into an ActorClass and checks the
+            # (old_status, status, actor) triple against the shared transition
+            # authority (shared.task_transitions). Runs after every other gate
+            # and immediately before the write so old_status/status/actor are
+            # all in scope. An out-of-vocabulary old/new status (ValueError
+            # from TaskStatus coercion) is a vocabulary rejection — rho1a's
+            # job, not this gate's — so it is treated as legal (never brick).
+            # reopen mirrors the terminal-exit gate above (2a): a terminal->X
+            # write that already cleared that gate (resolved_reopen_reason set)
+            # is treated as a legal reopen by the table, not double-flagged.
+            # Default (task_status.enforce_transitions=False) is LOG-MODE: an
+            # illegal verdict logs a grep-stable WARNING and the write still
+            # proceeds. Set True only after the Gamma soak: a typed
+            # illegal_transition rejection short-circuits before the write.
+            actor = derive_actor_class(agent_id)
+            try:
+                _legal_transition = is_legal_transition(
+                    old_status,
+                    status,
+                    actor,
+                    reopen=(resolved_reopen_reason is not None),
+                )
+            except ValueError:
+                _legal_transition = True
+            if not _legal_transition:
+                if self._enforce_transitions():
+                    return _illegal_transition_error(task_id, old_status, status, str(actor))
+                logger.warning(
+                    'illegal_transition would-reject %s->%s actor=%s',
+                    old_status,
+                    status,
+                    actor,
+                )
 
             # 3. Execute status change. Convert the typed DTO to a plain
             # dict so callers can tack on the reconciliation key below.
@@ -3630,6 +3677,20 @@ class TaskInterceptor:
         recon = getattr(cfg, 'reconciliation', None)
         return bool(getattr(recon, 'require_done_provenance', False))
 
+    def _enforce_transitions(self) -> bool:
+        """True when the transition-legality gate is enforcing (reject illegal).
+
+        False during phased rollout (log-mode default) — in that mode an
+        illegal ``(from, to, actor)`` transition logs a
+        ``illegal_transition would-reject`` WARNING and the transition
+        proceeds. Mirrors :meth:`_require_done_provenance`.
+        """
+        cfg = self._config
+        if cfg is None:
+            return False
+        task_status = getattr(cfg, 'task_status', None)
+        return bool(getattr(task_status, 'enforce_transitions', False))
+
 
 def _extract_status(task_data: dict) -> str:
     """Extract status from Taskmaster get_task response."""
@@ -3707,6 +3768,35 @@ def _terminal_exit_error(task_id: str, from_status: str, to_status: str) -> dict
             "override — e.g. 'un-defer script', 'manual re-scope', "
             "'reconciliation: re-implementation required'. The reason is "
             'persisted as task metadata for audit.'
+        ),
+    }
+
+
+def _illegal_transition_error(
+    task_id: str, from_status: str, to_status: str, actor: str,
+) -> dict:
+    """Structured error returned when the transition-legality gate rejects (enforce-mode).
+
+    Mirrors :func:`_terminal_exit_error` in shape so MCP callers handle the
+    rejection uniformly. Only returned when
+    ``task_status.enforce_transitions=True``; in the default log-mode the
+    same illegal verdict instead logs a ``illegal_transition would-reject``
+    WARNING and the transition proceeds.
+    """
+    return {
+        'success': False,
+        'error': 'illegal_transition',
+        'task_id': task_id,
+        'from_status': from_status,
+        'to_status': to_status,
+        'actor': actor,
+        'hint': (
+            f'Transition from {from_status!r} to {to_status!r} is not permitted '
+            f'for actor {actor!r} (task-status-authority Table A). This is '
+            'enforced because task_status.enforce_transitions=True; during the '
+            'phased log-mode rollout the same verdict only logs a warning and '
+            'proceeds. If this transition should be legal, the shared Table A '
+            '(shared/src/shared/task_transitions.py) needs updating, not this gate.'
         ),
     }
 
