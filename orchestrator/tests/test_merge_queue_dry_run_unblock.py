@@ -507,3 +507,47 @@ class TestUnscopedTypecheckFailedSpawns:
             f'Expected main-health-red reason prefix; got {outcome.reason!r}'
         )
         run_dry_run_mock.assert_not_awaited()
+
+
+class TestUnblockAutoDisabledSkipsSpawn:
+    """Step-7 (RED): unblock_auto.enabled=False must suppress the spawn even
+    when dry_run_handles carries a live scheduler."""
+
+    def test_unblock_auto_disabled_skips_spawn(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        config.unblock_auto.enabled = False
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+
+        handles = _make_handles()
+        run_dry_run_mock = AsyncMock(return_value=None)
+
+        async def _run() -> MergeOutcome | None:
+            with (
+                patch(
+                    'orchestrator.merge_queue.run_scoped_verification',
+                    new=AsyncMock(return_value=COMPILE_ERROR_RESULT),
+                ),
+                patch(
+                    'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                    new=AsyncMock(return_value=(False, '')),
+                ),
+                patch(
+                    'orchestrator.merge_queue.run_dry_run_unblock',
+                    new=run_dry_run_mock,
+                ),
+            ):
+                outcome = await _drive_verify_with_handles(
+                    req, merge_wt, git_ops, dry_run_handles=handles,
+                )
+                await asyncio.sleep(0)
+                return outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        run_dry_run_mock.assert_not_awaited()
