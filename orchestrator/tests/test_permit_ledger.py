@@ -493,3 +493,74 @@ class TestPermitStorageSlot:
         )
 
         assert entry.permit is None
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED / step-6 GREEN (task 2161): cap_permit storage slot on
+# RealMergeItem (replaces counts_against_cap: bool)
+# ---------------------------------------------------------------------------
+
+
+class TestCapPermitStorageSlot:
+    """RealMergeItem carries an optional ``cap_permit`` (a :class:`CapPermit`
+    or ``None``) REPLACING the old ``counts_against_cap: bool`` field --
+    permit PRESENCE is now the counts-against-cap signal, mirroring how
+    ``permit: SpecPermit | None`` already tracks speculation-slot ownership
+    (task 2161 step-5).
+
+    RED until step-6 GREEN renames ``RealMergeItem.counts_against_cap: bool``
+    to ``cap_permit: CapPermit | None = None``.
+    """
+
+    def test_real_merge_item_carries_a_cap_permit(self) -> None:
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_types import CapPermit, RealMergeItem
+
+        p = CapPermit()
+        item = RealMergeItem(
+            request=MagicMock(),
+            merge_result=MergeResult(success=True, merge_commit='deadbeef'),
+            merge_wt=Path('/fake/merge-wt'),
+            base_sha='aabbccdd',
+            speculative=False,
+            cap_permit=p,
+        )
+
+        assert item.cap_permit is p
+
+    def test_real_merge_item_cap_permit_defaults_to_none(self) -> None:
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_types import RealMergeItem
+
+        item = RealMergeItem(
+            request=MagicMock(),
+            merge_result=MergeResult(success=True, merge_commit='deadbeef'),
+            merge_wt=Path('/fake/merge-wt'),
+            base_sha='aabbccdd',
+            speculative=False,
+        )
+
+        assert item.cap_permit is None
+
+    def test_real_merge_item_no_longer_has_counts_against_cap(self) -> None:
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from orchestrator.git_ops import MergeResult
+        from orchestrator.merge_types import RealMergeItem
+
+        item = RealMergeItem(
+            request=MagicMock(),
+            merge_result=MergeResult(success=True, merge_commit='deadbeef'),
+            merge_wt=Path('/fake/merge-wt'),
+            base_sha='aabbccdd',
+            speculative=False,
+        )
+
+        assert not hasattr(item, 'counts_against_cap')
