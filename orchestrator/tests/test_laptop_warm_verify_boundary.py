@@ -491,7 +491,9 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
       second run's reset_persistent_merge_worktree -- reap_build_artifact_dirs
       retention (PRD SS10 invariant 1: source bit-identical to fresh checkout,
       build-cache dirs retained for warmth);
-    * both VerifyResults are passed=True, category=='', contention is None --
+    * both VerifyResults are passed=True, category=='passed' (rc==0's
+      ``_classify_failure`` value -- verify.py:643-644 -- not one of the
+      failure sentinels like FLOCK_CONTENTION_CATEGORY), contention is None --
       structurally unchanged by the live heartbeat;
     * is_flock_contention_failure(result) is False for both -- the REAL beta
       discriminant predicate that gates _run_post_merge_verify's escalation
@@ -549,8 +551,8 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
 
     for n, result in ((1, result_1), (2, result_2)):
         assert result.passed is True, f'run {n}: expected passed=True, got {result!r}'
-        assert result.category == '', (
-            f'run {n}: expected no category on a happy-path result, got '
+        assert result.category == 'passed', (
+            f'run {n}: expected the happy-path category (rc==0 -> "passed"), got '
             f'{result.category!r}'
         )
         assert result.contention is None, (
