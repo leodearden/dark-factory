@@ -115,3 +115,47 @@ async def count_non_cancelled(backend, project_root: str) -> int:
     """
     listing = await backend.get_tasks(project_root=project_root)
     return len([t for t in listing['tasks'] if t['status'] != 'cancelled'])
+
+
+# ── BT-A1: curator submit→resolve, two-way integration ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_bt_a1_submit_resolve_two_way_candidate_key_collision(real_stack):
+    """Two submit_and_resolve calls with the same normalized (title, files)
+    — curator OFF (config=None) so BOTH tickets dispatch CREATE straight to
+    tm.add_task. The 1st commits; the 2nd trips the real partial UNIQUE
+    index on (tag, candidate_key) (producer/backend), and the interceptor's
+    create-dispatch resolves the raised DuplicateCandidateKeyError as
+    'combined' (consumer) — the end-to-end integration the isolated unit
+    tests (backend-only producer test; interceptor test with a mocked
+    add_task) do not exercise together.
+    """
+    interceptor, backend, project_root = real_stack
+
+    first = await submit_and_resolve(
+        interceptor, project_root,
+        title='Fix parser',
+        metadata={'files': ['a.py', 'b.py']},
+    )
+    assert first['id'] == '1', f'expected the first submit to create id=1; got {first!r}'
+
+    # Case + extra internal whitespace on the title, file order swapped —
+    # compute_candidate_key is case/whitespace-insensitive on title and
+    # order-insensitive on files, so this collides with the first row.
+    second = await submit_and_resolve(
+        interceptor, project_root,
+        title='fix  parser',
+        metadata={'files': ['b.py', 'a.py']},
+    )
+    assert second['id'] == first['id'], (
+        f'expected the collision to resolve onto id={first["id"]!r}; got {second!r}'
+    )
+    assert second.get('action') == 'candidate_key_collision', second
+    assert second.get('deduplicated') is True, second
+
+    non_cancelled = await count_non_cancelled(backend, project_root)
+    assert non_cancelled == 1, (
+        f'expected exactly one non-cancelled row (no orphan from the rejected '
+        f'2nd insert); got {non_cancelled}'
+    )
