@@ -242,3 +242,59 @@ class TestRepairDuplicateEdgeUuids:
 
         assert result == 0
         graph.query.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# step-5/step-6: GraphitiBackend._run_startup_identity_scan — per-graph orchestrator
+# ---------------------------------------------------------------------------
+
+class TestRunStartupIdentityScan:
+    """GraphitiBackend._run_startup_identity_scan() — per-graph orchestrator."""
+
+    @pytest.mark.asyncio
+    async def test_scans_and_repairs_every_graph_and_aggregates_stats(
+        self, mock_config, make_backend,
+    ):
+        backend = make_backend(mock_config)
+        backend.list_graphs = AsyncMock(return_value=['g1', 'g2'])
+        backend._scan_duplicate_entity_names = AsyncMock(return_value=[('Foo', 2)])
+        backend._repair_duplicate_edge_uuids = AsyncMock(return_value=3)
+
+        stats = await backend._run_startup_identity_scan()
+
+        assert backend._scan_duplicate_entity_names.await_count == 2
+        assert backend._repair_duplicate_edge_uuids.await_count == 2
+        backend._scan_duplicate_entity_names.assert_any_call('g1')
+        backend._scan_duplicate_entity_names.assert_any_call('g2')
+        backend._repair_duplicate_edge_uuids.assert_any_call('g1')
+        backend._repair_duplicate_edge_uuids.assert_any_call('g2')
+
+        assert stats['graphs_scanned'] == 2
+        assert stats['dup_name_groups'] == 2  # one duplicated name per graph, summed
+        assert stats['edges_repaired'] == 6  # 3 per graph, summed
+
+    @pytest.mark.asyncio
+    async def test_one_graph_failure_does_not_abort_the_sweep(
+        self, mock_config, make_backend, caplog,
+    ):
+        """Per-graph best-effort: a raise on one graph is caught and logged,
+        and the sweep still processes the remaining graphs (mirrors the
+        initialize() index-setup loop idiom, graphiti_client.py:378-385)."""
+        backend = make_backend(mock_config)
+        backend.list_graphs = AsyncMock(return_value=['g1', 'g2'])
+        backend._scan_duplicate_entity_names = AsyncMock(return_value=[])
+
+        async def repair_side_effect(group_id):
+            if group_id == 'g1':
+                raise RuntimeError('boom')
+            return 3
+
+        backend._repair_duplicate_edge_uuids = AsyncMock(side_effect=repair_side_effect)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'):
+            stats = await backend._run_startup_identity_scan()  # must not raise
+
+        assert backend._repair_duplicate_edge_uuids.await_count == 2  # g2 still processed
+        assert stats['graphs_scanned'] == 2
+        assert stats['edges_repaired'] == 3  # only g2's 3 counted; g1 failed
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
