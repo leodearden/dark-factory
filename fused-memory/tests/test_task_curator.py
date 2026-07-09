@@ -4752,3 +4752,159 @@ class TestCuratorBatchPremiseRefutedDrop:
         assert decisions2[0].action == "create"
         assert not decisions2[0].justification.startswith("recon-premise-refuted:")
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-2085 step-7 RED: TestCuratorMaybeRouteDeterministic
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _make_operational_registry_yaml(
+    tmp_path, title_subs, desc_subs, name="test_operational_entry", reason="test operational reason",
+):
+    """Write a minimal operational-ask registry YAML and return its path."""
+    import yaml
+    content = [{
+        "name": name,
+        "reason": reason,
+        "title_substrings": title_subs,
+        "description_substrings": desc_subs,
+    }]
+    p = tmp_path / "operational_ask_registry.yaml"
+    p.write_text(yaml.dump(content), encoding="utf-8")
+    return p
+
+
+def _make_config_with_operational_registry(registry_path_str: str) -> FusedMemoryConfig:
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(operational_ask_registry_path=registry_path_str)
+    return cfg
+
+
+@pytest.mark.asyncio
+class TestCuratorMaybeRouteDeterministic:
+    """Unit tests for TaskCurator._maybe_route_deterministic — mirrors the
+    _maybe_blocklist_drop / _maybe_premise_refuted_drop method shape (lazy-load
+    once, cwd-relative path resolution, never raises) but returns
+    action='route_deterministic' and is deliberately NOT cached.
+    """
+
+    async def test_matching_candidate_returns_route_decision(self, tmp_path):
+        """(a) A candidate matching a registry entry returns
+        action=='route_deterministic' with a justification naming the entry."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is not None
+        assert decision.action == "route_deterministic"
+        assert "test_operational_entry" in decision.justification
+
+    async def test_non_matching_candidate_returns_none(self, tmp_path):
+        """(b) A non-matching candidate returns None."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Fix a normal bug in the retry loop",
+            description="Nothing operational here.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
+
+    async def test_registry_path_none_returns_none(self, tmp_path):
+        """(c) operational_ask_registry_path=None returns None."""
+        config = _make_config()  # default CuratorConfig has path=None
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
+
+    async def test_missing_registry_file_returns_none(self, tmp_path):
+        """(d) A missing registry file degrades to None rather than raising."""
+        nonexistent = tmp_path / "does_not_exist.yaml"
+        config = _make_config_with_operational_registry(str(nonexistent))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
+
+    async def test_malformed_registry_file_returns_none(self, tmp_path):
+        """(d) A malformed (non-list top-level) registry file degrades to None."""
+        bad_yaml = tmp_path / "bad_operational_ask_registry.yaml"
+        bad_yaml.write_text("just_a_key: just_a_value\n", encoding="utf-8")
+        config = _make_config_with_operational_registry(str(bad_yaml))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        decision = await curator._maybe_route_deterministic(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is None
+
+    async def test_route_decision_not_stored_in_cache(self, tmp_path):
+        """(e) The route decision is NOT written to the idempotency cache —
+        mirrors the premise-refuted no-cache assertion. A route must never
+        pin a stale decision after the born-at-L2 gate task already exists."""
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+        payload_hash = candidate.payload_hash()
+
+        decision = await curator._maybe_route_deterministic(candidate, payload_hash)
+
+        assert decision is not None
+        assert decision.action == "route_deterministic"
+        assert curator._check_cache(payload_hash) is None
+
