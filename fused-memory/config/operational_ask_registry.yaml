@@ -32,6 +32,16 @@
 #     standing registry entry.
 #   - When a re-proposed ask slips through by paraphrasing, add the new
 #     phrasing as an additional description_substrings entry here.
+#   - Safety net (2085 amendment): operational_ask_registry.py's
+#     match_candidate() unconditionally refuses to match ANY entry when the
+#     candidate title contains "fix", "bug", "crash", or "implement" — e.g.
+#     "Fix a bug in merge_entities against the live FalkorDB graph" would
+#     otherwise satisfy the merge_entities_live_graph entry below even
+#     though it is a code fix, not an operational ask. This is a backstop,
+#     not a substitute for tight anchors: still prefer a specific
+#     script/tool/namespace name over a bare, generic word as a title
+#     anchor, and never add an entry whose title plausibly implies a code
+#     change.
 # ============================================================
 
 - name: prune_recon_cycle_summaries_apply

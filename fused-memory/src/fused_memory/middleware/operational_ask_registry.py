@@ -9,6 +9,16 @@ author a RED->GREEN plan for that shape of work, so a match here routes the
 candidate straight to a deterministic PURE-GATE (born-at-L2 milestone gate)
 instead of letting it reach the architect and bounce as "unactionable".
 
+A registry entry's title/description substrings can incidentally co-occur in
+a legitimate CODE-FIX title too — e.g. "Fix a bug in merge_entities against
+the live FalkorDB graph" satisfies the merge_entities_live_graph entry's
+anchors even though the task is a bug fix, not an operational ask. Because a
+route decision short-circuits the LLM entirely, there is no downstream
+classifier to catch that false positive (2085 amendment). ``match_candidate``
+therefore checks the candidate's title against ``_CODE_CHANGE_TITLE_SIGNALS``
+first and unconditionally refuses to match when one is present, so such
+asks still reach the architect.
+
 Usage::
 
     from fused_memory.middleware.operational_ask_registry import (
@@ -153,6 +163,24 @@ def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
     return entries
 
 
+# Title phrases that strongly signal the candidate describes a CODE change (a
+# bug/crash fix or a new-feature implementation) rather than an operational
+# live-data/live-mutation ask. Checked BEFORE any registry entry in
+# match_candidate(): a registry entry's positive title/description
+# substrings can co-occur incidentally with one of these in a legitimate
+# code-fix title — e.g. "Fix a bug in merge_entities against the live
+# FalkorDB graph" independently satisfies the merge_entities_live_graph
+# entry's anchors even though the task is a code fix, not an operational ask
+# (2085 amendment). This is a deliberately conservative, registry-wide
+# guard: a false negative here just means a genuinely-operational ask falls
+# through to the architect and bounces "unactionable" again (the pre-2085
+# status quo, self-healed by adding/adjusting a registry entry) — whereas a
+# false positive silently skips the architect and stalls a real code change
+# at a born-at-L2 gate a human is unlikely to reject. Precision is favored
+# over recall.
+_CODE_CHANGE_TITLE_SIGNALS: tuple[str, ...] = ("fix", "bug", "crash", "implement")
+
+
 def match_candidate(
     candidate: CandidateTask,
     entries: list[OperationalAskEntry],
@@ -165,12 +193,24 @@ def match_candidate(
     - AT LEAST ONE string in ``entry.description_substrings`` must appear in
       the combined ``candidate.description + " " + candidate.details``.
 
+    Before consulting any entry, the candidate's title is checked against
+    ``_CODE_CHANGE_TITLE_SIGNALS`` — a hit (e.g. "fix", "bug", "crash",
+    "implement") unconditionally returns ``None`` regardless of entry
+    substrings, since such a title indicates a code change that must still
+    reach the TDD architect (2085 amendment: closes the false-positive gap
+    where a bug-fix title incidentally satisfies an entry's positive
+    anchors — see module docstring).
+
     Returns the first match in list order (deterministic). Returns ``None``
     when *entries* is empty or no entry matches.
 
     Pure string operations — no regex, no async, no I/O.
     """
     title_lower = (candidate.title or "").lower()
+
+    if any(signal in title_lower for signal in _CODE_CHANGE_TITLE_SIGNALS):
+        return None
+
     desc_lower = (
         (candidate.description or "") + " " + (candidate.details or "")
     ).lower()

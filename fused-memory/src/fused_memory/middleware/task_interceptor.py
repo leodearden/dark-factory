@@ -1715,6 +1715,13 @@ class TaskInterceptor:
         meta = TaskInterceptor._extract_metadata_dict(metadata)
         if meta is None:
             if metadata is not None:
+                # NOTE: _extract_metadata_dict() already emitted a WARNING
+                # (via _warn_metadata_discard) when it failed to parse this
+                # non-None metadata. This second WARNING is intentional, not
+                # a duplicate bug — it names *this* call site
+                # (deterministic-pure-gate stamping) so the discard is
+                # greppable by caller, mirroring the identical double-log in
+                # _inject_routing_override above. Two log lines, one failure.
                 logger.warning(
                     'deterministic-pure-gate: non-dict metadata discarded (type=%s); '
                     'using fresh dict. Original value: %r',

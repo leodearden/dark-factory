@@ -363,6 +363,57 @@ class TestMatchCandidate:
         result = match_candidate(candidate, [entry])
         assert result is entry
 
+    @pytest.mark.parametrize(
+        "signal_word,title",
+        [
+            ("fix", "Fix merge_entities handling of live graph nodes"),
+            ("bug", "There is a bug in merge_entities against the live graph"),
+            ("crash", "merge_entities crashes when handling live graph nodes"),
+            ("implement", "Implement retry logic for merge_entities against the live graph"),
+        ],
+    )
+    def test_code_change_title_signal_suppresses_match(self, signal_word, title):
+        """(2085 amendment) A title containing a code-change signal word
+        ("fix"/"bug"/"crash"/"implement") never matches, even when it
+        independently satisfies an entry's title+description substrings —
+        this closes the false-positive gap a substring-only gate cannot
+        otherwise catch (reviewer example: a code-fix title that mentions
+        both "merge_entities" and "live" plus a description naming the
+        production graph)."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["merge_entities", "live"],
+            desc_subs=["FalkorDB", "production graph"],
+        )
+        candidate = self._make_candidate(
+            title=title,
+            description="Runs directly against the production graph in FalkorDB.",
+        )
+        # Sanity: absent the code-change guard, this candidate would match —
+        # all title substrings and a description substring are present.
+        assert all(sub.lower() in title.lower() for sub in entry.title_substrings)
+
+        result = match_candidate(candidate, [entry])
+        assert result is None, (
+            f"expected the {signal_word!r} signal to suppress the match, got {result}"
+        )
+
+    def test_code_change_title_signal_is_case_insensitive(self):
+        """The code-change guard matches regardless of title case."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entry = self._make_entry(
+            title_subs=["merge_entities", "live"],
+            desc_subs=["FalkorDB"],
+        )
+        candidate = self._make_candidate(
+            title="FIX merge_entities against the live graph",
+            description="Talks to FalkorDB.",
+        )
+        result = match_candidate(candidate, [entry])
+        assert result is None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # step-5 RED: TestSeedOperationalAskRegistry
@@ -490,3 +541,28 @@ class TestSeedOperationalAskRegistry:
         )
         entry = match_candidate(candidate, entries)
         assert entry is None, f"Expected no match for unrelated candidate, got {entry.name!r}"
+
+    def test_code_fix_naming_merge_entities_and_live_falkordb_does_not_match(self):
+        """(2085 amendment, reviewer near-miss) A code-fix candidate that
+        legitimately mentions merge_entities + live + FalkorDB — exactly the
+        anchors merge_entities_live_graph keys on — must NOT be routed to a
+        deterministic PURE-GATE. Without the _CODE_CHANGE_TITLE_SIGNALS guard
+        in match_candidate(), this candidate would satisfy that entry's
+        title_substrings (["merge_entities", "live"]) and description_substrings
+        (["FalkorDB", "production graph"]) purely by co-incidence, silently
+        skipping the architect and stranding a real bug fix at a human gate."""
+        from fused_memory.middleware.operational_ask_registry import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title="Fix a bug in merge_entities against the live FalkorDB graph",
+            description=(
+                "merge_entities crashes when merging duplicate nodes on the "
+                "production graph; add a null check and a regression test."
+            ),
+        )
+        entry = match_candidate(candidate, entries)
+        assert entry is None, (
+            f"Expected no match for a code-fix candidate naming merge_entities "
+            f"+ live + FalkorDB, got {entry.name!r}"
+        )
