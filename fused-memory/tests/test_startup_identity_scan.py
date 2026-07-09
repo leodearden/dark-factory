@@ -355,3 +355,172 @@ class TestInitializeRunsIdentityScan:
         backend._run_startup_identity_scan = AsyncMock(side_effect=RuntimeError('boom'))
 
         await backend.initialize()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# step-9: live-FalkorDB semantic pins — authoritative B5+B6 signal
+# ---------------------------------------------------------------------------
+#
+# The mock tests above can only pin the Cypher string/params shape, not
+# FalkorDB's actual count(*) grouping, its enforcement of per-uuid
+# uniqueness, or whether ID(e) enumeration + `WHERE ID(e) = $eid` keying
+# genuinely rewrites the intended edge while leaving the rest untouched.
+# These tests pin the true B5/B6 semantics against a REAL FalkorDB server,
+# mirroring test_merge_entities.py:1021-1131 (task 2207 W6-δ's own live
+# pin for the sibling redirect_node_edges fix).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@pytest.mark.timeout(15)
+class TestScanDuplicateEntityNamesLiveFalkorDB:
+    """Pin the true B5 dup-node alarm semantics against a REAL FalkorDB
+    server: real count(*) grouping by name, and the `n.group_id =
+    $group_id` property predicate genuinely excludes a foreign-group_id
+    clone physically stored in the same graph key (the task-2115 leak
+    scenario) from the alarm."""
+
+    @pytest.mark.asyncio
+    async def test_scan_finds_real_duplicates_excludes_unique_and_foreign_group(
+        self, mock_config, startup_scan_live_graph, caplog,
+    ):
+        graph_name, graph = startup_scan_live_graph
+
+        # Two same-group 'Foo' nodes (a real duplicate), one unique 'Bar',
+        # and a foreign-group_id 'Foo' clone physically planted in this same
+        # graph key (the task-2115 leak scenario) that must NOT count.
+        await graph.query(
+            "CREATE "
+            "(:Entity {uuid: 'foo1', name: 'Foo', group_id: $gid}), "
+            "(:Entity {uuid: 'foo2', name: 'Foo', group_id: $gid}), "
+            "(:Entity {uuid: 'bar1', name: 'Bar', group_id: $gid}), "
+            "(:Entity {uuid: 'foreign1', name: 'Foo', group_id: 'foreign'})",
+            {'gid': graph_name},
+        )
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'):
+                result = await backend._scan_duplicate_entity_names(graph_name)
+
+            # Real count(*) grouping: only the same-group 'Foo' pair counts.
+            # 'Bar' is unique (excluded); the foreign-group 'Foo' clone is
+            # excluded by the `n.group_id = $group_id` predicate.
+            assert result == [('Foo', 2)]
+
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert any(graph_name in r.message and 'Foo' in r.message for r in warnings), (
+                f'expected a WARNING naming the group and duplicated name, got: '
+                f'{[r.message for r in warnings]}'
+            )
+        finally:
+            await backend.close()
+
+
+@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@pytest.mark.timeout(15)
+class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
+    """Pin the true B6 dup-uuid-edge repair semantics against a REAL
+    FalkorDB server: after repair, no RELATES_TO uuid is shared by more than
+    one edge, the re-minted edge carries a superseded_edge_uuid audit prop
+    equal to the uuid it replaced, no edges are lost, fact_embedding
+    survives intact, and a second call is a true no-op (idempotent).
+
+    Seeds a PRE-EXISTING dup-uuid pair between two DIFFERENT node pairs --
+    the discriminating scenario for this repair (a clean distinct-uuid seed
+    would already be graph-wide unique and would not exercise the repair
+    path at all).
+    """
+
+    @pytest.mark.asyncio
+    async def test_repair_fixes_real_dup_uuids_no_loss_preserves_embeddings_idempotent(
+        self, mock_config, startup_scan_live_graph,
+    ):
+        graph_name, graph = startup_scan_live_graph
+
+        await graph.query(
+            "CREATE (:Entity {uuid: 'a', name: 'A'}), "
+            "(:Entity {uuid: 'b', name: 'B'}), "
+            "(:Entity {uuid: 'c', name: 'C'}), "
+            "(:Entity {uuid: 'd', name: 'D'})"
+        )
+
+        async def seed_edge(src, dst, edge_uuid, fact, embedding):
+            await graph.query(
+                'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+                'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b) '
+                'SET e.fact_embedding = vecf32($embedding)',
+                {
+                    'src': src, 'dst': dst, 'edge_uuid': edge_uuid,
+                    'name': 'rel', 'fact': fact, 'embedding': embedding,
+                },
+            )
+
+        # One distinct-uuid edge (must be left untouched) plus a
+        # PRE-EXISTING dup-uuid pair ('dup') between two DIFFERENT node
+        # pairs.
+        await seed_edge('a', 'b', 'distinct1', 'a relates to b', [1.0, 2.0])
+        await seed_edge('c', 'd', 'dup', 'c relates to d', [3.0, 4.0])
+        await seed_edge('a', 'd', 'dup', 'a relates to d', [5.0, 6.0])
+
+        backend = GraphitiBackend(mock_config)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            result = await backend._repair_duplicate_edge_uuids(graph_name)
+            # (a) One dup-uuid group of size 2 -> re-mint 1, keep 1 survivor.
+            assert result == 1
+
+            # (b) Graph-wide: no uuid is shared by more than one RELATES_TO
+            # edge anymore.
+            dup_check = await graph.query(
+                'MATCH ()-[e:RELATES_TO]->() '
+                'WITH e.uuid AS u, count(*) AS c '
+                'WHERE c > 1 '
+                'RETURN count(u)'
+            )
+            assert dup_check.result_set[0][0] == 0
+
+            # (c) Edge set preserved: still exactly 3 RELATES_TO edges (none
+            # lost or merged by the repair).
+            all_edges = await graph.query(
+                'MATCH ()-[e:RELATES_TO]->() '
+                'RETURN e.uuid, e.superseded_edge_uuid, e.fact_embedding, e.fact'
+            )
+            rows = all_edges.result_set
+            assert len(rows) == 3
+
+            # (d) The re-minted edge carries superseded_edge_uuid == 'dup'
+            # and its fact_embedding survived intact.
+            reminted = [r for r in rows if r[1] == 'dup']
+            assert len(reminted) == 1
+            new_uuid, superseded, embedding, fact = reminted[0]
+            assert new_uuid != 'dup'
+            assert fact in ('c relates to d', 'a relates to d')
+            expected_embedding = [3.0, 4.0] if fact == 'c relates to d' else [5.0, 6.0]
+            assert list(embedding) == pytest.approx(expected_embedding)
+
+            # The dup group's survivor kept its original uuid untouched...
+            survivor = [r for r in rows if r[0] == 'dup']
+            assert len(survivor) == 1
+            assert survivor[0][1] is None  # never repaired -> no superseded_edge_uuid
+
+            # ...and the unrelated distinct-uuid edge is unaffected.
+            distinct = [r for r in rows if r[0] == 'distinct1']
+            assert len(distinct) == 1
+            assert distinct[0][1] is None
+            assert list(distinct[0][2]) == pytest.approx([1.0, 2.0])
+
+            # (e) Idempotent: a second call finds nothing left to repair.
+            result2 = await backend._repair_duplicate_edge_uuids(graph_name)
+            assert result2 == 0
+
+            dup_check2 = await graph.query(
+                'MATCH ()-[e:RELATES_TO]->() '
+                'WITH e.uuid AS u, count(*) AS c '
+                'WHERE c > 1 '
+                'RETURN count(u)'
+            )
+            assert dup_check2.result_set[0][0] == 0
+        finally:
+            await backend.close()
