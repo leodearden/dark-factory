@@ -330,3 +330,45 @@ async def test_bt_a4_restart_durability_combine_still_fires(tmp_path):
         assert non_cancelled == 1, non_cancelled
     finally:
         await close_stack(interceptor2, backend2, event_buffer2)
+
+
+# ── BT-A5: cancel + re-file → new row, no false combine ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_bt_a5_cancel_then_refile_creates_new_row(real_stack):
+    """Cancelling the survivor then re-filing the identical (title, files)
+    via the real interceptor path creates a NEW non-cancelled row — the
+    partial UNIQUE index excludes cancelled rows
+    (``WHERE ... status != 'cancelled'``), so this is a legitimate refile,
+    not a false combine. Complements the backend-only BT-A5 unit
+    (test_sqlite_task_backend.py) by driving the real interceptor.
+    """
+    interceptor, backend, project_root = real_stack
+
+    first = await submit_and_resolve(
+        interceptor, project_root,
+        title='Fix parser',
+        metadata={'files': ['a.py', 'b.py']},
+    )
+    assert first['id'] == '1', first
+
+    await backend.set_task_status(first['id'], 'cancelled', project_root=project_root)
+
+    second = await submit_and_resolve(
+        interceptor, project_root,
+        title='Fix parser',
+        metadata={'files': ['a.py', 'b.py']},
+    )
+    assert second['id'] == '2', (
+        f'expected the refile to land as a new id=2 (cancelled rows are '
+        f'excluded from the partial index); got {second!r}'
+    )
+    assert not second.get('deduplicated'), (
+        f'expected a create disposition, not a combine; got {second!r}'
+    )
+    assert second.get('action') != 'candidate_key_collision', second
+
+    listing = await backend.get_tasks(project_root=project_root)
+    statuses_by_id = {t['id']: t['status'] for t in listing['tasks']}
+    assert statuses_by_id == {'1': 'cancelled', '2': 'pending'}, statuses_by_id
