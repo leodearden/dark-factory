@@ -4380,9 +4380,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # MQ-refactor zeta (task 2159): single owner of the semaphore above —
         # mediates every acquire/release through a SpecPermit token so
         # conservation (slot_available + len(live) == depth) holds by
-        # construction. The verifier-side releases (_resolve_and_release/
-        # _finalize_inflight/cascade) still target _speculation_slot directly
-        # (raw, not through the ledger) until task eta migrates them.
+        # construction. As of task eta (2160), the verifier-side releases
+        # (_resolve_and_release/_finalize_inflight/cascade/stop-drain) all
+        # route through self._speculation_ledger.release(item.permit) too,
+        # so conservation is structural pipeline-wide and len(live) is the
+        # authoritative outstanding-permit count (speculation_accounting_
+        # violations reads it directly).
         self._speculation_ledger = PermitLedger(
             self._speculation_slot, self._speculation_depth,
         )
@@ -4390,9 +4393,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # state machine (spec_base/prefetched/pending_spec_base/
         # pending_predecessor + the permit lifecycle) with EXPLICIT
         # ownership-transfer semantics. Holds a REFERENCE to the shared
-        # _speculation_ledger above (never its own) so the verifier-side
-        # releases (_resolve_and_release/_finalize_inflight/cascade) keep
-        # releasing the same underlying semaphore unchanged. See
+        # _speculation_ledger above (never its own). The verifier-side
+        # releases (_resolve_and_release/_finalize_inflight/cascade) now
+        # release THROUGH that shared ledger via item.permit (task eta,
+        # 2160) rather than raw-releasing the semaphore directly. See
         # merge_speculation_controller.py's module docstring for the full
         # lifecycle contract.
         self._speculation_controller = SpeculationController(

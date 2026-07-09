@@ -101,63 +101,49 @@ if TYPE_CHECKING:
 
 class PermitLedger:
     """Single owner of a shared speculation-slot semaphore (MQ-refactor zeta
-    / task 2159).
+    / task 2159). As of task eta (2160), this ledger is the pipeline's SOLE
+    conservation authority — every acquire (merger prefetch) and every
+    release (verifier drain: stop-drain, cascade, ``_finalize_inflight``,
+    ``_resolve_and_release``) routes through it.
 
     Wraps an externally-owned ``asyncio.Semaphore`` (injected — never owns or
     creates its own, mirroring :class:`SpeculationController`'s existing
     contract) and mediates acquire/release through a :class:`SpecPermit`
-    token registered in ``live``. Conservation is structural FOR CALLS MADE
-    THROUGH THIS LEDGER: immediately after any ``acquire()`` or ``release()``
-    call ON THIS LEDGER, ``slot_available + len(live) == depth`` holds,
-    because neither mutates across an ``await`` boundary — on the single
-    asyncio event loop, each pair (semaphore + ``live``) is therefore atomic
-    from every other coroutine's perspective. This is a per-call, ledger-local
-    invariant, NOT a whole-pipeline one during task zeta — see the next
-    paragraph for the gap and "Known interim cost" below for when it closes.
+    token registered in ``live``. Conservation is structural: immediately
+    after any ``acquire()`` or ``release()`` call ON THIS LEDGER,
+    ``slot_available + len(live) == depth`` holds, because neither mutates
+    across an ``await`` boundary — on the single asyncio event loop, each
+    pair (semaphore + ``live``) is therefore atomic from every other
+    coroutine's perspective. Since task eta migrated every verifier-side
+    release off the raw ``_speculation_slot.release()`` call and onto
+    ``ledger.release(item.permit)``, this identity now holds PIPELINE-WIDE,
+    not merely for calls made directly on this ledger: ``len(live)`` is the
+    single authoritative count of outstanding permits, and
+    ``speculation_accounting_violations`` reads it directly for its
+    conservation check (``merge_queue.py``).
 
-    In task zeta this ledger WRAPS the worker's existing
-    ``_speculation_slot`` while the verifier side continues to release that
-    same semaphore directly (raw, not through this ledger) — task eta
-    migrates those call sites to ``ledger.release(item.permit)``. Until then,
-    ``live`` is not yet the pipeline's sole source of truth for in-flight
-    permits; only the acquire/release paths already routed through this
-    ledger (currently just :class:`SpeculationController`'s merger-side
-    lifecycle) are covered by the identity above. Concretely, this identity
-    is actively FALSE pipeline-wide once a permit has transferred and
-    drained: ``SpeculationController.on_transfer``/``on_transfer_terminal``
-    drop the controller's reference without discarding the token from
-    ``live``, and the verifier's subsequent raw release then restores
-    ``slot_available`` — so ``slot_available + len(live) == depth + 1`` (and
-    ``+ N`` after N such outstanding transfers) until task eta lands. Nothing
-    in production reads ``len(live)`` for conservation during zeta
-    (``speculation_accounting_violations`` reads ``slot_available`` /
-    ``held_by_merger`` / ``inflight_speculative``, not ``live``), so this gap
-    has no safety consequence today — it is purely the accepted interim cost
-    described next.
+    Permit handoff across the merger→verifier boundary:
+    ``SpeculationController.on_transfer``/``on_transfer_terminal`` drop the
+    controller's own reference to a transferred permit and RETURN it to the
+    caller, WITHOUT calling ``release`` — the token stays registered in
+    ``live`` because it is still outstanding, merely changing owner from the
+    merger to the verifier. The merger stamps the returned token onto the
+    enqueued item's ``.permit`` field (``RealMergeItem``/``DecidedItem``,
+    fields added by task zeta) immediately after ``put()``, and that value is
+    copied onto ``InflightEntry.permit`` at dispatch — so the verifier can
+    later call ``ledger.release(item.permit)`` on that exact SAME token once
+    it drains the item, discarding it from ``live`` at that point.
 
-    Known interim cost (until task eta): ``SpeculationController.on_transfer``
-    / ``on_transfer_terminal`` deliberately drop the controller's own
-    reference to a transferred permit WITHOUT calling ``release`` on it — the
-    verifier now owns that token and (in zeta) still releases the underlying
-    semaphore directly, raw, never through this ledger. So a transferred
-    permit is never discarded from ``live`` either: it stays registered for
-    the remainder of the process's zeta-era lifetime, one retained
-    :class:`SpecPermit` object per speculative transfer. This is intentional,
-    not a bug — discarding it at transfer time instead would make a later,
-    eta-migrated verifier's ``ledger.release(item.permit)`` call fail its
-    liveness check, since the very point of storing ``permit`` on
-    ``RealMergeItem``/``DecidedItem``/``InflightEntry`` (also task zeta) is
-    for the verifier to release that SAME still-live token once eta threads
-    it through. Net effect: ``live`` is a small, slow, real memory growth and
-    is NOT GC-safe in isolation before task eta lands — task eta closes this
-    by routing the verifier's release through ``ledger.release(item.permit)``,
-    which discards the token from ``live`` at that point. Tracked as a
-    follow-up dependency (not just this paragraph) via escalation
-    ``esc-2159-3``: a bounded/weak registry or periodic prune was considered
-    and rejected as an interim mitigation — before eta populates
-    ``item.permit``, ``live`` is the only strong reference to a transferred
-    token, so a weak registry would collect it prematurely and falsify the
-    very identity this class maintains.
+    This closes the task-zeta-era interim cost tracked via escalation
+    ``esc-2159-3``: before task eta, the verifier released the underlying
+    semaphore directly (raw, bypassing this ledger), so a transferred token
+    was never discarded from ``live`` and accumulated for the remainder of
+    the process's lifetime — a small, slow, real memory leak, though not a
+    safety issue at the time since nothing yet read ``len(live)`` for
+    conservation. Now that every verifier-side release routes through
+    ``ledger.release(item.permit)``, each token is discarded from ``live``
+    exactly once, at the point it is actually released, so ``live``'s size
+    tracks only genuinely-outstanding permits.
     """
 
     def __init__(self, slot: asyncio.Semaphore, depth: int) -> None:
