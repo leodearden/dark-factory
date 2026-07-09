@@ -228,3 +228,64 @@ class TestB1WriterReaderRoundTrip:
         assert '42' in harness._recovered_plans
         assert lane.exists()
         assert rec.state != DurableLaneState.QUARANTINED
+
+
+# ── B2 — crash->quarantine (orphaned admin-entry divergence) ───────────
+
+
+@pytest.mark.asyncio
+class TestB2CrashQuarantine:
+    """B2: the durable record says ASSIGNED:42, but the lane's git admin
+    entry (.git/worktrees/<lane>) is gone (the 2097/2098 orphaned-
+    registration divergence) — recovery must QUARANTINE, never re-pin.
+    """
+
+    async def test_orphaned_registration_quarantines_never_repins(
+        self, ig_git_repo: Path, caplog,
+    ):
+        import logging
+
+        repo = ig_git_repo
+        await _add_warm_lane_scripts(repo)
+        harness = _build_harness(_make_orch_config(repo))
+        _wire_recovery_scheduler(harness)
+
+        head = await _get_head(repo)
+        lane = await _acquire_lane(harness.git_ops, '42', head)
+        assert (repo / '.git' / 'worktrees' / lane.name).exists()
+
+        harness.git_ops.warm_lane_pool = WarmLanePool(
+            worktree_base=harness.git_ops.worktree_base,
+            size=harness.git_ops.warm_lane_pool.size,
+        )
+
+        # Simulate the 2097/2098 orphan: the admin entry is gone but the
+        # lane dir + durable record survive.
+        shutil.rmtree(repo / '.git' / 'worktrees' / lane.name)
+        assert await harness.git_ops._is_registered_worktree(lane) is False
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._recover_crashed_tasks()
+
+        rec = harness.git_ops._lane_lifecycle.read(lane)
+        assert rec is not None
+        assert rec.state == DurableLaneState.QUARANTINED
+
+        pool = harness.git_ops.warm_lane_pool
+        assert pool.assignment_for('42') is None
+        assert pool.state(lane) == LaneState.FREE
+        assert '42' not in harness._recovered_plans
+
+        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}
+        assert EventType.worktree_quarantined in emitted
+
+        assert any(
+            log_rec.levelno == logging.WARNING
+            and '42' in log_rec.getMessage()
+            and 'quarantin' in log_rec.getMessage().lower()
+            for log_rec in caplog.records
+        ), f'expected a quarantine warning naming task 42; got: {caplog.text!r}'
+
+        # Next dispatch is clean: a different task can still acquire a lane.
+        result = await pool.acquire_for('task/99')
+        assert result is not None
