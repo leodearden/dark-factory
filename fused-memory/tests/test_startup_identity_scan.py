@@ -151,3 +151,94 @@ class TestScanDuplicateEntityNames:
 
         assert result == []
         assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# step-3/step-4: GraphitiBackend._repair_duplicate_edge_uuids — B6 dup-uuid-edge repair
+# ---------------------------------------------------------------------------
+
+class TestRepairDuplicateEdgeUuids:
+    """GraphitiBackend._repair_duplicate_edge_uuids(group_id) — dup-uuid-EDGE repair (B6)."""
+
+    @pytest.mark.asyncio
+    async def test_remints_all_but_first_edge_in_dup_group(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """A three-edge dup-uuid group re-mints the last two (the survivor
+        keeps eids[0]'s original uuid), returning the re-mint count. Neither
+        the detection query nor the per-edge repair queries carry a
+        group_id predicate -- the repair is graph-key-scoped so EVERY
+        RELATES_TO edge reaches per-uuid uniqueness, regardless of its
+        group_id property."""
+        backend = make_backend(mock_config)
+
+        async def router(cypher, params=None):
+            result = MagicMock()
+            if 'collect(ID(e))' in cypher:
+                result.result_set = [['shared-uuid', [101, 102, 103]]]
+            else:
+                result.result_set = []
+            return result
+
+        graph = make_graph_mock([])
+        graph.query = AsyncMock(side_effect=router)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        result = await backend._repair_duplicate_edge_uuids(group_id='g1')
+
+        assert result == 2
+
+        all_calls = graph.query.call_args_list
+        detection_calls = [c for c in all_calls if 'collect(ID(e))' in extract_cypher(c)]
+        repair_calls = [c for c in all_calls if 'WHERE ID(e) = $eid' in extract_cypher(c)]
+
+        assert len(detection_calls) == 1
+        assert 'group_id' not in extract_cypher(detection_calls[0])
+        assert 'group_id' not in extract_params(detection_calls[0])
+
+        assert len(repair_calls) == 2, (
+            f'expected one per-edge repair call per re-minted edge, got '
+            f'{len(repair_calls)}: {[extract_cypher(c) for c in repair_calls]}'
+        )
+
+        seen_new_uuids = set()
+        seen_eids = set()
+        for call in repair_calls:
+            cypher = extract_cypher(call)
+            params = extract_params(call)
+
+            assert 'SET' in cypher
+            assert 'e.uuid = $new_uuid' in cypher
+            assert 'e.superseded_edge_uuid = $old_uuid' in cypher
+            assert 'e.uuid = old.uuid' not in cypher
+            assert 'group_id' not in cypher
+            assert 'group_id' not in params
+
+            eid = params.get('eid')
+            assert eid in (102, 103), f'survivor eid 101 must not be repaired, got {eid}'
+            seen_eids.add(eid)
+
+            assert params.get('old_uuid') == 'shared-uuid'
+
+            new_uuid = params.get('new_uuid')
+            assert new_uuid is not None
+            assert uuid.UUID(new_uuid).version == 4
+            seen_new_uuids.add(new_uuid)
+
+        assert seen_eids == {102, 103}
+        assert len(seen_new_uuids) == 2, 'each re-minted edge must get a DISTINCT fresh uuid'
+
+    @pytest.mark.asyncio
+    async def test_clean_graph_no_dup_uuids_is_noop(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """No dup-uuid groups -> return 0 and zero repair queries (only the
+        detection query ran)."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        result = await backend._repair_duplicate_edge_uuids(group_id='g1')
+
+        assert result == 0
+        graph.query.assert_awaited_once()
