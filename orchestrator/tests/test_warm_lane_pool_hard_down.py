@@ -49,6 +49,7 @@ class TestWarmBaseHardDownWatchdog:
             ),
         )
         scheduler = Scheduler(config, time_source=fake_clock)
+        scheduler.finish_startup()
         return scheduler, t
 
     def _install_callbacks(

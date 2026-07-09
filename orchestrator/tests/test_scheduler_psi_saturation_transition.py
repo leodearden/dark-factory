@@ -195,6 +195,7 @@ class _Driver:
         psi_feed: _PsiFeed,
     ) -> _Driver:
         scheduler = Scheduler(config, event_store=event_store, time_source=time_source)
+        scheduler.finish_startup()
         scheduler._read_psi_sample = psi_feed
         driver = cls(scheduler, event_store)
         driver._active = list(tasks)

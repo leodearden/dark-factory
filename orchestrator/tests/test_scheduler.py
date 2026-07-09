@@ -366,7 +366,9 @@ class TestGetTasksExceptionLogging:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_get_tasks_logs_exception_with_traceback(
@@ -405,7 +407,9 @@ class TestGetTasksNormalizesMetadata:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @staticmethod
     def _envelope(tasks: list[dict]) -> dict:
@@ -525,7 +529,9 @@ class TestGetTasksAndGetStatusFailsLoud:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @staticmethod
     def _envelope(payload: dict) -> dict:
@@ -664,7 +670,9 @@ class TestAcquireNextNoDuplicates:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_acquire_next_skips_already_dispatched(self, scheduler: Scheduler):
@@ -798,6 +806,7 @@ class TestAcquireNextNoDuplicates:
         the default may be overridden by a config.yaml or env var in this env.
         """
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1, lock_depth=2))
+        scheduler.finish_startup()
         task_a = {
             'id': 'A',
             'title': 'Task A',
@@ -842,7 +851,9 @@ class TestDepsSatisfied:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def test_deps_satisfied_returns_false_when_dep_in_progress(
         self, scheduler: Scheduler
@@ -899,7 +910,9 @@ class TestAcquireNextDependencyGating:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_acquire_next_blocks_on_in_progress_dependency(
@@ -1074,7 +1087,9 @@ class TestDepsSatisfiedLogging:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def test_deps_satisfied_logs_blocking_reason(
         self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
@@ -1108,7 +1123,9 @@ class TestGetModulesJsonStringMetadata:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def test_get_modules_extracts_modules_from_dict_metadata(
         self, scheduler: Scheduler
@@ -1234,7 +1251,9 @@ class TestGetModulesWriteThroughCache:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def test_derive_write_through_caches_derived_modules(self, scheduler: Scheduler):
         """After a real derive, _module_cache[task_id] equals the returned modules."""
@@ -1296,7 +1315,9 @@ class TestSeedModules:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def test_seed_modules_caches_derived_modules_for_real_files(
         self, scheduler: Scheduler
@@ -1348,7 +1369,9 @@ class TestUpdateTaskMetadataSerialization:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_update_task_serializes_dict_to_json_string(
@@ -1572,7 +1595,9 @@ class TestUpdateTaskStructuredRejection:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_update_task_returns_false_on_structured_rejection_wire_envelope(
@@ -1714,6 +1739,7 @@ class TestRequeueCooldown:
         """After release(requeued=True), task must not be re-acquired during cooldown."""
         config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -1734,6 +1760,7 @@ class TestRequeueCooldown:
         """After cooldown expires, task should be acquirable again."""
         config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -1758,6 +1785,7 @@ class TestRequeueCooldown:
         """Normal release (not requeued) should not impose a cooldown."""
         config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -1830,6 +1858,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -1858,6 +1887,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -1898,6 +1928,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -1926,6 +1957,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -1959,6 +1991,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=600.0)
         scheduler = Scheduler(config, time_source=fake_clock)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -2009,6 +2042,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         # Prime _last_dispatch_at as if task '42' was previously dispatched
         scheduler._last_dispatch_at['42'] = time.monotonic()
@@ -2056,6 +2090,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         # Prime both dicts as if task '42' has been scheduled before
         scheduler._skip_count['42'] = 5
@@ -2102,6 +2137,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         original_ts = time.monotonic()
         scheduler._last_dispatch_at['42'] = original_ts
@@ -2129,6 +2165,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -2180,6 +2217,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -2204,6 +2242,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -2267,6 +2306,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         # Simulate a prior dispatch — gate would be active for task '99'
         scheduler._last_dispatch_at['99'] = time.monotonic()
@@ -2313,6 +2353,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -2354,6 +2395,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         # Confirm directly: signal helper must return None for non-string reopen_reason
         assert scheduler._dispatch_cooldown_signal(task) is None, (
@@ -2395,6 +2437,7 @@ class TestDispatchCooldownGate:
 
         config = OrchestratorConfig(max_per_module=1, dispatch_cooldown_secs=1800.0)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -2516,6 +2559,7 @@ class TestFairness:
     async def test_skip_count_increments_when_top_passed_over(self, fair_config):
         """A (broad, top) fails, B (narrow, lower) succeeds → A's skip_count = 1."""
         scheduler = Scheduler(fair_config)
+        scheduler.finish_startup()
         # Seed compiler/src lock so A can't acquire (eval/src free, but broad lock fails).
         scheduler.lock_table.try_acquire('seed', ['compiler/src'])
         scheduler._dispatched.add('seed')  # seed task isn't in the candidate list
@@ -2535,6 +2579,7 @@ class TestFairness:
     async def test_skip_count_resets_on_successful_acquire(self, fair_config):
         """If the top candidate acquires, its skip counter is cleared."""
         scheduler = Scheduler(fair_config)
+        scheduler.finish_startup()
         scheduler._skip_count['A'] = 2
         a = self._broad_task()
         scheduler.get_tasks = AsyncMock(return_value=[a])
@@ -2547,6 +2592,7 @@ class TestFairness:
     async def test_reservation_installed_after_threshold(self, fair_config):
         """After skip_threshold consecutive skips, A's modules are parked."""
         scheduler = Scheduler(fair_config)
+        scheduler.finish_startup()
         scheduler.lock_table.try_acquire('seed', ['compiler/src'])
         scheduler._dispatched.add('seed')
 
@@ -2569,6 +2615,7 @@ class TestFairness:
     async def test_reservation_blocks_lower_ranked_tasks(self, fair_config):
         """Once A's park is installed, B can no longer take A's modules."""
         scheduler = Scheduler(fair_config)
+        scheduler.finish_startup()
         # Manually install a park for A on compiler/src + eval/src.
         scheduler.lock_table.install_parks(
             'A',
@@ -2584,6 +2631,7 @@ class TestFairness:
     async def test_owner_acquires_despite_own_park(self, fair_config):
         """The park owner can still acquire its own reserved modules."""
         scheduler = Scheduler(fair_config)
+        scheduler.finish_startup()
         scheduler.lock_table.install_parks(
             'A', ['compiler/src', 'eval/src'], priority='medium'
         )
@@ -2605,6 +2653,7 @@ class TestFairness:
         seed lock on compiler/src and A runs.
         """
         scheduler = Scheduler(fair_config)
+        scheduler.finish_startup()
 
         # Seed: block compiler/src with a long-running task.
         scheduler.lock_table.try_acquire('seed', ['compiler/src'])
@@ -2646,6 +2695,7 @@ class TestFairness:
         # Default config — no flag assignment needed.
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         # Seed compiler/src so A (high priority) is forced to skip.
         scheduler.lock_table.try_acquire('seed', ['compiler/src'])
@@ -2673,6 +2723,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         # Per-tier defaults: high -> threshold=1.
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         # B holds compiler/src; C holds eval/src; tools/src is FREE.
         scheduler.lock_table.try_acquire('B', ['compiler/src'])
@@ -2714,6 +2765,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
 
         # Pre-install L's low-tier park on m1 + m2 and seed its skip_count.
         scheduler.lock_table.install_parks('L', ['m1', 'm2'], priority='low')
@@ -2774,6 +2826,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
 
         # L parks m1 at low; H shadows L on m1 at high (H is active top).
         scheduler.lock_table.install_parks('L', ['m1'], priority='low')
@@ -2820,6 +2873,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
 
         # H shadows L on m1.
         scheduler.lock_table.install_parks('L', ['m1'], priority='low')
@@ -2857,6 +2911,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
 
         # L parks m1 at medium; H (which will be cancelled) shadows L at high.
         scheduler.lock_table.install_parks('L', ['m1'], priority='medium')
@@ -2910,6 +2965,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
 
         scheduler.lock_table.install_parks('A', ['m1', 'm2'], priority='high')
         scheduler._skip_count['A'] = 5
@@ -2949,6 +3005,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
 
         scheduler.lock_table.install_parks('X', ['m1'], priority='high')
         scheduler._skip_count['X'] = 2
@@ -2979,6 +3036,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
 
         scheduler.lock_table.install_parks('A', ['m1'], priority='high')
 
@@ -3018,6 +3076,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
 
         # Block m1 with a seed so A can't acquire its own park.
         scheduler.lock_table.try_acquire('seed', ['m1'])
@@ -3079,6 +3138,7 @@ class TestFairness:
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
 
         # --- Phase 0: Install initial parks ---
         # H accumulated skips and parks m1+m2 at high priority.
@@ -3177,7 +3237,9 @@ class TestGetStatus:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_get_status_returns_store_value(
@@ -3243,7 +3305,9 @@ class TestSetTaskStatusForwarding:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_forwards_done_provenance(
@@ -3747,7 +3811,9 @@ class TestPriorityInheritance:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        return Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        return scheduler
 
     def test_effective_priority_inherits_from_dependent(self, scheduler: Scheduler):
         """A medium task with a critical dependent scores as critical."""
@@ -3803,7 +3869,9 @@ class TestPriorityOverrideBoostOverlay:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        return Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        return scheduler
 
     def test_boost_overlay_lifts_own_priority(self, scheduler: Scheduler):
         """A boost_tier above the task's own tier becomes the effective priority."""
@@ -3870,7 +3938,9 @@ class TestTransitiveDependents:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        return Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        return scheduler
 
     def test_transitive_linear(self, scheduler: Scheduler):
         """A -> B -> C: A has 2 undone descendants."""
@@ -3908,7 +3978,9 @@ class TestScoreFunction:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        return Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        return scheduler
 
     def test_tier_base_dominates(self, scheduler: Scheduler):
         """A fresh medium task with no descendants scores = TIER_BASE[medium]."""
@@ -3944,6 +4016,7 @@ class TestAgeAnchor:
     def test_cancelled_resurrection_no_age_jump(self):
         """A previously-cancelled task re-pended scores no higher than brand-new medium."""
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         # Tick 1: task 1 is cancelled, task 100 is pending.
         tasks_tick1 = [
             _pending_task('1', status='cancelled'),
@@ -3969,6 +4042,7 @@ class TestAgeAnchor:
     def test_old_pending_accumulates_age(self):
         """Continuously-pending old tasks accumulate age from their creation id."""
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         # First-ever tick sees task 5 as pending — anchor to task_id.
         scheduler._update_age_anchors([_pending_task('5')], max_id=100)
         age = scheduler._compute_age('5', max_id=100)
@@ -4004,6 +4078,7 @@ class TestPerTierSkipThreshold:
                                'low': 9999, 'polish': 9999})
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='critical')
         assert scheduler.lock_table.has_parks('A')
 
@@ -4012,6 +4087,7 @@ class TestPerTierSkipThreshold:
         config = self._config({'critical': 1, 'high': 2, 'medium': 6,
                                'low': 9999, 'polish': 9999})
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         for _ in range(50):
             scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='low')
         assert not scheduler.lock_table.has_parks('A')
@@ -4022,6 +4098,7 @@ class TestPerTierSkipThreshold:
                                'low': 9999, 'polish': 9999})
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         for _ in range(150):
             scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='low')
         skip_events = [e for e in event_store.events
@@ -4036,6 +4113,7 @@ class TestPerTierSkipThreshold:
                                'low': 9999, 'polish': 9999})
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         for _ in range(3):
             scheduler._bump_skip_and_maybe_park('A', ['mod'], tier='medium')
         skip_events = [e for e in event_store.events
@@ -4053,6 +4131,7 @@ class TestLegacyOrderingPreserved:
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
         # Disable caps and fairness carve-outs for this test.
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         tasks = [
             _pending_task('1', priority='low', files=['modA']),
             _pending_task('2', priority='high', files=['modB']),
@@ -4067,6 +4146,7 @@ class TestLegacyOrderingPreserved:
         """New 5-tier: critical outranks high."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         tasks = [
             _pending_task('1', priority='high', files=['modA']),
             _pending_task('2', priority='critical', files=['modB']),
@@ -4080,6 +4160,7 @@ class TestLegacyOrderingPreserved:
         """New 5-tier: polish ranks below low."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         tasks = [
             _pending_task('1', priority='polish', files=['modA']),
             _pending_task('2', priority='low', files=['modB']),
@@ -4093,6 +4174,7 @@ class TestLegacyOrderingPreserved:
         """A medium task with a critical dependent is dispatched first."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         # Task 1 (medium, available) is needed by task 2 (critical, blocked).
         # Inheritance should lift task 1 above task 3 (high, available).
         tasks = [
@@ -4111,6 +4193,7 @@ class TestDispatchPriorityBookkeeping:
     @pytest.mark.asyncio
     async def test_release_clears_dispatched_priority(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         task = _pending_task('1', priority='high', files=['modA'])
         scheduler.get_tasks = AsyncMock(return_value=[task])
         result = await scheduler.acquire_next()
@@ -4124,6 +4207,7 @@ class TestDispatchPriorityBookkeeping:
         """dispatched_priority reflects effective (inherited) priority."""
         config = OrchestratorConfig(max_per_module=1, max_concurrent_tasks=10)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         tasks = [
             _pending_task('1', priority='medium', files=['modA']),
             _pending_task('2', priority='critical', deps=['1'], files=['modB']),
@@ -4146,6 +4230,7 @@ class TestBlastRadiusRefinement:
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         event_store = _RecordingEventStore()
         sched = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        sched.finish_startup()
         return sched
 
     @pytest.mark.asyncio
@@ -4582,6 +4667,7 @@ class TestBlastRadiusModuleCacheSeam:
         config = OrchestratorConfig(max_per_module=1, lock_depth=4)
         event_store = _RecordingEventStore()
         sched = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
+        sched.finish_startup()
         return sched
 
     @pytest.mark.asyncio
@@ -4744,6 +4830,7 @@ class TestSchedulerMcpSessionDI:
         stub = _StubMcpSession()
         cfg = OrchestratorConfig()
         sched = Scheduler(cfg, mcp_session=stub)
+        sched.finish_startup()
 
         with patch(
             'orchestrator.scheduler.mcp_call',
@@ -4759,6 +4846,7 @@ class TestSchedulerMcpSessionDI:
         stub = _StubMcpSession()
         cfg = OrchestratorConfig()
         sched = Scheduler(cfg, mcp_session=stub)
+        sched.finish_startup()
         no_http = AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected'))
 
         with patch('orchestrator.scheduler.mcp_call', new=no_http):
@@ -4776,6 +4864,7 @@ class TestSchedulerMcpSessionDI:
         stub = _StubMcpSession()
         cfg = OrchestratorConfig()
         sched = Scheduler(cfg, mcp_session=stub)
+        sched.finish_startup()
         no_http = AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected'))
 
         with patch('orchestrator.scheduler.mcp_call', new=no_http):
@@ -4790,6 +4879,7 @@ class TestSchedulerMcpSessionDI:
         stub = _StubMcpSession()
         cfg = OrchestratorConfig()
         sched = Scheduler(cfg, mcp_session=stub)
+        sched.finish_startup()
         no_http = AsyncMock(side_effect=AssertionError('HTTP path must not be used when mcp_session is injected'))
 
         with patch('orchestrator.scheduler.mcp_call', new=no_http):
@@ -4804,6 +4894,7 @@ class TestSchedulerMcpSessionDI:
         stub = _StubMcpSession()
         cfg = OrchestratorConfig()
         sched = Scheduler(cfg, mcp_session=stub)
+        sched.finish_startup()
 
         with patch(
             'orchestrator.scheduler.mcp_call',
@@ -4819,6 +4910,7 @@ class TestSchedulerMcpSessionDI:
         stub = _StubMcpSession()
         cfg = OrchestratorConfig()
         sched = Scheduler(cfg, mcp_session=stub)
+        sched.finish_startup()
 
         with patch(
             'orchestrator.scheduler.mcp_call',
@@ -4835,7 +4927,9 @@ class TestGetStatuses:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_get_statuses_returns_parsed_mapping(
@@ -4902,6 +4996,7 @@ class TestGetStatuses:
         stub = _StubMcpSession()
         cfg = OrchestratorConfig()
         sched = Scheduler(cfg, mcp_session=stub)
+        sched.finish_startup()
         no_http = AsyncMock(
             side_effect=AssertionError('HTTP path must not be used when mcp_session is injected')
         )
@@ -4989,6 +5084,7 @@ class TestGetStatuses:
         a freshly constructed Scheduler — future callers must use the tuple return.
         """
         sched = Scheduler(OrchestratorConfig())
+        sched.finish_startup()
         assert not hasattr(sched, 'last_get_statuses_error'), (
             'last_get_statuses_error property must be removed'
         )
@@ -5015,7 +5111,9 @@ class TestGetStatusesFailsLoud:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @staticmethod
     def _envelope(payload: dict) -> dict:
@@ -5190,6 +5288,7 @@ class TestReserveNowShortCircuit:
         store.set_override('/proj', 'A', reserve_now=True)
 
         scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         # Pre-hold A's modules so A cannot acquire them this tick.
@@ -5261,6 +5360,7 @@ class TestReserveNowShortCircuit:
 
         recording_store = _RecordingEventStore()
         scheduler = Scheduler(config, override_store=store, event_store=recording_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_a = {
@@ -5328,6 +5428,7 @@ class TestReserveNowShortCircuit:
 
         recording_store = _RecordingEventStore()
         scheduler = Scheduler(config, override_store=store, event_store=recording_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_a = {
@@ -5386,6 +5487,7 @@ class TestSchedulerOverrideStoreInjection:
         """Scheduler(config) sets _override_store=None by default."""
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         assert scheduler._override_store is None
 
     def test_init_accepts_explicit_override_store(self, tmp_path):
@@ -5395,6 +5497,7 @@ class TestSchedulerOverrideStoreInjection:
         config = OrchestratorConfig(max_per_module=1)
         store = OverrideStore(tmp_path / 'overrides.db')
         scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
         assert scheduler._override_store is store
 
     @pytest.mark.asyncio
@@ -5408,6 +5511,7 @@ class TestSchedulerOverrideStoreInjection:
         store.set_override('/proj', 'A', boost_tier='critical')
 
         scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_a = {
@@ -5452,6 +5556,7 @@ class TestSchedulerOverrideRestartSemantics:
         store.set_override('/proj', 'B', pinned=True)
 
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_a = _pending_task('A', priority='medium', files=['a/src'])
@@ -5511,6 +5616,7 @@ class TestPinDispatch:
         store.set_override('/proj', 'A', pinned=True)
 
         scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_a = {
@@ -5558,6 +5664,7 @@ class TestPinDispatch:
         store.set_override('/proj', 'B', pinned=True)
 
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         # Pre-hold A's module so A cannot acquire it this tick.
@@ -5621,6 +5728,7 @@ class TestOverrideGCIntegration:
         store.set_override('/proj', 'C', boost_tier='medium')
 
         scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_a = {
@@ -5679,6 +5787,7 @@ class TestOverrideGCIntegration:
         store.set_override('/proj', 'B', boost_tier='critical', ttl_until=now_dt + timedelta(hours=1))
 
         scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_a = {
@@ -5727,6 +5836,7 @@ class TestOverrideEventEmission:
         store = OverrideStore(tmp_path / 'o.db')
 
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_a = {
@@ -5796,6 +5906,7 @@ class TestOverrideEventEmission:
         store = OverrideStore(tmp_path / 'o.db')
 
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         # Pre-hold all modules so no task can dispatch (focus is purely on events).
@@ -5876,6 +5987,7 @@ class TestOverrideEventEmission:
         store = OverrideStore(tmp_path / 'o.db')
 
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
         scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
         scheduler._dispatched.add('seed')
@@ -5934,6 +6046,7 @@ class TestOverrideEventEmission:
         store = OverrideStore(tmp_path / 'o.db')
 
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
         scheduler.lock_table._held['seed'] = {'a/src', 'b/src'}
         scheduler._dispatched.add('seed')
@@ -6000,6 +6113,7 @@ class TestOverrideEventEmission:
         store = OverrideStore(tmp_path / 'o.db')
 
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         # Pre-hold all module files so nothing dispatches — focus is on events.
@@ -6119,6 +6233,7 @@ class TestRequeueCooldownGc:
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
         scheduler = Scheduler(config, time_source=lambda: now)
+        scheduler.finish_startup()
 
         # Seed three entries:
         # 'past'     — deadline in the past → should be removed
@@ -6146,6 +6261,7 @@ class TestRequeueCooldownGc:
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
         scheduler = Scheduler(config, time_source=lambda: now)
+        scheduler.finish_startup()
 
         # Seed an expired entry for task '7'.
         scheduler._requeue_until['7'] = now - 5.0
@@ -6186,6 +6302,7 @@ class TestRequeueCooldownGc:
         base_time = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
         scheduler = Scheduler(config, time_source=lambda: base_time)
+        scheduler.finish_startup()
 
         pending_task = {
             'id': '99',
@@ -6259,6 +6376,7 @@ class TestDeferredWatchDispatchGate:
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, time_source=lambda: now)
+        scheduler.finish_startup()
 
         task = {
             'id': '2217',
@@ -6292,6 +6410,7 @@ class TestDeferredWatchDispatchGate:
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, time_source=lambda: now)
+        scheduler.finish_startup()
 
         task = {
             'id': '2217',
@@ -6323,6 +6442,7 @@ class TestDeferredWatchDispatchGate:
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, time_source=lambda: now)
+        scheduler.finish_startup()
 
         task = {
             'id': '2217',
@@ -6354,6 +6474,7 @@ class TestDeferredWatchDispatchGate:
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, time_source=lambda: now)
+        scheduler.finish_startup()
 
         task = {
             'id': '2217',
@@ -6385,6 +6506,7 @@ class TestDeferredWatchDispatchGate:
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, time_source=lambda: now)
+        scheduler.finish_startup()
 
         task = {
             'id': '2217',
@@ -6437,6 +6559,7 @@ class TestDeferredWatchDispatchGate:
             event_store=event_store,  # type: ignore[arg-type]
             time_source=lambda: base_time,
         )
+        scheduler.finish_startup()
 
         deferred_task = {
             'id': '2217',
@@ -7124,7 +7247,9 @@ class TestSchedulerPause:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def test_pause_sets_is_paused_and_reason(self, scheduler: Scheduler):
         scheduler.pause('parked-threshold')
@@ -7215,7 +7340,9 @@ class TestSchedulerBlockedTransitionTracking:
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
         now = 1_000_000.0
-        return Scheduler(config, monotonic_clock_source=lambda: now)
+        scheduler = Scheduler(config, monotonic_clock_source=lambda: now)
+        scheduler.finish_startup()
+        return scheduler
 
     def test_record_blocked_transition_appends_timestamp(self):
         """_record_blocked_transition() adds entries matching the clock source."""
@@ -7229,6 +7356,7 @@ class TestSchedulerBlockedTransitionTracking:
 
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
         scheduler = Scheduler(config, monotonic_clock_source=time_source)
+        scheduler.finish_startup()
 
         # Three distinct task IDs → three entries in the deque.
         scheduler._record_blocked_transition('t1')
@@ -7249,6 +7377,7 @@ class TestSchedulerBlockedTransitionTracking:
 
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
         scheduler = Scheduler(config, monotonic_clock_source=time_source)
+        scheduler.finish_startup()
 
         # Seed three (task_id, timestamp) entries: two outside the 3600s window, one inside.
         from collections import deque
@@ -7289,6 +7418,7 @@ class TestSchedulerBlockedTransitionTracking:
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1, park_stop_parked_window_hours=1.0)
         scheduler = Scheduler(config, monotonic_clock_source=lambda: now)
+        scheduler.finish_startup()
 
         # Block the same task three times.
         scheduler._record_blocked_transition('task-1')
@@ -7316,6 +7446,7 @@ class TestSetTaskStatusBlockedRecording:
         now = 1_000_000.0
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, monotonic_clock_source=lambda: now)
+        scheduler.finish_startup()
 
         # Return a clean success response (no rejection structure).
         mock = AsyncMock(return_value={})
@@ -7332,6 +7463,7 @@ class TestSetTaskStatusBlockedRecording:
         """A successful non-blocked status transition must not touch _blocked_transitions."""
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         mock = AsyncMock(return_value={})
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock)
@@ -7352,6 +7484,7 @@ class TestSetTaskStatusBlockedRecording:
         """
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         # Return a terminal_exit_rejected response — 'done' is in TERMINAL_STATUSES
         # so the warn-and-return carve-out fires (logs warning, returns cleanly).
@@ -7389,6 +7522,7 @@ class TestParkStopTrip:
             park_stop_parked_window_hours=1.0,
         )
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         callback_args: list[str] = []
 
@@ -7421,6 +7555,7 @@ class TestParkStopTrip:
             park_stop_parked_threshold=3,
         )
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         callback_count = [0]
 
@@ -7449,6 +7584,7 @@ class TestParkStopTrip:
             park_stop_parked_threshold=5,
         )
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         callback_count = [0]
 
@@ -7484,6 +7620,7 @@ class TestParkStopTrip:
             park_stop_parked_window_hours=1.0,
         )
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         callback_args: list[str] = []
 
@@ -7532,6 +7669,7 @@ class TestParkStopTrip:
             park_stop_parked_window_hours=1.0,
         )
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         callback_count = [0]
 
@@ -7585,6 +7723,7 @@ class TestParkStopDisabled:
             park_stop_parked_threshold=3,
         )
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         callback_count = [0]
 
@@ -7620,7 +7759,9 @@ class TestDepsSatisfiedTrainAware:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def test_intra_train_merge_deferred_dep_satisfied(
         self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
@@ -7831,7 +7972,9 @@ class TestAcquireNextTrainDispatch:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_acquire_next_dispatches_train_member_when_predecessor_merge_deferred(
@@ -7909,7 +8052,9 @@ class TestTasksByTrain:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def _mixed_tasks(self) -> list[dict]:
         """Return a mixed task list: 3 T1 members (out of order), 1 T2, 1 non-train."""
@@ -8117,7 +8262,9 @@ class TestGetExternalStatuses:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_get_external_statuses_returns_parsed_mapping(
@@ -8260,7 +8407,9 @@ class TestGetExternalStatusesFailsLoud:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @staticmethod
     def _envelope(payload: dict) -> dict:
@@ -8370,7 +8519,9 @@ class TestGetExternalStatusesFoldRegression:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @staticmethod
     def _envelope(payload: dict) -> dict:
@@ -8446,7 +8597,9 @@ class TestGetExternalStatusesPartialResult:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @staticmethod
     def _envelope(payload: dict) -> dict:
@@ -8646,7 +8799,9 @@ class TestExternalDepFlatShapeSeam:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @staticmethod
     def _flat_envelope(statuses: dict) -> dict:
@@ -8754,7 +8909,9 @@ class TestDepsSatisfiedExternalGate:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def _task_with_external_dep(self, dep: str = 'dark_factory:5') -> dict:
         """Build a minimal pending task with one external dep."""
@@ -8919,7 +9076,9 @@ class TestApplyExternalDepPolicyCancelled:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_cancelled_dep_fires_callback_once(self, scheduler: Scheduler):
@@ -9035,7 +9194,9 @@ class TestApplyExternalDepPolicyUnresolved:
             max_per_module=1,
             max_external_dep_unresolved_cycles=2,
         )
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def _pending_task(self, dep: str = 'dark_factory:5') -> dict:
         return {
@@ -9150,7 +9311,9 @@ class TestApplyExternalDepPolicyTransientErr:
 
     @pytest.fixture
     def scheduler(self) -> Scheduler:
-        return Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        return scheduler
 
     def _pending_task(self) -> dict:
         return {
@@ -9261,7 +9424,9 @@ class TestExternalDepGateHeld_ResolverDegraded:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        return scheduler
 
     def _pending_task_with_ext(self, task_id: str = 'T') -> dict:
         return {
@@ -9370,7 +9535,9 @@ class TestExternalDepGateHeld_DepsLive:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler = Scheduler(config, event_store=_RecordingEventStore())  # type: ignore[arg-type]
+        scheduler.finish_startup()
+        return scheduler
 
     def _pending_task_with_ext(self, task_id: str = 'T') -> dict:
         return {
@@ -9506,7 +9673,9 @@ class TestAcquireNextExternalDepGate:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=2)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def _task(self, tid: str, ext_deps: list[str] | None = None) -> dict:
         return {
@@ -9669,7 +9838,9 @@ class TestSuppressBlockedWrite:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_baseline_blocked_calls_dispatch_and_records_transition(
@@ -9775,7 +9946,9 @@ class TestGetTasksStatusesParam:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_get_tasks_with_statuses_forwards_arg(self, scheduler: Scheduler):
@@ -9829,7 +10002,9 @@ class TestAcquireNextFetchesActiveOnly:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_acquire_next_passes_active_statuses_to_get_tasks(
@@ -9877,7 +10052,9 @@ class TestAcquireNextDepBackfillFromGetStatuses:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_done_dep_absent_from_active_fetch_still_dispatches(
@@ -9941,7 +10118,9 @@ class TestAcquireNextLocalBackfillFailsSafe:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @staticmethod
     def _envelope(payload: dict) -> dict:
@@ -10166,7 +10345,9 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     @pytest.mark.asyncio
     async def test_bookkeeping_purged_for_absent_task(self, scheduler: Scheduler):
@@ -10405,6 +10586,7 @@ class TestCarriesSubstrateProbe:
         }
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         scheduler.get_tasks = AsyncMock(return_value=[probe_task])
 
         assignment = await scheduler.acquire_next()
@@ -10441,7 +10623,9 @@ class TestExternalDepResolverDegradedEscalation:
             max_per_module=1,
             max_external_dep_unresolved_cycles=2,
         )
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def _pending_task(self) -> dict:
         return {
@@ -10727,6 +10911,7 @@ class TestDrainParkEvictionRequests:
             event_store=event_store,  # type: ignore[arg-type]
             park_eviction_store=eviction_store,
         )
+        scheduler.finish_startup()
         return scheduler, eviction_store, event_store
 
     def test_b3_dead_owner_evicted_with_events_and_row_drained(self, tmp_path):
@@ -10818,6 +11003,7 @@ class TestDrainParkEvictionGuard:
             event_store=event_store,  # type: ignore[arg-type]
             park_eviction_store=eviction_store,
         )
+        scheduler.finish_startup()
         return scheduler, eviction_store, event_store
 
     def test_b4a_live_owner_eviction_refused(self, tmp_path):
@@ -10918,6 +11104,7 @@ class TestDrainCalledFromAcquireNext:
             event_store=event_store,  # type: ignore[arg-type]
             park_eviction_store=eviction_store,
         )
+        scheduler.finish_startup()
 
         # Stack on m1: [L(buried/low), T(active-top/high)]
         scheduler.lock_table.install_parks('L', ['m1'], priority='low')
@@ -10991,6 +11178,7 @@ class TestDrainFiresWithNoActiveTasks:
             event_store=event_store,  # type: ignore[arg-type]
             park_eviction_store=eviction_store,
         )
+        scheduler.finish_startup()
 
         # Install a park for a dead owner.
         scheduler.lock_table.install_parks('dead_owner', ['m1'], priority='low')
@@ -11039,6 +11227,7 @@ class TestDrainBuriedOwnerRestoredEvents:
             event_store=event_store,  # type: ignore[arg-type]
             park_eviction_store=eviction_store,
         )
+        scheduler.finish_startup()
         return scheduler, eviction_store, event_store
 
     def test_evicting_non_top_owner_emits_restored_for_exposed_shadow(self, tmp_path):
@@ -11132,6 +11321,7 @@ class TestStarvationWatchdog:
         # isolate the watchdog logic cleanly).
         config.fairness.skip_threshold = 9999
         scheduler = Scheduler(config, time_source=fake_clock)
+        scheduler.finish_startup()
         return scheduler, t
 
     @staticmethod
@@ -11546,6 +11736,7 @@ class TestStreakRegistryMigration:
 
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config, time_source=fake_clock)
+        scheduler.finish_startup()
         return scheduler, t
 
     def test_legacy_attrs_alias_counter_containers(self):
@@ -11675,7 +11866,9 @@ class TestGetModulesAlphaDirectoryStrip:
         # config.yaml or env var in this environment, and test assertions in this
         # class are depth-sensitive (file-path normalization collapses at depth=1).
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        return Scheduler(config)
+        scheduler = Scheduler(config)
+        scheduler.finish_startup()
+        return scheduler
 
     def test_directory_only_files_returns_task_fallback(self, scheduler: Scheduler):
         """directory-only metadata.files → task-<id> fallback, not a wide module."""
@@ -11745,6 +11938,7 @@ class TestAcquireNextDirectoryCharterBoundary:
         """Both a directory-charter task and a file sibling are dispatchable."""
         config = OrchestratorConfig(lock_depth=10, max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         task_dir = {
             'id': 'dir',
@@ -11790,6 +11984,7 @@ class TestConsultAlreadyLanded:
         """A fresh Scheduler has _already_landed_gate is None and the consult
         returns the empty set without awaiting anything."""
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         assert scheduler._already_landed_gate is None
 
         result = await scheduler._consult_already_landed([_pending_task('Z')])
@@ -11798,6 +11993,7 @@ class TestConsultAlreadyLanded:
 
     async def test_gate_true_gates_the_candidate(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         scheduler._already_landed_gate = AsyncMock(return_value=True)
 
         result = await scheduler._consult_already_landed([_pending_task('Z')])
@@ -11807,6 +12003,7 @@ class TestConsultAlreadyLanded:
     async def test_gate_raises_fails_open_and_logs_warning(self, caplog):
         caplog.set_level('WARNING')
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         scheduler._already_landed_gate = AsyncMock(side_effect=RuntimeError('git hiccup'))
 
         result = await scheduler._consult_already_landed([_pending_task('Z')])
@@ -11834,6 +12031,7 @@ class TestAcquireNextAlreadyLandedGate:
 
     async def test_gate_true_withholds_dispatch(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
         scheduler._already_landed_gate = AsyncMock(return_value=True)
@@ -11846,6 +12044,7 @@ class TestAcquireNextAlreadyLandedGate:
 
     async def test_gate_false_dispatches_normally(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
         scheduler._already_landed_gate = AsyncMock(return_value=False)
@@ -11866,6 +12065,7 @@ class TestAcquireNextAlreadyLandedGate:
         store.set_override('/proj', 'Z', pinned=True)
 
         scheduler = Scheduler(config, override_store=store)
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
         scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id: task_id == 'Z')
 
@@ -11885,6 +12085,7 @@ class TestAcquireNextAlreadyLandedGate:
     async def test_gate_raises_fails_open_in_tick_and_dispatches(self, caplog):
         caplog.set_level('WARNING')
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
         scheduler._already_landed_gate = AsyncMock(side_effect=RuntimeError('git hiccup'))

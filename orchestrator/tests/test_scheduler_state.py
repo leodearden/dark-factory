@@ -88,6 +88,7 @@ class TestReserveNowArmedDiffEmit:
         store = OverrideStore(tmp_path / 'o.db')
 
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_x = _pending_task('X', files=['mod_x'])
@@ -122,6 +123,7 @@ class TestReserveNowArmedDiffEmit:
         store = OverrideStore(tmp_path / 'o.db')
 
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         task_x = _pending_task('X', files=['mod_x'])
@@ -162,6 +164,7 @@ class TestReserveNowConsumedShortCircuit:
 
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, override_store=store, event_store=event_store)  # type: ignore[arg-type]
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         # Pre-hold A's modules so parks survive the tick (A cannot acquire them).
@@ -484,6 +487,7 @@ class TestEffectivePrioritiesCache:
 
     def test_empty_before_first_tick(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         assert scheduler._last_effective_priorities == {}
 
     @pytest.mark.asyncio
@@ -496,6 +500,7 @@ class TestEffectivePrioritiesCache:
         """
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
 
         task_a = _pending_task('A', priority='medium', files=['mod_a'])
         task_b = {
@@ -535,11 +540,13 @@ class TestGetStateSnapshotShape:
 
     def test_snapshot_returns_eleven_top_level_keys(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()
         assert set(snap.keys()) == _SNAPSHOT_KEYS
 
     def test_snapshot_empty_scheduler_returns_empty_collections(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()
         assert snap['skip_counts'] == {}
         assert snap['parks'] == {}
@@ -562,6 +569,7 @@ class TestGetStateSnapshotShape:
         active-top owner — pinning the backward-compatible additive key.
         """
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         lt = scheduler.lock_table
         lt.install_parks('L', ['mod/a'], 'low')   # becomes bottom (shadowed)
         lt.install_parks('H', ['mod/a'], 'high')  # becomes active top
@@ -587,6 +595,7 @@ class TestGetStateSnapshotShape:
         # lock_depth lets the dashboard normalize footprints the same way the
         # scheduler does before matching against current_holders.
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1, lock_depth=3))
+        scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()
         assert snap['lock_depth'] == 3
 
@@ -609,6 +618,7 @@ class TestGetStateSnapshotShape:
             'autouse config-isolation fixture is not active or was overridden.'
         )
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         snapshot_path = (
             Path(scheduler._project_root) / 'data' / 'orchestrator' / 'scheduler_state.json'
         )
@@ -617,6 +627,7 @@ class TestGetStateSnapshotShape:
     def test_snapshot_is_deep_copy_of_internal_state(self):
         """Mutating the returned snapshot must not affect the scheduler's internal state."""
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         scheduler._skip_count['X'] = 3
         snap = scheduler.get_state_snapshot()
         snap['skip_counts']['X'] = 99
@@ -663,6 +674,7 @@ class TestGetStateSnapshotPopulated:
         scheduler = Scheduler(
             config, override_store=store, event_store=event_store  # type: ignore[arg-type]
         )
+        scheduler.finish_startup()
         scheduler._project_root = '/proj'
 
         # Pre-hold T3's modules so T3 can never acquire them.
@@ -739,6 +751,7 @@ class TestWriteStateSnapshot:
     def test_write_state_snapshot_creates_valid_json(self, tmp_path):
         """_write_state_snapshot_raw writes the snapshot to disk as parseable JSON."""
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         path = tmp_path / 'scheduler_state.json'
         scheduler._write_state_snapshot_raw(path)
 
@@ -751,6 +764,7 @@ class TestWriteStateSnapshot:
     def test_write_state_snapshot_atomic_replace(self, tmp_path):
         """Second write overwrites the first; no partial writes visible."""
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         path = tmp_path / 'scheduler_state.json'
 
         # First write: inject a sentinel skip count.
@@ -770,6 +784,7 @@ class TestWriteStateSnapshot:
     def test_write_state_snapshot_creates_parent_dirs(self, tmp_path):
         """_write_state_snapshot_raw creates missing parent directories."""
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         path = tmp_path / 'deep' / 'nested' / 'dir' / 'scheduler_state.json'
         scheduler._write_state_snapshot_raw(path)
         assert path.exists(), (
@@ -790,6 +805,7 @@ class TestWriteStateSnapshot:
         import orchestrator.scheduler as scheduler_module
 
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         path = tmp_path / 'scheduler_state.json'
 
         # Inject a disk-full error at the os.replace boundary so the test
@@ -815,6 +831,7 @@ class TestAcquireNextWritesSnapshot:
         """After acquire_next, scheduler_state.json exists and parses as JSON."""
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         scheduler._project_root = str(tmp_path)
 
         task_a = _pending_task('A', files=['mod_a'])
@@ -836,6 +853,7 @@ class TestAcquireNextWritesSnapshot:
         """If _write_state_snapshot_raw raises, acquire_next still dispatches tasks."""
         config = OrchestratorConfig(max_per_module=1)
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         scheduler._project_root = str(tmp_path)
 
         task_a = _pending_task('A', files=['mod_a'])
@@ -880,6 +898,7 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         object.__setattr__(config, 'project_root', None)
 
         scheduler = Scheduler(config)
+        scheduler.finish_startup()
         # Sanity: document the exact literal that str(None) produces.
         assert scheduler._project_root == 'None', (
             f"Expected '_project_root' to be the literal string 'None', "
@@ -911,6 +930,7 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         from unittest.mock import MagicMock
 
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         # Directly override _project_root, matching the test_scheduler_state.py
         # direct-set pattern used at lines 565 and 586.
         scheduler._project_root = bad_root
@@ -940,6 +960,7 @@ class TestWriteSnapshotBestEffortProjectRootGuard:
         from unittest.mock import MagicMock
 
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         scheduler._project_root = 'None'
         scheduler._write_state_snapshot_raw = MagicMock()
 
@@ -993,6 +1014,7 @@ class TestSnapshotWriteThrottle:
         config.snapshot_min_write_interval_secs = 1.0  # wide window
 
         scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler.finish_startup()
         scheduler._project_root = str(tmp_path)
 
         # Provide a single pending task that can be acquired each tick.
@@ -1051,6 +1073,7 @@ class TestSnapshotWriteThrottle:
         config.snapshot_min_write_interval_secs = throttle_interval
 
         scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler.finish_startup()
         scheduler._project_root = str(tmp_path)
 
         task_a = _pending_task('A', files=['mod_a'])
@@ -1097,6 +1120,7 @@ class TestSnapshotWriteThrottle:
         config.snapshot_min_write_interval_secs = 1.0  # wide window
 
         scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler.finish_startup()
         scheduler._project_root = str(tmp_path)
 
         task_a = _pending_task('A', files=['mod_a'])
@@ -1144,6 +1168,7 @@ class TestSnapshotWriteThrottle:
         config.snapshot_min_write_interval_secs = 0.0  # throttle disabled
 
         scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler.finish_startup()
         scheduler._project_root = str(tmp_path)
         scheduler._write_state_snapshot_raw = MagicMock()
 
@@ -1190,6 +1215,7 @@ class TestSnapshotWriteThrottle:
         config.snapshot_min_write_interval_secs = 0.0  # throttle disabled so gate never short-circuits
 
         scheduler = Scheduler(config, time_source=lambda: clock['t'])
+        scheduler.finish_startup()
         scheduler._project_root = str(tmp_path)
 
         # Spy on _write_state_snapshot_raw: tracks how many calls are in-flight simultaneously.
@@ -1245,6 +1271,7 @@ class TestStateSnapshotOverrideStoreLogging:
         from unittest.mock import MagicMock
 
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         mock_store = MagicMock()
         mock_store.get_pin_queue.side_effect = RuntimeError('boom')
         mock_store.get_overrides.return_value = {}
@@ -1293,6 +1320,7 @@ class TestStateSnapshotOverrideStoreLogging:
         from unittest.mock import MagicMock
 
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
         mock_store = MagicMock()
         # pin_queue returns an empty iterator (the for-loop consumes it fine).
         mock_store.get_pin_queue.return_value = iter([])
