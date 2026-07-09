@@ -797,6 +797,13 @@ class Harness:
         # harness pattern as _on_park_stop_trip / _on_external_dep_block /
         # γ's own _reconcile_landed_outbox.
         self.scheduler._landed_outbox_gate = self._landed_dispatch_gate
+        # Wire the already-landed pre-dispatch gate (task 2313) — catches
+        # out-of-band landings (ancestry / merge-marker / content-equivalence)
+        # that never passed through this orchestrator's own merge queue.
+        # Declared in scheduler.py, installed here alongside the other
+        # callback installs — same declare-in-scheduler / install-in-harness
+        # pattern as the adjacent _landed_outbox_gate / _suppress_blocked_write.
+        self.scheduler._already_landed_gate = self._already_landed_dispatch_gate
         # Wire the reclaim-on-exhaustion safety valve callbacks (task 1933).
         # Declared on git_ops with default None (byte-identical when not wired);
         # installed here when the knob is on — mirrors the _on_park_stop_trip /
