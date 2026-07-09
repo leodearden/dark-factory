@@ -355,6 +355,7 @@ class TestFailureRecovery:
         assert svc2.durable_queue is not None
 
         async def _completed():
+            assert svc2.durable_queue is not None
             s = await svc2.durable_queue.get_stats()
             return s if s['counts'].get('completed', 0) >= 1 else None
 
