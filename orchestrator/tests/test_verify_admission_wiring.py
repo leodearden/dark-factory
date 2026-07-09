@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shlex
 from unittest.mock import patch
 
 import pytest
@@ -249,3 +250,143 @@ class TestVerifyAdmissionAcquireWiring:
         assert max_seen == 1, f'test leg ran concurrently across verifies (max_seen={max_seen})'
         assert len(results) == 2
         assert all(r.passed for r in results)
+
+
+class TestResolveNicePrefix:
+    """Pure-unit tests: canonical T1 tiers by default, per-role config
+    override (shlex-split) when the corresponding knob is non-empty.
+    """
+
+    @pytest.mark.real_verify_admission
+    def test_task_matches_canonical_tier(self):
+        from orchestrator.verify import _resolve_nice_prefix
+
+        config = OrchestratorConfig()
+        assert _resolve_nice_prefix(config, 'task') == shlex.split('nice -n 15 ionice -c2 -n7')
+
+    @pytest.mark.real_verify_admission
+    def test_merge_matches_canonical_tier(self):
+        from orchestrator.verify import _resolve_nice_prefix
+
+        config = OrchestratorConfig()
+        assert _resolve_nice_prefix(config, 'merge') == ['nice', '-n', '5']
+
+    @pytest.mark.real_verify_admission
+    def test_background_matches_canonical_tier(self):
+        from orchestrator.verify import _resolve_nice_prefix
+
+        config = OrchestratorConfig()
+        assert _resolve_nice_prefix(config, 'background') == ['nice', '-n', '19', 'ionice', '-c3']
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.parametrize('role', ['offline', 'some-unknown-role'])
+    def test_offline_and_unknown_role_have_no_prefix(self, role):
+        from orchestrator.verify import _resolve_nice_prefix
+
+        config = OrchestratorConfig()
+        assert _resolve_nice_prefix(config, role) == []
+
+    @pytest.mark.real_verify_admission
+    def test_task_override_takes_precedence_over_canonical_tier(self):
+        from orchestrator.verify import _resolve_nice_prefix
+
+        config = OrchestratorConfig(verify_admission_nice_task='nice -n 3')
+        assert _resolve_nice_prefix(config, 'task') == ['nice', '-n', '3']
+
+
+class TestNicePrefixIntegration:
+    """Integration via run_verification + spy _run_cmd: the test leg is
+    wrapped ``<nice argv> /bin/bash -c <shlex.quote(cmd)>``; lint/type ride
+    un-niced; disabled admission leaves the test leg byte-identical.
+    """
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_task_role_wraps_test_leg_with_nice_and_bash_c(self, tmp_path):
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='task',
+                attempt_id=None,
+            )
+
+        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(_TEST_CMD)
+        assert captured_cmds[1] == _LINT_CMD, 'lint leg must not be niced'
+        assert captured_cmds[2] == _TYPE_CMD, 'type leg must not be niced'
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_merge_role_wraps_test_leg_with_its_own_nice_tier(self, tmp_path):
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='merge',
+                attempt_id=None,
+            )
+
+        assert captured_cmds[0] == 'nice -n 5 /bin/bash -c ' + shlex.quote(_TEST_CMD)
+        assert captured_cmds[1] == _LINT_CMD, 'lint leg must not be niced'
+        assert captured_cmds[2] == _TYPE_CMD, 'type leg must not be niced'
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_disabled_admission_leaves_test_leg_byte_identical(self, tmp_path):
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        slots_dir = tmp_path / 'slots'
+        config = OrchestratorConfig(
+            verify_admission_enabled=False,
+            verify_admission_slots_dir=str(slots_dir),
+            verify_admission_task_slots=1,
+        )
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=_module_config(),
+                role='task',
+                attempt_id=None,
+            )
+
+        assert captured_cmds[0] == _TEST_CMD, 'disabled admission must never nice/bash-c wrap the test leg'
+        assert captured_cmds[1] == _LINT_CMD
+        assert captured_cmds[2] == _TYPE_CMD
