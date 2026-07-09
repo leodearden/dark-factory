@@ -36,7 +36,7 @@ from unittest.mock import AsyncMock
 import pytest
 from shared.psi import PsiSample
 
-from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig
+from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.scheduler import Scheduler
 
@@ -101,13 +101,137 @@ def _psi(
 
 
 # ---------------------------------------------------------------------------
-# Scenario 1 — full idle -> saturated -> idle transition end-to-end
+# Multi-tick transition harness
 #
-# RED (step-1): drives ticks via ``_FakeClock`` / ``_PsiFeed`` / ``_Driver``,
-# none of which exist yet.  This is deliberate write-the-API-you-wish-you-had
-# TDD for the test-harness infrastructure itself (this task adds no
-# production module) — the NameError below IS the RED failure; step-2 builds
-# exactly the harness this test exercises.
+# GREEN (step-2): the core of the reusable harness — a controllable clock, a
+# mutable PSI feed, and a driver that wraps one real Scheduler + real
+# EventStore and models just enough of the harness main loop (live in-flight
+# tracking via get_tasks) to drive multi-tick transitions.  Completion
+# (_Driver.complete) and max_concurrent enforcement
+# (_Driver.run_until_quiescent) are deliberately NOT here yet — they land in
+# step-4 and step-6 respectively, keeping Scenarios 2 and 3 genuinely RED
+# until their own impl steps.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """Minimal controllable monotonic-style clock (mirrors DA3's, in
+    test_scheduler_dispatch_admission.py:258-268)."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self._t = start
+
+    def __call__(self) -> float:
+        return self._t
+
+    def advance(self, secs: float) -> None:
+        self._t += secs
+
+
+class _PsiFeed:
+    """Mutable PSI sample holder assignable to ``scheduler._read_psi_sample``.
+
+    Starts idle (all metrics 0.0, read_ok=True).  ``set_saturated`` accepts
+    any subset of the four PSI metrics as kwargs (unset metrics stay at their
+    idle default of 0.0) so callers only need to name the metric(s) driving
+    saturation.
+    """
+
+    def __init__(self) -> None:
+        self._sample: PsiSample = _psi()
+
+    def __call__(self) -> PsiSample:
+        return self._sample
+
+    def set_idle(self) -> None:
+        self._sample = _psi()
+
+    def set_saturated(
+        self,
+        *,
+        cpu_some10: float = 0.0,
+        mem_some10: float = 0.0,
+        mem_full10: float = 0.0,
+        io_some10: float = 0.0,
+    ) -> None:
+        self._sample = _psi(
+            cpu_some10=cpu_some10,
+            mem_some10=mem_some10,
+            mem_full10=mem_full10,
+            io_some10=io_some10,
+            read_ok=True,
+        )
+
+    def set_unreadable(self) -> None:
+        self._sample = _psi(read_ok=False)
+
+
+class _Driver:
+    """Drives one real Scheduler across many ``acquire_next()`` ticks.
+
+    Models the pieces of the harness main loop that ``acquire_next()``
+    itself deliberately does not own: a live ``get_tasks`` view over an
+    active-task list, and (in later steps) completion + a max-concurrent
+    cap.  Every dispatch decision is made by the REAL scheduler/lock-table/
+    event-store — the driver only supplies the surrounding bookkeeping.
+    """
+
+    def __init__(self, scheduler: Scheduler, event_store: EventStore) -> None:
+        self.scheduler = scheduler
+        self.event_store = event_store
+        self._active: list[dict] = []
+        self._completed: set[str] = set()
+        self._heavy_in_flight: set[str] = set()
+        self._det_dispatched: set[str] = set()
+
+    @classmethod
+    def build(
+        cls,
+        config: OrchestratorConfig,
+        tasks: list[dict],
+        *,
+        event_store: EventStore,
+        time_source,
+        psi_feed: _PsiFeed,
+    ) -> _Driver:
+        scheduler = Scheduler(config, event_store=event_store, time_source=time_source)
+        scheduler._read_psi_sample = psi_feed
+        driver = cls(scheduler, event_store)
+        driver._active = list(tasks)
+        scheduler.get_tasks = AsyncMock(side_effect=driver._get_tasks)
+        return driver
+
+    async def _get_tasks(self, *_args, **_kwargs) -> list[dict]:
+        return [t for t in self._active if t['id'] not in self._completed]
+
+    async def tick(self):
+        """Drive one acquire_next() tick; record the outcome in the ledger."""
+        result = await self.scheduler.acquire_next()
+        if result is not None:
+            if self.scheduler.is_deterministic(result.task):
+                self._det_dispatched.add(result.task_id)
+            else:
+                self._heavy_in_flight.add(result.task_id)
+        return result
+
+    async def run_ticks(self, n: int) -> list:
+        return [await self.tick() for _ in range(n)]
+
+    def heavy_in_flight(self) -> int:
+        return len(self._heavy_in_flight)
+
+    def dispatched_ids(self) -> set[str]:
+        return set(self._heavy_in_flight) | set(self._det_dispatched)
+
+    def deferred_events(self) -> list[dict]:
+        return self.event_store.fetch_events_by_type('dispatch_deferred')
+
+    def lock_acquired_events(self) -> list[dict]:
+        return self.event_store.fetch_events_by_type('lock_acquired')
+
+
+# ---------------------------------------------------------------------------
+# Scenario 1 — full idle -> saturated -> idle transition end-to-end
 # ---------------------------------------------------------------------------
 
 
