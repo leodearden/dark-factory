@@ -309,3 +309,45 @@ def test_malformed_yaml_exits_nonzero_without_mutating(tmp_path, args):
     assert _backup_files(config_path) == [], (
         f"malformed YAML must not produce a backup (args={args!r})"
     )
+
+
+# ---------------------------------------------------------------------------
+# step-9: RED -- a real apply creates a pre-edit backup; a no-op does not
+# ---------------------------------------------------------------------------
+
+def test_apply_creates_backup_with_preedit_contents(tmp_path):
+    """A real apply (false -> true) creates a <config>.bak-<label> file
+    whose contents equal the pre-edit config; a subsequent no-op apply
+    creates no additional backup."""
+    config_path = tmp_path / "reify-laptop.yaml"
+    before_text = _fixture_laptop_config("unflipped")
+    config_path.write_text(before_text)
+
+    first = _run_script(config_path)
+    assert first.returncode == 0, (
+        f"Expected exit 0 on first apply; got {first.returncode}\n"
+        f"stdout={first.stdout!r} stderr={first.stderr!r}"
+    )
+
+    backup_path = config_path.parent / f"{config_path.name}.bak-fixed"
+    assert backup_path.exists(), (
+        f"Expected backup {backup_path} to exist after the first apply; "
+        f"found backups={_backup_files(config_path)!r}"
+    )
+    assert backup_path.read_text() == before_text, (
+        "Expected the backup to hold the PRE-edit config bytes"
+    )
+
+    backups_after_first = _backup_files(config_path)
+
+    second = _run_script(config_path)
+    assert second.returncode == 0, (
+        f"Expected exit 0 on second (already-enabled) apply; got {second.returncode}\n"
+        f"stdout={second.stdout!r} stderr={second.stderr!r}"
+    )
+
+    backups_after_second = _backup_files(config_path)
+    assert backups_after_second == backups_after_first, (
+        f"Expected no additional backup from the no-op second run; "
+        f"before={backups_after_first} after={backups_after_second}"
+    )
