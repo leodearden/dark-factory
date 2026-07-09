@@ -2957,6 +2957,7 @@ def create_mcp_server(
         )
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def set_task_claimant(
         id: str,
         project_root: str,
@@ -2993,18 +2994,12 @@ def create_mcp_server(
         claimant_kwargs: dict[str, Any] = _maybe_kwargs(
             _CLAIMANT_WIRE_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
         )
-        try:
-            return await task_interceptor.set_task_claimant(
-                task_id=id,
-                project_root=project_root,
-                tag=tag,
-                **claimant_kwargs,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            logger.exception(f'set_task_claimant error: {e}')
-            return {'error': str(e), 'error_type': type(e).__name__}
+        return await task_interceptor.set_task_claimant(
+            task_id=id,
+            project_root=project_root,
+            tag=tag,
+            **claimant_kwargs,
+        )
 
     @mcp.tool()
     @mcp_tool_errors()
