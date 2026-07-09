@@ -1027,6 +1027,49 @@ allowlist in the same change — see the pinning test in
 """
 
 
+class ItemLifecycleState(StrEnum):
+    """The single source of an item's merge-queue lifecycle state
+    (merge-queue-reliability PRD scope-4 iota / task 2164, L-1).
+
+    Normalizes today's FOUR redundant state encodings — container
+    membership across the five queues (``_queue``/``_lane_buffers``/
+    ``_verifier_queue``/``_redispatch``/``_dispatch_item``), free-form
+    ``InflightEntry.phase: str`` values, the :class:`InflightStatus`
+    sentinel enum above, and the four worker transient side-fields
+    (``_inflight_req``/``_remerging_item``/``_finalizing_head``/
+    ``_dispatching_item``) — into ten members tracing the pipeline flow:
+    queued -> (lane_buffered ->) merging -> awaiting_verify ->
+    (redispatch_parked <->) dispatching -> verifying -> gate_reverify ->
+    finalizing -> terminal.
+
+    Members are ``str`` instances (mirrors :class:`InflightStatus` /
+    :class:`OutcomeKind` above), with lowercase wire values matching the
+    EXISTING ``InflightEntry.phase`` strings, so ``==``/``in`` comparisons
+    against those raw strings keep working unchanged and the downstream
+    repoint of ``snapshot()``/phase reads onto the registry (task kappa) is
+    a mechanical rename rather than a value remap.
+
+    This is ONLY the state vocabulary — see
+    ``orchestrator.merge_queue.ItemLifecycle`` for the request_id-keyed
+    registry, ``orchestrator.merge_queue._LEGAL_TRANSITIONS`` for the
+    legal-edge table, and ``ItemLifecycle.transition()`` for the guarded
+    mutator. Task iota delivers only this substrate; the sibling task kappa
+    wires ``transition()`` at every put/pop call site and repoints
+    ``snapshot()`` / the permit audit / liveness checks onto the registry.
+    """
+
+    QUEUED = 'queued'
+    LANE_BUFFERED = 'lane_buffered'
+    MERGING = 'merging'
+    AWAITING_VERIFY = 'awaiting_verify'
+    REDISPATCH_PARKED = 'redispatch_parked'
+    DISPATCHING = 'dispatching'
+    VERIFYING = 'verifying'
+    GATE_REVERIFY = 'gate_reverify'
+    FINALIZING = 'finalizing'
+    TERMINAL = 'terminal'
+
+
 @dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.

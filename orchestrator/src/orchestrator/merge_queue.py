@@ -124,6 +124,7 @@ from orchestrator.merge_types import (  # noqa: F401  re-export shim
     InFlightMergeRegistry,
     InflightStatus,
     InflightVerifyResult,
+    ItemLifecycleState,
     MainHealthAutoHealRegistry,
     MergeBounceRegistry,
     MergeDispatchResult,

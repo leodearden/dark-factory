@@ -21,7 +21,6 @@ test_permit_ledger.py's convention).
 
 from __future__ import annotations
 
-
 # ---------------------------------------------------------------------------
 # step-1 RED / step-2 GREEN: ItemLifecycleState enum contract
 # ---------------------------------------------------------------------------
