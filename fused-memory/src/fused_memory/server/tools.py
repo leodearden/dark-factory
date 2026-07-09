@@ -1044,6 +1044,7 @@ def create_mcp_server(
     # ------------------------------------------------------------------
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def search(
         query: str,
         project_id: str,
@@ -1122,10 +1123,7 @@ def create_mcp_server(
                 result_summary={'count': len(results)},
             )
             return response
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
         except Exception as e:
-            logger.exception(f'search error: {e}')
             await _log_read(
                 operation='search',
                 project_id=project_id,
@@ -1135,7 +1133,7 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            raise
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -1258,6 +1256,7 @@ def create_mcp_server(
         }
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_entity(
         name: str,
         project_id: str,
@@ -1318,10 +1317,7 @@ def create_mcp_server(
                 },
             )
             return result
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
         except Exception as e:
-            logger.exception(f'get_entity error: {e}')
             await _log_read(
                 operation='get_entity',
                 project_id=project_id,
@@ -1331,9 +1327,10 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            raise
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_entity_by_uuid(
         entity_uuid: str,
         project_id: str,
@@ -1379,8 +1376,6 @@ def create_mcp_server(
                 },
             )
             return result
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
         except NodeNotFoundError as e:
             # Expected diagnostic outcome, not a backend failure — this tool
             # exists specifically to confirm whether a node exists. Log it
@@ -1396,7 +1391,6 @@ def create_mcp_server(
             )
             return {'error': str(e), 'error_type': type(e).__name__}
         except Exception as e:
-            logger.exception(f'get_entity_by_uuid error: {e}')
             await _log_read(
                 operation='get_entity_by_uuid',
                 project_id=project_id,
@@ -1406,9 +1400,10 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            raise
 
     @mcp.tool()
+    @mcp_tool_errors()
     async def get_episodes(
         project_id: str,
         last_n: int = 10,
@@ -1451,10 +1446,7 @@ def create_mcp_server(
                 result_summary={'count': len(episodes)},
             )
             return {'episodes': episodes}
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
         except Exception as e:
-            logger.exception(f'get_episodes error: {e}')
             await _log_read(
                 operation='get_episodes',
                 project_id=project_id,
@@ -1464,7 +1456,7 @@ def create_mcp_server(
                 success=False,
                 error=str(e),
             )
-            return {'error': str(e), 'error_type': type(e).__name__}
+            raise
 
     # ------------------------------------------------------------------
     # Delete tools
