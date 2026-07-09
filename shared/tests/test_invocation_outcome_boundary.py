@@ -804,6 +804,31 @@ class TestB8SighupUncaps:
 # ---------------------------------------------------------------------------
 
 
+async def _capture_probe_envs(gate: UsageGate, accts: list[AccountState]) -> list[dict]:
+    """B9 support: call the REAL ``UsageGate._run_probe`` for each of *accts*
+    (bypassing the harness's AsyncMock) with ``asyncio.create_subprocess_exec``
+    faked, and return the subprocess env dict captured for each call, in
+    order -- lets the test assert the CLAUDE_CODE_OAUTH_TOKEN/CLAUDE_CONFIG_DIR
+    injection without spawning a real claude CLI."""
+    del gate._run_probe  # remove the harness's instance-level mock; fall back
+    # to the real UsageGate._run_probe under test (mirrors the established
+    # `del gate._run_probe` idiom in test_usage_gate.py).
+    captured: list[dict] = []
+
+    async def fake_exec(*args: object, **kwargs: object) -> MagicMock:
+        captured.append(kwargs.get('env'))
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b'{"ok":true}', b''))
+        return proc
+
+    with patch('shared.usage_gate.asyncio.create_subprocess_exec', side_effect=fake_exec):
+        for acct in accts:
+            await gate._run_probe(acct)
+
+    return captured
+
+
 class TestB9ProbeDirIsolationAndEnvPrecedence:
     """Deterministic isolation (producer) + env-injection mechanism
     (consumer) halves of B9; the live env-vs-config-dir precedence
