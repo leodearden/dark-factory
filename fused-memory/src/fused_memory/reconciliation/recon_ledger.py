@@ -306,6 +306,23 @@ class ReconLedgerStore:
         is one of :data:`MARKER_KINDS` and its ``task_id`` is in
         ``terminal_task_ids``. Returns the number of rows deleted.
 
+        **Multi-task (comma-joined) markers are intentionally NOT decomposed
+        here** (task 2228 W5-κ, review finding robustness_regression): the
+        terminal-referenced clause is an EXACT string match against the
+        stored ``task_id`` column, so a marker written with a comma-joined
+        multi-task ``task_id`` (e.g. ``'12,15'``, produced by
+        ``flag_dedup.compute_flag_signature``'s ``cited_tasks`` fallback) can
+        never equal a single id in ``terminal_task_ids`` — even when every
+        cited task has gone terminal. Such markers are not lost; they are
+        instead reaped later by the ``expires_at < now`` clause once their TTL
+        elapses, rather than promptly on the referenced tasks' terminal
+        transition (the retired ``_sweep_terminal_task_flag_markers`` split
+        comma-joined ids and deleted when every component was terminal — this
+        early-collection path is narrowed to single-task markers, the
+        dominant/incident-driving shape, by this collapse). Fail-safe
+        direction is preserved either way: uncertain/unmatched => keep, never
+        delete on partial information.
+
         When ``terminal_task_ids`` is empty, the terminal-referenced clause is
         omitted entirely and an expiry-only DELETE runs instead — an explicit
         guard rather than relying on an empty ``IN ()`` (which SQLite treats

@@ -14452,3 +14452,32 @@ class TestGcReconMarkers:
         )
 
         assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_marker_task_ids_failure_degrades_bounding_to_expiry_only_gc(self):
+        """A raising ledger.marker_task_ids() (the bounding call) must not
+        propagate and must not abort the whole GC pass — unlike a raising
+        ledger.gc() itself, this degrades ONLY the terminal_task_ids bound to
+        [] (so gc() runs its expiry-only branch that cycle); gc() still runs
+        and its count is still returned, not collapsed to 0 (task 2228 W5-κ
+        amendment, review finding test_coverage)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import _gc_recon_markers
+
+        memory_service = AsyncMock()
+        ledger = AsyncMock()
+        ledger.marker_task_ids = AsyncMock(side_effect=RuntimeError('ledger db locked'))
+        ledger.gc = AsyncMock(return_value=3)
+        memory_service.recon_ledger = ledger
+        taskmaster = AsyncMock()
+        # Non-empty so _resolve_terminal_task_ids returns a non-empty list,
+        # which is what triggers the marker_task_ids bounding call at all.
+        taskmaster.get_statuses = AsyncMock(return_value={'T-done': 'done'})
+        scope = _scope('reify', '/home/leo/src/reify')
+
+        result = await _gc_recon_markers(
+            memory_service, taskmaster, scope, 'r1',
+            now=datetime(2026, 7, 9, 0, 0, 0, tzinfo=UTC),
+        )
+
+        assert result == 3
+        ledger.gc.assert_awaited_once_with(scope.project_id, ANY, [])
