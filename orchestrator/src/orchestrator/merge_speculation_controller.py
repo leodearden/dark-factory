@@ -89,7 +89,8 @@ block.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 from orchestrator.merge_types import SpecPermit
 
@@ -99,27 +100,46 @@ if TYPE_CHECKING:
     from orchestrator.merge_types import MergeRequest
 
 
-class PermitLedger:
-    """Single owner of a shared speculation-slot semaphore (MQ-refactor zeta
-    / task 2159). As of task eta (2160), this ledger is the pipeline's SOLE
+class _Permit(Protocol):
+    """Structural bound for :class:`PermitLedger`'s token type (task 2161 /
+    theta): any permit token with a mutable ``released`` flag --
+    :class:`~orchestrator.merge_types.SpecPermit`,
+    :class:`~orchestrator.merge_types.CapPermit`, or a future permit type.
+    Purely a static-typing seam; no runtime isinstance check uses this.
+    """
+
+    released: bool
+
+
+_PermitT = TypeVar('_PermitT', bound=_Permit)
+
+
+class PermitLedger(Generic[_PermitT]):
+    """Single owner of a shared semaphore (MQ-refactor zeta / task 2159). As
+    of task eta (2160), the speculation-slot ledger is the pipeline's SOLE
     conservation authority — every acquire (merger prefetch) and every
     release (verifier drain: stop-drain, cascade, ``_finalize_inflight``,
-    ``_resolve_and_release``) routes through it.
+    ``_resolve_and_release``) routes through it. Task theta (2161)
+    generalizes the class over its token type (``token_factory``) so a
+    second instance can own ``_merge_ahead_cap`` and issue
+    :class:`~orchestrator.merge_types.CapPermit` tokens through the
+    identical machinery.
 
     Wraps an externally-owned ``asyncio.Semaphore`` (injected — never owns or
     creates its own, mirroring :class:`SpeculationController`'s existing
-    contract) and mediates acquire/release through a :class:`SpecPermit`
-    token registered in ``live``. Conservation is structural: immediately
-    after any ``acquire()`` or ``release()`` call ON THIS LEDGER,
-    ``slot_available + len(live) == depth`` holds, because neither mutates
-    across an ``await`` boundary — on the single asyncio event loop, each
-    pair (semaphore + ``live``) is therefore atomic from every other
-    coroutine's perspective. Since task eta migrated every verifier-side
-    release off the raw ``_speculation_slot.release()`` call and onto
-    ``ledger.release(item.permit)``, this identity now holds PIPELINE-WIDE,
-    not merely for calls made directly on this ledger: ``len(live)`` is the
-    single authoritative count of outstanding permits, and
-    ``speculation_accounting_violations`` reads it directly for its
+    contract) and mediates acquire/release through an opaque permit token
+    (built by ``token_factory``, default :class:`SpecPermit`) registered in
+    ``live``. Conservation is structural: immediately after any
+    ``acquire()`` or ``release()`` call ON THIS LEDGER, ``slot_available +
+    len(live) == depth`` holds, because neither mutates across an ``await``
+    boundary — on the single asyncio event loop, each pair (semaphore +
+    ``live``) is therefore atomic from every other coroutine's perspective.
+    Since task eta migrated every verifier-side release off the raw
+    ``_speculation_slot.release()`` call and onto
+    ``ledger.release(item.permit)``, this identity now holds PIPELINE-WIDE
+    for the speculation ledger, not merely for calls made directly on it:
+    ``len(live)`` is the single authoritative count of outstanding permits,
+    and ``speculation_accounting_violations`` reads it directly for its
     conservation check (``merge_queue.py``).
 
     Permit handoff across the merger→verifier boundary:
@@ -146,10 +166,17 @@ class PermitLedger:
     tracks only genuinely-outstanding permits.
     """
 
-    def __init__(self, slot: asyncio.Semaphore, depth: int) -> None:
+    def __init__(
+        self,
+        slot: asyncio.Semaphore,
+        depth: int,
+        *,
+        token_factory: Callable[[], _PermitT] = SpecPermit,  # type: ignore[assignment]
+    ) -> None:
         self._slot = slot
         self._depth = depth
-        self._live: set[SpecPermit] = set()
+        self._token_factory = token_factory
+        self._live: set[_PermitT] = set()
 
     @property
     def depth(self) -> int:
@@ -167,11 +194,11 @@ class PermitLedger:
         return self._slot._value  # type: ignore[attr-defined]
 
     @property
-    def live(self) -> frozenset[SpecPermit]:
+    def live(self) -> frozenset[_PermitT]:
         """Read-only view of the currently-outstanding permits."""
         return frozenset(self._live)
 
-    async def acquire(self) -> SpecPermit:
+    async def acquire(self) -> _PermitT:
         """Acquire one permit, returning a fresh token registered in ``live``.
 
         No ``await`` between the semaphore acquire and the ``live``
@@ -179,11 +206,11 @@ class PermitLedger:
         coroutine's perspective.
         """
         await self._slot.acquire()
-        permit = SpecPermit()
+        permit = self._token_factory()
         self._live.add(permit)
         return permit
 
-    def release(self, permit: SpecPermit) -> None:
+    def release(self, permit: _PermitT) -> None:
         """Release *permit*, restoring one slot. Idempotent + live-checked.
 
         Checks ``permit.released`` FIRST so a double-release is a silent
@@ -211,6 +238,25 @@ class PermitLedger:
         self._live.discard(permit)
         self._slot.release()
 
+    def release_for_shutdown(self, count: int) -> None:
+        """Shutdown-only valve: release *count* slots on the wrapped
+        semaphore directly, WITHOUT touching ``live`` (task 2161 step-4).
+
+        Deliberately over-releases the plain (never Bounded) ``asyncio.
+        Semaphore`` to unblock any coroutine still parked at ``acquire()``
+        during shutdown -- mirrors the pre-ledger ``stop()`` over-release
+        loops this method replaces. This intentionally BREAKS the
+        ``slot_available + len(live) == depth`` conservation identity (the
+        semaphore's counter rises while ``live`` is untouched), which is
+        safe only because every caller gates this behind ``not
+        self._running``, under which ``speculation_accounting_violations``
+        already short-circuits to ``[]`` before it would ever read the now-
+        violated identity. Never raises -- a plain ``Semaphore.release()``
+        simply increments its internal counter past ``depth``.
+        """
+        for _ in range(count):
+            self._slot.release()
+
 
 class SpeculationController:
     """Owns the merger loop's speculation state + merger-side permit lifecycle.
@@ -221,7 +267,7 @@ class SpeculationController:
     the full lifecycle.
     """
 
-    def __init__(self, ledger: PermitLedger, depth: int) -> None:
+    def __init__(self, ledger: PermitLedger[SpecPermit], depth: int) -> None:
         self._ledger = ledger
         self._depth = depth
         # The permit the merger currently holds, or None if it holds none —

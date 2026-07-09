@@ -806,7 +806,7 @@ class TestBookkeeping:
 
     A coalesced train is dispatched with speculative=False (bypassing the
     speculative look-ahead).  The SpeculativeItem put on the verifier queue
-    has speculative=False and counts_against_cap=False — both differ from a
+    has speculative=False and cap_permit=None — both differ from a
     normal solo merge.  After the train lands, both semaphores must return to
     their full K (no leaked permits).
 
@@ -817,12 +817,12 @@ class TestBookkeeping:
       (A) worker._speculation_slot is NOT locked after the train lands (no leaked permit)
       (B) worker._merge_ahead_cap is NOT locked after the train lands
       (C) the train's SpeculativeItem on the verifier queue has speculative=False
-          and counts_against_cap=False (bypassed both cap mechanisms)
+          and cap_permit=None (bypassed both cap mechanisms)
 
     GREEN (step-10): predicates corrected to not locked(); event-loop yields
     added before the assertions; SpeculativeItem intercepted via wrapping
     worker._verifier_queue.put() to capture the train's item and assert its
-    speculative=False / counts_against_cap=False.
+    speculative=False / cap_permit=None.
     """
 
     async def test_speculative_caps_return_to_k_after_train(
@@ -914,18 +914,18 @@ class TestBookkeeping:
 
         # (B) _merge_ahead_cap must NOT be locked — no cap was acquired/leaked.
         # The train's item is a DecidedItem (task ο), which has no
-        # counts_against_cap field at all (the GroupMergeRequest continue fires
+        # cap_permit field at all (the GroupMergeRequest continue fires
         # before the acquire site), so the verifier never releases it either.
         # Both sides are clean.
         assert not worker._merge_ahead_cap.locked(), (
             '_merge_ahead_cap must be unlocked after the train lands; '
             'trains are structurally exempt from Mechanism 1 (DecidedItem has no '
-            'counts_against_cap field)'
+            'cap_permit field)'
         )
 
         # (C) The train's item: speculative=False, and a DecidedItem (task ο) —
         # a GroupMergeRequest is dispatched with speculative=False (bypasses
-        # look-ahead) and DecidedItem has no counts_against_cap field at all
+        # look-ahead) and DecidedItem has no cap_permit field at all
         # (never acquired _merge_ahead_cap), so trains are structurally exempt
         # from Mechanism 1 rather than merely defaulted to False.
         from orchestrator.merge_queue import DecidedItem, GroupMergeRequest
@@ -943,7 +943,7 @@ class TestBookkeeping:
             f'got {train_item.speculative!r}'
         )
         assert isinstance(train_item, DecidedItem), (
-            f'Train item must be a DecidedItem — counts_against_cap is a '
+            f'Train item must be a DecidedItem — cap_permit is a '
             f'RealMergeItem-only field (task ο), so trains are structurally exempt '
             f'from Mechanism 1 rather than merely defaulted to False; got '
             f'{type(train_item).__name__}'

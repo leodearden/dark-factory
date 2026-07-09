@@ -179,7 +179,7 @@ class TestSpeculationAccountingViolations:
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
         # Force a leak: a merge-ahead-cap permit vanished without a
-        # corresponding counts_against_cap=True item in the verifier queue —
+        # corresponding cap_permit-bearing item in the verifier queue —
         # breaks identity (b).
         worker._merge_ahead_cap._value -= 1
 
@@ -262,6 +262,118 @@ def _make_spec_item(tmp_path: Path, *, speculative: bool):
         base_sha='aabbccdd00000000aaaa',
         speculative=speculative,
     )
+
+
+# ---------------------------------------------------------------------------
+# task 2161 (θ) amendment pass: identity (c) merge-ahead-cap handoff
+# cross-check
+#
+# (c) walks _verifier_queue directly and flags any RealMergeItem whose
+# cap_permit is non-None but absent from merge_ahead_ledger.live — a signal
+# independent of (b), which derives both its own operands from the ledger
+# itself and so cannot see a handoff/threading regression. These tests pin
+# (c)'s behaviour directly against a bare (non-running) worker:
+#   - a foreign/never-acquired token on a queued item IS flagged (the real
+#     bug class the check exists to catch);
+#   - a live-acquired token that gets released while its item is STILL
+#     queued (the narrow CancelledError-after-put() race documented at the
+#     _merger_loop put()-failure except block in merge_queue.py) IS flagged
+#     if left in place — (c) does not blindly tolerate every released token;
+#   - the same released token, once the except block clears the item's
+#     ``cap_permit`` back to ``None`` (the amendment-pass fix), is NOT
+#     flagged — matching the state an ordinary on-drain release +
+#     redispatch-clear already produces via
+#     ``dataclasses.replace(item, cap_permit=None)``.
+# ---------------------------------------------------------------------------
+
+
+class TestMergeAheadCapHandoffCrossCheck:
+    """Unit tests for speculation_accounting_violations()'s identity (c)."""
+
+    @pytest.mark.asyncio
+    async def test_healthy_queued_item_with_live_permit_no_violation(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        item = _make_spec_item(tmp_path, speculative=False)
+        item.cap_permit = await worker._merge_ahead_ledger.acquire()
+        worker._verifier_queue.put_nowait(item)
+
+        assert worker.speculation_accounting_violations() == []
+
+    def test_foreign_cap_permit_on_queued_item_flags_violation(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        """A genuine handoff bug: a token never issued by this ledger (so it
+        is neither live nor released) stamped onto a queued item. (c) exists
+        precisely to catch this — (b) stays green throughout because it
+        never reads the item's stamped token, only the ledger's own
+        bookkeeping.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_types import CapPermit
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        item = _make_spec_item(tmp_path, speculative=False)
+        item.cap_permit = CapPermit()  # never acquired through the ledger
+        worker._verifier_queue.put_nowait(item)
+
+        violations = worker.speculation_accounting_violations()
+
+        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
+        assert 'handoff' in violations[0]
+
+    @pytest.mark.asyncio
+    async def test_released_but_uncleared_cap_permit_flags_violation(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        """The false-positive scenario the amendment-pass fix targets, MINUS
+        the fix: a token acquired then released while its item is still
+        queued (the narrow put()-failure race). Left uncleared, (c) reports
+        it — from (c)'s perspective this is indistinguishable from a genuine
+        premature-release bug, which is exactly why the merger loop must
+        clear the field rather than leaving (c) to blindly tolerate any
+        released token (see the next test for the cleared, non-violating
+        state).
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        item = _make_spec_item(tmp_path, speculative=False)
+        item.cap_permit = await worker._merge_ahead_ledger.acquire()
+        worker._verifier_queue.put_nowait(item)
+        worker._merge_ahead_ledger.release(item.cap_permit)  # simulates the except-block release
+
+        violations = worker.speculation_accounting_violations()
+
+        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
+        assert 'handoff' in violations[0]
+
+    @pytest.mark.asyncio
+    async def test_released_and_cleared_cap_permit_no_violation(
+        self, git_ops: GitOps, tmp_path: Path,
+    ) -> None:
+        """The fix: once the merger loop's put()-failure except block clears
+        the item's stamped token (``_real_item.cap_permit = None``) after
+        releasing it through the ledger, (c) no longer sees a non-``None``
+        cap_permit on the queued item at all — no transient false-positive.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+
+        item = _make_spec_item(tmp_path, speculative=False)
+        item.cap_permit = await worker._merge_ahead_ledger.acquire()
+        worker._verifier_queue.put_nowait(item)
+        worker._merge_ahead_ledger.release(item.cap_permit)
+        item.cap_permit = None  # what the except-block fix now does
+
+        assert worker.speculation_accounting_violations() == []
 
 
 class TestRedispatchSpeculativeAccounting:

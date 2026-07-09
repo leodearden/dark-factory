@@ -800,6 +800,24 @@ class SpecPermit:
     released: bool = False
 
 
+@dataclass(eq=False)
+class CapPermit:
+    """Opaque merge-ahead-cap permit token (MQ-refactor theta / task 2161).
+
+    The ``_merge_ahead_cap`` analogue of :class:`SpecPermit`: returned by a
+    :class:`~orchestrator.merge_speculation_controller.PermitLedger`
+    constructed with ``token_factory=CapPermit`` and stored on the
+    :class:`RealMergeItem` that owns it (``.cap_permit``). Byte-for-byte
+    mirror of :class:`SpecPermit` -- same ``eq=False`` IDENTITY (not
+    field-value) comparison so a ledger's ``live`` set treats every acquired
+    token as a distinct member, and the same once-only ``released`` flip
+    that makes a second release of the same token a silent no-op rather than
+    an over-release or an assertion failure.
+    """
+
+    released: bool = False
+
+
 @dataclass
 class RealMergeItem:
     """Internal message passed from Merger coroutine to Verifier coroutine:
@@ -819,7 +837,7 @@ class RealMergeItem:
     speculative: bool                  # True → merged against pending N's SHA
     started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
     merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
-    counts_against_cap: bool = False  # True for non-speculative, non-train successful merges (Mechanism 1)
+    cap_permit: CapPermit | None = None  # θ: merge-ahead-cap token owned by PermitLedger; non-None for non-speculative, non-train successful merges (Mechanism 1)
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
 
 
@@ -832,7 +850,7 @@ class DecidedItem:
     The DECIDED arm of the MQ-refactor ο item union (mirrors
     ``classify_and_merge``'s :class:`Decided`).  Structurally disjoint from
     :class:`RealMergeItem` — this class has no
-    ``merge_result``/``merge_wt``/``merged_branch_tip``/``counts_against_cap``
+    ``merge_result``/``merge_wt``/``merged_branch_tip``/``cap_permit``
     fields, so the task-1990 I2 "REAL xor DECIDED" __post_init__ check retires
     into type structure: the illegal shape can no longer be constructed.
     """

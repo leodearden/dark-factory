@@ -115,6 +115,7 @@ from orchestrator.merge_speculation_controller import (  # noqa: F401  re-export
 )
 from orchestrator.merge_types import (  # noqa: F401  re-export shim
     _INFLIGHT_MERGE_ETA_ESTIMATE_SECS,
+    CapPermit,
     Decided,
     DecidedItem,
     GroupMergeRequest,
@@ -268,14 +269,16 @@ the SpeculativeMergeWorker verifier queue simultaneously (Mechanism 1, task 1646
 
 With BOUND=1 the Merger runs at most one non-speculative merge ahead of the
 Verifier: after enqueuing a counted item the Merger blocks at
-``_merge_ahead_cap.acquire()`` until the Verifier drains that item, at which
-point it re-reads a fresh main HEAD for the next merge.  Values in [1, 2] are
-safe; higher values allow more build-ahead but increase staleness risk.
+``self._merge_ahead_ledger.acquire()`` (task 2161/θ: ledger-mediated, wraps
+``_merge_ahead_cap``) until the Verifier drains that item, at which point it
+re-reads a fresh main HEAD for the next merge.  Values in [1, 2] are safe;
+higher values allow more build-ahead but increase staleness risk.
 
 Cap invariants (all verified by integration tests):
 - Acquired at the single success-enqueue site in _merger_loop for non-speculative
   blocking-path items (trains continue before this site; speculative items are
-  governed by _speculation_slot instead).
+  governed by _speculation_slot instead), stamped onto the item's
+  :attr:`~orchestrator.merge_types.RealMergeItem.cap_permit`.
 - Released ON-DRAIN in _verifier_loop, immediately after ``_verifier_queue.get()``
   returns a non-None item, before any branching or item reassignment.  This
   uniform placement covers all drain paths (normal verify, immediate_outcome,
@@ -4408,6 +4411,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # without raising.  Released ON-DRAIN (right after verifier_queue.get()
         # for a counted item) so the slot is free while verify runs.
         self._merge_ahead_cap = asyncio.Semaphore(self._speculation_depth)
+        # MQ-refactor theta (task 2161): single owner of the cap semaphore
+        # above — mediates every acquire/release through a CapPermit token
+        # (PermitLedger generalized over token_factory, mirroring zeta's
+        # _speculation_ledger) so conservation (slot_available + len(live) ==
+        # depth) holds by construction. len(live) is the authoritative
+        # in-flight-cap count (speculation_accounting_violations identity
+        # (b) and _inflight_cap_count read it directly).
+        self._merge_ahead_ledger: PermitLedger[CapPermit] = PermitLedger(
+            self._merge_ahead_cap, self._speculation_depth,
+            token_factory=CapPermit,
+        )
         # Per-lane halt: each event is set (running) by default
         self._lane_halt = {ln: asyncio.Event() for ln in MERGE_LANES}
         for ln in MERGE_LANES:
@@ -5484,20 +5498,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         )
 
     def _inflight_cap_count(self) -> int:
-        """Return the count of _verifier_queue items holding a merge-ahead-cap permit.
+        """Return the count of in-flight merge-ahead-cap permits.
 
-        Mechanism 1 (task 1646): the cap is acquired at the single
-        non-speculative success-enqueue site and released ON-DRAIN in
-        ``_dispatch_item`` immediately after ``_verifier_queue.get()`` —
-        never once an item reaches ``self._inflight``. So the in-flight cap
-        count is exactly the number of ``_verifier_queue`` items with
-        ``counts_against_cap=True``. Same CPython internal-deque read as
-        :meth:`_inflight_speculative_count`.
+        Task 2161 (θ): conservation is now structural rather than a
+        ``_verifier_queue`` scan. Every acquired :class:`CapPermit` is
+        registered in ``self._merge_ahead_ledger.live`` and discarded only
+        when released ON-DRAIN (or by the caller's redispatch-clear, which
+        follows an ON-DRAIN release that already happened — see
+        ``_dispatch_item``), so ``len(live)`` is already exactly the
+        in-flight count. Mirrors :meth:`_inflight_speculative_count`'s
+        ledger-derived collapse (task 2160/η).
         """
-        return sum(
-            1 for _item in self._verifier_queue._queue  # type: ignore[attr-defined]
-            if isinstance(_item, RealMergeItem) and _item.counts_against_cap
-        )
+        return len(self._merge_ahead_ledger.live)
 
     def speculation_accounting_violations(self) -> list[str]:
         """Return I4 permit/cap conservation violations as human-readable strings.
@@ -5514,8 +5526,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
               the merger/verifier split) since ``len(ledger.live) ==
               held_by_merger + inflight_speculative`` once every permit
               release routes through the ledger.
-          (b) merge-ahead-cap identity: ``merge_ahead_cap._value +
-              inflight_cap_count == depth`` — the Mechanism-1 cap analogue.
+          (b) merge-ahead-cap identity: ``merge_ahead_ledger.slot_available +
+              len(merge_ahead_ledger.live) == depth`` (task 2161/θ) — the
+              ledger-derived collapse of the Mechanism-1 cap analogue,
+              mirroring identity (a)'s structural form. Equivalent to the
+              prior ``merge_ahead_cap._value + inflight_cap_count == depth``
+              form since ``_inflight_cap_count`` now reads ``len(live)``
+              directly.
+          (c) merge-ahead-cap handoff cross-check: every :class:`RealMergeItem`
+              currently sitting in ``_verifier_queue`` with a non-``None``
+              ``cap_permit`` has that exact token present in
+              ``merge_ahead_ledger.live``. (b) derives both of its operands
+              from the ledger itself (``slot_available`` and ``len(live)``),
+              so it is tautological against a handoff/threading regression
+              (e.g. a stale or prematurely-released token stamped onto an
+              item); this check instead walks the actual queue contents —
+              independent of the ledger's own bookkeeping — and would catch
+              exactly that class of bug even though (b) stays green.
 
         Returns ``[]`` immediately when ``not self._running``: ``stop()``
         deliberately over-releases both semaphores by ``depth + 1`` as a
@@ -5556,7 +5583,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # ── (b) merge-ahead-cap identity ─────────────────────────────────────
         try:
             depth = self._speculation_depth
-            cap_available = self._merge_ahead_cap._value  # type: ignore[attr-defined]
+            cap_available = self._merge_ahead_ledger.slot_available
             inflight_cap = self._inflight_cap_count()
             total = cap_available + inflight_cap
             if total != depth:
@@ -5569,6 +5596,41 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         except Exception as exc:  # pragma: no cover — defensive
             violations.append(
                 f'speculation_accounting_violations: merge-ahead-cap check raised: {exc}'
+            )
+
+        # ── (c) merge-ahead-cap handoff cross-check ──────────────────────────
+        # Independent of (b): (b)'s two operands both come from the ledger
+        # itself, so it cannot see a handoff bug where an item's stamped
+        # cap_permit has drifted out of sync with the ledger (a stale/foreign
+        # token, or a premature release while the item is still queued). This
+        # walks the actual verifier-queue contents instead — the same
+        # internal-deque access `snapshot()` uses for its 'awaiting_verify'
+        # section — and cross-validates each RealMergeItem's cap_permit
+        # against merge_ahead_ledger.live by identity.
+        #
+        # This reintroduces an O(n) _verifier_queue scan that
+        # _inflight_cap_count()'s ledger-derived len(live) collapse (above)
+        # was written to avoid — deliberately: this method is a diagnostic/
+        # audit path (heartbeat-driven, not per-item hot path), and (c) checks
+        # a property (c) alone can see, so the O(1) win on the common
+        # conservation check (b) still stands. Not gated behind a flag unless
+        # this call site becomes hot.
+        try:
+            for _vq_item in list(self._verifier_queue._queue):  # type: ignore[attr-defined]
+                if (
+                    isinstance(_vq_item, RealMergeItem)
+                    and _vq_item.cap_permit is not None
+                    and _vq_item.cap_permit not in self._merge_ahead_ledger.live
+                ):
+                    violations.append(
+                        'merge-ahead-cap handoff violated: RealMergeItem in '
+                        '_verifier_queue carries a cap_permit not present in '
+                        'merge_ahead_ledger.live (stale or prematurely-released '
+                        'token)'
+                    )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(
+                f'speculation_accounting_violations: merge-ahead-cap handoff check raised: {exc}'
             )
 
         return violations
@@ -6801,13 +6863,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         shutdown = MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
         # Release speculation-depth permits, all lane halts, and merge-ahead cap
         # so the merger doesn't hang waiting at any synchronisation point.
-        # Over-releasing a plain Semaphore is safe (it just increments the counter).
-        for _ in range(self._speculation_depth + 1):
-            self._speculation_slot.release()
+        # θ (task 2161): routed through each ledger's release_for_shutdown(),
+        # which over-releases the wrapped semaphore directly without touching
+        # `live` -- the same over-release-is-safe shutdown valve as before,
+        # now the sole acquire/release surface for both semaphores (P-2).
+        self._speculation_ledger.release_for_shutdown(self._speculation_depth + 1)
         for ln in MERGE_LANES:
             self._lane_halt[ln].set()
-        for _ in range(self._speculation_depth + 1):
-            self._merge_ahead_cap.release()
+        self._merge_ahead_ledger.release_for_shutdown(self._speculation_depth + 1)
 
         # Drain per-lane buffers (items already removed from _queue by the merger)
         # Intentionally mutates _lane_buffers directly (not via
@@ -7769,8 +7832,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # (all return above) never reach this site, so `not speculative`
                     # is the exact predicate for blocking-path items.
                     counts_against_cap = not speculative
+                    cap_permit: CapPermit | None = None
                     if counts_against_cap:
-                        await self._merge_ahead_cap.acquire()
+                        cap_permit = await self._merge_ahead_ledger.acquire()
+                    _real_item: RealMergeItem | None = None
                     try:
                         self._register_owned_merge_worktree(merge_result.merge_worktree)
                         _real_item = RealMergeItem(
@@ -7779,44 +7844,67 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             base_sha=base_for_merge, speculative=speculative,
                             started_monotonic=t0,
                             merged_branch_tip=branch_head,  # γ2: branch tip at merge time
-                            counts_against_cap=counts_against_cap,
+                            cap_permit=cap_permit,
                         )
                         await self._verifier_queue.put(_real_item)
                     except BaseException:
                         # put() failed — the verifier will never drain this item
-                        # and release the cap.  Release it here to prevent the
-                        # merger from deadlocking at the next acquire.
+                        # and release the cap permit.  Release it here to prevent
+                        # the merger from deadlocking at the next acquire.
                         #
                         # Double-release edge case: if CancelledError is raised
                         # at the `await` boundary AFTER put() already enqueued
                         # the item (a narrow asyncio race), this release fires
-                        # AND the verifier releases again on drain — two releases
-                        # for one acquire.  This is intentionally tolerated:
-                        # asyncio.Semaphore allows over-release (its counter
-                        # simply increments past the original bound).
-                        # Do NOT replace with asyncio.BoundedSemaphore, which
-                        # raises ValueError on over-release and would crash here.
+                        # AND the verifier releases again on drain — two release
+                        # calls for the SAME token.  Unlike the speculation-slot
+                        # permit (stamped onto the item AFTER put() succeeds —
+                        # see below), cap_permit is necessarily stamped into the
+                        # RealMergeItem constructor above, BEFORE put(); there is
+                        # no deferred-stamping trick available here, so this
+                        # genuinely is a double-release ATTEMPT on the same
+                        # CapPermit token.  It is safe because
+                        # PermitLedger.release() is idempotent (checks
+                        # `.released` FIRST): the second call is a silent no-op,
+                        # never an over-release or an assertion failure.
                         #
-                        # The _speculation_slot / permit picture is DIFFERENT
-                        # from _merge_ahead_cap above — under the ledger (η)
-                        # this is NOT a double release.  On this same
-                        # CancelledError-after-put race, execution never
-                        # reaches the on_transfer() stamp below (it lives
-                        # after this except block, past the `raise`), so
-                        # `_real_item.permit` stays None.  The verifier later
-                        # drains this item and, per its `if entry.permit is
-                        # not None` release guard, skips releasing the
-                        # ledger for it.  Meanwhile on_transfer() was never
-                        # called, so the controller's held_by_merger stays
-                        # True and the outer finally's on_shutdown() (or an
-                        # enclosing except's on_abort()) performs the single
-                        # authoritative ledger release of the still-held
-                        # merger permit.  Net: released exactly once — the
-                        # "verifier also releases it on drain" / "over-release
-                        # safe" story above is specific to _merge_ahead_cap
-                        # and does not apply here.
-                        if counts_against_cap:
-                            self._merge_ahead_cap.release()
+                        # The _speculation_slot / permit picture avoids the
+                        # double-release attempt altogether via a DIFFERENT
+                        # mechanism: execution never reaches the on_transfer()
+                        # stamp below (it lives after this except block, past
+                        # the `raise`), so `_real_item.permit` stays None.  The
+                        # verifier later drains this item and, per its `if
+                        # entry.permit is not None` release guard, skips
+                        # releasing the ledger for it.  Meanwhile on_transfer()
+                        # was never called, so the controller's held_by_merger
+                        # stays True and the outer finally's on_shutdown() (or
+                        # an enclosing except's on_abort()) performs the single
+                        # authoritative ledger release of the still-held merger
+                        # permit.  Net: released exactly once — via deferred
+                        # stamping rather than the cap permit's idempotent
+                        # double-release tolerance above.
+                        if cap_permit is not None:
+                            self._merge_ahead_ledger.release(cap_permit)
+                            # Same race, a second symptom: if put() already
+                            # enqueued _real_item onto _verifier_queue before
+                            # the CancelledError propagated (the race above),
+                            # that item is still sitting in the queue holding
+                            # this now-released token —
+                            # speculation_accounting_violations' identity (c)
+                            # cross-checks every _verifier_queue item's
+                            # cap_permit against merge_ahead_ledger.live and
+                            # would report a transient false-positive "stale
+                            # or prematurely-released token" violation until
+                            # the verifier drains it. Clear it here so the
+                            # item's visible state matches "no live token",
+                            # exactly as an ordinary on-drain release is
+                            # immediately followed by
+                            # dataclasses.replace(item, cap_permit=None).
+                            # Harmless when _real_item was never enqueued (or
+                            # never constructed — the None-guard covers a
+                            # failure before its assignment above): it is
+                            # about to be discarded by the `raise` below.
+                            if _real_item is not None:
+                                _real_item.cap_permit = None
                         raise
                     # The put succeeded — verifier now owns the speculation
                     # permit for this item (released on drain if speculative).
@@ -8181,10 +8269,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # No host available: put item back on _redispatch.  Only a
                     # RealMergeItem ever needs a host lease (passthroughs never
                     # fail to dispatch), so item is always a RealMergeItem here.
-                    # counts_against_cap was already released in _dispatch_item;
-                    # clear the flag to prevent a double-release on re-dispatch.
+                    # cap_permit was already released in _dispatch_item; clear
+                    # it to prevent a double-release on re-dispatch.
                     assert isinstance(item, RealMergeItem)
-                    item_back = dataclasses.replace(item, counts_against_cap=False)
+                    item_back = dataclasses.replace(item, cap_permit=None)
                     self._redispatch.appendleft(item_back)
                     fill_done = True
                     break
@@ -8477,7 +8565,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # a RealMergeItem ever needs a host lease, so item is always a
                     # RealMergeItem here (see the DISPATCH-FILL branch above).
                     assert isinstance(item, RealMergeItem)
-                    item_back = dataclasses.replace(item, counts_against_cap=False)
+                    item_back = dataclasses.replace(item, cap_permit=None)
                     self._redispatch.appendleft(item_back)
                     continue
 
@@ -9537,11 +9625,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Returns an InflightEntry on success (to be appended to self._inflight),
         or None when no host slot is currently available (caller should put the
-        item back on self._redispatch unchanged — counts_against_cap already
-        released, so caller must clear it first via dataclasses.replace).
+        item back on self._redispatch unchanged — cap_permit already released,
+        so caller must clear it first via dataclasses.replace).
 
         Handles in order:
-          1. Mechanism 1 cap release (counts_against_cap).
+          1. Mechanism 1 cap release (cap_permit).
           2. Pre-dispatch abandon: cleanup merge_wt; return ABANDONED_PREDISPATCH
              passthrough entry (req.result already done; finalize no-ops delivery).
           3. Pre-dispatch operator-halt: cleanup merge_wt, re-queue req on _queue;
@@ -9569,9 +9657,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Mirrors original _verifier_loop :6327: release BEFORE any branching so
         # every drain path (normal verify, passthrough, abandon, halt) is covered.
         # cap release happens exactly once: here for items from _verifier_queue;
-        # items put back onto _redispatch have counts_against_cap cleared.
-        if isinstance(item, RealMergeItem) and item.counts_against_cap:
-            self._merge_ahead_cap.release()
+        # items put back onto _redispatch have cap_permit cleared.
+        # θ: release THROUGH the ledger, guarded by the threaded token rather
+        # than a bool — ledger.release(None) would AttributeError on `.released`.
+        if isinstance(item, RealMergeItem) and item.cap_permit is not None:
+            self._merge_ahead_ledger.release(item.cap_permit)
 
         # ── Pre-dispatch abandon ────────────────────────────────────────────
         if self._request_abandoned(req):
@@ -9633,7 +9723,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         # ── Real item: host acquire + verify dispatch ───────────────────────
         # Fast-path: if no host is free RIGHT NOW, return None so the caller
-        # puts the item back on _redispatch (counts_against_cap already cleared
+        # puts the item back on _redispatch (cap_permit already released
         # above; caller must clear it on the item before putting back).
         # Checked BEFORE the potentially-expensive _remerge call so no work is
         # done for an item that will be re-tried on a free host.

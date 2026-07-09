@@ -51,6 +51,7 @@ from orchestrator.merge_queue import (
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     WORKTREE_MISSING_REASON_PREFIX,
+    CapPermit,
     DecidedItem,
     DropGuardResult,
     GroupMergeRequest,
@@ -5303,7 +5304,15 @@ class TestSpeculativeMergeWorker:
             queue.put_nowait(req_n1)
             queue.put_nowait(req_n2)
 
-            deadline = time.monotonic() + 15
+            # 30 s (not the file's more common 15 s poll budget) to match this
+            # same test's own wait_for(..., timeout=30) calls below: under
+            # heavy host load the real git-subprocess merges backing N+1/N+2
+            # can occasionally exceed 15 s wall-clock with no logic fault
+            # (observed flake: attempt-1 timed out at 15 s while 667/668
+            # sibling tests passed; the identical scenario passed repeatedly
+            # in isolation and full-file reruns). The assertion itself —
+            # N+1 and N+2 must both reach the verifier queue — is unchanged.
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if worker._verifier_queue.qsize() >= 2:
                     break
@@ -5311,7 +5320,7 @@ class TestSpeculativeMergeWorker:
             else:
                 pytest.fail(
                     'N+1 and N+2 did not both appear in the verifier queue within '
-                    '15 s.  N+2 must be speculatively prefetched after N+1 (K=2).'
+                    '30 s.  N+2 must be speculatively prefetched after N+1 (K=2).'
                 )
 
             gate_open.set()
@@ -5577,7 +5586,7 @@ class TestSpeculativeMergeWorker:
         proof; the _cap_is_full check is an independent early signal.
 
         Scenario:
-          N   — non-speculative, counted (counts_against_cap=True)
+          N   — non-speculative, counted (cap_permit acquired)
                 — verify gated then FAILS → n_failed=True, main NOT advanced
           N+1 — non-speculative, counted (submitted after N's spec window closed)
                 — verifies NORMALLY (no chain-invalidation, no main_advanced)
@@ -5699,7 +5708,7 @@ class TestSpeculativeMergeWorker:
 
             await queue.put(req_n)
             # Wait for N's merger-phase merge to complete, so N is in the verifier
-            # queue with counts_against_cap=True but not yet drained
+            # queue with a cap_permit acquired but not yet drained
             await asyncio.wait_for(n_merge_done.wait(), timeout=30)
 
             # Cancel N's future before the verifier drains it → abandonment path
@@ -10011,8 +10020,8 @@ class TestMergedBranchTipCarryThroughRebuild:
     # merged_branch_tip specifically — the one field task-1928's original
     # hand-fix had to add back. These lock the general dataclasses.replace
     # guarantee that motivated the I3 switch: EVERY other SpeculativeItem
-    # field survives the rebuild unchanged, including counts_against_cap,
-    # which the pre-1990 hand-rebuild silently reset to its default (False).
+    # field survives the rebuild unchanged, including cap_permit,
+    # which the pre-1990 hand-rebuild silently reset to its default (None).
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -10049,7 +10058,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """(A2) The rebased_pending_reverify replace-only rebuild (~:8258) must
-        change ONLY base_sha — every other field, including counts_against_cap,
+        change ONLY base_sha — every other field, including cap_permit,
         survives unchanged. Complements test (A), which only checks
         merged_branch_tip.
         """
@@ -10073,7 +10082,7 @@ class TestMergedBranchTipCarryThroughRebuild:
             base_sha=base_main,
             speculative=False,
             merged_branch_tip=ORIGINAL_TIP,
-            counts_against_cap=True,
+            cap_permit=CapPermit(),
         )
 
         # Move main: edit line18 (non-adjacent) → rebase succeeds → rebased_onto
@@ -10131,7 +10140,7 @@ class TestMergedBranchTipCarryThroughRebuild:
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """(C2) The cas_failed replace-only rebuild (~:8322) must change ONLY
-        base_sha — every other field, including counts_against_cap, survives
+        base_sha — every other field, including cap_permit, survives
         unchanged. Complements test (C), which only checks merged_branch_tip.
         """
         branch = 'field-carry-cas'
@@ -10163,7 +10172,7 @@ class TestMergedBranchTipCarryThroughRebuild:
             base_sha=base_sha,
             speculative=False,
             merged_branch_tip=ORIGINAL_TIP,
-            counts_against_cap=True,
+            cap_permit=CapPermit(),
         )
 
         # Advance main for real (unrelated commit) so the CAS-retry's
