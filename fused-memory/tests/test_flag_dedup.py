@@ -8131,3 +8131,209 @@ async def test_dedup_flags_recurring_flag_without_flag_for_stage2_unaffected():
     )
     memory_service.delete_memory.assert_not_called()
 
+
+# ---------------------------------------------------------------------------
+# dedup_flags — ledger-backed marker path (task 2227 step-09)
+#
+# RED until step-10 rewrites dedup_flags' per-flag marker path onto a single
+# memory_service.recon_ledger.upsert(...) keyed on (task_id, flag_type) with
+# run_id='' in the identity (see plan.json design decisions), replacing the
+# Mem0 search/write/confirm/delete chain exercised by the tests above.
+# filter_suppressed (step-04) and acknowledge_flag_marker (step-08) are
+# already ledger-backed, so the completion branch's sweep already flows
+# through the ledger today; the tests below additionally pin that behaviour
+# survives the upcoming per-flag marker-path rewrite.
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsLedgerMarkerPath:
+    """dedup_flags' marker path becomes a single ledger UPSERT keyed on
+    (task_id, flag_type) — no Mem0 search/confirm/delete round trip."""
+
+    @pytest.mark.asyncio
+    async def test_recurring_flag_first_run_upserts_single_marker_row(
+        self, ledger_memory_service
+    ):
+        """A recurring flag's first run UPSERTs exactly one stage1_flag_marker
+        row, with payload run_id/last_seen_run_id set from the current run,
+        and the flag itself is annotated last_seen_run_id (no
+        persisted_from_run — this is a fresh signature)."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flags = [{'task_id': 42, 'flag_type': 'missing_deliverable'}]
+
+        result = await dedup_flags(ledger_memory_service, 'p', 'r1', flags)
+
+        assert len(result) == 1
+        assert 'persisted_from_run' not in result[0]
+        assert result[0]['last_seen_run_id'] == 'r1'
+
+        row = await _get_marker(
+            ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable'
+        )
+        assert row is not None
+        assert row.state == 'active'
+        payload = json.loads(row.payload_json)
+        assert payload['run_id'] == 'r1'
+        assert payload['last_seen_run_id'] == 'r1'
+
+    @pytest.mark.asyncio
+    async def test_recurring_flag_second_run_upserts_same_row(self, ledger_memory_service):
+        """The same signature recurring on a later run UPSERTs the SAME row
+        (still exactly one) with a refreshed run_id/last_seen_run_id, and the
+        flag is annotated persisted_from_run from the FIRST run's write."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flags = [{'task_id': 42, 'flag_type': 'missing_deliverable'}]
+        await dedup_flags(ledger_memory_service, 'p', 'r1', flags)
+
+        result = await dedup_flags(ledger_memory_service, 'p', 'r2', flags)
+
+        assert len(result) == 1
+        assert result[0]['persisted_from_run'] == 'r1'
+        assert result[0]['last_seen_run_id'] == 'r2'
+
+        row = await _get_marker(
+            ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable'
+        )
+        assert row is not None
+        payload = json.loads(row.payload_json)
+        assert payload['run_id'] == 'r2'
+        assert payload['last_seen_run_id'] == 'r2'
+
+    @pytest.mark.asyncio
+    async def test_same_signature_twice_in_one_call_collapses_to_one_row(
+        self, ledger_memory_service
+    ):
+        """The SAME recurring signature emitted twice in ONE dedup_flags call
+        collapses to exactly one ledger row — the ledger's UPSERT +
+        read-after-write consistency makes the old seen_signatures in-batch
+        memo unnecessary for this case."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flags = [
+            {'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'first'},
+            {'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'second'},
+        ]
+
+        result = await dedup_flags(ledger_memory_service, 'p', 'r1', flags)
+
+        assert len(result) == 2
+        row = await _get_marker(
+            ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable'
+        )
+        assert row is not None
+
+    @pytest.mark.asyncio
+    async def test_recurring_marker_path_never_touches_mem0_search_or_delete(
+        self, ledger_memory_service
+    ):
+        """The ledger-backed marker path performs no Mem0 read-back/confirm
+        loop and no per-prior delete_memory dance, across two recurring
+        cycles of the same signature."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flags = [{'task_id': 42, 'flag_type': 'missing_deliverable'}]
+        await dedup_flags(ledger_memory_service, 'p', 'r1', flags)
+        await dedup_flags(ledger_memory_service, 'p', 'r2', flags)
+
+        ledger_memory_service.search.assert_not_called()
+        ledger_memory_service.delete_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_completion_flag_writes_no_marker_and_sweeps_prior_to_addressed(
+        self, ledger_memory_service
+    ):
+        """A completion flag (flag_for_stage2=False) writes NO stage1_flag_marker
+        row and sweeps a pre-seeded prior to state='addressed' via the ledger
+        (acknowledge_flag_marker, already ledger-backed since step-08)."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, 'p', '77', 'duplicate_flag_marker_cleanup',
+            run_id='r0',
+        )
+
+        flags = [{
+            'task_id': 77,
+            'flag_type': 'duplicate_flag_marker_cleanup',
+            'flag_for_stage2': False,
+        }]
+
+        result = await dedup_flags(ledger_memory_service, 'p', 'r1', flags)
+
+        assert len(result) == 1
+        assert result[0]['completion_marker_self_deleted'] is True
+        assert result[0]['last_seen_run_id'] == 'r1'
+        assert 'persisted_from_run' not in result[0]
+        ledger_memory_service.add_memory.assert_not_called()
+
+        row = await _get_marker(
+            ledger_memory_service.recon_ledger, 'p', '77', 'duplicate_flag_marker_cleanup'
+        )
+        assert row is not None
+        assert row.state == 'addressed'
+
+    @pytest.mark.asyncio
+    async def test_completion_flag_with_no_prior_is_noop_sweep_still_annotated(
+        self, ledger_memory_service
+    ):
+        """A completion flag whose signature has no prior marker at all is a
+        clean no-op sweep — still annotated completion_marker_self_deleted=True,
+        and creates no row."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flags = [{
+            'task_id': 77,
+            'flag_type': 'duplicate_flag_marker_cleanup',
+            'flag_for_stage2': False,
+        }]
+
+        result = await dedup_flags(ledger_memory_service, 'p', 'r1', flags)
+
+        assert len(result) == 1
+        assert result[0]['completion_marker_self_deleted'] is True
+        assert result[0]['last_seen_run_id'] == 'r1'
+        assert 'persisted_from_run' not in result[0]
+        ledger_memory_service.add_memory.assert_not_called()
+
+        row = await _get_marker(
+            ledger_memory_service.recon_ledger, 'p', '77', 'duplicate_flag_marker_cleanup'
+        )
+        assert row is None
+
+    @pytest.mark.asyncio
+    async def test_duplicate_completion_signature_in_batch_self_annotates_each_occurrence(
+        self, ledger_memory_service
+    ):
+        """Revised task-2312 semantics under the ledger (seen_signatures
+        removed, plan.json design decision): the SAME completion signature
+        emitted twice in one batch self-annotates BOTH occurrences — the
+        ledger sweep (mark_addressed) is idempotent, so re-running it for the
+        second occurrence is harmless and no in-batch memo is needed to
+        prevent it."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flags = [
+            {
+                'task_id': 77,
+                'flag_type': 'duplicate_flag_marker_cleanup',
+                'flag_for_stage2': False,
+                'description': 'first',
+            },
+            {
+                'task_id': 77,
+                'flag_type': 'duplicate_flag_marker_cleanup',
+                'flag_for_stage2': False,
+                'description': 'second',
+            },
+        ]
+
+        result = await dedup_flags(ledger_memory_service, 'p', 'r1', flags)
+
+        assert len(result) == 2
+        for flag in result:
+            assert flag.get('completion_marker_self_deleted') is True
+            assert flag.get('last_seen_run_id') == 'r1'
+            assert 'persisted_from_run' not in flag
+
