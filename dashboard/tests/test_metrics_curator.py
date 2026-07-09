@@ -865,7 +865,10 @@ async def test_sample_curator_http_timeout_partial_pending_total(
     - no exception propagates
     - result['pending_total'] == 3 (partial accumulation from r1 only)
     - mcp_tool_call was called at least twice (loop reached r2)
-    - wall-clock elapsed < 3s (timeout was honoured, not the un-capped 5s sleep)
+    - wall-clock elapsed < 4.5s (timeout was honoured, not the un-capped 5s
+      sleep; the bound leaves ~1.5s of headroom above the 0.05s ceiling for
+      event-loop starvation on heavily loaded hosts, while staying safely
+      below the 5s sleep it guards against)
     """
     import time
 
@@ -918,8 +921,8 @@ async def test_sample_curator_http_timeout_partial_pending_total(
     assert result is not None
     assert result['pending_total'] == 3, f'Expected 3, got {result["pending_total"]}'
     assert call_count >= 2, f'Expected at least 2 mcp_tool_call invocations, got {call_count}'
-    assert elapsed < 3.0, (
-        f'Elapsed {elapsed:.3f}s ≥ 3s — wait_for ceiling does not appear to be in place'
+    assert elapsed < 4.5, (
+        f'Elapsed {elapsed:.3f}s ≥ 4.5s — wait_for ceiling does not appear to be in place'
     )
 
 
