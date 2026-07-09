@@ -5931,6 +5931,34 @@ async def test_planning_mode_add_task_failure_returns_error(
     taskmaster.set_task_status.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_planning_mode_candidate_key_collision_returns_combined(
+    interceptor_facade,
+    taskmaster,
+):
+    """A DuplicateCandidateKeyError raised by tm.add_task inside the
+    planning_mode path must resolve as a combined result pointing at the
+    survivor — NOT fall through to the generic error branch (task 2189
+    step-11/12: closes the planning-mode duplicate-reintroduction gap).
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    taskmaster.add_task = AsyncMock(
+        side_effect=DuplicateCandidateKeyError(existing_id=7, existing_status='in-progress'),
+    )
+    result = await interceptor_facade.submit_task(
+        '/project',
+        title='dup',
+        planning_mode=True,
+    )
+    assert result == {
+        'task_id': '7',
+        'status': 'in-progress',
+        'combined': True,
+        'planning_mode': True,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # _looks_like_task_id helper
 # ─────────────────────────────────────────────────────────────────────
