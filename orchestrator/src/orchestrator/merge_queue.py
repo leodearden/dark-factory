@@ -4403,6 +4403,19 @@ class ItemLifecycle:
         (``_maybe_auto_chain_generation``) rather than re-registering an
         existing one, so a genuine duplicate here means two callers raced
         to register the same attempt.
+
+        Deliberately ``ValueError``, not :class:`IllegalLifecycleTransition`:
+        the latter models an illegal EDGE in ``_LEGAL_TRANSITIONS`` (or a
+        from_state/registry disagreement) for an item already tracked by the
+        registry, so kappa can catch it precisely at each wired transition
+        call site. A duplicate ``register()`` is not an edge violation at
+        all — there is no *from_state* and no row in the table to violate —
+        it is a registry-identity precondition failure, the same category
+        ``dict``/``set`` APIs signal with ``ValueError``/``KeyError`` rather
+        than a domain-specific exception. Keeping the two distinct lets a
+        caller that wants only L-1 edge violations ``except
+        IllegalLifecycleTransition`` without also swallowing an unrelated
+        double-registration bug.
         """
         if request_id in self._states:
             raise ValueError(
