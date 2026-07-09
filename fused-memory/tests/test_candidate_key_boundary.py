@@ -277,3 +277,56 @@ async def test_bt_a3_crash_between_insert_and_commit_leaves_no_orphan(tmp_path):
         assert exc_info.value.existing_id == 1, exc_info.value.existing_id
     finally:
         await reopened.close()
+
+
+# ── BT-A4: cross-restart durability ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bt_a4_restart_durability_combine_still_fires(tmp_path):
+    """The candidate_key collision still combines after closing the whole
+    stack and opening a FRESH backend + interceptor (cold in-memory caches)
+    on the SAME tmp_path — proving the guarantee is a durable DB-index
+    property, not an artefact of the six in-memory dedup layers (which are
+    all cold after a restart).
+    """
+    project_root = str(tmp_path)
+
+    interceptor1, backend1, _pr1, event_buffer1 = await open_fresh_stack(tmp_path)
+    created = await submit_and_resolve(
+        interceptor1, project_root,
+        title='Fix parser',
+        metadata={'files': ['a.py', 'b.py']},
+    )
+    assert created['id'] == '1', created
+    await close_stack(interceptor1, backend1, event_buffer1)
+
+    # Phase 2: fresh stack, cold caches, same on-disk tasks.db + index.
+    interceptor2, backend2, _pr2, event_buffer2 = await open_fresh_stack(tmp_path)
+    try:
+        combined = await submit_and_resolve(
+            interceptor2, project_root,
+            title='fix  parser',
+            metadata={'files': ['b.py', 'a.py']},
+        )
+        assert combined['id'] == created['id'], (
+            f'expected the fresh stack to still combine onto id={created["id"]!r}; '
+            f'got {combined!r}'
+        )
+        assert combined.get('action') == 'candidate_key_collision', combined
+        assert combined.get('deduplicated') is True, combined
+
+        # Direct fresh-backend producer-side check too — durable independent
+        # of the interceptor's own (also-cold) in-memory dedup layers.
+        with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+            await backend2.add_task(
+                project_root=project_root,
+                title='Fix parser',
+                metadata=json.dumps({'files': ['a.py', 'b.py']}),
+            )
+        assert str(exc_info.value.existing_id) == created['id'], exc_info.value.existing_id
+
+        non_cancelled = await count_non_cancelled(backend2, project_root)
+        assert non_cancelled == 1, non_cancelled
+    finally:
+        await close_stack(interceptor2, backend2, event_buffer2)
