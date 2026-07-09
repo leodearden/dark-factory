@@ -2940,6 +2940,26 @@ class TaskKnowledgeSync(BaseStage):
         # stat key is left absent entirely so the harness
         # (_maybe_escalate_stale_task_count_snapshot) can distinguish a
         # CONFIRMED miss (0) from "unknown" (never miscounted as a miss).
+        #
+        # Duplicate-write note (reviewer finding, amendment round): a
+        # memory-stored Stage-2 norm ("the corrected 2026-07-01 norm",
+        # dark_factory procedural_knowledge) separately tells the Stage-2 LLM
+        # to author this same kind='task_count_snapshot' observation as its
+        # own final action each cycle. This task does not retire that norm
+        # in-repo (it is runtime Mem0 content, not source under this task's
+        # locks), so for a non-blocked project the LLM path and this
+        # deterministic path can both fire in the same cycle. That is
+        # tolerated, not silently assumed away: (a) task_count_snapshot has
+        # no pool cap/GC (unlike e.g. stage1_flag_marker), so an extra record
+        # is inert rather than a leak; (b) neither this stat nor the
+        # harness's evaluate_snapshot_cadence()/build_stale_snapshot_finding()
+        # (task_count_snapshot_cadence.py) look at record *count* — only
+        # presence-within-window (verify path, skipped here on a successful
+        # write) or the directly-trusted True below — so a duplicate cannot
+        # change either outcome; (c) historically the LLM has fired only
+        # sporadically (a handful of snapshots recorded over several weeks of
+        # reify reconciliation cycles), so same-cycle collisions are expected
+        # to stay rare even though the norm itself has not been retired.
         run_window_start = getattr(self, '_run_window_start', None)
         task_count_snapshot_written: bool | None = None
         if not is_snapshot_write_blocked(self.project_id):
