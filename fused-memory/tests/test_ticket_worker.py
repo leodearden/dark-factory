@@ -1717,7 +1717,10 @@ class TestProcessAddTicketsBatch:
         assert r2.get('reason') is not None and 'batch_target_index' in r2['reason']
 
         # t3 (titleless) resolves on its own — a distinct id from t1's.
-        assert r3 is not None and r3['status'] in {'created', 'combined', 'failed'}
+        # Deterministic per the add_task side_effect ordering: t3 dispatches
+        # its own create and gets back 'T3'.
+        assert r3 is not None and r3['status'] == 'created'
+        assert r3['task_id'] == 'T3'
         assert r3.get('task_id') != 'A'
 
         # t4 is an independent create — its own id, distinct from t1's.
