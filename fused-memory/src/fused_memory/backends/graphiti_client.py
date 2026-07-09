@@ -2516,47 +2516,6 @@ class GraphitiBackend:
         all_graphs = await client.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
-    async def _run_startup_identity_scan(self) -> dict:
-        """Run the startup identity-integrity scan over every project graph.
-
-        Orchestrates the two W6-ε responsibilities per graph in list_graphs():
-        the dup-node alarm (_scan_duplicate_entity_names) and the dup-uuid-edge
-        repair (_repair_duplicate_edge_uuids).
-
-        Per-graph best-effort: a single malformed/unreachable graph is caught,
-        logged, and skipped rather than aborting the sweep over the rest
-        (mirrors the index-setup loop idiom in initialize()). Called once
-        from initialize(), itself wrapped in a try/except there so a total
-        scan failure never breaks backend startup — this is a safety net,
-        not a startup gate.
-
-        Returns:
-            Aggregate stats dict: graphs_scanned (graphs attempted),
-            dup_name_groups (total duplicated-name groups found across all
-            graphs), edges_repaired (total dup-uuid edges re-minted across
-            all graphs).
-        """
-        graphs = await self.list_graphs()
-        stats = {'graphs_scanned': 0, 'dup_name_groups': 0, 'edges_repaired': 0}
-        for group_id in graphs:
-            stats['graphs_scanned'] += 1
-            try:
-                duplicates = await self._scan_duplicate_entity_names(group_id)
-                stats['dup_name_groups'] += len(duplicates)
-                repaired = await self._repair_duplicate_edge_uuids(group_id)
-                stats['edges_repaired'] += repaired
-            except Exception:
-                logger.warning(
-                    'Startup identity-integrity scan failed for graph %r', group_id,
-                    exc_info=True,
-                )
-        logger.info(
-            'Startup identity-integrity scan complete: graphs_scanned=%d dup_name_groups=%d '
-            'edges_repaired=%d',
-            stats['graphs_scanned'], stats['dup_name_groups'], stats['edges_repaired'],
-        )
-        return stats
-
     async def node_count(self, graph_name: str) -> int:
         """Count nodes in a specific FalkorDB graph.
 
