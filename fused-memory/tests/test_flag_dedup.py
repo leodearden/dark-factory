@@ -83,7 +83,7 @@ class TestComputeFlagSignature:
 
 @pytest.mark.asyncio
 async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
-    """Flags with no computable signature pass through with exactly one I/O call (suppression filter); add_memory never called.
+    """Flags with no computable signature pass through unchanged; add_memory never called.
 
     After task-1654 Fix 2, compute_content_fingerprint_signature is tried as a
     fallback for null-task_id flags.  The four "no-sig" cases that survive both
@@ -98,10 +98,15 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
       content-fp returns None because cited_tasks technically present but task_id
       is None — both helpers return None).
     - Empty dict: trivially no-sig.
+
+    No flag here has a computable signature, so the per-flag ledger path is
+    never reached; recon_ledger is set to None to model a memory_service with
+    no ledger attached (the degraded pass-through contract).
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
     memory_service = AsyncMock()
+    memory_service.recon_ledger = None
     flags = [
         # (1) has task_id but missing flag_type — compute_flag_signature None;
         #     content-fp None because task_id is not None.
@@ -127,9 +132,6 @@ async def test_dedup_flags_no_signature_flags_pass_through_unchanged():
 
     # All flags returned unchanged
     assert result == original_flags
-    # filter_suppressed issues exactly one project-scoped suppression search;
-    # no per-flag searches because no flags have computable signatures.
-    assert memory_service.search.call_count == 1
     # add_memory never called — no-signature flags never reach the marker write path
     memory_service.add_memory.assert_not_called()
 
@@ -366,123 +368,31 @@ async def _get_marker(
 
 
 @pytest.mark.asyncio
-async def test_dedup_flags_prior_marker_found_annotates_flag_no_write():
-    """When a prior stage1_flag_marker exists the flag gets persisted_from_run/last_seen_run_id,
-    a replacement marker is written, and the prior is deleted (atomic-replacement contract).
-
-    Updated for task-1146: the old \"no write on HIT\" contract is replaced by
-    atomic-replacement (write new marker → delete prior).
-    """
-    from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-    prior_marker = _make_memory_result({
-        'source': 'stage1_flag_marker',
-        'task_id': '42',
-        'flag_type': 'missing_deliverable',
-        'run_id': 'r0',
-        'last_seen_run_id': 'r0',
-    })
-    prior_marker.id = 'prior-42'
-
-    # task-1400 step-16: confirmation must find a marker with the CURRENT run_id='r1'
-    # (the prior has run_id='r0' and does not match the run_id-scoped confirmation kind filter)
-    new_marker_r1 = _make_memory_result({
-        'source': 'stage1_flag_marker',
-        'task_id': '42',
-        'flag_type': 'missing_deliverable',
-        'run_id': 'r1',
-    })
-    new_marker_r1.id = 'new-42-r1'
-
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(side_effect=_make_search_stub(
-        suppression=[[]],
-        marker={('42', 'missing_deliverable'): [[prior_marker], [new_marker_r1]]},
-    ))
-    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-    memory_service.delete_memory = AsyncMock(return_value=None)
-
-    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
-
-    result = await dedup_flags(
-        memory_service=memory_service,
-        project_id='p',
-        run_id='r1',
-        flags=flags,
-    )
-
-    # (a) Flag is annotated with persisted_from_run and last_seen_run_id
-    assert len(result) == 1
-    assert result[0]['persisted_from_run'] == 'r0'
-    assert result[0]['last_seen_run_id'] == 'r1'
-
-    # (b) search was called 3 times: suppression filter + per-flag prior-marker + confirmation.
-    #     call_args refers to the LAST call (confirmation search), which must mention
-    #     task_id+flag_type and use project_id='p'.
-    assert memory_service.search.call_count == 3  # 1 suppression + 1 per-flag + 1 confirmation
-    # project_id must be passed as a kwarg (production code uses kwargs throughout)
-    assert memory_service.search.call_args.kwargs['project_id'] == 'p'
-    # query must strictly mention both the task_id and the flag_type (no permissive 'or')
-    query = memory_service.search.call_args.kwargs.get('query', '')
-    assert '42' in query and 'missing_deliverable' in query
-
-    # (c) Replacement marker written and prior deleted (atomic-replacement)
-    memory_service.add_memory.assert_called_once()
-    memory_service.delete_memory.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_dedup_flags_hit_on_addressed_marker_does_not_suppress_flag():
+async def test_dedup_flags_hit_on_addressed_marker_does_not_suppress_flag(ledger_memory_service):
     """Pin the intended behavior for the addressed-marker/recurrence-detection
     interaction (task-2029 amendment round 2, reviewer finding: design).
 
-    An 'addressed' stage1_flag_marker (metadata.addressed_by/addressed_at_run
-    set by acknowledge_flag_marker's mode='tag') is matched by dedup_flags'
-    recurrence-detection search exactly like any other prior marker — neither
-    find_prior_memories' kind filter nor dedup_flags special-case
-    addressed_by. Confirmed here to be SAFE by construction rather than a
-    masking bug: dedup_flags NEVER drops/suppresses a flag on a HIT (a HIT
-    only annotates persisted_from_run/last_seen_run_id and replaces the
-    marker) — so a genuine recurrence is still surfaced to Stage 2 this
-    cycle — and the replacement marker dedup_flags writes carries NO
-    addressed_by/addressed_at_run, so the tag does not propagate forward: it
-    self-clears on the very next recurrence rather than permanently marking
-    future occurrences as pre-resolved.
+    A ``stage1_flag_marker`` row in state='addressed' (set by
+    acknowledge_flag_marker) is still found by ``ledger.get_by_identity`` —
+    the ledger's identity lookup does not filter on state — exactly like any
+    other prior marker. Confirmed here to be SAFE by construction rather than
+    a masking bug: dedup_flags NEVER drops/suppresses a flag on a HIT (a HIT
+    only annotates persisted_from_run/last_seen_run_id and re-upserts the
+    row) — so a genuine recurrence is still surfaced to Stage 2 this cycle —
+    and the re-upserted row carries a fresh payload with no addressed_by/
+    addressed_run_id key, so the tag does not propagate forward: it
+    self-clears (state reverts to 'active') on the very next recurrence
+    rather than permanently marking future occurrences as pre-resolved.
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
-    addressed_marker = _make_memory_result({
-        'source': 'stage1_flag_marker',
-        'kind': 'stage1_flag_marker',
-        'task_id': '42',
-        'flag_type': 'missing_deliverable',
-        'run_id': 'r-ack',
-        'last_seen_run_id': 'r-ack',
-        'addressed_by': 'r-ack',
-        'addressed_at_run': 'r-ack',
-    })
-    addressed_marker.id = 'addressed-42'
-
-    new_marker_r2 = _make_memory_result({
-        'source': 'stage1_flag_marker',
-        'task_id': '42',
-        'flag_type': 'missing_deliverable',
-        'run_id': 'r2',
-    })
-    new_marker_r2.id = 'new-42-r2'
-
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(side_effect=_make_search_stub(
-        suppression=[[]],
-        marker={('42', 'missing_deliverable'): [[addressed_marker], [new_marker_r2]]},
-    ))
-    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-    memory_service.delete_memory = AsyncMock(return_value=None)
+    ledger = ledger_memory_service.recon_ledger
+    await _seed_marker(ledger, 'p', '42', 'missing_deliverable', run_id='r-ack', state='addressed')
 
     flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'recurred'}]
 
     result = await dedup_flags(
-        memory_service=memory_service,
+        memory_service=ledger_memory_service,
         project_id='p',
         run_id='r2',
         flags=flags,
@@ -494,86 +404,18 @@ async def test_dedup_flags_hit_on_addressed_marker_does_not_suppress_flag():
     # Annotated from the addressed marker (treated as an ordinary HIT).
     assert result[0]['persisted_from_run'] == 'r-ack'
 
-    # The addressed marker is replaced (atomic-replacement contract) ...
-    memory_service.delete_memory.assert_called_once()
-    assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'addressed-42'
-
-    # ... and the NEW replacement marker carries NO addressed_by/addressed_at_run:
-    # the tag is transient and self-clears on the next recurrence instead of
-    # permanently marking every future occurrence as pre-resolved.
-    memory_service.add_memory.assert_called_once()
-    written_meta = memory_service.add_memory.call_args.kwargs.get('metadata', {})
-    assert 'addressed_by' not in written_meta, (
-        f'replacement marker must not carry forward addressed_by; got {written_meta!r}'
+    # The row is re-upserted: state reverts to 'active' and the new payload
+    # carries NO addressed_by/addressed_run_id — the tag is transient and
+    # self-clears on the next recurrence instead of permanently marking every
+    # future occurrence as pre-resolved.
+    row = await _get_marker(ledger, 'p', '42', 'missing_deliverable')
+    assert row is not None
+    assert row.state == 'active'
+    payload = json.loads(row.payload_json)
+    assert 'addressed_by' not in payload, (
+        f're-upserted marker must not carry forward addressed_by; got {payload!r}'
     )
-    assert 'addressed_at_run' not in written_meta
-
-
-@pytest.mark.asyncio
-async def test_dedup_flags_metadata_predicate_filters_non_matching_results():
-    """When Mem0 search returns rows matching task_id but with wrong source or wrong
-    flag_type, the metadata predicate filters them all out, so the flag is treated as
-    fresh: not annotated, and a new stage1_flag_marker is written.
-
-    Regression coverage for flag_dedup.py:77-86 — without this test, dropping the
-    source/flag_type guards from the kind dict passed to find_prior_memory would
-    silently start treating cross-source rows as prior markers.
-    """
-    from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-    # Three rows whose task_id matches but whose source and/or flag_type do not.
-    # They exercise both clauses of the kind conjunction independently:
-    wrong_source = _make_memory_result({
-        'source': 'targeted_reconciliation',  # wrong source
-        'task_id': '42',
-        'flag_type': 'missing_deliverable',
-    })
-    wrong_flag_type = _make_memory_result({
-        'source': 'stage1_flag_marker',
-        'task_id': '42',
-        'flag_type': 'stale_metadata',  # wrong flag_type
-    })
-    both_wrong = _make_memory_result({
-        'source': 'other',  # wrong source
-        'task_id': '42',
-        'flag_type': 'unrelated',  # wrong flag_type
-    })
-
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(side_effect=_make_search_stub(
-        suppression=[[wrong_source, wrong_flag_type, both_wrong]],
-        marker={('42', 'missing_deliverable'): [
-            [wrong_source, wrong_flag_type, both_wrong],  # pre-write search (all filtered → MISS)
-            [],  # confirmation search (miss)
-            [],  # confirmation retry (miss)
-        ]},
-    ))
-    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-
-    flags = [{'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'foo'}]
-
-    result = await dedup_flags(
-        memory_service=memory_service,
-        project_id='p',
-        run_id='r1',
-        flags=flags,
-    )
-
-    # Predicate rejected all rows — flag NOT annotated as prior-seen
-    assert len(result) == 1
-    assert 'persisted_from_run' not in result[0], (
-        'Predicate should have filtered all non-matching rows; flag must not be annotated'
-    )
-
-    # No-prior-marker write path exercised: a new marker is written
-    memory_service.add_memory.assert_called_once()
-    _assert_valid_stage1_marker(
-        memory_service.add_memory.call_args.kwargs,
-        task_id='42', flag_type='missing_deliverable', run_id='r1',
-    )
-
-    # Four search calls: 1 suppression + 1 per-flag + 2 confirmation (miss+retry).
-    assert memory_service.search.call_count == 4
+    assert 'addressed_run_id' not in payload
 
 
 # ---------------------------------------------------------------------------
