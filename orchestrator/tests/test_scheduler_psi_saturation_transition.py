@@ -232,6 +232,23 @@ class _Driver:
         while len(self._heavy_in_flight) > n:
             await self.complete(next(iter(self._heavy_in_flight)))
 
+    async def run_until_quiescent(self, max_in_flight: int) -> None:
+        """Drive ticks until heavy in-flight fills ``max_in_flight`` or no
+        further candidate is eligible to dispatch.
+
+        Mirrors the harness asyncio.Semaphore (harness.py:1427): unlike PSI
+        admission, ``acquire_next()`` itself enforces no max-concurrent cap,
+        so the driver must stop ISSUING ticks once ``max_in_flight`` heavies
+        are in flight rather than let the scheduler over-dispatch past the
+        lane's concurrency limit.  A tick returning None (no free-slot
+        candidate left to dispatch) also stops the loop, so a drained
+        backlog can never spin forever.
+        """
+        while self.heavy_in_flight() < max_in_flight:
+            result = await self.tick()
+            if result is None:
+                break
+
     def heavy_in_flight(self) -> int:
         return len(self._heavy_in_flight)
 
@@ -240,6 +257,12 @@ class _Driver:
 
     def deferred_events(self) -> list[dict]:
         return self.event_store.fetch_events_by_type('dispatch_deferred')
+
+    def deferred_events_since(self, event_id: int) -> list[dict]:
+        """dispatch_deferred events strictly after *event_id* (a prior
+        window's high-water id) — partitions the event stream into the
+        saturated window vs. post-recovery for a no-residual-hold assert."""
+        return [e for e in self.deferred_events() if e['id'] > event_id]
 
     def lock_acquired_events(self) -> list[dict]:
         return self.event_store.fetch_events_by_type('lock_acquired')
