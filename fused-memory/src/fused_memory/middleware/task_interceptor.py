@@ -790,9 +790,25 @@ class TaskInterceptor:
             # 1. Get before-state
             before = await tm.get_task(task_id, project_root, tag)
 
-            # 2. Same-status guard: no-op if nothing changed
+            # 2. Same-status guard: no-op if nothing changed. A done->done
+            # call that supplies a non-empty done_provenance is routed to
+            # the sanctioned same-status repair (task 2401) instead of the
+            # plain no-op — see _repair_done_provenance_same_status. This is
+            # the only way to correct a legacy done_provenance blob (e.g.
+            # missing the now-required `kind`) on a task that is already
+            # `done`, since a fresh done transition never reaches the normal
+            # done-provenance persist (2b, below) when old_status == status.
             old_status = _extract_status(before)
             if status == old_status:
+                if status == 'done' and done_provenance:
+                    return await _repair_done_provenance_same_status(
+                        tm,
+                        task_id,
+                        done_provenance,
+                        project_root,
+                        tag,
+                        before,
+                    )
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
             # 2a-pre. Bulk-reset circuit-breaker (task 918, refined task 1016):
@@ -4271,6 +4287,64 @@ def _merged_audit_metadata(before: dict, audit_fields: dict) -> dict:
         _warn_metadata_discard('_merged_audit_metadata', raw, warnings)
     existing: dict = parsed if isinstance(parsed, dict) else {}
     return {**existing, **audit_fields}
+
+
+async def _repair_done_provenance_same_status(
+    tm: Any,
+    task_id: str,
+    done_provenance: dict,
+    project_root: str,
+    tag: str | None,
+    before: dict,
+) -> dict:
+    """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
+
+    ``_apply_status_transition``'s same-status guard returns before the
+    normal done-provenance persist (2b) is ever reached, so a task that is
+    already ``done`` — carrying a legacy ``metadata.done_provenance`` written
+    before ``kind`` became a required field (e.g. ``{"commit": sha}``) — can
+    never be corrected via a fresh done transition. This helper is the
+    sanctioned repair (task 2401): validate the supplied ``done_provenance``
+    exactly like a fresh done transition
+    (:func:`_validate_done_provenance`, ``require=False`` — a same-status
+    repair must never itself demand provenance) and, on success, persist the
+    correction via the same read-modify-write ``update_task`` call used by
+    the normal persist (:func:`_merged_audit_metadata` preserves sibling
+    keys), still inside the caller's write lock.
+
+    No status write, no event, no reconciliation — the status is unchanged,
+    so those side effects do not apply; this is a pure metadata correction.
+
+    Callers must only invoke this when ``done_provenance`` is already known
+    to be non-empty (``_apply_status_transition``'s same-status guard checks
+    this); a caller with no supplied provenance should use the plain no-op
+    instead.
+    """
+    validation_err, resolved = await _validate_done_provenance(
+        task_id,
+        done_provenance,
+        project_root,
+        require=False,
+    )
+    if validation_err is not None:
+        return validation_err
+    if resolved is None:
+        return {'success': True, 'no_op': True, 'task_id': task_id}
+
+    merged_meta = _merged_audit_metadata(before, {'done_provenance': resolved})
+    await tm.update_task(
+        task_id=task_id,
+        metadata=json.dumps(merged_meta),
+        project_root=project_root,
+        tag=tag,
+    )
+    return {
+        'success': True,
+        'no_op': True,
+        'task_id': task_id,
+        'done_provenance_repaired': True,
+        'done_provenance': resolved,
+    }
 
 
 def _reject_status_in_update_task(

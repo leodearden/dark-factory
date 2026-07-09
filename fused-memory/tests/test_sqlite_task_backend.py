@@ -3599,6 +3599,60 @@ async def test_update_task_enforce_mode_rejects_invariant_violation(tmp_path, pr
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_update_task_tolerates_untouched_invalid_done_provenance(tmp_path, project_root):
+    """Enforce-mode update_task scopes its raise to the fields the write touches (task 2401).
+
+    Many ``done`` tasks carry a legacy ``metadata.done_provenance`` written
+    before ``kind`` became a required field (e.g. ``{"commit": "abc123"}``).
+    Under enforce mode, ``update_task`` validates the POST-MERGE blob — so
+    without scoping, a legacy row would permanently reject *every* future
+    metadata patch, even ones that never touch ``done_provenance``. This test
+    proves the write-boundary gate only blocks writes that are themselves
+    responsible for the invalid field (or a whole-blob invariant); an
+    untouched legacy ``done_provenance`` is tolerated and preserved as-is,
+    while a patch that touches ``done_provenance`` with a still-invalid value
+    is still rejected.
+    """
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        # Seed a pre-migration row: temporarily disable enforcement so the
+        # legacy (missing 'kind') done_provenance blob can be planted at all —
+        # enforce-mode add_task would otherwise reject it outright. This
+        # faithfully reproduces a blob written before the schema tightened.
+        backend._task_metadata_enforce = False
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({'done_provenance': {'commit': 'abc123'}}),
+        )
+        backend._task_metadata_enforce = True
+
+        # (a) An UNRELATED patch is tolerated: the untouched legacy
+        # done_provenance survives, and the new field lands.
+        await backend.update_task(
+            dto['id'], project_root=project_root,
+            metadata=json.dumps({'files': ['b.py']}),
+        )
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata']['files'] == ['b.py']
+        assert task['metadata']['done_provenance'] == {'commit': 'abc123'}, (
+            f'Expected the untouched legacy done_provenance to be preserved; '
+            f'got: {task["metadata"].get("done_provenance")!r}'
+        )
+
+        # (b) Guard rail: a patch that itself TOUCHES done_provenance with a
+        # still-invalid value (missing 'kind') is still rejected.
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({'done_provenance': {'commit': 'x'}}),
+            )
+    finally:
+        await backend.close()
+
+
 # ── read-path tolerance + collapse (task 2162, step-9/10) ─────────────
 
 
