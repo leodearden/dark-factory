@@ -24,6 +24,7 @@ from orchestrator.verify import (
     _maybe_prune_archive,
     _reproject_bare_uv_run,
     _resolve_verify_env,
+    _root_plus_single_subproject_prefix,
     _run_cmd,
     _scope_cargo_workspace,
     _scope_fallback_tool_to_subproject,
@@ -4288,6 +4289,99 @@ class TestSingleSubprojectPrefix:
         assert result is None
 
 
+class TestRootPlusSingleSubprojectPrefix:
+    """`_root_plus_single_subproject_prefix` identifies a root+single-subproject mixed diff.
+
+    Unlike `_single_subproject_prefix` (whose "any mixed root+subproject diff
+    → None" contract is deliberately pinned — see
+    `TestSingleSubprojectPrefix.test_mixed_root_and_subproject_files_returns_none`
+    — and left unchanged), this helper detects the specific case of
+    root-owning file(s) (a bare repo-root file, or a file under a top-level
+    directory that lacks its own ``pyproject.toml``, e.g. ``tests/``)
+    alongside exactly ONE real subproject (its own ``pyproject.toml``) and
+    returns that subproject's prefix, so the fallback can scope TEST to
+    ``cd <sub> && ... && <root-owning tests>`` instead of collapsing to the
+    fleet-wide command verbatim.
+    """
+
+    def test_root_file_plus_single_subproject_returns_prefix(self, tmp_path: Path) -> None:
+        """A bare root .py file + files under one real subproject → that subproject's prefix."""
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _root_plus_single_subproject_prefix(
+            ['conftest.py', 'cockpit/tests/test_c3.py'], tmp_path,
+        )
+        assert result == 'cockpit'
+
+    def test_non_subproject_top_level_dir_plus_subproject_returns_prefix(
+        self, tmp_path: Path,
+    ) -> None:
+        """A root-owning top-level dir (tests/, no pyproject.toml) + a subproject file → the prefix.
+
+        ``tests/`` has no ``pyproject.toml`` of its own, so it counts as
+        root-owning (same discriminator as ``_single_subproject_prefix``),
+        not as a second subproject.
+        """
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _root_plus_single_subproject_prefix(
+            ['tests/scripts/test_x.py', 'cockpit/tests/test_c3.py'], tmp_path,
+        )
+        assert result == 'cockpit'
+
+    def test_pure_single_subproject_diff_returns_none(self, tmp_path: Path) -> None:
+        """No root-owning file present (pure subproject diff) → None.
+
+        This case is already handled by `_single_subproject_prefix` alone;
+        the new helper only covers the *mixed* case.
+        """
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _root_plus_single_subproject_prefix(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], tmp_path,
+        )
+        assert result is None
+
+    def test_root_file_plus_two_subprojects_returns_none(self, tmp_path: Path) -> None:
+        """A root file plus TWO distinct subprojects → None (ambiguous, no single subproject)."""
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+        shared = tmp_path / 'shared'
+        shared.mkdir()
+        (shared / 'pyproject.toml').write_text('[project]\nname = "shared"\n')
+
+        result = _root_plus_single_subproject_prefix(
+            ['top_level.py', 'cockpit/tests/test_a.py', 'shared/tests/test_b.py'], tmp_path,
+        )
+        assert result is None
+
+    def test_pure_root_diff_returns_none(self, tmp_path: Path) -> None:
+        """No subproject touched at all → None."""
+        result = _root_plus_single_subproject_prefix(
+            ['top_level.py', 'tests/scripts/test_x.py'], tmp_path,
+        )
+        assert result is None
+
+    def test_worktree_none_returns_none(self) -> None:
+        """No worktree to check pyproject.toml against → None."""
+        result = _root_plus_single_subproject_prefix(
+            ['top_level.py', 'cockpit/tests/test_c3.py'], None,
+        )
+        assert result is None
+
+    def test_empty_files_returns_none(self, tmp_path: Path) -> None:
+        """Empty file list → None."""
+        result = _root_plus_single_subproject_prefix([], tmp_path)
+        assert result is None
+
+
 class TestBuildFallbackConfigWithNonDefaultCommands:
     """``_build_fallback_config`` uses project-configured commands when non-default.
 
@@ -4688,18 +4782,107 @@ class TestBuildFallbackConfigSubprojectScoped:
             f'got: {[r.getMessage() for r in caplog.records]}'
         )
 
-    def test_mixed_root_and_subproject_files_uses_fleet_chain_verbatim(
+    def test_mixed_root_conftest_plus_subproject_scopes_to_subproject_and_root_owning_tests(
         self, tmp_path: Path,
     ) -> None:
-        """A diff mixing a repo-root file with a subproject file falls back to the fleet chain.
+        """A root-level conftest.py + a single subproject test file scopes TEST narrowly.
 
-        Regression guard: ``_single_subproject_prefix`` must not collapse
+        Regression fix for the residual mixed-diff gap (task 2368):
+        previously ``_single_subproject_prefix`` disqualified subproject
+        scoping for ANY mixed root+subproject diff, so this fell through to
+        ``config.test_command`` verbatim — the fleet-wide ~7400-test chain
+        (esc-2293-13/-26/-27 misattributed flakes from unrelated
+        subprojects). ``_root_plus_single_subproject_prefix`` now detects
+        this specific shape and TEST is scoped to the subproject's own
+        tests plus the root-owning ``tests/scripts/`` suite instead.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/tests/test_c3.py', 'conftest.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run pytest tests/test_c3.py '
+            '&& cd .. && uv run --project shared pytest tests/scripts/'
+        )
+        # False-block guard: no OTHER fleet subproject's fanout segment may
+        # appear in the scoped command (the fleet chain must not be used).
+        assert 'cd ../escalation' not in result.test_command
+        assert 'cd ../fused-memory' not in result.test_command
+        assert 'cd ../dashboard' not in result.test_command
+        assert 'tests/scripts' in result.test_command
+
+    def test_mixed_root_file_plus_subproject_source_only_scopes_to_root_owning_tests_only(
+        self, tmp_path: Path,
+    ) -> None:
+        """A subproject source-only file + a root file yields only the root-owning suite.
+
+        No test file/conftest lives under the touched subproject, so there
+        is no subproject-scoped pytest target to derive — the mixed branch
+        falls back to the root-owning ``tests/scripts/`` suite alone.
+        lint/type are NOT rescoped into the subproject's narrow uv context
+        (only test_command gets this treatment — the mixed diff includes
+        root files that don't belong to the subproject's narrow env): they
+        must still cover BOTH touched files in the broad reprojected
+        context.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/src/cockpit/c3.py', 'top_level.py'], cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == 'uv run --project shared pytest tests/scripts/'
+        assert result.lint_command is not None
+        assert 'top_level.py' in result.lint_command
+        assert '--project cockpit' not in result.lint_command
+
+    def test_mixed_root_file_plus_two_subprojects_uses_fleet_chain_verbatim(
+        self, tmp_path: Path,
+    ) -> None:
+        """A root file plus TWO subprojects is ambiguous, so the fleet chain runs verbatim.
+
+        ``_root_plus_single_subproject_prefix`` returns None when more than
+        one subproject is touched (no single subproject to scope TEST to),
+        so this still falls through to the pre-existing
+        non-default-configured-command branch — the fleet chain, unchanged
+        from before this fix.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        shared = tmp_path / 'shared'
+        shared.mkdir()
+        (shared / 'pyproject.toml').write_text('[project]\nname = "shared"\n')
+        cfg = self._make_config(tmp_path)
+
+        result = _build_fallback_config(
+            ['cockpit/tests/test_a.py', 'shared/tests/test_b.py', 'top_level.py'],
+            cfg, worktree=worktree,
+        )
+
+        assert result is not None
+        assert result.test_command == self._FLEET_TEST_COMMAND
+
+    def test_mixed_root_and_subproject_files_scopes_test_to_subproject_and_root_owning_tests(
+        self, tmp_path: Path,
+    ) -> None:
+        """A diff mixing a repo-root file with a subproject file scopes TEST narrowly.
+
+        Regression guard (updated contract — task 2368):
+        ``_single_subproject_prefix`` must not collapse
         ``['cockpit/tests/test_a.py', 'top_level.py']`` to 'cockpit' (which
-        would drop test validation of the root-level file). With subproject
-        detection correctly disqualified (mixed root+subproject), the
-        pre-existing non-default-configured-command branch takes over and
-        the verbatim fleet chain runs — still validating both files, just not
-        scoped as narrowly as a pure-subproject diff would be.
+        would drop test validation of the root-level file) — it still
+        correctly returns None for this mixed diff.  But
+        ``_root_plus_single_subproject_prefix`` now recognizes this
+        specific "root file(s) + exactly one subproject" shape and scopes
+        TEST to the subproject's own tests plus the root-owning
+        ``tests/scripts/`` suite, instead of falling through to the
+        fleet-wide chain verbatim (the former behavior this test used to
+        pin before task 2368).
         """
         worktree = self._make_cockpit_worktree(tmp_path)
         cfg = self._make_config(tmp_path)
@@ -4709,7 +4892,72 @@ class TestBuildFallbackConfigSubprojectScoped:
         )
 
         assert result is not None
-        assert result.test_command == self._FLEET_TEST_COMMAND
+        assert result.test_command == (
+            'cd cockpit && uv run pytest tests/test_a.py '
+            '&& cd .. && uv run --project shared pytest tests/scripts/'
+        )
+
+    def test_mixed_root_test_file_outside_tests_scripts_emits_uncovered_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A root-owning collectable test file outside tests/scripts/ warns that it won't run.
+
+        Robustness amendment (task 2368 review): ``_ROOT_OWNING_TEST_COMMAND``
+        only runs ``tests/scripts/``, but a mixed diff's root-owning files can
+        include a collectable test file elsewhere (e.g. ``tests/e2e/test_x.py``
+        — ``tests/`` has no ``pyproject.toml`` of its own, so it counts as
+        root-owning, not a subproject). That file is silently never executed
+        by the scoped fallback; this must now surface as a WARNING instead of
+        being silent, mirroring the existing task-1852 data-module warning.
+        The scoped test_command itself is unaffected — only tests/scripts/
+        and the touched subproject's own tests are ever wired into it.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _build_fallback_config(
+                ['cockpit/tests/test_c3.py', 'tests/e2e/test_x.py'], cfg, worktree=worktree,
+            )
+
+        assert result is not None
+        assert result.test_command == (
+            'cd cockpit && uv run pytest tests/test_c3.py '
+            '&& cd .. && uv run --project shared pytest tests/scripts/'
+        )
+        assert any(
+            'tests/e2e/test_x.py' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), (
+            'Expected a WARNING about the uncovered root-owning test file; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_mixed_root_conftest_only_emits_no_uncovered_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A root file that is NOT a collectable test (e.g. conftest.py) does not warn.
+
+        Guards against a false-positive warning: the uncovered-root-test
+        check must only fire for files ``_is_collectable_test_file`` accepts,
+        not every root-owning file.
+        """
+        worktree = self._make_cockpit_worktree(tmp_path)
+        cfg = self._make_config(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _build_fallback_config(
+                ['cockpit/tests/test_c3.py', 'conftest.py'], cfg, worktree=worktree,
+            )
+
+        assert result is not None
+        assert not any(
+            'will not run' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        ), (
+            'Did not expect an uncovered-root-test WARNING for a non-test root file; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
 
 
 class TestRunScopedVerificationForwardsWorktreeToFallback:

@@ -68,6 +68,91 @@ def test_fallback_verify_runs_tests_scripts() -> None:
     )
 
 
+def test_fanout_includes_sampler_member() -> None:
+    """The fallback fleet chain must also run sampler's own tests/ suite.
+
+    Task 2368: ``sampler`` is a workspace member (root pyproject.toml
+    ``[tool.uv.workspace].members``) with its own ``pyproject.toml`` and
+    ``tests/``, but was never added to the fleet fanout — so a task touching
+    sampler alongside a root-level file (which disqualifies the
+    subproject-scoped fallback and falls through to this fleet chain) never
+    exercised sampler's own tests in the gating path. The segment must be a
+    HARD ``cd ../sampler`` (sampler is present on main, unlike cockpit —
+    see :func:`test_fanout_includes_cockpit_presence_guarded`) and carry a
+    pytest segment with ``--timeout>60`` like every other segment in this
+    chain.
+    """
+    cmd = _fleet_test_command()
+    assert re.search(r"cd \.\./sampler\b", cmd), (
+        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "must fan out to sampler/ via 'cd ../sampler' (task 2368) so "
+        f"sampler's own tests run; got: {cmd!r}"
+    )
+    # Matched directly against the raw command (not _pytest_segments' crude
+    # &&-split) because the identifying token 'sampler' lives in the 'cd'
+    # clause, not the pytest clause that follows it (mirrors the existing
+    # per-subproject segments, e.g. 'cd shared && uv run pytest tests/ …').
+    match = re.search(
+        r"cd \.\./sampler\s*&&\s*uv run pytest tests/\s*--timeout[=\s](\d+)", cmd,
+    )
+    assert match, (
+        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "must run a pytest segment for sampler's own tests/ suite immediately "
+        f"after 'cd ../sampler' (task 2368); got: {cmd!r}"
+    )
+    timeout_value = int(match.group(1))
+    assert timeout_value > 60, (
+        f"sampler's pytest segment sets --timeout={timeout_value}, which does "
+        "not raise the ceiling above the flaky 60s pyproject default (task 2368)"
+    )
+
+
+def test_fanout_includes_cockpit_presence_guarded() -> None:
+    """The fallback fleet chain must run cockpit's tests, guarded by a presence check.
+
+    Task 2368: ``cockpit`` is introduced by the un-merged Fleet Cockpit
+    batch (2291-2303) and is absent from main. A HARD ``cd ../cockpit``
+    segment would return non-zero and abort this entire ``&&`` chain —
+    breaking BOTH the fleet fallback AND merge-queue verify for every task
+    until cockpit lands. The segment must instead be guarded by a
+    ``[ -d cockpit ]`` presence check that skips cleanly when the directory
+    is absent, while still running (and propagating failures from) cockpit's
+    own tests/ suite once it exists — carrying a pytest segment with
+    ``--timeout>60`` like every other segment in this chain.
+    """
+    cmd = _fleet_test_command()
+    assert "cockpit" in cmd, (
+        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        f"must reference cockpit (task 2368); got: {cmd!r}"
+    )
+    assert re.search(r"\[\s*-d\s+cockpit\s*\]", cmd), (
+        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "references cockpit but is not presence-guarded with a '[ -d cockpit ]' "
+        "test (task 2368) — a hard 'cd ../cockpit' would abort the whole "
+        f"&&-chain while cockpit is absent from main; got: {cmd!r}"
+    )
+    # Matched directly against the raw command (not _pytest_segments' crude
+    # &&-split, which would split this guarded subshell's own internal &&
+    # into a non-pytest guard piece and a pytest piece that no longer
+    # contains the word 'cockpit') so the presence guard and its pytest
+    # invocation are verified as one associated unit.
+    match = re.search(
+        r"\[\s*-d\s+cockpit\s*\].*?cd\s+cockpit\s*&&\s*uv run pytest tests/\s*"
+        r"--timeout[=\s](\d+)",
+        cmd,
+    )
+    assert match, (
+        "orchestrator/config.yaml test_command (FALLBACK full-suite verify) "
+        "must run a pytest segment for cockpit's own tests/ suite guarded by "
+        f"'[ -d cockpit ]' (task 2368); got: {cmd!r}"
+    )
+    timeout_value = int(match.group(1))
+    assert timeout_value > 60, (
+        f"cockpit's pytest segment sets --timeout={timeout_value}, which does "
+        "not raise the ceiling above the flaky 60s pyproject default (task 2368)"
+    )
+
+
 def test_fallback_verify_raises_per_test_timeout() -> None:
     """Every pytest segment in the fallback chain must raise --timeout above 60s.
 
