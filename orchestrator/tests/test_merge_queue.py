@@ -5578,7 +5578,7 @@ class TestSpeculativeMergeWorker:
         proof; the _cap_is_full check is an independent early signal.
 
         Scenario:
-          N   — non-speculative, counted (counts_against_cap=True)
+          N   — non-speculative, counted (cap_permit acquired)
                 — verify gated then FAILS → n_failed=True, main NOT advanced
           N+1 — non-speculative, counted (submitted after N's spec window closed)
                 — verifies NORMALLY (no chain-invalidation, no main_advanced)
@@ -5700,7 +5700,7 @@ class TestSpeculativeMergeWorker:
 
             await queue.put(req_n)
             # Wait for N's merger-phase merge to complete, so N is in the verifier
-            # queue with counts_against_cap=True but not yet drained
+            # queue with a cap_permit acquired but not yet drained
             await asyncio.wait_for(n_merge_done.wait(), timeout=30)
 
             # Cancel N's future before the verifier drains it → abandonment path
@@ -10013,7 +10013,7 @@ class TestMergedBranchTipCarryThroughRebuild:
     # hand-fix had to add back. These lock the general dataclasses.replace
     # guarantee that motivated the I3 switch: EVERY other SpeculativeItem
     # field survives the rebuild unchanged, including cap_permit,
-    # which the pre-1990 hand-rebuild silently reset to its default (False).
+    # which the pre-1990 hand-rebuild silently reset to its default (None).
     # ------------------------------------------------------------------
 
     @staticmethod
