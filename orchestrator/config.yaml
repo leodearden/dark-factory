@@ -24,10 +24,21 @@ max_concurrent_tasks: 24
 # by the 5 subprojects' own tests/ dirs) via ``--project shared``, mirroring
 # scripts/orchestrator.yaml, so a task scoped only to tests/scripts/ is no
 # longer gated on unrelated subprojects while its own tests never run.
+# task 2368: sampler is a workspace member with its own tests/ and is now
+# fanned out the same as the other 5 subprojects (hard ``cd ../sampler``,
+# sampler is present on main). cockpit (introduced by the un-merged Fleet
+# Cockpit batch 2291-2303) is NOT yet present on main, so its segment is
+# wrapped in a ``[ -d cockpit ] || exit 0`` presence guard rather than a hard
+# ``cd ../cockpit`` — a hard cd would return non-zero and abort this entire
+# &&-chain (used by both this fallback AND merge-queue verify) while cockpit
+# is absent. The guard subshell keeps the outer cwd at repo root (it runs
+# after the preceding ``cd ..``) so the trailing tests/scripts/ segment still
+# resolves, and does not mask real cockpit test failures once the directory
+# exists.
 # NOTE: any pytest segment added to this chain in the future must also carry
 # --timeout>60 — enforced by
 # tests/scripts/test_fallback_verify_config.py::test_fallback_verify_raises_per_test_timeout.
-test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd .. && uv run --project shared pytest tests/scripts/ --timeout=300"
+test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
 # this to a single touched file for root-level changes) emits a bare ``ruff
