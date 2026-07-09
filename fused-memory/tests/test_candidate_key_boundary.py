@@ -159,3 +159,46 @@ async def test_bt_a1_submit_resolve_two_way_candidate_key_collision(real_stack):
         f'expected exactly one non-cancelled row (no orphan from the rejected '
         f'2nd insert); got {non_cancelled}'
     )
+
+
+# ── BT-A2: planning_mode reintroduction guard, two-way ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_bt_a2_planning_mode_reintroduction_guard(real_stack):
+    """Two identical planning_mode submit_task calls. planning_mode bypasses
+    the ticket store/curator entirely and calls tm.add_task directly with
+    status='deferred'; the 2nd call's insert trips the real partial UNIQUE
+    index and _submit_task_planning_mode resolves the raised
+    DuplicateCandidateKeyError as a combine — closing the planning-mode
+    duplicate-reintroduction gap end-to-end (not just against a mocked
+    add_task).
+    """
+    interceptor, backend, project_root = real_stack
+
+    first = await interceptor.submit_task(
+        project_root,
+        planning_mode=True,
+        title='Fix parser',
+        metadata={'files': ['a.py', 'b.py']},
+    )
+    assert first == {'task_id': '1', 'status': 'deferred', 'planning_mode': True}, first
+
+    # Case + extra internal whitespace on the title, file order swapped —
+    # same normalized candidate_key as the first submission.
+    second = await interceptor.submit_task(
+        project_root,
+        planning_mode=True,
+        title='fix  parser',
+        metadata={'files': ['b.py', 'a.py']},
+    )
+    assert second.get('combined') is True, second
+    assert second.get('planning_mode') is True, second
+    assert second.get('task_id') == first['task_id'], (
+        f'expected the collision to name survivor task_id={first["task_id"]!r}; got {second!r}'
+    )
+
+    non_cancelled = await count_non_cancelled(backend, project_root)
+    assert non_cancelled == 1, (
+        f'expected exactly one non-cancelled (deferred) row (no orphan); got {non_cancelled}'
+    )
