@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
@@ -24,6 +24,7 @@ from _orch_helpers import pydantic_spec
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.git_ops import WorktreeConflictError
 from orchestrator.merge_queue import PlanFilesTouchedResult
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
@@ -1944,4 +1945,140 @@ class TestSpawnDryRunUnblockBlockClass:
         )
         assert calls[1]['block_class'] == BlockClass.AGENT_FAILURE, (
             f'workflow-error reason: expected AGENT_FAILURE, got {calls[1].get("block_class")!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2282: a WorktreeConflictError surfacing from the execute/verify path
+# (e.g. a WIP-save commit() hitting an unresolved stash-pop conflict during
+# _inter_iteration_rebase) must halt the task with a targeted human
+# escalation (category='wip_conflict'), not the generic 'Workflow error:'
+# steward-routed path. Mirrors test_workflow_verify_infra_resume.py's
+# TestBareInfraOSErrorDefensiveNet fixture/patch convention for exercising
+# run()'s top-level exception routing without a full plan/execute setup.
+# ---------------------------------------------------------------------------
+
+
+def _make_wip_conflict_workflow(*, task_id: str = '2282') -> TaskWorkflow:
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = {
+        'id': task_id, 'title': 'Test task', 'description': 'Test desc',
+        'metadata': {},
+    }
+    assignment.modules = ['mod_a']
+
+    _spec = pydantic_spec(OrchestratorConfig)
+    config = MagicMock(spec_set=_spec)
+    config.fused_memory.project_id = 'dark_factory'
+    config.fused_memory.url = 'http://localhost:8002'
+    config.lock_depth = 2
+    config.steward_completion_timeout = 300.0
+    config.project_root = Path('/tmp/non-existent-for-test')
+
+    scheduler = MagicMock()
+    scheduler.update_task = AsyncMock(return_value=True)
+    scheduler.set_task_status = AsyncMock()
+    scheduler.get_status = AsyncMock(return_value='in-progress')
+    scheduler.get_task = AsyncMock(return_value={'id': task_id, 'metadata': {}})
+
+    git_ops = MagicMock()
+    git_ops.get_main_sha = AsyncMock(return_value='SHA-A')
+
+    queue = MagicMock()
+    queue.get_by_task = MagicMock(return_value=[])
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=scheduler,
+        briefing=MagicMock(),
+        mcp=MagicMock(),
+        escalation_queue=queue,
+    )
+
+    wf.worktree = Path('/tmp/fake-worktree-2282')
+    wf.artifacts = MagicMock()
+    wf.artifacts.read_iteration_log = MagicMock(return_value=([], []))
+    wf.plan = {'task_id': task_id, 'steps': []}
+    wf.initial_plan = {'task_id': task_id, 'steps': []}
+
+    # Stub _mark_blocked — we assert on how run() CALLS it, mirroring the
+    # existing infra-OSError defensive-net tests rather than re-testing
+    # _mark_blocked's own escalation-filing behavior (covered elsewhere).
+    wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+
+    return wf
+
+
+@pytest.mark.asyncio
+class TestWorktreeConflictErrorRouting:
+    """run(): a WorktreeConflictError escaping the execute/verify path routes
+    to _mark_blocked(category='wip_conflict', escalate_to_human=True) —
+    not the generic 'Workflow error:' handler (task 2282)."""
+
+    async def test_worktree_conflict_error_routes_to_wip_conflict_block(self):
+        wf = _make_wip_conflict_workflow()
+
+        async def fake_setup(*args, **kwargs):
+            pass
+
+        with (
+            patch.object(wf, '_setup_worktree_and_artifacts', side_effect=fake_setup),
+            patch.object(wf, '_recover_if_already_merged',
+                         new=AsyncMock(return_value=None)),
+            patch.object(wf, '_check_branch_on_main',
+                         new=AsyncMock(return_value=None)),
+            patch.object(
+                wf, '_execute_verify_review_loop',
+                side_effect=WorktreeConflictError(wf.worktree, ['foo.py']),
+            ),
+        ):
+            outcome = await wf.run()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        wf._mark_blocked.assert_awaited_once()  # type: ignore[attr-defined]
+        call_kwargs = wf._mark_blocked.await_args.kwargs  # type: ignore[attr-defined]
+        assert call_kwargs.get('category') == 'wip_conflict', (
+            f"Expected _mark_blocked(category='wip_conflict') but got "
+            f"category={call_kwargs.get('category')!r}. A WorktreeConflictError "
+            f"must not fall through to the generic 'Workflow error:' handler."
+        )
+        assert call_kwargs.get('escalate_to_human') is True, (
+            'wip_conflict block must set escalate_to_human=True (L1, skips steward)'
+        )
+
+        # No commit was attempted while handling the conflict — run() must not
+        # retry the WIP-save that just raised.
+        assert not wf.git_ops.commit.called  # type: ignore[attr-defined]
+
+    async def test_worktree_conflict_error_reason_is_not_generic_workflow_error(self):
+        wf = _make_wip_conflict_workflow()
+
+        async def fake_setup(*args, **kwargs):
+            pass
+
+        with (
+            patch.object(wf, '_setup_worktree_and_artifacts', side_effect=fake_setup),
+            patch.object(wf, '_recover_if_already_merged',
+                         new=AsyncMock(return_value=None)),
+            patch.object(wf, '_check_branch_on_main',
+                         new=AsyncMock(return_value=None)),
+            patch.object(
+                wf, '_execute_verify_review_loop',
+                side_effect=WorktreeConflictError(wf.worktree, ['foo.py']),
+            ),
+        ):
+            await wf.run()
+
+        call_args = wf._mark_blocked.await_args  # type: ignore[attr-defined]
+        reason = call_args.args[0] if call_args.args else call_args.kwargs.get('reason')
+        assert reason is not None and not reason.startswith('Workflow error:'), (
+            f'WorktreeConflictError must not use the generic task_failure reason, '
+            f'got reason={reason!r}'
+        )
+        assert 'foo.py' in reason, (
+            f'reason should name the conflicted path for operator triage, got {reason!r}'
         )
