@@ -24,6 +24,7 @@ from orchestrator.verify import (
     _maybe_prune_archive,
     _reproject_bare_uv_run,
     _resolve_verify_env,
+    _root_plus_single_subproject_prefix,
     _run_cmd,
     _scope_cargo_workspace,
     _scope_fallback_tool_to_subproject,
@@ -4285,6 +4286,99 @@ class TestSingleSubprojectPrefix:
         result = _single_subproject_prefix(
             ['cockpit/tests/test_a.py', 'top_level.py'], tmp_path,
         )
+        assert result is None
+
+
+class TestRootPlusSingleSubprojectPrefix:
+    """`_root_plus_single_subproject_prefix` identifies a root+single-subproject mixed diff.
+
+    Unlike `_single_subproject_prefix` (whose "any mixed root+subproject diff
+    → None" contract is deliberately pinned — see
+    `TestSingleSubprojectPrefix.test_mixed_root_and_subproject_files_returns_none`
+    — and left unchanged), this helper detects the specific case of
+    root-owning file(s) (a bare repo-root file, or a file under a top-level
+    directory that lacks its own ``pyproject.toml``, e.g. ``tests/``)
+    alongside exactly ONE real subproject (its own ``pyproject.toml``) and
+    returns that subproject's prefix, so the fallback can scope TEST to
+    ``cd <sub> && ... && <root-owning tests>`` instead of collapsing to the
+    fleet-wide command verbatim.
+    """
+
+    def test_root_file_plus_single_subproject_returns_prefix(self, tmp_path: Path) -> None:
+        """A bare root .py file + files under one real subproject → that subproject's prefix."""
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _root_plus_single_subproject_prefix(
+            ['conftest.py', 'cockpit/tests/test_c3.py'], tmp_path,
+        )
+        assert result == 'cockpit'
+
+    def test_non_subproject_top_level_dir_plus_subproject_returns_prefix(
+        self, tmp_path: Path,
+    ) -> None:
+        """A root-owning top-level dir (tests/, no pyproject.toml) + a subproject file → the prefix.
+
+        ``tests/`` has no ``pyproject.toml`` of its own, so it counts as
+        root-owning (same discriminator as ``_single_subproject_prefix``),
+        not as a second subproject.
+        """
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _root_plus_single_subproject_prefix(
+            ['tests/scripts/test_x.py', 'cockpit/tests/test_c3.py'], tmp_path,
+        )
+        assert result == 'cockpit'
+
+    def test_pure_single_subproject_diff_returns_none(self, tmp_path: Path) -> None:
+        """No root-owning file present (pure subproject diff) → None.
+
+        This case is already handled by `_single_subproject_prefix` alone;
+        the new helper only covers the *mixed* case.
+        """
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+
+        result = _root_plus_single_subproject_prefix(
+            ['cockpit/src/cockpit/c3.py', 'cockpit/tests/test_c3.py'], tmp_path,
+        )
+        assert result is None
+
+    def test_root_file_plus_two_subprojects_returns_none(self, tmp_path: Path) -> None:
+        """A root file plus TWO distinct subprojects → None (ambiguous, no single subproject)."""
+        cockpit = tmp_path / 'cockpit'
+        cockpit.mkdir()
+        (cockpit / 'pyproject.toml').write_text('[project]\nname = "cockpit"\n')
+        shared = tmp_path / 'shared'
+        shared.mkdir()
+        (shared / 'pyproject.toml').write_text('[project]\nname = "shared"\n')
+
+        result = _root_plus_single_subproject_prefix(
+            ['top_level.py', 'cockpit/tests/test_a.py', 'shared/tests/test_b.py'], tmp_path,
+        )
+        assert result is None
+
+    def test_pure_root_diff_returns_none(self, tmp_path: Path) -> None:
+        """No subproject touched at all → None."""
+        result = _root_plus_single_subproject_prefix(
+            ['top_level.py', 'tests/scripts/test_x.py'], tmp_path,
+        )
+        assert result is None
+
+    def test_worktree_none_returns_none(self) -> None:
+        """No worktree to check pyproject.toml against → None."""
+        result = _root_plus_single_subproject_prefix(
+            ['top_level.py', 'cockpit/tests/test_c3.py'], None,
+        )
+        assert result is None
+
+    def test_empty_files_returns_none(self, tmp_path: Path) -> None:
+        """Empty file list → None."""
+        result = _root_plus_single_subproject_prefix([], tmp_path)
         assert result is None
 
 
