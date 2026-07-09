@@ -313,12 +313,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
+from datetime import UTC, datetime
 from typing import Any, Literal, NotRequired, TypedDict
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.mem0_dedup import find_prior_memories
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
@@ -1390,24 +1393,46 @@ async def write_suppression_record(
     flag_types: list[str] | None = None,
     causation_id: str | None = None,
 ) -> AddMemoryResponse:
-    """Write a ``stage1_flag_suppression`` record to Mem0 for *task_id*.
+    """Upsert a ``stage1_flag_suppression`` record to the ledger for *task_id*.
 
     Builds the canonical payload via :func:`build_suppression_payload` (which
-    coerces *task_id* to ``int`` and pins ``metadata.kind``/``content``) then
-    calls ``memory_service.add_memory`` with *project_id* and *causation_id*
-    as separate write-time kwargs.
+    coerces *task_id* to ``int``, validates it, and pins ``metadata.kind``/
+    ``content``) then upserts one ``recon_ledger`` row per entry in
+    ``(flag_types or [''])`` to ``memory_service.recon_ledger`` — ``''`` is
+    the blanket/wildcard ``flag_type`` (suppresses every flag_type for
+    *task_id*); a non-empty ``flag_types`` list upserts one SCOPED row per
+    flag_type. Each row's identity is ``(project_id,
+    'stage1_flag_suppression', task_id, flag_type, run_id='')``, so a
+    repeated call with the same arguments UPSERTs the same row(s) — the
+    suppression row count never grows on recurrence. ``expires_at=None``:
+    suppressions are operator-managed and never expire via TTL.
+
+    ``memory_service.recon_ledger`` being unset/``None`` (ledger disabled or
+    not yet wired) skips the ledger write entirely — this degrades to a
+    Mem0-only mirror write, matching :func:`filter_suppressed`'s
+    pass-through contract when it finds no ledger to read.
+
+    After the ledger write(s), best-effort mirrors the same payload to Mem0
+    via ``memory_service.add_memory`` (PRD decision #4/#6 write-both/
+    read-new) — wrapped in try/except so a Mem0 failure never raises past
+    this function; reads never consult Mem0. On a mirror failure (or when
+    the ledger write happened but the mirror wasn't attempted for another
+    reason) an empty :class:`AddMemoryResponse` is synthesized so the return
+    type stays uniform.
 
     The ``_source='stage1_flag_suppression'`` sentinel distinguishes these
-    writes from ``'stage1_flag_dedup'`` and ``'targeted_recon'`` writes in the
-    audit journal, enabling per-class retention and query filtering.
+    mirror writes from ``'stage1_flag_dedup'`` and ``'targeted_recon'``
+    writes in the audit journal, enabling per-class retention and query
+    filtering.
 
     ``flag_types`` is an OPTIONAL scoping allowlist (task-1966), forwarded
-    verbatim to :func:`build_suppression_payload`.  When a non-empty list is
-    given, the record suppresses ONLY those (task_id, flag_type) pairs.  When
-    ``None`` or empty (the default), ``metadata.flag_types`` is omitted and
-    the record keeps the legacy blanket-suppression-for-task_id shape.
+    verbatim to :func:`build_suppression_payload` for the mirror payload.
+    When a non-empty list is given, the record suppresses ONLY those
+    (task_id, flag_type) pairs.  When ``None`` or empty (the default),
+    ``metadata.flag_types`` is omitted from the mirror payload and the
+    ledger gets a single blanket (``flag_type=''``) row.
 
-    Canonical schema (Mem0, observations_and_summaries category):
+    Canonical schema (Mem0 mirror, observations_and_summaries category):
       - ``metadata.kind = "stage1_flag_suppression"``
       - ``metadata.task_id = <N>`` (int — coerced by build_suppression_payload)
       - ``metadata.flag_types = [<str>, ...]`` (optional; sorted-unique)
@@ -1417,12 +1442,41 @@ async def write_suppression_record(
     can inspect ``memory_ids`` for empty-list deduplication / no-op detection.
     """
     payload = build_suppression_payload(task_id, flag_types=flag_types)
-    return await memory_service.add_memory(
-        **payload,
-        project_id=project_id,
-        causation_id=causation_id,
-        _source='stage1_flag_suppression',
-    )
+    tid = str(payload['metadata']['task_id'])
+
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is not None:
+        now_iso = datetime.now(UTC).isoformat()
+        payload_json = json.dumps(payload['metadata'])
+        for ft in flag_types or ['']:
+            await ledger.upsert(ReconLedgerRecord(
+                project_id=project_id,
+                record_kind='stage1_flag_suppression',
+                payload_json=payload_json,
+                state='active',
+                created_at=now_iso,
+                task_id=tid,
+                flag_type=str(ft),
+                run_id='',
+                expires_at=None,
+            ))
+
+    try:
+        return await memory_service.add_memory(
+            **payload,
+            project_id=project_id,
+            causation_id=causation_id,
+            _source='stage1_flag_suppression',
+        )
+    except Exception:
+        logger.debug(
+            'write_suppression_record: Mem0 mirror write failed for task_id=%s '
+            'project_id=%s (ledger write, if any, already committed)',
+            tid,
+            project_id,
+            exc_info=True,
+        )
+        return AddMemoryResponse(memory_ids=[])
 
 
 def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:

@@ -2777,18 +2777,106 @@ async def test_filter_suppressed_drops_flag_for_legacy_str_consumer_record():
 
 
 # ---------------------------------------------------------------------------
-# TestWriteSuppressionRecordLedger (task 2227 step-5) — write_suppression_record
-# upserts stage1_flag_suppression row(s) to the ReconLedgerStore; RED until
-# step-6 rewrites write_suppression_record onto the ledger, at which point
-# this class folds into TestWriteSuppressionRecord below (replacing its
-# Mem0-only body).
+# TestWriteSuppressionRecord (task-1185 step-3; rewritten onto the ledger at
+# task 2227 step-6) — write_suppression_record upserts stage1_flag_suppression
+# row(s) to memory_service.recon_ledger AND best-effort mirrors the same
+# payload to Mem0 via add_memory.
 # ---------------------------------------------------------------------------
 
 
-class TestWriteSuppressionRecordLedger:
-    """write_suppression_record(memory_service, project_id=..., task_id=...)
-    upserts stage1_flag_suppression row(s) to memory_service.recon_ledger —
-    not just a Mem0 write."""
+class TestWriteSuppressionRecord:
+    """Async tests for write_suppression_record(memory_service, *, project_id, task_id, causation_id).
+
+    Uses the ``ledger_memory_service`` fixture (prereq-1) throughout — a REAL
+    initialized ReconLedgerStore plus a mockable ``add_memory`` Mem0 mirror.
+    The canonical mirror-payload, project_id, _source, and default-causation_id
+    assertions are consolidated into one test that inspects the full kwargs
+    dict; separate small tests cover the causation_id/str-coercion variants
+    and the ledger-row invariants (task 2227 step-6).
+    """
+
+    @pytest.mark.asyncio
+    async def test_canonical_mirror_call_kwargs(self, ledger_memory_service):
+        """add_memory mirror called once with the full canonical kwargs dict.
+
+        Asserts content, category, metadata (kind + int task_id), project_id,
+        _source sentinel, and causation_id=None (default) in a single call.
+        """
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        result = await write_suppression_record(
+            ledger_memory_service, project_id='autopilot_video', task_id=42
+        )
+
+        ledger_memory_service.add_memory.assert_called_once_with(
+            content='STAGE 1 FLAG SUPPRESSION task_id=42',
+            category='observations_and_summaries',
+            metadata={'kind': 'stage1_flag_suppression', 'task_id': 42},
+            project_id='autopilot_video',
+            causation_id=None,
+            _source='stage1_flag_suppression',
+        )
+        assert result.memory_ids == ['mirror-id']
+
+    @pytest.mark.asyncio
+    async def test_passes_causation_id_when_provided(self, ledger_memory_service):
+        """causation_id is forwarded to the add_memory mirror when explicitly provided."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            ledger_memory_service, project_id='p', task_id=42, causation_id='recon-run-99'
+        )
+
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['causation_id'] == 'recon-run-99'
+
+    @pytest.mark.asyncio
+    async def test_coerces_str_task_id(self, ledger_memory_service):
+        """passing task_id='42' produces mirror metadata.task_id == 42 (int)
+        and a ledger row keyed by the same coerced task_id."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(ledger_memory_service, project_id='p', task_id='42')
+
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['task_id'] == 42
+        assert isinstance(kwargs['metadata']['task_id'], int)
+
+        rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
+        assert rows[0].task_id == '42'
+
+    @pytest.mark.asyncio
+    async def test_forwards_flag_types_to_mirror_metadata(self, ledger_memory_service):
+        """flag_types is forwarded into the mirror metadata.flag_types (task-1966 step-5)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(
+            ledger_memory_service,
+            project_id='p',
+            task_id=452,
+            flag_types=['human_review_required_deferred'],
+        )
+
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert kwargs['metadata']['flag_types'] == ['human_review_required_deferred']
+        assert kwargs['metadata']['kind'] == 'stage1_flag_suppression'
+        assert kwargs['metadata']['task_id'] == 452
+
+    @pytest.mark.asyncio
+    async def test_omitting_flag_types_produces_legacy_mirror_metadata(
+        self, ledger_memory_service
+    ):
+        """Omitting flag_types produces mirror metadata with NO flag_types key (legacy)."""
+        from fused_memory.reconciliation.flag_dedup import write_suppression_record
+
+        await write_suppression_record(ledger_memory_service, project_id='p', task_id=452)
+
+        kwargs = ledger_memory_service.add_memory.call_args.kwargs
+        assert 'flag_types' not in kwargs['metadata']
+
+    # -----------------------------------------------------------------
+    # Ledger-row invariants (task 2227 step-6)
+    # -----------------------------------------------------------------
 
     @pytest.mark.asyncio
     async def test_blanket_call_upserts_one_wildcard_row(self, ledger_memory_service):
@@ -2879,105 +2967,22 @@ class TestWriteSuppressionRecordLedger:
         rows = await ledger_memory_service.recon_ledger.list_suppressions('p')
         assert rows == []
 
-
-# ---------------------------------------------------------------------------
-# write_suppression_record tests (task-1185 step-3)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_memory_service():
-    """AsyncMock memory_service with add_memory returning a stub AddMemoryResponse."""
-    svc = AsyncMock()
-    svc.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['supp-1']))
-    return svc
-
-
-class TestWriteSuppressionRecord:
-    """Async tests for write_suppression_record(memory_service, *, project_id, task_id, causation_id).
-
-    Uses the ``mock_memory_service`` fixture to avoid per-test boilerplate.
-    The canonical-payload, project_id, _source, and default-causation_id
-    assertions are consolidated into one test that inspects the full kwargs
-    dict; separate small tests cover the causation_id and str-coercion variants.
-    """
-
     @pytest.mark.asyncio
-    async def test_canonical_call_kwargs(self, mock_memory_service):
-        """add_memory called once with the full canonical kwargs dict.
-
-        Asserts content, category, metadata (kind + int task_id), project_id,
-        _source sentinel, and causation_id=None (default) in a single call.
-        """
+    async def test_no_recon_ledger_degrades_to_mirror_only(self):
+        """memory_service.recon_ledger unset/None skips the ledger write
+        entirely and never raises — write_suppression_record degrades to a
+        Mem0-only mirror write (mirrors filter_suppressed's pass-through
+        contract when it finds no ledger to read)."""
         from fused_memory.reconciliation.flag_dedup import write_suppression_record
 
-        result = await write_suppression_record(
-            mock_memory_service, project_id='autopilot_video', task_id=42
-        )
+        svc = AsyncMock()
+        svc.recon_ledger = None
+        svc.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=['supp-1']))
 
-        mock_memory_service.add_memory.assert_called_once_with(
-            content='STAGE 1 FLAG SUPPRESSION task_id=42',
-            category='observations_and_summaries',
-            metadata={'kind': 'stage1_flag_suppression', 'task_id': 42},
-            project_id='autopilot_video',
-            causation_id=None,
-            _source='stage1_flag_suppression',
-        )
+        result = await write_suppression_record(svc, project_id='p', task_id=42)
+
+        svc.add_memory.assert_called_once()
         assert result.memory_ids == ['supp-1']
-
-    @pytest.mark.asyncio
-    async def test_passes_causation_id_when_provided(self, mock_memory_service):
-        """causation_id is forwarded to add_memory when explicitly provided."""
-        from fused_memory.reconciliation.flag_dedup import write_suppression_record
-
-        await write_suppression_record(
-            mock_memory_service, project_id='p', task_id=42, causation_id='recon-run-99'
-        )
-
-        kwargs = mock_memory_service.add_memory.call_args.kwargs
-        assert kwargs['causation_id'] == 'recon-run-99'
-
-    @pytest.mark.asyncio
-    async def test_coerces_str_task_id(self, mock_memory_service):
-        """passing task_id='42' produces metadata.task_id == 42 (int)."""
-        from fused_memory.reconciliation.flag_dedup import write_suppression_record
-
-        await write_suppression_record(mock_memory_service, project_id='p', task_id='42')
-
-        kwargs = mock_memory_service.add_memory.call_args.kwargs
-        assert kwargs['metadata']['task_id'] == 42
-        assert isinstance(kwargs['metadata']['task_id'], int)
-
-    @pytest.mark.asyncio
-    async def test_forwards_flag_types_to_metadata(self, mock_memory_service):
-        """flag_types is forwarded into metadata.flag_types (task-1966 step-5).
-
-        RED until step-6 adds the flag_types param and forwards it to
-        build_suppression_payload.
-        """
-        from fused_memory.reconciliation.flag_dedup import write_suppression_record
-
-        await write_suppression_record(
-            mock_memory_service,
-            project_id='p',
-            task_id=452,
-            flag_types=['human_review_required_deferred'],
-        )
-
-        kwargs = mock_memory_service.add_memory.call_args.kwargs
-        assert kwargs['metadata']['flag_types'] == ['human_review_required_deferred']
-        assert kwargs['metadata']['kind'] == 'stage1_flag_suppression'
-        assert kwargs['metadata']['task_id'] == 452
-
-    @pytest.mark.asyncio
-    async def test_omitting_flag_types_produces_legacy_metadata(self, mock_memory_service):
-        """Omitting flag_types produces metadata with NO flag_types key (legacy)."""
-        from fused_memory.reconciliation.flag_dedup import write_suppression_record
-
-        await write_suppression_record(mock_memory_service, project_id='p', task_id=452)
-
-        kwargs = mock_memory_service.add_memory.call_args.kwargs
-        assert 'flag_types' not in kwargs['metadata']
 
 
 def test_write_suppression_record_importable_from_canonical_path():
