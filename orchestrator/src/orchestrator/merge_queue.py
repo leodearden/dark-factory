@@ -1178,6 +1178,11 @@ async def _run_post_merge_verify(
                 detail = verify.type_output or ''
                 if detail:
                     reason = f'{reason}\n\n{detail}'
+            if verify.category != UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY:
+                _spawn_merge_verify_dry_run(
+                    dry_run_handles, req, merge_wt, reason, detail,
+                    event_store=event_store,
+                )
             return MergeOutcome('blocked', reason=reason)
 
         # Persistent ENOSPC after the prune-and-retry → transient infra.
