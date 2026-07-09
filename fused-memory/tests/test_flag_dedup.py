@@ -4224,13 +4224,15 @@ class TestDedupFlagsWriteGuard:
         # (iii) confirm_and_track not called — circuit-breaker counter untouched
         confirm_and_track.assert_not_called()
 
-    async def test_cross_cycle_fp_roundtrip(self):
+    async def test_cross_cycle_fp_roundtrip(self, ledger_memory_service):
         """(e2) Cross-cycle round-trip: cycle 1 writes fp: marker; cycle 2 detects it.
 
-        Verifies the full Stage-1-internal dedup loop for fp: keys:
-        - Cycle 1 (MISS): dedup_flags writes a stage1_flag_marker with task_id=fp:…
-        - Cycle 2 (HIT): find_prior_memories finds the cycle-1 marker; flag is annotated
-          with persisted_from_run → no re-escalation on cycle 2+.
+        Verifies the full ledger-backed dedup loop for fp: keys:
+        - Cycle 1: dedup_flags UPSERTs a stage1_flag_marker row keyed on fp:…
+          (a fresh signature — no persisted_from_run annotation).
+        - Cycle 2: get_by_identity finds the cycle-1 row; the flag is annotated
+          persisted_from_run="c1" → no re-escalation, and the SAME row is
+          UPSERTed again (still exactly one row, refreshed to cycle 2).
 
         Uses compute_content_fingerprint_signature / _content_fingerprint to derive the
         expected fp: value (no hardcoded hashes — anti-drift).
@@ -4249,61 +4251,28 @@ class TestDedupFlagsWriteGuard:
         assert sig is not None
         fp, ftype = sig
 
-        # ---- Cycle 1: MISS — no prior marker ----
-        written_c1 = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'kind': 'stage1_flag_marker',
-            'task_id': fp,
-            'flag_type': ftype,
-            'run_id': 'c1',
-            'last_seen_run_id': 'c1',
-        })
-        written_c1.id = 'fp-marker-c1'
-
-        ms_c1 = AsyncMock()
-        ms_c1.search = AsyncMock(side_effect=_make_search_stub(
-            suppression=[[]],
-            marker={(fp, ftype): [[], [written_c1]]},
-        ))
-        ms_c1.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-
+        # ---- Cycle 1: fresh signature — no prior row ----
         result_c1 = await dedup_flags(
-            memory_service=ms_c1,
+            memory_service=ledger_memory_service,
             project_id='proj',
             run_id='c1',
             flags=[flag],
         )
 
-        # Cycle 1: flag returned unchanged (MISS — no prior)
         assert 'persisted_from_run' not in result_c1[0], (
-            f'Cycle 1 MISS must not annotate flag; got {result_c1[0]}'
+            f'Cycle 1 must not annotate flag with persisted_from_run; got {result_c1[0]}'
         )
-        # Marker was written
-        ms_c1.add_memory.assert_called_once()
-        written_meta = ms_c1.add_memory.call_args.kwargs.get('metadata', {})
-        assert written_meta.get('task_id') == fp
+        assert result_c1[0]['last_seen_run_id'] == 'c1'
 
-        # ---- Cycle 2: HIT — prior fp: marker found via written_c1 ----
-        replacement_c2 = _make_memory_result({
-            'source': 'stage1_flag_marker',
-            'kind': 'stage1_flag_marker',
-            'task_id': fp,
-            'flag_type': ftype,
-            'run_id': 'c2',
-        })
-        replacement_c2.id = 'fp-marker-c2'
+        row_c1 = await _get_marker(ledger_memory_service.recon_ledger, 'proj', fp, ftype)
+        assert row_c1 is not None
+        payload_c1 = json.loads(row_c1.payload_json)
+        assert payload_c1.get('task_id') == fp
+        assert payload_c1['run_id'] == 'c1'
 
-        ms_c2 = AsyncMock()
-        ms_c2.search = AsyncMock(side_effect=_make_search_stub(
-            suppression=[[]],
-            # Prior = written_c1 marker; confirm = replacement_c2
-            marker={(fp, ftype): [[written_c1], [replacement_c2]]},
-        ))
-        ms_c2.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-        ms_c2.delete_memory = AsyncMock(return_value=None)
-
+        # ---- Cycle 2: same signature recurs — HIT on the cycle-1 row ----
         result_c2 = await dedup_flags(
-            memory_service=ms_c2,
+            memory_service=ledger_memory_service,
             project_id='proj',
             run_id='c2',
             flags=[flag],
@@ -4315,15 +4284,12 @@ class TestDedupFlagsWriteGuard:
         )
         assert result_c2[0]['last_seen_run_id'] == 'c2'
 
-        # Replacement written and prior deleted
-        ms_c2.add_memory.assert_called_once()
-        ms_c2.delete_memory.assert_called_once_with(
-            memory_id='fp-marker-c1',
-            store='mem0',
-            project_id='proj',
-            causation_id='c2',
-            _source='stage1_flag_dedup',
-        )
+        # Still exactly one row for this signature, refreshed to cycle 2.
+        row_c2 = await _get_marker(ledger_memory_service.recon_ledger, 'proj', fp, ftype)
+        assert row_c2 is not None
+        payload_c2 = json.loads(row_c2.payload_json)
+        assert payload_c2['run_id'] == 'c2'
+        assert payload_c2['last_seen_run_id'] == 'c2'
 
 
 # ---------------------------------------------------------------------------
@@ -5875,36 +5841,23 @@ class TestIsCompletionFlag:
 
 
 @pytest.mark.asyncio
-async def test_dedup_flags_completion_flag_sweeps_prior_without_writing_new_marker():
+async def test_dedup_flags_completion_flag_sweeps_prior_without_writing_new_marker(
+    ledger_memory_service,
+):
     """flag_for_stage2=False marks a ONE-TIME completed-work finding: dedup_flags
     does NOT write a new stage1_flag_marker for it (task-2312 review amendment —
     an emit-then-self-delete design raced Mem0 read-after-write indexing lag and
     could leave a fresh orphan). Instead it only sweeps any PRIOR marker for the
-    signature via acknowledge_flag_marker(mode='delete') — bypassing the
-    persist-for-dedup MISS/HIT path entirely.
+    signature via acknowledge_flag_marker → ledger.mark_addressed — bypassing
+    the persist-for-dedup MISS/HIT path entirely.
 
     A prior marker (simulating one left over from an earlier cycle) is found
-    and deleted; no marker is (re-)written.
+    and swept to state='addressed'; no marker is (re-)written.
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
 
-    prior_marker = _make_memory_result({
-        'source': 'stage1_flag_marker',
-        'kind': 'stage1_flag_marker',
-        'task_id': '77',
-        'flag_type': 'duplicate_flag_marker_cleanup',
-        'run_id': 'r0',
-        'last_seen_run_id': 'r0',
-    })
-    prior_marker.id = 'prior-77'
-
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(side_effect=_make_search_stub(
-        suppression=[[]],
-        marker={('77', 'duplicate_flag_marker_cleanup'): [[prior_marker]]},
-    ))
-    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-    memory_service.delete_memory = AsyncMock(return_value=None)
+    ledger = ledger_memory_service.recon_ledger
+    await _seed_marker(ledger, 'p', '77', 'duplicate_flag_marker_cleanup', run_id='r0')
 
     flags = [{
         'task_id': 77,
@@ -5914,20 +5867,19 @@ async def test_dedup_flags_completion_flag_sweeps_prior_without_writing_new_mark
     }]
 
     result = await dedup_flags(
-        memory_service=memory_service,
+        memory_service=ledger_memory_service,
         project_id='p',
         run_id='r1',
         flags=flags,
     )
 
-    # (a) No marker is (re-)written for a completion flag — only one search
-    # (acknowledge_flag_marker's own find_prior_memories) is issued for the
-    # marker query; the search stub would raise on a second, unconfigured pop.
-    memory_service.add_memory.assert_not_called()
+    # (a) No new marker is (re-)written for a completion flag.
+    ledger_memory_service.add_memory.assert_not_called()
 
-    # (b) The pre-existing prior is swept.
-    memory_service.delete_memory.assert_called_once()
-    assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'prior-77'
+    # (b) The pre-existing prior is swept to state='addressed' on the ledger.
+    row = await _get_marker(ledger, 'p', '77', 'duplicate_flag_marker_cleanup')
+    assert row is not None
+    assert row.state == 'addressed'
 
     # (c) Flag annotated; persist-for-dedup fields are NOT set (bypassed).
     assert len(result) == 1
@@ -5977,25 +5929,17 @@ async def test_dedup_flags_completion_flag_with_no_priors_is_noop_sweep():
 
 
 @pytest.mark.asyncio
-async def test_dedup_flags_completion_flag_duplicate_signature_in_batch_swept_once():
-    """Idempotency (task-2312 review amendment): when the SAME (task_id,
-    flag_type) completion signature is emitted twice in one items_flagged
-    batch, only the FIRST occurrence runs the acknowledge_flag_marker sweep —
-    the second is caught by the in-batch seen_signatures memo (task-1978)
-    because the completion branch now registers its signature there too,
-    instead of independently re-running a second sweep.
+async def test_dedup_flags_completion_flag_duplicate_signature_in_batch_swept_once(
+    ledger_memory_service,
+):
+    """Revised task-2312 semantics under the ledger (seen_signatures removed,
+    plan.json design decision): when the SAME (task_id, flag_type) completion
+    signature is emitted twice in one items_flagged batch, BOTH occurrences
+    self-annotate — the ledger sweep (acknowledge_flag_marker →
+    ledger.mark_addressed) is idempotent, so re-running it for the second
+    occurrence is harmless and no in-batch memo is needed to prevent it.
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(side_effect=_make_search_stub(
-        suppression=[[]],
-        # Only ONE entry configured: a second, unmemoized sweep would exhaust
-        # the queue and raise inside the search stub, failing the test.
-        marker={('77', 'duplicate_flag_marker_cleanup'): [[]]},
-    ))
-    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-    memory_service.delete_memory = AsyncMock(return_value=None)
 
     flags = [
         {
@@ -6013,45 +5957,39 @@ async def test_dedup_flags_completion_flag_duplicate_signature_in_batch_swept_on
     ]
 
     result = await dedup_flags(
-        memory_service=memory_service,
+        memory_service=ledger_memory_service,
         project_id='p',
         run_id='r1',
         flags=flags,
     )
 
-    memory_service.add_memory.assert_not_called()
-    memory_service.delete_memory.assert_not_called()
+    ledger_memory_service.add_memory.assert_not_called()
 
     assert len(result) == 2
-    # First occurrence: resolved directly by the completion branch.
-    assert result[0]['completion_marker_self_deleted'] is True
-    assert result[0]['last_seen_run_id'] == 'r1'
-    assert 'persisted_from_run' not in result[0]
-    # Second occurrence: short-circuited by the in-batch memo instead of
-    # re-running the sweep.
-    assert result[1].get('persisted_from_run') == 'r1'
-    assert result[1]['last_seen_run_id'] == 'r1'
-    assert 'completion_marker_self_deleted' not in result[1]
+    # Both occurrences: resolved directly by the completion branch — the
+    # idempotent ledger sweep makes a second sweep for the same signature
+    # harmless, so no in-batch memo is needed to skip it.
+    for flag in result:
+        assert flag.get('completion_marker_self_deleted') is True
+        assert flag.get('last_seen_run_id') == 'r1'
+        assert 'persisted_from_run' not in flag
 
 
 @pytest.mark.asyncio
-async def test_dedup_flags_recurring_flag_without_flag_for_stage2_unaffected():
+async def test_dedup_flags_recurring_flag_without_flag_for_stage2_unaffected(
+    ledger_memory_service,
+):
     """Dedup-safety guard: a flag WITHOUT flag_for_stage2 (an ordinary recurring
-    finding, MISS path) is completely unchanged by the completion-marker
-    feature — its marker is written and NOT deleted, proving cross-cycle
-    dedup is not regressed by the new branch.
+    finding) is completely unchanged by the completion-marker feature — its
+    marker is UPSERTed to the ledger and never swept, proving cross-cycle
+    dedup is not regressed by the completion branch.
     """
     from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-    memory_service = AsyncMock()
-    memory_service.search = AsyncMock(return_value=[])  # no prior marker, no suppression
-    memory_service.add_memory = AsyncMock(return_value=_STUB_ADD_MEMORY_RESPONSE)
-    memory_service.delete_memory = AsyncMock(return_value=None)
 
     flags = [{'task_id': '99', 'flag_type': 'stale_metadata', 'description': 'bar'}]
 
     result = await dedup_flags(
-        memory_service=memory_service,
+        memory_service=ledger_memory_service,
         project_id='p',
         run_id='r1',
         flags=flags,
@@ -6061,12 +5999,16 @@ async def test_dedup_flags_recurring_flag_without_flag_for_stage2_unaffected():
     assert 'persisted_from_run' not in result[0]
     assert 'completion_marker_self_deleted' not in result[0]
 
-    memory_service.add_memory.assert_called_once()
+    row = await _get_marker(ledger_memory_service.recon_ledger, 'p', '99', 'stale_metadata')
+    assert row is not None
+    assert row.state == 'active'
+
+    ledger_memory_service.add_memory.assert_called_once()
     _assert_valid_stage1_marker(
-        memory_service.add_memory.call_args.kwargs,
+        ledger_memory_service.add_memory.call_args.kwargs,
         task_id='99', flag_type='stale_metadata', run_id='r1',
     )
-    memory_service.delete_memory.assert_not_called()
+    ledger_memory_service.delete_memory.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
