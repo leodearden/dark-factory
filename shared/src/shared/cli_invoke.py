@@ -918,9 +918,14 @@ async def invoke_with_cap_retry(
                 # unconditionally; an unresolvable token means the account
                 # vanished/refreshed, so failing over is safe and
                 # self-terminating (no separate unattributed fall-through).
+                # Rebuild via the caller's hook (no-op when rebuild_prompt is
+                # None): a live-continuation caller's original_prompt
+                # (resume_delivers_prompt=True) is only valid inside the
+                # resumed session, not the brand-new one this failover starts.
                 if isinstance(outcome, AuthFailed):
                     slot.report(outcome)
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    await _rebuild_fresh_prompt()
                     logger.warning(
                         f'{label}: account {account_name} auth-failed '
                         f'(HTTP {result.api_error_status}) — failing over',
@@ -948,6 +953,10 @@ async def invoke_with_cap_retry(
                 # response whose cap-pattern IS detectable, so cap accounting resumes
                 # on the very next iteration.  At most one extra full-timeout
                 # (~configured_timeout_ms) is incurred before the cap is re-detected.
+                # Rebuild via the caller's hook (no-op when rebuild_prompt is
+                # None): a live-continuation caller's original_prompt
+                # (resume_delivers_prompt=True) is only valid inside the
+                # wedged session, not the brand-new one this retry starts.
                 if (
                     isinstance(outcome, ZeroOutputWedge)
                     and invoke_kwargs.get('resume_session_id')
@@ -959,6 +968,7 @@ async def invoke_with_cap_retry(
                         f'before retry',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
                 if slot.detect_cap_hit(result.stderr, result.output, backend=backend):
