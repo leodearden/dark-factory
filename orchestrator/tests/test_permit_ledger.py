@@ -298,6 +298,74 @@ class TestPermitLedgerTokenFactory:
 
 
 # ---------------------------------------------------------------------------
+# step-3 RED / step-4 GREEN (task 2161): PermitLedger.release_for_shutdown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPermitLedgerReleaseForShutdown:
+    """PermitLedger.release_for_shutdown(count) -- shutdown-only valve that
+    deliberately over-releases the wrapped semaphore to unblock any
+    coroutine parked at ``acquire()`` (task 2161 step-3).
+
+    RED until step-4 GREEN adds release_for_shutdown to PermitLedger.
+    """
+
+    async def test_raises_slot_available_by_count(self) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+
+        depth = 2
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth)
+        await ledger.acquire()  # slot_available now 1
+        before = ledger.slot_available
+
+        ledger.release_for_shutdown(depth + 1)
+
+        assert ledger.slot_available == before + (depth + 1)
+
+    async def test_does_not_mutate_live(self) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+
+        depth = 2
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth)
+        p1 = await ledger.acquire()
+        live_before = ledger.live
+
+        ledger.release_for_shutdown(depth + 1)
+
+        assert ledger.live == live_before
+        assert p1 in ledger.live
+        assert p1.released is False  # release_for_shutdown never touches the token itself
+
+    async def test_never_raises_when_over_releasing_past_depth(self) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+
+        depth = 1
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth)
+
+        ledger.release_for_shutdown(depth + 1)  # no live permits at all -- still must not raise
+
+        assert ledger.slot_available == depth + (depth + 1)
+        assert ledger.live == frozenset()
+
+    async def test_works_for_a_cap_permit_ledger_too(self) -> None:
+        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_types import CapPermit
+
+        depth = 2
+        ledger = PermitLedger(asyncio.Semaphore(depth), depth, token_factory=CapPermit)
+        p1 = await ledger.acquire()
+        live_before = ledger.live
+        before = ledger.slot_available
+
+        ledger.release_for_shutdown(depth + 1)
+
+        assert ledger.slot_available == before + (depth + 1)
+        assert ledger.live == live_before
+        assert p1 in ledger.live
+
+
+# ---------------------------------------------------------------------------
 # step-7 RED / step-8 GREEN: permit storage slot on RealMergeItem / DecidedItem
 # / InflightEntry
 # ---------------------------------------------------------------------------
