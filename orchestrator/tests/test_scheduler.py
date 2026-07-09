@@ -4665,6 +4665,69 @@ class TestBlastRadiusModuleCacheSeam:
             f'got {persisted}'
         )
 
+    @pytest.mark.asyncio
+    async def test_successful_narrow_updates_module_cache(
+        self, scheduler: Scheduler
+    ):
+        """A successful narrowing refinement must update _module_cache to the
+        narrowed set via the single-writer seam — not just the lock table.
+
+        Regression: _get_modules write-through populates the cache on every
+        scored/dispatched task, but only the acquire-FAILURE branch routed
+        through _write_module_cache. A successful narrow (release_subset +
+        _persist_files_metadata) left a stale, WIDER cache entry in place;
+        because _get_modules is cache-first, a later read could return
+        modules release_subset already freed (the δ over-claim class)
+        instead of re-deriving from the freshly narrowed metadata.files.
+        """
+        lt = scheduler.lock_table
+        assert lt.try_acquire('936', ['crates/reify-compiler/src/lib.rs'])
+        # Seed the cache with the PRE-refinement (wider) module set, mirroring
+        # what _get_modules' write-through would already have populated on an
+        # earlier dispatch-scoring read.
+        scheduler._write_module_cache('936', ['crates/reify-compiler/src/lib.rs'])
+        scheduler.get_task = AsyncMock(  # type: ignore[method-assign]
+            return_value={'id': '936', 'metadata': {}}
+        )
+        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        calls: list[tuple[str, list[str]]] = []
+        original_write = scheduler._write_module_cache
+
+        def spy(task_id: str, modules: list[str]) -> list[str]:
+            calls.append((task_id, modules))
+            return original_write(task_id, modules)
+
+        scheduler._write_module_cache = spy  # type: ignore[method-assign]
+
+        ok = await scheduler.handle_blast_radius_expansion(
+            '936',
+            current=['crates/reify-compiler/src/lib.rs'],
+            needed=['crates/reify-compiler/src/conformance.rs'],
+        )
+
+        assert ok is True
+        expected = ['crates/reify-compiler/src/conformance.rs']
+        assert ('936', expected) in calls, (
+            f'Expected _write_module_cache(936, {expected}) call on the '
+            f'success path; got {calls}'
+        )
+        assert scheduler._module_cache['936'] == expected, (
+            f'_module_cache must be updated to the narrowed set after a '
+            f"successful refinement; got {scheduler._module_cache.get('936')}"
+        )
+
+        # A later _get_modules read (cache-first) must return the narrowed
+        # set, not the stale wider set seeded before the refinement.
+        task = {
+            'id': '936',
+            'metadata': {'files': ['crates/reify-compiler/src/conformance.rs']},
+        }
+        assert scheduler._get_modules(task) == expected, (
+            'Cache-first _get_modules read must reflect the narrowed set, '
+            'not a stale pre-refinement cache entry'
+        )
+
 
 class TestSchedulerMcpSessionDI:
     """Tests for the optional mcp_session dependency-injection kwarg on Scheduler.

@@ -4648,6 +4648,17 @@ class Scheduler:
                             'persisted': bool(updated),
                         },
                     )
+            # Keep _module_cache in sync with the lock table on every
+            # successful refinement (widen, narrow, or shift) — not just the
+            # acquire-FAILURE branch below.  Without this, a successful
+            # NARROW (release_subset above frees `stale`) left a stale, wider
+            # cache entry in place; because _get_modules is cache-first, a
+            # later read could return modules this task no longer holds
+            # (the δ over-claim class) until the terminal/redispatch
+            # eviction sweep happened to clear the entry. Routes through the
+            # single-writer seam so cached and held module sets cannot
+            # diverge.
+            self._write_module_cache(task_id, sorted(needed_set))
             logger.info(f'Task {task_id} expanded to modules: {needed}')
             return True
 
@@ -4903,9 +4914,10 @@ class Scheduler:
     def _write_module_cache(self, task_id: str, modules: list[str]) -> list[str]:
         """The ONLY call site that assigns into ``self._module_cache``.
 
-        Every derive-and-cache path (``_get_modules``, the blast-radius
-        acquire-failure path, ``seed_modules``) routes through here so the
-        cache has a single writer.  Before task 2122, ``_get_modules`` derived
+        Every derive-and-cache path (``_get_modules``, both the success and
+        acquire-failure branches of ``handle_blast_radius_expansion``,
+        ``seed_modules``) routes through here so the cache has a single
+        writer.  Before task 2122, ``_get_modules`` derived
         without caching while ``handle_blast_radius_expansion`` and
         ``Harness._tag_task_modules`` each wrote ``_module_cache`` directly —
         three independent writers that could diverge.  The terminal/redispatch
