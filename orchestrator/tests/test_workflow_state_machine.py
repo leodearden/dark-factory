@@ -259,3 +259,36 @@ class TestTaskWorkflowStateMachineWiring:
         with pytest.raises(IllegalTransition):
             wf._enter_phase(WorkflowState.BLOCKED)
         assert wf.state == WorkflowState.DONE
+
+
+@pytest.mark.asyncio
+class TestMarkBlockedTerminalAbsorption:
+    """``_mark_blocked`` terminal-absorption guard (step-7/8): must be a
+    no-op for ANY terminal ``WorkflowState``, not just DONE.
+    """
+
+    async def test_mark_blocked_after_cancelled_returns_cancelled(self):
+        """New generalization — CANCELLED is absorbing too, not just DONE.
+
+        Currently RED: the pre-step-8 guard only checks
+        ``WorkflowState.DONE``, so this falls through to
+        ``_enter_phase(WorkflowState.BLOCKED)``, which raises
+        ``IllegalTransition`` (CANCELLED is absorbing per the machine).
+        """
+        wf, scheduler = _make_workflow()
+        wf.state = WorkflowState.CANCELLED
+
+        outcome = await wf._mark_blocked('late block after cancel')
+
+        assert outcome == WorkflowOutcome.CANCELLED
+        scheduler.set_task_status.assert_not_called()
+
+    async def test_mark_blocked_after_done_returns_done(self):
+        """DONE regression — mirrors test_workflow_e2e.py TestDoneIsTerminal."""
+        wf, scheduler = _make_workflow()
+        wf.state = WorkflowState.DONE
+
+        outcome = await wf._mark_blocked('late block')
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_not_called()
