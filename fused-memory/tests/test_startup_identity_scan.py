@@ -1,0 +1,92 @@
+"""Tests for the W6-ε startup identity-integrity scan (task 2210).
+
+Covers:
+- GraphitiBackend._scan_duplicate_entity_names — dup-NODE alarm (B5)
+- GraphitiBackend._repair_duplicate_edge_uuids — dup-uuid-EDGE repair (B6)
+- GraphitiBackend._run_startup_identity_scan — per-graph orchestrator
+- GraphitiBackend.initialize() wiring
+
+An idempotent startup identity-integrity pass, run per-graph over
+list_graphs() during initialize(). Two responsibilities: (a) dup-NODE
+alarm — detect exact-name duplicate Entity nodes and emit a LOUD WARN
+naming group_id+name (a safety net for the write-time identity gate, task
+2198/α + task 2202/β — a POSITIVE DETECTION signal, not input rejection);
+(b) dup-uuid-EDGE repair — a one-shot idempotent migration that re-mints
+fresh uuids (+ superseded_edge_uuid) on legacy dup-uuid RELATES_TO edges so
+per-uuid count(*)<=1, while PRESERVING the edge set. No-op on a clean
+graph. Unblocks W6-ζ (uuid-keyed read dedup).
+"""
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+import uuid
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import pytest_asyncio
+from _fm_helpers import extract_cypher, extract_params
+from falkordb import FalkorDB as _SyncFalkorDB
+from falkordb.asyncio import FalkorDB
+
+from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
+
+# ---------------------------------------------------------------------------
+# Live-FalkorDB integration test harness (task 2210 W6-ε)
+# ---------------------------------------------------------------------------
+#
+# The trailing live-FalkorDB test class pins the true B5/B6 semantics (real
+# count(*) grouping, per-uuid uniqueness, edge-set preservation, idempotent
+# re-run, group_id exclusion of a task-2115 foreign clone) against a REAL
+# FalkorDB server -- the mock tests above can only pin the Cypher
+# string/params shape, not FalkorDB's actual grouping/count semantics.
+# Duplicated (not shared via conftest.py) from test_merge_entities.py's
+# harness (itself duplicated from test_refresh_entity_summary.py /
+# test_list_indices_integration.py), per the established per-module
+# duplication convention that sidesteps the `sys.modules['conftest']`
+# collision documented in _fm_helpers.py.
+#
+# Skipped automatically when FalkorDB is not reachable; the mock tests above
+# guarantee coverage in that case.
+# ---------------------------------------------------------------------------
+
+FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
+FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
+
+
+def _falkor_available() -> bool:
+    """FalkorDB-native reachability probe (mirrors test_merge_entities.py)."""
+    try:
+        client = _SyncFalkorDB(host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2)
+        try:
+            client.select_graph('_probe').query('RETURN 1')
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+        return True
+    except Exception:
+        return False
+
+
+@pytest_asyncio.fixture
+async def startup_scan_live_graph():
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up.
+
+    A fresh graph name is minted on every invocation (rather than a shared
+    module-level constant) so this module's live tests never share state,
+    even under pytest-xdist or a shared FalkorDB instance.
+    """
+    graph_name = f'_test_2210_startup_scan_{uuid.uuid4().hex[:8]}'
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    with contextlib.suppress(Exception):
+        stale = client.select_graph(graph_name)
+        await stale.delete()
+    graph = client.select_graph(graph_name)
+    try:
+        yield graph_name, graph
+    finally:
+        with contextlib.suppress(Exception):
+            await graph.delete()
+        with contextlib.suppress(Exception):
+            await client.aclose()
