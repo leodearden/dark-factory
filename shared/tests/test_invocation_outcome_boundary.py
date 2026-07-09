@@ -548,6 +548,50 @@ class TestB4Reify3604NonCap:
 # ---------------------------------------------------------------------------
 
 
+async def _assert_probe_in_flight_skew_does_not_skew_attribution(gate: UsageGate) -> None:
+    """B5 support: drive account[0] to PROBE_IN_FLIGHT via the legal
+    CAPPED -> PROBING -> PROBE_IN_FLIGHT chain (simulating a concurrent
+    prober that already claimed its slot), then assert neither
+    ``before_invoke``'s lease (producer side) nor ``invoke_with_cap_retry``'s
+    cost-store attribution (consumer side) skews toward the PROBE_IN_FLIGHT
+    account -- both must name account[1], the account actually leased and
+    invoked (finding 3 / task W4-delta's AccountLease fix).
+    """
+    skewed, sibling = gate._accounts
+    gate._transition(skewed, AccountPhase.CAPPED)
+    gate._transition(skewed, AccountPhase.PROBING)
+    gate._transition(skewed, AccountPhase.PROBE_IN_FLIGHT)
+    assert skewed.phase == AccountPhase.PROBE_IN_FLIGHT
+
+    # Producer side: before_invoke must skip the PROBE_IN_FLIGHT account and
+    # lease the sibling instead.
+    lease = await gate.before_invoke()
+    assert lease is not None
+    assert lease.name == sibling.name
+
+    # Consumer side: the cost-store attribution recorded by
+    # invoke_with_cap_retry must name the account actually invoked (the
+    # sibling), not the skewed PROBE_IN_FLIGHT account.
+    cost_store = RecordingCostStore()
+    ok_result = AgentResult(success=True, output='done', cost_usd=0.02)
+    with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+        result = await invoke_with_cap_retry(
+            gate, 'B5[attribution]',
+            invoke_fn=scripted_cli(ok_result),
+            cost_store=cost_store,
+            backend='claude',
+            prompt='hi',
+        )
+
+    assert result.success is True
+    assert len(cost_store.invocations) == 1
+    assert cost_store.invocations[0]['account_name'] == sibling.name, (
+        f'expected cost-store attribution to name {sibling.name!r} (the '
+        f'account actually invoked), got '
+        f'{cost_store.invocations[0]["account_name"]!r}'
+    )
+
+
 @pytest.mark.asyncio
 class TestB5AttributionUnderProbeInFlightSkew:
     """account[0] PROBE_IN_FLIGHT must not skew before_invoke's lease
