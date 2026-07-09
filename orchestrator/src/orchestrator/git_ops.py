@@ -400,6 +400,45 @@ async def _assert_no_task_dir(sha: str, cwd: Path, context: str) -> None:
         )
 
 
+async def _assert_no_conflict_markers(sha: str, cwd: Path, context: str) -> None:
+    """Raise RuntimeError if the given commit SHA's tree has tracked files
+    carrying unresolved git conflict markers at column 0 (esc-2128-8).
+
+    Layer-2 defense-in-depth backstop: the primary guard lives in
+    :meth:`GitOps.commit` (unmerged-index detection, BEFORE the tree is
+    even staged); this is the last checkpoint before a marker-carrying
+    tree could reach main via :meth:`GitOps.advance_main`.
+
+    Matches ONLY the unambiguous opening/closing brackets — ``^<<<<<<< ``
+    and ``^>>>>>>> `` (exactly 7 chars + a trailing space, git's exact
+    marker format) — anchored at column 0.  Deliberately does NOT match a
+    bare ``^=======`` line: that would false-positive on reStructuredText /
+    Markdown heading underlines, which are common and legitimate.  Marker-
+    like text that isn't anchored at column 0 (e.g. inside a string
+    literal) is not matched either.
+
+    Fail-open (no raise) when git reports no match (``git grep`` exits 1)
+    OR on a git error — mirrors :func:`_assert_no_task_dir`'s fail-open
+    semantics: a broken git invocation must not itself become a false
+    block.
+    """
+    rc, out, _ = await _run(
+        ['git', 'grep', '-lE', r'^(<{7}|>{7}) ', sha, '--', '.'],
+        cwd=cwd,
+    )
+    if rc == 0 and out.strip():
+        # `git grep <tree> -- <pathspec>` prefixes each hit with
+        # `<resolved-sha>:` — strip it down to the bare path.
+        files = [line.partition(':')[2] for line in out.strip().splitlines()]
+        raise RuntimeError(
+            f'CONFLICT MARKER GATE FAILED ({context}): commit {sha[:8]} '
+            f'contains {len(files)} file(s) with unresolved conflict '
+            f'marker(s): {", ".join(files[:5])}. Refusing to advance main. '
+            f'Resolve the conflict marker(s) (or abort the operation that '
+            f'left them) and re-run.'
+        )
+
+
 @dataclass
 class MergeResult:
     success: bool
