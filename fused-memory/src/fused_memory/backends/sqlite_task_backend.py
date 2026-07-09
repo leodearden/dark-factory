@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daem
 from shared.task_metadata import SchemaWarning, apply_migrations, parse_metadata
 from shared.task_statuses import TaskStatus
 
-from fused_memory.backends.task_backend_errors import TaskmasterError
+from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError, TaskmasterError
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
     DependencyResult,
@@ -32,6 +33,9 @@ from fused_memory.backends.task_backend_types import (
 )
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.candidate_key_escalation import (
+    emit_residual_candidate_key_escalation,
+)
 from fused_memory.models.scope import resolve_project_id
 
 logger = logging.getLogger(__name__)
@@ -45,7 +49,13 @@ logger = logging.getLogger(__name__)
 #   v3: + candidate_key column (fm-task-dedup W8 task A1) — computed on every
 #       insert going forward; backfilled for non-cancelled rows on migration.
 #       See ``_migrate_v2_to_v3``.
-_SCHEMA_VERSION = 3
+#   v4: + partial UNIQUE index ux_tasks_candidate_key over (tag,
+#       candidate_key) WHERE candidate_key IS NOT NULL AND status !=
+#       'cancelled' (fm-task-dedup W8 task A2) — self-gating: re-audits for
+#       residual non-cancelled duplicates at connection-open and SKIPS the
+#       index build (leaving user_version at 3) when any remain, so the next
+#       open lands it once residuals are cleaned up. See ``_migrate_v3_to_v4``.
+_SCHEMA_VERSION = 4
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
@@ -218,7 +228,12 @@ def _files_for_key(metadata_raw: str | None) -> list[Any]:
     return raw_files if isinstance(raw_files, list) else []
 
 
-async def _migrate(conn: aiosqlite.Connection) -> None:
+async def _migrate(
+    conn: aiosqlite.Connection,
+    *,
+    project_root: str | None = None,
+    residual_dup_escalation_cb: Any = None,
+) -> None:
     """Cumulative, idempotent, version-gated schema migration.
 
     Gated on ``PRAGMA user_version``; a no-op once it reaches
@@ -236,6 +251,8 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
       ``heartbeat_at`` (task 2182, PRD plans/task-status-authority-prd.md).
     * v2 → v3: see :func:`_migrate_v2_to_v3` — add + backfill
       ``candidate_key`` (fm-task-dedup W8 task A1).
+    * v3 → v4: see :func:`_migrate_v3_to_v4` — self-gating partial UNIQUE
+      index over ``candidate_key`` (fm-task-dedup W8 task A2).
 
     Each ALTER step is column-presence-guarded, so a fresh DB whose
     ``_SCHEMA_SQL`` already created every column runs all steps as no-op
@@ -318,6 +335,14 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
 
     if version < 3:
         await _migrate_v2_to_v3(conn)
+        version = 3
+
+    if version < 4:
+        await _migrate_v3_to_v4(
+            conn,
+            project_root=project_root,
+            residual_dup_escalation_cb=residual_dup_escalation_cb,
+        )
 
 
 async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
@@ -409,6 +434,135 @@ async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
 
     await conn.execute('PRAGMA user_version = 3')
     await conn.commit()
+
+
+async def _migrate_v3_to_v4(
+    conn: aiosqlite.Connection,
+    *,
+    project_root: str | None = None,
+    residual_dup_escalation_cb: Any = None,
+) -> None:
+    """v3 -> v4 (fm-task-dedup W8 task A2): self-gating partial UNIQUE index.
+
+    Re-runs the same residual non-cancelled duplicate ``candidate_key``
+    audit ``_migrate_v2_to_v3`` performed (report-only there), extended with
+    ``GROUP_CONCAT(id ORDER BY id)`` to name the offending rows in a
+    deterministic (ascending id) order — SQLite does not otherwise guarantee
+    ``GROUP_CONCAT`` row order, and both the ERROR log token and the
+    escalation payload's ``task_ids`` list depend on a stable order:
+
+    * **Residuals found** — log a loud ERROR naming the groups (via the
+      ``residual_group_count=`` token, deliberately distinct from v2->v3's
+      ``duplicate_groups=`` token so the two audits' log-scraping assertions
+      never collide), invoke ``residual_dup_escalation_cb(project_root,
+      residual_groups)`` when provided (best-effort — a raising callback is
+      caught and logged, never propagated), and SKIP the index build.
+      ``user_version`` is left at 3 (NOT stamped to 4): a later
+      connection-open — after an operator cleans up the residuals — re-runs
+      this step and lands the index then (PRD decision #4: "the next deploy
+      lands the index").
+    * **Clean** — build ``ux_tasks_candidate_key``, a PARTIAL UNIQUE index
+      over ``(tag, candidate_key)`` excluding NULL keys and cancelled rows,
+      then stamp ``user_version = 4``.
+
+    FAIL-SAFE: this step NEVER raises. ``_get_connection`` only caches the
+    connection AFTER ``_migrate`` returns, so a raising migration would
+    crash-loop fused-memory on every connection-open. The index CREATE is
+    additionally guarded against ``sqlite3.IntegrityError`` (a residual
+    duplicate slipping past the audit, e.g. a race) -- skip, don't raise --
+    and the whole step is wrapped so nothing unexpected propagates either.
+
+    Deliberately NOT added to ``_SCHEMA_SQL``: a fresh-schema ``executescript``
+    run at every connection-open would raise ``IntegrityError`` building the
+    index against a DB that still holds residual duplicates, defeating the
+    self-gating fail-safe. Fresh DBs still get the index via the full
+    v0->v1->v2->v3->v4 chain, where this audit is trivially clean.
+    """
+    try:
+        dup_cursor = await conn.execute(
+            """
+            SELECT tag, candidate_key, GROUP_CONCAT(id ORDER BY id) AS ids,
+                   COUNT(*) AS n
+            FROM tasks
+            WHERE candidate_key IS NOT NULL AND status != 'cancelled'
+            GROUP BY tag, candidate_key
+            HAVING COUNT(*) > 1
+            """,
+        )
+        # aiosqlite types fetchall() as Iterable[Row] (not Sized); materialize
+        # to a list so len() below type-checks (it's already a list at runtime).
+        residual_rows = list(await dup_cursor.fetchall())
+
+        if residual_rows:
+            groups_desc = '; '.join(
+                f'tag={row["tag"]!r} candidate_key={row["candidate_key"]!r} '
+                f'ids=[{row["ids"]}]'
+                for row in residual_rows
+            )
+            logger.error(
+                'sqlite_task_backend: schema v3->v4 migration SKIPPED -- '
+                'residual_group_count=%d non-cancelled duplicate candidate_key '
+                'group(s) still present; UNIQUE index NOT created, '
+                'user_version stays at 3. Clean up the residual duplicates '
+                '(cancel or merge the extras) and the next connection-open '
+                'will land the index. Groups: %s',
+                len(residual_rows), groups_desc,
+            )
+
+            residual_groups = [
+                {
+                    'tag': row['tag'],
+                    'candidate_key': row['candidate_key'],
+                    'task_ids': row['ids'].split(','),
+                    'count': row['n'],
+                }
+                for row in residual_rows
+            ]
+            if residual_dup_escalation_cb is not None:
+                try:
+                    residual_dup_escalation_cb(project_root, residual_groups)
+                except Exception:
+                    # A broken/misbehaving callback must never crash
+                    # connection-open — the skip above has already happened;
+                    # escalation is purely additive.
+                    logger.exception(
+                        'sqlite_task_backend: residual_dup_escalation_cb '
+                        'raised while escalating %d residual duplicate '
+                        'candidate_key group(s) for project_root=%r',
+                        len(residual_groups), project_root,
+                    )
+            return
+
+        try:
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_candidate_key "
+                "ON tasks(tag, candidate_key) "
+                "WHERE candidate_key IS NOT NULL AND status != 'cancelled'",
+            )
+        except sqlite3.IntegrityError:
+            logger.error(
+                'sqlite_task_backend: schema v3->v4 migration -- CREATE UNIQUE '
+                'INDEX ux_tasks_candidate_key raised IntegrityError despite a '
+                'clean audit (race?); skipping index build, user_version '
+                'stays at 3.',
+            )
+            return
+
+        await conn.execute('PRAGMA user_version = 4')
+        await conn.commit()
+        logger.info(
+            'sqlite_task_backend: schema v3->v4 migration -- residual audit '
+            'clean; built partial UNIQUE index ux_tasks_candidate_key over '
+            '(tag, candidate_key) and advanced user_version to 4 '
+            '(fm-task-dedup task A2).',
+        )
+    except Exception:
+        # Defensive backstop -- this step must NEVER raise at connection-open
+        # (see docstring): a raising migration would crash-loop fused-memory.
+        logger.exception(
+            'sqlite_task_backend: schema v3->v4 migration failed unexpectedly; '
+            'skipping (user_version stays below 4, retried on next open)',
+        )
 
 
 async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
@@ -563,6 +717,7 @@ class SqliteTaskBackend:
         config: TaskmasterConfig | None = None,
         *,
         task_metadata_enforce: bool = False,
+        residual_dup_escalation_cb: Any = None,
     ) -> None:
         self.config = config
         # RED-TIER / restart-only (task 2162, W3-β): False (default) is
@@ -571,6 +726,13 @@ class SqliteTaskBackend:
         # True is enforce-mode — the same violation raises and the write is
         # rolled back. See config.schema.TaskMetadataConfig.
         self._task_metadata_enforce = task_metadata_enforce
+        # Injectable escalation seam for the v3->v4 migration's residual-dup
+        # skip path (fm-task-dedup W8 task A2) — defaults to the production
+        # helper so escalations fire without any server wiring; tests inject
+        # a recording stub. See _migrate_v3_to_v4.
+        self._residual_dup_escalation_cb = (
+            residual_dup_escalation_cb or emit_residual_candidate_key_escalation
+        )
         self._connections: dict[str, aiosqlite.Connection] = {}
         # Guards the connection map AND each project's first-access bring-up
         # (schema + WAL pragmas). Held briefly during open; released before
@@ -728,7 +890,11 @@ class SqliteTaskBackend:
             await conn.execute('PRAGMA foreign_keys=OFF')
             await conn.executescript(_SCHEMA_SQL)
             await conn.commit()
-            await _migrate(conn)
+            await _migrate(
+                conn,
+                project_root=project_root,
+                residual_dup_escalation_cb=self._residual_dup_escalation_cb,
+            )
             # Cache once per project_root — see the field docstring in
             # __init__ for why this is safe to compute a single time here
             # rather than on every claimant write.
@@ -937,6 +1103,14 @@ class SqliteTaskBackend:
         plain status change must never wipe a live claimant. Fails safe
         (WARNING, status-only write, no error) when the claimant columns are
         absent from a not-yet-migrated connection.
+
+        Raises :class:`DuplicateCandidateKeyError` (fm-task-dedup W8 task A2
+        review amendment) instead of letting a raw ``sqlite3.IntegrityError``
+        escape on the narrow un-cancel collision case: moving a row's status
+        OFF ``'cancelled'`` makes it visible to the partial UNIQUE index on
+        ``(tag, candidate_key)``, and if another non-cancelled row already
+        holds the same key, this UPDATE is rejected rather than silently
+        reactivating a duplicate.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -949,7 +1123,7 @@ class SqliteTaskBackend:
             )
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             cursor = await conn.execute(
-                'SELECT status FROM tasks WHERE tag = ? AND id = ?',
+                'SELECT status, candidate_key FROM tasks WHERE tag = ? AND id = ?',
                 (tag, tid),
             )
             row = await cursor.fetchone()
@@ -959,6 +1133,7 @@ class SqliteTaskBackend:
                     f'No tasks found for ID(s): {task_id}',
                 )
             old_status = row['status']
+            row_candidate_key = row['candidate_key']
 
             set_columns = ['status = ?', 'updated_at = ?']
             set_values: list[Any] = [status, _now()]
@@ -979,11 +1154,36 @@ class SqliteTaskBackend:
                     )
 
             set_values.extend([tag, tid])
-            await conn.execute(
-                f'UPDATE tasks SET {", ".join(set_columns)} '
-                'WHERE tag = ? AND id = ?',
-                set_values,
-            )
+            try:
+                await conn.execute(
+                    f'UPDATE tasks SET {", ".join(set_columns)} '
+                    'WHERE tag = ? AND id = ?',
+                    set_values,
+                )
+            except sqlite3.IntegrityError as exc:
+                # Only the candidate_key partial UNIQUE index is mapped to a
+                # typed collision (mirrors add_task's collision mapping); any
+                # other integrity violation is unrelated and re-raised
+                # untouched. Reachable via the narrow un-cancel path (see the
+                # docstring above). Nothing in this transaction has been
+                # written yet — this is the first write statement — so this
+                # survivor lookup sees the same state a post-rollback read
+                # would (this row's own candidate_key/status are unaffected,
+                # having never been applied).
+                if row_candidate_key is None or 'candidate_key' not in str(exc):
+                    raise
+                survivor_cursor = await conn.execute(
+                    "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                    "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                    (tag, row_candidate_key),
+                )
+                survivor = await survivor_cursor.fetchone()
+                raise DuplicateCandidateKeyError(
+                    existing_id=survivor['id'] if survivor is not None else None,
+                    existing_status=survivor['status'] if survivor is not None else None,
+                    tag=tag,
+                    candidate_key=row_candidate_key,
+                ) from exc
         return {
             'message': f'Successfully updated 1 task(s) to "{status}"',
             'tasks': [{
@@ -1139,62 +1339,92 @@ class SqliteTaskBackend:
         # raising; the key must never be the reason an insert fails.
         candidate_key = compute_candidate_key(title, _files_for_key(metadata))
 
-        async with self._write_lock(project_root), self._txn(project_root) as conn:
-            # High-water across BOTH live rows and the persisted counter, so a
-            # deleted top-level id is never reissued (see id_counters in the
-            # schema).  max(MAX(tasks.id), stored)+1 self-heals legacy DBs that
-            # predate the counter: the existing row high-water is honoured on
-            # the first post-upgrade alloc, then the counter holds the line.
-            cursor = await conn.execute(
-                """
-                SELECT MAX(highwater) FROM (
-                    SELECT COALESCE(MAX(id), 0) AS highwater FROM tasks
-                        WHERE tag = ?
-                    UNION ALL
-                    SELECT COALESCE(max_id, 0) AS highwater FROM id_counters
-                        WHERE tag = ?
-                )
-                """,
-                (tag, tag),
-            )
-            _max_row = await cursor.fetchone()
-            assert _max_row is not None  # aggregate MAX always returns one row
-            next_id = (_max_row[0] or 0) + 1
-            await self._validate_metadata_on_write(
-                metadata, project_root=project_root, tag=tag, task_id=next_id,
-            )
-            await conn.execute(
-                """
-                    INSERT INTO tasks (tag, id, title, description,
-                                       details, test_strategy, status, priority,
-                                       metadata, updated_at, candidate_key)
-                    VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+        try:
+            async with self._write_lock(project_root), self._txn(project_root) as conn:
+                # High-water across BOTH live rows and the persisted counter, so a
+                # deleted top-level id is never reissued (see id_counters in the
+                # schema).  max(MAX(tasks.id), stored)+1 self-heals legacy DBs that
+                # predate the counter: the existing row high-water is honoured on
+                # the first post-upgrade alloc, then the counter holds the line.
+                cursor = await conn.execute(
+                    """
+                    SELECT MAX(highwater) FROM (
+                        SELECT COALESCE(MAX(id), 0) AS highwater FROM tasks
+                            WHERE tag = ?
+                        UNION ALL
+                        SELECT COALESCE(max_id, 0) AS highwater FROM id_counters
+                            WHERE tag = ?
+                    )
                     """,
-                (
-                    tag, next_id, title,
-                    description or '', details or '',
-                    status, priority or 'medium', metadata, _now(),
-                    candidate_key,
-                ),
-            )
-            for dep in deps_list:
-                await conn.execute(
-                    'INSERT OR IGNORE INTO dependencies '
-                    '(tag, task_id, depends_on) VALUES (?, ?, ?)',
-                    (tag, next_id, dep),
+                    (tag, tag),
                 )
-            await conn.execute(
-                """
-                INSERT INTO id_counters (tag, max_id) VALUES (?, ?)
-                    ON CONFLICT(tag) DO UPDATE SET max_id = excluded.max_id
-                        WHERE excluded.max_id > id_counters.max_id
-                """,
-                (tag, next_id),
+                _max_row = await cursor.fetchone()
+                assert _max_row is not None  # aggregate MAX always returns one row
+                next_id = (_max_row[0] or 0) + 1
+                await self._validate_metadata_on_write(
+                    metadata, project_root=project_root, tag=tag, task_id=next_id,
+                )
+                await conn.execute(
+                    """
+                        INSERT INTO tasks (tag, id, title, description,
+                                           details, test_strategy, status, priority,
+                                           metadata, updated_at, candidate_key)
+                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                        """,
+                    (
+                        tag, next_id, title,
+                        description or '', details or '',
+                        status, priority or 'medium', metadata, _now(),
+                        candidate_key,
+                    ),
+                )
+                for dep in deps_list:
+                    await conn.execute(
+                        'INSERT OR IGNORE INTO dependencies '
+                        '(tag, task_id, depends_on) VALUES (?, ?, ?)',
+                        (tag, next_id, dep),
+                    )
+                await conn.execute(
+                    """
+                    INSERT INTO id_counters (tag, max_id) VALUES (?, ?)
+                        ON CONFLICT(tag) DO UPDATE SET max_id = excluded.max_id
+                            WHERE excluded.max_id > id_counters.max_id
+                    """,
+                    (tag, next_id),
+                )
+            return {
+                'id': str(next_id),
+                'message': f'Successfully added new task #{next_id}',
+            }
+        except sqlite3.IntegrityError as exc:
+            # Only the partial UNIQUE index on candidate_key is mapped to a
+            # typed collision — any other integrity violation (e.g. a PRIMARY
+            # KEY clash, which the id high-water allocation above should make
+            # unreachable) is unrelated and re-raised untouched. SQLite names
+            # the violated columns in the message ('UNIQUE constraint failed:
+            # tasks.tag, tasks.candidate_key'), and this is the only index
+            # that references candidate_key, so the substring check is
+            # unambiguous. A NULL candidate_key can never trip this index
+            # (the partial predicate excludes it), so it's checked first.
+            if candidate_key is None or 'candidate_key' not in str(exc):
+                raise
+            # `_txn` above has already rolled back the failed INSERT (zero
+            # orphan rows) by the time this except runs. Look up the
+            # surviving non-cancelled row with this (tag, candidate_key) on
+            # a fresh read over the same cached connection.
+            conn = await self._get_connection(project_root)
+            survivor_cursor = await conn.execute(
+                "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                (tag, candidate_key),
             )
-        return {
-            'id': str(next_id),
-            'message': f'Successfully added new task #{next_id}',
-        }
+            survivor = await survivor_cursor.fetchone()
+            raise DuplicateCandidateKeyError(
+                existing_id=survivor['id'] if survivor is not None else None,
+                existing_status=survivor['status'] if survivor is not None else None,
+                tag=tag,
+                candidate_key=candidate_key,
+            ) from exc
 
     async def update_task(
         self,
@@ -1317,13 +1547,15 @@ class SqliteTaskBackend:
             # title/files) would silently break the future A2 dedup index.
             # An update touching neither is left alone: the existing value
             # still correctly describes the unchanged row.
+            new_candidate_key: str | None = None
             if title is not None or metadata is not None:
                 final_title = title if title is not None else row['title']
                 final_metadata_raw = new_metadata if metadata is not None else row['metadata']
-                set_columns.append('candidate_key = ?')
-                set_values.append(
-                    compute_candidate_key(final_title, _files_for_key(final_metadata_raw)),
+                new_candidate_key = compute_candidate_key(
+                    final_title, _files_for_key(final_metadata_raw),
                 )
+                set_columns.append('candidate_key = ?')
+                set_values.append(new_candidate_key)
 
             # updated_at always advances, even on a no-op write — matches
             # the original behaviour and avoids surprising "stale" reads.
@@ -1332,11 +1564,37 @@ class SqliteTaskBackend:
 
             set_clause = ', '.join(set_columns)
             set_values.extend([tag, tid])
-            await conn.execute(
-                f'UPDATE tasks SET {set_clause} '
-                f'WHERE tag = ? AND id = ?',
-                set_values,
-            )
+            try:
+                await conn.execute(
+                    f'UPDATE tasks SET {set_clause} '
+                    f'WHERE tag = ? AND id = ?',
+                    set_values,
+                )
+            except sqlite3.IntegrityError as exc:
+                # Only the candidate_key partial UNIQUE index is mapped to a
+                # typed collision (mirrors add_task; fm-task-dedup W8 task A2
+                # review amendment); any other integrity violation is
+                # unrelated and re-raised untouched. Reachable only when this
+                # call recomputed candidate_key above (title/metadata
+                # touched) and the new key collides with another
+                # non-cancelled row of the same tag. Nothing in this
+                # transaction has been written yet — this is the first write
+                # statement — so this survivor lookup sees the same state a
+                # post-rollback read would.
+                if new_candidate_key is None or 'candidate_key' not in str(exc):
+                    raise
+                survivor_cursor = await conn.execute(
+                    "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
+                    "AND status != 'cancelled' ORDER BY id LIMIT 1",
+                    (tag, new_candidate_key),
+                )
+                survivor = await survivor_cursor.fetchone()
+                raise DuplicateCandidateKeyError(
+                    existing_id=survivor['id'] if survivor is not None else None,
+                    existing_status=survivor['status'] if survivor is not None else None,
+                    tag=tag,
+                    candidate_key=new_candidate_key,
+                ) from exc
 
             # Dependencies: replace-mode only. Empty list clears all deps.
             if dependencies is not None:

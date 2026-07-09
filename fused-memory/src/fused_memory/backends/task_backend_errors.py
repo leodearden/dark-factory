@@ -34,8 +34,47 @@ class TaskmasterError(Exception):
         self.raw = raw
 
 
+class DuplicateCandidateKeyError(TaskmasterError):
+    """Raised by ``add_task`` when the partial UNIQUE index on
+    ``(tag, candidate_key)`` rejects an insert (fm-task-dedup W8 task A2).
+
+    Names the surviving non-cancelled row so callers can resolve the
+    collision as a combine/dedup rather than a hard failure: the
+    interceptor's create-dispatch and planning-mode paths catch this
+    explicitly and return a ``'combined'``-style result pointing at
+    ``existing_id``.
+
+    Attributes:
+        existing_id: The surviving row's task id (``int``), or ``None`` if
+            the post-collision lookup somehow found no matching row.
+        existing_status: The surviving row's current status, or ``None``
+            under the same fallback condition.
+        tag: The tag the collision occurred under.
+        candidate_key: The colliding ``candidate_key`` value.
+    """
+
+    def __init__(
+        self,
+        existing_id: int | None,
+        existing_status: str | None = None,
+        tag: str | None = None,
+        candidate_key: str | None = None,
+    ) -> None:
+        super().__init__(
+            'DUPLICATE_CANDIDATE_KEY',
+            f'A task with the same normalized (title, files) already exists: '
+            f'tag={tag!r} candidate_key={candidate_key!r} '
+            f'existing_id={existing_id!r} existing_status={existing_status!r}',
+        )
+        self.existing_id = existing_id
+        self.existing_status = existing_status
+        self.tag = tag
+        self.candidate_key = candidate_key
+
+
 __all__ = [
     'TASKMASTER_TOOL_ERROR',
     'TASKMASTER_UNAVAILABLE',
+    'DuplicateCandidateKeyError',
     'TaskmasterError',
 ]

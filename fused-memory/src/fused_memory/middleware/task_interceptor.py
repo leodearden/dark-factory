@@ -35,6 +35,7 @@ from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.middleware.dark_factory_path_guard import (
     DARK_FACTORY_PROJECT_ID,
@@ -1949,6 +1950,18 @@ class TaskInterceptor:
                     status='deferred',
                     **kwargs,
                 )
+            except DuplicateCandidateKeyError as exc:
+                # The partial UNIQUE index rejected this insert — resolve as
+                # a combine pointing at the surviving row rather than
+                # reintroducing the duplicate via a generic error dict.
+                return {
+                    'task_id': (
+                        str(exc.existing_id) if exc.existing_id is not None else None
+                    ),
+                    'status': exc.existing_status,
+                    'combined': True,
+                    'planning_mode': True,
+                }
             except Exception as exc:
                 logger.exception(
                     'submit_task[planning_mode]: tm.add_task failed for project=%s',
@@ -2589,15 +2602,46 @@ class TaskInterceptor:
 
         async with self._write_lock(project_id):
             try:
-                result = await tm.add_task(
-                    project_root=project_root,
-                    metadata=metadata_json,
-                    **kwargs,
+                try:
+                    result = await tm.add_task(
+                        project_root=project_root,
+                        metadata=metadata_json,
+                        **kwargs,
+                    )
+                    atomic_metadata_written = metadata_json is not None
+                except TypeError:
+                    # Legacy two-step fallback for a backend whose add_task()
+                    # doesn't accept metadata= (see
+                    # test_add_task_falls_back_to_two_step_on_typeerror).
+                    # Nested inside the outer try so a collision on THIS
+                    # retry also resolves as 'combined' below rather than
+                    # escaping this method uncaught.
+                    result = await tm.add_task(project_root=project_root, **kwargs)
+                    atomic_metadata_written = False
+            except DuplicateCandidateKeyError as exc:
+                # The partial UNIQUE index on (tag, candidate_key) rejected
+                # this insert — resolve as a combine pointing at the
+                # surviving row rather than falling through to 'failed'
+                # (PRD decision #3: a collision is not a failure). Covers
+                # both the primary add_task() call and its TypeError
+                # fallback retry above.
+                existing_id = (
+                    str(exc.existing_id) if exc.existing_id is not None else None
                 )
-                atomic_metadata_written = metadata_json is not None
-            except TypeError:
-                result = await tm.add_task(project_root=project_root, **kwargs)
-                atomic_metadata_written = False
+                result_dict = {
+                    'id': existing_id,
+                    'title': candidate.title if candidate else '',
+                    'deduplicated': True,
+                    'action': 'candidate_key_collision',
+                    'justification': 'candidate_key_collision',
+                }
+                return (
+                    'combined',
+                    existing_id,
+                    'candidate_key_collision',
+                    result_dict,
+                    curator_degrade_reason,
+                )
 
             # The task backend's add_task is contractually guaranteed to return
             # an AddTaskResult DTO with a non-empty `id` — anything else raises

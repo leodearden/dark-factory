@@ -1842,7 +1842,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
     assert 'parent_id' not in tasks_cols, f'tasks still has parent_id column: {tasks_cols}'
     assert 'parent_id' not in deps_cols, f'dependencies still has parent_id column: {deps_cols}'
     assert 'parent_id' not in counters_cols, f'id_counters still has parent_id column: {counters_cols}'
-    assert user_version == 3, f'Expected user_version=3 after migration; got {user_version}'
+    assert user_version == 4, f'Expected user_version=4 after migration; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns after full-rebuild migration; got {tasks_cols}'
     )
@@ -1860,7 +1860,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
 
 @pytest.mark.asyncio
 async def test_migration_idempotent_second_open(tmp_path):
-    """Opening an already-migrated DB a second time is a no-op: user_version stays 3."""
+    """Opening an already-migrated DB a second time is a no-op: user_version stays 4."""
     import sqlite3
 
     project_root = str(tmp_path / 'proj')
@@ -1887,13 +1887,13 @@ async def test_migration_idempotent_second_open(tmp_path):
     finally:
         conn.close()
 
-    assert user_version == 3
+    assert user_version == 4
     assert 'parent_id' not in tasks_cols
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_has_no_parent_id_and_user_version_3(tmp_path):
+async def test_fresh_db_has_no_parent_id_and_user_version_4(tmp_path):
     """A brand-new DB is created with the post-migration schema from the start."""
     import sqlite3
 
@@ -1919,7 +1919,7 @@ async def test_fresh_db_has_no_parent_id_and_user_version_3(tmp_path):
         conn.close()
 
     assert 'parent_id' not in tasks_cols, f'New DB should not have parent_id; got {tasks_cols}'
-    assert user_version == 3, f'Fresh DB should have user_version=3; got {user_version}'
+    assert user_version == 4, f'Fresh DB should have user_version=4; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns in fresh schema; got {tasks_cols}'
     )
@@ -1980,13 +1980,15 @@ def _make_v1_schema_db(db_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     """Opening an already-migrated v1 DB ALTERs in the claimant columns and
-    then chains the v2->v3 candidate_key step, landing at v3.
+    then chains the v2->v3 candidate_key step and the v3->v4 index step,
+    landing at v4.
 
     This is the common production case: parent_id is already gone (a prior
     deploy ran the v0->v1 rebuild), but claimant_run_id/heartbeat_at don't
     exist yet. Distinct from test_migration_drops_parent_id_column_and_straggler
     above, which exercises the v0->v3 full-rebuild-then-ALTER path for DBs that
-    still have parent_id.
+    still have parent_id. The single seed row is duplicate-free, so the
+    v3->v4 residual audit is clean and the migration reaches v4 uninterrupted.
     """
     import sqlite3
 
@@ -2015,7 +2017,7 @@ async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected ALTER TABLE to add claimant_run_id/heartbeat_at; got {tasks_cols}'
     )
-    assert user_version == 3, f'Expected user_version=3 after v1->v3 migration; got {user_version}'
+    assert user_version == 4, f'Expected user_version=4 after v1->v4 migration; got {user_version}'
 
 
 def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
@@ -2276,7 +2278,10 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     assert by_id[1] == compute_candidate_key('Fix the bug', ['a.py'])
     assert by_id[2] == compute_candidate_key('Add the feature', ['c.py'])
     assert by_id[3] == compute_candidate_key('Refactor the thing', [])
-    assert user_version == 3, f'Expected user_version=3 after migration; got {user_version}'
+    # The v2->v3 backfill's own audit is clean (3/3 unique), and the v3->v4
+    # residual audit over the same rows is trivially clean too, so the chain
+    # reaches v4 (index built) rather than stopping at v3.
+    assert user_version == 4, f'Expected user_version=4 after migration; got {user_version}'
 
     # Exactly one audit record, at INFO (not WARNING), naming duplicate_groups=0.
     audit_records = [r for r in caplog.records if 'duplicate_groups=' in r.message]
@@ -2291,6 +2296,356 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     assert re.search(r'\bduplicate_groups=0\b', audit_records[0].message), (
         f'Expected duplicate_groups=0 in audit log; got: {audit_records[0].message!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
+    backend, project_root,
+):
+    """A fresh DB chains through v0->v4: the v3->v4 step's residual-duplicate
+    audit is trivially clean on an empty table, so it builds the partial
+    UNIQUE index over (tag, candidate_key) and stamps user_version=4.
+    """
+    import sqlite3
+
+    await backend.add_task(project_root=project_root, title='fresh task')
+
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    conn = sqlite3.connect(str(db_path))
+    try:
+        index_rows = {row[1]: row for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='ux_tasks_candidate_key'",
+        ).fetchone()
+    finally:
+        conn.close()
+
+    # (a) the partial UNIQUE index is present.
+    assert 'ux_tasks_candidate_key' in index_rows, (
+        f'Expected ux_tasks_candidate_key index; got: {sorted(index_rows)}'
+    )
+    # (b) it is UNIQUE — index_list column 2 is the `unique` flag.
+    assert index_rows['ux_tasks_candidate_key'][2] == 1, (
+        f'Expected ux_tasks_candidate_key to be UNIQUE; got {index_rows["ux_tasks_candidate_key"]}'
+    )
+    # (c) the stored SQL carries the partial predicate over (tag, candidate_key).
+    assert sql_row is not None, 'Expected ux_tasks_candidate_key SQL in sqlite_master'
+    index_sql = sql_row[0]
+    assert 'candidate_key IS NOT NULL' in index_sql, index_sql
+    assert "status != 'cancelled'" in index_sql, index_sql
+    assert 'tag' in index_sql and 'candidate_key' in index_sql, index_sql
+    # (d) user_version advances to 4 on a clean build.
+    assert user_version == 4, (
+        f'Expected user_version=4 after clean v3->v4 migration; got {user_version}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_self_gating_skips_index_and_escalates_on_residual_duplicates(
+    tmp_path, caplog,
+):
+    """When a residual non-cancelled duplicate candidate_key group is still
+    present at connection-open, the v3->v4 step must SKIP the index build,
+    leave user_version at 3, log a loud ERROR naming the group, and invoke
+    the injectable ``residual_dup_escalation_cb`` seam — all without raising
+    (connection-open migrations must be fail-safe).
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v1_schema_db_no_candidate_key(db_path)
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=recording_stub)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.ERROR, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Triggers connection-open (_SCHEMA_SQL + _migrate, chaining
+            # v1->v2->v3->v4).
+            await b.get_tasks(project_root=project_root)  # (a) must not raise
+    finally:
+        await b.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+    finally:
+        conn.close()
+
+    # (b) no index references candidate_key — the build was skipped.
+    assert not any('candidate_key' in idx for idx in indexes), (
+        f'No index should reference candidate_key on a residual-dup skip; got: {indexes}'
+    )
+    # (c) user_version stays at 3 — the skip does not stamp 4.
+    assert user_version == 3, (
+        f'Expected user_version to stay at 3 on residual-dup skip; got {user_version}'
+    )
+
+    expected_key = compute_candidate_key('Fix the bug', ['a.py', 'b.py'])
+
+    # (d) exactly one ERROR record naming the residual group via
+    # residual_group_count=, and it must NOT contain the v2->v3 audit's
+    # duplicate_groups= token — the two audits' log-scraping assertions must
+    # never collide.
+    error_records = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and 'residual_group_count=' in r.message
+    ]
+    assert len(error_records) == 1, (
+        f'Expected exactly one residual_group_count= ERROR record; got '
+        f'{len(error_records)}: {[r.message for r in error_records]}'
+    )
+    msg = error_records[0].message
+    assert re.search(r'\bresidual_group_count=1\b', msg), msg
+    assert 'duplicate_groups=' not in msg, (
+        f'v3->v4 ERROR message must not reuse the v2->v3 duplicate_groups= token; got: {msg!r}'
+    )
+    assert expected_key in msg, (
+        f'Expected the shared candidate_key in the ERROR message; got: {msg!r}'
+    )
+    assert 'ids=[1,2]' in msg, (
+        f'Expected the offending ids named in the ERROR message; got: {msg!r}'
+    )
+
+    # (e) the escalation stub was invoked once, naming the same group.
+    assert len(recorded) == 1, (
+        f'Expected exactly one escalation callback invocation; got {recorded}'
+    )
+    called_project_root, residual_groups = recorded[0]
+    assert called_project_root == project_root
+    assert residual_groups == [
+        {'tag': 'master', 'candidate_key': expected_key, 'task_ids': ['1', '2'], 'count': 2},
+    ], residual_groups
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_raising_escalation_cb_is_caught_and_logged(tmp_path, caplog):
+    """A misbehaving ``residual_dup_escalation_cb`` (raises instead of just
+    recording) must be caught and logged, never propagated -- connection-open
+    stays fail-safe even when the injected escalation seam itself is broken,
+    and the residual-dup skip outcome (no index, user_version stays at 3) is
+    unaffected by the callback's failure.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v1_schema_db_no_candidate_key(db_path)
+
+    def raising_cb(project_root_arg, residual_groups):
+        raise RuntimeError('escalation backend unreachable')
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg, residual_dup_escalation_cb=raising_cb)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.ERROR, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Must return normally despite the callback raising.
+            await b.get_tasks(project_root=project_root)
+    finally:
+        await b.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+    finally:
+        conn.close()
+
+    # The residual-dup skip outcome is unchanged by the callback failure.
+    assert not any('candidate_key' in idx for idx in indexes), (
+        f'No index should reference candidate_key when the residual audit '
+        f'found duplicates, regardless of the escalation callback outcome; '
+        f'got: {indexes}'
+    )
+    assert user_version == 3, (
+        f'Expected user_version to stay at 3 on residual-dup skip even when '
+        f'the escalation callback raises; got {user_version}'
+    )
+
+    # The callback's own exception was caught and logged (not swallowed
+    # silently, not propagated out of connection-open).
+    cb_failure_records = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR
+        and 'residual_dup_escalation_cb' in r.message
+        and 'raised while escalating' in r.message
+    ]
+    assert len(cb_failure_records) == 1, (
+        f'Expected exactly one ERROR record logging the raising callback; got '
+        f'{len(cb_failure_records)}: {[r.message for r in caplog.records]}'
+    )
+    assert cb_failure_records[0].exc_info is not None, (
+        'Expected the callback failure to be logged with exc_info (via '
+        'logger.exception) so the traceback is captured'
+    )
+
+
+# ── candidate_key collision (fm-task-dedup W8 task A2) ───────────────
+
+
+@pytest.mark.asyncio
+async def test_add_task_duplicate_candidate_key_raises_and_no_orphan(backend, project_root):
+    """A second add_task whose normalized (title, files) collides with an
+    existing non-cancelled row raises DuplicateCandidateKeyError naming the
+    survivor, and creates NO orphan row — the partial UNIQUE index rejects
+    the INSERT, ``_txn`` rolls it back, and get_tasks still shows exactly
+    one non-cancelled row.
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+
+    # Same normalized title (case + extra internal whitespace) and the same
+    # files (order swapped) — compute_candidate_key is case/whitespace
+    # insensitive on title and order-insensitive on files, so this collides.
+    with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+        await backend.add_task(
+            project_root=project_root,
+            title='fix  parser',
+            metadata=json.dumps({'files': ['b.py', 'a.py']}),
+        )
+
+    exc = exc_info.value
+    assert exc.existing_id == 1, f'Expected the collision to name survivor id=1; got {exc.existing_id!r}'
+    assert exc.existing_status == 'pending', (
+        f'Expected the survivor status to be pending; got {exc.existing_status!r}'
+    )
+
+    listing = await backend.get_tasks(project_root=project_root)
+    non_cancelled = [t for t in listing['tasks'] if t['status'] != 'cancelled']
+    assert len(non_cancelled) == 1, (
+        f'Expected exactly one non-cancelled row (no orphan from the '
+        f'rejected insert); got {len(non_cancelled)}: {listing["tasks"]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_task_cancelled_row_allows_refile(backend, project_root):
+    """BT-A5: cancelling the surviving row then re-filing the identical
+    (title, files) SUCCEEDS — the partial UNIQUE index excludes cancelled
+    rows (``WHERE ... status != 'cancelled'``), so a legitimate refile after
+    cancellation is never falsely blocked as a collision.
+    """
+    first = await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    await backend.set_task_status(first['id'], 'cancelled', project_root=project_root)
+
+    second = await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    assert second['id'] == '2', f'Expected the refile to land as a new id=2; got {second["id"]!r}'
+
+    listing = await backend.get_tasks(project_root=project_root)
+    statuses_by_id = {t['id']: t['status'] for t in listing['tasks']}
+    assert statuses_by_id == {'1': 'cancelled', '2': 'pending'}, statuses_by_id
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_uncancel_collision_raises_duplicate_candidate_key_error(
+    backend, project_root,
+):
+    """Review amendment (fm-task-dedup W8 task A2): un-cancelling a row whose
+    candidate_key collides with an existing non-cancelled row must raise
+    DuplicateCandidateKeyError, not a raw sqlite3.IntegrityError.
+    Un-cancelling moves the row back into the partial UNIQUE index's
+    predicate (``status != 'cancelled'``); if the refiled duplicate (BT-A5)
+    already occupies that (tag, candidate_key), reactivating the original is
+    rejected. The rejected UPDATE must roll back — task 1 stays cancelled.
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    first = await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    await backend.set_task_status(first['id'], 'cancelled', project_root=project_root)
+    # BT-A5 refile: succeeds because the partial index excludes cancelled rows.
+    second = await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    assert second['id'] == '2'
+
+    with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+        await backend.set_task_status(first['id'], 'pending', project_root=project_root)
+
+    exc = exc_info.value
+    assert exc.existing_id == 2, (
+        f'Expected the collision to name survivor id=2; got {exc.existing_id!r}'
+    )
+    assert exc.existing_status == 'pending', exc.existing_status
+
+    # The rejected UPDATE rolled back — task 1 is still cancelled.
+    listing = await backend.get_tasks(project_root=project_root)
+    statuses_by_id = {t['id']: t['status'] for t in listing['tasks']}
+    assert statuses_by_id == {'1': 'cancelled', '2': 'pending'}, statuses_by_id
+
+
+@pytest.mark.asyncio
+async def test_update_task_recompute_collision_raises_duplicate_candidate_key_error(
+    backend, project_root,
+):
+    """Review amendment (fm-task-dedup W8 task A2): update_task recomputes
+    candidate_key whenever title/metadata is touched; if the recomputed key
+    collides with another non-cancelled row, this must raise
+    DuplicateCandidateKeyError rather than a raw sqlite3.IntegrityError. The
+    rejected UPDATE must roll back — the row's title stays unchanged.
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    await backend.add_task(
+        project_root=project_root,
+        title='Fix parser',
+        metadata=json.dumps({'files': ['a.py', 'b.py']}),
+    )
+    other = await backend.add_task(
+        project_root=project_root,
+        title='Unrelated task',
+        metadata=json.dumps({'files': ['z.py']}),
+    )
+
+    with pytest.raises(DuplicateCandidateKeyError) as exc_info:
+        await backend.update_task(
+            other['id'],
+            project_root=project_root,
+            title='fix  parser',
+            metadata=json.dumps({'files': ['b.py', 'a.py']}),
+        )
+
+    exc = exc_info.value
+    assert exc.existing_id == 1, (
+        f'Expected the collision to name survivor id=1; got {exc.existing_id!r}'
+    )
+    assert exc.existing_status == 'pending', exc.existing_status
+
+    # The rejected UPDATE rolled back — task 2's title/candidate_key are unchanged.
+    two = await backend.get_task(other['id'], project_root=project_root)
+    assert two['title'] == 'Unrelated task', two['title']
+    assert two['candidate_key'] == compute_candidate_key('Unrelated task', ['z.py'])
 
 
 # ── Concurrency ────────────────────────────────────────────────────

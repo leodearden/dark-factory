@@ -5931,6 +5931,34 @@ async def test_planning_mode_add_task_failure_returns_error(
     taskmaster.set_task_status.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_planning_mode_candidate_key_collision_returns_combined(
+    interceptor_facade,
+    taskmaster,
+):
+    """A DuplicateCandidateKeyError raised by tm.add_task inside the
+    planning_mode path must resolve as a combined result pointing at the
+    survivor — NOT fall through to the generic error branch (task 2189
+    step-11/12: closes the planning-mode duplicate-reintroduction gap).
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    taskmaster.add_task = AsyncMock(
+        side_effect=DuplicateCandidateKeyError(existing_id=7, existing_status='in-progress'),
+    )
+    result = await interceptor_facade.submit_task(
+        '/project',
+        title='dup',
+        planning_mode=True,
+    )
+    assert result == {
+        'task_id': '7',
+        'status': 'in-progress',
+        'combined': True,
+        'planning_mode': True,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # _looks_like_task_id helper
 # ─────────────────────────────────────────────────────────────────────
@@ -7801,3 +7829,43 @@ class TestCheckEscalationIdempotencyTuple:
         )
         assert hit.get('id') == '42', f"expected hit id='42'; got {hit!r}"
         assert check_failed is False, f"expected check_failed=False; got {check_failed!r}"
+
+
+# ── task 2189 step-9/10: candidate_key collision → combined (create-dispatch) ──
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ticket_decision_candidate_key_collision_resolves_combined(
+    interceptor, taskmaster,
+):
+    """A DuplicateCandidateKeyError raised by tm.add_task inside the create
+    branch of _dispatch_ticket_decision must resolve as a 'combined' result
+    pointing at the survivor — NOT fall through to the generic failure path
+    (PRD decision #3 forbids marking a collision 'failed').
+    """
+    from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+
+    taskmaster.add_task = AsyncMock(
+        side_effect=DuplicateCandidateKeyError(existing_id=5, existing_status='pending'),
+    )
+
+    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+        ticket_id='t1',
+        project_root='/project',
+        project_id=resolve_project_id('/project'),
+        candidate=None,
+        decision=CuratorDecision(action='create'),
+        kwargs={'title': 'dup'},
+        metadata=None,
+        curator=None,
+    )
+
+    assert status == 'combined', f'expected combined, got {status!r} (reason={reason!r})'
+    assert task_id == '5', f'expected task_id=5 (existing_id); got {task_id!r}'
+    assert reason == 'candidate_key_collision', (
+        f'expected candidate_key_collision reason; got {reason!r}'
+    )
+    assert result_dict is not None, 'expected a result_dict, got None'
+    assert result_dict.get('deduplicated') is True, result_dict
+    assert result_dict.get('action') == 'candidate_key_collision', result_dict
+    assert degrade is None, f'expected no curator_degrade_reason; got {degrade!r}'
