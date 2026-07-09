@@ -2138,21 +2138,103 @@ Output JSON matching the schema. Every task must appear in the output.
                         or registered_branch == rec.branch
                     )
                     if is_registered and branch_ok:
+                        # ── Semantic identity guard (Fix C, mirrored) ─────
+                        # The checks above only prove this lane's admin entry
+                        # and checked-out branch still belong to rec.task_id.
+                        # For a RECYCLED id, a stale record could carry a
+                        # task_id/branch pair that happens to match current
+                        # git reality while the worktree's actual content
+                        # belongs to a different (deleted) task — exactly the
+                        # failure mode reify 3770 introduced this check to
+                        # catch on the heuristic path below (~2322). Run the
+                        # same check here, before pinning.
+                        if self.config.worktree_identity_guard_enabled:
+                            live = await self.scheduler.get_task(rec.task_id)
+                            if live is None:
+                                # get_task returns None for BOTH "deleted" and
+                                # transient error — defer (no adopt, no
+                                # destroy), same policy as the heuristic path.
+                                logger.warning(
+                                    'Recovery: lane %s record ASSIGNED for '
+                                    'task %s but no live DB task — deferring '
+                                    '(no adopt, no destroy)',
+                                    entry.name, rec.task_id,
+                                )
+                                continue
+                            stored_title = read_worktree_title(entry)
+                            if not identities_match(stored_title, live.get('title')):
+                                logger.warning(
+                                    'Recovery: lane %s record ASSIGNED for '
+                                    'task %s but identity MISMATCH — stored '
+                                    'title %r != live %r; quarantining',
+                                    entry.name, rec.task_id, stored_title,
+                                    live.get('title'),
+                                )
+                                dest = await self.git_ops.quarantine_worktree(
+                                    entry, rec.branch or rec.task_id,
+                                    'recovery-identity-mismatch',
+                                )
+                                self.git_ops._lane_lifecycle.transition(
+                                    entry, DurableLaneState.QUARANTINED,
+                                )
+                                if self.event_store:
+                                    self.event_store.emit(
+                                        EventType.worktree_quarantined,
+                                        task_id=rec.task_id,
+                                        data={
+                                            'reason': 'recovery-identity-mismatch',
+                                            'dest': str(dest) if dest else None,
+                                        },
+                                    )
+                                cleaned += 1
+                                continue
+
                         pool.restore_assignment(rec.task_id, entry)
                         rec_plan_path = self._resolve_recovery_artifact(
                             entry, 'plan.json',
                         )
                         if rec_plan_path.exists():
                             try:
-                                self._recovered_plans[rec.task_id] = json.loads(
-                                    rec_plan_path.read_text()
-                                )
+                                rec_plan = json.loads(rec_plan_path.read_text())
                             except (json.JSONDecodeError, OSError) as e:
+                                rec_plan = None
                                 logger.warning(
                                     'Recovery: lane %s record-adopted for task '
                                     '%s but plan.json unreadable (%s)',
                                     entry.name, rec.task_id, e,
                                 )
+                            if rec_plan is not None:
+                                # Mirror the heuristic path's completed-steps /
+                                # stamped-preservation decision (~2394-2434
+                                # below): only pre-load a plan that already
+                                # has completed work into _recovered_plans —
+                                # workflow.py treats a pre-loaded plan as
+                                # initial_plan and SKIPS _plan() entirely, so
+                                # a stale plan would never get revalidated
+                                # against a possibly-advanced main. A stamped
+                                # plan with zero completed steps (e.g. the
+                                # blast-radius lock-conflict requeue) is
+                                # preserved instead, so _plan() still takes
+                                # its revalidation-against-current-main
+                                # branch. An unstamped, zero-completed plan
+                                # has nothing usable to recover — leave both
+                                # dicts untouched, same as a missing plan.json.
+                                rec_completed = [
+                                    s for col in ('prerequisites', 'steps')
+                                    for s in rec_plan.get(col, [])
+                                    if isinstance(s, dict) and s.get('status') == 'done'
+                                ]
+                                if rec_completed:
+                                    self._recovered_plans[rec.task_id] = rec_plan
+                                elif rec_plan.get('_session_id'):
+                                    logger.info(
+                                        'Recovery: lane %s record-adopted for '
+                                        'task %s has stamped plan with no '
+                                        'completed steps — preserving for '
+                                        'revalidation instead of pre-loading',
+                                        entry.name, rec.task_id,
+                                    )
+                                    self._preserved_worktrees.add(rec.task_id)
                         rec_lock_path = self._resolve_recovery_artifact(
                             entry, 'plan.lock',
                         )

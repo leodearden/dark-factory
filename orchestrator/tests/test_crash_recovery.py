@@ -1331,6 +1331,53 @@ class TestRecordDrivenRecovery:
         assert record is not None
         assert record.state == DurableLaneState.ASSIGNED
 
+    async def test_adopt_stamped_zero_completed_preserves_not_preloads(
+        self, harness: Harness,
+    ):
+        """ADOPT + a stamped plan with zero completed steps (the
+        blast-radius lock-conflict requeue shape, workflow.py:1071-1088)
+        must NOT be pre-loaded into _recovered_plans -- workflow.py treats a
+        pre-loaded plan as initial_plan and skips _plan() entirely, so a
+        stale plan would never be revalidated against a possibly-advanced
+        main.  It must instead land in _preserved_worktrees, mirroring the
+        heuristic path's stamped-preservation branch (~2415 below), so the
+        next acquisition still takes _plan()'s revalidation branch.  The
+        lane is still ADOPTED (pinned) regardless -- only the pre-load
+        decision changes.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(
+            steps_done=0, steps_total=4, task_id='42', session_id='sess-abc',
+        )
+        lane = _setup_lane(base, '_lane-0', plan)
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
+        harness.git_ops.lane_branch_checkouts = AsyncMock(
+            return_value={'42': lane},
+        )
+        harness.scheduler.get_status = AsyncMock(return_value=None)  # non-terminal
+
+        await harness._recover_crashed_tasks()
+
+        # Still adopted/pinned -- the stamped-zero-completed shape only
+        # changes whether the plan is pre-loaded, not the pin decision.
+        assert pool.assignment_for('42') == lane
+        assert pool.state(lane) == LaneState.ASSIGNED
+
+        assert '42' not in harness._recovered_plans
+        assert '42' in harness._preserved_worktrees
+
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.ASSIGNED
+        assert record.task_id == '42'
+
+        harness.git_ops.quarantine_worktree.assert_not_called()  # type: ignore[attr-defined]
+        harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
+
 
 # ===========================================================================
 # Task 2257 (W11 delta) step-11 RED: compat (never-silently-re-pin a
