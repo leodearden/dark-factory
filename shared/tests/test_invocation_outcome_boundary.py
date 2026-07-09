@@ -289,6 +289,51 @@ class TestB1IllegalTransition:
 # observable tracking it (consumer).
 # ---------------------------------------------------------------------------
 
+_B2_SAMPLE_EVERY = 10  # how often the walk samples the consumer observable
+
+
+async def _random_legal_walk(gate: UsageGate, rng: random.Random, steps: int) -> None:
+    """B2 walk driver: *steps* random legal ``_transition`` edges.
+
+    After EVERY step, asserts the DD-5 ``_open`` invariant (producer side).
+    Every ``_B2_SAMPLE_EVERY`` steps, also asserts the one-directional
+    consumer-facing claim this task's plan specifies: whenever ``_open`` is
+    set, ``wait_for_open(timeout=0)`` returns True too (consumer side) --
+    sampled rather than checked on every step purely to keep a 300-step walk
+    fast, not because the invariant is expected to ever lapse between
+    samples.
+
+    NOTE -- deliberately one-directional: ``wait_for_open``'s fast path
+    short-circuits on ``UsageGate.is_paused`` (``all(capped or auth_failed)``
+    accounts), which is a narrower condition than ``not _open.is_set()``
+    (``all(phase not in {AVAILABLE, PROBING})``) -- a PROBE_IN_FLIGHT
+    account is neither AVAILABLE/PROBING (so ``_open`` is clear) nor
+    capped/auth_failed (so ``is_paused`` is False too), so
+    ``wait_for_open(0)`` can transiently return True while ``_open.is_set()``
+    is False during that in-flight probe window. That gray zone is real but
+    self-resolves within one invocation and is out of scope for this
+    property (the plan's own B2 language only claims the two unambiguous
+    directions: open implies wait_for_open returns, and all-capped implies
+    it blocks -- see test_consumer_wait_for_open_false_when_all_capped for
+    the second). Asserting full bidirectional equivalence here would be a
+    stronger claim than the seam actually guarantees.
+
+    ``wait_for_open(timeout=0)`` is used instead of ``before_invoke()``
+    for the mid-walk sample because ``before_invoke()`` blocks
+    indefinitely whenever the walk has landed on "every account capped" --
+    exactly the state B2 must also exercise.
+    """
+    assert _open_invariant_holds(gate)
+    for i in range(steps):
+        acct = rng.choice(gate._accounts)
+        legal = sorted(_LEGAL_TRANSITIONS.get(acct.phase, frozenset()))
+        if not legal:
+            continue
+        gate._transition(acct, rng.choice(legal))
+        assert _open_invariant_holds(gate)
+        if i % _B2_SAMPLE_EVERY == 0 and gate._open.is_set():
+            assert await gate.wait_for_open(timeout=0) is True
+
 
 @pytest.mark.asyncio
 class TestB2OpenInvariantProperty:
