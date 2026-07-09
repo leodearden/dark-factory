@@ -4082,6 +4082,15 @@ class Scheduler:
                     # to done inline — skip it here too so the pin loop and
                     # the scored loop share the one gated_ids source of truth.
                     continue
+                if psi_hold and not self.is_deterministic(pin_task):
+                    # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
+                    # doesn't reduce host load, so a pinned HEAVY candidate is
+                    # deferred exactly like a scored one — deterministic pins
+                    # remain exempt.  psi_hold and _note_heavy_deferral are
+                    # the SAME once-per-tick decision/helper the scored loop
+                    # uses below, so both loops share one hold and one event.
+                    _note_heavy_deferral(pin_tid)
+                    continue
                 # Eligible pinned candidate — try to acquire its modules.
                 pin_modules = self._get_modules(pin_task)
                 if self.lock_table.try_acquire(pin_tid, pin_modules):
