@@ -536,3 +536,24 @@ class TestB4Reify3604NonCap:
 
         # Consumer side: driven through the fake-CLI harness end-to-end.
         await _drive_non_cap_error_and_assert_bounded(result)
+
+
+# ---------------------------------------------------------------------------
+# B5 -- account[0] forced PROBE_IN_FLIGHT (simulating a concurrent prober
+# already holding its slot) must not skew attribution: before_invoke's lease
+# (producer side) and invoke_with_cap_retry's cost-store record (consumer
+# side) must both name account[1], the account actually leased and invoked
+# -- not account[0], closing the pre-delta name-skew (finding 3 / boundary
+# test B5).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB5AttributionUnderProbeInFlightSkew:
+    """account[0] PROBE_IN_FLIGHT must not skew before_invoke's lease
+    identity or invoke_with_cap_retry's cost-store attribution away from
+    account[1], the account actually leased and invoked."""
+
+    async def test_probe_in_flight_skew_does_not_skew_lease_or_attribution(self):
+        gate = make_boundary_gate(['acct-0', 'acct-1'])
+        await _assert_probe_in_flight_skew_does_not_skew_attribution(gate)
