@@ -16005,3 +16005,66 @@ class TestReconPoolMapImportOrder:
             'fused_memory.services must not raise a circular-import error; '
             f'stderr:\n{result.stderr}'
         )
+
+
+class TestResolveTerminalTaskIds:
+    """_resolve_terminal_task_ids resolves terminal task ids via ONE bulk
+    taskmaster.get_statuses(project_root) call (task 2228 W5-κ).
+
+    This replaces the per-marker taskmaster.get_task loop previously used by
+    _sweep_terminal_task_flag_markers: a single bulk status read is strictly
+    cheaper, and the caller (ReconLedgerStore.gc()) does the task_id
+    membership match itself.
+
+    Fail-safe: a falsy taskmaster or a get_statuses failure both degrade to
+    an empty list rather than raising or partially resolving — an empty
+    terminal_task_ids list flows into gc()'s expiry-only branch, which keeps
+    every task-referenced marker (preserves the old sweep's fail-safe KEEP
+    direction).
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_sorted_terminal_ids_as_strings(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _resolve_terminal_task_ids,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(return_value={
+            '10': 'done', '11': 'in-progress', '12': 'cancelled', '13': 'pending',
+        })
+
+        result = await _resolve_terminal_task_ids(
+            taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
+        )
+
+        assert result == ['10', '12']
+        taskmaster.get_statuses.assert_awaited_once_with('/home/leo/src/reify')
+
+    @pytest.mark.asyncio
+    async def test_falsy_taskmaster_returns_empty_no_call(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _resolve_terminal_task_ids,
+        )
+
+        result = await _resolve_terminal_task_ids(
+            None, _scope('reify', '/home/leo/src/reify'), 'r1',
+        )
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_failure_is_fail_safe_empty(self):
+        """A raising get_statuses must not propagate — degrades to [] (fail-safe)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _resolve_terminal_task_ids,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_statuses = AsyncMock(side_effect=RuntimeError('Taskmaster unavailable'))
+
+        result = await _resolve_terminal_task_ids(
+            taskmaster, _scope('reify', '/home/leo/src/reify'), 'r1',
+        )
+
+        assert result == []
