@@ -46,7 +46,11 @@ from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _render_live_workflow_section,
 )
-from fused_memory.reconciliation.summary_pool import pretrim_summary_pool
+from fused_memory.reconciliation.summary_pool import (
+    pretrim_summary_pool,
+    reconstruct_cycle_summary_stub,
+    verify_cycle_summary_written,
+)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_census_inconsistency,
@@ -66,6 +70,12 @@ logger = logging.getLogger(__name__)
 # via the shared reconciliation.summary_pool core.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
+
+# Audit tag for reconstruct_cycle_summary_stub's deterministic fallback-stub
+# write, invoked from run() when verify_cycle_summary_written CONFIRMS (count
+# == 0) that the LLM session exited without writing its per-cycle summary
+# (task 2366). Mirrors Stage 2's _STAGE2_SUMMARY_RECONSTRUCTION_SOURCE.
+_STAGE1_CYCLE_SUMMARY_RECONSTRUCTION_SOURCE = 'stage1_summary_reconstruction'
 
 
 class MemoryConsolidator(BaseStage):
@@ -157,6 +167,18 @@ class MemoryConsolidator(BaseStage):
         # below). Overwritten after dedup_flags on a full (non-remediation) run with
         # items_flagged; stays 0 otherwise.
         report.stats['stage1_completion_markers_self_deleted'] = 0
+
+        # Always present (task-2366): set BEFORE the remediation early-return below so
+        # downstream consumers see these keys on every run, including remediation passes
+        # (which never reach the full-cycle self-heal block near the end of run()).
+        # verified_count stays None (not 0) until the full-cycle block below actually
+        # runs the count check — None means "not checked this cycle", 0 means "checked
+        # and confirmed absent"; this distinction is load-bearing (see that block).
+        # This stat is deliberately Optional[int] end-to-end (contract note at the
+        # full-cycle assignment site below), unlike Stage 2's sibling stat which
+        # coerces a trailing None to 0.
+        report.stats['stage1_cycle_summary_verified_count'] = None
+        report.stats['stage1_cycle_summary_reconstructed'] = 0
 
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
@@ -400,6 +422,45 @@ class MemoryConsolidator(BaseStage):
             else:
                 report.stats['degenerate_task_nodes_swept'] = sweep_stats['deleted']
                 report.stats['degenerate_task_nodes_scanned'] = sweep_stats['scanned']
+
+        # ── Cycle-summary absence self-heal (task 2366) ────────────────────────
+        # The per-cycle cycle_summary memory is a PROMPT-DRIVEN final step of the
+        # LLM session (prompts/stage1.py) — a session that exhausts its
+        # turn/token/context budget can exit before writing one, leaving the
+        # summary absent from both Stage 3's metadata triple-filter and semantic
+        # search. Mirrors Stage 2's already-proven
+        # _verify_stage2_summary_written / _reconstruct_stage2_summary self-heal
+        # chain via the shared reconciliation.summary_pool core. Only reached on
+        # full (non-remediation) cycles — the remediation payload
+        # (_assemble_remediation_payload) never asks for a cycle_summary, so
+        # self-healing there would fabricate a spurious one every remediation pass.
+        # Gated on count == 0 specifically (not a falsy check) so a transient
+        # count_memories_by_metadata failure (verified_count is None) never
+        # fabricates a placeholder for a run whose real summary may already exist.
+        #
+        # Contract note (task 2366 amendment): unlike Stage 2's
+        # 'stage2_cycle_summary_verified_count' (task_knowledge_sync.py, which
+        # coerces a trailing None to 0 before storing — "this stat's contract
+        # (always an int) is preserved for downstream consumers"), this stat is
+        # deliberately left Optional[int]: None means "not confirmed absent, a
+        # transient count failure occurred" and is kept distinct from a
+        # confirmed 0. A consumer aggregating both stages' stats must treat
+        # this key as Optional[int] while stage2's is always int.
+        count = await verify_cycle_summary_written(
+            self.memory, self.project_id, run_id, stage='memory_consolidator',
+        )
+        report.stats['stage1_cycle_summary_verified_count'] = count
+        if count == 0:
+            report.stats['stage1_cycle_summary_reconstructed'] = (
+                await reconstruct_cycle_summary_stub(
+                    self.memory,
+                    self.project_id,
+                    run_id,
+                    stage='memory_consolidator',
+                    recon_pool=_STAGE1_CYCLE_SUMMARY_RECON_POOL,
+                    reconstruct_source=_STAGE1_CYCLE_SUMMARY_RECONSTRUCTION_SOURCE,
+                )
+            )
 
         return report
 

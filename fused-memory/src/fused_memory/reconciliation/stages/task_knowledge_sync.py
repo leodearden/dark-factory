@@ -1842,6 +1842,16 @@ async def _pretrim_stage2_summary_pool(
     )
 
 
+# SYNC WARNING (task 2366): this function is near-verbatim duplicated as the
+# generic fused_memory.reconciliation.summary_pool.verify_cycle_summary_written
+# (stage='task_knowledge_sync' reproduces this exact triple filter). Stage 1
+# (memory_consolidator.py) already delegates to that shared core; Stage 2 was
+# deliberately left calling this private copy to avoid regression risk to a
+# proven production path (see task 2366's plan: "Stage 2 delegation to it is
+# a noted follow-up (not in scope, to avoid Stage 2 regression risk)").
+# Editing the verify logic here is a signal to check whether the shared core
+# needs the same fix, and vice versa. A future task should refactor this to
+# delegate to the shared core and retire this copy.
 async def _verify_stage2_summary_written(
     memory_service,
     project_id: str,
@@ -2110,6 +2120,18 @@ async def _repair_stage2_summary_stage_metadata(
     return repaired
 
 
+# SYNC WARNING (task 2366): _extract_response_memory_ids,
+# _build_stage2_reconstruction_content, and _reconstruct_stage2_summary below
+# are near-verbatim duplicated as the generic
+# fused_memory.reconciliation.summary_pool._extract_response_memory_ids /
+# _build_fallback_summary_content / reconstruct_cycle_summary_stub. Stage 1
+# already delegates to that shared core; these Stage-2-private copies were
+# deliberately left in place to avoid regression risk to a proven production
+# path (see task 2366's plan). Editing any of the three functions below is a
+# signal to check whether the shared core needs the same fix, and vice versa.
+# A future task should refactor Stage 2 to delegate to the shared core
+# (keeping only _repair_stage2_summary_stage_metadata, which has no
+# shared-core analog) and retire these copies.
 def _extract_response_memory_ids(response) -> list:
     """Defensively read ``memory_ids`` from an ``add_memory`` response.
 

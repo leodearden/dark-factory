@@ -4,7 +4,7 @@ import json
 import logging
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
@@ -906,6 +906,13 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task-2029 amendment), even when nothing was flagged —
             # symmetric with stats['stage2_flag_markers_acknowledged'].
             'stage1_flag_markers_acknowledged': 0,
+            # Always present (task-2366), set before the remediation early-return.
+            # verified_count is whatever this test's unconfigured memory_service
+            # AsyncMock returns from count_memories_by_metadata (opaque — matched via
+            # ANY); reconstructed stays 0 because that Mock object never compares
+            # equal to the int 0 gate in run(), so reconstruction never fires here.
+            'stage1_cycle_summary_verified_count': ANY,
+            'stage1_cycle_summary_reconstructed': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -1003,6 +1010,13 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task-2029 amendment), even when nothing was flagged —
             # symmetric with stats['stage2_flag_markers_acknowledged'].
             'stage1_flag_markers_acknowledged': 0,
+            # Always present (task-2366), set before the remediation early-return.
+            # verified_count is whatever this test's unconfigured memory_service
+            # AsyncMock returns from count_memories_by_metadata (opaque — matched via
+            # ANY); reconstructed stays 0 because that Mock object never compares
+            # equal to the int 0 gate in run(), so reconstruction never fires here.
+            'stage1_cycle_summary_verified_count': ANY,
+            'stage1_cycle_summary_reconstructed': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
