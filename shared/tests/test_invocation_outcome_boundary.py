@@ -461,3 +461,40 @@ class TestB3CapHitDrivesAccountCapped:
     @pytest.mark.parametrize('record', _CAP_HIT_RECORDS, ids=_CAP_HIT_IDS)
     async def test_cap_hit_record_drives_account_to_capped(self, record):
         await _drive_caphit_record_to_capped(record)
+
+
+# ---------------------------------------------------------------------------
+# B4 -- reify-3604: a NON_CAP_CLI_ERROR_MARKERS string in stderr classifies
+# as CliLocalError and NEVER CapHit, even combined with cap-like text
+# (producer/classifier side); driving that result through the fake-CLI
+# harness leaves the account un-capped with a bounded, non-infinite retry
+# loop (consumer side).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestB4Reify3604NonCap:
+    """A NON_CAP_CLI_ERROR_MARKERS string always classifies as CliLocalError,
+    never CapHit -- reify-3604's structural fix (producer/classifier side) --
+    and driving it through invoke_with_cap_retry leaves the account un-capped
+    with a bounded, non-infinite retry loop (consumer side)."""
+
+    async def test_non_cap_marker_never_caps_account_and_loop_stays_bounded(self):
+        # A --session-id collision (NON_CAP_CLI_ERROR_MARKERS) whose output
+        # ALSO carries a cap-hit prefix + confirm keyword -- the adversarial
+        # case reify-3604 exists for: CliLocalError must outrank CapHit even
+        # when both patterns co-occur in the same output.
+        result = AgentResult(
+            success=False,
+            output="You've hit your usage limit. Your plan resets in 3h.",
+            stderr='Error: Session ID abc-123 is already in use.',
+        )
+
+        # Producer/classifier side.
+        outcome = classify_invocation(result, strict_confirm=True, backend='claude')
+        assert isinstance(outcome, CliLocalError)
+        assert outcome.marker == 'is already in use'
+        assert not isinstance(outcome, CapHit)
+
+        # Consumer side: driven through the fake-CLI harness end-to-end.
+        await _drive_non_cap_error_and_assert_bounded(result)
