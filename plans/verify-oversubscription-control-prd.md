@@ -1,117 +1,112 @@
-# PRD: Dark-Factory verify oversubscription control — merge-prioritized, PSI-reactive pytest worker admission
+# PRD: Dark-Factory verify oversubscription control — task-verify admission semaphore + role nice tiers
 
-**Date:** 2026-07-09 · **Status:** approved for **design-first** decomposition (B+H — queue the design lead task only; re-decompose implementation after it lands) · **Research substrate:** `plans/oversubscription-reify-to-df-research-2026-07-09.md` (authoritative — DF gap analysis + Reify design digest + anti-patterns; read it first). **Reify source of truth:** `/home/leo/src/reify/scripts/{jobserver-balancer.py,cpu-admit.sh,fleet-load-detector.sh,lib_test_semaphore.sh,lib_slot_acquire.sh,lib_cgroup.sh}`.
+**Date:** 2026-07-09 (design resolved in session; supersedes the 2026-07-09 design-first draft — mechanism now decided, T0 design-lead cancelled as task 2379) · **Status:** approved for decomposition · **Research substrate:** `plans/oversubscription-reify-to-df-research-2026-07-09.md`. **Reify source of truth:** `/home/leo/src/reify/scripts/{lib_test_semaphore.sh,lib_slot_acquire.sh,cpu-admit.sh,verify.sh}`.
 
-Cite by symbol; line refs are as-of `main` 20c934ca59 and drift.
+Cite by symbol; line refs are as-of `main` d895106bf7 and drift.
 
 ## 1. Consumer + user-observable surface (G1)
 
-- **Consumer (named, wired here):** the orchestrator's own **pytest verify subprocess** — both roles. Every task-lane and merge-lane verify runs pytest through `run_verification` / `run_scoped_verification` (`orchestrator/src/orchestrator/verify.py`); today each spawns `-n auto` = 32 xdist workers ungated (`orchestrator/pyproject.toml:100`). This PRD makes the orchestrator verify path acquire a **bounded, role-prioritized worker budget** before spawning xdist workers. The consumer is not a future PRD — it is the live verify path this PRD edits.
-- **Secondary consumer (design option, not a blocker):** other DF-orchestrated projects (reify already has its own cargo jobserver; solar-challenge / autopilot-video verify). "Make generally available" (the extraction ask) means the primitives land in a **shared** location DF verify imports; cross-project adoption is a *follow-up*, not gated here.
+- **Consumer (named, wired here):** every `pytest -n auto` spawn on the orchestrator's verify paths — task-lane verify, merge verify, main-tip sweep, review-checkpoint, and the env-recovery retry — all routed through `orchestrator/src/orchestrator/verify.py`. Today each spawns 32 xdist workers ungated (`orchestrator/pyproject.toml:100`); with `max_concurrent_tasks:24` plus a ~190-worker main-tip sweep, the box hits load 96–193 on 32 cores.
 - **User-observable surface:**
-  1. Under high self-concurrency (many lanes), **total live pytest xdist workers across all lanes stays ≤ a host budget (≈nproc)** — observable as host load avg tracking ~nproc instead of 96–193, and as an emitted metric/log line reporting the live-worker count and per-role token split.
-  2. **Merge-role verify is never starved by task-role verify:** under contention a merge verify acquires its worker budget ahead of task verifies (observable in the event log: a merge verify's workers admit while contending task verifies wait). This is the anti-livelock guarantee.
-  3. **Fail-open:** with the jobserver/PSI substrate absent or unreadable, verify runs exactly as today (ungated `-n auto`) — no stall, no deadlock.
+  1. Under high self-concurrency, **total concurrent task-role `pytest -n auto` processes ≤ N (default 1)** — so live xdist workers track ~nproc (+ at most one merge verify) instead of 6× oversubscribing; host loadavg falls toward ~nproc.
+  2. **Merge verify never waits on admission** and runs at the highest verify CPU priority; a merge and a task verify overlapping share the box by nice weight, not by starving each other (the anti-livelock guarantee).
+  3. The **main-tip sweep** (heaviest fan-out, ~190 workers, zero waiters) runs at the **lowest** priority tier and its per-subproject pytests **interleave** with real lane verifies instead of monopolizing them.
+  4. **Fail-open:** with the admission substrate absent/unavailable, verify runs exactly as today (ungated `-n auto`) — no stall, no requeue.
 
-No frozen numeric threshold is asserted as the signal (G6): the signals are *direction + a recorded delta* (load bounded to ~nproc; worker count ≤ budget; merge-before-task ordering), matching the `concurrent-merge-verify-prd` convention.
+Signals are *direction + recorded delta* (bounded worker count; merge-never-blocks; sweep-yields), not frozen thresholds (G6).
 
 ## 2. Premise validation (G6) + substrate (G3)
 
-Every premise is grounded in Reify's **already-working** production system (so these are ports, not guesses):
+Grounded in this session's measurements + reify's working system:
 
-1. **A token-pool cap on the gated quantity bounds host load.** Reify caps compile *jobs* at `nproc` via a FIFO token pool and holds load stable; DF must cap the *xdist-worker* count analogously. *Achievability basis:* reify's `jobserver-balancer.py` in production. **Translation hazard (core design problem, routed to the design task):** reify's client is `rustc` (each build job is a jobserver client); DF's xdist workers are **not** jobserver clients, so the gated quantity must become the **worker count** — either derive `-n k` per lane from a token grant, or gate the controller to a role-scoped budget. (Research doc §"Port-critical translation notes".)
-2. **Dual-pool merge>task priority prevents the task→merge livelock.** Reify's `decide()` ratchet (merge-demanded → move all task spare to merge; task give-back only when task fully starved) drifts monotonically to merge under contention. *Basis:* `jobserver-balancer.py:445-538` + `verify.sh:648-658`; asserted by `jobserver-acceptance.py::merge_ratchet_observed`. This is the mechanism satisfying the hard constraint.
-3. **PSI hold-back throttles the task pool without touching merge.** Reify holds `min(free_task, headroom)` task tokens when `/proc/pressure/cpu` some-avg10 ≥ 50, releases < 40 (hysteresis), reservoir bounded by `nproc//4`, `suppress_giveback` protects merge. *Basis:* `jobserver-balancer.py:610-654`.
-4. **Fail-open is a solved pattern here.** *Basis:* `shared/src/shared/pytest_jobserver.py:81-108` (plugin no-ops on missing FIFO/timeout), `shared/src/shared/psi.py:133-169` (`read_psi_sample` fail-open sentinel), the scheduler dispatch gate (`scheduler.py:4054-4064`).
+1. **`-n 32` is NOT ~2× `-n 16`, so serializing task verifies costs almost no throughput.** *Basis (measured this session):* the orchestrator suite is **7,774 tests, 20.7 s serial collection+import** — a fixed per-xdist-worker tax that does not shrink with more workers; with `--dist loadgroup` serial islands and I/O-bound tests, `-n 32 ≈ 1.3–1.6× -n 16`. Concurrency also *multiplies* the collection tax. ⇒ N=1 task-serialization is near-free and eliminates redundant-collection waste.
+2. **Local merge concurrency = 1**, so worst case is 1 merge + N task = (N+1)×32 workers; N=1 ⇒ **2× max**. *Basis:* the merge host allocator is "one slot per host, prefer-local" (`merge_queue.py:4526`); overlapping merge verifies offload to other hosts.
+3. **The main-tip sweep is fire-and-forget with zero synchronous waiters**, so throttling/interleaving it is free. *Basis:* `_main_tip_sweep_loop` is a background `asyncio.Task` (`harness.py:7966`); periodic `main_tip_sweep_interval_secs` default 1800 s, SHA-deduped; runs `run_full_verification` = all subprojects in **parallel** (`verify.py:3423`); its only effect is an L1 `infra_issue` escalation on drift. No dispatch/merge/deploy path `await`s it. (Same for `review_checkpoint` `run_full_verification` at `review_checkpoint.py:158` and the env-recovery retry at `verify.py:3957/3991`.)
+4. **flock self-heals on holder death** ⇒ no daemon, no canary, no leak-recovery. *Basis:* an flock FD released by the kernel on process exit; reify's `lib_slot_acquire.sh` N-slot model.
+5. **nice gives merge CPU priority without a hard cap; both fully utilize the box when alone.** *Basis:* reify `verify.sh` role nice (merge `nice 5` / task `nice 15`), work-conserving under contention.
 
-**Substrate (G3) — verified to exist on `main` today:**
-- `shared.psi`: `parse_pressure_file`, `read_pressure`, `PsiSample.saturated(cfg)`, `read_psi_sample` — `shared/src/shared/psi.py`; already consumed by the sampler and the scheduler gate. **REUSE (constraint 4).**
-- `DF_VERIFY_ROLE ∈ {task, merge, offline}` stamped into the verify env by `_resolve_verify_env` (`verify.py:~2738`) — the role signal the priority scheme keys on. **Verified.**
-- `pytest-jobserver.service` (running) + `/tmp/pytest-jobserver` FIFO (32 tokens) + client plugin `shared/src/shared/pytest_jobserver.py` — **exist but UNWIRED** (dropped from all conftests in `866db56dcf`) **and wrong granularity** (per-process, no `PYTEST_XDIST_WORKER` guard → 33 acquisitions/session deadlock trap). This PRD **replaces** the single-pool seeder and **reworks** the plugin; do not assume the current form is usable as-is.
-- `cpu_governance` / `cpu-governed-exec.sh` cgroup weighting (merge 300 / task 100) — exists (`config.py:717`), reify-only default-off; **available** if the design adopts cgroup weight as a reinforcing priority layer.
-- `reload_config` green-tier hot-tunability already covers `psi_admission` — the new config keys should join it.
-- **NET-NEW (owned by this PRD, not assumed):** a DF pytest **dual-pool worker-admission balancer** (the reify `jobserver-balancer.py` analogue, retargeted to workers) + its systemd unit + canary. This is the core work, correctly queued — no substrate fiction.
+**Substrate (G3) — verified on `main` today:**
+- `DF_VERIFY_ROLE ∈ {task, merge, offline}` stamped by `_resolve_verify_env` (`verify.py:~2755`) — the key the tier + bypass logic reads. **Verified.** (This PRD adds a `background` role for the sweep.)
+- The pytest command runner / `_run_cmd` in `verify.py` — the single spawn site to wrap. **Verified.**
+- `_maybe_govern_merge_cmd` (`verify.py:2765`) already wraps merge-role verify in reify's `cpu-governed-exec.sh` cgroup weighting (default-off) — the priority layer is half-wired; nice is its simpler sibling. **Verified.**
+- `reload_config` green-tier hot-tunability (per-role knobs) — new admission knobs join it. **Verified.**
+- `fcntl.flock` (Python stdlib) + `os.set_inheritable` (for the `9<&-` non-inheritance invariant). **Verified.**
+- **NET-NEW (owned here, not assumed):** a small `shared` admission module (Python flock N-slot semaphore + role nice/ionice prefix), the acquire-wrapper in `verify.py`, the `background` role. No daemon, no systemd unit. G3 verdict: no unmet substrate assumption.
 
-G3 verdict: no unmet substrate assumption. The one novel component (the worker balancer) is explicit net-new work, not an assumed capability.
+## 3. Approach (design resolved) + §Contract
 
-## 3. Approach — B + H (design-first; §Contract is the design task's deliverable)
+**Mechanism:** a **per-`pytest`-process** N-slot flock semaphore. Each `pytest -n auto` spawn, keyed by `DF_VERIFY_ROLE`, either **acquires a task-slot** (roles `task` and `background`) or **bypasses the count** (role `merge`). All spawns get a role **nice/ionice** prefix. Per-*process* (not per-verify) granularity is load-bearing: a single verify invocation (sweep / review-checkpoint / fleet-fallback) fans out to ~6 concurrent pytests internally, so only per-process acquisition bounds it — and acquire/release per pytest lets multi-subproject verifies **interleave** instead of monopolizing the slot.
 
-This is a **load-bearing concurrency subsystem with a documented livelock hazard**, so it is authored **B+H**: a design-first lead task produces the contract + boundary-test sketch **before** any implementation task is decomposed. The core mechanism choice (per-lane static `-n k` grant vs. a live worker balancer) is genuinely open and is the design task's central decision — routing it to a first-class design task (rather than guessing here) is the correct handling for a B+H PRD.
+**Hard constraints (locked this session):**
+- **C-merge-priority / never-block:** merge-role pytests never acquire the counting semaphore and get the highest verify nice; task can never starve merge (anti-livelock).
+- **C-untimed-acquire:** the slot wait happens **before** the pytest command's timeout clock starts (outside the timed region); it never counts toward `verify_command_timeout_secs` and never triggers a requeue (reify clock-stop equivalent).
+- **C-fail-open:** missing lock dir / acquire error / disabled → run ungated `-n auto` (today's behavior), never block.
+- **C-no-FD-inheritance:** slot FDs are `os.set_inheritable(fd, False)` so no pytest worker / sccache-class descendant pins a slot after exit (reify `9<&-`).
+- **C-no-load-derived-count:** N and `-n` are fixed config, never derived from instantaneous loadavg (reify positive-feedback-collapse lesson).
 
-**Hard constraints the design MUST satisfy (non-negotiable):**
-- **C-merge-priority:** merge-role verify is never starved by task-role verify (implement reify's dual-pool + monotone ratchet, or an equivalent with a proven no-starve invariant). This is the anti-livelock requirement.
-- **C-fail-open:** every gate no-ops to today's behaviour on missing/unreadable substrate — never deadlocks. Reuse `shared.psi` fail-open + the plugin's existing fail-open.
-- **C-anti-patterns (all three, from the research doc):** (a) **no load-average-derived worker counts** (positive-feedback collapse to N=1 — `cargo-test-occt-gated.sh:114-121`); (b) **no FD inheritance** by descendant daemons pinning tokens/locks (the `9<&-` invariant — sccache-class wedge); (c) **no admit-on-timeout requeue** (resubmission storms — reify moved compile admission to a continuous never-requeue hold with clock-stop markers).
-- **C-worker-granularity:** the gated quantity is the **xdist worker count**, not the pytest-process count (the current plugin's defect). Resolve per-worker-vs-per-process token semantics + a `PYTEST_XDIST_WORKER` guard so the 32 workers of one session do not each re-acquire.
+### §Contract (seam signatures)
+- `shared.verify_admission`:
+  - `acquire_task_slot(role: str, *, slots_dir: Path, n: int, wait: bool = True) -> ContextManager[bool]` — flock one of `n` slot-files; `role == 'merge'` → no-op pass-through (returns immediately, `held=False`); non-inheritable FD; fail-open (returns a no-op CM that yields `False`) on any OSError / missing dir. Untimed by contract (caller acquires before starting the pytest timeout).
+  - `nice_prefix(role: str) -> list[str]` — argv prefix: `merge → ['nice','-n','5']`; `task → ['nice','-n','15','ionice','-c2','-n7']`; `background → ['nice','-n','19','ionice','-c3']`; `offline`/unknown → `[]`.
+- **Acquire seam in `verify.py`:** the pytest-command runner acquires `acquire_task_slot(role, …)` around the pytest subprocess, and prepends `nice_prefix(role)` to the command argv. Only pytest spawns are wrapped (lint/type ride the same held slot as they already run concurrently within one verify).
+- **Config (green-tier, `reload_config`):** `verify_admission_enabled: bool = True`, `verify_admission_task_slots: int = 1`, `verify_admission_slots_dir: str` (default `/tmp/df-verify-slots-$(id -u)`), and the three nice/ionice tiers as tunables.
 
-### §Contract (skeleton — the design task fills every field)
-- **Token/FIFO layout:** FIFO path(s), token = one xdist worker, total = f(nproc), dual pool `merge`/`task`, baseline partition (reify default: `task = max(1, nproc//4)`, `merge = nproc − task`).
-- **Acquisition seam:** where in `verify.py` the verify acquires its role-scoped worker grant and how `-n <k>` is derived from it (replacing `-n auto`); how `shared/escalation/dashboard` segments (which declare no xdist) are handled (they must not receive `-n` — the same reason a uniform cap was rejected in `config.yaml`).
-- **Priority invariant:** the exact `decide()`-equivalent rule + a stated no-starve proof obligation for merge.
-- **PSI reactivity:** thresholds (default hold 50 / release 40 cpu some-avg10, mem full-avg10 10 — reify parity), what shrinks (task budget only), reservoir bound, all hot-tunable via `reload_config`.
-- **Resilience:** canary sum-invariant + leak-recovery (tokens lost on orchestrator-restart SIGKILL), custodian FD-hold contract.
-- **Packaging:** shell-in-place vs Python daemon vs **extract-to-shared-package** (the "generally available" ask) — decide and justify.
-
-### §Boundary-test sketch (the integration-gate signal — G2/G5)
-| Scenario | Precondition | Postcondition (both sides) |
+### §Boundary-test sketch (T-GATE signal — G2/G5)
+| Scenario | Precondition | Postcondition |
 |---|---|---|
-| Global cap holds | N≫1 concurrent verifies dispatched | total live xdist workers across lanes ≤ budget (≈nproc); host load tracks ~nproc |
-| Merge beats task | merge-role + task-role verify contend for the last tokens | merge acquires its budget first; task waits — **no task-starves-merge** |
-| PSI shrink | `/proc/pressure/cpu` some-avg10 ≥ hold threshold | task budget shrinks; **merge budget unchanged** |
-| Fail-open | FIFO/PSI absent | verify runs ungated `-n auto`, passes, no stall |
-| Leak recovery | a verify's holder SIGKILLed mid-run | canary restores the sum invariant within its cycle |
+| Global cap | M task verifies dispatched, N=1 | ≤1 task-role pytest runs at a time; the rest block on the slot |
+| Merge never blocks | 1 merge + saturated task slot | merge pytest starts immediately (no acquire), runs at nice 5 |
+| Sweep yields + interleaves | sweep (background) + a task verify contend | sweep pytests run at nice 19 and a task verify acquires between sweep subprojects (no full-duration monopoly) |
+| Untimed wait | task verify waits > 0 on the slot | wait excluded from `verify_command_timeout_secs`; no requeue |
+| Self-heal | slot holder SIGKILLed | slot frees immediately (no canary) |
+| Fail-open | slots_dir absent / disabled | ungated `-n auto`, verify passes, no block |
 
 ## 4. Pre-conditions for activating
 
-- None blocking. The structural verify fixes this defends against are already on main (tasks **2361/2365/2368** — do NOT re-file). The per-test load-hardening is filed separately (tickets `tkt_0RR2FNF…`, `tkt_0RR2FP9…`, `tkt_0RR2FPK…`) and is independent.
-- Implementation tasks (T1+) are **blocked on the design lead task (T0)** landing.
+None blocking. Structural verify fixes already on main (2361/2365/2368). Per-test load-hardening filed separately. No dep on the L3b batch (2326-2329) — complementary.
 
-## 5. Resolved design decisions
+## 5. Resolved design decisions (this session)
 
-- **Reuse `shared.psi`, not a new parser.** (constraint 4; single source of truth.)
-- **Key priority off `DF_VERIFY_ROLE`,** the existing merge/task/offline role env — do not invent a new role signal.
-- **Replace, don't patch, the single-pool `pytest-jobserver.service`;** its per-process granularity is the wrong axis.
-- **B+H / design-first:** the core mechanism decision is routed to T0 with a mandatory contract deliverable (above), not guessed in this PRD.
-- **Complementary to L3b dispatch-admission (2326-2329), not a replacement:** dispatch-admission bounds *how many lanes start*; this bounds *workers per running verify* + enforces merge priority. Both compose (see §7).
+- **Semaphore-on-tasks + merge-bypass + nice**, NOT a jobserver token pool — reify's *test* mechanism (the jobserver gates cargo compile-jobs, which are jobserver clients; xdist workers are not). Rejected a custom `pytest_xdist_make_scheduler` (task 1907 proved it deadlocks).
+- **Per-pytest-process** acquisition (not per-verify-invocation) — bounds internal fan-out (sweep/review-checkpoint/fleet-fallback) and lets multi-subproject verifies interleave.
+- **Three nice tiers:** merge (5) > task (15) > background/sweep (19, ionice idle). Sweep = `background` role (lowest), because it is fire-and-forget with zero waiters and must never delay real lane verifies.
+- **N=1 default** (config knob) — sublinear `-n` scaling makes serialization near-free; 2× worst-case bound.
+- **`-n auto` unchanged in v1**; `-n`/N tuning deferred to a benchmarked follow-up (T6).
+- **Daemonless flock** (self-healing) — no custodian, no canary.
+- **PSI reactivity deferred to phase 2** (the static N + the live L3b dispatch gate already bound load).
 
 ## 6. Out of scope
 
-- Re-doing tasks 2361/2365/2368 (done) or the filed per-test hardening tickets.
-- Migrating reify itself onto the extracted shared primitive (follow-up if extraction is chosen).
-- The scheduler dispatch-admission gate (owned by the L3b batch) — this PRD does not change it.
-- cgroup weighting is *optional reinforcement*; the hard cap must come from the token/worker budget, not cgroup (cgroup is work-conserving, not a cap).
+- 2361/2365/2368 (done) and the filed per-test hardening tickets.
+- PSI-reactive task-pool shrink (phase 2).
+- cgroup weighting (the existing `_maybe_govern_merge_cmd` path stays as-is; nice is the v1 priority layer).
+- Migrating reify onto the extracted `shared.verify_admission` (follow-up).
+- Bounding **agent inner-loop** test runs (only verify paths are gated in v1).
 
 ## 7. Cross-PRD relationship (G4)
 
-| Other work | Direction | Seam mechanism | Owner | Status |
+| Other work | Direction | Seam | Owner | Status |
 |---|---|---|---|---|
-| L3b host-PSI dispatch-admission (df 2326-2329) | complements | both read `/proc/pressure` via `shared.psi`; dispatch gate holds new lane dispatch, this gate bounds running verify workers + merge priority | **this PRD** owns verify-worker admission; L3b owns dispatch admission | compose — no contested ownership |
-| Reify cargo jobserver (`reify-jobserver.service`) | pattern-source / potential shared consumer | `jobserver-balancer.py` design + `fleet-load-detector.sh` (built as the reify→DF seam) | **this PRD** owns the DF/pytest port; reify migration deferred | reference / optional-extract |
+| L3b host-PSI dispatch-admission (df 2326-2329) | complements | dispatch gate bounds new **lanes**; this bounds **verify workers** + priority | this PRD owns verify admission | compose — no contested ownership |
+| Reify test-semaphore (`lib_test_semaphore.sh`) | pattern-source | flock N-slot + role nice | this PRD owns the DF port (reimplemented in `shared`) | reference |
 
-No reciprocal-ambiguity seam. G4 satisfied.
+No reciprocal ambiguity. G4 satisfied.
 
-## 8. Decomposition plan (design-first; queue **T0 only** now)
+## 8. Decomposition plan (each leaf names its observable signal)
 
-**T0 — DESIGN LEAD (queue now).** *Design: DF pytest verify oversubscription control (dual-pool, merge-prioritized, PSI-reactive worker admission).* Produce a committed design doc `plans/verify-oversubscription-control-design.md` filling every §Contract field and the §Boundary-test sketch, resolving the core mechanism choice (per-lane `-n k` grant vs live balancer) and the worker-granularity/plugin semantics, honouring C-merge-priority / C-fail-open / C-anti-patterns / C-worker-granularity. **Signal (observable):** committed design doc whose §Contract and §Boundary-test tables are complete and whose merge no-starve invariant is stated with its proof obligation. (This is the H artifact and the gate for T1+.)
+- **T1 — `shared.verify_admission` module (foundation, intermediate).** Python flock N-slot semaphore (`acquire_task_slot`, non-inheritable FD, fail-open, merge no-op) + `nice_prefix` role tiers, per §Contract. Signal (roped into T-GATE): real-process unit tests — N=1 serializes two acquirers; a SIGKILLed holder frees the slot; missing dir → fail-open no-block; `merge` role never blocks; FD is non-inheritable. Consumer: T2.
+- **T2 — Wire per-pytest acquire + nice into `verify.py` (leaf).** Wrap every pytest spawn: task/background acquire (untimed, before the pytest timeout; fail-open), merge bypass; prepend `nice_prefix(role)`. Add the config knobs + `reload_config` green-tier entries. Signal: with admission on, a 2nd concurrent task-role verify's pytest waits until the 1st releases; a merge verify starts immediately; with `verify_admission_enabled=false`, the spawned command is byte-identical to today. Depends: T1.
+- **T3 — `background` role for the sweep + fan-out coverage (leaf).** Add `DF_VERIFY_ROLE=background` (lowest nice tier); stamp it on main-tip-sweep pytests; confirm review-checkpoint + env-recovery-retry pytests acquire as task-role (inherited from T2's per-process wrap). Signal: during a sweep, its subproject pytests run at nice 19 and a concurrent task-lane verify acquires the slot between sweep subprojects (observable interleave); total task+background live pytests ≤ N. Depends: T2.
+- **T4 — INTEGRATION GATE (leaf).** The §Boundary-test sketch as an executable scenario (global cap; merge-never-blocks; sweep yields+interleaves; untimed-wait/no-requeue; self-heal; fail-open). Signal: all six boundary scenarios pass. This is the G2 integration gate; T1–T3 are its intermediates. Depends: T2, T3.
+- **T5 — Cap merge internal fan-out (leaf; later in DAG).** Bound the concurrent subproject pytests a single merge/fleet verify spawns (e.g. a small merge-role internal fanout cap reusing `max_concurrent_module_verifies`, or a merge slot pool) so a root-`conftest` fleet-merge can't spawn ~190 workers. Signal: a simulated root-conftest merge verify spawns ≤ cap concurrent pytests; a scoped merge is unaffected. Depends: T2.
+- **T6 — Benchmark-tuned N and default `-n` (leaf; follow-up).** Clean idle-window benchmark of the `-n` speedup curve (isolating the 20.7 s collection tax) and single-verify core utilization; commit results + recommended `verify_admission_task_slots` / default `-n` (or a config change). Signal: a committed benchmark report with recommended defaults. Depends: T4.
 
-*Implementation tasks below are SPECIFIED BY T0 — re-run `/prd decompose` after T0 lands to file them with T0-informed detail. Listed here for shape/coverage only; each `depends_on: T0`.*
+## 9. Open questions (tactical)
 
-- **T1 — Worker balancer/custodian daemon** (dual FIFO, FIONREAD non-destructive sensing, `decide()` ratchet, PSI hold-back, `held_back` publication). Signal: daemon seeds N tokens split merge/task and the split moves per the ratchet under a synthetic demand harness (reify's `jobserver-acceptance.py` analogue).
-- **T2 — systemd unit** replacing the single-pool `pytest-jobserver.service` (custodian FD-hold contract; `PartOf` the orchestrator unit for re-seed on restart). Signal: `systemctl --user` shows the dual-pool custodian; both FIFOs present with the baseline split.
-- **T3 — Verify-side worker grant + `-n` derivation, role-keyed** wired into `verify.py` (acquire budget → derive `-n k`; merge role gets priority pool; no `-n` for xdist-less segments; fail-open). Signal: event log shows a task verify running with a bounded `-n k` drawn from the task pool; merge verify from the merge pool.
-- **T4 — pytest plugin rework + conftest wiring:** `PYTEST_XDIST_WORKER` guard + token=worker semantics; restore registration in the subproject conftests (the `866db56dcf` regression, done correctly). Signal: under `-n k`, exactly the controller (not each of k workers) participates in admission; a missing FIFO runs unthrottled (fail-open test).
-- **T5 — Canary + leak-recovery** (sum-invariant timer; restore tokens lost to SIGKILL). Signal: after a killed holder, the canary restores `sum == budget` within one cycle.
-- **T6 — Config keys + `reload_config` green-tier wiring** (thresholds, pool sizes, enable flag; hot-tunable). Signal: a `reload_config` edit to the hold threshold takes effect on the running custodian without restart.
-- **T7 — `fleet-load-detector` wiring (the DF seam) + escalation** on sustained host oversubscription. Signal: sustained load>threshold emits the oversubscription signal / files an escalation.
-- **T8 — INTEGRATION GATE (leaf):** the §Boundary-test sketch as an executable scenario — N concurrent verifies ⇒ total live workers ≤ budget AND merge-role admits ahead of contending task-role AND fail-open path verified. Signal: the boundary-test scenarios pass (this is the G2 leaf; T1–T7 are its intermediates).
-- **T9 (optional) — Extract primitives to a shared package** for cross-project reuse ("generally available"). Signal: DF verify imports the shared module; a second DF project can opt in via config.
-
-## 9. Open questions (tactical — do not block save)
-
-- Token total: exactly `nproc`, or `nproc − headroom` for the orchestrator/agent processes themselves? (T0 picks; reify uses `nproc`.)
-- Whether merge priority needs the cgroup-weight reinforcement layer (reify 300/100) or the token partition alone suffices for pytest (no compile-job long-pole). (T0 decides; default: token partition first, cgroup optional.)
-- Interaction with `_force_serial_pytest` env-recovery retry (`verify.py:3087`) — the serial retry should bypass the jobserver (it already sets `-p no:xdist`). (Tactical wiring detail.)
+- Exact `slots_dir` lifecycle (tmpfiles vs first-use mkdir) and whether to pre-seed N slot-files or create lazily. (T1 picks; fail-open covers absence.)
+- Whether `background` should also be excluded from `-n auto` capping later (T6 territory).
+- Interaction with `_force_serial_pytest` env-recovery retry (already `-p no:xdist`, single worker) — it should still acquire a task/background slot but its 1-worker load is negligible; confirm it doesn't double-hold. (Tactical.)
 
 ## META check
 
-If decomposed **design-first** (T0 now; T1+ after T0 lands), the architecture is complete, coherent, cohesive, and good: the single open design question (core gating mechanism) is correctly routed to a first-class design task with a mandatory contract, the anti-livelock and anti-pattern constraints are stated as hard requirements, all substrate is verified, and the integration gate (T8) closes the G2 loop. **Do not** auto-queue T1–T9 before T0 lands — that is the design-first discipline this PRD is built on.
+Complete/coherent/good under decompose: the mechanism is fully resolved (semaphore-on-tasks + three nice tiers, per-pytest granularity), every hard constraint is a named contract clause, all substrate is verified, the integration gate (T4) closes the G2 loop, and the two follow-ups the user asked for (merge fan-out cap = T5; `-n`/N tuning = T6) are explicit tasks later in the DAG. No open design questions remain.
