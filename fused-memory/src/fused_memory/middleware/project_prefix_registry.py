@@ -26,10 +26,10 @@ logger = logging.getLogger(__name__)
 
 
 # Top-level directory names that appear in many projects and therefore do
-# not uniquely identify any project.  Mirrors the intentional exclusions in
-# the original dark_factory_path_guard (``shared/``, ``hooks/`` etc.) and
-# extends with the obvious build/runtime/test dirs so the registry stays
-# focused on source-tree subprojects.
+# not uniquely identify any project.  Mirrors the intentional exclusions of
+# the original task-1088 dark-factory-only guard (``shared/``, ``hooks/``
+# etc.) and extends with the obvious build/runtime/test dirs so the registry
+# stays focused on source-tree subprojects.
 _GENERIC_DIRS: frozenset[str] = frozenset({
     'src', 'tests', 'test', 'docs', 'doc', 'scripts', 'bin', 'examples',
     'node_modules', 'target', '.venv', 'venv', '__pycache__',
@@ -41,6 +41,25 @@ _GENERIC_DIRS: frozenset[str] = frozenset({
     'fixtures', 'assets', 'public', 'static', 'vendor', 'third_party',
     'proto', 'protos', 'sdks', 'sdk',
 })
+
+
+# ---------------------------------------------------------------------------
+# Built-in dark_factory constants — folded in from the retired dark-factory-
+# only back-compat shim (task 2208 / PRD D2).
+# ---------------------------------------------------------------------------
+
+DARK_FACTORY_PROJECT_ID: str = 'dark_factory'
+
+DARK_FACTORY_ROOT: str = '/home/leo/src/dark-factory'
+
+DARK_FACTORY_PATH_PREFIXES: tuple[str, ...] = (
+    'orchestrator/',
+    'fused-memory/',
+    'fused_memory/',
+    'mem0/',
+    'graphiti/',
+    'dashboard/',
+)
 
 
 def _candidate_prefixes_for_root(root: Path) -> list[str]:
@@ -164,6 +183,24 @@ class ProjectPrefixRegistry:
                 'project_prefix_registry:   %s → %s', pid, list(prefixes) or '<empty>',
             )
         return registry
+
+    @classmethod
+    def default(cls) -> ProjectPrefixRegistry:
+        """Return the built-in, filesystem-independent dark_factory registry.
+
+        Folds in the retired back-compat shim's constants (task 2208 / PRD
+        D2) so the guard always classifies dark-factory paths even when no
+        ``known_project_roots`` are configured — this is the registry the
+        task interceptor falls back to when constructed without an explicit
+        ``prefix_registry``, making the multi-project guard path
+        (:func:`check_text_for_scope` / ``check_files_for_scope``) the only
+        path, single-project deployments included.
+        """
+        return cls(
+            project_to_root={DARK_FACTORY_PROJECT_ID: DARK_FACTORY_ROOT},
+            project_to_prefixes={DARK_FACTORY_PROJECT_ID: DARK_FACTORY_PATH_PREFIXES},
+            prefix_to_project=dict.fromkeys(DARK_FACTORY_PATH_PREFIXES, DARK_FACTORY_PROJECT_ID),
+        )
 
     def all_prefixes(self) -> tuple[str, ...]:
         """Return all registered prefixes (sorted, deduplicated).
