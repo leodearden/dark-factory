@@ -168,6 +168,15 @@ class MemoryConsolidator(BaseStage):
         # items_flagged; stays 0 otherwise.
         report.stats['stage1_completion_markers_self_deleted'] = 0
 
+        # Always present (task-2366): set BEFORE the remediation early-return below so
+        # downstream consumers see these keys on every run, including remediation passes
+        # (which never reach the full-cycle self-heal block near the end of run()).
+        # verified_count stays None (not 0) until the full-cycle block below actually
+        # runs the count check — None means "not checked this cycle", 0 means "checked
+        # and confirmed absent"; this distinction is load-bearing (see that block).
+        report.stats['stage1_cycle_summary_verified_count'] = None
+        report.stats['stage1_cycle_summary_reconstructed'] = 0
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
@@ -410,6 +419,36 @@ class MemoryConsolidator(BaseStage):
             else:
                 report.stats['degenerate_task_nodes_swept'] = sweep_stats['deleted']
                 report.stats['degenerate_task_nodes_scanned'] = sweep_stats['scanned']
+
+        # ── Cycle-summary absence self-heal (task 2366) ────────────────────────
+        # The per-cycle cycle_summary memory is a PROMPT-DRIVEN final step of the
+        # LLM session (prompts/stage1.py) — a session that exhausts its
+        # turn/token/context budget can exit before writing one, leaving the
+        # summary absent from both Stage 3's metadata triple-filter and semantic
+        # search. Mirrors Stage 2's already-proven
+        # _verify_stage2_summary_written / _reconstruct_stage2_summary self-heal
+        # chain via the shared reconciliation.summary_pool core. Only reached on
+        # full (non-remediation) cycles — the remediation payload
+        # (_assemble_remediation_payload) never asks for a cycle_summary, so
+        # self-healing there would fabricate a spurious one every remediation pass.
+        # Gated on count == 0 specifically (not a falsy check) so a transient
+        # count_memories_by_metadata failure (verified_count is None) never
+        # fabricates a placeholder for a run whose real summary may already exist.
+        count = await verify_cycle_summary_written(
+            self.memory, self.project_id, run_id, stage='memory_consolidator',
+        )
+        report.stats['stage1_cycle_summary_verified_count'] = count
+        if count == 0:
+            report.stats['stage1_cycle_summary_reconstructed'] = (
+                await reconstruct_cycle_summary_stub(
+                    self.memory,
+                    self.project_id,
+                    run_id,
+                    stage='memory_consolidator',
+                    recon_pool=_STAGE1_CYCLE_SUMMARY_RECON_POOL,
+                    reconstruct_source=_STAGE1_CYCLE_SUMMARY_RECONSTRUCTION_SOURCE,
+                )
+            )
 
         return report
 
