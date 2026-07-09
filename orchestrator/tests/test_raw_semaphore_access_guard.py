@@ -167,7 +167,7 @@ def test_no_raw_semaphore_access_outside_permit_ledger() -> None:
     """
     offenders: list[str] = []
 
-    for py_file in sorted(_SRC_DIR.glob('*.py')):
+    for py_file in sorted(_SRC_DIR.rglob('*.py')):
         source = py_file.read_text(encoding='utf-8')
         for lineno, attr_method in _raw_semaphore_accesses(source):
             offenders.append(f'{py_file.name}:{lineno}: {attr_method}()')

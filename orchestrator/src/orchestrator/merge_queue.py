@@ -5533,6 +5533,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
               prior ``merge_ahead_cap._value + inflight_cap_count == depth``
               form since ``_inflight_cap_count`` now reads ``len(live)``
               directly.
+          (c) merge-ahead-cap handoff cross-check: every :class:`RealMergeItem`
+              currently sitting in ``_verifier_queue`` with a non-``None``
+              ``cap_permit`` has that exact token present in
+              ``merge_ahead_ledger.live``. (b) derives both of its operands
+              from the ledger itself (``slot_available`` and ``len(live)``),
+              so it is tautological against a handoff/threading regression
+              (e.g. a stale or prematurely-released token stamped onto an
+              item); this check instead walks the actual queue contents —
+              independent of the ledger's own bookkeeping — and would catch
+              exactly that class of bug even though (b) stays green.
 
         Returns ``[]`` immediately when ``not self._running``: ``stop()``
         deliberately over-releases both semaphores by ``depth + 1`` as a
@@ -5586,6 +5596,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         except Exception as exc:  # pragma: no cover — defensive
             violations.append(
                 f'speculation_accounting_violations: merge-ahead-cap check raised: {exc}'
+            )
+
+        # ── (c) merge-ahead-cap handoff cross-check ──────────────────────────
+        # Independent of (b): (b)'s two operands both come from the ledger
+        # itself, so it cannot see a handoff bug where an item's stamped
+        # cap_permit has drifted out of sync with the ledger (a stale/foreign
+        # token, or a premature release while the item is still queued). This
+        # walks the actual verifier-queue contents instead — the same
+        # internal-deque access `snapshot()` uses for its 'awaiting_verify'
+        # section — and cross-validates each RealMergeItem's cap_permit
+        # against merge_ahead_ledger.live by identity.
+        try:
+            for _vq_item in list(self._verifier_queue._queue):  # type: ignore[attr-defined]
+                if (
+                    isinstance(_vq_item, RealMergeItem)
+                    and _vq_item.cap_permit is not None
+                    and _vq_item.cap_permit not in self._merge_ahead_ledger.live
+                ):
+                    violations.append(
+                        'merge-ahead-cap handoff violated: RealMergeItem in '
+                        '_verifier_queue carries a cap_permit not present in '
+                        'merge_ahead_ledger.live (stale or prematurely-released '
+                        'token)'
+                    )
+        except Exception as exc:  # pragma: no cover — defensive
+            violations.append(
+                f'speculation_accounting_violations: merge-ahead-cap handoff check raised: {exc}'
             )
 
         return violations
