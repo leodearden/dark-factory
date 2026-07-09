@@ -222,7 +222,7 @@ class TestBlockRecordRoundTrip:
             investigated_at='',
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
-            record.risk_label = 'medium'
+            record.risk_label = 'medium'  # type: ignore[misc]
 
     def test_has_expected_fields(self):
         from orchestrator.unblock_types import BlockRecord
