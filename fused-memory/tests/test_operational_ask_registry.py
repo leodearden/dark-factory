@@ -182,6 +182,52 @@ class TestLoadOperationalRegistry:
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) >= 1
 
+    def test_load_entry_with_empty_title_substrings_skips_and_warns(self, tmp_path, caplog):
+        """(2085 amendment) An EMPTY title_substrings list must be rejected, not
+        silently accepted: match_candidate's `all(sub in title for sub in [])`
+        is vacuously True, so an empty title_substrings would match every
+        candidate title and degrade the gate to a description-only match."""
+        from fused_memory.middleware.operational_ask_registry import load_operational_registry
+
+        yaml_content = """
+- name: bad_entry
+  reason: title_substrings is an empty list
+  title_substrings: []
+  description_substrings:
+    - "description match"
+"""
+        p = tmp_path / "empty_title.yaml"
+        p.write_text(yaml_content, encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            entries = load_operational_registry(p)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) >= 1
+
+    def test_load_entry_with_empty_description_substrings_skips_and_warns(self, tmp_path, caplog):
+        """(2085 amendment) An EMPTY description_substrings list must likewise be
+        rejected, so both match anchors are guaranteed non-empty at match time."""
+        from fused_memory.middleware.operational_ask_registry import load_operational_registry
+
+        yaml_content = """
+- name: bad_entry
+  reason: description_substrings is an empty list
+  title_substrings:
+    - "pattern"
+  description_substrings: []
+"""
+        p = tmp_path / "empty_desc.yaml"
+        p.write_text(yaml_content, encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            entries = load_operational_registry(p)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) >= 1
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # step-1 RED: TestMatchCandidate

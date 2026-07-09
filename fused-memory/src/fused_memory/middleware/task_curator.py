@@ -928,6 +928,19 @@ class TaskCurator:
         accepted only for signature symmetry with the other two guards and is
         unused here.
 
+        KNOWN LIMITATION (residual duplicate-gate risk): the exact-match /
+        idempotency-cache checks key off a payload fingerprint, so they only
+        catch byte-identical (or near-identical) re-proposals. A PARAPHRASED
+        re-proposal of the same operational ask — different wording, but
+        still containing the registry's title/description substrings — will
+        miss the fingerprint match, will not be cached, and will re-match
+        this registry, filing a SECOND born-at-L2 pure-gate for work that is
+        already gated. This is not auto-deduped against already-open gate
+        tasks (no task-search lookup is performed here). Operators should
+        expect this for paraphrased re-files and manually cancel/resolve the
+        duplicate gate — see the "paraphrased re-proposals" guidance in
+        config/operational_ask_registry.yaml's header.
+
         Returns ``None`` when:
         - The registry path is not configured (``None``).
         - The registry file is missing, unreadable, or unparseable (one

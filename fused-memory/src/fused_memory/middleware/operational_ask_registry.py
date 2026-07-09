@@ -131,6 +131,16 @@ def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
             )
             continue
 
+        if not title_subs or not desc_subs:
+            logger.warning(
+                "operational_ask_registry: skipping entry %r — title_substrings and "
+                "description_substrings must be non-empty (an empty title_substrings "
+                "would match every candidate title via all([]) == True, degrading the "
+                "gate to a description-only match)",
+                item.get("name", "<unnamed>"),
+            )
+            continue
+
         entries.append(
             OperationalAskEntry(
                 name=str(item["name"]),
