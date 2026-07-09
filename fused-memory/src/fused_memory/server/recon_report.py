@@ -361,6 +361,12 @@ class ReconReportState:
         original finding_id — Stage 2 can then attach citations to that finding
         rather than creating a redundant row.  Cross-run isolation is preserved:
         findings from a different run_id are never considered.
+
+        A null/missing ``flag_type`` on a re-raise of an already-flagged
+        ``task_id`` inherits that task's single established flag_type before
+        the signature lookup runs (task-2318), so an under-specified re-raise
+        collapses onto the canonical finding instead of allocating a distinct
+        ``(task_id, None)`` row.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -388,6 +394,28 @@ class ReconReportState:
         # 'd' never collides with a real-signature finding that shares description 'd'.
         c_task_id = _canonical_sig_field(task_id)
         c_flag_type = _canonical_sig_field(flag_type)
+
+        # Flag-type inheritance (task-2318): a re-raise that omits flag_type
+        # for an already-flagged task_id must not fork into its own (task_id,
+        # None) signature — it should collapse onto that task's established
+        # finding so Stage 2 can attach citations to the canonical row.
+        # Inherit ONLY when EXACTLY ONE non-null flag_type is established for
+        # this task_id in the run: zero means this null re-raise is the first
+        # signal (kept as (task_id, None), still dedups against later bare-null
+        # re-raises); more than one is ambiguous — a bare re-raise gives no
+        # basis to pick which condition it restates, so guessing risks
+        # merging two genuinely distinct findings, and is deliberately not
+        # done. Scanning _run_sig_index[run_id] (rather than a new index)
+        # reuses its existing cross-stage, run-quiescence-scoped lifetime
+        # (task-2088), so inheritance works across stages and survives an
+        # earlier stage's own entry being TTL-evicted, with no tick() change.
+        if c_task_id is not None and c_flag_type is None:
+            established = {
+                ft for (tid, ft) in self._run_sig_index.get(run_id, {}) if tid == c_task_id and ft is not None
+            }
+            if len(established) == 1:
+                c_flag_type = next(iter(established))
+
         sig = (c_task_id, c_flag_type)
         desc_hash = ""
         if sig != (None, None):
