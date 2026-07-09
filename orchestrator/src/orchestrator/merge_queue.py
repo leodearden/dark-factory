@@ -917,13 +917,18 @@ def _spawn_merge_verify_dry_run(
 
     None-safe: no-ops when *handles* is ``None`` or ``handles.scheduler`` is
     ``None`` — the solo-reverify and train module-level
-    ``_run_post_merge_verify`` callers pass no handles.
+    ``_run_post_merge_verify`` callers pass no handles.  Also no-ops when
+    ``req.config.unblock_auto.enabled`` is falsy (mirrors
+    ``workflow._spawn_dry_run_unblock``'s enablement gate).
 
     *event_store* is accepted but intentionally NOT yet forwarded to
     ``run_dry_run_unblock`` — wired in a later step.
     """
     _ = event_store
     if handles is None or handles.scheduler is None:
+        return
+    ua = getattr(req.config, 'unblock_auto', None)
+    if not ua or not ua.enabled:
         return
     task_name = f'unblock-auto-{req.task_id}'
     try:
