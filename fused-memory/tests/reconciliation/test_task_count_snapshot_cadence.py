@@ -12,6 +12,10 @@ Covers (grown step-by-step per plan.json):
 - TestBuildStaleSnapshotFinding         (step-3/4)
 - TestVerifyTaskCountSnapshotWritten    (step-5/6)
 - TestRunRecordsTaskCountSnapshotWrittenStat (step-7/8)
+
+Task 2325 follow-up (exempt never-snapshotted projects + make the Stage-2
+task_count_snapshot write structural):
+- TestBuildTaskCountSnapshotContent     (task 2325 step-3/4)
 """
 
 from __future__ import annotations
@@ -37,9 +41,11 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
     SNAPSHOT_WRITTEN_STAT_KEY,
+    TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
     TASK_COUNT_SNAPSHOT_MISS_THRESHOLD,
     build_stale_snapshot_finding,
+    build_task_count_snapshot_content,
     compute_snapshot_miss_streak,
     evaluate_snapshot_cadence,
     extract_snapshot_written,
@@ -219,6 +225,53 @@ class TestBuildStaleSnapshotFinding:
         second = build_stale_snapshot_finding('reify')
         assert first['description']
         assert first['description'] == second['description']
+
+
+# ---------------------------------------------------------------------------
+# build_task_count_snapshot_content (task 2325 step-3/4)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTaskCountSnapshotContent:
+    """build_task_count_snapshot_content(...) -> str (task 2325).
+
+    Pure, dependency-free renderer for the deterministic task_count_snapshot
+    Mem0 write content -- no I/O, no mocks needed. Mirrors the module's
+    "pure compute helper" contract (see module docstring).
+    """
+
+    def test_category_constant_value(self):
+        assert TASK_COUNT_SNAPSHOT_CATEGORY == 'observations_and_summaries'
+
+    def test_content_contains_project_counts_highest_id_and_date(self):
+        content = build_task_count_snapshot_content(
+            'reify',
+            total=42, done=18, cancelled=3, active=20, other=1,
+            highest_task_id=99, as_of='2026-07-08',
+        )
+
+        assert isinstance(content, str)
+        assert 'reify' in content
+        assert '42' in content
+        assert '18' in content
+        assert '3' in content
+        assert '20' in content
+        assert '1' in content
+        assert '99' in content
+        assert '2026-07-08' in content
+
+    def test_content_without_as_of_is_non_empty_and_contains_counts(self):
+        content = build_task_count_snapshot_content(
+            'reify',
+            total=42, done=18, cancelled=3, active=20, other=1,
+            highest_task_id=99, as_of=None,
+        )
+
+        assert isinstance(content, str)
+        assert content
+        assert 'reify' in content
+        assert '42' in content
+        assert '99' in content
 
 
 # ---------------------------------------------------------------------------
