@@ -937,15 +937,12 @@ class GraphitiBackend:
         Matches the node as either source or target (undirected) and filters
         edges where invalid_at IS NULL (i.e. not yet invalidated).
 
-        Deduplicates by edge ELEMENT identity (WITH DISTINCT e), not by the
-        (uuid, fact, name) property tuple. FalkorDB does not enforce property
-        uniqueness, and redirect_node_edges (the merge path) copies
-        new.uuid = old.uuid onto redirected edges, so an entity can carry
-        multiple genuinely-distinct RELATES_TO relationships that share one
-        (uuid, fact, name) tuple. Deduping on the element itself still
-        collapses the undirected self-loop double-match (an A→A edge matches
-        the same element twice) while correctly counting distinct edges that
-        happen to share copied properties.
+        Deduplicates in Python, keyed on e.uuid. RELATES_TO edge uuids are
+        unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
+        redirect_node_edges; task 2210 W6-epsilon repaired legacy dup-uuid
+        edges), so keying on e.uuid is equivalent to the prior element-identity
+        dedup while collapsing the undirected self-loop double-match (an A->A
+        edge matches the same uuid twice).
 
         Args:
             node_uuid: UUID of the Entity node.
@@ -958,14 +955,35 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
             'WHERE e.invalid_at IS NULL '
-            'WITH DISTINCT e '
             'RETURN e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher, {'uuid': node_uuid})
-        return [
-            self._edge_dict(row[0], row[1], row[2])
-            for row in (result.result_set or [])
-        ]
+        seen: dict[str, EdgeDict] = {}
+        edges: list[EdgeDict] = []
+        for row in (result.result_set or []):
+            edge_uuid = row[0]
+            if edge_uuid in seen:
+                # Diagnostic only: the uuid-keyed dedup premise (task 2213 W6-zeta)
+                # is that RELATES_TO edge uuids are unique graph-wide post
+                # tasks 2207/2210. If that invariant is ever violated, two
+                # genuinely-distinct edges sharing a uuid would silently
+                # collapse to the first-seen row. Surface it at debug level
+                # rather than failing silently.
+                dup = self._edge_dict(row[0], row[1], row[2])
+                prior = seen[edge_uuid]
+                if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
+                    logger.debug(
+                        'get_valid_edges_for_node: edge uuid %s seen again with '
+                        'differing fact/name (kept fact=%r name=%r, saw fact=%r '
+                        'name=%r) — uuid-uniqueness invariant may be violated; '
+                        'keeping first-seen row',
+                        edge_uuid, prior['fact'], prior['name'], dup['fact'], dup['name'],
+                    )
+                continue
+            edge = self._edge_dict(row[0], row[1], row[2])
+            seen[edge_uuid] = edge
+            edges.append(edge)
+        return edges
 
     @_canonicalize_group_args
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
@@ -1007,19 +1025,15 @@ class GraphitiBackend:
         and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
         n.uuid differs.
 
-        Deduplicates by the (entity, edge-element) pair (WITH DISTINCT n, e), not
-        by the (uuid, fact, name) property tuple. FalkorDB does not enforce
-        property uniqueness, and redirect_node_edges (the merge path) copies
-        new.uuid = old.uuid onto redirected edges, so an entity can carry
-        multiple genuinely-distinct RELATES_TO relationships that share one
-        (uuid, fact, name) tuple — a property-tuple RETURN DISTINCT would
-        collapse those into a single row and undercount edge_count.
-        WITH DISTINCT n, e preserves the intended double-attribution (each
+        Deduplicates in Python, keyed on (n.uuid, e.uuid). RELATES_TO edge uuids
+        are unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
+        redirect_node_edges; task 2210 W6-epsilon repaired legacy dup-uuid edges),
+        so keying on the (entity, edge-uuid) pair is equivalent to the prior
+        element-identity dedup: it preserves the intended double-attribution (each
         directed edge appears once under each endpoint entity, as distinct
-        (n, e) pairs) and still collapses the undirected self-loop
+        (n.uuid, e.uuid) pairs) and still collapses the undirected self-loop
         double-match (A→A edges, where both traversal directions yield the
-        identical (n, e) pair), while no longer collapsing distinct edges
-        that merely share copied properties.
+        identical (n.uuid, e.uuid) pair).
 
         Uses ro_query since no writes are performed.
 
@@ -1040,14 +1054,31 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity)-[e:RELATES_TO]-() '
             'WHERE e.invalid_at IS NULL '
-            'WITH DISTINCT n, e '
             'RETURN n.uuid, e.uuid, e.fact, e.name'
         )
         result = await graph.ro_query(cypher)
+        seen: dict[tuple[str, str], EdgeDict] = {}
         grouped: dict[str, list[EdgeDict]] = {}
         for row in (result.result_set or []):
-            entity_uuid = row[0]
-            grouped.setdefault(entity_uuid, []).append(self._edge_dict(row[1], row[2], row[3]))
+            entity_uuid, edge_uuid = row[0], row[1]
+            key = (entity_uuid, edge_uuid)
+            if key in seen:
+                # Diagnostic only: see get_valid_edges_for_node — the same
+                # uuid-uniqueness invariant underpins this method's dedup key.
+                dup = self._edge_dict(row[1], row[2], row[3])
+                prior = seen[key]
+                if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
+                    logger.debug(
+                        'get_all_valid_edges: (entity, edge) pair %s seen again '
+                        'with differing fact/name (kept fact=%r name=%r, saw '
+                        'fact=%r name=%r) — uuid-uniqueness invariant may be '
+                        'violated; keeping first-seen row',
+                        key, prior['fact'], prior['name'], dup['fact'], dup['name'],
+                    )
+                continue
+            edge = self._edge_dict(row[1], row[2], row[3])
+            seen[key] = edge
+            grouped.setdefault(entity_uuid, []).append(edge)
         return grouped
 
     @_canonicalize_group_args

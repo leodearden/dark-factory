@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import re
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -314,17 +313,18 @@ class TestGetValidEdgesForNode:
         await assert_ro_query_only(backend, make_graph_mock, [], 'get_valid_edges_for_node', 'node-uuid-1', group_id='test')
 
     @pytest.mark.asyncio
-    async def test_cypher_dedups_by_edge_identity_not_property_tuple(
+    async def test_cypher_has_no_with_distinct_dedup_is_uuid_keyed(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """Query dedupes by edge ELEMENT identity (WITH DISTINCT e), not property tuple.
+        """Query no longer uses WITH DISTINCT — dedup is uuid-keyed in Python.
 
-        FalkorDB does not enforce property uniqueness, and redirect_node_edges
-        copies new.uuid = old.uuid on merge, so an entity can carry multiple
-        genuinely-distinct RELATES_TO elements sharing one (uuid, fact, name)
-        tuple. `RETURN DISTINCT e.uuid, e.fact, e.name` collapses those distinct
-        elements into a single row, undercounting edge_count. `WITH DISTINCT e`
-        dedupes by the edge element itself, so each relationship is counted once.
+        After task 2207 (W6-delta) stopped minting copied uuids in
+        redirect_node_edges and task 2210 (W6-epsilon) repaired legacy
+        dup-uuid edges, RELATES_TO edge uuids are unique graph-wide. The
+        fragile element-identity idiom (WITH DISTINCT e) is therefore replaced
+        by plain uuid-keyed dedup in Python: the Cypher simply RETURNs
+        e.uuid, e.fact, e.name and get_valid_edges_for_node dedupes on e.uuid
+        (which also collapses the undirected self-loop double-match).
         """
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
@@ -333,22 +333,21 @@ class TestGetValidEdgesForNode:
         call_args = graph.ro_query.call_args
         assert call_args is not None, "graph.ro_query was not called"
         cypher = extract_cypher(call_args)
-        # Regex (not a plain substring) so harmless reformatting (e.g. extra/
-        # collapsed whitespace) can't produce a false-negative test failure.
-        assert re.search(r'WITH\s+DISTINCT\s+e\b', cypher), (
-            f'Cypher must dedupe by edge element identity (WITH DISTINCT e): {cypher}'
+        # The whole point of W6-zeta (task 2213): drop the WITH DISTINCT idiom.
+        assert 'WITH DISTINCT' not in cypher, (
+            f'Cypher must NOT use WITH DISTINCT — dedup is uuid-keyed in Python: {cypher}'
         )
         assert 'RETURN DISTINCT' not in cypher, f"Cypher must not dedupe by property tuple: {cypher}"
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
     @pytest.mark.asyncio
-    async def test_identical_property_rows_preserved(self, mock_config, make_backend, make_graph_mock):
-        """Python layer does no dedup — identical-property rows from the DB are both kept.
+    async def test_rows_sharing_uuid_collapse_to_one(self, mock_config, make_backend, make_graph_mock):
+        """Python dedup keys on e.uuid — rows sharing a uuid collapse to one edge.
 
-        Element-identity dedup (WITH DISTINCT e) happens server-side in Cypher;
-        the Python layer must not additionally dedupe by property tuple, or it
-        would re-introduce the undercount for distinct edges that legitimately
-        share a copied (uuid, fact, name) tuple (e.g. after redirect_node_edges).
+        Edge uuids are unique graph-wide after W6-delta/epsilon, so two rows
+        carrying the same e.uuid can only be the undirected self-loop
+        double-match of a single edge. uuid-keyed dedup collapses them to one,
+        equivalent to the prior WITH DISTINCT e element-identity dedup.
         """
         backend = make_backend(mock_config)
         rows = [
@@ -358,7 +357,7 @@ class TestGetValidEdgesForNode:
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('node-uuid-1', group_id='test')
-        assert len(result) == 2
+        assert len(result) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -387,19 +386,18 @@ class TestGetAllValidEdges:
         assert result['node-2'] == [{'uuid': 'e3', 'fact': 'factC', 'name': 'edge3'}]
 
     @pytest.mark.asyncio
-    async def test_cypher_dedups_by_edge_identity(self, mock_config, make_backend, make_graph_mock):
-        """Query dedupes by (entity, edge-element) identity, not property tuple.
+    async def test_cypher_has_no_with_distinct_dedup_is_uuid_pair_keyed(
+        self, mock_config, make_backend, make_graph_mock
+    ):
+        """Query no longer uses WITH DISTINCT — dedup is (n.uuid, e.uuid)-keyed in Python.
 
-        FalkorDB does not enforce property uniqueness, and redirect_node_edges
-        copies new.uuid = old.uuid on merge, so an entity can carry multiple
-        genuinely-distinct RELATES_TO elements sharing one (uuid, fact, name)
-        tuple. `RETURN DISTINCT n.uuid, e.uuid, e.fact, e.name` collapses those
-        distinct elements into a single row, undercounting edge_count.
-        `WITH DISTINCT n, e` dedupes by the (entity, edge-element) pair itself:
-        it still preserves the intended double-attribution (a directed edge
-        appears once under each endpoint entity, as distinct (n, e) pairs) and
-        still collapses the undirected self-loop double-match, while no longer
-        collapsing genuinely-distinct edges that share copied properties.
+        After W6-delta/epsilon (tasks 2207/2210) made RELATES_TO edge uuids
+        unique graph-wide, the fragile element-identity idiom
+        (WITH DISTINCT n, e) is replaced by plain (n.uuid, e.uuid)-keyed dedup
+        in Python. That pair-key preserves the intended double-attribution (a
+        directed edge appears once under each endpoint entity, as distinct
+        (n.uuid, e.uuid) pairs) and still collapses the undirected self-loop
+        double-match (A->A yields the identical pair twice).
         """
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
@@ -408,12 +406,9 @@ class TestGetAllValidEdges:
         call_args = graph.ro_query.call_args
         assert call_args is not None, "graph.ro_query was not called"
         cypher = extract_cypher(call_args)
-        # Regex (not a plain substring) so harmless reformatting — different
-        # comma spacing, or listing the two WITH variables in the other order
-        # (both are semantically identical for an unordered DISTINCT dedup) —
-        # can't produce a false-negative test failure.
-        assert re.search(r'WITH\s+DISTINCT\s+(?:n\s*,\s*e|e\s*,\s*n)\b', cypher), (
-            f'Cypher must dedupe by (entity, edge) identity (WITH DISTINCT n, e): {cypher}'
+        # The whole point of W6-zeta (task 2213): drop the WITH DISTINCT idiom.
+        assert 'WITH DISTINCT' not in cypher, (
+            f'Cypher must NOT use WITH DISTINCT — dedup is (n.uuid, e.uuid)-keyed in Python: {cypher}'
         )
         assert 'RETURN DISTINCT' not in cypher, f"Cypher must not dedupe by property tuple: {cypher}"
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
@@ -491,29 +486,26 @@ class TestGetAllValidEdges:
         assert result == {}
 
     @pytest.mark.asyncio
-    async def test_identical_rows_produce_duplicate_entries(self, mock_config, make_backend, make_graph_mock):
-        """Python grouping loop does no dedup — identical rows produce duplicate list entries.
+    async def test_rows_sharing_uuid_pair_collapse_to_one(self, mock_config, make_backend, make_graph_mock):
+        """Python grouping loop dedupes on (n.uuid, e.uuid) — rows sharing that pair collapse.
 
-        WITH DISTINCT n, e in the Cypher query is the sole guard against
-        duplicate rows (it guards specifically against self-loop duplicates
-        where A→A edges yield two identical rows under the undirected MATCH).
-        If the database ever returns identical rows the Python layer faithfully
-        appends both, producing duplicate entries in the result list.  This test
-        documents and locks in that contract so it is never accidentally 'fixed'
-        at the Python layer (which would silently change behaviour for the
-        legitimate self-loop case that WITH DISTINCT n, e already handles, and
-        would re-introduce the edge_count undercount for genuinely-distinct
-        edges that share a copied property tuple).
+        After W6-delta/epsilon made edge uuids unique graph-wide, two rows
+        carrying the same (n.uuid, e.uuid) pair can only be the undirected
+        self-loop double-match (A→A edges yield two identical rows under the
+        undirected MATCH). The (n.uuid, e.uuid)-keyed dedup collapses them to a
+        single entry — equivalent to the prior WITH DISTINCT n, e — while still
+        preserving cross-endpoint double-attribution (a directed edge appears
+        once under each of its two distinct endpoint uuids).
         """
         backend = make_backend(mock_config)
         rows = [
             ['node-1', 'e1', 'factA', 'edge1'],
-            ['node-1', 'e1', 'factA', 'edge1'],  # identical duplicate
+            ['node-1', 'e1', 'factA', 'edge1'],  # identical self-loop double-match
         ]
         graph = make_graph_mock(rows)
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_all_valid_edges(group_id='test')
-        assert len(result['node-1']) == 2  # both rows appended, no dedup
+        assert len(result['node-1']) == 1  # same (n.uuid, e.uuid) → collapsed
 
 
 # ---------------------------------------------------------------------------
@@ -1281,16 +1273,23 @@ class TestEdgeDedupLiveFalkorDB:
             await backend.close()
 
     @pytest.mark.asyncio
-    async def test_distinct_edges_sharing_copied_properties_both_counted(
+    async def test_edges_sharing_a_uuid_collapse_under_uuid_keyed_dedup(
         self, mock_config, edge_dedup_live_graph
     ):
-        """Two distinct edges sharing one copied (uuid, fact, name) tuple are both counted.
+        """Two edges sharing one uuid collapse per-endpoint under uuid-keyed dedup.
 
-        Simulates the post-redirect_node_edges scenario: a merge sets
-        new.uuid = old.uuid on the redirected edge, so two genuinely-distinct
-        RELATES_TO relationships can share identical properties. A
-        property-tuple RETURN DISTINCT would collapse them into one row;
-        WITH DISTINCT e / WITH DISTINCT n, e must not.
+        Pre-W6-delta, redirect_node_edges could set new.uuid = old.uuid on a
+        redirected edge, letting two genuinely-distinct relationships share a
+        uuid — the reason the read path used element-identity WITH DISTINCT.
+        W6-delta (task 2207) stopped minting copied uuids and W6-epsilon (task
+        2210) repaired legacy ones, so edge uuids are now unique graph-wide.
+        W6-zeta (task 2213) therefore replaces WITH DISTINCT with plain
+        uuid-keyed dedup. This test manually injects the now-impossible
+        dup-uuid state and pins the resulting contract: two edges sharing a
+        uuid collapse to one per endpoint. node-a sees both rows under the same
+        (node-a, shared-uuid) key → 1; node-b and node-c each key on a distinct
+        (endpoint, shared-uuid) pair → 1 apiece (double-attribution across
+        distinct endpoints is preserved).
         """
         graph_name, graph = edge_dedup_live_graph
         await graph.query(
@@ -1312,10 +1311,10 @@ class TestEdgeDedupLiveFalkorDB:
         backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
         try:
             edges_for_a = await backend.get_valid_edges_for_node('node-a', group_id=graph_name)
-            assert len(edges_for_a) == 2
+            assert len(edges_for_a) == 1
 
             all_edges = await backend.get_all_valid_edges(group_id=graph_name)
-            assert len(all_edges['node-a']) == 2
+            assert len(all_edges['node-a']) == 1
             assert len(all_edges['node-b']) == 1
             assert len(all_edges['node-c']) == 1
         finally:
