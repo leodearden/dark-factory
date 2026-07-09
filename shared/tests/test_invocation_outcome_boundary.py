@@ -872,6 +872,19 @@ class TestB9ProbeDirIsolationAndEnvPrecedence:
 # ---------------------------------------------------------------------------
 
 
+async def _assert_no_resume_task_spawned_via_any_path(gate: UsageGate, acct: AccountState) -> None:
+    """B10 support: after gate.shutdown() has armed _shutting_down, neither
+    a CAPPED _transition's enter-phase side effect (producer -- the normal
+    call path) nor a direct call to the spawner method itself (consumer --
+    any caller reaching _start_account_resume_probe by whatever path)
+    starts a new resume task. The refusal lives in the spawner
+    (gate-internal), not in any cancel-before-shutdown discipline a caller
+    must separately observe."""
+    assert acct.resume_task is None or acct.resume_task.done()
+    gate._start_account_resume_probe(acct)  # direct call, bypassing _transition entirely
+    assert acct.resume_task is None or acct.resume_task.done()
+
+
 @pytest.mark.asyncio
 class TestB10ShutdownRefusesProbes:
     """await gate.shutdown() then a CapHit transition spawns no resume
