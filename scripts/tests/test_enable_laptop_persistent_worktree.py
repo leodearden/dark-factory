@@ -44,9 +44,11 @@ def _fixture_laptop_config(state="unflipped"):
     state:
       "unflipped" - git.persistent_merge_worktree: false present (default;
                     mirrors defaults.yaml's shipped default).
+      "flipped"   - git.persistent_merge_worktree: true already present.
     """
     key_line = {
         "unflipped": f"  {KEY}: false\n",
+        "flipped": f"  {KEY}: true\n",
     }[state]
 
     return (
